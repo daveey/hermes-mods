@@ -1,0 +1,121 @@
+From e5b8444726673ad68323845a152fafed2e2d9b65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 10:02:01 +0000
+Subject: [PATCH] [daveey] Prove frozen diagnostic commands across actual Board
+ HTTP and replica apply
+
+Exercise real SQLite producer -> local wrangler Worker/DO -> authenticated canonical receipt -> actual replica ingestion -> immutable deadline escalation, including reply loss and reopened connection. Prove no root status mutation or execution authority.
+---
+ hermes_cli/kanban_actionability_transport.py  |  7 ++
+ .../test_kanban_actionability_board.py        | 81 +++++++++++++++++++
+ 2 files changed, 88 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_actionability_board.py
+
+diff --git a/hermes_cli/kanban_actionability_transport.py b/hermes_cli/kanban_actionability_transport.py
+index f4d5376b60..4c384af0c6 100644
+--- a/hermes_cli/kanban_actionability_transport.py
++++ b/hermes_cli/kanban_actionability_transport.py
+@@ -197,6 +197,13 @@ def confirm(conn, hub, board: str, op_id: str) -> dict:
+         dest = receipt.get('destination')
+         if not isinstance(dest, dict) or dest.get('kind') not in ('task', 'chat', 'unavailable'):
+             raise ValueError('actionability destination unconfirmed')
++        owner = wire['payload']['owner']
++        target = owner['refs'][0] if dest['kind'] == 'task' and owner['kind'] == 'task' and len(owner['refs']) == 1 else wire['task']
++        outcome = 'route_unavailable' if dest['kind'] == 'unavailable' else 'recorded'
++        if (set(dest) != {'task_id', 'kind'} or dest['task_id'] != target or receipt['outcome'] != outcome
++                or dest['kind'] == 'task' and owner['kind'] != 'task'
++                or dest['kind'] == 'chat' and owner['kind'] == 'task'):
++            raise ValueError('actionability destination does not match frozen owner')
+         notice, notice_p = _evidence(hub, board, wire['notice_uid'], dest.get('task_id'), 'decision_requested', gateway)
+         expected = {'root_task': wire['task'], 'root_episode': wire['payload']['facts']['root_episode'],
+                     'contract_key': wire['payload']['contract_key'], 'contract_event_uid': wire['contract_uid'],
+diff --git a/tests/hermes_cli/test_kanban_actionability_board.py b/tests/hermes_cli/test_kanban_actionability_board.py
+new file mode 100644
+index 0000000000..592c95db16
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_board.py
+@@ -0,0 +1,81 @@
++"""Composed real Core/SQLite -> local Board HTTP/DO -> replica proof. [daveey]
++
++Opt-in local wrangler only; no production enrollment, stopped incidents or provider calls.
++B2_M1_LOCAL_BOARD_URL=http://127.0.0.1:8791 (wrangler fixture admin key: test-admin-key).
++"""
++import hashlib
++import json
++import os
++import uuid
++from urllib.request import Request, urlopen
++
++import pytest
++
++from hermes_cli import kanban_actionability_transport as act
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.mark.skipif(not os.environ.get('B2_M1_LOCAL_BOARD_URL'), reason='requires isolated local wrangler Board')
++def test_frozen_root_board_replica_deadline_escalation(tmp_path, monkeypatch):
++    url = os.environ['B2_M1_LOCAL_BOARD_URL']
++    assert url.startswith('http://127.0.0.1:')
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    gateway, board = 'm1-' + uuid.uuid4().hex[:10], 'm1-' + uuid.uuid4().hex[:10]
++    key = 'hmk_' + uuid.uuid4().hex  # disposable local enrollment, never a real credential
++
++    def api(path, payload, admin=False):
++        headers = {'Content-Type': 'application/json'}
++        if admin:
++            headers['Authorization'] = 'Bearer test-admin-key'
++        with urlopen(Request(url + path, json.dumps(payload).encode(), headers), timeout=10) as response:
++            return json.load(response)
++
++    enrollment = api('/v1/admin/gateways', {'name': gateway}, True)
++    api('/v1/enroll', {'gateway': gateway, 'code': enrollment['code'], 'key_sha256': hashlib.sha256(key.encode()).hexdigest()})
++    hub = client.Hub(client.Identity(url, key, gateway))
++    conn = kbc.connect(home / 'kanban.db')
++    try:
++        client.ensure_identity(conn, board, gateway)
++        sync.set_mode(conn, 'primary')
++        tid = kb.create_task(conn, title='isolated inert M1 composed proof', assignee='default')
++        assert client.push(conn, hub, board, gateway, primary=True).rejected == 0
++        client.pull(conn, hub, board, observers=False)
++        task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        # Anchor to the actual canonical lifecycle producer, not an invented test predicate.
++        source = conn.execute("SELECT uid,created_at FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()
++        assert source is not None
++        source = hub.row_evidence(board, 'task_events', source['uid'])['row']
++        payload = {'version': 1, 'facts': {'status': task['status'], 'assignee': task['assignee'], 'current_run_uid': None,
++                    'root_episode': None, 'source_uids': [{'uid': source['uid'], 'version': source['version']}], 'dependencies': []},
++                   'owner': {'kind': 'unavailable', 'refs': []},
++                   'blocker': {'prerequisite': 'explicit administrative disposition', 'trigger': 'supported owner decision', 'evidence': [source['uid']]},
++                   'action': 'repair_lifecycle_contract', 'instruction': 'Record diagnostic custody only; never run original scope',
++                   'first_observed': source['created_at'], 'deadline_at': source['created_at'] + 1, 'legacy': False}
++        with kbc.write_txn(conn):
++            root = act.reserve(conn, tid, payload)
++        # Send canonical op but lose its reply before local ACK. Restart keeps exact bytes.
++        assert hub.ops(board, [json.loads(root['request_json'])])['results'][0]['status'] == 'applied'
++        conn.close()
++        conn = kbc.connect(home / 'kanban.db')
++        assert act.command(conn, root['op_id'])['request_json'] == root['request_json']
++        assert act.confirm(conn, hub, board, root['op_id'])['delivery_state'] == 'confirmed'
++        # No sleeps: move only the isolated producer timestamp before initial publication
++        # is not allowed. A one-second deadline can naturally pass during root roundtrip.
++        import time
++        from tests.waiting import wait_until
++        wait_until(lambda: time.time() >= payload['deadline_at'], timeout=3)
++        with kbc.write_txn(conn):
++            due = act.reserve(conn, tid, payload, phase='escalation')
++        result = act.confirm(conn, hub, board, due['op_id'])
++        assert result['outcome'] == 'route_unavailable' and result['execution_authority'] is False
++        assert act.confirm(conn, hub, board, due['op_id']) == result
++        assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == task
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='decision_requested'", (tid,)).fetchone()[0] == 1
++        assert not conn.execute('SELECT 1 FROM task_runs').fetchone()
++    finally:
++        conn.close()
+-- 
+2.43.0
+

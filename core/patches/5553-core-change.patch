@@ -1,0 +1,280 @@
+From ddfb74423ff9f380418240f25ae549d2768c2b1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:35:50 +0000
+Subject: [PATCH] fix(desktop): group non-chat blocked cards by creator
+ [daveey]
+
+A successful session-label lookup omits internal runtime sessions, but the sidebar retained their ids as phantom chats. Distinguish an omitted label from an unavailable endpoint, preserve genuine untitled sessions and older-backend raw-id fallback, and group sessionless cards by creator and gateway with drawer navigation.
+
+Proof: focused regression RED then GREEN; Desktop full typecheck passes; all kanban plugin tests pass (24 files, 192 tests); eslint passes; scripts/check --base origin/main passes all 21 checks. Four source mutants killed: omitted-label manager retention, missing endpoint fallback removal, creator-key omission and gateway-key omission.
+---
+ .../src/plugins/kanban/api.blocked.test.ts    | 31 ++++++-
+ apps/desktop/src/plugins/kanban/api.ts        | 10 ++-
+ .../plugins/kanban/blocked-section.test.ts    | 89 +++++++++++++++++--
+ .../src/plugins/kanban/blocked-section.tsx    | 15 +++-
+ apps/desktop/src/plugins/kanban/types.ts      |  2 +
+ 5 files changed, 137 insertions(+), 10 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.blocked.test.ts b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+index 9b87458c64..7664ed96c0 100644
+--- a/apps/desktop/src/plugins/kanban/api.blocked.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+@@ -139,7 +139,7 @@ describe('fetchBlockedTasks', () => {
+     expect(taskGateway('mini-b')).toBe('mini')
+   })
+ 
+-  it('resolves each managing session to its live tip and title on the card\'s gateway', async () => {
++  it("resolves each managing session to its live tip and title on the card's gateway", async () => {
+     registry('local')
+     await bind(call => {
+       if (call.path === '/boards') {
+@@ -176,6 +176,35 @@ describe('fetchBlockedTasks', () => {
+     })
+   })
+ 
++  it('treats omitted manager ids as creator-owned cards, retaining the creator', async () => {
++    registry('local')
++    await bind(call => {
++      if (call.path === '/boards') {
++        return { boards: [{ counts: { blocked: 2 }, slug: 'bb' }], current: 'bb' }
++      }
++
++      if (call.path === '/board?board=bb') {
++        return board({
++          blocked: ['internal-a', 'internal-b'].map(session_id =>
++            task(session_id, { created_by: 'bb-dev', session_id, status: 'blocked' })
++          )
++        })
++      }
++
++      if (call.path.startsWith('/session-labels?')) {
++        return { profile: 'default', sessions: {} }
++      }
++
++      return new Error(`unexpected ${call.path}`)
++    })
++
++    const tasks = await fetchBlockedTasks()
++    expect(tasks.map(t => [t.manager, t.creator])).toEqual([
++      [null, 'bb-dev'],
++      [null, 'bb-dev']
++    ])
++  })
++
+   it('an older backend without /session-labels still groups by the raw id', async () => {
+     registry('local')
+     await bind(call => {
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 4575956b4b..085996f15c 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -1158,6 +1158,8 @@ export function mergeBoardLists(parts: Array<{ gateway: string; boards: BoardsRe
+ /** A blocked card plus the board it lives on (the drawer opens it there). */
+ export interface BlockedTask extends KanbanTask {
+   board: string
++  /** Creating profile, used when no visible chat manages this card. */
++  creator?: null | string
+   /** The chat managing the card, resolved to its live compression tip and
+    *  title on the card's own gateway; null when no session owns it. */
+   manager: null | { id: string; profile: null | string; title: null | string }
+@@ -1210,12 +1212,14 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+       const ids = [...new Set(found.map(managerId).filter((id): id is string => Boolean(id)))]
+       let labels: SessionLabels['sessions'] = {}
+       let profile: null | string = null
++      let labelsAnswered = false
+ 
+       if (ids.length) {
+         try {
+           const answer = await read<SessionLabels>(`/session-labels?ids=${encodeURIComponent(ids.join(','))}`)
+           labels = answer.sessions ?? {}
+           profile = answer.profile?.trim() || null
++          labelsAnswered = true
+         } catch {
+           // Older backend without the endpoint: group by the raw id, untitled.
+         }
+@@ -1227,8 +1231,12 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+ 
+         return {
+           ...task,
++          creator: task.created_by,
+           gateway: task.gateway ?? (gateways.length > 1 ? gateway : undefined),
+-          manager: id ? { id: label?.tip_id || id, profile, title: label?.title?.trim() || null } : null
++          manager:
++            id && (!labelsAnswered || label)
++              ? { id: label?.tip_id || id, profile, title: label?.title?.trim() || null }
++              : null
+         }
+       })
+     })
+diff --git a/apps/desktop/src/plugins/kanban/blocked-section.test.ts b/apps/desktop/src/plugins/kanban/blocked-section.test.ts
+index ea0498d542..e798191944 100644
+--- a/apps/desktop/src/plugins/kanban/blocked-section.test.ts
++++ b/apps/desktop/src/plugins/kanban/blocked-section.test.ts
+@@ -2,17 +2,43 @@ import { describe, expect, it, vi } from 'vitest'
+ 
+ import type { BlockedTask } from './api'
+ 
++const view = vi.hoisted(() => ({
++  tasks: [] as BlockedTask[],
++  rows: [] as { icon: string; label: string; onSelect: () => void }[],
++  openSession: vi.fn(),
++  navigate: vi.fn()
++}))
++
+ vi.mock('@hermes/plugin-sdk', async () => ({
+   atom: (await import('nanostores')).atom,
+-  host: {},
+-  SidebarSection: () => null,
+-  SidebarSectionRow: () => null,
+-  useQuery: vi.fn(),
+-  useValue: vi.fn(),
++  host: { activeConnectionId: () => 'local', navigate: view.navigate, openSession: view.openSession, state: {} },
++  SidebarSection: ({ children }: { children: React.ReactNode }) => children,
++  SidebarSectionRow: (props: (typeof view.rows)[number]) => {
++    view.rows.push(props)
++
++    return null
++  },
++  useQuery: () => ({ data: view.tasks }),
++  useValue: () => true,
+   usePluginI18n: vi.fn()
+ }))
++vi.mock('./ui', () => ({
++  ago: () => null,
++  useKanban: () => ({
++    sidebar: {
++      blocked: 'Blocked',
++      noSession: 'No managing session',
++      untitledSession: 'Untitled session',
++      openSession: (title: string) => title,
++      blockedTip: (title: string) => title
++    }
++  })
++}))
+ 
+-const { groupBlockedTasks, managingSessionRoute } = await import('./blocked-section')
++const { groupBlockedTasks, managingSessionRoute, BlockedTasksSection } = await import('./blocked-section')
++const { $openTaskRequest } = await import('./open-task')
++const { createElement } = await import('react')
++const { renderToStaticMarkup } = await import('react-dom/server')
+ 
+ const card = (id: string, manager: BlockedTask['manager'], gateway?: string): BlockedTask =>
+   ({ board: 'default', gateway, id, manager, status: 'blocked', title: id }) as BlockedTask
+@@ -43,6 +69,57 @@ describe('groupBlockedTasks', () => {
+   })
+ })
+ 
++describe('blocked group headers', () => {
++  function render(tasks: BlockedTask[]) {
++    view.tasks = tasks
++    view.rows = []
++    view.openSession.mockClear()
++    view.navigate.mockClear()
++    $openTaskRequest.set(null)
++    renderToStaticMarkup(createElement(BlockedTasksSection))
++
++    return view.rows[0]
++  }
++
++  it('groups omitted ids by creator and gateway and opens the first card, not a phantom chat', () => {
++    const tasks = ['a', 'b'].map(id => ({ ...card(id, null, 'mini'), creator: 'bb-dev' }))
++    const groups = groupBlockedTasks(tasks)
++    expect(groups).toHaveLength(1)
++    expect(groups[0].sessionId).toBeNull()
++    const header = render(tasks)
++    expect(header.label).toBe('bb-dev · mini')
++    expect(header.icon).toBe('circle-slash')
++    header.onSelect()
++    expect($openTaskRequest.get()).toEqual({ board: 'default', taskId: 'a' })
++    expect(view.navigate).toHaveBeenCalledWith('/kanban')
++    expect(view.openSession).not.toHaveBeenCalled()
++  })
++
++  it('keeps creators and gateways separate and omits the single-gateway suffix', () => {
++    const tasks = [
++      { ...card('a', null), creator: 'bb-dev' },
++      { ...card('b', null), creator: 'bb-device' },
++      { ...card('c', null, 'mini'), creator: 'bb-dev' }
++    ]
++
++    expect(groupBlockedTasks(tasks)).toHaveLength(3)
++    expect(render(tasks.slice(0, 1)).label).toBe('bb-dev')
++    expect(render([card('legacy', null)]).label).toBe('No managing session')
++  })
++
++  it.each(['failed labels request raw id', 'known id with null title'])(
++    '%s retains an Untitled session header that opens the session',
++    () => {
++      const header = render([card('a', mgr('s'))])
++      expect(header.label).toBe('Untitled session')
++      expect(header.icon).toBe('comment-discussion')
++      header.onSelect()
++      expect(view.openSession).toHaveBeenCalledWith('s', {})
++      expect(view.navigate).not.toHaveBeenCalled()
++    }
++  )
++})
++
+ describe('managingSessionRoute', () => {
+   const gateways = [
+     { id: 'local', kind: 'local', label: 'Mac' },
+diff --git a/apps/desktop/src/plugins/kanban/blocked-section.tsx b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+index 1c0b352ed7..810b379e11 100644
+--- a/apps/desktop/src/plugins/kanban/blocked-section.tsx
++++ b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+@@ -36,6 +36,7 @@ export interface BlockedGroup {
+   /** Managing chat's live stored id; null = no session owns these cards. */
+   sessionId: null | string
+   title: null | string
++  creator?: null | string
+   gateway?: string
+   /** Hermes profile the session lives in on its gateway. */
+   profile: null | string
+@@ -68,11 +69,16 @@ export function groupBlockedTasks(tasks: readonly BlockedTask[]): BlockedGroup[]
+ 
+   for (const task of tasks) {
+     const sessionId = task.manager?.id ?? null
+-    const key = sessionId ? `${task.gateway ?? ''}:${sessionId}` : `${task.gateway ?? ''}:`
++
++    const key = sessionId
++      ? `${task.gateway ?? ''}:${sessionId}`
++      : JSON.stringify([task.gateway ?? '', 'creator', task.creator ?? null])
++
+     let group = groups.get(key)
+ 
+     if (!group) {
+       group = {
++        creator: task.creator,
+         gateway: task.gateway,
+         key,
+         profile: task.manager?.profile ?? null,
+@@ -136,7 +142,12 @@ export function BlockedTasksSection() {
+ 
+         const shown = group.tasks.slice(0, budget)
+         budget -= shown.length
+-        const title = group.sessionId ? group.title || k.sidebar.untitledSession : k.sidebar.noSession
++
++        const creatorTitle = group.creator
++          ? [group.creator, group.gateway].filter(Boolean).join(' · ')
++          : k.sidebar.noSession
++
++        const title = group.sessionId ? group.title || k.sidebar.untitledSession : creatorTitle
+         const sessionId = group.sessionId
+ 
+         return (
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index a911aaea64..6a2f31e101 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -12,6 +12,8 @@ export interface KanbanTask {
+   priority?: number
+   tenant?: null | string
+   created_at?: number
++  /** Profile that created the card (not necessarily a user-visible chat). */
++  created_by?: null | string
+   latest_summary?: null | string
+   comment_count?: number
+   link_counts?: { parents: number; children: number }
+-- 
+2.43.0
+

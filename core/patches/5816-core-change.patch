@@ -1,0 +1,76 @@
+From beba674d9995e56dc9568dad22ecb8750f577dbe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:56:15 +0000
+Subject: [PATCH] [daveey] test: keep synthetic signal worker main thread
+ dispatching
+
+Occurrence50 originally failed its unchanged 2s SIGTERM bound (job134465440161), then passed retry. The original log has no thread-delivery trace; exact historical scheduling attribution remains unknown.
+
+Why: Python signal callbacks run only in the main thread. The fixture parked that thread in an unbounded lock wait. A signal delivered to a helper can remain pending forever without entering the handler, independently of the non-daemon shutdown defect being tested. Periodically re-enter the interpreter with a timed Event wait, keeping the deliberately stuck non-daemon thread.
+
+Proof: direct helper-thread delivery via pthread_kill reproduces the original assertion deterministically: old wait RED 2passed/1failed; periodic wait GREEN 3passed/0failed twice. Replacing fixture os._exit with KeyboardInterrupt fails both process and helper delivery cases (1passed/2failed). Restored fixture, final GREEN3/0, HERMES_TEST_FILE_RETRIES=0 throughout. Original elapsed<2 assertion, deadline, handler grace and production source unchanged. scripts/check --base origin/main passed. This fixes a reproduced failure class, not a proven historical signal routing.
+---
+ .../test_signal_handler_kanban_worker.py      | 34 ++++++++++++++++---
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/tests/hermes_cli/test_signal_handler_kanban_worker.py b/tests/hermes_cli/test_signal_handler_kanban_worker.py
+index f78aad7769..3e095f3378 100644
+--- a/tests/hermes_cli/test_signal_handler_kanban_worker.py
++++ b/tests/hermes_cli/test_signal_handler_kanban_worker.py
+@@ -88,9 +88,25 @@ def _synthetic_worker_script() -> str:
+             raise KeyboardInterrupt()
+ 
+         signal.signal(signal.SIGTERM, handler)
++
++        # Direct delivery to a helper makes the pending-main-thread boundary
++        # reproducible, without depending on the kernel's process-signal choice.
++        request = os.environ.get("HERMES_TEST_SIGNAL_REQUEST")
++        if request:
++            def deliver_from_helper():
++                while not os.path.exists(request):
++                    time.sleep(0.01)
++                signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
++            threading.Thread(target=deliver_from_helper, daemon=True).start()
++
+         print("READY", flush=True)
+         try:
+-            threading.Event().wait()
++            # Python handlers run only in the main thread, even when the OS
++            # delivers the signal to a helper. An unbounded lock wait need not
++            # be interrupted in that case; periodically re-enter the evaluator.
++            idle = threading.Event()
++            while not idle.wait(0.05):
++                pass
+         except KeyboardInterrupt:
+             sys.exit(0)
+         """
+@@ -179,13 +195,23 @@ def _cleanup(proc: subprocess.Popen) -> None:
+     sys.platform == "win32",
+     reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
+ )
+-def test_sigterm_with_kanban_task_env_terminates_quickly():
++@pytest.mark.parametrize("signal_route", ["process", "helper-thread"])
++def test_sigterm_with_kanban_task_env_terminates_quickly(tmp_path, signal_route):
+     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
+     even when a non-daemon thread is still alive."""
+-    proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
++    request = tmp_path / "signal-request"
++    env = {"HERMES_KANBAN_TASK": "t_test_28181"}
++    if signal_route == "helper-thread":
++        if not hasattr(signal, "pthread_kill"):
++            pytest.skip("thread-directed POSIX signals unavailable")
++        env["HERMES_TEST_SIGNAL_REQUEST"] = str(request)
++    proc = _spawn_synthetic(env)
+     try:
+         t0 = time.time()
+-        os.kill(proc.pid, signal.SIGTERM)
++        if signal_route == "helper-thread":
++            request.touch()
++        else:
++            os.kill(proc.pid, signal.SIGTERM)
+ 
+         # Should die in <2s. The handler sleeps ~50ms, then os._exit(0)
+         # is immediate. Give generous headroom for slow CI runners.
+-- 
+2.43.0
+

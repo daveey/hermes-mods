@@ -1,0 +1,256 @@
+From c00a0dce5dc666e32ce007bd33f443c49c4880b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:54:50 +0000
+Subject: [PATCH] fix(kanban): validate class policy during active quota
+ episodes [daveey]
+
+Root: an active quota episode bypassed structural registry admission even after live quota recovery released its hold; final apply silently kept historical selectors on unroutable policy. Remove the structural exemption and refuse late invalid policy instead of retaining profile or legacy pins. Preserve episode deadlines and all transient wall/probe gates.
+
+Proof: unchanged reviewer probe 2 passed / 1 failed; expanded episode/no-episode registry and capability controls plus retained quota files 85 passed. Stable 82-file consumer run 1579 passed / 4 failed; repaired fixtures retain lossless historical rows and correct eligible class construction. Final five whole files passed with retries disabled. Fresh exact-head CI and independent review remain mandatory; fleet remediation/deployment acceptance is not claimed.
+---
+ hermes_cli/kanban_class_walls.py              |  7 +-
+ hermes_cli/kanban_model_tier.py               | 12 +--
+ .../test_kanban_class_unroutable.py           | 10 ++-
+ .../test_kanban_model_neutral_review61.py     | 81 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_pin_provider.py  |  2 +
+ .../test_kanban_quota_episode_class_strong.py |  5 +-
+ .../test_kanban_quota_episode_walls.py        | 11 ++-
+ 7 files changed, 107 insertions(+), 21 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_model_neutral_review61.py
+
+diff --git a/hermes_cli/kanban_class_walls.py b/hermes_cli/kanban_class_walls.py
+index 472bd8294e..30668fa6fc 100644
+--- a/hermes_cli/kanban_class_walls.py
++++ b/hermes_cli/kanban_class_walls.py
+@@ -26,10 +26,11 @@ def _unroutable_class(conn, task_id, *, lane):
+     from hermes_cli.kanban_model_tier import class_unroutable_reason, resolve_model_tier
+ 
+     task = kb.get_task(conn, task_id)
+-    from hermes_cli.kanban_quota_episode import active
+     from hermes_cli.kanban_review_model import is_review_run
+-    if task is None or active(conn, task_id):
+-        return None  # the existing episode owns its typed hold and reset deadline
++    if task is None:
++        return None
++    # Episodes own transient walls/deadlines, not structural eligibility: live
++    # recovery can release their hold before the episode itself is retired.
+     config = _assignee_config(task.assignee)
+     if not isinstance(config, dict):
+         return 'config_unavailable'
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 6aeef82b69..0270c5e338 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -499,14 +499,10 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+             if is_review:
+                 from hermes_cli.kanban_review_model import ReviewModelUnavailable
+                 raise ReviewModelUnavailable(f"Review model {model} is unroutable: {why}")
+-            # A tier-chosen class this host cannot route would crash the worker at startup ("No eligible
+-            # standard routes under billing/capability policy", 2026-10-27: shared config switched
+-            # kanban.default_model to class:standard before the host's route registry landed). Keep the
+-            # profile's own model instead; the next run re-decides once routes exist.
+-            logger.warning("kanban model tier: %s is not routable on this host (%s); %s keeps its profile model",
+-                           model, why, getattr(task, "id", "?"))
+-            reason = f"{reason}+unroutable:{model}:{why}"
+-            model = provider = None
++            # Policy may change after the preclaim check. Refuse within spawn
++            # accounting rather than silently retaining a legacy row/profile pin.
++            from agent.model_routing import ModelRoutingError
++            raise ModelRoutingError(f"Kanban model {model} is unroutable: {why}")
+     # Persist the pace choice before the owner reloads its authoritative model_tier receipt. An offer that expired or
+     # no longer matches raises OfferLost: the launch is refused and requeued, never started on the held route.
+     from hermes_cli.kanban_pace_reroute import REASON as _PACED, take as _take_pace_move
+diff --git a/tests/hermes_cli/test_kanban_class_unroutable.py b/tests/hermes_cli/test_kanban_class_unroutable.py
+index 7e3ef6bd1d..99132fd08e 100644
+--- a/tests/hermes_cli/test_kanban_class_unroutable.py
++++ b/tests/hermes_cli/test_kanban_class_unroutable.py
+@@ -88,12 +88,14 @@ def test_review_with_only_eligible_standard_route_uses_tier_fallback(board):
+ 
+ 
+ def test_card_pinned_class_is_left_to_the_card(board):
+-    """A card's own class selector is the creator's choice (the only per-card route spec left): the tier fallback
+-    records it as unroutable here but never rewrites the card's class."""
++    """A card's class is preserved, but an unusable class refuses without a route receipt."""
+     _write(board, {"enabled": True})
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="x", assignee="default", model_override="class:deep",
+                                                 provider_override="auto"))
+-        reason = tier.apply_model_tier(conn, task, lane="ready")
+-    assert reason == "class+unroutable:class:deep:no_eligible_routes"
++        from agent.model_routing import ModelRoutingError
++        with pytest.raises(ModelRoutingError, match='class:deep.*no_eligible_routes'):
++            tier.apply_model_tier(conn, task, lane="ready")
++        assert not [e for e in kb.list_events(conn, task.id) if e.kind in ('model_tier', 'run_route')]
++        assert kb.get_task(conn, task.id).model_override == "class:deep"
+     assert task.model_override == "class:deep"
+diff --git a/tests/hermes_cli/test_kanban_model_neutral_review61.py b/tests/hermes_cli/test_kanban_model_neutral_review61.py
+new file mode 100644
+index 0000000000..86db95782a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_neutral_review61.py
+@@ -0,0 +1,81 @@
++"""Quota episodes never authorize structurally unusable class policy."""
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch, kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli.kanban_class_walls import pickup_refusal
++from hermes_cli.kanban_quota_episode import episode
++from tests.hermes_cli.test_kanban_quota_episode import board as board, routing, reap  # noqa: PLC0414
++from tests.hermes_cli.test_kanban_quota_episode_walls import _clock
++
++
++def disable(config, mode):
++    policy = config['model_routing']
++    routes = policy['routes']['standard']
++    actions = {
++        'disabled': lambda: policy.update(enabled=False),
++        'empty': lambda: policy['routes'].update(standard=[]),
++        'providers_off': lambda: config.update(providers={r['provider']: {'enabled': False} for r in routes}),
++        'capabilities': lambda: [r['capabilities'].update(tools=False) for r in routes],
++        'healthy': lambda: None,
++    }
++    actions[mode]()
++
++
++@pytest.mark.parametrize('active_episode', [True, False])
++@pytest.mark.parametrize('mode', ['disabled', 'empty', 'providers_off', 'capabilities', 'healthy'])
++def test_episode_live_recovery_preserves_structural_gate(board, monkeypatch, all_assignees_spawnable,
++                                                       active_episode, mode):
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='Normal work', assignee='a')
++        # Historical fixture only: live policy mutations must not create this row.
++        conn.execute("UPDATE tasks SET model_override='claude-opus-5-5',provider_override='anthropic',"
++                     "model_pin_mandatory=1 WHERE id=?", (tid,))
++        conn.commit()
++        if active_episode:
++            reap(conn, tid, text='usage limit resets in ~11h')
++        clock[0] += 1800
++        state = episode(conn, tid)
++        disable(config, mode)
++        monkeypatch.setattr(walls, 'live_quota_room', lambda *a: True)
++        monkeypatch.setattr(walls, 'active_walls', lambda **kw: {})
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda *a: None)
++        before = kb.get_task(conn, tid)
++        runs = conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
++        if mode != 'healthy':
++            assert pickup_refusal(conn, {'id': tid, 'status': 'ready'})[0] == 'model_unroutable'
++        launched = []
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: launched.append(
++            (task.model_override, task.provider_override)))
++        current = kb.get_task(conn, tid)
++        assert bool(launched) == (mode == 'healthy')
++        if mode == 'healthy':
++            assert launched == [('class:standard', 'auto')]
++        else:
++            assert current.status == 'ready'
++            assert current.claim_lock == before.claim_lock
++            assert current.current_run_id == before.current_run_id
++            assert current.consecutive_failures == before.consecutive_failures
++            assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == runs
++            assert any('model_unroutable' in why for _, why in result.skipped_ineligible)
++            assert episode(conn, tid) == state
++        assert (current.model_override, current.provider_override) == ('claude-opus-5-5', 'anthropic')
++
++
++@pytest.mark.parametrize('mode', ['disabled', 'empty', 'providers_off', 'capabilities'])
++def test_final_apply_refuses_policy_changed_after_preclaim(board, monkeypatch, mode):
++    config, cfg = routing(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='Normal work', assignee='a')
++        conn.execute("UPDATE tasks SET model_override='claude-opus-5-5',provider_override='anthropic' WHERE id=?", (tid,))
++        conn.commit()
++        task = kb.get_task(conn, tid)
++        disable(config, mode)
++        # No successful return/receipt can authorize a historical selector.
++        with pytest.raises(ModelRoutingError, match='unroutable'):
++            tier.apply_model_tier(conn, task, lane='ready', cfg=cfg)
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='run_route'", (tid,)).fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_kanban_pin_provider.py b/tests/hermes_cli/test_kanban_pin_provider.py
+index 1f21827e27..b0e9e32953 100644
+--- a/tests/hermes_cli/test_kanban_pin_provider.py
++++ b/tests/hermes_cli/test_kanban_pin_provider.py
+@@ -164,6 +164,8 @@ def test_class_selector_keeps_provider_auto(auto_home, monkeypatch, tmp_path):
+ # --- dispatcher: legacy rows ------------------------------------------------------------------------------
+ 
+ def test_dispatcher_binds_legacy_null_provider_row(auto_home, monkeypatch, tmp_path):
++    from tests.hermes_cli.test_kanban_quota_episode import routing
++    routing(monkeypatch)  # Real eligible class policy; legacy selector is ignored.
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="legacy", assignee="default")
+         conn.execute("UPDATE tasks SET model_override=?, provider_override=NULL WHERE id=?", (OPUS, tid))
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_class_strong.py b/tests/hermes_cli/test_kanban_quota_episode_class_strong.py
+index 572755476c..60d2eb063c 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_class_strong.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_class_strong.py
+@@ -91,10 +91,11 @@ def test_pattern_strong_class_card_takes_the_free_provider(board, monkeypatch):
+     _deep_routes(monkeypatch)
+     _serving(monkeypatch, {'anthropic'})
+     monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
+-    monkeypatch.setattr(tier, 'load_tier_config', lambda: {**CLASS_CFG, 'default_model_keep_patterns': ['security']})
++    cfg = {**CLASS_CFG, 'default_model_keep_patterns': ['security']}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='security work', assignee='a')
+-        reap(conn, tid, admit=CLASS_CFG, **_codex_wall(clock[0] + 55 * 3600))
++        reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + 55 * 3600))
+         clock[0] += 301
+         assert decision(conn, kb.get_task(conn, tid), lane='ready') == (None, ('claude-opus-5-5', 'anthropic'))
+ 
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+index bfe2eaa112..2e93685930 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_walls.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -56,9 +56,7 @@ def test_episode_default_card_without_class_alternate_falls_back_to_strong_tier(
+     nothing can move it: it holds for the reset instead of spawning into the wall."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    if why == 'routing_disabled':
+-        config['model_routing']['enabled'] = False
+-    else:  # the only standard route is the walled codex one; the strong class has room
++    if why != 'routing_disabled':  # the only standard route is walled; the strong class has room
+         _class_routes(config, standard=[('openai-codex', 'gpt-6-astra')], deep=[('anthropic', 'claude-opus-5-5')])
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+@@ -66,6 +64,8 @@ def test_episode_default_card_without_class_alternate_falls_back_to_strong_tier(
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='episode default card', assignee='a')
+         reap(conn, tid, admit=HUB_CFG, **_codex_wall(reset))
++        if why == 'routing_disabled':
++            config['model_routing']['enabled'] = False
+         # Only the episode knows the wall: no provider file, no live pool evidence.
+         monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
+         clock[0] += 301
+@@ -87,7 +87,6 @@ def test_episode_fallback_never_rewrites_a_legacy_pin_row(board, monkeypatch, al
+     off the card holds for the reset and the author row is retained."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    config['model_routing']['enabled'] = False
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     with kbc.connect() as conn:
+@@ -95,6 +94,7 @@ def test_episode_fallback_never_rewrites_a_legacy_pin_row(board, monkeypatch, al
+         conn.execute("UPDATE tasks SET model_override='gpt-6-astra', provider_override='openai-codex' WHERE id=?", (tid,))
+         conn.commit()
+         reap(conn, tid, admit=HUB_CFG, **_codex_wall(clock[0] + 55 * 3600))
++        config['model_routing']['enabled'] = False
+         clock[0] += 301
+         assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+         persisted = kb.get_task(conn, tid)
+@@ -186,6 +186,9 @@ def test_stuck_warning_names_the_episode_deadline_end_to_end(board, monkeypatch,
+     """(c) Through a real tick: the held episode card's warning suffix is the episode deadline."""
+     from hermes_cli.kanban_db_dispatch_clock import _iso
+     clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    _class_routes(config, standard=[('anthropic', 'claude-sonnet-5-5')],
++                  deep=[('anthropic', 'claude-opus-5-5')])
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='backoff warning', assignee='a')
+         for _ in range(3):
+-- 
+2.43.0
+

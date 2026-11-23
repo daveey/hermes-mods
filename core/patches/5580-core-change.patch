@@ -1,0 +1,97 @@
+From e63800ed5a500a29039e818852c134cb9ab91345 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:43:36 +0000
+Subject: [PATCH] fix(kanban): refuse unavailable profile config before claim
+ without aborting tick [daveey]
+
+Import failure in assignee config escaped new class preflight and aborted dispatch. Catch only ImportError and report typed config_unavailable; do not admit unknown routes or swallow arbitrary resolver faults. Test actual preclaim zero runs, dry-run unchanged row/history and same-card recovery after imports restore using real eligible registry. RED18/2; focused GREEN3files28/0, retries disabled.
+---
+ hermes_cli/kanban_class_walls.py              |  5 ++-
+ .../test_kanban_dispatch_claim_allowlist.py   | 39 ++++++++++++++++---
+ 2 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_class_walls.py b/hermes_cli/kanban_class_walls.py
+index aff3759059..b428bb7f38 100644
+--- a/hermes_cli/kanban_class_walls.py
++++ b/hermes_cli/kanban_class_walls.py
+@@ -24,7 +24,10 @@ def unroutable_class(conn, task_id, *, lane):
+     model, _, _ = resolve_model_tier(conn, routing_view(task), lane=lane)
+     if not is_class_selector(model):
+         return None
+-    config = _assignee_config(task.assignee)
++    try:
++        config = _assignee_config(task.assignee)
++    except ImportError:
++        return 'config_unavailable'  # missing profile machinery is unknown eligibility, not a tick-wide fault
+     if config is None:
+         return 'config_unavailable'
+     return class_unroutable_reason(model, config)
+diff --git a/tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py b/tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py
+index 37bba0f17c..339336065c 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py
++++ b/tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py
+@@ -9,6 +9,7 @@ gateway wake-up loop hot.
+ """
+ from __future__ import annotations
+ 
++import json
+ import sys
+ from pathlib import Path
+ 
+@@ -24,6 +25,11 @@ def kanban_home(tmp_path, monkeypatch):
+     """Isolated HERMES_HOME with an empty kanban DB."""
+     home = tmp_path / ".hermes"
+     home.mkdir()
++    route = {"model": "claude-opus-5-5", "provider": "anthropic", "weight": 1,
++             "billing": "subscription", "eligible": True, "funding_verified": True,
++             "capabilities": {"tools": True, "streaming": True}}
++    (home / "config.yaml").write_text(json.dumps({"model_routing": {
++        "enabled": True, "routes": {level: [route] for level in ("fast", "standard", "deep")}}}))
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     kb.init_db()
+@@ -97,14 +103,35 @@ def test_profiles_import_failure_with_allowlist_claims_nothing(kanban_home, monk
+ 
+ 
+ def test_profiles_import_failure_without_allowlist_keeps_gate_disabled(kanban_home, monkeypatch):
+-    """No allowlist configured = gate disabled even when the profiles module
+-    cannot be imported (upstream behaviour unchanged)."""
++    """No allowlist leaves the gate disabled; unavailable route config still fails closed.
++
++    Refusal is preclaim/read-only in dry-run; restored imports permit the same
++    neutral card on the next real tick, without a policy or budget change.
++    """
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="local card", assignee="default")
+-        monkeypatch.setitem(sys.modules, "hermes_cli.profiles", None)
+-        res = kbd.dispatch_once(conn, dry_run=True)
+-    assert [t for t, _a, _w in res.spawned] == [tid]
+-    assert res.skipped_nonspawnable == []
++        before = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++        events = [tuple(row) for row in conn.execute("SELECT * FROM task_events WHERE task_id=?", (tid,))]
++        with monkeypatch.context() as broken:
++            broken.setitem(sys.modules, "hermes_cli.profiles", None)
++            assert kbd.dispatch_profile_allowlist_summary() == "any"
++            res = kbd.dispatch_once(conn, dry_run=True)
++        assert res.spawned == []
++        assert res.skipped_nonspawnable == []
++        assert res.skipped_ineligible == [(tid, "model_unroutable:config_unavailable")], repr(res)
++        assert tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++        assert [tuple(row) for row in conn.execute("SELECT * FROM task_events WHERE task_id=?", (tid,))] == events
++        assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++        seen = []
++        with monkeypatch.context() as broken:
++            broken.setitem(sys.modules, "hermes_cli.profiles", None)
++            refused = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: seen.append(task.id))
++        assert seen == [] and refused.skipped_ineligible == [(tid, "model_unroutable:config_unavailable")]
++        assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++        recovered = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: seen.append(task.id))
++        assert seen == [tid], repr(recovered)
++        stored = kb.get_task(conn, tid)
++        assert stored is not None and stored.model_override is None and stored.provider_override is None
+ 
+ 
+ def test_profiles_import_failure_without_allowlist_diagnostics_matches_dispatch(kanban_home, monkeypatch):
+-- 
+2.43.0
+

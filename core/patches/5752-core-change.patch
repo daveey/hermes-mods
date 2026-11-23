@@ -1,0 +1,189 @@
+From f6427737c9dc4a8e9b35ca1a3a98892f0fb9199f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:59:12 +0000
+Subject: [PATCH] [daveey] Keep annotation invalidation pending when a coverage
+ install fails
+
+A failed inotify install (EMFILE/ENOSPC/EACCES) while answering a source
+event left every scope certified; the loop's retry arrives as a timeout and
+returned without reading, so the commit was not projected until an unrelated
+event. A failed install now clears the certification and forces the next
+refresh to read whatever woke it.
+---
+ hermes_cli/kanban_annotation_host.py          |  15 ++-
+ .../test_annotation_native_holder.py          | 106 ++++++++++++++++++
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 2cc8419c10..28d7676737 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -580,6 +580,7 @@ _event_ready: set[tuple[str, ...]] = set()
+ SETTLE_S = (0.25, HOLDER_INTERVAL_S)
+ _unsettled: set[tuple[str, ...]] = set()
+ _settle_deadlines: dict[tuple[str, ...], tuple[float, ...]] = {}
++_coverage_stale: set[bool] = set()  # non-empty: the last coverage install failed
+ 
+ 
+ def note_deadline(due: float | None) -> None:
+@@ -647,7 +648,7 @@ def _event_refresh(events) -> float | None:
+         # its demand metadata each control event so first demand still activates it.
+         settled |= {scope for scope, ctx in list(_known.items())
+                     if scope not in settled and not ctx.run(_scope_interested, scope)}
+-        if set(_known) <= settled and (due is None or due > time.time()):
++        if not _coverage_stale and set(_known) <= settled and (due is None or due > time.time()):
+             return due
+     else:
+         _unsettled.update(_known)  # source/overflow/ownership/explicit wake
+@@ -673,7 +674,16 @@ def _event_refresh(events) -> float | None:
+         directories.update(scoped_dirs)
+         controls.update(scoped_controls)
+         scopes.append((scope, ctx))
+-    events.replace(files, directories=directories, controls=controls)
++    try:
++        events.replace(files, directories=directories, controls=controls)
++    except BaseException:
++        # The event that asked for this refresh is already drained and the
++        # loop's retry arrives as a plain timeout: nothing stays certified, and
++        # the next call reads whatever woke it.
++        _event_ready.clear()
++        _coverage_stale.add(True)
++        raise
++    _coverage_stale.clear()
+     _event_ready.clear()
+     for scope, ctx in scopes:
+         def refresh_scope():
+@@ -905,6 +915,7 @@ def start_holder(role: str) -> threading.Thread | None:
+ 
+ def reset() -> None:
+     _event_ready.clear()
++    _coverage_stale.clear()
+     _unsettled.clear()
+     _settle_deadlines.clear()
+     _clock_deadlines.clear()
+diff --git a/tests/hermes_cli/test_annotation_native_holder.py b/tests/hermes_cli/test_annotation_native_holder.py
+index 7ae9bdad9a..817a0c8e77 100644
+--- a/tests/hermes_cli/test_annotation_native_holder.py
++++ b/tests/hermes_cli/test_annotation_native_holder.py
+@@ -1,5 +1,7 @@
+ """Exercise native scheduling through the actual annotation projection path."""
+ import contextvars
++import errno
++import os
+ import resource
+ import sqlite3
+ 
+@@ -57,6 +59,110 @@ def test_source_invalidation_gets_bounded_coalesced_confirmations(monkeypatch, t
+     assert len(calls) == 4, 'settled source was read again while idle'
+ 
+ 
++def test_failed_coverage_install_keeps_source_invalidation_pending(monkeypatch, tmp_path):
++    scope = ('install-test',)
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    monkeypatch.setattr(host, '_clock_deadlines', {})
++    monkeypatch.setattr(host, '_event_ready', set())
++    monkeypatch.setattr(host, '_coverage_stale', set(), raising=False)
++    _no_confirmations(monkeypatch)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    # A far provider clock: the retry must not wait for it either.
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), 160.0))
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / 'copy')
++    monkeypatch.setattr(disk, 'demand_age', lambda scope: 0)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(host.time, 'time', lambda: 100.0)
++    calls = []
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', calls.append)
++    broken = [False]
++
++    def replace(*args, **kwargs):
++        if broken[0]:
++            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
++    events = SimpleNamespace(replace=replace, control_only=False)
++    assert host._event_refresh(events) == 160.0
++    assert calls == [scope]
++    broken[0] = True  # a source event arrives while inotify instances are exhausted
++    with pytest.raises(OSError):
++        host._event_refresh(events)
++    assert calls == [scope], 'read without installed coverage'
++    events.control_only = True  # the loop's retry is a wait timeout; the event is already drained
++    broken[0] = False
++    assert host._event_refresh(events) == 160.0
++    assert calls == [scope, scope], 'failed install dropped the source invalidation'
++    assert host._event_refresh(events) == 160.0
++    assert calls == [scope, scope], 'recovered coverage was read again while idle'
++
++
++@pytest.mark.parametrize('wal', [False, True])
++def test_real_projection_survives_failed_coverage_install(tmp_path, monkeypatch, wal):
++    """Real loop, FileEvents and projection; only replace() fails for one second."""
++    scope = ('install-loop', 'default')
++    path = tmp_path / 'kanban.db'
++    conn = helpers._board(path, [('t1', 'running', 's1')])
++    if wal:
++        assert conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
++        conn.execute('SELECT * FROM tasks').fetchall()
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path])
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(ksa, '_replica_paths', list)
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(ksa, '_done_checks', {})
++    monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(path)], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    disk.touch_demand(scope)
++    ready, stop, done = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    refresh = ksa._refresh_annotation_locked
++
++    def record(scope):
++        result = refresh(scope)
++        calls.append(dict(result[0]))
++        ready.set()
++        if not result[0]:
++            done.set()
++        return result
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
++    with FileEvents() as events:
++        original = events.replace
++        armed, failed = [], []
++
++        def replace(*args, **kwargs):
++            if armed and (not failed or time.monotonic() < failed[0] + 1.0):
++                failed.append(time.monotonic())
++                raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
++            return original(*args, **kwargs)
++        monkeypatch.setattr(events, 'replace', replace)
++        thread = threading.Thread(target=run, args=(
++            events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
++            lambda: host._event_refresh(events)))
++        thread.start()
++        try:
++            assert ready.wait(5)
++            stop.wait(max(host.SETTLE_S) + .5)  # ownership confirmations spent
++            armed.append(True)
++            disk.touch_demand(scope)
++            conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++            delivered = done.wait(8)
++            assert failed, 'the install failure was never injected'
++            assert delivered, f'replace failed {len(failed)}x; commit not projected; reads={calls}'
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(5)
++            conn.close()
++            ksa._reset_cache_for_tests()
++
++
+ def test_failed_scope_does_not_starve_other_scopes(monkeypatch, tmp_path):
+     current = contextvars.ContextVar('annotation-test-scope')
+     scopes = [('failed',), ('healthy',)]
+-- 
+2.43.0
+

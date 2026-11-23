@@ -1,0 +1,76 @@
+From 4aa9d2a8876cb4b0125b20582683d2d958e06bb2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:40:34 +0000
+Subject: [PATCH] [daveey] Pin nested finalizer close scope restoration
+
+A nested finalizer must restore the active outer scope instead of forcing explicit blocking close semantics. Exercise a real RLock held on another thread, require nonblocking acquisition and deferred close, then verify drain closes and untracks the connection.
+
+Proof: active=previous to active=False mutant fails the new test at blocking acquisition (initial and retry). Restored production code passes 29 tests across five finalizer, registry and original CI reproducer files via scripts/run_tests.sh.
+---
+ .../test_finalizer_live_lock_guards.py        | 50 +++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/tests/hermes_state/test_finalizer_live_lock_guards.py b/tests/hermes_state/test_finalizer_live_lock_guards.py
+index 30c9ac2563..36b196ef69 100644
+--- a/tests/hermes_state/test_finalizer_live_lock_guards.py
++++ b/tests/hermes_state/test_finalizer_live_lock_guards.py
+@@ -53,6 +53,56 @@ def test_explicit_close_waits_outside_its_own_finalizer_scope(tmp_path, monkeypa
+     assert not safe.has_live_connection(tmp_path / "scope.db")
+ 
+ 
++def test_nested_finalizer_scope_preserves_nonblocking_outer_close(tmp_path, monkeypatch):
++    path = tmp_path / "nested.db"
++    conn = safe.connect_tracked(path, check_same_thread=False)
++    real_lock = safe._live_lock
++    attempted, finished = threading.Event(), threading.Event()
++    modes, errors = [], []
++
++    class ObservedLock:
++        def acquire(self, blocking=True):
++            modes.append(blocking)
++            attempted.set()
++            return real_lock.acquire(blocking=blocking)
++
++        def release(self):
++            real_lock.release()
++
++    def close():
++        try:
++            with safe.finalizer_close():
++                with safe.finalizer_close():
++                    pass
++                conn.close()
++        except Exception as exc:
++            errors.append(exc)
++        finally:
++            finished.set()
++
++    runner = threading.Thread(target=close, daemon=True)
++    try:
++        with monkeypatch.context() as patch:
++            patch.setattr(safe, "_live_lock", ObservedLock())
++            try:
++                with real_lock:
++                    runner.start()
++                    assert attempted.wait(10)
++                    assert modes == [False], "nested scope cleared the outer finalizer flag"
++                    assert finished.wait(10), "outer finalizer waited on the held lock"
++                    assert conn.execute("SELECT 1").fetchone() == (1,)
++            finally:
++                # Release the real lock before joining even when the mutant blocks.
++                runner.join(10)
++        assert not runner.is_alive()
++        assert errors == []
++        assert not safe.has_live_connection(path), "deferred close was not drained"
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute("SELECT 1")
++    finally:
++        conn.close()
++
++
+ def test_cross_thread_deferred_close_failure_keeps_path_live(tmp_path):
+     path = tmp_path / "thread-affine.db"
+     conn = safe.connect_tracked(path)  # SQLite's real check_same_thread=True default.
+-- 
+2.43.0
+

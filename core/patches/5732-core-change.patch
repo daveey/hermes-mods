@@ -1,0 +1,433 @@
+From 569a8d55de8a2522e1023e68f7dadf5036cfbf26 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:52:38 +0000
+Subject: [PATCH] [daveey] Persist frozen diagnostic actionability transport
+ custody
+
+M1 administrative diagnostics only; no producer activation, admission, status, lease, budget or release authority. Preserve exact outbox bytes and canonical root/deadline/notice evidence through ACK loss and local cache loss.
+---
+ hermes_cli/kanban_actionability_transport.py  | 222 ++++++++++++++++++
+ hermes_cli/kanban_decision_ask.py             |   4 +
+ hermes_cli/kanban_sync_client.py              |   6 +-
+ hermes_cli/kanban_sync_hub_routes.py          |   5 +
+ hermes_cli/kanban_sync_wire.py                |   3 +
+ .../test_kanban_actionability_transport.py    | 102 ++++++++
+ 6 files changed, 339 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_actionability_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_actionability_transport.py
+
+diff --git a/hermes_cli/kanban_actionability_transport.py b/hermes_cli/kanban_actionability_transport.py
+new file mode 100644
+index 0000000000..f4d5376b60
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_transport.py
+@@ -0,0 +1,222 @@
++"""Frozen administrative actionability commands; never execution or hold authority. [daveey]
++
++Custody outlives transport ACK and disposable scheduling indexes. Unknown replies
++retain exact bytes indefinitely. Production producers opt in only after deployment.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_retain_transport as retain
++
++KIND = 'actionability_record'
++
++
++def canonical(value) -> str:
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
++
++
++def digest(value: str) -> str:
++    return hashlib.sha256(value.encode('utf-8')).hexdigest()
++
++
++def ensure_schema(conn) -> None:
++    """Local custody, deliberately absent from sync/capture table inventories."""
++    conn.execute('CREATE TABLE IF NOT EXISTS kanban_actionability_commands ('
++                 'op_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, contract_key TEXT NOT NULL, phase TEXT NOT NULL, '
++                 'request_json TEXT NOT NULL, request_sha256 TEXT NOT NULL, delivery_state TEXT NOT NULL, '
++                 'canonical_receipt_json TEXT, UNIQUE(task_id,contract_key,phase))')
++
++
++def envelope(task_id: str, payload: dict, phase: str = 'contract') -> dict:
++    if phase not in ('contract', 'escalation'):
++        raise ValueError('unsupported actionability phase')
++    payload = json.loads(canonical(payload))
++    key = digest(canonical({'task': task_id, 'facts': payload['facts'], 'owner': payload['owner'],
++                            'prerequisite': payload['blocker']['prerequisite'],
++                            'trigger': payload['blocker']['trigger'], 'action': payload['action']}))
++    if payload.get('contract_key', key) != key:
++        raise ValueError('actionability semantic key changed')
++    payload['contract_key'] = key
++    identity = digest(task_id + ':' + key)
++    return {'client_op_id': f'ar-{identity}-{phase}', 'op': KIND, 'task': task_id, 'phase': phase,
++            'contract_uid': f'ac-{identity}', 'receipt_uid': f'ae-{identity}', 'notice_uid': f'an-{identity}',
++            'payload': payload}
++
++
++def command(conn, op_id: str) -> dict | None:
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_actionability_commands'").fetchone():
++        return None
++    row = conn.execute('SELECT * FROM kanban_actionability_commands WHERE op_id=?', (op_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def reserve(conn, task_id: str, payload: dict, *, phase: str = 'contract') -> dict:
++    """Freeze inside the home producer transaction; never make network calls here."""
++    if not conn.in_transaction or sync.board_mode(conn) != 'primary':
++        raise ValueError('actionability reservation requires primary write transaction')
++    state = sync.sync_state(conn) or {}
++    task = conn.execute('SELECT created_on FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is None or not task[0] or task[0] != state.get('gateway_id'):
++        raise ValueError('actionability requires exact home gateway')
++    wire = envelope(task_id, payload, phase)
++    ensure_schema(conn)
++    old = command(conn, wire['client_op_id'])
++    frozen = canonical(wire)
++    if old:
++        if old['request_json'] != frozen:
++            raise ValueError('actionability request changed after first committed bytes')
++        return old
++    conn.execute('INSERT INTO kanban_actionability_commands '
++                 '(op_id,task_id,contract_key,phase,request_json,request_sha256,delivery_state) '
++                 "VALUES (?,?,?,?,?,?,'pending')", (wire['client_op_id'], task_id, wire['payload']['contract_key'],
++                                                     phase, frozen, digest(frozen)))
++    conn.execute('INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) '
++                 f"VALUES (?,'tasks',?,?,?,'',{sync._NOW_MS_SQL})", (wire['client_op_id'], task_id, KIND, frozen))
++    return command(conn, wire['client_op_id'])
++
++
++def frozen_wire(row: dict) -> dict:
++    value = row['fields'] if isinstance(row['fields'], dict) else json.loads(row['fields'])
++    if (not isinstance(value, dict) or value.get('op') != KIND or value.get('client_op_id') != row['op_id']
++            or value.get('task') != row['row_uid']):
++        raise ValueError('actionability outbox identity differs from frozen request')
++    return value
++
++
++def outbound(conn, row: dict) -> dict:
++    if row['op'] == 'retain':
++        return retain.outbound(conn, row)
++    wire = frozen_wire(row)
++    owned = command(conn, row['op_id'])
++    if (not owned or owned['delivery_state'] == 'rejected' or owned['request_json'] != canonical(wire)
++            or owned['request_sha256'] != digest(owned['request_json'])
++            or owned['task_id'] != wire['task'] or envelope(wire['task'], wire['payload'], wire['phase']) != wire):
++        raise ValueError('actionability outbox lost immutable custody')
++    return wire
++
++
++def capability(hub, board: str) -> dict:
++    value = hub.actionability_capability(board)
++    if (not isinstance(value, dict) or type(value.get('actionability_record')) is not int
++            or value['actionability_record'] != 1 or type(value.get('frozen_replay')) is not int
++            or value['frozen_replay'] != 1 or value.get('diagnostic_only') is not True
++            or not isinstance(value.get('hlc'), str)
++            or not re.fullmatch(r'[0-9]{13}-[0-9]{4}-server', value['hlc'])):
++        raise ValueError('actionability unsupported; canonical diagnostic deployment prerequisite')
++    return value
++
++
++def own_batch(rows: list[dict]) -> list[dict]:
++    for i, row in enumerate(rows):
++        if row['op'] in ('retain', KIND):
++            return rows[:i] if i else rows[:1]
++    return rows
++
++
++def before_send(conn, rows, hub, board) -> None:
++    retain.before_send(conn, rows, hub, board)
++    if any(row['op'] == KIND for row in rows):
++        capability(hub, board)
++        for row in rows:
++            if row['op'] == KIND:
++                outbound(conn, row)
++
++
++def record_result(conn, row: dict, result: dict) -> str:
++    if row.get('op') != KIND:
++        return retain.record_result(conn, row, result)
++    old = command(conn, row['op_id'])
++    if old is None:
++        raise ValueError('actionability custody missing')
++    if old['delivery_state'] in ('confirmed', 'acknowledged', 'rejected'):
++        return 'deferred'
++    from hermes_cli.kanban_sync_compat import transient_rejection
++    if result.get('status') == 'applied':
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (row['op_id'],))
++        state, count = 'acknowledged', 'applied'
++    elif result.get('status') == 'rejected' and not transient_rejection(result):
++        conn.execute("UPDATE kanban_sync_outbox SET state='rejected',last_error=? WHERE op_id=?",
++                     (str(result.get('reason'))[:500], row['op_id']))
++        state, count = 'rejected', 'rejected'
++    else:
++        conn.execute('UPDATE kanban_sync_outbox SET attempts=attempts+1,last_error=? WHERE op_id=?',
++                     ('diagnostic delivery unknown; replay exact frozen identity after canonical recovery', row['op_id']))
++        state, count = 'unknown', 'deferred'
++    conn.execute('UPDATE kanban_actionability_commands SET delivery_state=? WHERE op_id=?', (state, row['op_id']))
++    return count
++
++
++def _evidence(hub, board, uid, task_id, kind, gateway):
++    proof = hub.row_evidence(board, 'task_events', uid)
++    row = proof.get('row') if isinstance(proof, dict) else None
++    if (not isinstance(row, dict) or proof.get('board') != board or proof.get('table') != 'task_events'
++            or proof.get('uid') != uid or proof.get('state') != 'live' or row.get('uid') != uid
++            or row.get('task_id') != task_id or row.get('kind') != kind or row.get('version') != 1
++            or row.get('deleted_at') is not None or row.get('origin_gateway') != gateway):
++        raise ValueError('actionability canonical evidence unavailable or changed identity')
++    payload = json.loads(row.get('payload') or '{}')
++    if not isinstance(payload, dict):
++        raise ValueError('actionability canonical evidence malformed')
++    return row, payload
++
++
++def confirm(conn, hub, board: str, op_id: str) -> dict:
++    """Bounded exact replay, independent evidence and local projection, outside writer txn."""
++    if conn.in_transaction:
++        raise ValueError('actionability network confirmation cannot run under a writer transaction')
++    old = command(conn, op_id)
++    if not old or old['delivery_state'] == 'rejected':
++        raise ValueError('actionability frozen custody unavailable or rejected')
++    wire = outbound(conn, {'op': KIND, 'op_id': op_id, 'row_uid': old['task_id'], 'fields': old['request_json']})
++    capability(hub, board)
++    reply = hub.ops(board, [wire])
++    results = reply.get('results', []) if isinstance(reply, dict) else []
++    if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
++            or results[0].get('client_op_id') != op_id or results[0].get('status') != 'applied'):
++        raise ValueError('actionability delivery unknown; preserve exact request')
++    gateway = hub.ident.gateway
++    root, root_p = _evidence(hub, board, wire['contract_uid'], wire['task'], 'actionability_contract', gateway)
++    expected_root = envelope(wire['task'], wire['payload'], 'contract')
++    if (root_p.get('contract') != wire['payload'] or root_p.get('home_gateway') != gateway
++            or root_p.get('request_uid') != expected_root['client_op_id']
++            or root_p.get('request_sha256') != digest(canonical(expected_root))):
++        raise ValueError('actionability root does not attest frozen contract')
++    rows, receipt = [root], root_p
++    if wire['phase'] == 'escalation':
++        event, receipt = _evidence(hub, board, wire['receipt_uid'], wire['task'], 'actionability_escalation_recorded', gateway)
++        if (receipt.get('request_sha256') != old['request_sha256'] or receipt.get('request_uid') != op_id
++                or receipt.get('contract') != wire['payload'] or receipt.get('contract_event_uid') != wire['contract_uid']
++                or receipt.get('notice_event_uid') != wire['notice_uid'] or receipt.get('home_gateway') != gateway
++                or receipt.get('outcome') not in ('recorded', 'route_unavailable')):
++            raise ValueError('actionability escalation does not attest frozen request')
++        dest = receipt.get('destination')
++        if not isinstance(dest, dict) or dest.get('kind') not in ('task', 'chat', 'unavailable'):
++            raise ValueError('actionability destination unconfirmed')
++        notice, notice_p = _evidence(hub, board, wire['notice_uid'], dest.get('task_id'), 'decision_requested', gateway)
++        expected = {'root_task': wire['task'], 'root_episode': wire['payload']['facts']['root_episode'],
++                    'contract_key': wire['payload']['contract_key'], 'contract_event_uid': wire['contract_uid'],
++                    'notice_event_uid': wire['notice_uid'], 'deadline_at': wire['payload']['deadline_at'], 'kind': 'administrative_only'}
++        if receipt.get('envelope') != expected or notice_p.get('actionability') != expected:
++            raise ValueError('actionability notice linkage unconfirmed')
++        rows.extend([event, notice])
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_db_connect import write_txn
++    # Actual authenticated remote-apply path. Do not advance the normal feed cursor.
++    changes = [client._row_change('task_events', row) for row in rows]
++    sync.apply_remote_changes(conn, changes, new_cursor=sync.sync_state(conn)['cursor'], board=board)
++    with write_txn(conn):
++        changed = conn.execute("UPDATE kanban_actionability_commands SET canonical_receipt_json=?,delivery_state='confirmed' "
++                               "WHERE op_id=? AND request_sha256=? AND delivery_state!='rejected'",
++                               (canonical(receipt), op_id, old['request_sha256'])).rowcount
++        if not changed:
++            raise ValueError('actionability custody changed during confirmation')
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (op_id,))
++    return {'ok': True, 'task_id': wire['task'], 'contract_key': wire['payload']['contract_key'],
++            'phase': wire['phase'], 'receipt_uid': wire['contract_uid'] if wire['phase'] == 'contract' else wire['receipt_uid'],
++            'delivery_state': 'confirmed', 'outcome': receipt.get('outcome', 'contract_recorded'),
++            'received_by_chat': False, 'terminal_for_run': False, 'execution_authority': False}
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index 7c3d8058de..d9b4b7fffd 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -35,6 +35,10 @@ def notice_text(payload: dict) -> str:
+     ask = str(payload.get("why") or payload.get("reason") or "")
+     if len(ask) > 6000:
+         ask = ask[:4500] + "\n[... full text in the card comments ...]\n" + ask[-1500:]
++    if isinstance(payload.get("actionability"), dict) and payload["actionability"].get("kind") == "administrative_only":
++        return ("Administrative reconsideration for the accountable owner (not a request for the user):\n" + ask
++                + "\nComments record a decision only; they never release or rerun the root scope. "
++                "Use the existing supported authority and admission gates; a notice grants neither.")
+     return ("Decision for the creator agent (not a request for the user). This card is parked until you decide:\n" + ask
+             + "\nAnswer with a comment on the card (kanban_comment); the comment wakes it. "
+             "Retain agent recovery on quota/offline failures. Escalate to the user only for a concrete human-only "
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6b95f2c35f..30f3fcd7ad 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -674,7 +674,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+     cache (one per round, shared by both sends)."""
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli import kanban_sync_live_claim as _live_claim
+-    from hermes_cli import kanban_retain_transport as retain_transport
++    from hermes_cli import kanban_actionability_transport as retain_transport
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+     out, seen = PushResult(), {} if seen is None else seen
+     for _ in range(max_batches):
+@@ -694,7 +694,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             from hermes_cli import kanban_sync_envelope as envelopes
+             envelopes.prune_parents(conn)
+             rows, _wire, parents = _within_batch(conn, rows, [{} for _r in rows], gateway)
+-            wire = [retain_transport.outbound(conn, r) if r["op"] == "retain" else envelopes.outbound(conn, r, lambda r=r: strip_stale_push(
++            wire = [retain_transport.outbound(conn, r) if r["op"] in ("retain", "actionability_record") else envelopes.outbound(conn, r, lambda r=r: strip_stale_push(
+                 conn, wire_ops.translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway))), supported=bool(origin_cap)) for r in rows]
+             parents = [(envelopes.parent(conn, tid, lambda op=op: op, supported=bool(origin_cap)), tid) for op, tid in parents]
+             wire = [op for op, _tid in parents] + wire
+@@ -716,7 +716,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     row = rejected_parent(conn, parents, res)
+                 if row is None:
+                     continue
+-                if row["op"] == "retain":
++                if row["op"] in ("retain", "actionability_record"):
+                     result = retain_transport.record_result(conn, row, res)
+                     setattr(out, result, getattr(out, result) + 1)
+                     continue  # No generic transient remap, mirror edits or acknowledgement authority.
+diff --git a/hermes_cli/kanban_sync_hub_routes.py b/hermes_cli/kanban_sync_hub_routes.py
+index ba9d03bc00..22629ed87e 100644
+--- a/hermes_cli/kanban_sync_hub_routes.py
++++ b/hermes_cli/kanban_sync_hub_routes.py
+@@ -17,6 +17,11 @@ class HubRoutesMixin:
+ 
+         return self._call("GET", f"/v2/boards/{quote(board, safe='')}/status-origin/capability")
+ 
++    def actionability_capability(self, board: str) -> dict:
++        from urllib.parse import quote
++
++        return self._call("GET", f"/v2/boards/{quote(board, safe='')}/actionability/capability")
++
+     def decision_retain_capability(self, board: str) -> dict:
+         from urllib.parse import quote
+ 
+diff --git a/hermes_cli/kanban_sync_wire.py b/hermes_cli/kanban_sync_wire.py
+index 2d5bf15e5f..f7f2ae8394 100644
+--- a/hermes_cli/kanban_sync_wire.py
++++ b/hermes_cli/kanban_sync_wire.py
+@@ -16,6 +16,9 @@ def translate(row: dict, hlc: str) -> dict:
+     if row["op"] == "retain":
+         from hermes_cli.kanban_retain_transport import frozen_wire
+         return frozen_wire(row)
++    if row["op"] == "actionability_record":
++        from hermes_cli.kanban_actionability_transport import frozen_wire
++        return frozen_wire(row)
+     op = {"client_op_id": row["op_id"], "table": row["table_name"], "uid": row["row_uid"], "hlc": hlc}
+     if row["op"] == "delete":
+         return {**op, "op": "delete"}
+diff --git a/tests/hermes_cli/test_kanban_actionability_transport.py b/tests/hermes_cli/test_kanban_actionability_transport.py
+new file mode 100644
+index 0000000000..4564f5c043
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_transport.py
+@@ -0,0 +1,102 @@
++"""Diagnostic commands use real SQLite lifecycle/outbox; ACK never means receipt."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_failure_transport as support
++
++live = support.live
++
++
++def contract(conn):
++    tid = kb.create_task(conn, title='diagnostic original scope', assignee='default')
++    with kbc.write_txn(conn):
++        # Canonical-home evidence normally arrives on the task's first Board ACK.
++        conn.execute("UPDATE tasks SET created_on='fixture',sync_version=1 WHERE id=?", (tid,))
++        conn.execute('DELETE FROM kanban_sync_outbox')
++    return tid, {'version': 1, 'facts': {'status': 'ready', 'assignee': 'default', 'current_run_uid': None,
++        'root_episode': None, 'source_uids': [], 'dependencies': []}, 'owner': {'kind': 'unavailable', 'refs': []},
++        'blocker': {'prerequisite': 'administrative owner', 'trigger': 'explicit owner decision', 'evidence': []},
++        'action': 'repair_lifecycle_contract', 'instruction': 'Repair diagnostic custody, not original scope',
++        'first_observed': 1, 'deadline_at': 2, 'legacy': False}
++
++
++def reserve(conn, tid, payload, phase='contract'):
++    from hermes_cli import kanban_actionability_transport as act
++    with kbc.write_txn(conn):
++        return act.reserve(conn, tid, payload, phase=phase)
++
++
++def test_wire_custody_and_outbox_atomic_rollback_and_no_original_effect(live):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    before = dict(live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    with pytest.raises(RuntimeError), kbc.write_txn(live):
++        act.reserve(live, tid, payload)
++        raise RuntimeError('rollback diagnostic command')
++    assert not sync.outbox(live)
++    owned = reserve(live, tid, payload)
++    assert owned['request_sha256'] == hashlib.sha256(owned['request_json'].encode()).hexdigest()
++    assert dict(live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == before
++    assert len(sync.outbox(live)) == 1
++    assert reserve(live, tid, payload) == owned
++    assert act.outbound(live, sync.outbox(live)[0]) == json.loads(owned['request_json'])
++    with pytest.raises(ValueError, match='changed'):
++        reserve(live, tid, {**payload, 'deadline_at': 3})
++
++
++@pytest.mark.parametrize('answer', ['lost', 'ack', 'storage_error', 'missing', 'malformed'])
++def test_real_push_retains_original_identity_after_unknown_or_ack(live, answer):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    owned = reserve(live, tid, payload)
++    wire = json.loads(owned['request_json'])
++    class Hub:
++        def actionability_capability(self, board):
++            return {'actionability_record': 1, 'frozen_replay': 1, 'diagnostic_only': True,
++                    'hlc': '0000000000001-0000-server'}
++        def ops(self, board, sent):
++            assert sent == [wire]
++            if answer == 'lost':
++                raise OSError('lost reply')
++            if answer == 'missing':
++                return {'results': []}
++            if answer == 'malformed':
++                return {'results': [{'client_op_id': owned['op_id'], 'status': 'merged'}]}
++            return {'results': [{'client_op_id': owned['op_id'], 'status': 'applied' if answer == 'ack' else 'rejected', 'reason': 'storage_error'}]}
++    if answer == 'lost':
++        with pytest.raises(OSError):
++            client.push(live, Hub(), 'default', 'fixture', primary=True, max_batches=1)
++    else:
++        client.push(live, Hub(), 'default', 'fixture', primary=True, max_batches=1)
++    current = act.command(live, owned['op_id'])
++    assert current['request_json'] == owned['request_json'] and current['canonical_receipt_json'] is None
++    if answer == 'ack':
++        assert current['delivery_state'] == 'acknowledged' and not sync.outbox(live)
++    else:
++        assert len(sync.outbox(live)) == 1 and sync.outbox(live)[0]['op_id'] == owned['op_id']
++    assert live.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'ready'
++
++
++def test_deleted_disposable_indexes_do_not_renew_contract_deadline(live):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    root = reserve(live, tid, payload)
++    # Transport custody is NOT a disposable scheduling index, even after its ACK.
++    with kbc.write_txn(live):
++        act.record_result(live, sync.outbox(live)[0], {'status': 'applied'})
++        live.execute('CREATE TABLE kanban_actionability(task_id TEXT)')
++        live.execute('DROP TABLE kanban_actionability')
++    assert reserve(live, tid, payload) == act.command(live, root['op_id'])
++    assert not sync.outbox(live)
++    with pytest.raises(ValueError, match='changed'):
++        reserve(live, tid, {**payload, 'first_observed': 10, 'deadline_at': 11})
++
++
++def test_administrative_notice_does_not_promise_comment_release():
++    from hermes_cli.kanban_decision_ask import notice_text
++    text = notice_text({'why': 'scope authority unavailable', 'actionability': {'kind': 'administrative_only'}})
++    assert 'never release or rerun' in text and 'the comment wakes it' not in text
+-- 
+2.43.0
+

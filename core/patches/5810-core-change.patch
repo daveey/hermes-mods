@@ -1,0 +1,125 @@
+From e4a57739473cb372de4a02476133f4b7ec5981ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:04:54 -0800
+Subject: [PATCH] [daveey] kanban: stranded-park: a finished goal recovery no
+ longer owns the park
+
+kanban_goal_recovery.current_park stays true after the goal recovery card
+completes, and that card's brief leaves the source parked, so treating it as an
+owner stranded the source for good. Only an open kernel recovery card
+(open_recovery_card, which covers goal_unachievable parks) owns the park now.
+
+awaiting_stale_sweep mirrors the stale-triage sweep's own skips (open recovery
+card, judged goal hold): the sweep never releases those cards, so they are not
+its to own either.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_stranded_park.py            | 14 ++++----
+ hermes_cli/kanban_triage_sweep.py             |  8 +++--
+ tests/hermes_cli/test_kanban_stranded_park.py | 35 ++++++++++++++++---
+ 3 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 6f32295f63..135ecb9f03 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -301,15 +301,17 @@ def _leased(row: dict, now: int) -> bool:
+ 
+ 
+ def _agent_owned(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """An agent route still owns the park: its open kernel recovery card (or a judged goal hold), an enforced lane
+-    gate, or the stale-triage sweep that will release it. Escalating these would turn agent work into a human ask
+-    (a recovery card's resume then refuses with human_gate, and the requester skips a card with a human_request)."""
+-    from hermes_cli.kanban_goal_recovery import current_park
++    """An agent route still owns the park: its open kernel recovery card (continuation_exhausted or
++    goal_unachievable), an enforced lane gate, or the stale-triage sweep that will release it. Escalating these
++    would turn agent work into a human ask (a recovery card's resume then refuses with human_gate, and the
++    requester skips a card with a human_request). A judged goal hold whose recovery card is done owns nothing:
++    ``kanban_goal_recovery.current_park`` stays true after recovery ends and that card's brief leaves the source
++    parked, so only this escalation surfaces it."""
+     from hermes_cli.kanban_lanes import gate_refusal
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+     from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep
+-    return bool(open_recovery_card(conn, task_id) or current_park(conn, task_id)
+-                or gate_refusal(conn, task_id) or awaiting_stale_sweep(conn, task_id))
++    return bool(open_recovery_card(conn, task_id) or gate_refusal(conn, task_id)
++                or awaiting_stale_sweep(conn, task_id))
+ 
+ 
+ def _excluded(conn: sqlite3.Connection, row: dict, now: int) -> bool:
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 14cfcf53d4..94f80d408f 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -251,13 +251,17 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+ def awaiting_stale_sweep(conn: sqlite3.Connection, task_id: str) -> bool:
+     """True when :func:`sweep_stale_triage` will still release this card on its own (once idle long enough): in
+     triage, not gate-held, re-entered since its last sweep and not capped, and not a hold the sweep skips (spend
+-    decision, containment). Such a card is agent-owned; it is not stranded."""
++    decision, containment, an open kernel recovery card, a judged goal hold). Such a card is agent-owned; it is not
++    stranded."""
+     if conn.execute("SELECT 1 FROM tasks t WHERE t.id = ? AND t.status = 'triage' " + _gate_exclusion()
+                     + "AND " + _PENDING, (task_id, *_PENDING_ARGS)).fetchone() is None:
+         return False
+     from hermes_cli.kanban_containment_connections import held as containment_held
++    from hermes_cli.kanban_goal_recovery import current_park
++    from hermes_cli.kanban_resume_requester import open_recovery_card
+     from hermes_cli.kanban_spend_decision import pending as spend_decision_pending
+-    return not (spend_decision_pending(conn, task_id) or containment_held(conn, task_id))
++    return not (spend_decision_pending(conn, task_id) or containment_held(conn, task_id)
++                or open_recovery_card(conn, task_id) or current_park(conn, task_id))
+ 
+ 
+ def sweep_stale_triage(
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index 8192e85fcf..39115b1802 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -407,12 +407,39 @@ def test_open_recovery_card_owns_the_park(kanban_home, own_gateway, monkeypatch)
+         assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+ 
+ 
+-def test_goal_hold_owns_the_park(kanban_home, own_gateway, monkeypatch):
+-    from hermes_cli import kanban_goal_recovery as goal
++def _goal_parked(conn):
++    """A real judged goal park (goal_unachievable, re-kinded blocked event) and its kernel recovery card."""
++    from hermes_cli.kanban_goal_recovery import current_park, park
++    from hermes_cli.kanban_resume_requester import ensure_recovery_cards
++    tid = kb.create_task(conn, title="Deliver exact goal", assignee="default", goal_mode=True)
++    assert kb.claim_task(conn, tid)
++    task = kb.get_task(conn, tid)
++    assert park(conn, task, "Prerequisite unavailable", expected_run_id=task.current_run_id)
++    assert kb.get_task(conn, tid).status == "triage" and current_park(conn, tid)
++    (rec,) = ensure_recovery_cards(conn)
++    return tid, rec
++
++
++def test_goal_park_with_open_recovery_card_is_untouched(kanban_home, own_gateway):
+     with kbc.connect_closing() as conn:
+-        tid = _parked(conn, status="blocked", event="blocked", kind="needs_input")
+-        monkeypatch.setattr(goal, "current_park", lambda c, task_id: task_id == tid)
++        tid, _ = _goal_parked(conn)
+         assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, tid)[2] is None
++
++
++def test_goal_park_whose_recovery_finished_is_escalated(kanban_home, own_gateway):
++    """current_park stays true after the goal recovery card completes (its brief leaves the source parked), so it
++    owns nothing: the source is escalated once parked past the threshold."""
++    from hermes_cli.kanban_goal_recovery import current_park
++    with kbc.connect_closing() as conn:
++        tid, rec = _goal_parked(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rec,))
++        assert current_park(conn, tid)
++        assert _sweep(conn, now=_later(1), cfg={}) == []
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        status, kind, raw = _row(conn, tid)
++        assert card_is_open_human_ask(status, kind, raw)
+ 
+ 
+ def test_lane_gate_and_shared_blocker_parks_are_untouched(kanban_home, own_gateway):
+-- 
+2.43.0
+

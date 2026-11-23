@@ -1,0 +1,937 @@
+From 769f0eab73a8ec6f37deac97aafb3748e0e09c69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 05:15:38 +0000
+Subject: [PATCH] fix(desktop): queue archive preflight across reconnects
+ [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: archive can fail before the already-retrying PATCH. Client logs
+showed two GET preflight connect timeouts. The hub
+handled a matching GET in 2.16s; this does not identify the connection's cause.
+
+Five-whys — transport/preflight:
+1. User must click again because preflight exits before sending the archive.
+2. refreshArchiveTasks turns a failed live read into unknown after 6s reads /
+   a 14s overall budget; the safety-unknown path is not reconnect recovery.
+3. PR2063 retries fenced mutations, but preflight is outside that boundary.
+Root (happened): connection readiness and safety judgments share an error
+contract. A reconnect is exposed as a final archive safety failure.
+Root (not caught): prior mutation tests began after preflight; existing
+unreachable-owner tests expected the unknown warning, not recovery and a
+complete fresh safety pass. The new narrow test fails on unmodified main.
+Recurrence: earlier owner-routing fix 5c653ed500 and PATCH fix PR2063 did not
+cover the pre-PATCH read. This change handles that boundary, not flapping.
+
+Countermeasures:
+- Keep optimistic hiding and visibly queue reconnectable transport failures
+  for the existing bounded 60s budget. Retry the entire ancestry/task read on
+  the captured owner/profile; do not skip guards or treat unknown as safe.
+- Other unknown causes retain explicit safety confirmation. Exhaustion
+  restores the row and shows an error. Reload drops the window-local intent
+  and reports that cancellation; it never replays a stale safety decision.
+- One archive UUID logs start, readiness/safety, queued and actual PATCH sends.
+  committed requires an owner-scoped GET with matching ID and archived=true/1;
+  ACK alone or failed readback is verification-pending, never committed.
+- Precommit review found resolved nondefault profile was discarded for an
+  ownerless row; preserve it and add hook-level regression coverage.
+
+Five-whys — upgrade fence / historical drift:
+1. 409 client_upgrade_required refuses identity-less session writes.
+2. The server requires request_id + revision/generation fencing; the message
+   describes protocol incompatibility, not a backend Git-SHA equality test.
+3. Current Desktop already obtains mutation-snapshot and sends that identity;
+   refusal remains definitive, is not transport-retried, and readableError
+   displays the version explanation with the Update Hermes action.
+Root (happened, proven): a mutation lacked required protocol identity. The
+historical app/backend stamps ea936d5d20 / 2cc7101849 differ, but that alone
+DOES NOT prove partial installation or why the particular request lacked
+identity. The historic app source already had fencing. The originating
+request body and install transaction timeline are unavailable here: causal
+attribution stops at that evidence boundary, not an invented updater defect.
+Root (not caught): old bundle/server protocol skew was surfaced only on edit;
+Git-SHA drift is not a protocol-pairing assertion. Current update flow uses
+prebuild/install stamps plus deferred bundle swap while Desktop is open;
+re-pair via the supported update/quit-reopen flow, never relax the fence.
+Regression: upgrade refusal restores the row, sends once, exposes Update
+Hermes and never emits committed. No new updater mutation is justified by
+these historical stamps. Do not claim the historical install cause settled.
+
+Proof: 114 tests in 10 selected Desktop modules pass; TypeScript --noEmit and
+ESLint on touched TypeScript pass; scripts/check --base origin/main passes
+all 21 checks. The narrow preflight regression is RED on unmodified main.
+Coverage includes preflight/snapshot/PATCH reconnect, same mutation identity,
+owner switch and nondefault resolution, nontransport unknown, reload drop,
+queue exhaustion and negative authoritative-readback cases.
+
+Gate6 stays UNPROVEN until the fixed laptop bundle has a natural stale-window
+archive with correlated committed, no second start/manual retry in 10min,
+and hub sessions.archived=1; inspect all retained rotations continuously.
+No app/backend/tunnel launch, outage injection, or historical proof harness.
+---
+ apps/desktop/src/api/sessions.ts              |   8 +-
+ .../use-session-actions/archive-commit.ts     |  28 ++-
+ .../archive-linked-confirm.test.tsx           |  47 +++--
+ .../archive-reconnect.test.ts                 | 192 ++++++++++++++++++
+ .../use-session-actions/archive-soft-hide.ts  |  27 ++-
+ .../confirm-linked-archive.ts                 |   7 +-
+ .../hooks/use-session-actions/index.ts        |  29 +--
+ .../preflight-reconnect-regression.test.ts    |  28 +++
+ .../reconnect-archive-preflight.ts            |  63 ++++++
+ .../refresh-archive-tasks.ts                  |  18 +-
+ apps/desktop/src/i18n/en.ts                   |   2 +
+ apps/desktop/src/i18n/overlay-gaps.json       |   2 +
+ apps/desktop/src/i18n/types.ts                |   2 +
+ apps/desktop/src/lib/archive-trace.ts         |  23 +++
+ locales/_keys.desktop.json                    |   2 +
+ 15 files changed, 430 insertions(+), 48 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/preflight-reconnect-regression.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+ create mode 100644 apps/desktop/src/lib/archive-trace.ts
+
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 7173842389..9ae6ae4e3d 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -413,7 +413,7 @@ export function mutateSessionFenced<T>(key: string, read: () => Promise<SessionM
+   })
+ }
+ 
+-function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: Record<string, unknown>, profile?: ProfileScope): Promise<T> {
++function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: Record<string, unknown>, profile?: ProfileScope, onSend?: () => void): Promise<T> {
+   // Null is the window's v1 route (its primary, local or remote); defaulting it to
+   // the registry's 'local' source would pin a remote primary's edits to this machine.
+   const scope = { connectionId: getApiRequestConnection(), ...sessionScoped(profile) }
+@@ -431,6 +431,8 @@ function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: R
+       return hermesApi<T>({ ...scope, path: params.size ? `${path}?${params}` : path, method, timeoutMs })
+     }
+ 
++    onSend?.()
++
+     return hermesApi<T>({ ...scope, path, method, timeoutMs,
+       body: { ...payload, ...identity, ...(scope.profile ? { profile: scope.profile } : {}) } })
+   }
+@@ -459,13 +461,13 @@ function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: R
+ // An object owner also carries its CONNECTION [daveey]: a row listed from another
+ // gateway (All Gateways sidebar) must be archived on that gateway, not on the
+ // active one — otherwise the PATCH 404s locally and the row reappears.
+-export function setSessionArchived(id: string, archived: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
++export function setSessionArchived(id: string, archived: boolean, profile?: ProfileScope, onSend?: () => void): Promise<{ ok: boolean }> {
+   const owner: ProfileScope =
+     profile && typeof profile === 'object'
+       ? { ...profile, profile: sessionWriteProfile(profile.profile) ?? null }
+       : sessionWriteProfile(profile)
+ 
+-  return mutateSessionHttp(id, 'PATCH', { archived, ...(archived ? { pinned: false } : {}) }, owner)
++  return mutateSessionHttp(id, 'PATCH', { archived, ...(archived ? { pinned: false } : {}) }, owner, onSend)
+ }
+ 
+ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+index 8fb49f73a1..f6dba6f1a0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+@@ -1,5 +1,7 @@
++import { hermesApiAs } from '@/api/client'
+ import { type ProfileScope, setSessionArchived } from '@/hermes'
+ import type { Translations } from '@/i18n/types'
++import { type ArchiveTrace, startArchiveTrace } from '@/lib/archive-trace'
+ import { sessionWriteRetryAction } from '@/lib/session-write-retry'
+ import { notifyError } from '@/store/notifications'
+ 
+@@ -8,6 +10,7 @@ import type { softHideArchivedRow } from './archive-soft-hide'
+ type HiddenRow = ReturnType<typeof softHideArchivedRow>
+ 
+ interface ArchiveCommit {
++  trace?: ArchiveTrace
+   storedSessionId: string
+   /** Resolved once (`pinSessionWriteOwner`) before the first attempt; every Retry reuses it. */
+   owner: ProfileScope
+@@ -30,12 +33,33 @@ export async function commitArchive(commit: ArchiveCommit): Promise<boolean> {
+   const { copy, hidden, owner, storedSessionId } = commit
+ 
+   try {
+-    await setSessionArchived(storedSessionId, true, owner)
++    let sends = 0
++
++    if (commit.trace) {
++      await setSessionArchived(storedSessionId, true, owner, () => commit.trace?.(`patch-sent n=${++sends}`))
++    } else {
++      await setSessionArchived(storedSessionId, true, owner)
++    }
++
++    // A write ACK alone is not archived=true evidence. Use the same pinned
++    // owner and the real IPC read path. Failed verification never replays a
++    // committed mutation or pretends its optimistic DOM is backend truth.
++    if (commit.trace) {
++      const scope = owner && typeof owner === 'object' ? owner : { profile: owner }
++      await Promise.resolve().then(() => hermesApiAs<{ id: string; archived?: boolean | number }>({ connectionId: scope.connectionId ?? null, profile: scope.profile ?? null },
++        { path: `/api/sessions/${encodeURIComponent(storedSessionId)}`, timeoutMs: 6_000 }))
++        .then(row => commit.trace?.(row.id === storedSessionId && (row.archived === true || row.archived === 1)
++          ? 'committed' : 'verification-pending:not-archived'))
++        .catch(() => commit.trace?.('verification-pending:read-failed'))
++    }
++
+     commit.onArchived()
+   } catch (err) {
++    commit.trace?.(`failed:${String(err)}`)
+     hidden.restore()
+     notifyError(err, copy.archiveFailed, {
+-      action: sessionWriteRetryAction(err, commit.retryLabel, () => void commitArchive({ ...commit, hidden: commit.rehide() })),
++      action: sessionWriteRetryAction(err, commit.retryLabel, () => void commitArchive({ ...commit,
++        trace: commit.trace ? startArchiveTrace(storedSessionId) : undefined, hidden: commit.rehide() })),
+       id: `archive-failed:${storedSessionId}`
+     })
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index a214245ac3..846795a939 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -6,11 +6,12 @@ import type { MutableRefObject } from 'react'
+ import { useEffect } from 'react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { type SessionInfo, setSessionArchived } from '@/hermes'
++import { getSession, type SessionInfo, setSessionArchived } from '@/hermes'
+ import { registerArchiveGuard, resetArchiveGuardsForTests } from '@/store/archive-guards'
+ import { $confirmRequest, settleConfirm } from '@/store/confirm'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $pinnedSessionIds } from '@/store/layout'
++import { $notifications } from '@/store/notifications'
+ import { $offlineSessions, _resetOfflineSessionsForTests } from '@/store/offline-sessions'
+ import { $projectTree } from '@/store/project-tree'
+ import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
+@@ -126,7 +127,7 @@ describe('archiveSession linked-work confirmation', () => {
+     await act(() => handle.archiveSession('s-1'))
+ 
+     expect($confirmRequest.get()).toBeNull()
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' })
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' }, expect.any(Function))
+   })
+ 
+   it('asks before archiving a chat with open Kanban tasks; Cancel keeps it', async () => {
+@@ -185,7 +186,7 @@ describe('archiveSession linked-work confirmation', () => {
+       await done
+     })
+ 
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' })
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' }, expect.any(Function))
+     expect($sessions.get()).toEqual([])
+   })
+ 
+@@ -356,7 +357,7 @@ describe('offline archive owner isolation', () => {
+     const handle = await mountHarness()
+     await act(() => handle.archiveSession('s-1', { selectedRow }))
+     expect(hubRequest).not.toHaveBeenCalled()
+-    expect(setSessionArchived).toHaveBeenCalledWith('s-1', true, { connectionId: 'mini', profile: 'work' })
++    expect(setSessionArchived).toHaveBeenCalledWith('s-1', true, { connectionId: 'mini', profile: 'work' }, expect.any(Function))
+   })
+   // Offline rows keep main's owner-scoped flow: no bare-id tombstone, no live-slice copy.
+   it('does not tombstone another owner\'s cached chat with the same id', async () => {
+@@ -493,32 +494,32 @@ describe('archive preflight follows the remote owner when Recents lacks it', ()
+     await act(() => handle.archiveSession('hub-1'))
+ 
+     expect($confirmRequest.get()).toBeNull()
+-    expect(api.mock.calls.map(([request]) => request.connectionId)).toEqual(['hermes-hub', 'hermes-hub', 'hermes-hub'])
++    expect(api.mock.calls.map(([request]) => request.connectionId)).toEqual(['hermes-hub', 'hermes-hub', 'hermes-hub', 'hermes-hub'])
+     expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'hermes-hub', sessionId: 'hub-1' }))
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, hub)
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, hub, expect.any(Function))
+   })
+ 
+-  it('still warns when the owning hub is genuinely unreachable', async () => {
++  it('queues when the owning hub is unreachable and fails visibly at the deadline without a safety override', async () => {
+     $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])
+     api.mockImplementation(desktopApi('down'))
+     const handle = await mountHarness()
++    vi.useFakeTimers()
+     let done: Promise<void> | undefined
+ 
+     act(() => {
+       done = handle.archiveSession('hub-1')
+     })
+-    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
+-
+-    expect($confirmRequest.get()!.details).toEqual([
+-      { label: 'Kanban tasks', value: 'Task status unavailable; work may still be unfinished.' },
+-      { label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }
+-    ])
++    await act(() => vi.advanceTimersByTimeAsync(0))
++    expect($confirmRequest.get()).toBeNull()
++    expect($notifications.get().some(n => n.message.includes('Will archive when reconnected'))).toBe(true)
++    expect(ancestryGuard).not.toHaveBeenCalled()
+     expect(api.mock.calls.every(([request]) => request.connectionId === 'hermes-hub')).toBe(true)
+-    expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/^\[archive-preflight\] task status unknown for hub-1 via hermes-hub\/default: GET \/api\/sessions\/hub-1 failed: Timed out/))
+     await act(async () => {
+-      settleConfirm(false)
++      await vi.advanceTimersByTimeAsync(70_000)
+       await done
+     })
++    vi.useRealTimers()
++    expect($notifications.get().some(n => n.kind === 'error')).toBe(true)
+     expect(vi.mocked(setSessionArchived)).not.toHaveBeenCalled()
+   })
+ 
+@@ -552,7 +553,19 @@ describe('archive preflight follows the remote owner when Recents lacks it', ()
+ 
+     await act(() => handle.archiveSession('hub-1', { selectedRow }))
+ 
+-    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: undefined }))
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, { profile: 'default' })
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local' }))
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, { connectionId: 'local', profile: 'default' }, expect.any(Function))
++  })
++
++  it('writes to the resolved nondefault profile, not default, for an ownerless/profileless row', async () => {
++    const selectedRow = remoteRow({ connection_id: undefined, profile: undefined, kanban_observed_at: Date.now() / 1000 })
++    setSessions([selectedRow])
++    vi.mocked(getSession).mockResolvedValueOnce({ ...selectedRow, profile: 'work' })
++    api.mockImplementation(async () => ({ id: 'hub-1', archived: true }))
++    const handle = await mountHarness()
++    await act(() => handle.archiveSession('hub-1', { selectedRow }))
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true,
++      { connectionId: 'local', profile: 'work' }, expect.any(Function))
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local', profile: 'work' }))
+   })
+ })
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+new file mode 100644
+index 0000000000..0db07d2e6b
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+@@ -0,0 +1,192 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import type { HermesApiRequest } from '@/global'
++import type { SessionInfo } from '@/hermes'
++import { en } from '@/i18n/en'
++import { startArchiveTrace } from '@/lib/archive-trace'
++import { $confirmRequest, settleConfirm } from '@/store/confirm'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $notifications, clearNotifications, readableError } from '@/store/notifications'
++
++import { commitArchive } from './archive-commit'
++import { archivePreflight } from './archive-soft-hide'
++import { confirmLinkedArchive } from './confirm-linked-archive'
++import { reportDroppedArchiveQueues } from './reconnect-archive-preflight'
++
++const row = { id: 'archive-proof', connection_id: 'owner', profile: 'work', kanban_unknown: true } as SessionInfo
++const hidden = () => ({ end: vi.fn(), hid: true, ids: [row.id], restore: vi.fn() })
++const upgrade = '409: {"detail":"client_upgrade_required: this app is out of sync (different versions) with the Hermes backend; update the app to edit sessions"}'
++
++beforeEach(() => {
++  vi.useFakeTimers()
++  sessionStorage.clear()
++  clearNotifications()
++})
++afterEach(() => {
++  settleConfirm(false)
++  clearNotifications()
++  $connectionsRegistry.set(null)
++  vi.unstubAllGlobals()
++  vi.useRealTimers()
++})
++
++async function archive(trace: ReturnType<typeof startArchiveTrace>) {
++  if (!(await confirmLinkedArchive(row.id, row, 'work', en.desktop, false, trace))) {return false}
++
++  return commitArchive({ storedSessionId: row.id, owner: { connectionId: 'owner', profile: 'work' },
++    hidden: hidden(), rehide: hidden, copy: en.desktop, onArchived: vi.fn(), retryLabel: 'Retry', trace })
++}
++
++it.each(['direct', 'preflight reconnect', 'snapshot reconnect', 'PATCH reconnect', 'upgrade refusal'])('correlates %s with one start, real sends and authoritative commit only', async mode => {
++  const stages: string[] = []
++  let archived = false
++  let failed = false
++  const patches: Record<string, unknown>[] = []
++
++  const api = vi.fn(async ({ path, method, body, connectionId, profile }) => {
++    expect([connectionId, profile]).toEqual(['owner', 'work'])
++
++    if (path.includes('mutation-snapshot')) {
++      if (mode === 'snapshot reconnect' && !failed) {failed = true; throw new Error('socket hang up')}
++
++      return { exists: true, runtime_revision: 0, runtime_generation: 1 }
++    }
++
++    if (method === 'PATCH') {
++      patches.push(body)
++
++      if (mode === 'upgrade refusal') {throw new Error(upgrade)}
++
++      if (mode === 'PATCH reconnect' && !failed) {failed = true; throw new Error('socket hang up')}
++      archived = true
++
++      return { ok: true }
++    }
++
++    if (path.startsWith('/api/sessions/')) {
++      if (mode === 'preflight reconnect' && !failed) {failed = true; throw new Error('Timed out connecting to Hermes backend after 6000ms')}
++
++      return { id: row.id, parent_session_id: null, archived }
++    }
++
++    return { tasks: [] }
++  })
++
++  vi.stubGlobal('hermesDesktop', { api, logLine: (line: string) => {
++    if (line.startsWith('[archive-trace]')) {stages.push(line)}
++  } })
++  const trace = startArchiveTrace(row.id)
++  const result = archive(trace)
++  await vi.advanceTimersByTimeAsync(0)
++
++  if (mode === 'preflight reconnect') {
++    expect($notifications.get().some(n => n.message === en.desktop.archiveQueued && n.persistent)).toBe(true)
++    expect(patches).toHaveLength(0)
++  }
++
++  await vi.advanceTimersByTimeAsync(1_000)
++  expect(await result).toBe(mode !== 'upgrade refusal')
++  const prefix = `[archive-trace] ${row.id} ${trace.attemptId} `
++  const events = stages.map(line => line.slice(prefix.length))
++  expect(stages.every(line => line.startsWith(prefix))).toBe(true)
++  expect(events.filter(e => e === 'start')).toHaveLength(1)
++  expect(events[0]).toBe('start')
++  expect(events).toContain('preflight=ok')
++  expect(events).toContain('patch-sent n=1')
++
++  if (mode === 'preflight reconnect') {
++    expect(events.slice(1, 4)).toEqual(['preflight=waiting-reconnect', 'queued', 'preflight=ok'])
++  }
++
++  if (mode === 'PATCH reconnect') {
++    expect(events).toContain('patch-sent n=2')
++    expect(patches[0].request_id).toBeTruthy()
++    expect(patches[1]).toEqual(patches[0])
++  }
++
++  if (mode === 'upgrade refusal') {
++    expect(events.at(-1)).toMatch(/^failed:.*client_upgrade_required/)
++    expect(events).not.toContain('committed')
++    expect(patches).toHaveLength(1)
++    expect(readableError(new Error(upgrade), 'Archive failed')).toMatchObject({
++      message: 'The app and the backend are on different versions. Update both.', action: { label: 'Update Hermes' }
++    })
++  } else {
++    expect(events.at(-1)).toBe('committed')
++  }
++})
++
++it('reruns ancestry and task safety after a reconnect, never treating unknown as permission', async () => {
++  let failed = false
++  const paths: string[] = []
++  vi.stubGlobal('hermesDesktop', { api: vi.fn(async ({ path }) => {
++    paths.push(path)
++
++    if (path === `/api/sessions/${row.id}`) {return { id: row.id, parent_session_id: 'root' }}
++
++    if (path === '/api/sessions/root') {return { id: 'root' }}
++
++    if (!failed) {failed = true; throw new Error('Remote backend "conn:owner::work" is down (socket hang up); reconnect in progress')}
++
++    return { tasks: [{ id: 'new-task', status: 'running' }] }
++  }) })
++  const pending = confirmLinkedArchive(row.id, row, 'work', en.desktop)
++  await vi.advanceTimersByTimeAsync(0)
++  $connectionsRegistry.set({ version: 1, primary: 'different', connections: [], secureTokenStorage: true })
++  await vi.advanceTimersByTimeAsync(1_000)
++  expect(paths).toEqual([`/api/sessions/${row.id}`, '/api/sessions/root', '/api/session-kanban-tasks?ids=archive-proof%2Croot',
++    `/api/sessions/${row.id}`, '/api/sessions/root', '/api/session-kanban-tasks?ids=archive-proof%2Croot'])
++  expect($confirmRequest.get()?.details).toEqual([{ label: 'Kanban tasks', value: '1 open' }])
++  settleConfirm(false)
++  expect(await pending).toBe(false)
++})
++
++it('ends a never-recovered queue visibly without sending any PATCH', async () => {
++  const api = vi.fn(async (_request: HermesApiRequest) => {throw new Error('socket hang up')})
++  vi.stubGlobal('hermesDesktop', { api })
++  const hiddenRow = hidden()
++  const result = archivePreflight(row.id, row, true, hiddenRow, en.desktop)
++  await vi.advanceTimersByTimeAsync(70_000)
++  expect(await result).toBe(false)
++  expect(hiddenRow.restore).toHaveBeenCalledOnce()
++  expect($notifications.get().some(n => n.kind === 'error')).toBe(true)
++  expect(api.mock.calls.every(([arg]) => !arg.method)).toBe(true)
++  expect($confirmRequest.get()).toBeNull()
++  expect(Object.keys(sessionStorage)).toHaveLength(0)
++})
++
++it('drops reload markers with a visible note, without replay, once; active remounts are not reloads', async () => {
++  sessionStorage.setItem('hermes:archive-preflight-queue:old-attempt', row.id)
++  const api = vi.fn(async (_request: HermesApiRequest) => {throw new Error('socket hang up')})
++  vi.stubGlobal('hermesDesktop', { api })
++  reportDroppedArchiveQueues()
++  expect($notifications.get().find(n => n.id === 'archive-queue-reload')?.message).toBe(en.desktop.archiveQueueDropped)
++  expect(api).not.toHaveBeenCalled()
++  reportDroppedArchiveQueues()
++  expect($notifications.get().filter(n => n.id === 'archive-queue-reload')).toHaveLength(1)
++  const result = confirmLinkedArchive(row.id, row, 'work', en.desktop).catch(error => error)
++  await vi.advanceTimersByTimeAsync(0)
++  const keys = Object.keys(sessionStorage)
++  expect(keys).toHaveLength(1)
++  reportDroppedArchiveQueues()
++  expect(Object.keys(sessionStorage)).toEqual(keys)
++  await vi.advanceTimersByTimeAsync(70_000)
++  await result
++})
++
++it.each(['read-failed', 'not-archived'])('does not fabricate committed evidence from an ACK and %s verification', async failure => {
++  const logLine = vi.fn()
++  vi.stubGlobal('hermesDesktop', { logLine, api: async ({ path, method }: HermesApiRequest) => {
++    if (path.includes('mutation-snapshot')) {return { exists: true, runtime_revision: 0, runtime_generation: 1 }}
++
++    if (method === 'PATCH') {return { ok: true }}
++
++    if (failure === 'not-archived') {return { id: 'verify-only', archived: false }}
++    throw new Error('socket hang up')
++  } })
++  const trace = startArchiveTrace('verify-only')
++  expect(await commitArchive({ storedSessionId: 'verify-only', owner: { connectionId: 'owner', profile: 'work' },
++    hidden: hidden(), rehide: hidden, copy: en.desktop, onArchived: vi.fn(), retryLabel: 'Retry', trace })).toBe(true)
++  expect(logLine.mock.calls.flat().join('\n')).toContain(`verification-pending:${failure}`)
++  expect(logLine.mock.calls.flat().join('\n')).not.toContain(' committed')
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+index 7b4d677c2b..d877854232 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+@@ -1,8 +1,11 @@
+ import type { SessionInfo } from '@/hermes'
+ import type { Translations } from '@/i18n/types'
++import type { ArchiveTrace } from '@/lib/archive-trace'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $pinnedSessionIds } from '@/store/layout'
+ import { notifyError } from '@/store/notifications'
+ import { archiveIfOfflineCached } from '@/store/offline-session-actions'
++import { sessionActionRow } from '@/store/offline-session-owner'
+ import { $profiles } from '@/store/profile'
+ import { sessionPinId } from '@/store/session'
+ import {
+@@ -12,9 +15,19 @@ import {
+   untombstoneSessions
+ } from '@/store/session-removal'
+ 
++import { archiveOwnerRow } from './archive-owner'
+ import { confirmLinkedArchive } from './confirm-linked-archive'
+ import { dropListedSession, type findListedSession, resolveSessionProfile, restoreListedSession } from './utils'
+ 
++export function captureArchiveOwner(storedSessionId: string, selectedRow: SessionInfo | undefined, listed: ReturnType<typeof findListedSession>): SessionInfo {
++  let row = sessionActionRow(storedSessionId, selectedRow) ?? listed?.session
++
++  // Explicit selection is authoritative; other entry paths resolve like resume.
++  if (!selectedRow) {row = archiveOwnerRow(storedSessionId, row)}
++
++  return { ...row, connection_id: row?.connection_id || $connectionsRegistry.get()?.primary || undefined } as SessionInfo
++}
++
+ /**
+  * [daveey] Archive hides the row the moment the user asks, before the
+  * linked-work preflight (ancestry + task reads, plugin guards: up to ~14 s on a
+@@ -94,7 +107,8 @@ export async function archivePreflight(
+   listed: boolean,
+   hidden: HiddenRow,
+   copy: Translations['desktop'],
+-  options?: { skipLinkedConfirm?: boolean }
++  options?: { skipLinkedConfirm?: boolean },
++  trace?: ArchiveTrace
+ ): Promise<false | string | undefined> {
+   const stampedProfile = archived?.profile?.trim()
+   const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+@@ -106,8 +120,17 @@ export async function archivePreflight(
+     return false
+   }
+ 
+-  if (!(await confirmLinkedArchive(storedSessionId, archived, profile, copy, options?.skipLinkedConfirm))) {
++  try {
++    if (!(await confirmLinkedArchive(storedSessionId, archived, profile, copy, options?.skipLinkedConfirm, trace))) {
++      trace?.('failed:confirmation-cancelled')
++      hidden.restore()
++
++      return false
++    }
++  } catch (error) {
++    trace?.(`failed:${String(error)}`)
+     hidden.restore()
++    notifyError(error, copy.archiveFailed)
+ 
+     return false
+   }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.ts b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.ts
+index 17aca249af..236dddec0e 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.ts
+@@ -1,15 +1,16 @@
+ import type { SessionInfo } from '@/hermes'
+ import type { Translations } from '@/i18n/types'
++import type { ArchiveTrace } from '@/lib/archive-trace'
+ import { collectArchiveLinks, sessionKanbanArchiveLinks } from '@/store/archive-guards'
+ import { confirm as confirmAction } from '@/store/confirm'
+ 
+-import { refreshArchiveTasks } from './refresh-archive-tasks'
++import { reconnectArchivePreflight } from './reconnect-archive-preflight'
+ 
+-export async function confirmLinkedArchive(storedSessionId: string, archived: SessionInfo | undefined, profile: string | undefined, copy: Translations['desktop'], skip = false): Promise<boolean> {
++export async function confirmLinkedArchive(storedSessionId: string, archived: SessionInfo | undefined, profile: string | undefined, copy: Translations['desktop'], skip = false, trace?: ArchiveTrace): Promise<boolean> {
+   if (skip) {return true}
+ 
+         const linked = [
+-          ...sessionKanbanArchiveLinks(await refreshArchiveTasks(storedSessionId, archived, profile), copy),
++          ...sessionKanbanArchiveLinks(await reconnectArchivePreflight(storedSessionId, archived, profile, copy, trace), copy),
+           ...(await collectArchiveLinks({
+             connectionId: archived?.connection_id,
+             ids: [...new Set([storedSessionId, archived?.id, archived?._lineage_root_id].filter(Boolean) as string[])],
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index d261d34913..fd86c2ddd1 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -21,6 +21,7 @@ import {
+   setSessionArchived
+ } from '@/hermes'
+ import { useI18n } from '@/i18n'
++import { startArchiveTrace } from '@/lib/archive-trace'
+ import {
+   type ChatMessage,
+   preserveLocalAssistantErrors,
+@@ -54,7 +55,6 @@ import { pendingSessionReplay, requestGatewayForAgent, retainGatewayForAgent } f
+ import { clearSessionGoal } from '@/store/goals'
+ import { $pinnedSessionIds } from '@/store/layout'
+ import { clearNotifications, notify, notifyError } from '@/store/notifications'
+-import { sessionActionRow } from '@/store/offline-session-owner'
+ import { adoptDraftPreviewTabs, prunePreviewTabsForSession } from '@/store/preview'
+ import {
+   $activeGatewayProfile,
+@@ -170,8 +170,7 @@ import {
+ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+ 
+ import { commitArchive } from './archive-commit'
+-import { archiveOwnerRow } from './archive-owner'
+-import { archivePreflight, softHideArchivedRow } from './archive-soft-hide'
++import { archivePreflight, captureArchiveOwner, softHideArchivedRow } from './archive-soft-hide'
+ import { branchThroughRowId } from './branch-boundary'
+ import { branchCreateKey } from './branch-create-key'
+ import { closeStoredSessionTile } from './close-stored-tile'
+@@ -190,6 +189,7 @@ import {
+ } from './owner-follow'
+ import { reconcilePersistedLiveTurn } from './persisted-live-turn'
+ import { provisionalTranscriptPaint, transcriptRestScope } from './provisional-transcript'
++import { reportDroppedArchiveQueues } from './reconnect-archive-preflight'
+ import { rememberedOwnerForResume } from './remembered-owner'
+ import { restorePendingApproval } from './restore-pending-approval'
+ import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
+@@ -430,6 +430,7 @@ export function useSessionActions({
+ 
+   // Drop the create/fork guard once the router catches up — or if the user
+   // navigates somewhere other than the pending id (left the pre-create route).
++  useEffect(reportDroppedArchiveQueues, [])
+   useEffect(() => {
+     const pending = pendingCreatedStoredSessionIdRef.current
+ 
+@@ -3430,21 +3431,14 @@ export function useSessionActions({
+       options?: { onDeselect?: () => void; skipLinkedConfirm?: boolean; selectedRow?: SessionInfo }
+     ) => {
+       clearNotifications()
+-
++      const trace = startArchiveTrace(storedSessionId)
+       const listed = findListedSession(storedSessionId)
+       let archived: SessionInfo | undefined
+ 
+       try {
+-        archived = sessionActionRow(storedSessionId, options?.selectedRow) ?? listed?.session
+-
+-        // A selected row is the user's explicit owner; every other door
+-        // (hotkey, tile menu, plugins) resolves it like resume does, so a
+-        // remote chat whose Recents row is momentarily absent or ownerless is
+-        // neither checked nor archived on the registry primary.
+-        if (!options?.selectedRow) {
+-          archived = archiveOwnerRow(storedSessionId, archived)
+-        }
++        archived = captureArchiveOwner(storedSessionId, options?.selectedRow, listed)
+       } catch (err) {
++        trace(`failed:${String(err)}`)
+         notifyError(err, copy.archiveFailed)
+ 
+         return
+@@ -3462,21 +3456,20 @@ export function useSessionActions({
+         }
+       }
+ 
+-      const profile = await archivePreflight(storedSessionId, archived, Boolean(listed), hidden, copy, options)
++      const profile = await archivePreflight(storedSessionId, archived, Boolean(listed), hidden, copy, options, trace)
+ 
+       if (profile === false) {
+         return
+       }
+ 
+-      // Route to the row's OWN gateway (mirrors deleteSession's removedOwner): an
+-      // All-Gateways row archived via the active connection 404s there. Pinned once,
+-      // so a Retry goes to the same owner with the same retained identity.
++      // Pin the same owner/profile the preflight checked, including a resolved profile.
+       const archiveOwner = pinSessionWriteOwner(
+-        archived?.connection_id ? { connectionId: archived.connection_id, profile: archived.profile || 'default' } : profile
++        archived?.connection_id ? { connectionId: archived.connection_id, profile: profile || 'default' } : profile
+       )
+ 
+       await commitArchive({
+         copy,
++        trace,
+         hidden,
+         owner: archiveOwner,
+         rehide: () => softHideArchivedRow(storedSessionId, archived, findListedSession(storedSessionId) ?? listed),
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/preflight-reconnect-regression.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/preflight-reconnect-regression.test.ts
+new file mode 100644
+index 0000000000..13e385e024
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/preflight-reconnect-regression.test.ts
+@@ -0,0 +1,28 @@
++import { afterEach, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/hermes'
++import { en } from '@/i18n/en'
++import { $confirmRequest, settleConfirm } from '@/store/confirm'
++
++import { confirmLinkedArchive } from './confirm-linked-archive'
++
++afterEach(() => { settleConfirm(false); vi.unstubAllGlobals(); vi.useRealTimers() })
++
++it('queues a reconnect instead of asking the user to override unknown task safety', async () => {
++  vi.useFakeTimers()
++  let failed = false
++
++  const api = vi.fn(async ({ path }) => {
++    if (!failed) {failed = true; throw new Error('socket hang up')}
++
++    return path.startsWith('/api/sessions/') ? { id: 'regression' } : { tasks: [] }
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  const pending = confirmLinkedArchive('regression', { id: 'regression', connection_id: 'owner', kanban_unknown: true } as SessionInfo, 'work', en.desktop)
++  await vi.advanceTimersByTimeAsync(0)
++  expect($confirmRequest.get()).toBeNull()
++  await vi.advanceTimersByTimeAsync(1_000)
++  expect(await pending).toBe(true)
++  expect(api.mock.calls).toHaveLength(3)
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+new file mode 100644
+index 0000000000..fcbefd36a1
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+@@ -0,0 +1,63 @@
++import { randomUuid } from '@hermes/shared'
++
++import { isReconnectableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
++import type { SessionInfo } from '@/hermes'
++import { translateNow } from '@/i18n'
++import type { Translations } from '@/i18n/types'
++import type { ArchiveTrace } from '@/lib/archive-trace'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { dismissNotification, notify } from '@/store/notifications'
++
++import { refreshArchiveTasks } from './refresh-archive-tasks'
++
++const PREFIX = 'hermes:archive-preflight-queue:'
++const active = new Set<string>()
++
++/** A reload cancels the window-local operation, never resumes a stale safety verdict.
++ * Keep a marker until settlement so the next renderer explains that cancellation. */
++export function reportDroppedArchiveQueues(): void {
++  const keys = Object.keys(sessionStorage).filter(key => key.startsWith(PREFIX) && !active.has(key))
++
++  if (!keys.length) {return}
++  keys.forEach(key => sessionStorage.removeItem(key))
++  notify({ id: 'archive-queue-reload', kind: 'warning', persistent: true, durationMs: 0,
++    message: translateNow('desktop.archiveQueueDropped') })
++}
++
++export async function reconnectArchivePreflight(id: string, row: SessionInfo | undefined, profile: string | undefined,
++  copy: Translations['desktop'], trace?: ArchiveTrace): Promise<SessionInfo | undefined> {
++  // Pin even an ownerless primary row before waiting: a gateway switch cannot
++  // move its safety read to a different same-named profile.
++  const session = { ...row, connection_id: row?.connection_id || $connectionsRegistry.get()?.primary || undefined } as SessionInfo
++  const key = `${PREFIX}${trace?.attemptId ?? randomUuid()}`
++  let queued = false
++  active.add(key)
++
++  try {
++    return await withSessionWriteReconnect(async remainingMs => {
++      try {
++        const result = await refreshArchiveTasks(id, session, profile, { retryTransport: true, budgetMs: remainingMs, trace })
++
++        return result
++      } catch (error) {
++        if (isReconnectableSessionWriteError(error)) {
++          trace?.('preflight=waiting-reconnect')
++
++          if (!queued) {
++            queued = true
++            sessionStorage.setItem(key, id)
++            notify({ id: key, kind: 'info', persistent: true, durationMs: 0, message: copy.archiveQueued })
++            trace?.('queued')
++          }
++        }
++
++        throw error
++      }
++    }, { label: `archive-preflight ${id}` })
++  } finally {
++    active.delete(key)
++    sessionStorage.removeItem(key)
++
++    if (queued) {dismissNotification(key)}
++  }
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index 632c9513a6..fcaa7ebd23 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -1,5 +1,7 @@
+ import { hermesApiAs } from '@/api/client'
++import { isReconnectableSessionWriteError } from '@/api/session-write-reconnect'
+ import type { SessionInfo } from '@/hermes'
++import type { ArchiveTrace } from '@/lib/archive-trace'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { hasFreshKanbanObservation } from '@/store/kanban-observation'
+ 
+@@ -16,10 +18,13 @@ const isTimeout = (error: unknown) => /timed out/i.test(String((error as Error)?
+  * Failed/malformed reads remain unknown, including incomplete ancestry.
+  * A fresh row that claims work is read too: its `kanban_active` also counts settled cards still waiting for the chat's
+  * close-out, which the task list leaves out, so only the read says what is open. If that read fails, the row stands. */
+-export async function refreshArchiveTasks(id: string, session: SessionInfo | undefined, profile: string | undefined): Promise<SessionInfo | undefined> {
++export async function refreshArchiveTasks(id: string, session: SessionInfo | undefined, profile: string | undefined,
++  options?: { retryTransport?: boolean; budgetMs?: number; trace?: ArchiveTrace }): Promise<SessionInfo | undefined> {
+   const fresh = hasFreshKanbanObservation(session) && !session?.kanban_unknown && !session?.kanban_remote_stale
+ 
+   if (fresh && !session?.kanban_active && !session?.kanban_blocked) {
++    options?.trace?.('preflight=ok')
++
+     return session
+   }
+ 
+@@ -40,6 +45,7 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+       const detail = error === undefined ? '' : `: ${String((error as Error)?.message ?? error).slice(0, 200)}`
+       const route = `${owner.connectionId ?? '(none)'}/${owner.profile}${session?.connection_id ? '' : ' (no row owner)'}`
+       console.error(`[archive-preflight] task status unknown for ${id} via ${route}: ${reason}${detail}`)
++      options?.trace?.(`preflight=unknown:${reason}${detail}`)
+     }
+ 
+     return unknown
+@@ -51,8 +57,10 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+ 
+   const request = async <T>(path: string): Promise<T> => {
+     try {
+-      return await hermesApiAs<T>(owner, { path, timeoutMs: READ_TIMEOUT_MS })
++      return await hermesApiAs<T>(owner, { path, timeoutMs: Math.min(READ_TIMEOUT_MS, options?.budgetMs ?? READ_TIMEOUT_MS) })
+     } catch (error) {
++      if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
++
+       if (!isTimeout(error)) {throw error}
+ 
+       return hermesApiAs<T>(owner, { path, timeoutMs: READ_TIMEOUT_MS })
+@@ -96,7 +104,9 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+       else {return unknownBecause(`task ${task.id} has status ${task.status}`)}
+     }
+ 
++    if (settled) {return unknown}
+     settled = true
++    options?.trace?.('preflight=ok')
+ 
+     return { ...session, kanban_active: active, kanban_blocked: blocked, kanban_unknown: false,
+       kanban_remote_stale: 0, kanban_observed_at: Date.now() / 1000 } as SessionInfo
+@@ -104,9 +114,11 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+ 
+   try {
+     return await Promise.race([read(), new Promise<SessionInfo>(resolve => {
+-      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${OVERALL_BUDGET_MS}ms (${stage})`)), OVERALL_BUDGET_MS)
++      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${OVERALL_BUDGET_MS}ms (${stage})`)), Math.min(OVERALL_BUDGET_MS, options?.budgetMs ?? OVERALL_BUDGET_MS))
+     })])
+   } catch (error) {
++    if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
++
+     return unknownBecause(`${stage} failed`, error)
+   } finally {
+     clearTimeout(timer)
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 8943b63d74..4a4ea73d5f 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -4859,6 +4859,8 @@ export const en: Translations = {
+     deleteFailed: 'Delete failed',
+     archived: 'Archived',
+     archiveFailed: 'Archive failed',
++    archiveQueued: 'Will archive when reconnected. Task safety will be checked again first.',
++    archiveQueueDropped: 'A queued archive was cancelled by reload. Review the chat and archive again.',
+     archiveLinkedTitle: (title: string) => (title ? `Archive “${title}”?` : 'Archive this chat?'),
+     archiveLinkedBody: 'Review the linked-work status below. Archiving only hides the chat; it does not stop any tasks or machines.',
+     archiveLinkedConfirm: 'Archive anyway',
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index de70cea8c9..a94e7c2115 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -1,4 +1,6 @@
+ {
++  "desktop.archiveQueued": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "desktop.archiveQueueDropped": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.cardColours.red": ["ar", "de", "es", "fr", "ja", "ru", "zh", "zh-hant"],
+   "sidebar.row.cardColours.pink": ["ar", "de", "es", "fr", "ja", "ru", "zh", "zh-hant"],
+   "sidebar.row.cardColours.amber": ["ar", "de", "es", "fr", "ja", "ru", "zh", "zh-hant"],
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 7118019f67..b2ad1e0b36 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -4290,6 +4290,8 @@ export interface Translations extends NoticeTranslations {
+     deleteFailed: string
+     archived: string
+     archiveFailed: string
++    archiveQueued: string
++    archiveQueueDropped: string
+     archiveLinkedTitle: (title: string) => string
+     archiveLinkedBody: string
+     archiveLinkedConfirm: string
+diff --git a/apps/desktop/src/lib/archive-trace.ts b/apps/desktop/src/lib/archive-trace.ts
+new file mode 100644
+index 0000000000..8e3612bd0e
+--- /dev/null
++++ b/apps/desktop/src/lib/archive-trace.ts
+@@ -0,0 +1,23 @@
++import { randomUuid } from '@hermes/shared'
++
++export type ArchiveTrace = ((stage: string) => void) & { attemptId: string }
++
++/** One user invocation, including its automatic retries. Never log prompts or tokens. */
++export function startArchiveTrace(sessionId: string): ArchiveTrace {
++  const attemptId = randomUuid()
++
++  const trace = Object.assign((stage: string) => {
++    const line = `[archive-trace] ${sessionId} ${attemptId} ${stage.replace(/[\r\n]/g, ' ').slice(0, 400)}`
++
++    try {
++      console.info(line)
++      window.hermesDesktop?.logLine?.(line)
++    } catch {
++      // Diagnostics cannot change the mutation outcome.
++    }
++  }, { attemptId })
++
++  trace('start')
++
++  return trace
++}
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 7b9e779bfa..69bfd76205 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -1555,6 +1555,8 @@
+     "desktop.archiveLinkedTasksUnknown",
+     "desktop.archiveLinkedTasksValue",
+     "desktop.archiveLinkedTitle",
++    "desktop.archiveQueueDropped",
++    "desktop.archiveQueued",
+     "desktop.archived",
+     "desktop.attachFailed",
+     "desktop.attachImages",
+-- 
+2.43.0
+

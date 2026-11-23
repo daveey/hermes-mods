@@ -1,0 +1,663 @@
+From b7a8ef0ad8e81c2b9ebcd04317d460928473b6a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 05:21:43 +0000
+Subject: [PATCH] fix(tui): isolate retained notification signature observers
+ [daveey]
+
+Problem: sustained generic cached_ro contention makes each notification signature
+borrow a cold private connection and rescan all subscriptions/event history.
+The installed PR3992 behavior is correct but amplifies read work under contention.
+
+Why 1: generic dashboard borrows exhaust the shared-reader wait, selecting private
+fallbacks (deterministic second-thread hold, real SQL RED: four calls =>4/4 scans).
+Why 2: connection-local data_version and event offsets cannot cross into those
+private handles; PR3992 correctly refuses their shared-memo publication.
+Why 3: signature retention was coupled to the unrelated generic-reader domain.
+Root (happened): reader/memo custody did not match the notification workload.
+Root (not caught): 743d95b4f9 / PR3992 tested that repeated private reads preserve
+the shared memo and fresh rows, not that their repeated SQL work is bounded.
+Recurrence: PR3992 fixed invalidation/custody correctness; this removes the
+remaining reproduced contention cost, not a regression of its correctness fix.
+Historical timeout causation remains undetermined: stack occupancy is not CPU%.
+
+Countermeasures:
+- A dedicated query-only retained observer per board serializes signature reads
+  with bounded acquisition. Generic cached_ro semantics are unchanged.
+- Use existing managed open/recovery, exact-connection memo fencing and generation
+  eviction callbacks. Revalidate DB inode plus independent WAL and SHM identities.
+- Cap retained observers at64; private fallback remains fresh and unpublished.
+  Recovery never closes active borrowers. Reset/cap retirement takes lifecycle
+  locks nonblocking and retains custody when closing must be deferred.
+- Retain subscription/event coverage, schema repair fallback and notification
+  semantics. No poll interval, endpoint budget or detector changes.
+
+Proof (pool worker; synthetic/read-thread, not whole-serve recovery):
+- Authentic prechange RED:4 repeated generic-contended calls =>4 full-subscription
+  and4 event-from-zero scans. Same regression GREEN after isolation =>0/0.
+- Additional edge REDs caught WAL-only invalidation and unbounded guarded close
+  during capacity eviction; fixed with independent generation/lifecycle checks.
+- 48 notification tests pass. All12 exact-anchor mutation controls killed on a
+  no-file-retry run; isolated SHM/deferred-retirement tests close two earlier gaps.
+- Consumer sweep:63 files,1096 tests passed before the final two additive tests.
+- Full scripts/check:21 checks green; final tree is rechecked before publishing.
+- Synthetic8815 TUI subscriptions/980663events,6 generic-contended calls:
+  baseline76.2584ms threadCPU,6/6 scans; isolated0.137006ms,0/0 scans.
+  With six unrelated title commits:77.743567=>0.974411ms,6/6=>0/0 scans.
+  Writer CPU excluded. This proves amplification removal, not live frequency or
+  sole historical timeout causation. Benchmark output retained on the card.
+
+Natural deployment only. Incident t_e39e99d8b9d544dd retains serving-process
+activation, endpoint attribution and fresh unchanged30min detector acceptance.
+---
+ tests/tui_gateway/test_notify_reader.py    | 302 +++++++++++++++++++++
+ tests/tui_gateway/test_notify_revision.py  |  11 +-
+ tests/tui_gateway/test_notify_subs_gate.py |   8 +-
+ tui_gateway/notification_idle.py           |   9 +-
+ tui_gateway/notification_reader.py         | 170 ++++++++++++
+ 5 files changed, 487 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notify_reader.py
+ create mode 100644 tui_gateway/notification_reader.py
+
+diff --git a/tests/tui_gateway/test_notify_reader.py b/tests/tui_gateway/test_notify_reader.py
+new file mode 100644
+index 0000000000..6d0623fe25
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_reader.py
+@@ -0,0 +1,302 @@
++"""Real-SQL notification observer contention and lifetime regressions."""
++import contextlib
++import threading
++
++from hermes_cli import kanban_session_activity as activity
++from tests.tui_gateway import test_notify_subs_gate as helpers
++from tui_gateway import notification_idle as idle
++
++board = helpers.board
++
++
++def test_generic_reader_contention_keeps_warm_notification_work_bounded(board, monkeypatch):
++    path, _tasks = board
++    # Trace actual connections at open, including ephemeral private fallbacks.
++    from hermes_cli import kanban_generation as generation
++    original = generation.open_ro
++    statements = []
++
++    def traced(*args, **kwargs):
++        conn = original(*args, **kwargs)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(generation, 'open_ro', traced)
++    monkeypatch.setattr(activity, '_open_ro', traced)
++    before = idle.board_signature(path, helpers.CHAT)
++    statements.clear()
++    ready, release = threading.Event(), threading.Event()
++
++    def hold():
++        with activity.cached_ro(path):
++            ready.set()
++            release.wait(10)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert ready.wait(5)
++        for _ in range(4):
++            assert idle.board_signature(path, helpers.CHAT) == before
++    finally:
++        release.set()
++        thread.join(5)
++    assert not thread.is_alive()
++    scans = [s for s in statements if s.startswith(idle._SUBS_SQL)]
++    zero = [s for s in statements if 'FROM task_events WHERE id > 0 ' in s]
++    assert (len(scans), len(zero)) == (0, 0), statements
++
++
++def test_generic_hold_still_sees_commits_without_cold_event_replay(board):
++    from tests.tui_gateway.test_notify_revision import writer
++    from tui_gateway import notification_reader as reader
++    path, tasks = board
++    before = idle.board_signature(path, helpers.CHAT)
++    with reader.reading(path) as (conn, _):
++        statements = []
++        conn.set_trace_callback(statements.append)
++    ready, release = threading.Event(), threading.Event()
++
++    def hold():
++        with activity.cached_ro(path):
++            ready.set()
++            release.wait(10)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert ready.wait(5)
++        with writer(path) as conn:
++            conn.execute("UPDATE kanban_notify_subs SET last_event_id = 96 WHERE chat_id = ?", (helpers.CHAT,))
++            conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'completed', '{}', 1)",
++                         (tasks[0],))
++        after = idle.board_signature(path, helpers.CHAT)
++        assert after != before and after[1] > before[1]
++        assert after[2][0][4] == 96
++        for _ in range(3):
++            assert idle.board_signature(path, helpers.CHAT) == after
++        assert sum(s.startswith(idle._SUBS_SQL) for s in statements) == 1
++        assert not any('FROM task_events WHERE id > 0 ' in s for s in statements)
++    finally:
++        release.set()
++        thread.join(5)
++        with reader.reading(path) as (conn, _):
++            conn.set_trace_callback(None)
++    assert not thread.is_alive()
++
++
++def test_reset_during_borrow_defers_close_and_prevents_reuse(board):
++    import sqlite3
++    import pytest
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    with reader.reading(path) as (old, retained):
++        assert retained
++        idle.reset_board_signatures()
++        assert old.execute('SELECT 1').fetchone() == (1,)
++        with reader.reading(path) as (fresh, retained):
++            assert not retained and fresh is not old
++    with pytest.raises(sqlite3.ProgrammingError):
++        old.execute('SELECT 1')
++
++
++def test_private_reader_closes_on_exception_and_never_publishes(board):
++    import sqlite3
++    import pytest
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    idle.board_signature(path, helpers.CHAT)
++    held = idle._SIGS[str(path)]
++    with reader.reading(path) as (shared, _):
++        with pytest.raises(ValueError, match='controlled'):
++            with reader.reading(path, busy_budget=0) as (private, retained):
++                assert not retained and private is not shared
++                assert private.execute('PRAGMA query_only').fetchone() == (1,)
++                raise ValueError('controlled')
++        with pytest.raises(sqlite3.ProgrammingError):
++            private.execute('SELECT 1')
++        assert idle._SIGS[str(path)] is held
++        assert shared.execute('SELECT 1').fetchone() == (1,)
++
++
++def test_error_and_unfinished_transaction_close_retained_reader(board):
++    import sqlite3
++    import pytest
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    with pytest.raises(sqlite3.OperationalError):
++        with reader.reading(path) as (old, _):
++            old.execute('SELECT * FROM nonexistent_notification_fixture')
++    with pytest.raises(sqlite3.ProgrammingError):
++        old.execute('SELECT 1')
++    with reader.reading(path) as (transaction, _):
++        transaction.execute('BEGIN')
++    with pytest.raises(sqlite3.ProgrammingError):
++        transaction.execute('SELECT 1')
++    assert idle.board_signature(path, helpers.CHAT)[0] == 'notify'
++
++
++def test_generation_eviction_refuses_foreign_borrow_and_reopens(board):
++    import sqlite3
++    import pytest
++    from hermes_cli import kanban_generation as generation
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    errors = []
++    with reader.reading(path) as (old, _):
++        def evict():
++            try:
++                reader.evict(str(path.resolve()))
++            except generation.DeletedWalGenerationError as exc:
++                errors.append(exc)
++        thread = threading.Thread(target=evict)
++        thread.start()
++        thread.join(5)
++        assert not thread.is_alive() and len(errors) == 1
++        assert old.execute('SELECT 1').fetchone() == (1,)
++    reader.evict(str(path.resolve()))
++    with reader.reading(path) as (fresh, _):
++        assert fresh is not old
++    # The registered callback, not only its direct helper, participates in recovery.
++    assert reader.evict in list(generation._reader_caches)
++    with pytest.raises(sqlite3.ProgrammingError) as caught:
++        old.execute('SELECT 1')
++    assert 'closed' in str(caught.value)
++
++
++def test_registry_cap_closes_idle_and_active_retirees(board, monkeypatch):
++    import sqlite3
++    import pytest
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    other = path.with_name('other-notify.db')
++    with contextlib.closing(sqlite3.connect(path)) as source:
++        with contextlib.closing(sqlite3.connect(other)) as target:
++            source.backup(target)
++    monkeypatch.setattr(reader, 'MAX_READERS', 1)
++    with reader.reading(path) as (old, _):
++        pass
++    with reader.reading(other) as (second, _):
++        with pytest.raises(sqlite3.ProgrammingError):
++            old.execute('SELECT 1')
++        with reader.reading(path) as (third, retained):
++            assert not retained  # active slots are never evicted to make room
++            assert second.execute('SELECT 1').fetchone() == (1,)
++            assert third is not old
++    reader.close_all()
++    with pytest.raises(sqlite3.ProgrammingError):
++        second.execute('SELECT 1')
++    assert len(reader._registry) == 0
++
++
++def test_wal_only_replacement_invalidates_observer(board):
++    import sqlite3
++    from pathlib import Path
++    path, _ = board
++    before = idle.board_signature(path, helpers.CHAT)
++    old = idle._SIGS[str(path)][0]
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        assert conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
++    # Only WAL changes: same main inode and same SHM mapping.
++    wal = Path(str(path) + '-wal')
++    wal.rename(Path(str(path) + '-old-wal'))
++    wal.touch()
++    assert idle.board_signature(path, helpers.CHAT) == before
++    assert idle._SIGS[str(path)][0] is not old
++
++
++def test_shm_only_replacement_invalidates_observer(board):
++    from pathlib import Path
++    path, _ = board
++    before = idle.board_signature(path, helpers.CHAT)
++    old = idle._SIGS[str(path)][0]
++    Path(str(path) + '-shm').rename(Path(str(path) + '-old-shm'))
++    assert idle.board_signature(path, helpers.CHAT) == before
++    assert idle._SIGS[str(path)][0] is not old
++
++
++def test_reset_deferred_by_foreign_lifecycle_reopens_retired_reader(board):
++    from hermes_cli import kanban_generation as generation
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    before = idle.board_signature(path, helpers.CHAT)
++    old = idle._SIGS[str(path)][0]
++    done = threading.Event()
++
++    def reset():
++        try:
++            reader.close_all()
++        finally:
++            done.set()
++
++    thread = threading.Thread(target=reset)
++    try:
++        with generation.lifecycle_access(path, timeout=1):
++            thread.start()
++            assert done.wait(1), 'reset must defer rather than wait for foreign lifecycle'
++            assert reader._registry[str(path)].conn is old
++            assert reader._registry[str(path)].retired
++    finally:
++        thread.join(5)
++    assert not thread.is_alive()
++    assert idle.board_signature(path, helpers.CHAT) == before
++    assert idle._SIGS[str(path)][0] is not old
++
++
++def test_capacity_retirement_does_not_wait_for_foreign_board_lifecycle(board, monkeypatch):
++    from hermes_cli import kanban_generation as generation
++    from tui_gateway import notification_reader as reader
++    path, _ = board
++    with reader.reading(path):
++        pass
++    other = path.with_name('new-notify.db')
++    import sqlite3
++    with contextlib.closing(sqlite3.connect(path)) as source:
++        with contextlib.closing(sqlite3.connect(other)) as target:
++            source.backup(target)
++    monkeypatch.setattr(reader, 'MAX_READERS', 1)
++    done = threading.Event()
++    outcomes = []
++
++    def read_other():
++        try:
++            with reader.reading(other, busy_budget=0) as (conn, _):
++                outcomes.append(conn.execute('SELECT 1').fetchone())
++        except generation.BoardLifecycleBusy:
++            outcomes.append('busy')
++        finally:
++            done.set()
++
++    thread = threading.Thread(target=read_other)
++    try:
++        with generation.lifecycle_access(path, timeout=1):
++            thread.start()
++            assert done.wait(1), 'new board waited for an unrelated lifecycle during capacity retirement'
++    finally:
++        thread.join(5)
++    assert not thread.is_alive() and outcomes
++
++
++def test_atomic_replacement_with_retained_reader_rebuilds_equal_revision(tmp_path):
++    import sqlite3
++    from tui_gateway import notification_reader as reader
++    path = tmp_path / 'board.db'
++    replacement = tmp_path / 'replacement.db'
++    for file, value in ((path, 1), (replacement, 2)):
++        with contextlib.closing(sqlite3.connect(file)) as conn:
++            conn.executescript('CREATE TABLE task_events(id INTEGER PRIMARY KEY, kind TEXT);'
++                               'INSERT INTO task_events VALUES (1, "completed");'
++                               'CREATE TABLE kanban_notify_subs(chat_id, task_id, platform, thread_id, '
++                               'last_event_id, inflight_from);')
++            conn.execute("INSERT INTO kanban_notify_subs VALUES ('chat', 'task', 'tui', '', ?, NULL)", (value,))
++            conn.commit()
++    try:
++        before = idle.board_signature(path, 'chat')
++        old = idle._SIGS[str(path)][0]
++        replacement.replace(path)  # old observer remains open until the next borrow
++        after = idle.board_signature(path, 'chat')
++        assert after != before and after[2][0][4] == 2
++        assert idle._SIGS[str(path)][0] is not old
++    finally:
++        reader.close_all()
++        idle.reset_board_signatures()
+diff --git a/tests/tui_gateway/test_notify_revision.py b/tests/tui_gateway/test_notify_revision.py
+index 16275fb847..fe26d01fc4 100644
+--- a/tests/tui_gateway/test_notify_revision.py
++++ b/tests/tui_gateway/test_notify_revision.py
+@@ -8,6 +8,7 @@ import pytest
+ from hermes_cli import kanban_session_activity as activity
+ from hermes_cli import kanban_notify_revision as revision
+ from tui_gateway import notification_idle as idle
++from tui_gateway import notification_reader as reader
+ from tests.tui_gateway import test_notify_subs_gate as helpers
+ 
+ board = helpers.board
+@@ -47,7 +48,7 @@ def test_private_fallback_does_not_displace_shared_memo(board):
+     ready, release = threading.Event(), threading.Event()
+ 
+     def hold():
+-        with activity.cached_ro(path):
++        with reader.reading(path):
+             ready.set()
+             assert release.wait(5)
+ 
+@@ -66,7 +67,7 @@ def test_private_fallback_does_not_displace_shared_memo(board):
+         release.set()
+         thread.join(5)
+     assert not thread.is_alive()
+-    with activity.cached_ro(path) as conn:
++    with reader.reading(path) as (conn, _retained):
+         sql = []
+         conn.set_trace_callback(sql.append)
+     try:
+@@ -74,7 +75,7 @@ def test_private_fallback_does_not_displace_shared_memo(board):
+         assert idle._SIGS[str(path)][0] is shared[0]
+         assert not any('WHERE id > 0 ' in s for s in sql), sql
+     finally:
+-        with activity.cached_ro(path) as conn:
++        with reader.reading(path) as (conn, _retained):
+             conn.set_trace_callback(None)
+ 
+ 
+@@ -194,7 +195,7 @@ def test_same_file_new_connection_does_not_reuse_data_version(board):
+     path, _tasks = board
+     before = idle.board_signature(path, CHAT)
+     old = idle._SIGS[str(path)][0]
+-    activity.evict_readers(str(path.resolve()))
++    reader.evict(str(path.resolve()))
+     with writer(path) as conn:
+         conn.execute("UPDATE kanban_notify_subs SET last_event_id = 74 WHERE chat_id = ?", (CHAT,))
+     assert idle.board_signature(path, CHAT) != before
+@@ -208,7 +209,7 @@ def test_replaced_database_rebuilds_event_and_subscription_state(board):
+     with contextlib.closing(sqlite3.connect(path)) as source:
+         with contextlib.closing(sqlite3.connect(replacement)) as target:
+             source.backup(target)
+-    activity.evict_readers(str(path.resolve()))
++    reader.evict(str(path.resolve()))
+     with writer(replacement) as conn:
+         conn.execute("DELETE FROM task_events")
+         conn.execute("UPDATE kanban_notify_subs SET last_event_id = 81 WHERE chat_id = ?", (CHAT,))
+diff --git a/tests/tui_gateway/test_notify_subs_gate.py b/tests/tui_gateway/test_notify_subs_gate.py
+index ace425ecb2..663a7b8e55 100644
+--- a/tests/tui_gateway/test_notify_subs_gate.py
++++ b/tests/tui_gateway/test_notify_subs_gate.py
+@@ -49,15 +49,15 @@ def _bookkeeping(tid: str, n: int) -> None:
+ 
+ @contextlib.contextmanager
+ def _subs_reads(path):
+-    """Full tui subscription reads on the shared board reader."""
+-    from hermes_cli.kanban_session_activity import cached_ro
++    """Full tui subscription reads on the retained notification observer."""
++    from tui_gateway.notification_reader import reading
+     seen: list = []
+-    with cached_ro(path) as conn:
++    with reading(path) as (conn, _retained):
+         conn.set_trace_callback(lambda sql: seen.append(sql) if "last_event_id, inflight_from FROM" in sql else None)
+     try:
+         yield seen
+     finally:
+-        with contextlib.suppress(Exception), cached_ro(path) as conn:
++        with contextlib.suppress(Exception), reading(path) as (conn, _retained):
+             conn.set_trace_callback(None)
+ 
+ 
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index f9fea1eb7d..350ff4e829 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -121,10 +121,9 @@ def board_signature(path, chat_id=None):
+     """What a poll of ``path`` for ``chat_id`` could claim: equal signatures mean no new deliverable event and no
+     change to that chat's subscription rows, so a bookkeeping commit (heartbeat, claim of another card, run
+     stamps) keeps it. A board without the notify tables keys on its commit revision. Raises like any read."""
+-    from hermes_cli.kanban_session_activity import cached_ro
+-    from hermes_cli.kanban_reader_lifecycle import is_shared_reader
++    from tui_gateway.notification_reader import reading
+     key = str(path)
+-    with cached_ro(Path(path)) as conn:
++    with reading(Path(path)) as (conn, retained):
+         version = conn.execute("PRAGMA data_version").fetchone()[0]
+         with _SIGS_LOCK:
+             held = _SIGS.get(key)
+@@ -134,7 +133,7 @@ def board_signature(path, chat_id=None):
+             held = _notify_content(conn, version, held, path)
+             if held is None:
+                 return conn, version
+-            if is_shared_reader(path, conn):
++            if retained:
+                 with _SIGS_LOCK:
+                     if len(_SIGS) >= _SIGS_MAX:
+                         _SIGS.clear()
+@@ -144,6 +143,8 @@ def board_signature(path, chat_id=None):
+ 
+ 
+ def reset_board_signatures() -> None:
++    from tui_gateway.notification_reader import close_all
++    close_all()
+     with _SIGS_LOCK:
+         _SIGS.clear()
+ 
+diff --git a/tui_gateway/notification_reader.py b/tui_gateway/notification_reader.py
+new file mode 100644
+index 0000000000..534de75f91
+--- /dev/null
++++ b/tui_gateway/notification_reader.py
+@@ -0,0 +1,170 @@
++"""Notification-only read observers; unrelated dashboard borrows never cool their memos.
++
++One serialized retained observer per board, bounded to 64 boards. Contention within
++this domain gets a fresh private read, never a memo from another connection.
++Generation recovery uses nonblocking eviction: never close a foreign borrower or
++wait for its lock while holding the board lifecycle lock.
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import sqlite3
++import threading
++import time
++from collections import OrderedDict
++from pathlib import Path
++
++from hermes_cli import kanban_generation as generation
++
++MAX_READERS = 64
++BUSY_BUDGET = 0.5
++SHARED_WAIT = 0.05
++_registry = OrderedDict()
++_registry_lock = threading.Lock()
++
++
++class _Reader:
++    def __init__(self, path):
++        self.path = path
++        self.lock = threading.Lock()
++        self.conn: sqlite3.Connection | None = None
++        self.ident: tuple[int, int] | None = None
++        self.wal: tuple[int, int] | None = None
++        self.retired = False
++
++    def close(self):
++        self.retired = True
++        if self.conn is not None:
++            # Guarded close takes this lock internally, without a timeout. Take
++            # it nonblocking first; preserve custody if another opener owns it.
++            with generation.lifecycle_access(self.path, timeout=0):
++                self.conn.close()
++                self.conn = None
++
++
++def _identity(path):
++    try:
++        st = os.stat(path)
++        return st.st_dev, st.st_ino
++    except OSError:
++        return None
++
++
++def _live(reader, path):
++    from hermes_cli.kanban_lockguard import shm_identity
++    conn = reader.conn
++    return (not reader.retired and conn is not None and conn in generation._connections
++            and path not in generation._poisoned and reader.ident == _identity(path)
++            and reader.wal == _identity(path + '-wal')
++            and getattr(conn, '_hermes_generation_shm', None) == shm_identity(path))
++
++
++def evict(path):
++    """Generation recovery hook: no waiting under its lifecycle lock."""
++    with _registry_lock:
++        reader = _registry.get(path)
++    if reader is None or reader.conn is None:
++        return
++    if not reader.lock.acquire(blocking=False):
++        raise generation.DeletedWalGenerationError('notification reader is borrowed; retry generation recovery')
++    try:
++        reader.close()
++    finally:
++        reader.lock.release()
++
++
++generation.register_reader_cache(evict)
++
++
++def close_all():
++    """Retire all readers; active/busy readers retain custody until they can close."""
++    with _registry_lock:
++        readers = list(_registry.values())
++        for reader in readers:
++            reader.retired = True
++    for reader in readers:
++        if reader.lock.acquire(blocking=False):
++            try:
++                with contextlib.suppress(generation.BoardLifecycleBusy):
++                    reader.close()
++                if reader.conn is None:
++                    with _registry_lock:
++                        if _registry.get(reader.path) is reader:
++                            del _registry[reader.path]
++            finally:
++                reader.lock.release()
++
++
++def _reader(path):
++    with _registry_lock:
++        reader = _registry.get(path)
++        if reader is not None:
++            _registry.move_to_end(path)
++            return reader
++        candidates = list(_registry.values()) if len(_registry) >= MAX_READERS else []
++    for old in candidates:
++        if not old.lock.acquire(blocking=False):
++            continue
++        try:
++            with contextlib.suppress(generation.BoardLifecycleBusy):
++                old.close()
++            if old.conn is None:
++                with _registry_lock:
++                    if _registry.get(old.path) is old:
++                        del _registry[old.path]
++                break
++        finally:
++            old.lock.release()
++    with _registry_lock:
++        if path in _registry:
++            return _registry[path]
++        if len(_registry) >= MAX_READERS:
++            return None  # every slot still owned: private, never exceed the cap
++        reader = _registry[path] = _Reader(path)
++        return reader
++
++
++@contextlib.contextmanager
++def reading(path, *, busy_budget=BUSY_BUDGET):
++    """Yield (connection, retained custody), exclusive through signature publication.
++
++    The coordination/open budget is shared, not renewed after waiting. A private
++    fallback is query-only and always closes, even on non-SQL exceptions.
++    """
++    path = Path(path)
++    key = generation._path(path)
++    started = time.monotonic()
++    reader = _reader(key)
++    acquired = reader is not None and reader.lock.acquire(timeout=max(0.0, min(SHARED_WAIT, busy_budget)))
++    if not acquired:
++        with contextlib.closing(generation.open_ro(path, timeout=max(0.0, busy_budget - (time.monotonic() - started)))) as conn:
++            yield conn, False
++        return
++    assert reader is not None and key is not None
++    with _registry_lock:
++        attached = _registry.get(key) is reader
++    try:
++        if not _live(reader, key):
++            reader.close()
++            before = _identity(key)
++            reader.retired = False
++            reader.conn = generation.open_ro(path, check_same_thread=False,
++                                             timeout=max(0.0, busy_budget - (time.monotonic() - started)))
++            reader.ident = before
++            reader.wal = _identity(key + '-wal')
++            if before is None or before != _identity(key):
++                reader.close()
++                raise generation.DeletedWalGenerationError('notification board replaced during open; retry')
++        conn = reader.conn
++        assert conn is not None
++        try:
++            yield conn, attached and not reader.retired
++        except sqlite3.Error:
++            reader.close()
++            raise
++        finally:
++            if reader.conn is not None and (not attached or reader.retired or reader.conn.in_transaction):
++                reader.close()
++    finally:
++        reader.lock.release()
+-- 
+2.43.0
+

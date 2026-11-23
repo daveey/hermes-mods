@@ -1,0 +1,177 @@
+From 28710faa804450696518704af26a9ddbb6a13e07 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:59:40 +0000
+Subject: [PATCH] perf(lanes): batch source-owned projection histories [daveey]
+
+The projection visits every open card but queried each event history separately, multiplying SQLite calls under serve GIL contention. Batch up to 400 selected card IDs on first demand, retain only request-local rows, and leave terminal parents lazy. Failed batches publish nothing. Whole-card source choice and per-card event order are preserved; no watcher, timer, new DB handle or cross-request memo is added.
+
+Proof: regression RED at 805 history statements versus 3 and 12 selected-source reads versus 2. GREEN: 91 tests in five lanes consumer files; scripts/check all guards green. This is a bounded read batching improvement, not live latency or CPU acceptance.
+---
+ hermes_cli/kanban_lanes_flow_evidence.py      | 22 +++--
+ hermes_cli/kanban_lanes_sources.py            |  3 +
+ .../test_kanban_lanes_event_batch.py          | 92 +++++++++++++++++++
+ .../test_kanban_lanes_flow_projection.py      |  2 +-
+ 4 files changed, 112 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_lanes_event_batch.py
+
+diff --git a/hermes_cli/kanban_lanes_flow_evidence.py b/hermes_cli/kanban_lanes_flow_evidence.py
+index f7de794ed6..10693a5971 100644
+--- a/hermes_cli/kanban_lanes_flow_evidence.py
++++ b/hermes_cli/kanban_lanes_flow_evidence.py
+@@ -40,12 +40,22 @@ class Evidence:
+         from hermes_cli import kanban_lanes_flow as flow
+ 
+         if task_id not in self._events:
+-            events = self.conn.execute(
+-                "SELECT id, kind, payload FROM task_events WHERE task_id=? ORDER BY id",
+-                (task_id,)).fetchall()
+-            self._events[task_id] = [
+-                {"id": event["id"], "kind": event["kind"], "payload": flow._payload(dict(event))}
+-                for event in events]
++            # Every projection visits the open cards. Read their histories in
++            # bounded batches on first demand; terminal parents remain lazy.
++            ids = list(dict.fromkeys([row['id'] for row in self.rows
++                                      if row['id'] not in self._events] + [task_id]))
++            loaded = {tid: [] for tid in ids}
++            for start in range(0, len(ids), 400):
++                batch = ids[start:start + 400]
++                marks = ','.join('?' for _ in batch)
++                events = self.conn.execute(
++                    f"SELECT task_id, id, kind, payload FROM task_events "
++                    f"WHERE task_id IN ({marks}) ORDER BY task_id, id", batch).fetchall()
++                for event in events:
++                    loaded[event['task_id']].append(
++                        {"id": event["id"], "kind": event["kind"], "payload": flow._payload(dict(event))})
++            # A failed batch must not leave a partially populated view.
++            self._events.update(loaded)
+         return self._events[task_id]
+ 
+     def parents(self, task_id):
+diff --git a/hermes_cli/kanban_lanes_sources.py b/hermes_cli/kanban_lanes_sources.py
+index 7af01859e8..89ce588679 100644
+--- a/hermes_cli/kanban_lanes_sources.py
++++ b/hermes_cli/kanban_lanes_sources.py
+@@ -167,6 +167,9 @@ class Sources(Evidence):
+                 self._rows.update((r['id'], r) for r in db.execute(
+                     f'SELECT * FROM tasks WHERE id IN ({marks})', batch))
+         self.rows = sorted(self._rows.values(), key=lambda r: (r['created_at'], r['id']))
++        # Batch only histories selected from this source, never a losing copy.
++        for db in (local, fleet):
++            self._readers[id(db)].rows = [row for row in self.rows if self._source[row['id']] is db]
+ 
+     def connection(self, task_id) -> sqlite3.Connection:
+         if task_id not in self._source and task_id not in self._deleted:
+diff --git a/tests/hermes_cli/test_kanban_lanes_event_batch.py b/tests/hermes_cli/test_kanban_lanes_event_batch.py
+new file mode 100644
+index 0000000000..3af31e2126
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_event_batch.py
+@@ -0,0 +1,92 @@
++"""Lanes histories use bounded source-owned reads, not one query per card."""
++import contextlib
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_lanes_flow_evidence import Evidence
++from tests.hermes_cli import test_kanban_lanes_sources as sources_base
++
++conn = sources_base.conn
++copies = sources_base.copies
++configured = sources_base.configured
++
++
++def test_selected_sources_batch_only_their_own_card_histories(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    for i in range(12):
++        for db, version in ((live, 2 if i % 2 else 1), (fleet, 1 if i % 2 else 2)):
++            sources_base.card(db, str(i), 'ready', version)
++            for stamp in (3, 1, 2):
++                db.execute('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)',
++                           (str(i), 'commented', '{"source":"' + ('local' if db is live else 'fleet') + '"}', stamp))
++    chosen = Sources(live, fleet)
++    queries = []
++    live.set_trace_callback(queries.append)
++    fleet.set_trace_callback(queries.append)
++    for row in chosen.rows:
++        events = chosen.events(row['id'])
++        assert len(events) == 3
++        assert [e['id'] for e in events] == sorted(e['id'] for e in events)
++        assert {e['payload']['source'] for e in events} == ({'local'} if int(row['id']) % 2 else {'fleet'})
++    assert len([q for q in queries if 'FROM task_events' in q]) == 2
++
++
++
++def test_open_card_histories_are_batched_and_cached_per_view():
++    with contextlib.closing(sqlite3.connect(':memory:')) as db:
++        db.row_factory = sqlite3.Row
++        db.executescript('''
++            CREATE TABLE tasks(id TEXT, status TEXT, created_at INTEGER);
++            CREATE TABLE task_events(id INTEGER, task_id TEXT, kind TEXT, payload TEXT);
++        ''')
++        db.executemany('INSERT INTO tasks VALUES (?, ?, ?)',
++                       [(str(i), 'ready', i) for i in range(805)])
++        db.executemany('INSERT INTO task_events VALUES (?, ?, ?, ?)',
++                       [(i, str(i), 'commented', '{}') for i in range(805)])
++        evidence = Evidence(db)
++        queries = []
++        db.set_trace_callback(queries.append)
++        for row in evidence.rows:
++            assert evidence.events(row['id']) == [
++                {'id': int(row['id']), 'kind': 'commented', 'payload': {}}]
++        reads = [q for q in queries if 'FROM task_events' in q]
++        assert len(reads) == 3, reads
++        queries.clear()
++        assert evidence.events('1')[0]['id'] == 1
++        assert not queries
++        # A new view must observe edits; the cache never crosses requests.
++        db.execute("UPDATE task_events SET payload='{\"changed\":true}' WHERE id=1")
++        assert Evidence(db).events('1')[0]['payload'] == {'changed': True}
++
++
++def test_failed_batch_is_not_published_and_retry_reads_fresh(conn):
++    for i in range(401):
++        conn.execute('INSERT INTO tasks(id,title,status,created_at) VALUES(?,?,?,?)',
++                     (str(i), str(i), 'ready', i))
++    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('0','commented','{}',1)")
++
++    class FailSecondBatch:
++        def __init__(self):
++            self.reads = 0
++
++        def execute(self, sql, args=()):
++            if 'FROM task_events' in sql:
++                self.reads += 1
++                if self.reads == 2:
++                    raise sqlite3.OperationalError('fixture read failure')
++            return conn.execute(sql, args)
++
++    evidence = Evidence(FailSecondBatch())
++    with pytest.raises(sqlite3.OperationalError, match='fixture read failure'):
++        evidence.events('0')
++    assert not evidence._events
++    conn.execute("UPDATE task_events SET payload='{\"retry\":true}' WHERE task_id='0'")
++    assert evidence.events('0')[0]['payload'] == {'retry': True}
++    assert evidence.events('400') == []
++    # A terminal parent is not part of open-card prefetch; read it on demand.
++    conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('parent','parent','done',0)")
++    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('parent','done','{}',1)")
++    assert evidence.events('parent')[0]['kind'] == 'done'
++
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_projection.py b/tests/hermes_cli/test_kanban_lanes_flow_projection.py
+index 3d66f952b9..98e72563d5 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow_projection.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow_projection.py
+@@ -110,7 +110,7 @@ def test_evidence_shared_between_context_and_snapshot_and_not_between_requests(c
+     finally:
+         conn.set_trace_callback(None)
+     assert result['cards'][0]['pr'] == URL
+-    histories = [q for q in queries if 'FROM task_events WHERE task_id=' in q and 'ORDER BY id' in q]
++    histories = [q for q in queries if 'FROM task_events WHERE task_id' in q and 'ORDER BY' in q]
+     assert len(histories) == 1
+     conn.execute("UPDATE tasks SET status='archived' WHERE id='c'")
+     conn.commit()
+-- 
+2.43.0
+

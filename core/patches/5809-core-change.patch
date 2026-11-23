@@ -1,0 +1,393 @@
+From c7ff00c05d4349567f9b5c558d3854cad745c1fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:57:59 -0800
+Subject: [PATCH] [daveey] kanban: stranded-park review fixes
+
+- B1: an open kernel recovery card (open_recovery_card) or a judged goal hold
+  (current_park) owns the park; re-kinding it would make the recovery resume
+  refuse with human_gate and the requester skip it.
+- B2: a triage card the stale-triage sweep will still release (entry newer than
+  its last triage_swept, not capped, not gate-held, not a spend/containment
+  hold) is agent-owned; the predicate is shared with sweep_stale_triage
+  (kanban_triage_sweep._PENDING / awaiting_stale_sweep).
+- B3: the generated ask has no choices (default Unblock/Archive buttons answer
+  it) and follows the ask-line convention; a spend-pending card's unblock names
+  `hermes kanban promote <id> --reason ...` (new spend window).
+- S1: lane-gate holds and shared-blocker parks (payload.blocker_id) are skipped.
+- S2: the desk subscription is written inside the escalation txn, after the
+  re-check and before the event.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_stranded_park.py            |  66 ++++++---
+ hermes_cli/kanban_triage_sweep.py             |  27 +++-
+ tests/hermes_cli/test_kanban_stranded_park.py | 132 +++++++++++++++++-
+ 3 files changed, 197 insertions(+), 28 deletions(-)
+
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index ba53c148a2..6f32295f63 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -39,9 +39,6 @@ DEFAULT_PARK_SECONDS = 7200
+ DEFAULT_OWNER_IDLE_SECONDS = 86400
+ DEFAULT_SWEEP_INTERVAL_SECONDS = 300
+ SHEPHERD_KIND = "shepherd"
+-CHOICES = [{"label": "Release (promote)", "value": "promote"},
+-           {"label": "Archive", "value": "archive"},
+-           {"label": "Re-scope", "value": "rescope"}]
+ _SPEND_KEYS = ("limit", "runs", "runs_with_usage", "cost_usd")
+ 
+ 
+@@ -303,14 +300,31 @@ def _leased(row: dict, now: int) -> bool:
+     return bool(row.get("lease_holder")) and (expires is None or int(expires) > now)
+ 
+ 
++def _agent_owned(conn: sqlite3.Connection, task_id: str) -> bool:
++    """An agent route still owns the park: its open kernel recovery card (or a judged goal hold), an enforced lane
++    gate, or the stale-triage sweep that will release it. Escalating these would turn agent work into a human ask
++    (a recovery card's resume then refuses with human_gate, and the requester skips a card with a human_request)."""
++    from hermes_cli.kanban_goal_recovery import current_park
++    from hermes_cli.kanban_lanes import gate_refusal
++    from hermes_cli.kanban_resume_requester import open_recovery_card
++    from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep
++    return bool(open_recovery_card(conn, task_id) or current_park(conn, task_id)
++                or gate_refusal(conn, task_id) or awaiting_stale_sweep(conn, task_id))
++
++
+ def _excluded(conn: sqlite3.Connection, row: dict, now: int) -> bool:
+     from hermes_cli.kanban_open_asks import card_is_open_human_ask
+     tid, kind = row["id"], row.get("block_kind")
+     if _leased(row, now) or card_is_open_human_ask(row["status"], kind, row.get("human_request")):
+         return True
+-    if kind == "time" or (kind == "dependency" and _dependency_open(conn, tid)):
++    if kind in ("time", "lane_gate") or (kind == "dependency" and _dependency_open(conn, tid)):
+         return True
+-    return _armed_wake(conn, tid)
++    return _armed_wake(conn, tid) or _agent_owned(conn, tid)
++
++
++def _shared_blocker(entry: Optional[dict]) -> bool:
++    """Parked behind a declared shared blocker another card probes (as ``sweep_agent_owned_blocks`` skips)."""
++    return bool(entry and entry["payload"].get("blocker_id"))
+ 
+ 
+ # --- desk binding --------------------------------------------------------------------------------------------------
+@@ -326,16 +340,27 @@ def _desk(desk: str, own: str):
+     except OriginError:
+         logger.warning("kanban: kanban.triage_owner_chat %r is not <gateway>/<profile>/<session>", desk)
+         return None
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++    chat_id = f"{origin.gateway}/{origin.profile}/{origin.session}"
++    if is_placeholder_session(origin.session) or is_headless_session(chat_id):
++        logger.warning("kanban: kanban.triage_owner_chat %r is not an interactive chat; no desk binding", desk)
++        return None
+     return origin, bool(own) and origin.gateway == own and origin.profile == get_active_profile_name()
+ 
+ 
+ def _subscribe_desk(conn: sqlite3.Connection, task_id: str, desk) -> None:
+-    """Local delivery for the desk chat: before the escalation event, so the subscription's cursor includes it."""
+-    from hermes_cli.kanban_db_notify import add_notify_sub
++    """Local delivery for the desk chat, inside the escalation txn and before its event, so the subscription's
++    cursor includes that event. The same insert as the spend producer's ``bind`` (``add_notify_sub`` opens its own
++    write txn and cannot nest); an existing row keeps its provenance. Caller holds the write txn."""
+     origin, local = desk
+-    add_notify_sub(conn, task_id=task_id, platform="tui" if local else "hub",
+-                   chat_id=origin.session if local else f"{origin.gateway}/{origin.profile}/{origin.session}",
+-                   delivery_metadata={"reason": SHEPHERD_KIND})
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++        "VALUES (?,?,?,'','notify',?,?,(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++        (task_id, "tui" if local else "hub",
++         origin.session if local else f"{origin.gateway}/{origin.profile}/{origin.session}",
++         json.dumps({"reason": SHEPHERD_KIND}), int(time.time()), task_id))
+ 
+ 
+ def _link_desk(conn: sqlite3.Connection, task_id: str, desk, now: int) -> None:
+@@ -356,16 +381,24 @@ def _link_desk(conn: sqlite3.Connection, task_id: str, desk, now: int) -> None:
+ 
+ # --- the sweep -----------------------------------------------------------------------------------------------------
+ 
+-def _request(row: dict, entry: Optional[dict], age: int, owner_note: str, kind) -> dict:
++def _request(conn: sqlite3.Connection, row: dict, entry: Optional[dict], age: int, owner_note: str, kind) -> dict:
++    """The generated ask. No ``choices``: the default Unblock/Archive buttons answer it (a choice list makes every
++    answer a non-archive unblock). The action follows the ask-line convention (``user_ask_lint_error``). A pending
++    spend decision refuses the Unblock button, so its release is the promote command (a new spend window)."""
+     from hermes_cli.kanban_human_request import validate_human_request
++    from hermes_cli.kanban_spend_decision import pending as spend_pending
++    tid = row["id"]
+     title = " ".join(str(row.get("title") or "").split())[:200]
++    unblock = (f"Unblock = run `hermes kanban promote {tid} --reason '<what changed>'`, which releases it with a "
++               "new spend window (the Unblock button is refused while the spend decision is pending)"
++               if spend_pending(conn, tid) else "Unblock = it goes back to work as it is")
+     return validate_human_request({
+-        "action": f"Decide this parked card: release it (promote), archive it, or re-scope it: {title}",
++        "action": (f"Decide this parked card ({title}): release it, archive it, or re-scope it by replying with the "
++                   f"new scope. {unblock}; archive = the card and its remaining work are dropped."),
+         "why_human": f"Parked {age // 3600}h with no live owner and no request ({_reason(entry)})",
+         "interaction": "approval",
+         "scope": "This card only",
+         "evidence": _evidence(entry, owner_note),
+-        "choices": CHOICES,
+     }, kind=kind)
+ 
+ 
+@@ -376,8 +409,6 @@ def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now
+     from hermes_cli.kanban_human_request import NONHUMAN_KINDS
+ 
+     tid = row["id"]
+-    if desk is not None:
+-        _subscribe_desk(conn, tid, desk)
+     desk_chat = f"{desk[0].gateway}/{desk[0].profile}/{desk[0].session}" if desk is not None else None
+     with kb.write_txn(conn):
+         fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+@@ -391,9 +422,10 @@ def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now
+             if kind in NONHUMAN_KINDS:
+                 kind = "needs_input"
+                 conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (kind, tid))
+-            store_request(conn, tid, _request(fresh, entry, age, "No unreleased chat link to a live chat and no "
++            store_request(conn, tid, _request(conn, fresh, entry, age, "No unreleased chat link to a live chat and no "
+                                               "open spend-decision supervisor card", kind))
+         if desk is not None:
++            _subscribe_desk(conn, tid, desk)
+             _link_desk(conn, tid, desk, now)
+         kb._append_event(conn, tid, EVENT, {
+             "episode_start": entry["created_at"] if entry else int(fresh.get("created_at") or 0),
+@@ -451,7 +483,7 @@ def sweep_stranded_parks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                 continue
+             entry = park_entry(conn, tid)
+             start = entry["created_at"] if entry else int(row.get("created_at") or 0)
+-            if now - start < park_s or _escalated(conn, tid, entry):
++            if now - start < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry):
+                 continue
+             try:
+                 if live_owner(conn, tid, own=own, liveness=liveness):
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index e2414450e3..14cfcf53d4 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -32,6 +32,14 @@ _TRIAGE_BRIEF = (
+     "probe if it waits on something external. Do not return it to triage."
+ )
+ _MARKS = ",".join("?" * len(TRIAGE_ENTRY_EVENTS))
++# The re-entry predicate on alias ``t`` (params ``_PENDING_ARGS``): a triage entry newer than the last sweep, and the
++# sweep not capped since that entry. Shared by ``sweep_stale_triage`` and ``awaiting_stale_sweep``.
++_PENDING = (
++    f"COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id AND n.kind IN ({_MARKS})), 0) > "
++    "COALESCE((SELECT MAX(s.id) FROM task_events s WHERE s.task_id = t.id AND s.kind = 'triage_swept'), -1) "
++    "AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = t.id AND c.kind = 'triage_sweep_capped' "
++    f"AND c.id > COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id AND n.kind IN ({_MARKS})), 0))")
++_PENDING_ARGS = (*TRIAGE_ENTRY_EVENTS, *TRIAGE_ENTRY_EVENTS)
+ 
+ 
+ def _gate_exclusion() -> str:
+@@ -240,6 +248,18 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+     return created
+ 
+ 
++def awaiting_stale_sweep(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when :func:`sweep_stale_triage` will still release this card on its own (once idle long enough): in
++    triage, not gate-held, re-entered since its last sweep and not capped, and not a hold the sweep skips (spend
++    decision, containment). Such a card is agent-owned; it is not stranded."""
++    if conn.execute("SELECT 1 FROM tasks t WHERE t.id = ? AND t.status = 'triage' " + _gate_exclusion()
++                    + "AND " + _PENDING, (task_id, *_PENDING_ARGS)).fetchone() is None:
++        return False
++    from hermes_cli.kanban_containment_connections import held as containment_held
++    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending
++    return not (spend_decision_pending(conn, task_id) or containment_held(conn, task_id))
++
++
+ def sweep_stale_triage(
+     conn: sqlite3.Connection, *, default_assignee: Optional[str] = None,
+     older_than: int = TRIAGE_STALE_SECONDS, now: Optional[int] = None,
+@@ -256,12 +276,7 @@ def sweep_stale_triage(
+         "SELECT t.id, t.title, t.body, t.assignee, t.human_request, t.tenant FROM tasks t "
+         "WHERE t.status = 'triage' " + _gate_exclusion() +
+         "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id), t.created_at) <= ? "
+-        "AND COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id "
+-        f"AND n.kind IN ({_MARKS})), 0) > "
+-        "COALESCE((SELECT MAX(s.id) FROM task_events s WHERE s.task_id = t.id AND s.kind = 'triage_swept'), -1) "
+-        "AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = t.id AND c.kind = 'triage_sweep_capped' "
+-        f"AND c.id > COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id AND n.kind IN ({_MARKS})), 0))",
+-        (cutoff, *TRIAGE_ENTRY_EVENTS, *TRIAGE_ENTRY_EVENTS),
++        "AND " + _PENDING, (cutoff, *_PENDING_ARGS),
+     ).fetchall()
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+     from hermes_cli.kanban_goal_recovery import current_park
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index beb88dfea7..8192e85fcf 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -89,11 +89,15 @@ def _later(hours):
+     return int(time.time()) + int(hours * HOUR)
+ 
+ 
+-def _parked(conn, *, kind="transient", status="triage", event="agent_block_escalated"):
++def _parked(conn, *, kind="transient", status="triage", event="agent_block_escalated", payload=None, capped=True):
++    """A parked card. A triage card is ``capped`` by default: the stale-triage sweep stopped releasing it, so no
++    agent route owns it (an uncapped one is the sweep's, see ``test_stale_triage_owned_card_is_untouched``)."""
+     tid = kb.create_task(conn, title="Parked work", assignee="default")
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status=?, block_kind=? WHERE id=?", (status, kind, tid))
+-        kb._append_event(conn, tid, event, {"reason": "retry needed"})
++        kb._append_event(conn, tid, event, payload or {"reason": "retry needed"})
++        if status == "triage" and capped:
++            kb._append_event(conn, tid, "triage_sweep_capped", {"cap": 3})
+     return tid
+ 
+ 
+@@ -119,11 +123,11 @@ def test_spend_stop_on_dead_chat_gets_request_and_desk(kanban_home, own_gateway)
+         assert card_is_open_human_ask(status, kind, raw)
+         request = json.loads(raw)
+         assert request["interaction"] == "approval" and request["scope"] == "This card only"
+-        assert request["action"].startswith("Decide this parked card: release it (promote), archive it, or re-scope")
+-        assert "Bounded work" in request["action"]
++        assert request["action"].startswith("Decide this parked card (Bounded work): release it, archive it, or re-sc")
++        assert f"Unblock = run `hermes kanban promote {tid} --reason" in request["action"]
+         assert request["why_human"].startswith("Parked 3h with no live owner and no request (spend_budget_triaged")
+         assert "spend_budget_triaged" in request["evidence"] and "runs=" in request["evidence"]
+-        assert [c["value"] for c in request["choices"]] == ["promote", "archive", "rescope"]
++        assert "choices" not in request
+         # The desk chat is bound: a synced shepherd link (no profile, as local reconcile wants it) and a tui sub.
+         links = conn.execute("SELECT chat_gateway, chat_profile, chat_session, kind, released FROM task_chat_links "
+                              "WHERE task_id=? AND kind='shepherd'", (tid,)).fetchall()
+@@ -213,6 +217,11 @@ def test_created_parked_card_uses_creation_as_episode(kanban_home, own_gateway):
+         tid = kb.create_task(conn, title="Straight into triage", assignee="default", triage=True)
+         assert _row(conn, tid)[0] == "triage"
+         assert stranded.park_entry(conn, tid)["kind"] == "created"
++        # Never swept: the stale-triage sweep owns it.
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "triage_sweep_capped", {"cap": 3})
++        assert stranded.park_entry(conn, tid)["kind"] == "created"
+         assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+ 
+ 
+@@ -300,6 +309,7 @@ def test_once_per_episode_and_again_on_a_new_episode(kanban_home, own_gateway):
+         assert _sweep(conn, now=_later(3), cfg={}) == []
+         with kb.write_txn(conn):
+             kb._append_event(conn, tid, "blocked", {"reason": "parked again"})
++            kb._append_event(conn, tid, "triage_sweep_capped", {"cap": 3})
+         assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+         assert len(_events(conn, tid, stranded.EVENT)) == 2
+         assert "blocked: parked again" in json.loads(_row(conn, tid)[2])["why_human"]
+@@ -366,3 +376,115 @@ def test_state_db_opened_once_per_sweep(kanban_home, own_gateway, monkeypatch):
+             _link(conn, tid, OWN, None, chat)
+         assert sorted(_sweep(conn, now=_later(3), cfg={})) == sorted(tids[1:])
+     assert len(opened) == 1 and opened[0].name == "state.db"
++
++
++# --- review fixes: agent-owned parks stay agent work; the ask is answerable -----------------------------------------
++
++def test_stale_triage_owned_card_is_untouched(kanban_home, own_gateway):
++    """A triage card the stale-triage sweep will still release (re-entered since its last sweep, not capped) is
++    agent-owned even when the sweep has not run (it only runs while the dispatcher may spawn)."""
++    from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, capped=False)
++        assert awaiting_stale_sweep(conn, tid)
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, tid)[2] is None
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "triage_sweep_capped", {"cap": 3})
++        assert not awaiting_stale_sweep(conn, tid)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++
++
++def test_open_recovery_card_owns_the_park(kanban_home, own_gateway, monkeypatch):
++    from hermes_cli import kanban_resume_requester as requester
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, status="blocked", event="continuation_exhausted", kind=None)
++        rec = kb.create_task(conn, title="recover", assignee="default")
++        monkeypatch.setattr(requester, "open_recovery_card", lambda c, target: rec if target == tid else None)
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, tid)[2] is None
++        monkeypatch.setattr(requester, "open_recovery_card", lambda c, target: None)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++
++
++def test_goal_hold_owns_the_park(kanban_home, own_gateway, monkeypatch):
++    from hermes_cli import kanban_goal_recovery as goal
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, status="blocked", event="blocked", kind="needs_input")
++        monkeypatch.setattr(goal, "current_park", lambda c, task_id: task_id == tid)
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++
++
++def test_lane_gate_and_shared_blocker_parks_are_untouched(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        gate = _parked(conn, kind="lane_gate")
++        shared = _parked(conn, status="blocked", event="blocked",
++                         payload={"reason": "same outage", "blocker_id": "t_0123456789abcdef"})
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, gate)[2] is None and _row(conn, shared)[2] is None
++
++
++def test_desk_subscription_is_written_only_with_the_escalation(kanban_home, own_gateway, monkeypatch):
++    """The desk sub is inside the escalation txn: a card that stops qualifying at the re-check gets no sub."""
++    calls = []
++    real = stranded._escalated
++
++    def flip(conn, task_id, entry):
++        calls.append(task_id)
++        return len(calls) > 1 or real(conn, task_id, entry)
++
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        monkeypatch.setattr(stranded, "_escalated", flip)
++        assert _sweep(conn, now=_later(3), cfg={"kanban": {"triage_owner_chat": DESK}}) == []
++        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++        assert conn.execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id=?", (tid,)).fetchone()[0] == 0
++
++
++def test_generated_ask_passes_the_ask_lint(kanban_home, own_gateway):
++    from hermes_cli.kanban_block_policy import standing_ask_error, user_ask_lint_error
++    with kbc.connect_closing() as conn:
++        plain = _parked(conn)
++        spend = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert sorted(_sweep(conn, now=_later(3), cfg={})) == sorted([plain, spend])
++        for tid in (plain, spend):
++            request = json.loads(_row(conn, tid)[2])
++            assert user_ask_lint_error(request) is None, request["action"]
++            assert standing_ask_error(conn, tid, "Parked work", request) is None
++        assert "Unblock = it goes back to work" in json.loads(_row(conn, plain)[2])["action"]
++
++
++def _answer(conn, tid, choice):
++    from hermes_cli import kanban_card_answer as ca
++    request = {"ownerGateway": "owner", "ownerProfile": "default", "board": "default", "task": tid,
++               "generation": ca.snapshot(conn, tid)["generation"], "choice": choice,
++               "operationId": f"desktop-op-{choice}"}
++    return ca.apply(conn, request, owner_gateway="owner", owner_profile="default", board="default",
++                    verify_source=lambda req: {"gateway": "origin", "recorded": True, "answer": req})
++
++
++def test_archive_answer_archives_and_unblock_answer_resumes(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        archived, resumed = _parked(conn), _parked(conn)
++        assert sorted(_sweep(conn, now=_later(3), cfg={})) == sorted([archived, resumed])
++        _answer(conn, archived, "archive")
++        assert kb.get_task(conn, archived).status == "archived"
++        _answer(conn, resumed, "unblock")
++        task = kb.get_task(conn, resumed)
++        assert task.status not in ("triage", "blocked", "archived") and task.human_request is None
++
++
++def test_spend_pending_unblock_answer_routes_to_promote(kanban_home, own_gateway):
++    """The Unblock button cannot release a pending spend decision (kanban_card_answer refuses it), so the ask names
++    the promote route; archive still works from the button, and promote releases the card."""
++    from hermes_cli import kanban_card_answer as ca
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert f"hermes kanban promote {tid} --reason" in json.loads(_row(conn, tid)[2])["action"]
++        # The fence's spend_decision_pending refusal surfaces from apply() as ask_changed_or_held.
++        with pytest.raises(ca.AnswerRefused, match="ask_changed_or_held|spend_decision_pending"):
++            _answer(conn, tid, "unblock")
++        assert _row(conn, tid)[0] == "triage" and _row(conn, tid)[2]
++        assert kb.promote_task(conn, tid, actor="operator", reason="rescoped")[0]
++        assert kb.get_task(conn, tid).status == "ready"
+-- 
+2.43.0
+

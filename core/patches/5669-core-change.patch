@@ -1,0 +1,449 @@
+From f2f3d2d18f5f82b52f7af1da7fa8b3a27c1c6fde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:30:07 +0000
+Subject: [PATCH] [daveey] Add authenticated card-answer runtime adapters and
+ primary-owner fences
+
+---
+ hermes_cli/kanban_card_answer.py              |  20 ++-
+ hermes_cli/kanban_card_answer_runtime.py      |  80 ++++++++++
+ hermes_cli/kanban_card_answer_transport.py    |  63 ++++++++
+ .../test_kanban_card_answer_runtime.py        | 142 ++++++++++++++++++
+ .../test_kanban_card_answer_transport.py      |  72 +++++++++
+ 5 files changed, 374 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_card_answer_runtime.py
+ create mode 100644 hermes_cli/kanban_card_answer_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_runtime.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_transport.py
+
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index 345574c607..13b4406e69 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -80,8 +80,20 @@ def _receipt(conn, task, operation_id, fingerprint):
+     return None
+ 
+ 
++def _owner(conn, task, gateway, *, require_primary=False):
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
++    if row is None or ('created_on' in row.keys() and row['created_on'] not in (None, '', gateway)):
++        raise AnswerRefused('owner_card_missing_or_foreign')
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone():
++        state = conn.execute('SELECT gateway_id,mode FROM kanban_sync_state LIMIT 1').fetchone()
++        if state is None or state['gateway_id'] != gateway or state['mode'] != 'primary':
++            raise AnswerRefused('owner_board_not_primary')
++    elif require_primary:
++        raise AnswerRefused('owner_board_not_primary')
++
++
+ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board: str,
+-          verify_source: Callable[[dict], dict]) -> dict:
++          verify_source: Callable[[dict], dict], require_primary: bool = False) -> dict:
+     """Apply only after independent source-operation and owner verification.
+ 
+     ``verify_source`` is a trusted adapter callback, NOT an envelope field. It
+@@ -99,6 +111,7 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+             or request["board"] != board or len(request["operationId"]) > 200
+             or len(request["choice"]) > 2000 or len(request["generation"]) != 64):
+         raise AnswerRefused("invalid_answer")
++    _owner(conn, request['task'], owner_gateway, require_primary=require_primary)
+     fingerprint = digest(request)
+     old = _receipt(conn, request["task"], request["operationId"], fingerprint)
+     if old:
+@@ -127,9 +140,10 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+     note = "Choice recorded in Desktop (remote): " + encoded(choices[0]) + "\nOperation: " + request["operationId"]
+ 
+     def fence(c):
++        _owner(c, request['task'], owner_gateway, require_primary=require_primary)
+         from hermes_cli.kanban_spend_decision import pending
+-        row = c.execute("SELECT * FROM tasks WHERE id=?", (request["task"],)).fetchone()
+-        if row is None or ("containment_episode" in row.keys() and row["containment_episode"]):
++        from hermes_cli.kanban_containment_guard import pending as containment_pending
++        if containment_pending(c, request['task']):
+             return "containment_hold"
+         if not archive and pending(c, request["task"]):
+             return "spend_decision_pending"
+diff --git a/hermes_cli/kanban_card_answer_runtime.py b/hermes_cli/kanban_card_answer_runtime.py
+new file mode 100644
+index 0000000000..243ad19d83
+--- /dev/null
++++ b/hermes_cli/kanban_card_answer_runtime.py
+@@ -0,0 +1,80 @@
++"""Private managed-runtime entry points; IDs are hints, authenticated records are truth.
++
++No public tool or CLI is registered here. The courier must run these in the exact
++receiving profile. Network evidence is read independently of its stdin envelope.
++"""
++from __future__ import annotations
++
++import re
++
++from hermes_cli.kanban_card_answer import AnswerRefused, apply
++from hermes_cli.kanban_card_answer_proof import verify
++from hermes_cli.kanban_card_answer_source import recorded
++from hermes_cli.kanban_card_answer_transport import Records
++
++
++def _profile():
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name
++    profile = get_active_profile_name()
++    if profile == 'custom':
++        raise AnswerRefused('local_profile_unknown')
++    return profile, get_hermes_home()
++
++
++def owner(request_id: str, proof_id: str) -> dict:
++    """Apply an authenticated exact request only in this profile's own live board."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    records = Records()
++    profile, _ = _profile()
++    original = records.read(request_id)
++    args = original.get('args')
++    answer = args.get('answer') if isinstance(args, dict) else None
++    if (not isinstance(answer, dict) or answer.get('ownerGateway') != records.gateway
++            or answer.get('ownerProfile') != profile):
++        raise AnswerRefused('owner_route_mismatch')
++    # board_own_db_path ignores a worker's HERMES_KANBAN_DB pin. Resolve only a
++    # canonical board, never a supplied file or the hub's replica database.
++    board = answer.get('board')
++    if not isinstance(board, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', board):
++        raise AnswerRefused('owner_board_invalid')
++    path = kb.board_own_db_path(board)
++    if not path.is_file():
++        raise AnswerRefused('owner_board_missing')
++    # Validate the original even on receipt replay; source readback may be offline
++    # only after the durable owner receipt already exists.
++    if (original.get('id') != request_id or original.get('to_gw') != records.gateway
++            or original.get('coll') != 'tasks' or original.get('action') != 'card-answer'
++            or original.get('key') != f"{profile}/{board}/{answer.get('task')}"):
++        raise AnswerRefused('owner_route_mismatch')
++    with connect_closing(path) as conn:
++        return apply(conn, answer, owner_gateway=records.gateway, owner_profile=profile, board=board, require_primary=True,
++                     verify_source=lambda a: verify(a, request_id=request_id, proof_id=proof_id,
++                                                   owner_gateway=records.gateway, read_request=records.read))
++
++
++def source(proof_id: str) -> dict:
++    """Prove the exact local operation, never a claimed sourceRef or recorded flag."""
++    records = Records()
++    profile, home = _profile()
++    proof = records.read(proof_id)
++    args = proof.get('args')
++    if not isinstance(args, dict) or set(args) != {'answer', 'source', 'requestId'}:
++        raise AnswerRefused('source_request_invalid')
++    identity = args['source']
++    answer = args['answer']
++    if (not isinstance(identity, dict) or set(identity) != {'gateway', 'profile', 'session'}
++            or identity.get('gateway') != records.gateway or identity.get('profile') != profile
++            or not isinstance(identity.get('session'), str) or not identity['session']
++            or not isinstance(answer, dict)):
++        raise AnswerRefused('source_route_mismatch')
++    # The same validator verifies both legs before the source operation is read.
++    # Only the result/state are substituted, not any server-stamped coordinates.
++    result = dict(args, gateway=records.gateway, recorded=True)
++    validated = dict(proof, state='done', result=result)
++    original = records.read(args['requestId'])
++    verify(answer, request_id=args['requestId'], proof_id=proof_id, owner_gateway=answer.get('ownerGateway'),
++           read_request=lambda rid: validated if rid == proof_id else original)
++    return recorded(home / 'user-steps/actions.sqlite3', source=identity,
++                    owner_gateway=answer['ownerGateway'], request_id=args['requestId'], answer=answer)
+diff --git a/hermes_cli/kanban_card_answer_transport.py b/hermes_cli/kanban_card_answer_transport.py
+new file mode 100644
+index 0000000000..29d3b49ee3
+--- /dev/null
++++ b/hermes_cli/kanban_card_answer_transport.py
+@@ -0,0 +1,63 @@
++"""Authenticated read-only Hub records for private card-answer adapters. [daveey]"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import urllib.error
++import urllib.parse
++import urllib.request
++from pathlib import Path
++
++from hermes_cli.kanban_card_answer import AnswerRefused
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        # Do not forward the enrolled gateway credential to a redirect target.
++        return None
++
++
++class Records:
++    """Configuration and credentials come from this machine, never an envelope."""
++
++    def __init__(self):
++        path = Path(os.environ.get('HERMES_MAIL_CONFIG') or Path.home() / '.config/hermes-mail/config.json')
++        config = json.loads(path.read_text(encoding='utf-8-sig'))
++        self.gateway = config.get('gateway')
++        if not isinstance(self.gateway, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', self.gateway):
++            raise AnswerRefused('local_gateway_invalid')
++        self.url = (config.get('hub_url') or config.get('url') or 'https://hub.example.invalid').rstrip('/')
++        parsed = urllib.parse.urlsplit(self.url)
++        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
++                or parsed.query or parsed.fragment):
++            raise AnswerRefused('hub_endpoint_invalid')
++        self._key = (path.parent / 'gateway.key').read_text().strip()
++        if not self._key or '\n' in self._key or '\r' in self._key:
++            raise AnswerRefused('hub_credential_invalid')
++        self._opener = urllib.request.build_opener(_NoRedirect())
++
++    def read(self, request_id: str) -> dict:
++        if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.:-]{0,199}', request_id):
++            raise AnswerRefused('courier_request_id_invalid')
++        request = urllib.request.Request(self.url + '/v2/sync/requests/' + urllib.parse.quote(request_id, safe=''),
++                                         headers={'Authorization': 'Bearer ' + self._key}, method='GET')
++        try:
++            with self._opener.open(request, timeout=10) as response:
++                raw = response.read(1024 * 1024 + 1)
++        except urllib.error.HTTPError as exc:
++            if exc.code == 404:
++                raise AnswerRefused('courier_record_missing') from None
++            raise OSError('courier_record_unavailable') from None
++        except (urllib.error.URLError, TimeoutError):
++            raise OSError('courier_record_unavailable') from None
++        if len(raw) > 1024 * 1024:
++            raise AnswerRefused('courier_record_invalid')
++        try:
++            body = json.loads(raw)
++        except (ValueError, UnicodeError):
++            raise AnswerRefused('courier_record_invalid') from None
++        record = body.get('request') if isinstance(body, dict) else None
++        if not isinstance(record, dict) or record.get('id') != request_id:
++            raise AnswerRefused('courier_record_invalid')
++        return record
+diff --git a/tests/hermes_cli/test_kanban_card_answer_runtime.py b/tests/hermes_cli/test_kanban_card_answer_runtime.py
+new file mode 100644
+index 0000000000..3d7cf2c151
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_runtime.py
+@@ -0,0 +1,142 @@
++"""Real core writes behind independently read request records; no network writes."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_runtime as runtime
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_card_answer as helpers
++from tests.hermes_cli import test_kanban_card_answer_proof as proof_helpers
++
++kanban_home = helpers.kanban_home
++
++
++def setup(monkeypatch, home):
++    with kbc.connect_closing() as conn:
++        answer = helpers.setup_answer(conn)
++        conn.execute('CREATE TABLE kanban_sync_state(gateway_id TEXT, mode TEXT)')
++        conn.execute("INSERT INTO kanban_sync_state VALUES ('owner','primary')")
++        conn.commit()
++    _, rows = proof_helpers.records()
++    for row in rows.values():
++        row['args']['answer'] = copy.deepcopy(answer)
++    rows['original']['key'] = 'default/default/' + answer['task']
++    rows['proof']['result']['answer'] = copy.deepcopy(answer)
++    calls = []
++    class Records:
++        gateway = 'owner'
++        def read(self, rid):
++            calls.append(rid)
++            return copy.deepcopy(rows[rid])
++    monkeypatch.setattr(runtime, 'Records', Records)
++    monkeypatch.setattr(runtime, '_profile', lambda: ('default', home))
++    return answer, rows, calls
++
++
++def test_owner_applies_readback_and_replays_without_proof(kanban_home, monkeypatch):
++    answer, rows, calls = setup(monkeypatch, kanban_home)
++    receipt = runtime.owner('original', 'proof')
++    assert receipt['operationId'] == answer['operationId']
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, answer['task']).status == 'ready'
++        assert len(helpers.comments(conn, answer['task'])) == 1
++    del rows['proof']
++    calls.clear()
++    assert runtime.owner('original', 'proof') == receipt
++    assert calls == ['original']
++
++
++@pytest.mark.parametrize('field,value', [('ownerGateway', 'foreign'), ('ownerProfile', 'work'),
++                                        ('board', '../default'), ('board', 'absent')])
++def test_route_refuses_without_mutation(kanban_home, monkeypatch, field, value):
++    answer, rows, _ = setup(monkeypatch, kanban_home)
++    rows['original']['args']['answer'][field] = value
++    with pytest.raises((ca.AnswerRefused, ValueError)):
++        runtime.owner('original', 'proof')
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, answer['task']).status == 'blocked'
++        assert helpers.comments(conn, answer['task']) == []
++
++
++@pytest.mark.parametrize('where', ['before', 'during'])
++def test_copied_foreign_card_refuses_under_lock(kanban_home, where):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        conn.execute('ALTER TABLE tasks ADD COLUMN created_on TEXT')
++        def foreign():
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (req['task'],))
++        if where == 'before':
++            foreign()
++        def verify(a):
++            if where == 'during':
++                foreign()
++            return helpers.verified(a)
++        with pytest.raises(ca.AnswerRefused, match='owner_card_missing_or_foreign'):
++            helpers.apply(conn, req, verify)
++        assert kb.get_task(conn, req['task']).status == 'blocked'
++        assert helpers.comments(conn, req['task']) == []
++
++
++@pytest.mark.parametrize('gateway,mode', [('foreign', 'primary'), ('owner', 'replica')])
++def test_wrong_board_identity_refuses(kanban_home, gateway, mode):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        conn.execute('CREATE TABLE kanban_sync_state(gateway_id TEXT, mode TEXT)')
++        conn.execute('INSERT INTO kanban_sync_state VALUES (?,?)', (gateway, mode))
++        conn.commit()
++        with pytest.raises(ca.AnswerRefused, match='owner_board_not_primary'):
++            helpers.apply(conn, req)
++        assert kb.get_task(conn, req['task']).status == 'blocked'
++
++
++@pytest.mark.parametrize('archive', [False, True])
++def test_containment_observation_without_marker_preserved(kanban_home, archive):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn, choices=not archive)
++        if archive:
++            req['choice'] = 'archive'
++        conn.execute('CREATE TABLE containment_observations(task_id TEXT, episode TEXT)')
++        conn.execute("INSERT INTO containment_observations VALUES (?, 'unverified-episode')", (req['task'],))
++        conn.commit()
++        with pytest.raises(ca.AnswerRefused, match='ask_changed_or_held'):
++            helpers.apply(conn, req)
++        assert kb.get_task(conn, req['task']).status == 'blocked'
++        assert helpers.comments(conn, req['task']) == []
++
++
++def test_runtime_rejects_board_without_primary_identity(kanban_home, monkeypatch):
++    answer, _, _ = setup(monkeypatch, kanban_home)
++    with kbc.connect_closing() as conn:
++        conn.execute('DROP TABLE kanban_sync_state')
++        conn.commit()
++    with pytest.raises(ca.AnswerRefused, match='owner_board_not_primary'):
++        runtime.owner('original', 'proof')
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, answer['task']).status == 'blocked'
++
++
++def test_source_reads_local_store_only_after_both_authenticated_legs(monkeypatch, tmp_path):
++    answer, rows = proof_helpers.records()
++    rows['proof'].pop('result')
++    rows['proof']['state'] = 'pending'
++    calls = []
++    class Records:
++        gateway = 'origin'
++        def read(self, rid):
++            calls.append(rid)
++            return copy.deepcopy(rows[rid])
++    monkeypatch.setattr(runtime, 'Records', Records)
++    monkeypatch.setattr(runtime, '_profile', lambda: ('work', tmp_path))
++    def read(path, **kwargs):
++        assert calls == ['proof', 'original']
++        assert path == tmp_path / 'user-steps/actions.sqlite3'
++        assert kwargs['answer'] == answer
++        return {'proof': 'from-real-reader'}
++    monkeypatch.setattr(runtime, 'recorded', read)
++    assert runtime.source('proof') == {'proof': 'from-real-reader'}
++    rows['original']['from'] = 'gw:foreign'
++    with pytest.raises(ca.AnswerRefused, match='source_request_mismatch'):
++        runtime.source('proof')
+diff --git a/tests/hermes_cli/test_kanban_card_answer_transport.py b/tests/hermes_cli/test_kanban_card_answer_transport.py
+new file mode 100644
+index 0000000000..bada376aa9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_transport.py
+@@ -0,0 +1,72 @@
++"""Exercise the actual urllib reader and credential/redirect fences offline."""
++import io
++import json
++import urllib.error
++import urllib.request
++
++import pytest
++
++from hermes_cli import kanban_card_answer_transport as transport
++from hermes_cli.kanban_card_answer import AnswerRefused
++
++
++@pytest.fixture
++def config(tmp_path, monkeypatch):
++    path = tmp_path / 'config.json'
++    path.write_text(json.dumps(dict(gateway='owner', hub_url='https://example.com/hub')))
++    (tmp_path / 'gateway.key').write_text('fixture-key')
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(path))
++    return path
++
++
++def test_reads_exact_authenticated_record(config, monkeypatch):
++    reader = transport.Records()
++    def open_request(req, timeout):
++        assert req.full_url == 'https://example.com/hub/v2/sync/requests/request-one'
++        assert req.method == 'GET' and req.headers['Authorization'] == 'Bearer fixture-key'
++        assert timeout == 10
++        return io.BytesIO(json.dumps({'request': {'id': 'request-one', 'state': 'done'}}).encode())
++    monkeypatch.setattr(reader._opener, 'open', open_request)
++    assert reader.read('request-one') == {'id': 'request-one', 'state': 'done'}
++
++
++@pytest.mark.parametrize('url', ['http://example.com', 'https://user:secret@example.com',
++                                  'https://example.com/?q=a', 'https://example.com/#fragment'])
++def test_endpoint_never_accepts_credentials_or_plaintext(config, url):
++    config.write_text(json.dumps(dict(gateway='owner', hub_url=url)))
++    with pytest.raises(AnswerRefused, match='hub_endpoint_invalid'):
++        transport.Records()
++
++
++@pytest.mark.parametrize('rid', ['../other', 'a/b', '', 'a?x=1', 'a' * 201])
++def test_untrusted_id_cannot_change_route(config, rid, monkeypatch):
++    reader = transport.Records()
++    monkeypatch.setattr(reader._opener, 'open', lambda *a, **kw: pytest.fail('network must not run'))
++    with pytest.raises(AnswerRefused, match='courier_request_id_invalid'):
++        reader.read(rid)
++
++
++@pytest.mark.parametrize('raw', [b'not JSON', b'[]', b'{"request":{"id":"other"}}', b'x' * (1024 * 1024 + 1)],
++                         ids=['invalid-json', 'array', 'wrong-id', 'oversize'])
++def test_malformed_or_wrong_record_refuses(config, raw, monkeypatch):
++    reader = transport.Records()
++    monkeypatch.setattr(reader._opener, 'open', lambda *a, **kw: io.BytesIO(raw))
++    with pytest.raises(AnswerRefused, match='courier_record_invalid'):
++        reader.read('request-one')
++
++
++@pytest.mark.parametrize('status', [302, 401, 404, 503])
++def test_http_errors_have_no_sensitive_details(config, status, monkeypatch):
++    reader = transport.Records()
++    def fail(*a, **kw):
++        raise urllib.error.HTTPError('https://private.example', status, 'private-secret', {}, None)
++    monkeypatch.setattr(reader._opener, 'open', fail)
++    with pytest.raises((OSError, AnswerRefused)) as exc:
++        reader.read('request-one')
++    assert 'private' not in str(exc.value)
++    assert str(exc.value) == ('courier_record_missing' if status == 404 else 'courier_record_unavailable')
++
++
++def test_redirect_never_forwards_enrolled_key():
++    request = urllib.request.Request('https://example.com', headers={'Authorization': 'Bearer fixture-key'})
++    assert transport._NoRedirect().redirect_request(request, None, 302, '', {}, 'https://other.example') is None
+-- 
+2.43.0
+

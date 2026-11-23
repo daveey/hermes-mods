@@ -1,0 +1,115 @@
+From ce615a933bd403d5fe4cabc890ab66100f100589 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:40:58 +0000
+Subject: [PATCH] fix(state): retain finalizer lock acquisition and cover CI
+ import surface [daveey]
+
+---
+ hermes_cli/sqlite_safe_read.py                | 13 ++---
+ scripts/ci/classify_changes.py                |  1 +
+ .../hermes_state/test_finalizer_live_lock.py  | 50 +++++++++++++++++++
+ 3 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 71d2480f5a..b3cbd6fb14 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -175,15 +175,16 @@ class _TrackingMixin:
+     _hermes_tracked_path: str | None = None
+ 
+     def close(self) -> None:  # type: ignore[misc]
+-        if getattr(_finalizer_state, "active", False):
+-            if not _live_lock.acquire(blocking=False):
+-                _deferred_closes.append(self)
+-                return
+-            _live_lock.release()  # we own it now (reentrant): the ``with`` below cannot block
+-        with _live_lock:
++        finalizing = getattr(_finalizer_state, "active", False)
++        if not _live_lock.acquire(blocking=not finalizing):
++            _deferred_closes.append(self)
++            return
++        try:
+             super().close()  # type: ignore[misc]
+             self._hermes_tracked_path = None
+             _apply_releases()
++        finally:
++            _live_lock.release()
+ 
+ 
+ class TrackedConnection(_TrackingMixin, sqlite3.Connection):
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index 90558a19a2..7d3e0e22d9 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -308,6 +308,7 @@ HERMES_STATE_IMPORTS = (
+     "agent/skill_commands.py",
+     "hermes_cli/__init__.py",
+     "hermes_cli/sqlite_runtime.py",
++    "hermes_cli/sqlite_safe_read.py",
+     "hermes_cli/timefmt.py",
+     "hermes_constants.py",
+     "hermes_dir_acl.py",
+diff --git a/tests/hermes_state/test_finalizer_live_lock.py b/tests/hermes_state/test_finalizer_live_lock.py
+index 6e1affcd74..65bb62d6f4 100644
+--- a/tests/hermes_state/test_finalizer_live_lock.py
++++ b/tests/hermes_state/test_finalizer_live_lock.py
+@@ -72,6 +72,56 @@ def test_explicit_close_still_waits_for_live_lock(tmp_path):
+     runner.join(10)
+ 
+ 
++def test_finalizer_keeps_nonblocking_acquisition_until_connection_is_closed(tmp_path, monkeypatch):
++    """A contender takes the lock at the first release; no blocking reacquisition is safe."""
++    conn = safe.connect_tracked(tmp_path / "race.db", check_same_thread=False)
++    real_lock = safe._live_lock
++    released, contender_held, finish = threading.Event(), threading.Event(), threading.Event()
++    done = threading.Event()
++
++    class HandoffLock:
++        def acquire(self, blocking=True):
++            return real_lock.acquire(blocking=blocking)
++
++        def release(self):
++            real_lock.release()
++            if not released.is_set():
++                released.set()
++                assert contender_held.wait(5)
++
++        def __enter__(self):
++            self.acquire()
++            return self
++
++        def __exit__(self, *args):
++            self.release()
++
++    def contend():
++        assert released.wait(5)
++        with real_lock:
++            contender_held.set()
++            finish.wait(10)
++
++    def finalize():
++        with safe.finalizer_close():
++            conn.close()
++        done.set()
++
++    contender = threading.Thread(target=contend, daemon=True)
++    runner = threading.Thread(target=finalize, daemon=True)
++    with monkeypatch.context() as patch:
++        patch.setattr(safe, "_live_lock", HandoffLock())
++        contender.start()
++        runner.start()
++        try:
++            assert done.wait(2), "finalizer released its nonblocking acquisition then blocked reacquiring"
++        finally:
++            finish.set()
++            contender.join(10)
++            runner.join(10)
++    assert not safe.has_live_connection(tmp_path / "race.db")
++
++
+ _EXIT_PROBE = """
+ import sys, threading
+ from pathlib import Path
+-- 
+2.43.0
+

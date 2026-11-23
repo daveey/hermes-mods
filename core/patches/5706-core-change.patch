@@ -1,0 +1,561 @@
+From e6eeedac34a85ea615198a80a51d1d4a59f47600 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:04:32 +0000
+Subject: [PATCH] [daveey] Bind plugin attestation to boot-pinned review
+ records
+
+Register reviewed directory code before import; revalidate approved files on strict observations. Keep unknowns and entry-point plugins fail-closed. Charge identify startup to its deadline.
+---
+ gateway/capsule_contract.py                   |   7 +-
+ hermes_cli/code_attestation.py                |   7 +-
+ hermes_cli/data/plugin-review-records.json    |   4 +
+ hermes_cli/plugin_review_records.py           | 111 ++++++++++++++++++
+ hermes_cli/plugins_loader.py                  |   4 +
+ tests/gateway/test_capsule_identify_budget.py |  23 +++-
+ .../test_plugin_review_attestation.py         |  95 +++++++++++++++
+ .../hermes_cli/test_plugin_review_records.py  | 104 ++++++++++++++++
+ .../plugins/code-attestation.md               |  70 +++++++++++
+ 9 files changed, 421 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/data/plugin-review-records.json
+ create mode 100644 hermes_cli/plugin_review_records.py
+ create mode 100644 tests/hermes_cli/test_plugin_review_attestation.py
+ create mode 100644 tests/hermes_cli/test_plugin_review_records.py
+ create mode 100644 website/docs/developer-guide/plugins/code-attestation.md
+
+diff --git a/gateway/capsule_contract.py b/gateway/capsule_contract.py
+index 8c45b08424..853e46de47 100644
+--- a/gateway/capsule_contract.py
++++ b/gateway/capsule_contract.py
+@@ -1,5 +1,6 @@
+ """Strict, dynamically checked availability of the cross-revision capsule ABI."""
+ import threading
++import time
+ from pathlib import Path
+ 
+ from hermes_cli.kanban_capsule_owner import CONTRACT_CAPABILITY
+@@ -35,11 +36,12 @@ def _verified_sha(*, worker=False):
+ 
+ # Advisory only: one in-flight verifier, no cached positives. A slow filesystem
+ # must withdraw v2 rather than consume the control client's entire timeout.
+-_IDENTIFY_VERIFY_BUDGET_S = 0.5
++_IDENTIFY_VERIFY_BUDGET_S = 0.4  # Leave transport/scheduling headroom inside identify's 0.5s budget.
+ _advisory_lock = threading.Lock()
+ 
+ 
+ def _advisory_sha():
++    deadline = time.monotonic() + _IDENTIFY_VERIFY_BUDGET_S
+     if not _advisory_lock.acquire(blocking=False):
+         return None
+     done = threading.Event()
+@@ -63,7 +65,8 @@ def _advisory_sha():
+     except RuntimeError:
+         _advisory_lock.release()
+         return None
+-    return result[0] if done.wait(_IDENTIFY_VERIFY_BUDGET_S) else None
++    completed = done.wait(max(0.0, deadline - time.monotonic()))
++    return result[0] if completed and time.monotonic() < deadline else None
+ 
+ 
+ def available_capabilities(capabilities, *, advertised_sha=None):
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index fd8a9fd7a1..b52556b8c8 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -288,7 +288,9 @@ def _boot_blobs(root, sha):
+             continue
+         metadata, filename = row.split(b"\t", 1)
+         mode, kind, digest = metadata.split()
+-        if kind == b"blob" and mode in (b"100644", b"100755") and filename.endswith(b".py"):
++        if (kind == b"blob" and mode in (b"100644", b"100755")
++                and (filename.endswith(b".py")
++                     or filename == b"hermes_cli/data/plugin-review-records.json")):
+             blobs[os.fsdecode(filename)] = digest.decode("ascii")
+     return blobs
+ 
+@@ -1427,6 +1429,9 @@ class Attestation:
+         """
+         with self._lock:
+             self._inventory_modules()
++            if getattr(self, '_reviewed_plugins', None):
++                from hermes_cli.plugin_review_records import verify_registered
++                verify_registered(self)
+             return {"core_root": str(self.core_root), "boot_sha": self.boot_sha,
+                     "route": self.route, "generation": self._generation,
+                     "unknowns": tuple(sorted(self._unknown))}
+diff --git a/hermes_cli/data/plugin-review-records.json b/hermes_cli/data/plugin-review-records.json
+new file mode 100644
+index 0000000000..7cc198d64a
+--- /dev/null
++++ b/hermes_cli/data/plugin-review-records.json
+@@ -0,0 +1,4 @@
++{
++  "version": 1,
++  "plugins": {}
++}
+diff --git a/hermes_cli/plugin_review_records.py b/hermes_cli/plugin_review_records.py
+new file mode 100644
+index 0000000000..4afe26dafd
+--- /dev/null
++++ b/hermes_cli/plugin_review_records.py
+@@ -0,0 +1,111 @@
++"""Boot-pinned plugin review records, never approvals inferred from installed bytes."""
++import hashlib
++import json
++import re
++from pathlib import Path, PurePosixPath
++
++REGISTRY = 'hermes_cli/data/plugin-review-records.json'
++MAX_REGISTRY = 1024 * 1024
++MAX_FILES = 4096
++MAX_FILE_BYTES = 8 * 1024 * 1024
++MAX_TOTAL_BYTES = 32 * 1024 * 1024
++
++
++def _object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError('duplicate review key')
++        result[key] = value
++    return result
++
++
++def read_records(core_root, expected_blob):
++    """Only bytes matching the exact boot tree can supply review authority."""
++    with (core_root / REGISTRY).open('rb') as stream:
++        data = stream.read(MAX_REGISTRY + 1)
++    if len(data) > MAX_REGISTRY:
++        raise ValueError('review registry limit')
++    blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
++    if not expected_blob or blob != expected_blob:
++        raise ValueError('review registry is not boot-pinned')
++    value = json.loads(data, object_pairs_hook=_object)
++    if (not isinstance(value, dict) or set(value) != {'version', 'plugins'}
++            or type(value['version']) is not int or value['version'] != 1
++            or not isinstance(value['plugins'], dict)):
++        raise ValueError('review registry schema')
++    count = 0
++    for key, files in value['plugins'].items():
++        if not isinstance(key, str) or not key or not isinstance(files, dict) or not files:
++            raise ValueError('review record schema')
++        count += len(files)
++        if count > MAX_FILES:
++            raise ValueError('review file count limit')
++        for name, digest in files.items():
++            path = PurePosixPath(name)
++            if (not name or path.is_absolute() or '..' in path.parts
++                    or path.as_posix() != name or '\\' in name or ':' in name
++                    or '\x00' in name or not isinstance(digest, str)
++                    or re.fullmatch('[0-9a-f]{64}', digest) is None):
++                raise ValueError('review file schema')
++    return value['plugins']
++
++
++def validate_files(root, digests):
++    """Fresh bounded read of every approved file, including not-yet-imported code."""
++    total = 0
++    for name, expected in digests.items():
++        path = root / name
++        if not path.resolve().is_relative_to(root):
++            raise ValueError('review file escapes root')
++        with path.open('rb') as stream:
++            data = stream.read(min(MAX_FILE_BYTES, MAX_TOTAL_BYTES - total) + 1)
++        total += len(data)
++        if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
++            raise ValueError('review source size limit')
++        if hashlib.sha256(data).hexdigest() != expected:
++            raise ValueError('review source digest mismatch')
++
++
++def register_directory(key, directory):
++    """Called before module construction; no late ledger installation."""
++    from hermes_cli import code_attestation
++    ledger = code_attestation._installed
++    if ledger is None:
++        return False
++    try:
++        root = Path(directory).resolve()
++        if root.is_relative_to(ledger.core_root):
++            return True  # Physical core custody, not the manifest's source label.
++        records = read_records(ledger.core_root, ledger._blobs.get(REGISTRY))
++        digests = records.get(key)
++        if not digests:
++            raise ValueError('plugin has no reviewed record')
++        validate_files(root, digests)
++        component = 'plugin:' + key
++        with ledger._lock:
++            expected = (root, 'plugin', digests)
++            existing = ledger._components.get(component)
++            if existing != expected:
++                ledger.register_component_root(component, root, 'plugin', digests=digests)
++            if ledger._components.get(component) != expected:
++                return False
++            ledger.__dict__.setdefault('_reviewed_plugins', {})[component] = (root, dict(digests))
++        return True
++    except (OSError, ValueError, TypeError, RecursionError):
++        ledger.mark_unknown('plugin-review-unverified:' + key)
++        return False
++
++
++def verify_registered(ledger):
++    for component, (root, digests) in getattr(ledger, '_reviewed_plugins', {}).items():
++        try:
++            validate_files(root, digests)
++        except (OSError, ValueError):
++            ledger.mark_unknown('plugin-review-drift:' + component)
++
++
++def unreviewed_entrypoint(key):
++    from hermes_cli import code_attestation
++    if code_attestation._installed is not None:
++        code_attestation._installed.mark_unknown('plugin-entrypoint-unreviewed:' + key)
+diff --git a/hermes_cli/plugins_loader.py b/hermes_cli/plugins_loader.py
+index af62745435..75ab3d6b2c 100644
+--- a/hermes_cli/plugins_loader.py
++++ b/hermes_cli/plugins_loader.py
+@@ -838,6 +838,8 @@ class PluginLoaderMixin:
+         from hermes_cli.worker_drain_capability import revoke
+         revoke('directory plugin has no reviewed drain coverage')
+         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
++        from hermes_cli.plugin_review_records import register_directory
++        register_directory(manifest_key(manifest), plugin_dir)
+         init_file = plugin_dir / "__init__.py"
+         if not init_file.exists():
+             raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
+@@ -874,6 +876,8 @@ class PluginLoaderMixin:
+         the referenced attribute (normally ``register``) for the ``module:function`` form."""
+         from hermes_cli.worker_drain_capability import revoke
+         revoke('entrypoint plugin has no reviewed drain coverage')
++        from hermes_cli.plugin_review_records import unreviewed_entrypoint
++        unreviewed_entrypoint(manifest_key(manifest))
+         for ep in _select_entry_point_group(importlib.metadata.entry_points(), ENTRY_POINTS_GROUP):
+             if ep.name == manifest.name:
+                 return ep.load()
+diff --git a/tests/gateway/test_capsule_identify_budget.py b/tests/gateway/test_capsule_identify_budget.py
+index e89f5f8f9d..8da71cde31 100644
+--- a/tests/gateway/test_capsule_identify_budget.py
++++ b/tests/gateway/test_capsule_identify_budget.py
+@@ -39,7 +39,7 @@ def test_slow_identity_withdraws_only_v2_and_never_reuses_late_positive(tmp_path
+             started = time.monotonic()
+             answer = await asyncio.to_thread(identify_gateway, home)
+             assert answer is not None, 'slow v2 check lost the entire default-timeout identify answer'
+-            assert time.monotonic() - started < 1.5
++            assert time.monotonic() - started < 0.5
+             assert entered.is_set()
+             assert answer['capabilities'] == [CAPABILITY]
+             # A hung verifier must not accumulate threads on subsequent requests.
+@@ -95,3 +95,24 @@ def test_advisory_thread_start_failure_withdraws_and_releases_slot(monkeypatch):
+         assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
+     monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
+     assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
++
++
++def test_advisory_charges_startup_and_rejects_completed_late_positive(monkeypatch):
++    from gateway import capsule_contract as contract
++    clock = [10.0]
++    monkeypatch.setattr(contract.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++
++    class LateThread:
++        def __init__(self, target):
++            self.target = target
++
++        def start(self):
++            clock[0] += 0.51
++            self.target()
++
++    monkeypatch.setattr('agent.memory_provider.spawn_context_thread',
++                        lambda target, **kwargs: LateThread(target))
++    assert contract._advisory_sha() is None
++    assert contract._advisory_lock.acquire(blocking=False)
++    contract._advisory_lock.release()
+diff --git a/tests/hermes_cli/test_plugin_review_attestation.py b/tests/hermes_cli/test_plugin_review_attestation.py
+new file mode 100644
+index 0000000000..5d63f34b11
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_review_attestation.py
+@@ -0,0 +1,95 @@
++"""Review records exercised through a real supported boot and directory loader."""
++import hashlib
++import json
++import shutil
++
++import pytest
++
++from tests.hermes_cli import test_code_attestation_route as routes
++
++core = routes.core
++python = routes.python
++pytestmark = pytest.mark.live_system_guard_bypass
++
++PLUGIN = 'from dataclasses import dataclass\n@dataclass\nclass Value:\n    number: int = 7\n'
++PROBE = '''import json, os, time
++from pathlib import Path
++from types import SimpleNamespace
++from hermes_cli import code_attestation as ca
++from hermes_cli.plugins_loader import PluginLoaderMixin
++from gateway.capsule_contract import available_capabilities, _verified_sha
++from hermes_cli.kanban_capsule_owner import CONTRACT_CAPABILITY
++root = Path(os.environ['PLUGIN_ROOT'])
++mode = os.environ['PLUGIN_MODE']
++manifest = SimpleNamespace(path=root, name='review-fixture', key='review-fixture')
++loader = PluginLoaderMixin()
++if mode == 'changed':
++    (root / '__init__.py').write_text('value = 999\\n')
++if mode == 'missing':
++    (root / 'unused.py').unlink()
++module = loader._load_directory_module(manifest, module_name='hermes_plugins.review_fixture')
++if mode == 'unrooted':
++    import sys
++    sys.path.insert(0, str(root.parent / 'outside'))
++    import outside_dependency
++if mode == 'omitted':
++    import importlib.util
++    spec = importlib.util.spec_from_file_location('hermes_plugins.extra', root / 'extra.py')
++    extra = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(extra)
++if mode == 'conflict':
++    from hermes_cli.plugin_review_records import register_directory
++    register_directory('review-fixture', root.parent / 'other-plugin')
++if mode == 'after':
++    (root / '__init__.py').write_text('value = 999\\n')
++if mode == 'reload':
++    module = loader._load_directory_module(manifest, module_name='hermes_plugins.review_fixture')
++sha = ca._ledger().boot_sha
++started = time.monotonic()
++caps = available_capabilities([CONTRACT_CAPABILITY], advertised_sha=sha)
++elapsed = time.monotonic() - started
++from hermes_cli import git_fingerprint as gf
++import subprocess
++from gateway.capsule_contract import CORE_ROOT
++json.dump({'boot': gf._capsule_boot, 'core_root': str(CORE_ROOT),
++           'disk': gf._capsule_clean_sha(CORE_ROOT),
++           'status': subprocess.check_output(['git', '-C', str(CORE_ROOT), 'status', '--porcelain'], text=True),
++           'caps': caps, 'verified': _verified_sha(), 'elapsed': elapsed,
++           'unknowns': ca.integrity_observation()['unknowns'], 'sha': sha},
++          open(os.environ['ATTEST_PROBE_OUT'], 'w'))
++'''
++
++
++@pytest.mark.parametrize('mode', ['reviewed', 'reload', 'changed', 'missing', 'after', 'unreviewed', 'unrooted',
++                                 'omitted', 'conflict'])
++def test_supported_plugin_boot(tmp_path, core, python, mode):
++    tree = tmp_path / 'core'
++    shutil.copytree(core, tree)
++    shutil.copy2(routes.ROOT / '.gitignore', tree / '.gitignore')
++    plugin = tmp_path / 'plugin'
++    plugin.mkdir()
++    (plugin / '__init__.py').write_text(PLUGIN)
++    (plugin / 'unused.py').write_text('unused = True\n')
++    outside = tmp_path / 'outside'
++    outside.mkdir()
++    (outside / 'outside_dependency.py').write_text('value = 1\n')
++    files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in plugin.iterdir()}
++    shutil.copytree(plugin, tmp_path / 'other-plugin')
++    (plugin / 'extra.py').write_text('extra = True\n')
++    records = {} if mode == 'unreviewed' else {'review-fixture': files}
++    (tree / 'hermes_cli/data/plugin-review-records.json').write_text(json.dumps({'version': 1, 'plugins': records}))
++    (tree / 'attest_probe.py').write_text(PROBE)
++    routes._git(tree, 'add', '-A')
++    routes._git(tree, 'commit', '-qm', 'review fixture')
++    result = routes.run_stub(tmp_path, python, routes.current_script(tree), extra_env={
++        'PLUGIN_ROOT': str(plugin), 'PLUGIN_MODE': mode})
++    if mode in ('reviewed', 'reload'):
++        assert result['unknowns'] == []
++        assert result['status'] == '', result['status']
++        assert result['verified'] == result['sha'], result
++        assert result['caps'] == ['kanban-capsule-contract-v2']
++    else:
++        assert result['unknowns']
++        assert result['verified'] is None
++        assert result['caps'] == []
++    assert result['elapsed'] < 0.5
+diff --git a/tests/hermes_cli/test_plugin_review_records.py b/tests/hermes_cli/test_plugin_review_records.py
+new file mode 100644
+index 0000000000..57cb73b6b4
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_review_records.py
+@@ -0,0 +1,104 @@
++"""Fail-closed review registry parsing and registration seams."""
++import hashlib
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import plugin_review_records as records
++
++
++def put(tmp_path, payload):
++    path = tmp_path / records.REGISTRY
++    path.parent.mkdir(parents=True, exist_ok=True)
++    data = payload.encode()
++    path.write_bytes(data)
++    return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
++
++
++@pytest.mark.parametrize('payload', [
++    '[]', '{"version":true,"plugins":{}}', '{"version":2,"plugins":{}}',
++    '{"version":1,"plugins":{},"extra":0}', '{"version":1,"plugins":{},"plugins":{}}',
++    '{"version":1,"plugins":{"plug":{}}}', '{"version":1,"plugins":[]}',
++    '{"version":1,"plugins":{"plug":{"__init__.py":null}}}',
++])
++def test_invalid_schema(tmp_path, payload):
++    blob = put(tmp_path, payload)
++    with pytest.raises(ValueError):
++        records.read_records(tmp_path, blob)
++
++
++@pytest.mark.parametrize('name', ['../file.py', '/file.py', './file.py', 'a//b.py', 'a\\b.py', 'C:file.py', 'a\x00.py'])
++def test_invalid_path(tmp_path, name):
++    blob = put(tmp_path, json.dumps({'version': 1, 'plugins': {'plug': {name: 'a' * 64}}}))
++    with pytest.raises(ValueError):
++        records.read_records(tmp_path, blob)
++
++
++def test_pinned_registry_and_limits(tmp_path, monkeypatch):
++    payload = json.dumps({'version': 1, 'plugins': {'plug': {'file.py': 'a' * 64}}})
++    blob = put(tmp_path, payload)
++    assert records.read_records(tmp_path, blob)['plug'] == {'file.py': 'a' * 64}
++    for wrong in (None, '0' * 40):
++        with pytest.raises(ValueError):
++            records.read_records(tmp_path, wrong)
++    monkeypatch.setattr(records, 'MAX_FILES', 0)
++    with pytest.raises(ValueError, match='count'):
++        records.read_records(tmp_path, blob)
++    monkeypatch.setattr(records, 'MAX_REGISTRY', 1)
++    with pytest.raises(ValueError, match='limit'):
++        records.read_records(tmp_path, blob)
++
++
++def test_file_bounds_and_escape(tmp_path, monkeypatch):
++    root = tmp_path / 'plugin'
++    root.mkdir()
++    source = root / 'file.py'
++    source.write_bytes(b'abc')
++    digest = hashlib.sha256(b'abc').hexdigest()
++    records.validate_files(root, {'file.py': digest})
++    with pytest.raises(ValueError, match='mismatch'):
++        records.validate_files(root, {'file.py': '0' * 64})
++    outside = tmp_path / 'outside.py'
++    outside.write_bytes(b'abc')
++    source.unlink()
++    source.symlink_to(outside)
++    with pytest.raises(ValueError, match='escapes'):
++        records.validate_files(root, {'file.py': digest})
++    source.unlink()
++    source.write_bytes(b'abc')
++    monkeypatch.setattr(records, 'MAX_FILE_BYTES', 2)
++    with pytest.raises(ValueError, match='limit'):
++        records.validate_files(root, {'file.py': digest})
++
++
++def test_unreviewed_entrypoint_latched_before_load(monkeypatch):
++    from hermes_cli import code_attestation, plugins_loader
++    events = []
++    ledger = SimpleNamespace(mark_unknown=lambda reason: events.append(reason))
++    monkeypatch.setattr(code_attestation, '_installed', ledger)
++    entry = SimpleNamespace(name='example', load=lambda: events.append('load') or 17)
++    monkeypatch.setattr(plugins_loader, '_select_entry_point_group', lambda *args: [entry])
++    monkeypatch.setattr(plugins_loader.importlib.metadata, 'entry_points', list)
++    manifest = SimpleNamespace(name='example', key='example')
++    assert plugins_loader.PluginLoaderMixin()._load_entrypoint_module(manifest) == 17
++    assert events == ['plugin-entrypoint-unreviewed:example', 'load']
++
++
++def test_uninstalled_ledger_is_not_created(tmp_path, monkeypatch):
++    from hermes_cli import code_attestation
++    monkeypatch.setattr(code_attestation, '_installed', None)
++    assert records.register_directory('example', tmp_path) is False
++    records.unreviewed_entrypoint('example')
++    assert code_attestation._installed is None
++
++
++def test_physical_core_not_source_label(tmp_path, monkeypatch):
++    from hermes_cli import code_attestation
++    unknowns = []
++    ledger = SimpleNamespace(core_root=tmp_path, _blobs={}, mark_unknown=unknowns.append)
++    monkeypatch.setattr(code_attestation, '_installed', ledger)
++    assert records.register_directory('example', tmp_path / 'bundled')
++    assert not records.register_directory('example', Path(str(tmp_path) + '-outside'))
++    assert unknowns == ['plugin-review-unverified:example']
+diff --git a/website/docs/developer-guide/plugins/code-attestation.md b/website/docs/developer-guide/plugins/code-attestation.md
+new file mode 100644
+index 0000000000..b177044ecc
+--- /dev/null
++++ b/website/docs/developer-guide/plugins/code-attestation.md
+@@ -0,0 +1,70 @@
++# Plugin code attestation for capsule owners
++
++The `kanban-capsule-contract-v2` capability requires a supported boot route, an
++unchanged clean core checkout and a process ledger with **no unknown code**.
++Enabling or installing a plugin does not satisfy that requirement. Normal legacy
++plugin loading is unchanged when attestation fails; the strict capability is
++withheld.
++
++## Reviewed directory plugins
++
++`hermes_cli/data/plugin-review-records.json` is a versioned core review record:
++
++```json
++{
++  "version": 1,
++  "plugins": {
++    "example-plugin": {
++      "__init__.py": "<64 lowercase hexadecimal SHA256 characters>",
++      "helpers.py": "<64 lowercase hexadecimal SHA256 characters>"
++    }
++  }
++}
++```
++
++The example digest placeholders are not valid records. The shipped registry is
++initially empty: this change does **not** approve any installed external plugin.
++To enroll one, review the exact plugin sources, calculate their SHA256 digests,
++and submit the record through the normal independent core review and CI path.
++Include every executable source and any file whose integrity is part of that
++review. A new plugin revision needs new review and new pinned digests. Installation
++metadata, a plugin's own manifest, a Git remote and freshly hashed installed files
++are never approval authorities.
++
++Before constructing a directory plugin module, the loader reads the bounded
++registry and checks its Git blob digest against the **boot commit's** tree entry.
++It validates the schema, canonical relative paths and all registered file bytes,
++then registers that physical directory with the executed-code ledger. Files that
++escape the directory via symlinks are rejected. Repeated loads reuse only an
++identical component/root/kind/digest registration; other overlap remains a sticky
++conflict. Resolved directories inside core keep existing core custody regardless
++of the plugin's manifest source label.
++
++Execution still requires the existing source/code-object checks. Files missing
++from the approved map cannot acquire review just by sharing the directory. Each
++strict integrity observation freshly checks all registered review-map files,
++including files not yet imported. Changed or deleted bytes withhold the capability;
++restoring bytes cannot erase an already latched unknown. Registry reads are
++bounded to 1 MiB and 4096 file records; validation reads at most 8 MiB per file and
++32 MiB per plugin. Exceeding a bound fails closed.
++
++Entry-point plugins currently have no reviewed-package registration contract.
++Their loading explicitly latches an unknown before `ep.load()`, even if their
++files have installer RECORD receipts. They continue to work on legacy paths but
++cannot advertise the strict capsule capability.
++
++## Dependencies and latency
++
++Managed dependency activation retains its existing order: register the selected
++site-packages environment, verify installer RECORD custody, then call
++`site.addsitedir`. These dependencies are **installer-trusted, not source-audited**.
++Plugin-controlled search-path additions are not automatically registered. An
++unrooted dependency or unsupported generated code still withholds the capability.
++
++Identify uses one in-flight verifier with no cached positive. Its 0.4-second
++absolute deadline includes thread setup and leaves headroom within a 0.5-second
++identify budget. Late positives are discarded. Slow storage withdraws v2 rather
++than hiding the legacy answer. OS scheduling or synchronous thread-start stalls
++cannot be hard-preempted by a Python deadline; this is not a hard-real-time
++promise. Owner launch still performs full synchronous verification, without
++filtering the ledger's unknowns.
+-- 
+2.43.0
+

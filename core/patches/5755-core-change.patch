@@ -1,0 +1,1488 @@
+From a823dd1a4a2b3310b7dd2a664de234fbcdf8b69f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:05:24 +0000
+Subject: [PATCH] [daveey] Refuse concrete model pins on new delegations from
+ Kanban workers
+
+Problem: a managed Kanban worker could start new delegated work (delegate_task tasks, the subagent lifecycle service, an internal credentials_cfg route, a backend/default route) on a concrete model/provider, endpoint, credential or transport override. That recreates the per-model restriction the no-pin policy removes from cards, one level below the dispatcher.
+Why it got through: model/provider selectors were only stripped as "hidden task fields" or passed straight into route resolution; nothing tied a child to the Kanban-origin parent that built it, so no boundary could tell a worker's delegation from an interactive one.
+Why not fixed at one caller: there are several entry paths (registry handler, AIAgent dispatch, lifecycle service, route resolution, the child builder), and tier/runtime merges add request overrides after any early check.
+
+Change (restriction only, grants no authority):
+- agent/kanban_delegation_policy.py: pure logical checks plus a process-local weak identity map from live agent objects to a restriction token. The token is never serialized, read from the environment or accepted from a request field.
+- agent/managed_worker.py registers the exact agent bound by WorkerCustody.bind_agent as a root; a natively bound worker with no registration refuses new delegation rather than falling back to interactive behaviour.
+- tools/delegate_tool.py, run_agent.py: both model-facing strip callers preflight the original tasks before stripping; a valid class selector survives, any concrete model, provider, endpoint, credential or routing override refuses the whole batch before credential resolution.
+- tools/delegate_tool_routes.py: Kanban-origin backend/default routes are staged to their logical class before any credential or profile resolution.
+- agent/subagent_lifecycle.py validates the request before cleanup, correlation, credential, session or executor work.
+- _build_child_agent checks the merged builder kwargs against the staged logical request as its first operation, registers each child with its parent's token, and request overrides are rechecked after the tier overlay.
+Dynamic allocation inside AIAgent is unchanged: the concrete route is still chosen by the native allocator from the class. Interactive, cron and other unclassified parents keep the previous behaviour, including per-task pins where config allows them.
+
+Proof (before publication, on base 9b201d02d4d1):
+- Causal RED 3 failed / 5 passed before the late tier-merge fence, then GREEN. Focused run 224 passed, 0 failed: the three test files in this commit (no_pin 174, component79 24, lineage 8) plus an 18-case JSON-string task edge probe kept as card evidence, not committed.
+- scripts/check: 21 checks OK.
+- Importing-consumer sweep, 876 lexical module consumers, run per file, serial, retries 0, 3 GiB address-space limit, 8 GiB cgroup, Linux only. It is not 876 unconditional passes:
+  - 349 files run with explicit MALLOC_ARENA_MAX=2 through the allocator opt-in landed separately in ad3b1eba4b: 347 green; tests/hermes_cli/test_code_attestation_deps.py failed once while the component was uncommitted (source-skew against HEAD) and passed 8/8 on the committed content; tests/hermes_cli/test_verify_console_scripts.py is a Windows-only whole-file skip, not applicable, not a pass.
+  - The other 527 (462 + 60 + 5 excluded) were run earlier without the allocator opt-in; their recorded failures and exclusions are retained in the card evidence and are not converted to passes here. Required exact-head CI is the authority for those files.
+
+Limits and unproved scope:
+- Linux only. The real-builder positive test stubs child-session DB open and client creation: it proves fixture admission, class allocation and lineage, not a live model response.
+- Not covered: auxiliary, MoA, plugin and external delegation paths outside delegate_task and the lifecycle service; the full per-sink override cross-product.
+- This is the delegation boundary only. Card create/edit/set-model/review-handoff boundaries, fleet remediation, deployment and live admission proof are separate work on the card and are not claimed here.
+
+Card: t_b76fc0ced1eeacb2
+---
+ agent/kanban_delegation_policy.py             | 224 +++++++++
+ agent/managed_worker.py                       |   3 +
+ agent/subagent_lifecycle.py                   |  39 +-
+ run_agent.py                                  |   9 +-
+ tests/agent/test_origin_managed_custody.py    |   7 +
+ .../hermes_cli/test_origin_worker_custody.py  |   5 +
+ .../test_kanban_delegation_component79.py     | 196 ++++++++
+ tests/tools/test_kanban_delegation_lineage.py |  96 ++++
+ tests/tools/test_kanban_delegation_no_pin.py  | 476 ++++++++++++++++++
+ tools/delegate_tool.py                        | 116 ++++-
+ tools/delegate_tool_routes.py                 |  33 +-
+ 11 files changed, 1178 insertions(+), 26 deletions(-)
+ create mode 100644 agent/kanban_delegation_policy.py
+ create mode 100644 tests/tools/test_kanban_delegation_component79.py
+ create mode 100644 tests/tools/test_kanban_delegation_lineage.py
+ create mode 100644 tests/tools/test_kanban_delegation_no_pin.py
+
+diff --git a/agent/kanban_delegation_policy.py b/agent/kanban_delegation_policy.py
+new file mode 100644
+index 0000000000..49e58b722b
+--- /dev/null
++++ b/agent/kanban_delegation_policy.py
+@@ -0,0 +1,224 @@
++"""Restriction-only classification of Kanban-native delegation lineage.
++
++A managed Kanban worker (and every descendant it builds) may start NEW delegated work only on a logical
++model class, never on a concrete model/provider pin, endpoint, credential or transport override.  This module
++holds the pure logical checks and a process-local weak identity map from live agent objects to a restriction
++token.  Nothing here grants authority: ``WorkerCustody.validated`` (creator rights, live lease) is untouched,
++and the token is never serialized, read from the environment, or accepted from a request field.
++"""
++from __future__ import annotations
++
++import os
++import threading
++import weakref
++from dataclasses import dataclass
++from types import MappingProxyType
++from typing import Any, Mapping, Optional
++
++from agent.model_routing import CLASSES
++
++
++class RestrictionError(ValueError):
++    """A new Kanban-origin delegation asked for something other than a logical class."""
++
++
++class _Token:
++    """Identity-only restriction marker shared by a native root and its descendants."""
++    __slots__ = ()
++
++
++@dataclass(frozen=True, eq=False)
++class LogicalRequest:
++    """What a new delegation logically asked for; dynamic allocation happens later, inside AIAgent."""
++    model_class: str
++    tuning: Mapping[str, Any]
++    origin: _Token
++
++
++_LOCK = threading.RLock()  # a weakref drop callback can run while a registration holds it
++_ENTRIES: dict[int, tuple[weakref.ref, _Token]] = {}
++
++_TRANSPORT_KEYS = ("base_url", "api_key", "api_mode", "command", "args", "acp_command", "acp_args")
++_ROUTING_KEYS = frozenset({"model", "provider", *_TRANSPORT_KEYS, "models", "route", "fallbacks"})
++_WIRE_CONTAINERS = ("extra_body", "extra_query")
++_AUTH_HEADERS = frozenset({"authorization", "x-api-key", "api-key", "host"})
++_KEPT_TUNING = ("request_overrides", "reasoning_effort", "service_tier", "label")
++
++
++def _registered(ident: int) -> bool:
++    with _LOCK:
++        return ident in _ENTRIES
++
++
++def _lookup(agent: Any) -> Optional[_Token]:
++    entry = _ENTRIES.get(id(agent))
++    return entry[1] if entry is not None and entry[0]() is agent else None
++
++
++def _put(agent: Any, token: _Token) -> None:
++    ident = id(agent)
++
++    def drop(ref, ident=ident):
++        with _LOCK:
++            if (entry := _ENTRIES.get(ident)) is not None and entry[0] is ref:
++                del _ENTRIES[ident]
++    try:
++        _ENTRIES[ident] = (weakref.ref(agent, drop), token)
++    except TypeError as exc:
++        raise RestrictionError("invalid_delegation_parent") from exc
++
++
++def register_root(agent: Any, original: Any) -> None:
++    """Trusted seam, called right after ``WorkerCustody.bind_agent``: classify the exact bound agent."""
++    from agent.origin_worker_custody import WorkerCustody
++    bound = getattr(agent, "_native_origin_worker_custody", None)
++    store = getattr(agent, "_session_db", None)
++    if (type(original) is not WorkerCustody or type(bound) is not WorkerCustody or bound is original
++            or original.agent is not None or bound.agent is not agent or store is None or bound.store is not store
++            or bound._handoff is not original._handoff or not original._handoff.used
++            or bound.session_id != original.session_id or getattr(agent, "session_id", None) != bound.session_id
++            or bound.pid != os.getpid() or tuple(sorted(store.scope.items())) != bound.execution_scope):
++        raise RestrictionError("invalid_worker_origin_registration")
++    with _LOCK:
++        if _lookup(agent) is not None:
++            raise RestrictionError("duplicate_worker_origin_registration")
++        _put(agent, _Token())
++
++
++def register_child(parent: Any, child: Any, token: Any) -> None:
++    """Classify a newly built descendant; ``token`` must be exactly the parent's registered token."""
++    with _LOCK:
++        if token is None or _lookup(parent) is not token or _lookup(child) is not None:
++            raise RestrictionError("invalid_delegation_lineage")
++        _put(child, token)
++
++
++def origin_for(agent: Any) -> Optional[_Token]:
++    """The agent's restriction token, or None for an unclassified (interactive/cron) parent.
++
++    A natively bound worker with no registration is an invariant failure, never an interactive fallback."""
++    with _LOCK:
++        token = _lookup(agent)
++    if token is not None:
++        return token
++    from agent.origin_worker_custody import WorkerCustody
++    bound = getattr(agent, "_native_origin_worker_custody", None)
++    if type(bound) is WorkerCustody and bound.agent is agent:
++        raise RestrictionError("Kanban worker delegation lineage is unregistered; refusing new delegation.")
++    return None
++
++
++# ── pure logical checks ──────────────────────────────────────────────────────────────────────
++
++
++def parent_class(parent: Any) -> str:
++    meta = getattr(parent, "model_routing", None)
++    level = meta.get("requested_class") if isinstance(meta, dict) else None
++    return f"class:{level}" if level in CLASSES else "class:standard"
++
++
++def is_class(model: Any) -> bool:
++    return isinstance(model, str) and model.startswith("class:") and model[len("class:"):] in CLASSES
++
++
++def _blank(value: Any) -> bool:
++    return value is None or (isinstance(value, (str, list, tuple, dict)) and len(value) == 0)
++
++
++def _where(index: Optional[int]) -> str:
++    return "" if index is None else f"Task {index}: "
++
++
++def _refuse(index: Optional[int], what: str) -> RestrictionError:
++    return RestrictionError(
++        f"{_where(index)}{what}. New delegations from a Kanban worker take a model class "
++        f"(class:{'|class:'.join(sorted(CLASSES))}) with provider auto; concrete models, providers, endpoints, "
++        f"credentials and routing overrides are not accepted.")
++
++
++def class_for_selectors(source: Mapping[str, Any], parent: Any, index: Optional[int] = None) -> str:
++    """The validated logical class for a task/config/request mapping; refuses every concrete selector."""
++    model, provider = source.get("model"), source.get("provider")
++    if model is not None and not isinstance(model, str):
++        raise _refuse(index, "model must be a string class selector")
++    if provider is not None and not isinstance(provider, str):
++        raise _refuse(index, "provider must be a string")
++    if model and not is_class(model):
++        raise _refuse(index, f"model {model!r} is not a configured class")
++    if provider not in (None, "", "auto"):
++        raise _refuse(index, f"provider {provider!r} is a concrete pin")
++    for key in _TRANSPORT_KEYS:
++        if not _blank(source.get(key)):
++            raise _refuse(index, f"{key} is a transport override")
++    return model or parent_class(parent)
++
++
++def check_request_overrides(overrides: Any, index: Optional[int] = None) -> None:
++    """Refuse routing keys at the top level and in the SDK merge containers; other tuning is untouched."""
++    if overrides is None:
++        return
++    if not isinstance(overrides, Mapping):
++        raise _refuse(index, "request_overrides must be a mapping")
++    for key in overrides:
++        if str(key).lower() in _ROUTING_KEYS:
++            raise _refuse(index, f"request_overrides.{key} is a routing override")
++    for name in _WIRE_CONTAINERS:
++        inner = overrides.get(name)
++        if inner is None:
++            continue
++        if not isinstance(inner, Mapping):
++            raise _refuse(index, f"request_overrides.{name} must be a mapping")
++        for key in inner:
++            if str(key).lower() in _ROUTING_KEYS:
++                raise _refuse(index, f"request_overrides.{name}.{key} is a routing override")
++    headers = overrides.get("extra_headers")
++    if headers is not None:
++        if not isinstance(headers, Mapping):
++            raise _refuse(index, "request_overrides.extra_headers must be a mapping")
++        for key in headers:
++            if str(key).lower() in _AUTH_HEADERS:
++                raise _refuse(index, f"request_overrides.extra_headers.{key} is a destination/auth override")
++
++
++def preflight_tasks(parent: Any, tasks: Any) -> list[str]:
++    """Class for every task (whole-batch refusal); non-list/non-dict shapes keep their native handling."""
++    if not isinstance(tasks, list):
++        return []
++    return [class_for_selectors(t, parent, i) for i, t in enumerate(tasks) if isinstance(t, Mapping)]
++
++
++def canonical_route(route: Mapping[str, Any], model_class: str, index: Optional[int] = None) -> dict[str, Any]:
++    """Backend/default route -> its logical class, discarding stored concrete selectors and endpoints.
++
++    Active override pins refuse instead of disappearing; non-routing tuning is preserved."""
++    check_request_overrides(route.get("request_overrides"), index)
++    out = {key: route[key] for key in _KEPT_TUNING if route.get(key) is not None}
++    return {**out, "model": model_class, "provider": "auto", "fallback_providers": []}
++
++
++def class_for_config(cfg: Mapping[str, Any], parent: Any) -> tuple[str, dict[str, Any]]:
++    """An explicit credentials_cfg/lifecycle block is a NEW logical request: validate, then canonicalize."""
++    model_class = class_for_selectors(cfg, parent)
++    return model_class, canonical_route(cfg, model_class)
++
++
++def logical_request(model_class: str, route: Mapping[str, Any], token: _Token) -> LogicalRequest:
++    tuning = {k: route[k] for k in _KEPT_TUNING if route.get(k) is not None}
++    return LogicalRequest(model_class, MappingProxyType(tuning), token)
++
++
++def fence_build(parent: Any, logical: Any, **merged: Any) -> Optional[_Token]:
++    """Builder's first operation: the merged builder kwargs must still equal the staged logical request."""
++    token = origin_for(parent)
++    if token is None and logical is None:
++        return None
++    if token is None or not isinstance(logical, LogicalRequest) or logical.origin is not token:
++        raise RestrictionError("Kanban delegation build refused: missing or mismatched logical request.")
++    if merged.get("model") != logical.model_class or merged.get("override_provider") not in (None, "", "auto"):
++        raise _refuse(None, "the build selection differs from the validated class request")
++    for key in ("override_base_url", "override_api_key", "override_api_mode", "override_acp_command",
++                "override_acp_args"):
++        if not _blank(merged.get(key)):
++            raise _refuse(None, f"{key} is a transport override")
++    check_request_overrides(merged.get("override_request_overrides"))
++    return token
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index e1110cb027..7336a7e138 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -410,6 +410,9 @@ def execute(frame, channel):
+                 bind_adopted_agent(agent, store, home=frame['home'], scope=scope)
+             if origin_custody is not None:
+                 origin_custody.bind_agent(agent)
++                # Restriction-only lineage for NEW delegations (no authority; see kanban_delegation_policy).
++                from agent.kanban_delegation_policy import register_root
++                register_root(agent, origin_custody)
+             if controls.stopped.is_set():
+                 from agent.interrupt_compat import request_hard_interrupt
+                 request_hard_interrupt(agent)
+diff --git a/agent/subagent_lifecycle.py b/agent/subagent_lifecycle.py
+index 3342bfcd2d..23413f41d1 100644
+--- a/agent/subagent_lifecycle.py
++++ b/agent/subagent_lifecycle.py
+@@ -283,6 +283,18 @@ class SubagentLifecycleService:
+         parent_session_id = _session_id_of(parent)
+         if request.parent_session_id and request.parent_session_id != parent_session_id:
+             raise SubagentLifecycleError("parent_session_id does not match the active session.")
++        # Kanban-origin parents: validate the logical request (and the legacy default's tuning) before ANY cleanup,
++        # correlation, credential, session or executor work.
++        from agent import kanban_delegation_policy as policy
++        origin, model_class, scoped_cfg = None, "", {}
++        try:
++            origin = policy.origin_for(parent)
++            if origin is not None:
++                from tools.delegate_tool import _load_config
++                model_class = policy.class_for_selectors({"model": request.model, "provider": request.provider}, parent)
++                scoped_cfg = policy.canonical_route(_load_config(), model_class)
++        except policy.RestrictionError as exc:
++            raise SubagentLifecycleError(str(exc)) from exc
+         correlation_key = (parent_session_id, request.correlation_id or "")
+         with _REGISTRY.lock:
+             self._cleanup_locked()
+@@ -294,20 +306,27 @@ class SubagentLifecycleService:
+             DEFAULT_MAX_ITERATIONS,
+         )
+         # Routing precedence: request.provider > delegation config > parent.
+-        routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
++        if origin is not None:  # a class request is the only routing source; legacy concrete defaults are canonicalized
++            routing_cfg, extra = scoped_cfg, {"logical_request": policy.logical_request(model_class, scoped_cfg, origin)}
++        else:
++            routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
++            extra = {}
+         try:
+             creds = _resolve_delegation_credentials(routing_cfg, parent)
+         except ValueError as exc:
+             raise SubagentLifecycleError(str(exc)) from exc
+-        child = _build_child_preserving_parent_tools(
+-            task_index=0, goal=request.goal, context=request.context,
+-            toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+-            model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
+-            task_count=1, parent_agent=parent, role=request.role,
+-            model_source=("caller_pin" if request.model or request.provider else
+-                          "delegation_default" if routing_cfg.get("model") or routing_cfg.get("provider")
+-                          else "parent_inherit"), **_credential_overrides(creds, routing_cfg),
+-        )
++        try:
++            child = _build_child_preserving_parent_tools(
++                task_index=0, goal=request.goal, context=request.context,
++                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
++                model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
++                task_count=1, parent_agent=parent, role=request.role,
++                model_source=("caller_pin" if request.model or request.provider else
++                              "delegation_default" if routing_cfg.get("model") or routing_cfg.get("provider")
++                              else "parent_inherit"), **_credential_overrides(creds, routing_cfg), **extra,
++            )
++        except policy.RestrictionError as exc:
++            raise SubagentLifecycleError(str(exc)) from exc
+         subagent_id = str(getattr(child, "_subagent_id", "") or "")
+         if not subagent_id:
+             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
+diff --git a/run_agent.py b/run_agent.py
+index 2652654751..71d40120ce 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1442,14 +1442,19 @@ class AIAgent(
+ 
+     def _dispatch_delegate_task(self, function_args: dict) -> str:
+         """Single call site for delegate_task dispatch; new DELEGATE_TASK_SCHEMA fields are added only here."""
+-        from tools.delegate_tool import _strip_model_hidden_task_fields, delegate_task as _delegate_task
++        from tools.delegate_tool import delegate_task as _delegate_task, prepare_model_tasks
++        from tools.registry import tool_error
++        try:  # a Kanban-origin parent's original tasks are preflighted before the hidden selectors are stripped
++            tasks = prepare_model_tasks(self, function_args.get("tasks"))
++        except ValueError as exc:
++            return tool_error(str(exc))
+         # Top-level MODEL delegations run in the background (handle returned, results re-enter as messages),
+         # unless the session's delegate_task is the joined variant (one-shot, delegation.gateway_mode inline).
+         # An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and owns no gateway
+         # session. The schema-level `background` param is intentionally ignored.
+         return _delegate_task(
+             goal=function_args.get("goal"), context=function_args.get("context"),
+-            tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
++            tasks=tasks,
+             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
+             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
+             action=function_args.get("action"),
+diff --git a/tests/agent/test_origin_managed_custody.py b/tests/agent/test_origin_managed_custody.py
+index 8e2a51f6dd..86659313c3 100644
+--- a/tests/agent/test_origin_managed_custody.py
++++ b/tests/agent/test_origin_managed_custody.py
+@@ -176,13 +176,20 @@ def test_adopted_execute_binds_managed_custody_only_without_task_custody(tmp_pat
+     calls, task_bound = [], []
+     capability = SimpleNamespace(bind_agent=task_bound.append) if kanban else None
+     monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: capability)
++    # This is a wiring-only mock, not a counterfeit native custody capability. Keep the restriction
++    # registration seam observable without relaxing its production exact-WorkerCustody validation.
++    registered = []
++    monkeypatch.setattr('agent.kanban_delegation_policy.register_root',
++                        lambda agent, original: registered.append((agent, original)))
+     monkeypatch.setattr(origin_managed_custody, 'bind_adopted_agent',
+                         lambda agent, store, **kw: calls.append((agent, store, kw)))
+ 
+     def turns(agent, frame, history):
+         if kanban:
+             assert task_bound == [agent] and calls == []
++            assert registered == [(agent, capability)]
+         else:
++            assert registered == []
+             [(bound, store, kw)] = calls
+             # The harness substitutes its store class; the seam must pass the one the agent was built on.
+             assert bound is agent and store is built['session_db']
+diff --git a/tests/hermes_cli/test_origin_worker_custody.py b/tests/hermes_cli/test_origin_worker_custody.py
+index 3bdd478580..0e1ef086ac 100644
+--- a/tests/hermes_cli/test_origin_worker_custody.py
++++ b/tests/hermes_cli/test_origin_worker_custody.py
+@@ -130,9 +130,14 @@ def test_adopted_execute_hands_capability_to_constructed_agent(tmp_path, monkeyp
+     bound = []
+     capability = SimpleNamespace(bind_agent=lambda agent: bound.append(agent))
+     monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: capability)
++    registered = []
++    monkeypatch.setattr('agent.kanban_delegation_policy.register_root',
++                        lambda agent, original: registered.append((agent, original)))
+     def turns(agent, frame, history):
+         assert bound == [agent]
++        assert registered == [(agent, capability)]  # restriction lineage registered after the bind, before any turn
+         return dict(final_response='ok', completed=True)
+     monkeypatch.setattr(session_kanban, 'run_worker_turns', turns)
+     _execute(frame, monkeypatch)
+     assert len(bound) == 1
++    assert len(registered) == 1
+diff --git a/tests/tools/test_kanban_delegation_component79.py b/tests/tools/test_kanban_delegation_component79.py
+new file mode 100644
+index 0000000000..574974e103
+--- /dev/null
++++ b/tests/tools/test_kanban_delegation_component79.py
+@@ -0,0 +1,196 @@
++"""Bounded SPEC77 late-merge and real-construction controls (no provider traffic)."""
++import json
++from copy import deepcopy
++from unittest.mock import MagicMock
++
++import pytest
++
++from agent import kanban_delegation_policy as policy
++from tests.tools import test_kanban_delegation_no_pin as pins
++
++worker = pins.worker
++native = pins.native
++effects = pins.effects
++interactive = pins.interactive
++
++
++class Child:
++    def __init__(self, overrides):
++        self.request_overrides = overrides
++
++
++@pytest.mark.parametrize("late", [{"model": "late-pin"}, {"extra_body": {"provider": {"order": ["p"]}}},
++                                 {"extra_headers": {"HOST": "late.invalid"}}])
++def test_postconstruction_tier_merge_rechecked_and_unstarted_child_closed(native, monkeypatch, late):
++    import tools.delegate_tool as dt
++    routes, error = dt._routes_for([{"goal": "neutral work"}], {}, None, native)
++    assert not error
++    # Construction can merge provider defaults; the tier pin is the last merge before launch.
++    child = Child({"temperature": 0.2})
++    policy.register_child(native, child, policy.origin_for(native))
++    routes[0].creds["task_tier_overrides"] = late
++    closed, detached = [], []
++    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", lambda **kw: child)
++    monkeypatch.setattr(dt, "_close_child", lambda obj, *a: closed.append(obj))
++    monkeypatch.setattr(dt, "_detach_child", lambda parent, obj: detached.append(obj))
++    children, error = dt._build_children([{"goal": "neutral work"}], [None], routes, top_role="leaf",
++        max_iterations=2, parent_agent=native, live_deleg_id=None, live_writers=[])
++    assert children == [] and error, "late routing mutation escaped the actual _build_children caller"
++    assert closed == detached == [child]
++
++
++def test_postconstruction_harmless_tier_merge_admitted(native, monkeypatch):
++    import tools.delegate_tool as dt
++    routes, error = dt._routes_for([{"goal": "neutral work"}], {}, None, native)
++    assert not error
++    child = Child({"temperature": 0.2, "service_tier": "old"})
++    policy.register_child(native, child, policy.origin_for(native))
++    routes[0].creds["task_tier_overrides"] = {"service_tier": "priority"}
++    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", lambda **kw: child)
++    children, error = dt._build_children([{"goal": "neutral work"}], [None], routes, top_role="leaf",
++        max_iterations=2, parent_agent=native, live_deleg_id=None, live_writers=[])
++    assert not error and children[0][2] is child
++    assert child.request_overrides == {"temperature": 0.2, "service_tier": "priority"}
++
++
++def test_real_builder_registers_descendants_and_dynamic_alternative_under_pool_wall(native, monkeypatch):
++    from agent.credential_pool import load_pool
++    from agent.delegation_context import delegated_child_context
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from hermes_cli.config import atomic_config_write, load_config_readonly
++    from hermes_constants import get_hermes_home
++    from tests.agent.test_model_routing import policy as routing_policy
++    from tests.hermes_cli.test_codex_subscription_routing import PRO
++    import tools.delegate_tool as dt
++    home = get_hermes_home()
++    # The worker fixture fakes Path.home to its home parent; keep auth's real-root seat belt enabled
++    # while distinguishing this disposable HERMES_HOME from that fake account root.
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: home.parent / "account79")
++    cfg = load_config_readonly()
++    cfg.update(routing_policy())
++    alternative = deepcopy(cfg["model_routing"]["routes"]["deep"][0])
++    alternative["capabilities"]["streaming"] = True
++    blocked = dict(alternative, provider="openai-codex", model="gpt-5.5")
++    # Keep the walled route and an authentically excluded paid route in the registry.
++    paid = dict(alternative, provider="openrouter", model="paid", billing="metered")
++    cfg["model_routing"]["routes"]["deep"] = [blocked, alternative, paid]
++    cfg["model"] = {"context_length": 100000}
++    atomic_config_write(home / "config.yaml", cfg)
++    (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {
++        "openai-codex": [{"id": "wall", "auth_type": "oauth", "source": "manual:device_code",
++                          "priority": 0, "access_token": PRO}],
++        "anthropic": [{"id": "eligible", "auth_type": "oauth", "source": "manual",
++                       "priority": 0, "access_token": "sk-ant-oat01-fixture-only"}]}}))
++    pool = load_pool("openai-codex", allowed_auth_types={"oauth"})
++    assert pool.has_available(model="gpt-5.5")
++    pool.mark_exhausted_and_rotate(status_code=429, credential_id="wall", model="gpt-5.5")
++    assert not load_pool("openai-codex", allowed_auth_types={"oauth"}).has_available(model="gpt-5.5")
++    raw = "Please delegate neutral analysis using the available subscription class."
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="neutral carrier79", assignee="default")
++        kb.add_comment(conn, tid, "operator", raw)
++        context = kb.build_worker_context(conn, tid)
++    assert raw in context
++    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
++    monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", lambda *a, **kw: MagicMock())
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 4)
++    # Local DB-open effect is isolated: allocation and actual AIAgent construction stay real.
++    monkeypatch.setattr(dt, "_open_child_session_db", lambda *a, **kw: None)
++    monkeypatch.setattr("httpx.Client.send", lambda *a, **kw: pytest.fail("network during construction"))
++    made = []
++    try:
++        for parent in (native,):
++            routes, error = dt._routes_for([{"goal": "neutral analysis", "model": "class:deep", "provider": "auto"}], {}, None, parent)
++            assert not error
++            child = dt._build_child_agent(task_index=0, goal="neutral analysis", context=context, toolsets=None,
++                model=routes[0].creds["model"], max_iterations=2, task_count=1, parent_agent=parent,
++                logical_request=routes[0].logical, **dt._route_overrides(routes[0]))
++            made.append(child)
++        with delegated_child_context():
++            routes, error = dt._routes_for([{"goal": "neutral descendant"}], {}, None, child)
++            assert not error
++            grandchild = dt._build_child_agent(task_index=0, goal="neutral descendant", context=None, toolsets=None,
++                model=routes[0].creds["model"], max_iterations=2, task_count=1, parent_agent=child,
++                logical_request=routes[0].logical, **dt._route_overrides(routes[0]))
++            made.append(grandchild)
++            rejected, error = dt._routes_for([{"goal": "forged pin", "model": "gpt-5.5"}], {}, None, grandchild)
++            assert error and not rejected
++        for obj in made:
++            assert policy.origin_for(obj) is policy.origin_for(native)
++            assert obj.provider == "anthropic" and obj.model == alternative["model"]
++            assert obj.model_routing["requested_class"] == "deep"
++            assert obj.model_routing["billing_group"] == "subscription"
++            assert not getattr(obj, "_native_origin_worker_custody", None)
++            assert obj._credential_pool.current().auth_type == "oauth"
++            assert not obj._fallback_chain
++        assert child.session_id != grandchild.session_id
++        assert len(cfg["model_routing"]["routes"]["deep"]) == 3
++    finally:
++        for obj in reversed(made):
++            obj.release_clients()
++
++
++@pytest.mark.parametrize("sink", ["registry", "dispatch", "facade"])
++def test_managed_continue_native_refusal_precedes_effects(native, monkeypatch, sink):
++    import tools.delegate_tool as dt
++    from tools.registry import registry
++    monkeypatch.setattr("tools.delegate_tool_continue._claim_resume", lambda *a: pytest.fail("resume claimed"))
++    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a: pytest.fail("credentials"))
++    args = {"action": "continue", "subagent_id": "old-child", "message": "next"}
++    if sink == "registry":
++        result = registry.get_entry("delegate_task").handler(args, parent_agent=native)
++    elif sink == "dispatch":
++        result = native._dispatch_delegate_task(args)
++    else:
++        result = dt.delegate_task(parent_agent=native, **args)
++    assert "unavailable in managed worker sessions" in result
++
++
++@pytest.mark.parametrize("fields", [{"model": " class:deep"}, {"model": "class:Deep"},
++                                   {"model": 7}, {"provider": 7}])
++def test_lifecycle_noncanonical_and_nonstring_selectors_have_no_effect(native, effects, fields):
++    from agent.subagent_lifecycle import SubagentLifecycleError
++    with pytest.raises(SubagentLifecycleError):
++        pins._launch(native, **fields)
++    assert effects.calls == []
++
++
++@pins.CALLERS
++def test_forged_identity_fields_cannot_clear_authenticated_restriction(native, effects, caller):
++    task = {"goal": "do the task", "model": "concrete-pin", "provider": "anthropic",
++            "origin": "interactive", "model_source": "restored", "exact_pin": True,
++            "metadata": {"origin": "interactive"}, "request_overrides": {"origin": "interactive"}}
++    assert pins._refused(caller(native, [task]))
++    assert effects.calls == []
++
++
++@pins.CALLERS
++def test_malformed_nonmapping_task_is_structured_error(native, effects, caller):
++    assert pins._refused(caller(native, ["not a task"]))
++    assert effects.calls == []
++
++
++def test_unrelated_interactive_object_stays_unrestricted_while_root_registered(native, interactive, effects, monkeypatch):
++    assert policy.origin_for(native) is not None and policy.origin_for(interactive) is None
++    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", lambda cfg, parent: {
++        "model": cfg.get("model"), "provider": cfg.get("provider"), "base_url": None, "api_key": None,
++        "api_mode": None, "request_overrides": None})
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: True)
++    assert pins.ADMITTED in pins._caller_facade(interactive, [{"goal": "do it", "model": "exact"}])
++    effects.calls.clear()
++    assert pins._refused(pins._caller_facade(native, [{"goal": "do it", "model": "exact"}]))
++    assert effects.calls == []
++
++
++@pytest.mark.parametrize("field", ["pid", "session_id", "store", "agent", "execution_scope"])
++def test_malformed_bound_root_capability_refused(worker, field):
++    from dataclasses import replace
++    agent = worker[0]
++    bound = agent._native_origin_worker_custody
++    changes = {"pid": -1, "session_id": "wrong-session", "store": object(), "agent": object(),
++               "execution_scope": ()}
++    agent._native_origin_worker_custody = replace(bound, **{field: changes[field]})
++    with pytest.raises(policy.RestrictionError, match="invalid_worker_origin_registration"):
++        policy.register_root(agent, agent._test_original_worker_custody)
+diff --git a/tests/tools/test_kanban_delegation_lineage.py b/tests/tools/test_kanban_delegation_lineage.py
+new file mode 100644
+index 0000000000..e6270ae53c
+--- /dev/null
++++ b/tests/tools/test_kanban_delegation_lineage.py
+@@ -0,0 +1,96 @@
++"""Restriction lineage: authenticated root registration, descendants, and no authority from the token."""
++import gc
++from types import SimpleNamespace
++
++import pytest
++
++from agent import kanban_delegation_policy as policy
++from tests.tools import test_kanban_delegation_no_pin as pins
++
++worker = pins.worker
++effects = pins.effects
++interactive = pins.interactive
++
++
++class _Child:
++    """Weakref-able stand-in for a built child agent."""
++
++
++@pytest.fixture
++def root(worker):
++    agent = worker[0]
++    policy.register_root(agent, agent._test_original_worker_custody)
++    agent.model_routing = {"requested_class": "fast"}
++    return agent
++
++
++def test_root_registers_once_and_classifies(root):
++    assert policy.origin_for(root) is not None
++    with pytest.raises(policy.RestrictionError):
++        policy.register_root(root, root._test_original_worker_custody)
++
++
++def test_registration_requires_the_exact_bound_capability(worker):
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    agent, store = worker[0], worker[1]
++    other = _agent_with_db(store, session_id=agent.session_id, platform="kanban")
++    with pytest.raises(policy.RestrictionError):
++        policy.register_root(other, agent._test_original_worker_custody)  # never bound to `other`
++    with pytest.raises(policy.RestrictionError):
++        policy.register_root(agent, SimpleNamespace(_handoff=None))  # not a WorkerCustody
++    with pytest.raises(policy.RestrictionError):
++        policy.register_root(agent, None)
++
++
++def test_unregistered_interactive_parent_is_unclassified(interactive):
++    assert policy.origin_for(interactive) is None
++
++
++def test_bound_native_agent_without_registration_fails_closed(worker):
++    with pytest.raises(policy.RestrictionError):
++        policy.origin_for(worker[0])
++
++
++def test_child_lineage_and_grandchild_restriction(root, effects, monkeypatch):
++    monkeypatch.setattr("tools.delegate_tool._get_max_spawn_depth", lambda: 4)
++    token = policy.origin_for(root)
++    child, grandchild = _Child(), _Child()
++    policy.register_child(root, child, token)
++    assert policy.origin_for(child) is token
++    child._delegate_depth = 1
++    policy.register_child(child, grandchild, policy.origin_for(child))
++    assert policy.origin_for(grandchild) is token
++    grandchild._delegate_depth = 2
++    child.model_routing = {"requested_class": "standard"}
++    result = pins._caller_facade(child, [{"goal": "grandchild pin attempt", "model": "gpt-5"}])
++    assert pins._refused(result) and "depth limit" not in result
++    assert effects.calls == []
++    assert pins.ADMITTED in pins._caller_facade(child, [{"goal": "grandchild class work"}])
++    assert effects.routes[0].creds["model"] == "class:standard"
++
++
++def test_token_for_an_unrelated_parent_refuses(root, interactive):
++    token = policy.origin_for(root)
++    with pytest.raises(policy.RestrictionError):
++        policy.register_child(interactive, _Child(), token)
++    with pytest.raises(policy.RestrictionError):
++        policy.register_child(root, _Child(), object())
++    assert policy.origin_for(interactive) is None
++
++
++def test_registered_descendant_gains_no_native_creator_authority(root):
++    child = _Child()
++    policy.register_child(root, child, policy.origin_for(root))
++    assert getattr(child, "_native_origin_worker_custody", None) is None
++    capability = root._native_origin_worker_custody
++    assert capability.validated(None) is None  # no live facade turn: the token never grants a lease
++
++
++def test_registration_is_weak(root):
++    child = _Child()
++    policy.register_child(root, child, policy.origin_for(root))
++    ident = id(child)
++    assert policy._registered(ident) is True
++    del child
++    gc.collect()
++    assert policy._registered(ident) is False
+diff --git a/tests/tools/test_kanban_delegation_no_pin.py b/tests/tools/test_kanban_delegation_no_pin.py
+new file mode 100644
+index 0000000000..7e1764ab44
+--- /dev/null
++++ b/tests/tools/test_kanban_delegation_no_pin.py
+@@ -0,0 +1,476 @@
++"""New Kanban-origin delegations take a logical model class, never a concrete model/provider pin.
++
++Every test drives a real named caller (registry handler, AIAgent dispatch, delegate_task/_routes_for,
++SubagentLifecycleService.launch, the child builder) from the authenticated adopted-worker fixture, with
++*effect* sentinels around credential resolution, budget, transcripts, announcements, builds and
++executor submission.  A positive control stops at the first allowed effect: admission proof, not a model run.
++"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from tests.hermes_cli import test_origin_worker_custody as custody_tests
++
++worker = custody_tests.worker  # module alias: a directly imported fixture name would be shadowed (F811)
++
++CLASSES = ("deep", "standard", "fast")
++ADMITTED = "admitted-at-build"
++
++
++def _register(agent, capability):
++    from agent import kanban_delegation_policy as policy
++    policy.register_root(agent, capability)
++
++
++class Effects:
++    def __init__(self):
++        self.calls = []
++        self.routes = []
++        self.build_kwargs = {}
++
++    def note(self, name):
++        self.calls.append(name)
++
++
++@pytest.fixture
++def effects(monkeypatch):
++    rec = Effects()
++    import tools.delegate_tool as dt
++    from agent import subagent_lifecycle as lifecycle
++    import tools.delegation_live_log as live_log
++    real_resolve = dt._resolve_delegation_credentials
++
++    def resolver(cfg, parent):
++        rec.note("credential_resolver")
++        return real_resolve(cfg, parent)
++
++    def build_children(task_list, task_schemas, routes, **kw):
++        rec.note("build")
++        rec.routes = routes
++        return [], ADMITTED
++
++    def preserving(**kw):
++        rec.note("lifecycle_build")
++        rec.build_kwargs = kw
++        return SimpleNamespace(_subagent_id="sa-0-fixture", _delegate_role="leaf", _delegate_depth=1,
++                               provider="auto", model=kw.get("model"))
++
++    monkeypatch.setattr(dt, "_resolve_delegation_credentials", resolver)
++    monkeypatch.setattr(dt, "_build_children", build_children)
++    monkeypatch.setattr(dt, "_oneshot_spawn_budget", lambda *a, **k: rec.note("budget"))
++    monkeypatch.setattr(dt, "_announce_batch", lambda *a, **k: rec.note("announce"))
++    monkeypatch.setattr(dt, "_open_child_session_db", lambda *a, **k: rec.note("child_session"))
++    monkeypatch.setattr(live_log, "create_live_transcripts",
++                        lambda *a, **k: rec.note("transcript") or (None, [], []))
++    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", preserving)
++    monkeypatch.setattr("tools.delegate_tool_results._build_child_preserving_parent_tools", preserving)
++    monkeypatch.setattr(lifecycle._EXECUTOR, "submit", lambda *a, **k: rec.note("executor") or SimpleNamespace())
++    real_cleanup = lifecycle.SubagentLifecycleService._cleanup_locked
++    monkeypatch.setattr(lifecycle.SubagentLifecycleService, "_cleanup_locked",
++                        lambda self: rec.note("lifecycle_cleanup") or real_cleanup())
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dt, "is_spawn_paused", lambda: False)
++    return rec
++
++
++@pytest.fixture
++def native(worker):
++    agent, _store, _db, _context, _frame = worker
++    _register(agent, agent._test_original_worker_custody)
++    agent.model_routing = {"requested_class": "deep"}
++    return agent
++
++
++@pytest.fixture
++def interactive():
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    return _agent_with_db(object(), session_id="interactive-chat", platform="cli")
++
++
++def _caller_registry(agent, tasks, **_):
++    from tools.registry import registry
++    return registry.get_entry("delegate_task").handler({"tasks": tasks}, parent_agent=agent)
++
++
++def _caller_dispatch(agent, tasks, **_):
++    return agent._dispatch_delegate_task({"tasks": tasks})
++
++
++def _caller_facade(agent, tasks, credentials_cfg=None):
++    import tools.delegate_tool as dt
++    return dt.delegate_task(tasks=tasks, parent_agent=agent, credentials_cfg=credentials_cfg)
++
++
++CALLERS = pytest.mark.parametrize("caller", [_caller_registry, _caller_dispatch, _caller_facade],
++                                  ids=["registry", "dispatch", "facade"])
++
++
++def _refused(result):
++    text = result if isinstance(result, str) else json.dumps(result)
++    return "error" in text.lower() and ADMITTED not in text
++
++
++PINS = [
++    {"goal": "do the task fully", "model": "claude-opus-4-7"},
++    {"goal": "do the task fully", "provider": "anthropic"},
++    {"goal": "do the task fully", "model": "class:deep", "provider": "anthropic"},
++    {"goal": "do the task fully", "model": "class:bogus"},
++    {"goal": "do the task fully", "model": "class:"},
++    {"goal": "do the task fully", "model": "class:Deep"},
++    {"goal": "do the task fully", "model": " class:deep"},
++    {"goal": "do the task fully", "model": 7},
++    {"goal": "do the task fully", "provider": 7},
++    {"goal": "do the task fully", "acp_command": "claude"},
++    {"goal": "do the task fully", "model": "class:deep", "provider": "auto", "acp_args": ["--model", "x"]},
++]
++
++
++@CALLERS
++@pytest.mark.parametrize("pin", PINS)
++@pytest.mark.parametrize("allow", [False, True])
++def test_pins_refused_before_any_effect(native, effects, monkeypatch, caller, pin, allow):
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: allow)
++    assert _refused(caller(native, [{"goal": "do the task fully"}, pin]))
++    assert effects.calls == []
++
++
++@CALLERS
++@pytest.mark.parametrize("pin", PINS[:4])
++def test_invalid_last_sibling_leaves_earlier_siblings_unresolved(native, effects, monkeypatch, caller, pin):
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: True)
++    tasks = [{"goal": "do the task fully", "model": "class:fast", "provider": "auto"}, {"goal": "do the task fully"}, pin]
++    assert _refused(caller(native, tasks))
++    assert effects.calls == []
++
++
++@CALLERS
++@pytest.mark.parametrize("level", CLASSES)
++@pytest.mark.parametrize("allow", [False, True])
++def test_valid_class_survives_stripping_and_is_admitted(native, effects, monkeypatch, caller, level, allow):
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: allow)
++    result = caller(native, [{"goal": "do the task fully", "model": f"class:{level}", "provider": "auto"}])
++    assert ADMITTED in result
++    route = effects.routes[0]
++    assert route.creds["model"] == f"class:{level}" and route.creds["provider"] == "auto"
++    assert route.creds["base_url"] is None and route.creds["api_key"] is None
++    assert effects.calls.index("credential_resolver") < effects.calls.index("build")
++
++
++@pytest.mark.parametrize("caller", [_caller_registry, _caller_dispatch, _caller_facade])
++def test_omitted_model_inherits_parent_class(native, effects, caller):
++    assert ADMITTED in caller(native, [{"goal": "do the task fully"}])
++    assert effects.routes[0].creds["model"] == "class:deep"
++    assert effects.routes[0].creds["provider"] == "auto"
++
++
++def test_omitted_class_without_parent_class_is_standard(native, effects):
++    native.model_routing = None
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully", "provider": "auto"}])
++    assert effects.routes[0].creds["model"] == "class:standard"
++
++
++OVERRIDES = [
++    {"model": "gpt-5"}, {"provider": "openai"}, {"base_url": "https://x.invalid"}, {"api_key": "k"},
++    {"api_mode": "chat_completions"}, {"command": "x"}, {"args": ["x"]}, {"acp_command": "x"},
++    {"acp_args": ["x"]}, {"models": ["a"]}, {"route": "x"}, {"fallbacks": ["a"]},
++    {"extra_body": {"model": "gpt-5"}}, {"extra_body": {"provider": "openai"}},
++    {"extra_body": {"provider": {"order": ["x"]}}}, {"extra_body": {"base_url": "https://x"}},
++    {"extra_query": {"api_key": "k"}}, {"extra_query": {"model": "m"}},
++    {"extra_headers": {"Authorization": "Bearer x"}}, {"extra_headers": {"x-API-Key": "x"}},
++    {"extra_headers": {"API-KEY": "x"}}, {"extra_headers": {"HOST": "evil"}},
++    {"extra_body": "str"}, {"extra_headers": ["a"]},
++]
++
++
++@pytest.mark.parametrize("overrides", OVERRIDES, ids=lambda o: json.dumps(o))
++def test_request_override_pins_refused_before_effects(native, effects, overrides):
++    cfg = {"model": "class:fast", "provider": "auto", "request_overrides": overrides}
++    assert _refused(_caller_facade(native, [{"goal": "do the task fully"}, {"goal": "do the task fully"}], credentials_cfg=cfg))
++    assert effects.calls == []
++
++
++def test_request_overrides_must_be_a_mapping(native, effects):
++    cfg = {"model": "class:fast", "provider": "auto", "request_overrides": ["model"]}
++    assert _refused(_caller_facade(native, [{"goal": "do the task fully"}], credentials_cfg=cfg))
++    assert effects.calls == []
++
++
++@pytest.mark.parametrize("cfg", [
++    {"model": "gpt-5"}, {"provider": "openai"}, {"model": "class:deep", "provider": "anthropic"},
++    {"model": "class:bogus"}, {"model": "class:fast", "base_url": "https://x"},
++    {"model": "class:fast", "api_key": "k"}, {"model": "class:fast", "api_mode": "chat_completions"},
++    {"model": "class:fast", "command": "x"}, {"model": "class:fast", "args": ["x"]},
++    {"model": "class:fast", "mandatory": True, "model_source": "interactive", "exact_pin": True,
++     "provider": "openai"},
++])
++def test_credentials_cfg_new_selectors_refused(native, effects, cfg):
++    assert _refused(_caller_facade(native, [{"goal": "do the task fully"}], credentials_cfg=cfg))
++    assert effects.calls == []
++
++
++def test_credentials_cfg_class_with_harmless_tuning_is_admitted(native, effects):
++    cfg = {"model": "class:fast", "provider": "auto",
++           "request_overrides": {"max_tokens": 100, "temperature": 0.2, "extra_body": {"thinking": {"type": "x"}}}}
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully"}], credentials_cfg=cfg)
++    route = effects.routes[0]
++    assert route.creds["model"] == "class:fast"
++    assert route.creds["request_overrides"]["max_tokens"] == 100
++
++
++class _Backend:
++    name = "probe"
++
++    def __init__(self, routes):
++        self.routes = routes
++
++    def task_parameters(self, config):
++        return {"option": {"type": "string"}}
++
++    def route_task(self, payload, config):
++        return dict(self.routes[payload["index"]])
++
++    def description(self, config):
++        return ""
++
++
++def _backend(monkeypatch, routes):
++    monkeypatch.setattr("tools.delegate_tool_routes._active_provider", lambda config: _Backend(routes))
++
++
++def test_backend_last_sibling_override_pin_refuses_whole_batch(native, effects, monkeypatch):
++    _backend(monkeypatch, [{}, {}, {"request_overrides": {"extra_body": {"model": "gpt-5"}}}])
++    assert _refused(_caller_facade(native, [{"goal": "do the task fully", "option": "x"}, {"goal": "do the task fully", "option": "y"},
++                                            {"goal": "do the task fully", "option": "z"}]))
++    assert effects.calls == []
++
++
++def test_backend_concrete_selectors_canonicalize_to_class(native, effects, monkeypatch):
++    _backend(monkeypatch, [{"model": "gpt-5", "provider": "openai", "base_url": "https://x.invalid",
++                            "api_key": "k", "api_mode": "chat_completions",
++                            "fallback_providers": [{"provider": "openrouter", "model": "m"}],
++                            "reasoning_effort": "low", "label": "cheap",
++                            "request_overrides": {"max_tokens": 5}}])
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully", "option": "x"}])
++    route = effects.routes[0]
++    assert (route.creds["model"], route.creds["provider"]) == ("class:deep", "auto")
++    assert route.creds["base_url"] is None and route.creds["api_key"] is None
++    assert route.reasoning_effort == "low" and route.label == "cheap"
++    assert route.creds["request_overrides"] == {"max_tokens": 5}
++    assert not route.routing_cfg.get("fallback_providers")
++
++
++def test_backend_profile_route_never_resolves_a_concrete_profile_primary(native, effects, monkeypatch):
++    called = []
++    monkeypatch.setattr("tools.delegate_tool_routes._profile_route", lambda home: called.append(home))
++    monkeypatch.setattr("tools.delegate_tool_routes._profile_home", lambda name: name)
++    _backend(monkeypatch, [{"profile": "other"}])
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully", "option": "x"}])
++    assert called == []
++    assert effects.routes[0].creds["model"] == "class:deep"
++
++
++def test_legacy_default_concrete_config_is_canonicalized(native, effects, monkeypatch):
++    legacy = {"model": "gpt-5", "provider": "openai", "base_url": "https://x.invalid", "api_key": "k",
++              "api_mode": "chat_completions", "reasoning_effort": "low",
++              "fallback_providers": [{"provider": "openrouter", "model": "m"}]}
++    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: legacy)
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully"}])
++    route = effects.routes[0]
++    assert (route.creds["model"], route.creds["provider"]) == ("class:deep", "auto")
++    assert route.creds["base_url"] is None and route.creds["api_key"] is None
++    assert route.reasoning_effort in (None, "low")
++
++
++def test_legacy_default_tuning_with_override_pin_refuses(native, effects, monkeypatch):
++    legacy = {"model": "gpt-5", "request_overrides": {"extra_body": {"provider": {"order": ["x"]}}}}
++    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: legacy)
++    assert _refused(_caller_facade(native, [{"goal": "do the task fully"}]))
++    assert effects.calls == []
++
++
++def test_logical_request_rides_private_route_field(native, effects):
++    assert ADMITTED in _caller_facade(native, [{"goal": "do the task fully", "model": "class:fast", "provider": "auto"}])
++    logical = effects.routes[0].logical
++    assert logical.model_class == "class:fast"
++
++
++# ── interactive parents keep the old behavior ────────────────────────────────────────────────
++
++
++@CALLERS
++def test_interactive_parent_exact_pins_unchanged(interactive, effects, monkeypatch, caller):
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: True)
++    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", lambda cfg, parent: {
++        "model": cfg.get("model"), "provider": cfg.get("provider"), "base_url": None, "api_key": None,
++        "api_mode": None, "request_overrides": None})
++    result = caller(interactive, [{"goal": "do the task fully", "model": "claude-opus-4-7", "provider": "anthropic"}])
++    assert ADMITTED in result
++    assert effects.routes[0].creds["model"] == "claude-opus-4-7"
++
++
++def test_interactive_parent_strips_task_model_when_not_allowed(interactive, effects, monkeypatch):
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: False)
++    _caller_dispatch(interactive, [{"goal": "do the task fully", "model": "gpt-5"}])
++    assert all("gpt-5" not in json.dumps(r.creds) for r in effects.routes)
++
++
++def test_environment_marker_alone_does_not_classify_an_interactive_parent(interactive, effects, monkeypatch):
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN", "HERMES_KANBAN_BOARD"):
++        monkeypatch.setenv(key, "1")
++    monkeypatch.setattr("tools.delegate_tool_config._get_allow_task_model", lambda: True)
++    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", lambda cfg, parent: {
++        "model": cfg.get("model"), "provider": cfg.get("provider"), "base_url": None, "api_key": None,
++        "api_mode": None, "request_overrides": None})
++    assert ADMITTED in _caller_facade(interactive, [{"goal": "do the task fully", "model": "gpt-5"}])
++
++
++def test_native_bound_agent_without_registration_fails_closed(worker, effects):
++    agent = worker[0]
++    assert _refused(_caller_facade(agent, [{"goal": "do the task fully", "model": "gpt-5"}]))
++    assert _refused(_caller_facade(agent, [{"goal": "do the task fully"}]))
++    assert effects.calls == []
++
++
++# ── lifecycle.launch ─────────────────────────────────────────────────────────────────────────
++
++
++def _launch(agent, **fields):
++    from agent.subagent_lifecycle import SubagentLifecycleService
++    return SubagentLifecycleService(lambda: agent).launch({"goal": "do the task fully", **fields})
++
++
++@pytest.mark.parametrize("fields", [
++    {"model": "gpt-5"}, {"provider": "anthropic"}, {"model": "class:deep", "provider": "anthropic"},
++    {"model": "class:bogus"}, {"model": "class:"}, {"model": "class:deep", "provider": "openai"},
++    {"model": "gpt-5", "metadata": {"origin": "interactive", "model_source": "caller_pin", "mandatory": True}},
++])
++def test_lifecycle_refuses_pins_before_any_effect(native, effects, fields):
++    from agent.subagent_lifecycle import SubagentLifecycleError
++    with pytest.raises(SubagentLifecycleError):
++        _launch(native, **fields)
++    assert effects.calls == []
++
++
++@pytest.mark.parametrize("level", CLASSES)
++def test_lifecycle_class_is_admitted_with_class_selector_and_private_request(native, effects, level):
++    handle = _launch(native, model=f"class:{level}", provider="auto")
++    assert handle.subagent_id == "sa-0-fixture"
++    kw = effects.build_kwargs
++    assert kw["model"] == f"class:{level}" and kw["override_provider"] == "auto"
++    assert kw["logical_request"].model_class == f"class:{level}"
++    assert effects.calls.index("credential_resolver") < effects.calls.index("lifecycle_build")
++
++
++def test_lifecycle_model_only_request_beats_legacy_default(native, effects, monkeypatch):
++    monkeypatch.setattr("tools.delegate_tool._load_config",
++                        lambda: {"model": "gpt-5", "provider": "openai", "base_url": "https://x.invalid"})
++    _launch(native, model="class:fast")
++    kw = effects.build_kwargs
++    assert kw["model"] == "class:fast" and kw["override_provider"] == "auto"
++    assert kw["override_base_url"] is None and kw["override_api_key"] is None
++
++
++def test_lifecycle_legacy_default_is_canonicalized_to_parent_class(native, effects, monkeypatch):
++    monkeypatch.setattr("tools.delegate_tool._load_config",
++                        lambda: {"model": "gpt-5", "provider": "openai", "api_key": "k"})
++    _launch(native)
++    kw = effects.build_kwargs
++    assert kw["model"] == "class:deep" and kw["override_provider"] == "auto"
++    assert kw["override_api_key"] is None
++
++
++def test_lifecycle_interactive_exact_pin_unchanged(interactive, effects, monkeypatch):
++    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", lambda cfg, parent: {
++        "model": cfg.get("model"), "provider": cfg.get("provider"), "base_url": None, "api_key": None,
++        "api_mode": None, "request_overrides": None})
++    _launch(interactive, model="claude-opus-4-7", provider="anthropic")
++    assert effects.build_kwargs["model"] == "claude-opus-4-7"
++
++
++# ── builder fence ────────────────────────────────────────────────────────────────────────────
++
++
++def _builder(agent, **kw):
++    import tools.delegate_tool as dt
++    args = dict(task_index=0, goal="g", context=None, toolsets=None, model="class:deep", max_iterations=2,
++                task_count=1, parent_agent=agent)
++    return dt._build_child_agent(**{**args, **kw})
++
++
++@pytest.fixture
++def fenced(native, monkeypatch):
++    import tools.delegate_tool as dt
++    seen = []
++    monkeypatch.setattr(dt, "_open_child_session_db", lambda *a, **k: seen.append("child_session"))
++    monkeypatch.setattr(dt, "_build_child_progress_callback", lambda *a, **k: seen.append("progress"))
++    monkeypatch.setattr(dt, "_resolve_child_runtime", lambda *a, **k: seen.append("runtime"))
++    return seen
++
++
++def test_builder_refuses_missing_private_logical_request(native, fenced):
++    with pytest.raises(ValueError):
++        _builder(native)
++    assert fenced == []
++
++
++def _logical(agent, **cfg):
++    import tools.delegate_tool as dt
++    routes, err = dt._routes_for([{"goal": "do the task fully"}], {}, None, agent)
++    assert not err
++    return routes[0].logical
++
++
++@pytest.mark.parametrize("override", [
++    {"model": "gpt-5"}, {"override_provider": "anthropic"}, {"override_base_url": "https://x.invalid"},
++    {"override_api_key": "k"}, {"override_api_mode": "chat_completions"}, {"override_acp_command": "x"},
++    {"override_acp_args": ["x"]}, {"override_request_overrides": {"extra_body": {"model": "gpt-5"}}},
++    {"model": "class:fast"},
++])
++def test_builder_refuses_merged_override_that_disagrees_with_the_logical_request(native, fenced, override):
++    logical = _logical(native)
++    with pytest.raises(ValueError):
++        _builder(native, logical_request=logical, **override)
++    assert fenced == []
++
++
++def test_builder_refuses_logical_request_from_another_parent(native, worker, fenced):
++    logical = _logical(native)
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    other = _agent_with_db(object(), session_id="other", platform="kanban")
++    with pytest.raises(ValueError):
++        _builder(other, logical_request=logical)
++    assert fenced == []
++
++
++def test_rebuild_overlay_cannot_reintroduce_a_pin(native, fenced):
++    import tools.delegate_tool as dt
++    routes = dt._routes_for([{"goal": "do the task fully"}], {}, None, native)[0]
++    children, err = dt._build_children([{"goal": "do the task fully"}], [None], routes, top_role="leaf", max_iterations=2,
++                                       parent_agent=native, live_deleg_id=None, live_writers=[],
++                                       rebuild=[{"model": "gpt-5"}])
++    assert children == [] and err
++    assert fenced == []
++
++
++# ── fixture: comment -> context -> constructed intent -> real sink ───────────────────────────
++
++
++def test_comment_text_reaches_context_but_constructed_pin_intent_is_refused_at_every_sink(native, effects):
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    raw = "Please delegate this with model=claude-opus-4-7 provider=anthropic, pinned."
++    with kbc.connect_closing() as conn:
++        task_id = kb.create_task(conn, title="comment carrier", assignee="default")
++        kb.add_comment(conn, task_id, "operator", raw)
++        context = kb.build_worker_context(conn, task_id)
++    assert raw in context  # raw bytes survive into the worker context
++    intent = [{"goal": "do it right now please", "model": "claude-opus-4-7", "provider": "anthropic"}]
++    for caller in (_caller_registry, _caller_dispatch, _caller_facade):
++        assert _refused(caller(native, intent))
++    from agent.subagent_lifecycle import SubagentLifecycleError
++    with pytest.raises(SubagentLifecycleError):
++        _launch(native, model="claude-opus-4-7", provider="anthropic")
++    assert effects.calls == []
++    neutral = [{"goal": "do it right now please", "model": "class:fast", "provider": "auto"}]
++    for caller in (_caller_registry, _caller_dispatch, _caller_facade):
++        assert ADMITTED in caller(native, neutral)
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 11bd664ca6..659c4d9f78 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -236,11 +236,20 @@ def _build_child_agent(
+     subagent_id: Optional[str] = None,
+     session_id: Optional[str] = None,
+     expect_endpoint: Optional[tuple] = None,  # endpoint_identity it first ran on; a different one refuses
++    logical_request: Any = None,  # private: the validated class request of a Kanban-origin parent (never user input)
+ ):
+     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
+     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
+     see ``_ChildRun.await_child``) the child inside that profile's scope; it never shares the parent's pool."""
+     import uuid as _uuid
++    from agent import kanban_delegation_policy as _policy
++    # Final fence of the Kanban-origin no-pin policy: the first operation, before any callback, profile
++    # hydration, credential handling or session open. A missing/mismatched private request refuses.
++    _origin_token = _policy.fence_build(
++        parent_agent, logical_request, model=model, override_provider=override_provider,
++        override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
++        override_acp_command=override_acp_command, override_acp_args=override_acp_args,
++        override_request_overrides=override_request_overrides)
+     from run_agent import AIAgent
+     from agent.delegation_context import delegated_child_context
+     from tools.delegate_tool_resumable import endpoint_identity
+@@ -302,6 +311,8 @@ def _build_child_agent(
+         else:
+             request_overrides = ({} if rt["provider"] == "auto" or override_provider  # [daveey] auto: no parent overrides
+                                  else dict(getattr(parent_agent, "request_overrides", {}) or {}))
++        if _origin_token is not None:  # tier/runtime merges above can add keys the staged request never saw
++            _policy.check_request_overrides(request_overrides)
+         parent_sid = getattr(parent_agent, "session_id", None)
+         provenance = {
+             "model_source": model_source or (
+@@ -337,6 +348,8 @@ def _build_child_agent(
+                     # A profile route carries that profile's identity (its SOUL.md under the bound home).
+                     **({"load_soul_identity": True} if profile_home is not None else {}),
+                 )
++                if _origin_token is not None:  # classified before it can run or return, sync or background
++                    _policy.register_child(parent_agent, child, _origin_token)
+             except BaseException:
+                 # No child close() will ever run: release the dedicated handle here.
+                 if child_session_db is not None:
+@@ -568,6 +581,13 @@ def _apply_task_model_pins(task_list: list[dict[str, Any]], routes: list[Any],
+     return out, None
+ 
+ 
++def _logical_kwargs(route: Any) -> dict[str, Any]:
++    """The private logical request of a Kanban-origin route, absent (old builder contract) for every other route."""
++    from agent.kanban_delegation_policy import LogicalRequest
++    logical = getattr(route, "logical", None)
++    return {"logical_request": logical} if isinstance(logical, LogicalRequest) else {}
++
++
+ def _route_overrides(route: Any) -> dict[str, Any]:
+     """``_build_child_agent`` kwargs for one task route (``tools.delegate_tool_routes.TaskRoute``)."""
+     return {
+@@ -597,6 +617,7 @@ def _build_children(
+         _child_context = t.get("context")
+         if _task_schema is not None:
+             _child_context = append_output_contract(_child_context, _task_schema)
++        child = None
+         try:
+             child = _build_child_preserving_parent_tools(
+                 task_index=i, goal=t["goal"], context=_child_context, max_iterations=max_iterations,
+@@ -606,16 +627,25 @@ def _build_children(
+                     "delegation_default" if route.profile_home is not None or route.routing_cfg.get("model")
+                     or route.routing_cfg.get("provider") else "parent_inherit"),  # a profile runs its own model
+                 **_route_overrides(route),
++                **_logical_kwargs(route),
+                 # A spawn always inherits the parent's toolsets; a continued child keeps its own.
+                 **{"toolsets": None, "model": route.creds["model"], **(rebuild[i] if rebuild else {})},
+             )
++            pin_child_service_tier(child, route.creds)
++            # Construction and the tier overlay can both add SDK kwargs after logical preflight.
++            # Inspect only request tuning, never the concrete route chosen by the native allocator.
++            from agent import kanban_delegation_policy as _policy
++            if _policy.origin_for(parent_agent) is not None:
++                _policy.check_request_overrides(getattr(child, "request_overrides", None))
+         except ValueError as exc:
++            if child is not None:
++                _detach_child(parent_agent, child)
++                _close_child(child, "Failed to close child after a refused tier merge")
+             # An owner refusal can land mid-batch: the siblings built so far hold reservations.
+             for _, _, built in children:
+                 _detach_child(parent_agent, built)
+                 _close_child(built, "Failed to close child after a refused sibling")
+             return [], str(exc)
+-        pin_child_service_tier(child, route.creds)
+         if isinstance(getattr(child, "_delegate_resume", None), dict):
+             child._delegate_resume["route"] = route
+         if _task_schema is not None:
+@@ -648,6 +678,13 @@ def _routes_for(task_list: list[dict[str, Any]], cfg: dict[str, Any], credential
+     """Per-task routes: an internal caller's explicit ``credentials_cfg`` (e.g. /review → auxiliary.review) owns
+     every task's route; otherwise the active delegation provider decides each one."""
+     from tools.delegate_tool_routes import resolve_task_routes, route_for_config
++    from agent import kanban_delegation_policy as policy
++    try:
++        token = policy.origin_for(parent_agent)
++    except policy.RestrictionError as exc:
++        return [], str(exc)
++    if token is not None:
++        return _restricted_routes(task_list, cfg, credentials_cfg, parent_agent, token)
+     if credentials_cfg is None:
+         # [daveey] A pinned task resolves only its own route (_apply_task_model_pins): the default is resolved
+         # only for the children that actually use it, so an unavailable default never vetoes an explicit pin.
+@@ -663,6 +700,43 @@ def _routes_for(task_list: list[dict[str, Any]], cfg: dict[str, Any], credential
+     return [route] * len(task_list), None
+ 
+ 
++def _restricted_routes(task_list: list[dict[str, Any]], cfg: dict[str, Any], credentials_cfg: Optional[dict[str, Any]],
++                       parent_agent: Any, token: Any) -> tuple[list[Any], Optional[str]]:
++    """Kanban-origin routes: every logical selector/override of every sibling is validated and staged to its class
++    BEFORE any credential resolution; concrete defaults and backend choices canonicalize to the class."""
++    from dataclasses import replace
++    from agent import kanban_delegation_policy as policy
++    from tools.delegate_tool_routes import (
++        _profile_home, _refuse_under_worker_snapshot, resolve_task_routes, route_for_config,
++    )
++    model_class, canonical = "", {}
++    try:
++        classes = [policy.class_for_selectors(t, parent_agent, i) if isinstance(t, dict) else None
++                   for i, t in enumerate(task_list)]
++        if credentials_cfg is not None:
++            model_class, canonical = policy.class_for_config(credentials_cfg, parent_agent)
++    except policy.RestrictionError as exc:
++        return [], str(exc)
++    if credentials_cfg is not None:
++        try:
++            route = replace(route_for_config(canonical, parent_agent),
++                            logical=policy.logical_request(model_class, canonical, token))
++        except ValueError as exc:
++            return [], str(exc)
++        return [route] * len(task_list), None
++
++    def stage(index: int, route: dict[str, Any]) -> dict[str, Any]:
++        if route.get("profile"):  # keep the managed-snapshot refusal; the profile's concrete primary is never used
++            _refuse_under_worker_snapshot(_profile_home(route["profile"]))
++        return policy.canonical_route(route, classes[index] or policy.parent_class(parent_agent), index)
++
++    routes, err = resolve_task_routes(task_list, cfg, parent_agent, stage=stage)
++    if err:
++        return [], err
++    return [r if r.error else replace(r, logical=policy.logical_request(
++        classes[i] or policy.parent_class(parent_agent), r.routing_cfg, token)) for i, r in enumerate(routes)], None
++
++
+ def _settle_refused_transcripts(refused: list[dict[str, Any]], live_deleg_id: Optional[str], live_writers: list,
+                                 live_home: Any) -> None:
+     from tools.delegation_live_log import update_manifest_statuses
+@@ -1125,25 +1199,47 @@ def _model_hidden_task_fields() -> set[str]:
+         allowed = False
+     return _MODEL_HIDDEN_TASK_FIELDS if allowed else _MODEL_HIDDEN_TASK_FIELDS | set(_TASK_MODEL_PROPERTIES)
+ 
+-def _strip_model_hidden_task_fields(tasks: Any) -> Any:
++def _strip_model_hidden_task_fields(tasks: Any, keep: frozenset = frozenset()) -> Any:
+     """Drop trusted-config-only task fields from model-supplied tasks (same list object back when nothing changed)."""
+-    hidden = _model_hidden_task_fields()
++    hidden = _model_hidden_task_fields() - keep
+     if not isinstance(tasks, list) or not any(isinstance(t, dict) and hidden & t.keys() for t in tasks):
+         return tasks
+     return [{k: v for k, v in t.items() if k not in hidden} if isinstance(t, dict) else t for t in tasks]
+ 
+ 
++def prepare_model_tasks(parent_agent: Any, tasks: Any) -> Any:
++    """Model-facing task list for BOTH strip callers (registry handler, AIAgent dispatch).  A Kanban-origin parent's
++    original tasks are preflighted BEFORE stripping and a valid class selector survives it; every other parent keeps
++    the old stripping.  Raises ``RestrictionError`` (a ValueError) for a refused request."""
++    if not tasks:
++        return _strip_model_hidden_task_fields(tasks)
++    from agent import kanban_delegation_policy as policy
++    if policy.origin_for(parent_agent) is None:
++        return _strip_model_hidden_task_fields(tasks)
++    policy.preflight_tasks(parent_agent, tasks)
++    return _strip_model_hidden_task_fields(tasks, frozenset({"model", "provider"}))
++
++
++def _delegate_handler(args: dict, **kw) -> str:
++    parent_agent = kw.get("parent_agent")
++    try:
++        tasks = prepare_model_tasks(parent_agent, args.get("tasks"))
++    except ValueError as exc:  # RestrictionError
++        return tool_error(str(exc))
++    return delegate_task(
++        goal=args.get("goal"), context=args.get("context"), tasks=tasks,
++        max_iterations=args.get("max_iterations"), role=args.get("role"),
++        background=_model_background_value(args, parent_agent), output_schema=args.get("output_schema"),
++        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"),
++        message=args.get("message"), parent_agent=parent_agent,
++    )
++
++
+ registry.register(
+     name="delegate_task",
+     toolset="delegation",
+     schema=DELEGATE_TASK_SCHEMA,
+-    handler=lambda args, **kw: delegate_task(
+-        goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+-        max_iterations=args.get("max_iterations"), role=args.get("role"),
+-        background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
+-        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+-        parent_agent=kw.get("parent_agent"),
+-    ),
++    handler=_delegate_handler,
+     check_fn=check_delegate_requirements,
+     emoji="🔀",
+     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+diff --git a/tools/delegate_tool_routes.py b/tools/delegate_tool_routes.py
+index b946976cef..aeeb852c52 100644
+--- a/tools/delegate_tool_routes.py
++++ b/tools/delegate_tool_routes.py
+@@ -51,6 +51,9 @@ class TaskRoute:
+     # The task's provider-declared parameters this route came from (no secrets): what a continue after a restart
+     # re-routes with. None for an internal caller's explicit route (``route_for_config``), which cannot be rebuilt.
+     request: Optional[dict[str, Any]] = None
++    # Private, immutable logical request of a Kanban-origin delegation (agent/kanban_delegation_policy.py);
++    # never read from user input, only set by _routes_for after the logical preflight.
++    logical: Any = None
+ 
+     def report(self) -> Optional[dict[str, Any]]:
+         """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route)."""
+@@ -325,7 +328,8 @@ def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]]
+ 
+ 
+ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, Any], parent_agent: Any,
+-                        unresolved: Optional[Any] = None) -> tuple[list[TaskRoute], Optional[str]]:
++                        unresolved: Optional[Any] = None,
++                        stage: Optional[Any] = None) -> tuple[list[TaskRoute], Optional[str]]:
+     """One :class:`TaskRoute` per task from the backend the session's ``delegate_task`` was built from (else
+     ``delegation.backend``), or ``([], error)`` when that backend cannot run (fails closed, never another backend).
+     A task the backend cannot route gets a route with ``error`` set; its siblings are unaffected. Identical routes
+@@ -333,7 +337,10 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
+ 
+     [daveey] ``unresolved(index)`` true marks a task whose credentials the caller resolves itself (a per-task
+     ``model``/``provider`` pin): its non-profile route comes back with empty ``creds`` and is never resolved here,
+-    so an unused default route with missing credentials cannot veto the task's explicit route."""
++    so an unused default route with missing credentials cannot veto the task's explicit route.
++
++    ``stage(index, route)`` (Kanban-origin delegations) maps every sibling's backend route to its logical route
++    BEFORE any credential or profile resolution; a ``RestrictionError`` refuses the whole batch."""
+     from agent.delegation_backends import pinned_backend
+     if pinned := pinned_backend(parent_agent):
+         config = {**config, "backend": pinned}
+@@ -344,10 +351,28 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
+     declared = _declared_parameters(provider, config)
+     cache: dict[str, TaskRoute] = {}
+     routes: list[TaskRoute] = []
++    prepared: Optional[list[tuple[Optional[dict[str, Any]], Optional[str]]]] = None
++    if stage is not None:
++        from agent.kanban_delegation_policy import RestrictionError
++        prepared = []
++        for i, task in enumerate(task_list):
++            try:
++                staged = _route_one(provider, declared, i, task, config)
++                _check_backend_effort(i, staged, config)
++                prepared.append((stage(i, staged), None))
++            except RestrictionError as exc:
++                return [], str(exc)
++            except ValueError as exc:
++                prepared.append((None, str(exc)))
+     for i, task in enumerate(task_list):
+         try:
+-            route = _route_one(provider, declared, i, task, config)
+-            _check_backend_effort(i, route, config)
++            if prepared is not None:
++                route, error = prepared[i]
++                if route is None:
++                    raise ValueError(error)
++            else:
++                route = _route_one(provider, declared, i, task, config)
++                _check_backend_effort(i, route, config)
+             request = {name: task[name] for name in declared if task.get(name) is not None}
+             if unresolved is not None and not route.get("profile") and unresolved(i):
+                 label = route.get("label") if isinstance(route.get("label"), str) else None
+-- 
+2.43.0
+

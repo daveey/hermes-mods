@@ -1,0 +1,588 @@
+From dedd27dc4098719c9884a189badd2df050c56357 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 00:14:16 +0000
+Subject: [PATCH] [daveey] stop attributable refusals before reclaim retry
+
+---
+ gateway/session_kanban.py                    |   3 +-
+ hermes_cli/kanban_db_dispatch.py             |  10 +-
+ hermes_cli/kanban_db_promote.py              |   5 +
+ hermes_cli/kanban_refusal_proof.py           |  41 +++++++
+ hermes_cli/kanban_refusal_receipt.py         |  93 ++++++++++++++
+ hermes_cli/kanban_spend_decision.py          |  72 ++++++++---
+ hermes_cli/kanban_spend_promote.py           |   3 +
+ tests/gateway/test_kanban_refusal_receipt.py |  80 ++++++++++++
+ tests/hermes_cli/test_kanban_refusal_stop.py | 121 +++++++++++++++++++
+ 9 files changed, 401 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/kanban_refusal_proof.py
+ create mode 100644 hermes_cli/kanban_refusal_receipt.py
+ create mode 100644 tests/gateway/test_kanban_refusal_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_refusal_stop.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index e2052d5718..385a93ee58 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -419,6 +419,7 @@ def _record_worker_result(context, code, last_output, failure=None, extra=None,
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_quota_receipt import quota_fields, route_fields
++    from hermes_cli.kanban_refusal_receipt import refusal_fields
+     from hermes_cli.kanban_spend_budget import usage_fields
+     observer_error = None
+     strict_death_proof = False
+@@ -451,7 +452,7 @@ def _record_worker_result(context, code, last_output, failure=None, extra=None,
+                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                  'last_output': last_output, **quota_fields(failure), **route_fields(failure, agent),
+                  **usage_fields(agent),  # [daveey] the run's tokens, summed by kanban_spend_budget on the home board
+-                 **(extra or {}), **identity_fields,
++                 **(extra or {}), **refusal_fields(failure), **identity_fields,
+                  **({'death_proof_version': 1} if strict_death_proof else {})},
+                 run_id=context['run_id'])
+ 
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index dfcc89ca4c..0a0ec5fee8 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1269,7 +1269,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+         host_prefix = _kb._host_prefix()
+         now_boot, reboot_victims = _host_reboot.victims(rows, lambda r: _kb._claim_is_local(r["claim_lock"] or "",
+                                                                                           host_prefix))
+-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, owner_reclaim_blocked
++        from hermes_cli.kanban_owner_recovery import apply_attempt_note
+         for row in rows:
+             lock = row["claim_lock"] or ""
+             if not _kb._claim_is_local(lock, host_prefix):
+@@ -1284,13 +1284,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+                 continue
+             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                 continue
+-            from hermes_cli.kanban_failed_result import reclaim_proof, result_exit_code
+-            proof, hold = reclaim_proof(conn, row, failed_results_only=failed_results_only)
++            from hermes_cli.kanban_failed_result import result_exit_code
++            from hermes_cli.kanban_refusal_receipt import reclaim_admission
++            proof, hold = reclaim_admission(conn, row, failed_results_only=failed_results_only)
+             if hold:
+                 continue
+-            if proof is None and owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+-                continue
+-
+             pid = int(row["worker_pid"])
+             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
+             exit_code = result_exit_code(conn, row, proof)
+diff --git a/hermes_cli/kanban_db_promote.py b/hermes_cli/kanban_db_promote.py
+index c2b40f5070..942028d06c 100644
+--- a/hermes_cli/kanban_db_promote.py
++++ b/hermes_cli/kanban_db_promote.py
+@@ -15,6 +15,9 @@ def promote_task(
+     System callers omit the precondition. Manual boundaries check unread comments
+     under the write lock; dry runs validate without writing anything.
+     """
++    from hermes_cli.kanban_refusal_receipt import restricted
++    if restricted(conn, task_id):
++        return False, 'Provider safety restriction has no supported execution release'
+     cur_status = _kb._task_status(conn, task_id)
+     if cur_status is None:
+         return False, f"task {task_id} not found"
+@@ -38,6 +41,8 @@ def promote_task(
+             return False, refusal
+         return True, None
+     with _kb.write_txn(conn):
++        if restricted(conn, task_id):
++            return False, 'Provider safety restriction has no supported execution release'
+         if precondition and (refusal := precondition(conn)):
+             return False, refusal
+         # A scheduled exception authorizes only an unresolved spend decision, rechecked under the writer lock.
+diff --git a/hermes_cli/kanban_refusal_proof.py b/hermes_cli/kanban_refusal_proof.py
+new file mode 100644
+index 0000000000..79fa099fd3
+--- /dev/null
++++ b/hermes_cli/kanban_refusal_proof.py
+@@ -0,0 +1,41 @@
++"""Stop-only attribution after the ordinary dead-interpreter proof has passed."""
++from __future__ import annotations
++
++
++def select_refusal(conn, row, proof):
++    """A later callback/owner restart cannot erase an earlier attributable refusal.
++
++    This never supplies process-death or retry authority: an ordinary reclaim
++    proof is a prerequisite, and the refused binding must itself be proven gone.
++    """
++    if not proof:
++        return None
++    from hermes_cli.kanban_failed_result import process_gone
++    from hermes_cli.kanban_failed_result_identity import _identity, _payload
++    from hermes_cli.kanban_lost_result import evidence_rows
++    from hermes_cli.kanban_refusal_receipt import refusal_fields
++
++    events = evidence_rows(conn, row['id'], row['current_run_id'])
++    bounds = [(e, _payload(e)) for e in events if e['kind'] == 'worker_bound']
++    for event in events:
++        p = _payload(event)
++        if (event['kind'] != 'worker_result' or not p or not refusal_fields(p)
++                or p.get('failure_retryable') is not False
++                or type(p.get('exit_code')) is not int or p['exit_code'] == 0
++                or p.get('claim_lock') != row['claim_lock']):
++            continue
++        for bound_event, bound in bounds:
++            if not bound or bound.get('claim_lock') != row['claim_lock'] or p.get('pid') != bound.get('pid'):
++                continue
++            if p.get('death_proof_version') == 1:
++                if p.get('bound_event_identity') != _identity(bound_event, bound):
++                    continue
++            elif p.get('death_proof_version') is not None or bound_event['id'] >= event['id']:
++                continue
++            if process_gone(bound.get('pid'), bound.get('started_at')):
++                result = {**proof, 'source_result_event_id': event['id'], 'result': p}
++                result.pop('source_result_event_uid', None)
++                if 'uid' in event.keys() and event['uid']:
++                    result['source_result_event_uid'] = event['uid']
++                return result
++    return None
+diff --git a/hermes_cli/kanban_refusal_receipt.py b/hermes_cli/kanban_refusal_receipt.py
+new file mode 100644
+index 0000000000..00e386c269
+--- /dev/null
++++ b/hermes_cli/kanban_refusal_receipt.py
+@@ -0,0 +1,93 @@
++"""Credential-free, typed safety evidence for an attributable worker result.
++
++This is stop evidence, not provider clearance or a retry grant. Never classify a
++refusal from last_output: it can quote a refusal from an unrelated attempt.
++"""
++from __future__ import annotations
++
++
++def refusal_fields(result) -> dict:
++    """Keep the terminal turn's verdict, excluding provider prose and transcript."""
++    if (not isinstance(result, dict) or result.get('failed') is not True
++            or result.get('failure_reason') != 'content_policy_blocked'):
++        return {}
++    from agent.turn_failure_copy import safe_refusal_category
++
++    fields = {'failed': True, 'failure_reason': 'content_policy_blocked',
++              'failure_retryable': False,
++              'refused_turn_ran_actions': result.get('refused_turn_ran_actions') is True}
++    category = safe_refusal_category(result.get('refusal_category'))
++    if category is not None:
++        fields['refusal_category'] = category
++    return fields
++
++
++def restricted(conn, task_id: str) -> bool:
++    """A safety restriction cannot be cleared by ordinary budget promotion/archive."""
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
++        "('spend_budget_triaged','decision_hold_restricted') AND json_valid(payload) "
++        "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.cause') END='safety_refusal' "
++        "LIMIT 1", (task_id,)).fetchone() is not None
++
++
++def reclaim_admission(conn, row, *, failed_results_only=False):
++    """Existing death/owner admission followed by stop-before-retry finalization."""
++    from hermes_cli.kanban_failed_result import reclaim_proof
++    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
++    proof, hold = reclaim_proof(conn, row, failed_results_only=failed_results_only)
++    if hold or (proof is None and owner_reclaim_blocked(conn, row['id'], crash_sweep=True)):
++        return proof, True
++    return proof, stop_failed_refusal(conn, row, proof)
++
++
++def stop_failed_refusal(conn, row, proof) -> bool:
++    """Consume an exact dead-interpreter proof inside the reclaim transaction.
++
++    Primary closure belongs solely to the canonical release/feed. Local boards
++    end the run and retain the same decision kernel atomically, without retry.
++    """
++    from hermes_cli.kanban_refusal_proof import select_refusal
++    proof = select_refusal(conn, row, proof)
++    if not proof:
++        return False
++    result = proof['result']
++    if type(result.get('exit_code')) is not int or result['exit_code'] == 0:
++        return False
++    if not conn.in_transaction:
++        raise RuntimeError('refusal finalization requires the reclaim transaction')
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_failure_release as release
++    from hermes_cli import kanban_spend_decision as decision
++
++    task, run = row['id'], row['current_run_id']
++    diagnostic = {k: v for k, v in proof.items() if k != 'result'}
++    diagnostic.update(refusal_fields(result))
++    if release.queue(conn, task, run, outcome='crashed',
++                     error='Provider safety refusal; execution release unavailable', diagnostic=diagnostic):
++        return True
++    # Revalidate the exact admitted run; no state from a later attempt is changed.
++    from hermes_cli.kanban_source_receipt import with_source_receipt
++    changed = with_source_receipt(conn, task, lambda: conn.execute(
++        "UPDATE tasks SET status='triage', claim_lock=NULL, claim_expires=NULL, "
++        "worker_pid=NULL, worker_started_at=NULL, "
++        "last_failure_error='Provider safety refusal; execution release unavailable' "
++        "WHERE id=? AND status='running' AND current_run_id=? AND claim_lock IS ? "
++        "AND worker_pid IS ? AND worker_started_at IS ?",
++        (task, run, row['claim_lock'], row['worker_pid'], row['worker_started_at'])), run_id=run)
++    if changed.rowcount != 1:
++        return True  # lost CAS: never book a competing failure
++    payload = {**diagnostic, 'cause': 'safety_refusal',
++               'reason': 'Provider safety refusal; execution release unavailable',
++               'release_authority': 'unavailable',
++               'next_step': 'Owning supervisor must resolve the scope/authority boundary; do not rerun refused work'}
++    kb._end_run(conn, task, outcome='safety_refused', status='safety_refused',
++                error=payload['reason'], metadata=payload)
++    if (stop := decision.pending_episode(conn, task)) is not None:
++        payload['episode'] = stop.get('uid') or str(stop['id'])
++        kb._append_event(conn, task, 'decision_hold_restricted', payload, run_id=run)
++    else:
++        kb._append_event(conn, task, decision.EVENT, payload, run_id=run)
++    kb._append_event(conn, task, 'safety_refused', payload, run_id=run)
++    decision.ensure_producer(conn, task)
++    return True
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 11861cf173..1bed0d303b 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -11,19 +11,23 @@ NOTICE = "spend_budget_decision_ready"
+ def ensure_producer(conn, task_id: str) -> None:
+     """Repair pre-notice stops too; one durable producer receipt per spend-stop episode."""
+     import json
+-    from hermes_cli.kanban_sync_divergence import _event_order
+     with kb.write_txn(conn, allow_nested=True):
+-        if not pending(conn, task_id):
++        stop = pending_episode(conn, task_id)
++        if stop is None:
+             return
+-        events = [dict(r) for r in conn.execute(
+-            "SELECT * FROM task_events WHERE task_id=? AND kind=?", (task_id, EVENT))]
+-        stop = max(events, key=_event_order)
+         episode = stop.get("uid") or str(stop["id"])
+-        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? "
+-                        "AND json_extract(payload,'$.episode')=?", (task_id, NOTICE, episode)).fetchone():
+-            return
++        previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
++                                "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
++                                (task_id, NOTICE, episode)).fetchone()
+         payload = json.loads(stop["payload"] or "{}")
+-        route = producer(conn, task_id, payload.get("reason") or "Spend budget reached")
++        from hermes_cli.kanban_refusal_receipt import restricted
++        safety = restricted(conn, task_id)
++        prior = json.loads(previous[0]) if previous else None
++        if prior and (not safety or prior.get('cause') == 'safety_refusal'):
++            return
++        if safety:
++            payload['cause'] = 'safety_refusal'
++        route = prior['producer'] if prior else producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
+         kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
+ 
+ 
+@@ -36,26 +40,49 @@ def safe_ensure_producer(conn, task_id: str) -> None:
+         logging.getLogger(__name__).exception("spend decision producer failed for %s; hold retained", task_id)
+ 
+ 
+-def pending(conn, task_id: str) -> bool:
+-    """Only an explicit promotion or archive releases a spend stop, not an automatic status change."""
++def pending_episode(conn, task_id: str):
++    """Same existing episode as canonical Board, including safety annotations."""
++    import json
+     from hermes_cli.kanban_sync_divergence import _event_order
+-    rows = conn.execute(
+-        "SELECT * FROM task_events WHERE task_id=? "
+-        "AND kind IN ('spend_budget_triaged','promoted_manual','archived') "
+-        "AND created_at=(SELECT MAX(created_at) FROM task_events WHERE task_id=? "
+-        "AND kind IN ('spend_budget_triaged','promoted_manual','archived'))", (task_id, task_id)).fetchall()
+-    return bool(rows and max((dict(r) for r in rows), key=_event_order)["kind"] == EVENT)
++    events = [dict(r) for r in conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind IN "
++        "('spend_budget_triaged','decision_hold_restricted','promoted_manual','archived')", (task_id,))]
++    events.sort(key=_event_order, reverse=True)
++    for event in events:
++        try:
++            payload = json.loads(event['payload'] or '{}')
++        except (TypeError, ValueError):
++            continue
++        if (isinstance(payload, dict) and payload.get('cause') == 'safety_refusal'
++                and event['kind'] in (EVENT, 'decision_hold_restricted')):
++            return next((e for e in events if e['kind'] == EVENT and e.get('uid') == payload.get('episode')),
++                        event) if event['kind'] != EVENT else event
++    ordinary = [e for e in events if e['kind'] != 'decision_hold_restricted']
++    return ordinary[0] if ordinary and ordinary[0]['kind'] == EVENT else None
++
++
++def pending(conn, task_id: str) -> bool:
++    """Budget promotion/archive never clear an attributable safety restriction."""
++    return pending_episode(conn, task_id) is not None
+ 
+ 
+ def unblock_refusal(conn, task_id: str) -> str | None:
+     """An unblock is not a recorded spend decision; keep every release surface honest."""
+     if not pending(conn, task_id):
+         return None
++    from hermes_cli.kanban_refusal_receipt import restricted
++    if restricted(conn, task_id):
++        return 'Provider safety restriction retained; no supported execution release. Owning supervisor must resolve the scope/authority boundary without rerunning refused work.'
+     return (f"cannot unblock {task_id}: spend-budget decision pending; split or re-scope the work, "
+             f"then use `hermes kanban promote {task_id} --reason <what changed>`, or archive it")
+ 
+ 
+ def notice(payload: dict) -> str:
++    if payload.get('cause') == 'safety_refusal':
++        return ('Provider safety refusal retained. There is no supported execution release; '
++                'ordinary promotion, review, comments and timers are not clearance. '
++                'The owning supervisor may resolve the scope/authority boundary or withdraw '
++                'the work without declaring incomplete acceptance satisfied. Do not rerun the refused work.')
+     return (str(payload.get("reason") or "Spend budget reached") + ". Held in triage until a recorded decision: "
+             "split or re-scope the work, then manually promote it, or archive it. "
+             "Do not requeue unchanged; the stale-triage sweep cannot release this hold.")
+@@ -97,13 +124,18 @@ def producer(conn, task_id: str, note: str) -> dict:
+                     f"WHERE s.task_id=? AND {_owning_sub_clause()} LIMIT 1", (task_id,)).fetchone():
+         return {"kind": "chats"}
+     episode = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
++    from hermes_cli.kanban_refusal_receipt import restricted
++    safety = restricted(conn, task_id)
++    guidance = notice({'reason': note, **({'cause': 'safety_refusal'} if safety else {})})
++    action = ('\n\nRecord the administrative scope/authority decision without execution release. '
++              'Do not run the original work here.' if safety else
++              f"\n\nRecord the decision on {task_id}; use `hermes kanban promote {task_id} --reason '<what changed>'` "
++              'only after re-scoping or justifying further spend, or archive it. Do not run the original work here.')
+     sup = kb.create_task(
+         conn, title=forwarded_title(f"Spend budget decision: {task.title}"[:200], f"Spend budget decision: {task_id}"),
+         body=f"Card {task_id} has stopped. No chat owns its decision.\n\n"
+              + "Source title and stop reason (historical evidence):\n" + forwarded_text(task.title) + "\n"
+-             + forwarded_text(note) + "\n\n" + notice({})
+-             + f"\n\nRecord the decision on {task_id}; use `hermes kanban promote {task_id} --reason '<what changed>'` "
+-               "only after re-scoping or justifying further spend, or archive it. Do not run the original work here.",
++             + forwarded_text(note) + "\n\n" + guidance + action,
+         assignee=_supervisor_profile(), created_by="kanban-spend-budget", workspace_kind="scratch",
+         idempotency_key=f"spend-budget-decision:{task_id}:{episode}", tenant=task.tenant)
+     return {"kind": "supervisor", "task_id": sup}
+diff --git a/hermes_cli/kanban_spend_promote.py b/hermes_cli/kanban_spend_promote.py
+index 5122565653..ff4919b671 100644
+--- a/hermes_cli/kanban_spend_promote.py
++++ b/hermes_cli/kanban_spend_promote.py
+@@ -101,6 +101,9 @@ def scope_refusal(conn: sqlite3.Connection, target: str, requester: Optional[str
+     from hermes_cli import kanban_spend_decision as ksd
+     from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
+     from hermes_cli.kanban_operator_call import COMMENT_MARK
++    from hermes_cli.kanban_refusal_receipt import restricted
++    if restricted(conn, target):
++        return 'Provider safety restriction has no supported execution release; ordinary spend promotion is not clearance'
+     row = conn.execute("SELECT status, human_request, block_kind FROM tasks WHERE id = ?", (target,)).fetchone()
+     if row is None:
+         return f"no such task {target}"
+diff --git a/tests/gateway/test_kanban_refusal_receipt.py b/tests/gateway/test_kanban_refusal_receipt.py
+new file mode 100644
+index 0000000000..03f825e6f9
+--- /dev/null
++++ b/tests/gateway/test_kanban_refusal_receipt.py
+@@ -0,0 +1,80 @@
++"""The real worker-result writer must preserve typed safety evidence, never prose."""
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from agent.turn_failure_copy import content_policy_blocked_result
++from gateway import session_kanban
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect_closing
++
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_PROFILE', 'default')
++    for name in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_TASK',
++                 'HERMES_KANBAN_RUN_ID', 'HERMES_DELEGATED_CHILD_CONTEXT'):
++        monkeypatch.delenv(name, raising=False)
++    db = kb.kanban_db_path()
++    kb.init_db()
++    with connect_closing() as conn:
++        tid = kb.create_task(conn, title='isolated refusal receipt', assignee='default')
++        assert kb.claim_task(conn, tid, claimer='host:fixture')
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'worker_bound',
++                             {'pid': os.getpid(), 'claim_lock': task.claim_lock},
++                             run_id=task.current_run_id)
++    return {'db': str(db), 'task_id': tid, 'run_id': task.current_run_id,
++            'claim_lock': task.claim_lock}
++
++
++def _result(worker, failure):
++    session_kanban._record_worker_result(worker, 1, 'worker failed', failure)
++    with connect_closing() as conn:
++        rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result'",
++                            (worker['task_id'],)).fetchall()
++        assert len(rows) == 1
++        return json.loads(rows[0]['payload'])
++
++
++def test_typed_refusal_survives_the_actual_worker_writer(worker):
++    failure = content_policy_blocked_result(
++        [], 1, final_response='display only', error_detail='private provider prose',
++        refusal_category='cyber_safety', ran_actions=True)
++    result = _result(worker, failure)
++    assert result['failed'] is True
++    assert result['failure_reason'] == 'content_policy_blocked'
++    assert result['failure_retryable'] is False
++    assert result['refusal_category'] == 'cyber_safety'
++    assert result['refused_turn_ran_actions'] is True
++    assert not {'messages', 'error', 'refused_turn_notice', 'final_response'} & result.keys()
++    assert 'private provider prose' not in json.dumps(result)
++
++
++@pytest.mark.parametrize('failure', [
++    {'failure_reason': 'content_policy_blocked', 'failed': False},
++    {'failure_reason': 'content_policy_blocked', 'failed': 1},
++    {'failed': True, 'failure_reason': 'rate_limit', 'failure_resets_at': 1999999999},
++    {'failed': True, 'error': 'content_policy_blocked: quoted text'},
++    RuntimeError('content_policy_blocked'),
++])
++def test_prose_and_unproven_failures_do_not_mint_refusal(worker, failure):
++    result = _result(worker, failure)
++    assert result.get('failure_reason') != 'content_policy_blocked'
++    assert 'refusal_category' not in result
++
++
++def test_invalid_category_is_not_copied(worker):
++    failure = content_policy_blocked_result(
++        [], 1, final_response='', error_detail='', refusal_category='<private provider text>')
++    result = _result(worker, failure)
++    assert result['failure_reason'] == 'content_policy_blocked'
++    assert 'refusal_category' not in result
+diff --git a/tests/hermes_cli/test_kanban_refusal_stop.py b/tests/hermes_cli/test_kanban_refusal_stop.py
+new file mode 100644
+index 0000000000..a4a7eff84a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_stop.py
+@@ -0,0 +1,121 @@
++"""Real failed interpreter -> dispatcher stop, without any model/provider call."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++from tests.hermes_cli import test_kanban_sync_run_rows as transport
++
++board = fixtures.board
++kanban_home = transport.kanban_home
++svc = transport.svc
++live = transport.live
++
++
++def refused_child(conn, context, monkeypatch):
++    source = fixtures._CHILD.replace(
++        "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
++        "_record_worker_result(context, 1, 'fixture refusal', "
++        "{'failed': True, 'failure_reason': 'content_policy_blocked', 'failure_retryable': False})")
++    assert source != fixtures._CHILD
++    monkeypatch.setattr(fixtures, '_CHILD', source)
++    return fixtures._failed_child(conn, context)
++
++
++@pytest.mark.parametrize('observer', [False, True])
++@pytest.mark.parametrize('existing', [False, True])
++def test_refused_interpreter_stops_once_without_retry(board, monkeypatch, observer, existing):
++    conn, context = board
++    if existing:
++        with kb.write_txn(conn):
++            kb._append_event(conn, context['task_id'], decision.EVENT, {'reason': 'existing budget stop'})
++    result = refused_child(conn, context, monkeypatch)
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    task = kb.get_task(conn, context['task_id'])
++    assert task is not None
++    assert task.status == 'triage'
++    assert task.current_run_id is None
++    assert task.claim_lock is None
++    assert task.consecutive_failures == 0
++    run = conn.execute('SELECT * FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    assert run['outcome'] == 'safety_refused'
++    assert run['ended_at'] is not None
++    assert decision.pending(conn, task.id)
++    assert conn.execute('SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?',
++                        (task.id, decision.EVENT)).fetchone()[0] == 1
++    restricted = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind IN "
++                              "('spend_budget_triaged','decision_hold_restricted')", (task.id,)).fetchall()
++    assert any(json.loads(r[0]).get('source_result_event_id') == result['id'] for r in restricted)
++    notices = conn.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?',
++                           (task.id, decision.NOTICE)).fetchall()
++    assert len(notices) == 1
++    notice = json.loads(notices[0][0])
++    assert notice['cause'] == 'safety_refusal'
++    assert 'manually promote' not in decision.notice(notice)
++    if notice['producer']['kind'] == 'supervisor':
++        supervisor = kb.get_task(conn, notice['producer']['task_id'])
++        assert supervisor is not None and 'hermes kanban promote' not in (supervisor.body or '')
++    decision.ensure_producer(conn, task.id)
++    assert conn.execute('SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?',
++                        (task.id, decision.NOTICE)).fetchone()[0] == 1
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, task.id).status == 'triage'
++    # A comment or historical review event is not safety clearance or a new grant.
++    with kb.write_txn(conn):
++        kb._append_event(conn, task.id, 'commented', {'writer_kind': 'human'})
++        kb._append_event(conn, task.id, 'promoted_manual', {'reason': 'ordinary administrative action'})
++    assert decision.pending(conn, task.id)
++    ok, reason = kb.promote_task(conn, task.id, actor='fixture', reason='administrative promotion')
++    assert not ok and reason and 'safety' in reason.lower()
++    assert kb.get_task(conn, task.id).status == 'triage'
++
++
++@pytest.mark.parametrize('observer', [False, True])
++def test_later_owner_restart_cannot_hide_refusal(board, monkeypatch, observer):
++    from tests.hermes_cli.test_kanban_owner_restart_failed_receipt import book, latest as last_receipt
++    conn, context = board
++    refused_child(conn, context, monkeypatch)
++    book(context)
++    latest = last_receipt(conn)
++    assert 'failure_reason' not in json.loads(latest['payload'])
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    task = kb.get_task(conn, context['task_id'])
++    assert task is not None and task.status == 'triage'
++    stop = decision.pending_episode(conn, task.id)
++    assert stop is not None
++    source = json.loads(stop['payload'])['source_result_event_id']
++    assert source != latest['id']
++    assert json.loads(conn.execute('SELECT payload FROM task_events WHERE id=?', (source,)).fetchone()[0])['failure_reason'] == 'content_policy_blocked'
++    assert task.consecutive_failures == 0
++
++
++@pytest.mark.parametrize('observer', [False, True])
++def test_primary_refusal_queues_exact_release_without_local_closure(live, kanban_home, svc, monkeypatch, observer):
++    from hermes_cli.kanban_sync_client import translate
++    from hermes_cli.kanban_failure_release import queued
++
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    tid, uid = transport._claimed(live, kanban_home, svc, 'refused interpreter transport')
++    task = kb.get_task(live, tid)
++    assert task is not None
++    context = {'db': str(kanban_home / 'kanban.db'), 'task_id': tid,
++               'run_id': task.current_run_id, 'claim_lock': task.claim_lock, 'board': transport.BOARD}
++    refused_child(live, context, monkeypatch)
++    dispatch.detect_crashed_workers(live, failed_results_only=observer)
++    assert queued(live, task.current_run_id)
++    assert kb.get_task(live, tid).status == 'running'
++    assert live.execute('SELECT status FROM task_runs WHERE uid=?', (uid,)).fetchone()[0] == 'running'
++    releases = live.execute("SELECT * FROM kanban_sync_outbox WHERE op='release'").fetchall()
++    assert len(releases) == 1
++    wire = translate(dict(releases[0]), '0000000000000-0000-fixture')
++    assert wire['run_uid'] == uid
++    assert wire['diagnostic']['failure_reason'] == 'content_policy_blocked'
++    source = wire['diagnostic']['source_result_event_uid']
++    assert live.execute("SELECT kind FROM task_events WHERE uid=?", (source,)).fetchone()[0] == 'worker_result'
++    dispatch.detect_crashed_workers(live)
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE op='release'").fetchone()[0] == 1
+-- 
+2.43.0
+

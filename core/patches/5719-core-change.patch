@@ -1,0 +1,213 @@
+From 9b201d02d4d19985628f624b4250b0b4ef356c63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:29:26 +0000
+Subject: [PATCH] [daveey] Use WAL generation rather than stat-only goal cache
+ identity
+
+CI reproduced three stale-read failures on coarse filesystem timestamps. Use the existing lock-safe WAL index generation reader, decline certification for rollback/unattested stores, and discover profile names with one scandir rather than stat-only directory caching. Preserve short-lived query connections and request-only invalidation. Added coarse-stat, scope-switch and discovery recovery coverage; 47 focused consumer tests and all 21 scripts/check gates pass.
+---
+ hermes_cli/goal_session_activity.py           | 49 ++++++------
+ .../hermes_cli/test_goal_session_activity.py  | 76 ++++++++++++++++---
+ 2 files changed, 93 insertions(+), 32 deletions(-)
+
+diff --git a/hermes_cli/goal_session_activity.py b/hermes_cli/goal_session_activity.py
+index 5abea01b7b..0643cd591e 100644
+--- a/hermes_cli/goal_session_activity.py
++++ b/hermes_cli/goal_session_activity.py
+@@ -11,14 +11,16 @@ Paused, done and cleared goals don't count: nothing resumes them unasked.
+ [daveey]
+ 
+ Read-only and cheap: one primary-key range scan of ``state_meta`` per profile
+-database, cached by file change signals checked only on requests. No timer or
+-retained SQLite handle is needed.
++database, cached by SQLite WAL generation checked only on requests. No timer or
++retained SQLite connection is needed. Unattested/rollback-journal databases are
++read afresh; names-only profile discovery avoids per-entry filesystem stats.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
+ import logging
++import os
+ import sqlite3
+ import threading
+ from pathlib import Path
+@@ -30,7 +32,6 @@ _KEY_PREFIX = "goal:"
+ _cache_lock = threading.Lock()
+ # Only immutable answers are retained; SQLite connections close after each scan.
+ _cache: dict[Path, tuple[tuple, frozenset[str]]] = {}
+-_directories: dict[Path, tuple[tuple, tuple[Path, ...]]] = {}
+ _MAX_CACHED_PATHS = 128
+ 
+ 
+@@ -42,24 +43,27 @@ def _stamp(path: Path) -> tuple:
+     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+ 
+ 
+-def _db_stamp(path: Path) -> tuple:
+-    return _stamp(path), _stamp(Path(str(path) + "-wal")), _stamp(Path(str(path) + "-journal"))
++def _db_stamp(path: Path) -> tuple | None:
++    from hermes_cli.session_list_flight import data_stamp
++
++    # Stat timestamps can repeat across commits. SQLite's WAL index generation
++    # cannot; the shared reader also rejects torn header copies. Include file
++    # identities so replacement with an equal generation cannot reuse an answer.
++    generation = data_stamp(path)
++    if generation is None:
++        return None
++    return (_stamp(path), _stamp(Path(str(path) + "-wal")),
++            _stamp(Path(str(path) + "-shm")), generation)
+ 
+ 
+ def _profile_candidates(directory: Path) -> tuple[Path, ...]:
+-    before = _stamp(directory)
+-    prior = _directories.get(directory)
+-    if prior is not None and prior[0] == before:
+-        return prior[1]
+-    _directories.pop(directory, None)
+-    # Include missing state.db candidates: creating one in an existing profile
+-    # need not change the profiles directory's mtime.
+-    paths = tuple(sorted(p / "state.db" for p in directory.iterdir())) if before else ()
+-    if before == _stamp(directory) and len(paths) <= _MAX_CACHED_PATHS:
+-        if len(_directories) >= _MAX_CACHED_PATHS:
+-            _directories.clear()
+-        _directories[directory] = before, paths
+-    return paths
++    # One names-only directory read: no glob/is_dir/lexists stat per entry.
++    # Directory timestamps alone miss additions within a filesystem clock tick.
++    try:
++        with os.scandir(directory) as entries:
++            return tuple(sorted(directory / entry.name / "state.db" for entry in entries))
++    except (FileNotFoundError, NotADirectoryError):
++        return ()
+ 
+ 
+ def _state_db_paths() -> list[Path]:
+@@ -72,7 +76,7 @@ def _state_db_paths() -> list[Path]:
+         try:
+             paths.update(dict.fromkeys(_profile_candidates(root / "profiles")))
+         except OSError:
+-            _directories.pop(root / "profiles", None)
++            _log.debug("goal profile discovery failed for %s", root, exc_info=True)
+     return list(paths)
+ 
+ 
+@@ -108,15 +112,15 @@ def active_goal_sessions() -> frozenset[str]:
+             try:
+                 before = _db_stamp(path)
+                 prior = _cache.get(path)
+-                if prior is not None and prior[0] == before:
++                if before is not None and prior is not None and prior[0] == before:
+                     ids.update(prior[1])
+                     continue
+                 _cache.pop(path, None)
+-                if not before[0]:
++                if not _stamp(path):
+                     continue
+                 active = frozenset(_read_active(path))
+                 ids.update(active)
+-                if before == _db_stamp(path) and len(_cache) < _MAX_CACHED_PATHS:
++                if before is not None and before == _db_stamp(path) and len(_cache) < _MAX_CACHED_PATHS:
+                     _cache[path] = before, active
+             except (OSError, sqlite3.Error) as exc:
+                 # Never certify errors; the next request retries even without a write.
+@@ -154,4 +158,3 @@ def annotate_goal_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+ def _reset_cache_for_tests() -> None:
+     with _cache_lock:
+         _cache.clear()
+-        _directories.clear()
+diff --git a/tests/hermes_cli/test_goal_session_activity.py b/tests/hermes_cli/test_goal_session_activity.py
+index d8951bda51..62abee4941 100644
+--- a/tests/hermes_cli/test_goal_session_activity.py
++++ b/tests/hermes_cli/test_goal_session_activity.py
+@@ -72,15 +72,22 @@ def test_committed_goal_change_is_visible_without_ttl(home):
+ 
+ 
+ def test_unchanged_requests_do_not_repeat_sql_or_profile_glob(home, monkeypatch):
+-    _make_state_db(home / "state.db", {"s": {"goal": "g", "status": "active"}})
+-    _make_state_db(home / "profiles" / "work" / "state.db", {})
+-    assert gsa.active_goal_sessions() == {"s"}
+-    monkeypatch.setattr(gsa, "_read_active", lambda _: pytest.fail("unchanged SQL read"))
+-    monkeypatch.setattr(Path, "glob", lambda *a: pytest.fail("unchanged profile glob"))
+-    monkeypatch.setattr(Path, "iterdir", lambda *a: pytest.fail("unchanged directory scan"))
+-    # Advancing time must not force a reread; the database change is the signal.
+-    monkeypatch.setattr(time, "monotonic", lambda: 1e12)
+-    assert gsa.active_goal_sessions() == {"s"}
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    keeper = sqlite3.connect(path)
++    try:
++        keeper.execute("PRAGMA journal_mode=WAL")
++        keeper.execute("SELECT * FROM state_meta").fetchall()  # initialize WAL index
++        assert gsa.active_goal_sessions() == {"s"}
++        assert path in gsa._cache  # prove reuse, not a vacuous result
++        monkeypatch.setattr(gsa, "_read_active", lambda _: pytest.fail("unchanged SQL read"))
++        monkeypatch.setattr(Path, "glob", lambda *a: pytest.fail("unchanged profile glob"))
++        monkeypatch.setattr(Path, "iterdir", lambda *a: pytest.fail("per-entry discovery"))
++        # Advancing time must not force a reread; the database change is the signal.
++        monkeypatch.setattr(time, "monotonic", lambda: 1e12)
++        assert gsa.active_goal_sessions() == {"s"}
++    finally:
++        keeper.close()
+ 
+ 
+ def test_profile_add_remove_and_database_created_in_existing_profile(home):
+@@ -167,3 +174,54 @@ def test_missing_or_schemaless_db_is_harmless(home):
+     sqlite3.connect(home / "state.db").close()  # no state_meta table
+     rows = [{"id": "s1"}]
+     assert gsa.annotate_goal_activity(rows) == [{"id": "s1"}]
++
++
++@pytest.mark.parametrize("wal", [False, True])
++def test_equal_stat_metadata_never_hides_committed_changes(home, monkeypatch, wal):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    conn = sqlite3.connect(path)
++    try:
++        if wal:
++            conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("SELECT * FROM state_meta").fetchall()
++        original = gsa._stamp
++        stamps = {p: original(p) for p in (path, Path(str(path) + "-wal"),
++                                           Path(str(path) + "-shm"))}
++        monkeypatch.setattr(gsa, "_stamp", lambda p: stamps[p] if p in stamps else original(p))
++        assert gsa.active_goal_sessions() == {"s"}
++        if wal:
++            assert path in gsa._cache
++        else:
++            assert path not in gsa._cache
++        conn.execute("DELETE FROM state_meta")
++        conn.commit()
++        assert not gsa.active_goal_sessions()
++    finally:
++        conn.close()
++
++
++def test_directory_discovery_recovers_without_metadata_change(home, monkeypatch):
++    path = home / "profiles" / "work" / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    original = gsa.os.scandir
++    with monkeypatch.context() as patch:
++        def denied(p):
++            if p == home / "profiles":
++                raise PermissionError("denied")
++            return original(p)
++        patch.setattr(gsa.os, "scandir", denied)
++        assert not gsa.active_goal_sessions()
++    assert gsa.active_goal_sessions() == {"s"}
++
++
++def test_scoped_home_switch_removes_prior_answer(home, monkeypatch):
++    import hermes_constants
++
++    other = home / "other"
++    _make_state_db(home / "state.db", {"old": {"goal": "g", "status": "active"}})
++    _make_state_db(other / "state.db", {"new": {"goal": "g", "status": "active"}})
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: home / "absent")
++    assert gsa.active_goal_sessions() == {"old"}
++    monkeypatch.setenv("HERMES_HOME", str(other))
++    assert gsa.active_goal_sessions() == {"new"}
+-- 
+2.43.0
+

@@ -1,0 +1,518 @@
+From b1e1e28653a2a1a886e82d908677080fa43b3c6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:54:50 +0000
+Subject: [PATCH] refactor(delegation): adopt owner-claimed units without
+ replacing ledger [daveey]
+
+Problem: live child work correctly vetoes update checkpointing; parent parking alone
+cannot preserve the child. The existing async dispatch always creates/replaces its
+unit row, so it cannot register already-claimed work under its original identity.
+Why 1: continue creates a new delegation ID rather than reusing completion custody.
+Why 2: capacity, ledger insert, lease, retirement, monitor and finalization shared one
+new-dispatch-only path (tools/async_delegation.py _dispatch_admitted).
+Root (happened): no scheduling seam for an owner-claimed durable running unit.
+Root (not caught): prior pause fixes were accepted on clean windows without a live
+child/reservation precondition; no restart-with-child contract was exercised.
+Recurrence: hub due-to-apply remained 570s/1015s after earlier pause guards;
+this is only authorized slice2a, not a claim those failures are repaired.
+
+Add adopt_unit for a row already owned by this exact process incarnation. Recheck
+unchanged durable custody under the registry lock; reject duplicates, terminal or
+settled rows. Use common admitted scheduling without resetting ledger/delivery
+state; retain the row on executor/lease/submit failure. Restore original routing,
+time, transcripts, slot and partial children, joining them through the original
+one-shot finalizer. Persist slot_key for new units; legacy rows use an independent
+conservative slot. No parked state, ownership transfer, crash retry, new config or
+update-admission relaxation. Child receipt CAS/resume and real SIGKILL-after-park
+proof are deliberately separate slice2b; no partial park implementation here.
+
+Proof: canonical adoption RED13 missing-module failures; final focused21 passed.
+155 consumer files:3132 passed,0 failed,5 platform skips.20/20 mutants killed with
+green baseline (identity,state,delivery,stale/duplicate,partial,slot,lease,reservation,
+capacity,closed-session,monitor,ledger preservation). Full scripts/check21 checks OK.
+Live check: none for this slice; installed timeline instrumentation is separate.
+Undo: reviewed revert; this change cannot produce parked rows.
+---
+ docs/designs/delegation-owned-adoption.md  |  29 +++
+ tests/tools/test_async_delegation_adopt.py | 250 +++++++++++++++++++++
+ tools/async_delegation.py                  |  27 ++-
+ tools/async_delegation_adopt.py            |  95 ++++++++
+ 4 files changed, 392 insertions(+), 9 deletions(-)
+ create mode 100644 docs/designs/delegation-owned-adoption.md
+ create mode 100644 tests/tools/test_async_delegation_adopt.py
+ create mode 100644 tools/async_delegation_adopt.py
+
+diff --git a/docs/designs/delegation-owned-adoption.md b/docs/designs/delegation-owned-adoption.md
+new file mode 100644
+index 0000000000..c1ab91ff05
+--- /dev/null
++++ b/docs/designs/delegation-owned-adoption.md
+@@ -0,0 +1,29 @@
++# Owner-claimed async delegation registration
++
++`tools.async_delegation_adopt.adopt_unit` is an internal scheduling seam for a durable
++unit **already claimed by this process**. It is not an automatic retry of abandoned
++work and does not transfer ownership, park children, change update admission, or
++replace `delegate_task continue`.
++
++The caller must first establish resumable child custody, provide a runner for only
++the unfinished children, and keep the original delegation ID. This seam refuses a
++missing, terminal, delivery-settled, foreign-incarnation or already registered row.
++It rechecks the unchanged durable row under the in-memory registration lock.
++
++Scheduling uses the same session-close, slot capacity, approval-notification lease,
++retirement reservation, context propagation and progress-monitor path as new units.
++Registration does not INSERT/REPLACE the ledger or reset delivery attempts. The
++original dispatch time, routing scope, transcripts, child sessions, slot and partial
++finished results survive. A pool/lease/submit failure removes only the in-memory
++registration and releases scheduling reservations; the adopted durable row remains
++available to the caller. Finished children join the remaining results before the
++original one-shot finalizer publishes the original unit's completion.
++
++New units persist `slot_key` in task_json; older rows without it conservatively use
++the original delegation ID as a separate slot. No schema change is required.
++
++Verification: `bash scripts/run_tests.sh tests/tools/test_async_delegation_adopt.py`.
++This verifies registration/finalization, not SIGKILL-after-park recovery. That later
++protocol must separately prove original completion and external tool effects exactly
++once across restart before it is enabled. Reverting this seam is an ordinary reviewed
++revert; no parked rows are produced by this change.
+diff --git a/tests/tools/test_async_delegation_adopt.py b/tests/tools/test_async_delegation_adopt.py
+new file mode 100644
+index 0000000000..c40ef9984f
+--- /dev/null
++++ b/tests/tools/test_async_delegation_adopt.py
+@@ -0,0 +1,250 @@
++"""Re-register an owned durable unit, not a new delegation or an automatic crash retry."""
++import json
++import os
++import threading
++from queue import Empty
++from types import SimpleNamespace
++
++import pytest
++
++from tools import async_delegation as ad
++from tools.process_registry import process_registry
++
++
++@pytest.fixture(autouse=True)
++def clean_registry():
++    ad._reset_for_tests()
++    while not process_registry.completion_queue.empty():
++        process_registry.completion_queue.get_nowait()
++    yield
++    if ad._executor is not None:
++        ad._executor.shutdown(wait=True)
++    ad._reset_for_tests()
++    while not process_registry.completion_queue.empty():
++        process_registry.completion_queue.get_nowait()
++
++
++def seed():
++    record = dict(delegation_id="deleg_adopt", goal="original", goals=["finished", "remaining"],
++                  is_batch=True, task_indexes=[0, 1], context="original context", toolsets=["file"],
++                  role="leaf", model="original-model", session_key="route", parent_session_id="parent",
++                  origin_ui_session_id="ui", origin_session_id="origin", scope_id="scope",
++                  user_id="user", user_name="name", dispatched_at=123.0,
++                  slot_key="original-slot", task_transcripts={"1": "transcript"},
++                  task_session_ids={"1": "child"})
++    ad._persist_dispatch(record)
++    ad.record_unit_child("deleg_adopt", {"task_index": 0, "status": "completed", "summary": "saved"})
++    with ad._transaction() as conn:
++        conn.execute("UPDATE async_delegations SET delivery_attempts=3 WHERE delegation_id='deleg_adopt'")
++    return record
++
++
++def row():
++    with ad._transaction() as conn:
++        conn.row_factory = __import__("sqlite3").Row
++        return dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id='deleg_adopt'").fetchone())
++
++
++def adopt(runner=None, **kwargs):
++    from tools.async_delegation_adopt import adopt_unit
++    return adopt_unit("deleg_adopt", runner=runner or dict, **kwargs)
++
++
++def test_adopt_keeps_identity_finished_siblings_and_single_completion():
++    original = seed()
++    before = row()
++    entered, release = threading.Event(), threading.Event()
++
++    def runner():
++        entered.set()
++        assert release.wait(10)
++        return {"results": [{"task_index": 1, "status": "completed", "summary": "new"}],
++                "total_duration_seconds": 2}
++
++    try:
++        assert adopt(runner) == {"status": "dispatched", "delegation_id": "deleg_adopt"}
++        assert entered.wait(10)
++        assert row() == before, "registration must never replace the durable row"
++        record = ad._records["deleg_adopt"]
++        assert record["slot_key"] == original["slot_key"]
++        assert record["task_transcripts"] == original["task_transcripts"]
++        assert record["task_session_ids"] == original["task_session_ids"]
++        assert record["_finished_children"][0]["summary"] == "saved"
++        assert record["_approval_lease"].active
++        assert adopt()["status"] == "rejected"
++    finally:
++        release.set()
++        if ad._executor:
++            ad._executor.shutdown(wait=True)
++    event = process_registry.completion_queue.get_nowait()
++    assert event["delegation_id"] == "deleg_adopt"
++    assert event["dispatched_at"] == 123.0
++    for key in ("scope_id", "user_id", "user_name", "origin_ui_session_id", "origin_session_id", "parent_session_id"):
++        assert event[key] == original[key]
++    assert [r["summary"] for r in event["results"]] == ["saved", "new"]
++    ad._finalize("deleg_adopt", {"results": []}, "error")
++    with pytest.raises(Empty):
++        process_registry.completion_queue.get_nowait()
++    assert row()["delivery_attempts"] == 3
++    assert row()["state"] == "completed"
++    assert json.loads(row()["result_json"])["results"] == event["results"]
++    assert adopt()["status"] == "rejected"
++
++
++@pytest.mark.parametrize("changes", [
++    {"owner_pid": os.getpid() + 1}, {"owner_started_at": "mismatch"}, {"owner_started_at": None},
++    {"owner_started_at": "0"}, {"state": "stalled"}, {"delivery_state": "dropped"},
++    {"state": "completed"}, {"state": "finalizing"}, {"delivery_state": "delivered"},
++    {"completed_at": 1.0}, {"event_json": "{}"},
++])
++def test_unowned_or_terminal_row_is_not_reexecuted(changes):
++    seed()
++    with ad._transaction() as conn:
++        conn.execute("UPDATE async_delegations SET " + ",".join(f"{key}=?" for key in changes) +
++                     " WHERE delegation_id='deleg_adopt'", tuple(changes.values()))
++    before = row()
++    assert adopt(lambda: pytest.fail("must not run"))["status"] == "rejected"
++    assert row() == before
++    assert "deleg_adopt" not in ad._records
++
++
++def test_missing_row_and_worker_are_refused(monkeypatch):
++    assert adopt()["status"] == "rejected"
++    seed()
++    monkeypatch.setattr(ad, "require_ledger_owner", lambda: (_ for _ in ()).throw(PermissionError("owner only")))
++    with pytest.raises(PermissionError, match="owner only"):
++        adopt()
++    assert "deleg_adopt" not in ad._records
++
++
++@pytest.mark.parametrize("failure", ["submit", "executor", "lease"])
++def test_schedule_failure_preserves_row_and_releases_gates(monkeypatch, failure):
++    from hermes_cli import backend_retirement
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    seed()
++    before = row()
++    def fail_submit(fn):
++        raise RuntimeError("injected submit failure")
++    monkeypatch.setattr(ad, "_get_executor", lambda size: SimpleNamespace(submit=fail_submit))
++    if failure == "executor":
++        monkeypatch.setattr(ad, "_get_executor", lambda size: fail_submit(None))
++    if failure == "lease":
++        from tools import approval_notify_lease
++        monkeypatch.setattr(approval_notify_lease, "acquire", lambda key: fail_submit(None))
++    assert adopt()["status"] == "rejected"
++    assert row() == before
++    assert "deleg_adopt" not in ad._records
++    assert fence.prepare()["ok"] is True
++
++
++def test_capacity_closed_session_and_retirement_remain_gates(monkeypatch):
++    from hermes_cli import backend_retirement
++    seed()
++    before = row()
++    ad._records["other"] = dict(delegation_id="other", status="running", slot_key="other")
++    assert adopt(max_async_children=1)["status"] == "rejected"
++    ad._records.clear()
++    ad._refused_by[("parent_session_id", "parent")] = {"closed"}
++    assert adopt()["status"] == "rejected"
++    ad._refused_by.clear()
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    assert fence.prepare()["ok"] is True
++    assert adopt()["status"] == "rejected"
++    assert row() == before
++
++
++def test_adopted_runner_stall_retains_results_and_worker_reservation(monkeypatch):
++    from hermes_cli import backend_retirement
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    entered, release = threading.Event(), threading.Event()
++    seed()
++    def runner():
++        entered.set()
++        assert release.wait(10)
++        return {"results": [{"task_index": 1, "status": "completed"}]}
++    try:
++        assert adopt(runner)["status"] == "dispatched"
++        assert entered.wait(10)
++        ad._finalize("deleg_adopt", {"error": "stalled"}, "stalled")
++        assert fence.prepare() == {"ok": False, "idle": False}
++    finally:
++        release.set()
++        if ad._executor:
++            ad._executor.shutdown(wait=True)
++    event = process_registry.completion_queue.get_nowait()
++    assert [r["status"] for r in event["results"]] == ["completed", "stalled"]
++    assert process_registry.completion_queue.empty()
++    assert fence.prepare()["ok"] is True
++
++
++def test_stale_read_is_refused(monkeypatch):
++    from tools import async_delegation_adopt as adoption
++    seed()
++    old = adoption.owned_row
++    reads = []
++    def changed(delegation_id):
++        value = old(delegation_id)
++        reads.append(value)
++        if len(reads) == 1:
++            with ad._transaction() as conn:
++                conn.execute("UPDATE async_delegations SET owner_pid=0 WHERE delegation_id=?", (delegation_id,))
++        return value
++    monkeypatch.setattr(adoption, "owned_row", changed)
++    assert adopt(lambda: pytest.fail("stale registration ran"))["status"] == "rejected"
++    assert "deleg_adopt" not in ad._records
++    assert row()["owner_pid"] == 0
++
++
++def test_adoption_uses_stale_monitor_and_original_pool_slot(monkeypatch):
++    seed()
++    ad._records["sibling"] = dict(delegation_id="sibling", status="running", slot_key="original-slot")
++    monitors = []
++    monkeypatch.setattr(ad, "_ensure_stale_monitor", lambda: monitors.append(True))
++    release = threading.Event()
++    def runner():
++        assert release.wait(10)
++        return {"results": [{"task_index": 1, "status": "completed"}]}
++    try:
++        assert adopt(runner, max_async_children=1, progress_fn=lambda: (1, False))["status"] == "dispatched"
++        assert monitors == [True]
++        assert ad._records["deleg_adopt"]["progress_fn"]() == (1, False)
++    finally:
++        release.set()
++        if ad._executor:
++            ad._executor.shutdown(wait=True)
++
++
++def test_concurrent_adopters_publish_once():
++    from tools.thread_context import propagate_context_to_thread
++    seed()
++    start = threading.Barrier(3)
++    release = threading.Event()
++    handles, calls = [], []
++    def runner():
++        calls.append(True)
++        assert release.wait(10)
++        return {"results": [{"task_index": 1, "status": "completed"}]}
++    def register():
++        start.wait(10)
++        handles.append(adopt(runner))
++    threads = [threading.Thread(target=propagate_context_to_thread(register)) for _ in range(2)]
++    try:
++        for thread in threads:
++            thread.start()
++        start.wait(10)
++        for thread in threads:
++            thread.join(10)
++            assert not thread.is_alive()
++        assert sorted(h["status"] for h in handles) == ["dispatched", "rejected"]
++    finally:
++        release.set()
++        for thread in threads:
++            thread.join(10)
++        if ad._executor:
++            ad._executor.shutdown(wait=True)
++    assert calls == [True]
++    assert process_registry.completion_queue.get_nowait()["delegation_id"] == "deleg_adopt"
++    assert process_registry.completion_queue.empty()
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 8610706eca..d5d57d4f17 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -221,7 +221,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
+     task_payload = {
+         key: record.get(key)
+         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts",
+-                    "task_session_ids", *_ROUTING_KEYS)
++                    "task_session_ids", "slot_key", *_ROUTING_KEYS)
+         if key in record}
+     try:  # where the children's terminals started; lets recovery add a git-state hint
+         task_payload["owner_cwd"] = os.getcwd()
+@@ -1168,6 +1168,7 @@ def _dispatch_admitted(
+     task_indexes: Optional[list[int]] = None,
+     task_transcripts: Optional[dict[str, str]] = None,
+     task_session_ids: Optional[dict[str, str]] = None,
++    _adopt_row: Optional[dict[str, Any]] = None,
+ ) -> dict[str, Any]:
+     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
+     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
+@@ -1202,6 +1203,10 @@ def _dispatch_admitted(
+         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
+         "_home": hermes_home_key(get_hermes_home())}  # the profile that dispatched it (``active_count(home=...)``)
+     with _records_lock:
++        if _adopt_row is not None:
++            from tools.async_delegation_adopt import restore_owned_record
++            if not restore_owned_record(record, _adopt_row):
++                return {"status": "rejected", "error": "Delegation ownership or durable row changed"}
+         if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
+             return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
+         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
+@@ -1209,15 +1214,12 @@ def _dispatch_admitted(
+             return {"status": "rejected", "error": capacity_error}
+         _records[delegation_id] = record
+         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+-    _persist_dispatch(record)
++    if _adopt_row is None:
++        _persist_dispatch(record)
+     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
+     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
+-    executor = _get_executor(max(max_async_children, live_units))
+-
+     from tools.approval_notify_lease import acquire, run as run_with_notify_lease
+-    lease = acquire(session_key)
+-    with _records_lock:
+-        record["_approval_lease"] = lease
++    lease = None
+ 
+     def _worker() -> None:
+         result: dict[str, Any] = {}
+@@ -1242,6 +1244,10 @@ def _dispatch_admitted(
+     # reservation too: the stall monitor may finalize its registry record before it really exits.
+     retirement.acquire()
+     try:
++        executor = _get_executor(max(max_async_children, live_units))
++        lease = acquire(session_key)
++        with _records_lock:
++            record["_approval_lease"] = lease
+         future = executor.submit(propagate_context_to_thread(_worker))
+         def worker_done(completed):
+             try:
+@@ -1252,11 +1258,14 @@ def _dispatch_admitted(
+                 retirement.release()
+ 
+         future.add_done_callback(worker_done)
+-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
++    except Exception as exc:
+         retirement.release()
+-        lease.release()
++        if lease is not None:
++            lease.release()
+         with _records_lock:
+             _records.pop(delegation_id, None)
++        if _adopt_row is not None:
++            return {"status": "rejected", "error": f"Failed to schedule adopted delegation: {exc}"}
+         if remote := worker_ledger():
+             remote.unscheduled(delegation_id)
+         else:
+diff --git a/tools/async_delegation_adopt.py b/tools/async_delegation_adopt.py
+new file mode 100644
+index 0000000000..cdc0bbcfe6
+--- /dev/null
++++ b/tools/async_delegation_adopt.py
+@@ -0,0 +1,95 @@
++"""Re-register an already claimed local unit; never claim or retry abandoned work.
++
++Receipt/ownership transfer belongs to the recovery caller. This scheduling seam preserves
++its durable row, original identity and finished siblings through the normal finalizer.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++
++
++def owned_row(delegation_id):
++    from tools import async_delegation as ad
++    from gateway.status import get_process_start_time, start_time_fingerprints_match
++
++    ad.require_ledger_owner()
++    with ad._DB_LOCK, ad._transaction() as conn:
++        conn.row_factory = sqlite3.Row
++        found = conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
++    if found is None:
++        return None
++    row = dict(found)
++    started = get_process_start_time(os.getpid())
++    try:
++        same_owner = bool(row["owner_started_at"] and started and
++                          start_time_fingerprints_match(row["owner_started_at"], started))
++    except (TypeError, ValueError):
++        same_owner = False
++    if (row["owner_pid"] != os.getpid() or not same_owner
++            or row["state"] != "running" or row["delivery_state"] != "pending"
++            or row["completed_at"] is not None or row["event_json"] is not None):
++        return None
++    return row
++
++
++def restore_owned_record(record, expected):
++    """Caller holds the registry lock: refuse duplicate registration and stale reads."""
++    from tools import async_delegation as ad
++
++    delegation_id = record["delegation_id"]
++    if delegation_id in ad._records or owned_row(delegation_id) != expected:
++        return False
++    task = json.loads(expected["task_json"])
++    partial = json.loads(expected["result_json"] or "{}")
++    for key in ad._ROUTING_KEYS:
++        record.pop(key, None)
++        if key in task:
++            record[key] = task[key]
++    record["dispatched_at"] = expected["dispatched_at"]
++    record["_finished_children"] = {
++        entry["task_index"]: entry for entry in partial.get("results", [])
++        if isinstance(entry.get("task_index"), int)
++    } if partial.get("partial") else {}
++    return True
++
++
++def adopt_unit(delegation_id, *, runner, interrupt_fn=None, progress_fn=None, max_async_children=3):
++    """Schedule an owner-claimed running row once, without replacing its durable ledger.
++
++    No ownership CAS, auto-resume policy bypass or parked state is implemented here.
++    A failed schedule retains the row so its caller can safely release its claim.
++    """
++    from tools import async_delegation as ad
++
++    row = owned_row(delegation_id)
++    if row is None:
++        return {"status": "rejected", "error": "Delegation is not an unfinished unit owned by this process"}
++    task = json.loads(row["task_json"])
++    partial = json.loads(row["result_json"] or "{}")
++
++    def run_remaining():
++        result = runner() or {}
++        if partial.get("partial") and result.get("results"):
++            combined = {entry["task_index"]: entry for entry in partial["results"]}
++            combined.update((entry["task_index"], entry) for entry in result["results"])
++            indexes = task.get("task_indexes")
++            if indexes is None:
++                indexes = range(len(task.get("goals") or []))
++            return {**result, "results": [combined[i] for i in indexes if i in combined]}
++        return result
++
++    return ad._dispatch(
++        delegation_id=delegation_id, goal=task.get("goal", ""),
++        goals=task.get("goals") if task.get("is_batch") else None,
++        context=task.get("context"), toolsets=task.get("toolsets"), role=task.get("role", "leaf"),
++        model=task.get("model"), session_key=row["origin_session"] or "",
++        parent_session_id=row["parent_session_id"], origin_ui_session_id=row["origin_ui_session_id"] or "",
++        origin_session_id=row["origin_session_id"] or "", runner=run_remaining,
++        interrupt_fn=interrupt_fn, progress_fn=progress_fn, max_async_children=max_async_children,
++        capacity_error="Async delegation capacity reached while adopting unit",
++        slot_key=task.get("slot_key"), task_indexes=task.get("task_indexes"),
++        task_transcripts=task.get("task_transcripts"), task_session_ids=task.get("task_session_ids"),
++        _adopt_row=row,
++    )
+-- 
+2.43.0
+

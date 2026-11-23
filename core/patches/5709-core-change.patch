@@ -1,0 +1,124 @@
+From 87e4e3eea69e05f1de57e13ef3aec0360cf29e84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:20:03 +0000
+Subject: [PATCH] fix(kanban): freeze origin retries across compression and
+ retain active board [daveey]
+
+Independent review reproduced new request IDs after real session compression and omitted nondefault board routing. Keep origin binding session for the durable comment writer envelope while checking live continuation authority; resolve omitted board with canonical current-board selection. Proof: reviewer regressions RED before fix, origin comment/retry/decision/ledger suites GREEN and full scripts/check GREEN.
+---
+ hermes_cli/kanban_origin_comment.py           | 10 ++-
+ .../test_kanban_origin_comment_retry.py       | 70 +++++++++++++++++++
+ 2 files changed, 77 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_comment_retry.py
+
+diff --git a/hermes_cli/kanban_origin_comment.py b/hermes_cli/kanban_origin_comment.py
+index 1265266225..50ec8a15f1 100644
+--- a/hermes_cli/kanban_origin_comment.py
++++ b/hermes_cli/kanban_origin_comment.py
+@@ -42,7 +42,8 @@ def bound_owner(path: Path, *, task_id: str, board: str, gateway: str,
+                 continue
+             task = json.loads(task_raw)
+             ask = task.get('ask_notice') or {}
+-            route = {**owner, 'binding_hash': digest, 'ask_event': ask.get('event_id')}
++            route = {**owner, 'binding_hash': digest, 'ask_event': ask.get('event_id'),
++                     'origin_session': origin['session']}
+             matches[json.dumps(owner, sort_keys=True)] = route
+     if len(matches) > 1:
+         raise ValueError('origin_comment_ambiguous')
+@@ -98,7 +99,8 @@ def forward(conn, task_id: str, args: dict, body: str) -> dict | None:
+     if not session or not ledger.exists():
+         return None
+     replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
+-    route = bound_owner(ledger, task_id=task_id, board=args.get('board') or 'default',
++    from hermes_cli.kanban_db import get_current_board
++    route = bound_owner(ledger, task_id=task_id, board=args.get('board') or get_current_board(),
+                         gateway=_gateway(replica), profile=get_active_profile_name(),
+                         session=_resolve_session(home / 'state.db', session),
+                         resolve_session=lambda sid: _resolve_session(home / 'state.db', sid))
+@@ -106,4 +108,6 @@ def forward(conn, task_id: str, args: dict, body: str) -> dict | None:
+         return None
+     if args.get('relays_user_message') or args.get('relayed_human'):
+         raise ValueError('origin_comment_human_relay_unsupported')
+-    return send(route, session=session, body=body)
++    # Authorization follows the live continuation; the durable request and its
++    # writer envelope stay bound to the accepted origin across compression.
++    return send(route, session=route['origin_session'], body=body)
+diff --git a/tests/hermes_cli/test_kanban_origin_comment_retry.py b/tests/hermes_cli/test_kanban_origin_comment_retry.py
+new file mode 100644
+index 0000000000..d80fe50a98
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_comment_retry.py
+@@ -0,0 +1,70 @@
++import shutil
++import sqlite3
++
++from tests.hermes_cli import test_kanban_origin_comment as fixtures
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++from hermes_cli import kanban_origin_comment as comments
++
++world = fixtures.world
++kanban_home = fixtures.kanban_home
++courier = fixtures.courier
++publish = fixtures.publish
++accept = fixtures.accept
++
++
++def test_retry_after_real_compression_reuses_request(kanban_home, world, courier, monkeypatch):
++    from gateway.session_context import scoped_current_session_id
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_origin_adapter as adapter
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_state import SessionDB
++
++    binding = world[2]
++    binding['owner']['board'] = 'default'
++    binding['task_record_key'] = 'work/default/t_one'
++    publish(world[1], binding)
++    accept(world)
++    home = get_hermes_home()
++    (home / 'kanban').mkdir(exist_ok=True)
++    shutil.copyfile(world[0], home / 'kanban/origin-ledger.db')
++    helpers._session('s_old')
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    with kbc.connect_closing(home / 'kanban' / 'probe.db') as conn:
++        with scoped_current_session_id('s_old'):
++            first = comments.forward(conn, 't_one', {}, 'Choose B')
++        # Real continuation rows, consumed by the production lineage resolver.
++        db = SessionDB(home / 'state.db')
++        db.end_session('s_old', 'compression')
++        db.create_session('s_new', source='desktop', parent_session_id='s_old')
++        db.close()
++        assert adapter._resolve_session(home / 'state.db', 's_old') == 's_new'
++        with scoped_current_session_id('s_new'):
++            second = comments.forward(conn, 't_one', {}, 'Choose B')
++    assert first['request_id'] == second['request_id'], (first, second)
++    assert len(courier[1]) == 2
++    assert courier[1][0][0] == courier[1][1][0]
++    assert [call[1]['env']['HERMES_SESSION_ID'] for call in courier[1]] == ['s_old', 's_old']
++
++
++def test_omitted_board_uses_active_board(kanban_home, world, courier, monkeypatch):
++    from gateway.session_context import scoped_current_session_id
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_origin_adapter as adapter
++    publish(world[1], world[2])
++    accept(world)
++    home = get_hermes_home()
++    (home / 'kanban').mkdir(exist_ok=True)
++    shutil.copyfile(world[0], home / 'kanban/origin-ledger.db')
++    helpers._session('s_old')
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    from hermes_cli.kanban_db_boards import create_board
++    create_board('build')
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', 'build')
++    with scoped_current_session_id('s_old'):
++        explicit = helpers._tool('comment', {'task_id': 't_one', 'body': 'B', 'board': 'build'})
++        omitted = helpers._tool('comment', {'task_id': 't_one', 'body': 'B'})
++    assert explicit.get('status') == 'comment_pending', explicit
++    assert omitted.get('status') == 'comment_pending', omitted
+-- 
+2.43.0
+

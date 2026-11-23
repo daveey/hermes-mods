@@ -1,0 +1,237 @@
+From e1f1cec0bce48d9bdb0b960fb7eb980c0b025b01 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 07:48:09 +0000
+Subject: [PATCH] fix(kanban): retain PR acceptance through GraphQL exhaustion
+ [daveey]
+
+GraphQL quota is shared with display pollers; exhaustion previously stranded delivered PR tasks while REST remained available. Fall back only on GitHub quota errors, retaining profile credentials, required context/app identities, complete exact-head evidence, merge-time cutoff and fresh PR head/state readback. Generic auth, local budget and incomplete REST policy reads remain fail closed. Regression: 11 acceptance consumer files pass, including an actual SQLite completion under injected GraphQL exhaustion and stale/failure controls.
+---
+ hermes_cli/kanban_pr_acceptance.py      | 34 ++++++++--
+ hermes_cli/kanban_pr_rest.py            | 42 ++++++++++++
+ tests/hermes_cli/test_kanban_pr_rest.py | 85 +++++++++++++++++++++++++
+ 3 files changed, 154 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_rest.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_rest.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index b50ce56524..89312948c4 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -17,6 +17,7 @@ from pathlib import Path
+ from urllib.parse import quote
+ 
+ from hermes_cli.kanban_pr_merge_time import check_receipt, flag_main_health, merge_evidence, timestamp
++from hermes_cli.kanban_pr_rest import GraphQLRateLimit as _GraphQLRateLimit, UnprotectedBranch, quota_error, read_pr
+ 
+ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+@@ -70,6 +71,11 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+                                 text=True, encoding="utf-8", errors="replace", timeout=30,
+                                 check=True, env=env)
+     except subprocess.CalledProcessError as exc:
++        if endpoint == "graphql" and exc.returncode != 75 and quota_error((exc.stderr or "") + (exc.stdout or "")):
++            raise _GraphQLRateLimit("GitHub GraphQL quota exhausted") from None
++        if (endpoint.endswith("/protection/required_status_checks")
++                and "Branch not protected" in (exc.stderr or "") and "HTTP 404" in (exc.stderr or "")):
++            raise UnprotectedBranch() from None
+         # 401/403/404 = the login cannot see this repository (wrong profile identity
+         # or missing grant), not a transient API failure. Persist only the status
+         # code + endpoint, never gh's stderr (credentials/host details).
+@@ -86,6 +92,8 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+         raise
+     value = json.loads(result.stdout)
+     if isinstance(value, dict) and value.get("errors"):
++        if endpoint == "graphql" and quota_error(json.dumps(value["errors"])):
++            raise _GraphQLRateLimit("GitHub GraphQL quota exhausted")
+         raise ValueError("GitHub returned incomplete GraphQL evidence")
+     return value
+ 
+@@ -182,6 +190,18 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
+         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
+ 
+ 
++def _acceptance_pr(query, repo, number, profile_home, receipt):
++    try:
++        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
++        if repository is None:
++            raise _GateAuthError(f"HTTP 404 on graphql {repo}")
++        return repository["pullRequest"]
++    except _GraphQLRateLimit:
++        pr = read_pr(_api, repo, number, profile_home)
++        receipt["pr_transport"] = "rest_graphql_rate_limit"
++        return pr
++
++
+ def collect_acceptance(contract: str, published_pr: str | None,
+                        assignee: str | None = None) -> dict:
+     receipt = {"ok": False, "classification": "missing", "head_sha": None,
+@@ -216,11 +236,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                  f'{{pullRequest(number:{number:d})'
+                  '{headRefOid baseRefName state mergedAt mergeCommit{oid} '
+                  'baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}')
+-        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+-        if repository is None:
+-            # A private repo the login cannot read resolves to null, not an error.
+-            raise _GateAuthError(f"HTTP 404 on graphql {repo}")
+-        pr = repository["pullRequest"]
++        pr = _acceptance_pr(query, repo, number, profile_home, receipt)
+         sha, branch = pr["headRefOid"], pr["baseRefName"]
+         receipt["head_sha"] = sha
+         receipt["pr_state"] = pr["state"]
+@@ -361,8 +377,12 @@ def pr_closed_unmerged(url: str, assignee: str | None = None) -> bool:
+              f'{{pullRequest(number:{int(match[2]):d}){{state}}}}}}')
+     try:
+         profile_home = _assignee_profile_home(assignee)
+-        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+-        return bool(repository) and repository["pullRequest"]["state"] == "CLOSED"
++        try:
++            repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
++            return bool(repository) and repository["pullRequest"]["state"] == "CLOSED"
++        except _GraphQLRateLimit:
++            pull = _api(f"repos/{match[1]}/pulls/{match[2]}", profile_home=profile_home)
++            return pull["state"] == "closed" and pull["merged"] is False
+     except Exception:
+         return False
+ 
+diff --git a/hermes_cli/kanban_pr_rest.py b/hermes_cli/kanban_pr_rest.py
+new file mode 100644
+index 0000000000..170378cedd
+--- /dev/null
++++ b/hermes_cli/kanban_pr_rest.py
+@@ -0,0 +1,42 @@
++"""REST projection of the PR/policy evidence used by completion acceptance."""
++from urllib.parse import quote
++
++
++class GraphQLRateLimit(ValueError):
++    """Only GitHub GraphQL quota exhaustion; not a local budget or auth refusal."""
++
++
++class UnprotectedBranch(ValueError):
++    """GitHub positively reports that the base branch is not protected."""
++
++
++def quota_error(text: str) -> bool:
++    lowered = text.lower()
++    return "rate_limited" in lowered or "api rate limit" in lowered
++
++
++def read_pr(api, repo: str, number: int, profile_home: str | None) -> dict:
++    """Preserve policy app IDs and merge timestamps; unreadable policy fails closed."""
++    pull = api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
++    state, merged = pull["state"], pull["merged"]
++    if state not in {"open", "closed"} or not isinstance(merged, bool) or (merged and state != "closed"):
++        raise ValueError("Invalid REST PR state")
++    result = {"headRefOid": pull["head"]["sha"], "baseRefName": pull["base"]["ref"],
++              "state": "MERGED" if merged else state.upper(),
++              "mergedAt": pull["merged_at"], "mergeCommit": {"oid": pull["merge_commit_sha"]}}
++    if result["state"] == "CLOSED":
++        return result
++    branch = quote(result["baseRefName"], safe="")
++    try:
++        protection = api(f"repos/{repo}/branches/{branch}/protection/required_status_checks",
++                         profile_home=profile_home)
++    except UnprotectedBranch:
++        protection = {"contexts": [], "checks": []}
++    # Both keys are part of the REST contract; missing policy is not no policy.
++    required = [{"context": row["context"], "app": {"databaseId": row["app_id"]}}
++                for row in protection["checks"]]
++    pinned = {row["context"] for row in required}
++    required.extend({"context": context, "app": None}
++                    for context in protection["contexts"] if context not in pinned)
++    result["baseRef"] = {"branchProtectionRule": {"requiredStatusChecks": required}}
++    return result
+diff --git a/tests/hermes_cli/test_kanban_pr_rest.py b/tests/hermes_cli/test_kanban_pr_rest.py
+new file mode 100644
+index 0000000000..80af0214c6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_rest.py
+@@ -0,0 +1,85 @@
++"""Quota fallback retains exact-head, policy and merge-time acceptance."""
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as gate
++from tests.hermes_cli import test_kanban_pr_acceptance as fixtures
++
++
++acceptance_github = fixtures.github
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("fault", [None, "failure", "missing", "stale", "head_change"])
++def test_exhausted_completion_uses_rest(acceptance_github, monkeypatch, fault):
++    github = acceptance_github
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++
++    original = gate._api
++    calls = []
++
++    def api(endpoint, **kwargs):
++        calls.append(endpoint)
++        if endpoint == "graphql":
++            raise gate._GraphQLRateLimit("GraphQL quota exhausted")
++        if endpoint.endswith("/protection/required_status_checks"):
++            return {"contexts": ["required"], "checks": [{"context": "required", "app_id": 1}]}
++        value = original(endpoint, **kwargs)
++        if endpoint == "repos/acme/repo/pulls/7":
++            value.update(merged_at="2026-11-02T13:10:04Z", merge_commit_sha=None)
++        return value
++
++    monkeypatch.setattr(gate, "_api", api)
++    if fault == "failure":
++        github["conclusion"] = "failure"
++    elif fault:
++        github[fault] = True
++    with connect() as conn:
++        task = kb.create_task(conn, title="REST acceptance", completion_contract="acme/repo")
++        ok = kb.complete_task(conn, task, summary="done", metadata={
++            "published_pr": "https://github.com/acme/repo/pull/7"})
++        assert ok is (fault is None)
++        assert (kb.get_task(conn, task).status == "done") is ok
++    assert calls.count("graphql") == 1
++    assert sum(path == "repos/acme/repo/pulls/7" for path in calls) == 2
++
++
++@pytest.mark.parametrize("message", [
++    "GraphQL: API rate limit already exceeded for user ID 123",
++    '{"errors":[{"type":"RATE_LIMITED"}]}',
++])
++def test_transport_classifies_rate_limit_before_http_auth(monkeypatch, message):
++    monkeypatch.setattr(gate, "_gh_command_prefix", lambda home: [])
++    monkeypatch.setattr(gate, "_gh_env", lambda home: None)
++    monkeypatch.setattr("hermes_platform.resolver.github.resolve_gh", lambda *a: type(
++        "Resolved", (), {"found": True, "command": ["gh"]})())
++
++    def fail(*args, **kwargs):
++        raise subprocess.CalledProcessError(1, "gh", stderr=message + " (HTTP 403)")
++
++    monkeypatch.setattr(subprocess, "run", fail)
++    with pytest.raises(gate._GraphQLRateLimit):
++        gate._api("graphql", query="{}")
++    with pytest.raises(gate._GateAuthError):
++        gate._api("repos/acme/repo/pulls/7")
++
++
++def test_rest_policy_unreadable_does_not_accept(acceptance_github, monkeypatch):
++    original = gate._api
++
++    def api(endpoint, **kwargs):
++        if endpoint == "graphql":
++            raise gate._GraphQLRateLimit()
++        if "/protection/" in endpoint:
++            raise gate._GateAuthError("HTTP 404")
++        value = original(endpoint, **kwargs)
++        if endpoint == "repos/acme/repo/pulls/7":
++            value.update(merged_at="2026-11-02T13:10:04Z", merge_commit_sha=None)
++        return value
++
++    monkeypatch.setattr(gate, "_api", api)
++    receipt = gate.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
++    assert not receipt["ok"]
++    assert receipt["classification"] == "auth"
+-- 
+2.43.0
+

@@ -1,0 +1,267 @@
+From c8682228e825eaf068d5141baa71d94c9b9fa161 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:49:21 +0000
+Subject: [PATCH] [daveey] kanban connect: one clean integrity check per DB
+ file, not per CLI process
+
+The hub scaler's `hermes kanban create` (canary + failure card) timed out at 10 s for 20 minutes and the
+new node could not join. PR3932's 30 s cap only hid the cause. Measured on the hub with cProfile of the installed
+launcher (`hermes kanban show`, 13.1 s): 9.2 s asleep in `_cross_process_init_lock`, 2.6 s in `PRAGMA integrity_check`
+of the 700 MB board, imports/argparse under 1.5 s. 1/4/8 concurrent CLIs: 9-16 / 15-18 / 19-21 s.
+
+Why: `connect()` ran the full integrity probe once per PROCESS (the `_INITIALIZED_PATHS` cache is in-process) while
+holding the cross-process init lock, so every short-lived CLI paid an O(board) scan and N concurrent CLIs queued N
+serial scans; waiters gave up at the 10 s lock bound and scanned anyway. Tests used tiny boards and one process.
+
+Fix: a clean full check writes `<db>.integrity-ok` (device + inode + time). A fresh stamp (6 h) for the same file skips
+the scan. An expired, missing or garbled stamp, a replaced file, or a failed check still runs the full check with the
+unchanged quarantine/REINDEX path. A failed check never stamps; an unwritable stamp never fails connect.
+
+Proof: tests/tools/test_kanban_connect_integrity_stamp.py spawns real processes through `connect()` (RED: 6 scans for
+6 processes; GREEN: 1). Real `hermes kanban show` entrypoint vs a synthetic 1.1 GB board in an isolated home, 1/4/8
+concurrent: old 3.5/11.2/13.6 s; fixed 4.2 cold then 1.8-3.0 s (interpreter + import floor).
+---
+ hermes_cli/kanban_db_connect.py               |  49 +++++-
+ .../test_kanban_connect_integrity_stamp.py    | 147 ++++++++++++++++++
+ 2 files changed, 194 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_kanban_connect_integrity_stamp.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 91e04f2c88..57bd2168ea 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -52,6 +52,12 @@ _CONTENT_ADDRESSED_BACKUP = re.compile(r"\.corrupt\.[0-9a-f]{16}\.bak")
+ # then proceed without the lock (in-process _INIT_LOCK + idempotent init backstop).
+ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
+ _INIT_LOCK_POLL_SECONDS = 0.05
++# A clean full ``integrity_check`` is O(board size) (3.0 s at the hub's 700 MB) and ran once PER PROCESS, under the
++# cross-process init lock, so N concurrent ``hermes kanban`` CLIs cost N serial scans (9-20 s each).
++# A clean result is stamped next to the DB (``<db>.integrity-ok``: file identity + wall time); a fresh stamp for the
++# same file lets later processes skip the scan. A TTL of 0 (module constant) always scans.
++_INTEGRITY_STAMP_SUFFIX = ".integrity-ok"
++_INTEGRITY_STAMP_TTL_SECONDS = 6 * 3600.0
+ 
+ 
+ def _resolve_busy_timeout_ms() -> int:
+@@ -670,6 +676,41 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
+     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
+ 
+ 
++def _integrity_stamp_path(resolved: Path) -> Path:
++    return resolved.with_name(resolved.name + _INTEGRITY_STAMP_SUFFIX)
++
++
++def _integrity_stamp_fresh(resolved: Path) -> bool:
++    """True when a clean full check of THIS file (same device+inode) was recorded within the TTL. Any doubt
++    (missing/unreadable/garbled stamp, replaced file, a clock step backwards) is False: the scan runs."""
++    ttl = _INTEGRITY_STAMP_TTL_SECONDS
++    if ttl <= 0:
++        return False
++    try:
++        st = resolved.stat()
++        stamp = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
++        age = time.time() - float(stamp["verified_at"])
++        return stamp["dev"] == st.st_dev and stamp["ino"] == st.st_ino and 0 <= age < ttl
++    except (OSError, ValueError, KeyError, TypeError):
++        return False
++
++
++def _write_integrity_stamp(resolved: Path) -> None:
++    """Best effort: a failed write only means the next process scans again."""
++    if _INTEGRITY_STAMP_TTL_SECONDS <= 0:
++        return
++    target = _integrity_stamp_path(resolved)
++    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
++    try:
++        st = resolved.stat()
++        tmp.write_text(json.dumps({"dev": st.st_dev, "ino": st.st_ino, "verified_at": time.time(), "pid": os.getpid()}),
++                       encoding="utf-8")
++        os.replace(tmp, target)
++    except OSError:
++        with contextlib.suppress(OSError):
++            tmp.unlink()
++
++
+ def _guard_existing_db_is_healthy(path: Path) -> None:
+     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
+ 
+@@ -680,8 +721,9 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
+     the file + sidecars and raise :class:`KanbanDbCorruptError` so callers
+     never recreate the schema on top of a damaged DB. ``OperationalError``
+     (lock/busy) is NOT corruption and propagates raw (no spurious backup).
+-    No-op for missing / zero-byte files and paths already proven healthy this
+-    process. All writes are confined to the resolved path's parent.
++    No-op for missing / zero-byte files, paths already proven healthy this
++    process, and files another process fully checked within the stamp TTL.
++    All writes are confined to the resolved path's parent.
+     """
+     try:
+         resolved = path.resolve()
+@@ -689,8 +731,11 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
+         return
+     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
+         return
++    if _integrity_stamp_fresh(resolved):
++        return  # another process fully checked this very file within the TTL: no per-process O(board) scan
+     messages, reason = _probe_for_corruption(resolved)
+     if reason is None:
++        _write_integrity_stamp(resolved)
+         return
+     # The probe ran in THIS process, whose view can be stale (deleted WAL/SHM
+     # generation after a sibling's close). Only an independently confirmed failure
+diff --git a/tests/tools/test_kanban_connect_integrity_stamp.py b/tests/tools/test_kanban_connect_integrity_stamp.py
+new file mode 100644
+index 0000000000..84eec64b34
+--- /dev/null
++++ b/tests/tools/test_kanban_connect_integrity_stamp.py
+@@ -0,0 +1,147 @@
++"""A fresh ``hermes kanban`` process must not re-scan the whole board DB, nor queue behind the others that do.
++
++Observed on the hub: every ``hermes kanban show/create/archive`` took 9-20 s. cProfile of the installed launcher:
++9.2 s asleep in ``_cross_process_init_lock`` (another CLI held ``kanban.db.init.lock``) + 2.6 s in
++``PRAGMA integrity_check`` of the 700 MB board; imports and argparse were under 1.5 s. ``connect()`` ran the full
++integrity probe once PER PROCESS (the ``_INITIALIZED_PATHS`` cache is in-process) while holding the cross-process lock,
++so N concurrent CLIs cost N serial scans and the waiters' 10 s bound expired (the hub scaler's 10 s subprocess
++ceiling, then 30 s, was only the symptom). A clean full check now leaves a verified stamp next to the DB: processes
++that find a fresh stamp for the same file skip the O(DB) scan.
++
++Real subprocesses (not a mocked ``connect``) enter through ``kanban_db_connect.connect`` like the CLI does.
++"""
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++CHILD = r"""
++import os, sys, threading
++from pathlib import Path
++from hermes_cli import kanban_db_connect as kbc
++
++log = os.environ["CHECK_LOG"]
++real = kbc._run_integrity_check
++
++def counted(conn):
++    with open(log, "a") as f:
++        f.write(f"{os.getpid()}\n")
++    threading.Event().wait(float(os.environ.get("CHECK_SLEEP_S", "0")))  # a slow scan, as on a 700 MB board
++    return real(conn)
++
++kbc._run_integrity_check = counted
++kbc._INTEGRITY_STAMP_TTL_SECONDS = float(os.environ.get("CHECK_TTL_S", kbc._INTEGRITY_STAMP_TTL_SECONDS))
++kbc.connect(Path(sys.argv[1])).close()
++"""
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    from hermes_cli import kanban_db_connect as kbc
++    path = home / "kanban.db"
++    kbc.init_db(path)
++    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++    return path
++
++
++def _env(tmp_path, board_path, **extra):
++    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_KANBAN_", "PYTEST"))}
++    env.update(HERMES_HOME=str(board_path.parent), HERMES_KANBAN_HOME=str(board_path.parent),
++               CHECK_LOG=str(tmp_path / "checks.log"), PYTHONPATH=str(REPO), **extra)
++    return env
++
++
++def _spawn(tmp_path, board_path, n, **extra):
++    env = _env(tmp_path, board_path, **extra)
++    procs = [subprocess.Popen([sys.executable, "-c", CHILD, str(board_path)], env=env, cwd=REPO,
++                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(n)]
++    for p in procs:
++        _out, err = p.communicate(timeout=120)
++        assert p.returncode == 0, err[-2000:]
++    log = tmp_path / "checks.log"
++    return log.read_text().split() if log.exists() else []
++
++
++def _stamp(board_path):
++    return board_path.with_name(board_path.name + ".integrity-ok")
++
++
++def test_concurrent_cli_processes_share_one_integrity_check(tmp_path, board):
++    """Old: every process scanned (6 checks, serialized behind the init lock). Fixed: the first scans, the rest skip."""
++    checks = _spawn(tmp_path, board, 6, CHECK_SLEEP_S="0.4")
++    assert len(checks) == 1, checks
++    assert _stamp(board).exists()
++
++
++def test_next_process_after_a_clean_check_skips_the_scan(tmp_path, board):
++    assert len(_spawn(tmp_path, board, 1)) == 1
++    started = time.monotonic()
++    assert len(_spawn(tmp_path, board, 1, CHECK_SLEEP_S="5")) == 1  # still the first run's single line: no second scan
++    assert time.monotonic() - started < 5
++
++
++def test_an_expired_stamp_forces_a_fresh_full_check(tmp_path, board):
++    _spawn(tmp_path, board, 1)
++    stamp = json.loads(_stamp(board).read_text())
++    stamp["verified_at"] -= 7 * 3600
++    _stamp(board).write_text(json.dumps(stamp))
++    assert len(_spawn(tmp_path, board, 1)) == 2
++
++
++def test_a_stamp_for_a_replaced_file_is_ignored(tmp_path, board):
++    _spawn(tmp_path, board, 1)
++    data = board.read_bytes()
++    replacement = board.with_name("kanban.db.restore")
++    replacement.write_bytes(data)  # allocated while the old file still holds its inode number
++    for suffix in ("-wal", "-shm"):
++        Path(str(board) + suffix).unlink(missing_ok=True)
++    os.replace(replacement, board)  # same bytes, new inode: the stamp vouched for another file
++    assert len(_spawn(tmp_path, board, 1)) == 2
++
++
++def test_ttl_zero_disables_the_stamp(tmp_path, board):
++    assert len(_spawn(tmp_path, board, 2, CHECK_TTL_S="0")) == 2
++    assert not _stamp(board).exists()
++
++
++def test_corruption_is_still_caught_when_the_check_runs_and_never_stamped(tmp_path, board):
++    from hermes_cli import kanban_db_connect as kbc
++    conn = sqlite3.connect(board)
++    conn.execute("CREATE TABLE IF NOT EXISTS pad(x TEXT)")
++    conn.executemany("INSERT INTO pad VALUES (?)", [("x" * 500,)] * 3000)
++    conn.commit()
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    conn.close()
++    raw = bytearray(board.read_bytes())
++    for off in range(len(raw) // 2, len(raw) // 2 + 4096, 8):  # smash interior pages: the header stays valid
++        raw[off] = 0xFF
++    board.write_bytes(bytes(raw))
++    for suffix in ("-wal", "-shm"):
++        Path(str(board) + suffix).unlink(missing_ok=True)
++    kbc._INITIALIZED_PATHS.discard(str(board.resolve()))
++    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
++        kbc.connect(board).close()
++    assert not _stamp(board).exists()
++
++
++def test_an_unwritable_stamp_never_fails_the_connect(board, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++
++    def refuse(*_a, **_k):
++        raise OSError("read-only filesystem")
++    monkeypatch.setattr(kbc.os, "replace", refuse)
++    kbc._INITIALIZED_PATHS.discard(str(board.resolve()))
++    kbc.connect(board).close()
+-- 
+2.43.0
+

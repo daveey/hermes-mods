@@ -1,0 +1,132 @@
+From 26084bb76786fc28186ff0f31c4ccc3ebcdf3405 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:34:28 +0000
+Subject: [PATCH] fix(tests): ignore clone capability work in SIGTERM copy
+ fixture [daveey]
+
+The locked page-copy fixture used the full .partial* cleanup inventory as
+readiness. Since #3863, the clone capability probe briefly occupies that
+namespace before the real destination exists. A readiness poll can return
+that probe, then the assertion sees a live child and no staging file.
+
+Explicitly disable clone only for this page-copy fixture, as the WAL copy
+fixture already does. Preserve the real exclusive SQLite lock, SIGTERM
+exit 143, empty stdout, and exhaustive staging cleanup assertions. No
+production change, glob exclusion, retry adjustment or timeout widening.
+
+Add a controlled owned-child regression: real _clone_unavailable creates
+and removes its probe; socket barriers acknowledge its removal after the
+parent observes it, then hold the child before actual staging. Replacing
+only the filesystem clone makes the schedule independent of reflink
+support. Removing the fixture opt-out reproduces the incident assertion.
+
+Proof:
+- Exact job 136812356125/run 44892881102 at 707a3bee7b61 downloaded
+  with gh: readiness assertion (None is None and []), failed ID retry pass.
+- Controlled old fixture RED at that exact assertion; fixed schedule GREEN.
+- HERMES_TEST_FILE_RETRIES=0: targeted 2 pass; whole staging file 5 pass.
+- Six backup files: 119 pass, 2 pre-existing progress index assertions fail,
+  3 filesystem-dependent clone skips. Separate baseline repair owner
+  t_e2f527f781935f35; production and progress test blobs unchanged here.
+- scripts/hermes-python scripts/check --base origin/main: 21 checks OK.
+
+Ownership: historical lock-deadline #342 and weakref/SystemExit #405
+remain intact. Fresh hub open backup-owner SQL empty; open backup PR
+search only unrelated upstream #3502 before publication.
+
+Hermes-Card: t_a67bba0b4dbbb313
+---
+ .../test_backup_preflight_staging.py          | 62 ++++++++++++++++++-
+ 1 file changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_backup_preflight_staging.py b/tests/hermes_cli/test_backup_preflight_staging.py
+index 669049cc41..12e448bae8 100644
+--- a/tests/hermes_cli/test_backup_preflight_staging.py
++++ b/tests/hermes_cli/test_backup_preflight_staging.py
+@@ -6,6 +6,7 @@ reporters accumulated 11.7 GB of them (#124972, #128605).
+ """
+ import os
+ import signal
++import socket
+ import sqlite3
+ import subprocess
+ import sys
+@@ -42,8 +43,11 @@ def test_sigterm_mid_copy_removes_the_staging_copy(tmp_path):
+     holder.execute("BEGIN EXCLUSIVE")
+     try:
+         # The child's own 10s lock deadline must not expire while a starved runner delays the SIGTERM.
++        # This fixture tests the locked page copy, not clone capability detection. Its
++        # short-lived .partial-probe is not readiness for the actual staging copy.
++        env = {**os.environ, "HERMES_PREFLIGHT_CLONE": "0"}
+         proc = subprocess.Popen([sys.executable, "-I", "-S", str(SCRIPT), str(home), "600"],
+-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+         try:
+             wait_until(lambda: _staging(home) or proc.poll() is not None, timeout=30, what="the staging copy")
+             assert proc.poll() is None and _staging(home), "the pre-flight must still be copying"
+@@ -63,6 +67,62 @@ def test_sigterm_mid_copy_removes_the_staging_copy(tmp_path):
+     assert _staging(home) == []
+ 
+ 
++@pytest.mark.platforms("posix")
++def test_sigterm_readiness_does_not_accept_a_transient_clone_probe(tmp_path, monkeypatch):
++    """Force probe observation -> probe removal -> readiness assertion, without sleeps.
++
++    Run the real SIGTERM fixture with an owned child. The real capability check creates
++    and removes its probe; only the filesystem clone is replaced, so this works off APFS too.
++    Removing the fixture's clone opt-out must fail before it sends SIGTERM.
++    """
++    driver = """
++import errno, json, runpy, signal, socket, sys
++from pathlib import Path
++ns = runpy.run_path(sys.argv[1], run_name='not_main')
++g = ns['preflight_state_db'].__globals__
++barrier = socket.socket(fileno=int(sys.argv[3]))
++barrier.settimeout(30)
++original = g['_clone_unavailable']
++probed = False
++def clone_file(*args):
++    global probed
++    probed = True
++    assert barrier.recv(1) == b'G'
++    raise OSError(errno.ENOTSUP, 'controlled unsupported clone')
++def unavailable(*args):
++    result = original(*args)
++    if probed:
++        barrier.sendall(b'R')  # the real finally has removed the probe
++        assert barrier.recv(1) == b'G'  # keep actual staging absent for the assertion
++    return result
++g['_clone_file'] = clone_file
++g['_clone_unavailable'] = unavailable
++signal.signal(signal.SIGTERM, ns['_on_sigterm'])
++print(json.dumps(ns['preflight_state_db'](Path(sys.argv[2]), busy_timeout_seconds=600,
++                                       clone=True, reporter=ns['_ProgressReporter']())))
++"""
++    popen, staging = subprocess.Popen, _staging
++    parent, child = socket.socketpair()
++    parent.settimeout(30)
++    with parent, child:
++        def start(argv, **kwargs):
++            return popen([*argv[:3], "-c", driver, argv[3], argv[4], str(child.fileno())],
++                         pass_fds=(child.fileno(),), **kwargs)
++
++        def observe(home):
++            observed = staging(home)
++            if any(name.endswith(".partial-probe") for name in observed):
++                parent.sendall(b'G')
++                assert parent.recv(1) == b'R'
++                assert staging(home) == []
++            return observed
++
++        monkeypatch.setenv("HERMES_PREFLIGHT_CLONE", "1")
++        monkeypatch.setattr(subprocess, "Popen", start)
++        monkeypatch.setattr(sys.modules[__name__], "_staging", observe)
++        test_sigterm_mid_copy_removes_the_staging_copy(tmp_path)
++
++
+ @pytest.mark.platforms("posix")
+ def test_a_sigterm_swallowed_by_a_weakref_callback_still_stops_the_copy(tmp_path):
+     """Python runs the signal handler between arbitrary bytecodes, and a SystemExit raised inside a
+-- 
+2.43.0
+

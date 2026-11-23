@@ -1,0 +1,138 @@
+From d51e72faee2dc643c41d8370f1a917c348da4a49 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:18:51 +0000
+Subject: [PATCH] [daveey] Canonical status: one board read per refresh attempt
+
+The status reducer read the cards a second time inside the same refresh. That second read is a warm
+display read (stale_ok): it answers from the previous projection and starts a background rebuild, so the
+status was reduced from different data than the explanation. Under tests that run threads inline the
+rebuild never returned, which hung 11 tui_gateway files on PR CI run 44968177484 (600 s each).
+
+refresh now shares one card read (or its one failure) between the explanation and the status for each
+publication attempt; nothing is remembered across attempts or refreshes.
+
+Proof: tests/hermes_state/test_session_status_refresh.py 2 new cases RED (2 reads) then GREEN; the 11
+previously hung files plus the two status files: 13 files, 281 passed, 0 failed (canonical runner).
+---
+ hermes_state_outcome.py                       | 21 ++++++++++
+ hermes_state_session_status_snapshot.py       | 17 ++++++---
+ .../test_session_status_refresh.py            | 38 +++++++++++++++++++
+ 3 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 7046095d5b..1fd3975030 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -24,6 +24,7 @@ import json
+ import logging
+ import sqlite3
+ import time
++from contextvars import ContextVar
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Iterator, Optional
+ 
+@@ -323,7 +324,27 @@ def _gateway_running(home: Path) -> bool:
+     return get_running_pid(home / "gateway.pid", cleanup_stale=False) is not None
+ 
+ 
++# [daveey] One card read per refresh attempt: the explanation and the canonical status reduce the same
++# answer (or the same failure), not a cold projection followed by a second, stale display read.
++_card_read: ContextVar[Optional[dict]] = ContextVar("session_outcome_card_read", default=None)
++
++
+ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
++    memo = _card_read.get()
++    if memo is None:
++        return _read_card_items(ids)
++    key = tuple(ids)
++    if key not in memo:
++        try:
++            memo[key] = _read_card_items(ids)
++        except Exception as exc:  # health: allow BLE001 -- replayed to every reader of this attempt
++            memo[key] = exc
++    if isinstance(memo[key], Exception):
++        raise memo[key]
++    return memo[key]
++
++
++def _read_card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+     """(decision items, waits) from the cards these chats created or shepherd: a card parked on a
+     validated ``human_request`` is a decision, every other open card is a wait."""
+     from hermes_cli.kanban_open_asks import card_is_open_human_ask
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index 75dbb0a995..712c5a359a 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -282,12 +282,17 @@ def refresh(db: Any, sid: str, trigger: str, concluding: frozenset[str]) -> dict
+     for _attempt in range(CAS_ATTEMPTS):
+         tip = so._tip(db, sid)
+         row = so._row(db, tip)
+-        derived = so._derive(db, tip, concluding=concluding)
+-        if row is None:
+-            return derived
+-        raw, fence = row.get("outcome_json"), _user_fence(db, tip)
+-        stored = so._parse(raw)
+-        derived = {**derived, "status": canonical_status(db, tip, stored, trigger=trigger, concluding=concluding)}
++        shared = so._card_read.set({})  # the explanation and the status reduce one card read
++        try:
++            derived = so._derive(db, tip, concluding=concluding)
++            if row is None:
++                return derived
++            raw, fence = row.get("outcome_json"), _user_fence(db, tip)
++            stored = so._parse(raw)
++            derived = {**derived,
++                       "status": canonical_status(db, tip, stored, trigger=trigger, concluding=concluding)}
++        finally:
++            so._card_read.reset(shared)
+         if so._same(stored, derived):
+             # Unchanged is only an answer while it is still what is stored for the same newest request.
+             if (so._row(db, tip) or {}).get("outcome_json") == raw and _user_fence(db, tip) == fence:
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+index b2a4edd917..33a6e9f015 100644
+--- a/tests/hermes_state/test_session_status_refresh.py
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -391,3 +391,41 @@ def test_exhausted_fence_leaves_the_successor_in_place(db, monkeypatch):
+     out = so.refresh_outcome("chat", "manual", db=db)
+     assert count[0] == snapshot.CAS_ATTEMPTS
+     assert out == before == so.get_outcome("chat", db=db)
++
++
++def test_one_refresh_reads_the_board_once_for_explanation_and_status(db, board, monkeypatch):
++    """A second card read in the same refresh is a warm display read: it answers stale and starts a
++    background projection, so the status would be reduced from different data than the explanation."""
++    say(db, "user", "do it")
++    say(db, "assistant", "Done.", finish_reason="stop")
++    add_card(board, "t_open", "running")
++    reads, background = [], []
++    real = ksa.session_outcome_tasks
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **kw: reads.append(a) or real(*a, **kw))
++    monkeypatch.setattr(ksa, "_refresh_links_in_background", background.append)
++
++    first = refresh(db)
++    assert len(reads) == 1 and background == []
++    assert first["presentation"]["stripe"] == "waiting"
++
++    set_card(board, "t_open", "done")  # the next refresh reads again: nothing is remembered across refreshes
++    second = refresh(db)
++    assert len(reads) == 2
++    assert second["presentation"]["stripe"] == "done"
++
++
++def test_a_failed_board_read_is_replayed_not_reread_as_empty(db, monkeypatch):
++    say(db, "user", "do it")
++    say(db, "assistant", "Done.", finish_reason="stop")
++    calls = []
++
++    def broken(*a, **kw):
++        calls.append(a)
++        raise OSError("board unreadable")
++
++    monkeypatch.setattr(ksa, "session_outcome_tasks", broken)
++    status = refresh(db)
++    assert len(calls) == 1
++    assert status["presentation"]["stripe"] != "done"
++    assert status["reason"] == "source_unknown"
++    assert any(reason.startswith("cards:") for reason in status["coverage"]["reasons"])
+-- 
+2.43.0
+

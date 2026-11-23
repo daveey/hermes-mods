@@ -1,0 +1,252 @@
+From 8810cdfa16f7b0157b66b133c4583460e8cfaef8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:50:27 +0000
+Subject: [PATCH] [daveey] Preserve SQLite fixture semantics under runtime
+ custody auditing
+
+Why: guard installation eagerly read schema, retaining a reader and rejecting intentionally corrupt or locked fixtures; backup-to-memory lost observed trigger custody. Custom connection wrappers also changed class identity and bypassed their authorizer composition. Session fixture provenance must outlive copied homes.
+
+Proof: new regressions RED (4 failed/28 passed, then 2 interface failures); resolved installation without SQL, lazy exact observed trigger definitions and explicit cursor closure, stable class wrappers and native authorizer composition. All 33 formerly failing CI files GREEN: 919 passed, 0 failed, 5 skipped, retries0. Runtime observer remains test-only; no source-text completeness claim or protocol activation.
+---
+ tests/_fixtures/custody_writes.py             | 11 ++-
+ tests/hermes_cli/custody_authorizer.py        | 61 ++++++++++----
+ .../test_kanban_sync_capture_sites.py         | 83 ++++++++++++++++++-
+ 3 files changed, 132 insertions(+), 23 deletions(-)
+
+diff --git a/tests/_fixtures/custody_writes.py b/tests/_fixtures/custody_writes.py
+index 7b9b18191c..461df97ae4 100644
+--- a/tests/_fixtures/custody_writes.py
++++ b/tests/_fixtures/custody_writes.py
+@@ -6,9 +6,12 @@ import pytest
+ from tests.hermes_cli.custody_authorizer import CustodyGuard
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def custody_writes_are_audited(monkeypatch):
++@pytest.fixture(autouse=True, scope="session")
++def custody_writes_are_audited():
++    # Module/session templates create real triggers before function fixtures run. Keep their
++    # observed definition custody for the whole process, including later copied test homes.
+     guard = CustodyGuard()
+-    monkeypatch.setattr(sqlite3, "connect", guard.factory(sqlite3.connect))
+-    yield guard
++    with pytest.MonkeyPatch.context() as patch:
++        patch.setattr(sqlite3, "connect", guard.factory(sqlite3.connect))
++        yield guard
+     assert not guard.violations, f"unaudited runtime custody writers: {guard.violations}"
+diff --git a/tests/hermes_cli/custody_authorizer.py b/tests/hermes_cli/custody_authorizer.py
+index 6ba3523abc..ca1c9251ef 100644
+--- a/tests/hermes_cli/custody_authorizer.py
++++ b/tests/hermes_cli/custody_authorizer.py
+@@ -71,23 +71,39 @@ class CustodyGuard:
+ 
+     def install(self, connection, database):
+         external = None
+-        filename = connection.execute("PRAGMA database_list").fetchone()[2]
+-        database_key = filename if filename else object()
+-        # A copied/restored fixture can retain provenance only for a byte-identical trigger
+-        # definition actually created under this guard, never by trigger name alone.
+-        for schema in ("main", "temp"):
+-            for name, sql in connection.execute(f"SELECT name, sql FROM {schema}.sqlite_master WHERE type='trigger'"):
+-                identity = self.trigger_definitions.get(sql)
+-                if identity is not None:
+-                    self.triggers[database_key, schema, name] = identity
++        install_authorizer = connection.set_authorizer
++        # Installing an observer must not open a read transaction: recovery tests deliberately
++        # connect to corrupt/locked/undecodable databases. Each connection has separate custody.
++        database_key = object()
++
++        def definitions(schema, name=None):
++            quoted = '"' + schema.replace('"', '""') + '"'
++            sql = f"SELECT name, sql FROM {quoted}.sqlite_master WHERE type='trigger'"
++            cursor = sqlite3.Connection.execute(
++                connection, sql + (" AND name=?" if name is not None else ""),
++                (name,) if name is not None else ())
++            try:
++                return cursor.fetchall()
++            finally:
++                cursor.close()
++
++        def creator(schema, trigger):
++            key = (database_key, schema, trigger)
++            if key not in self.triggers:
++                # A backup/reopen can adopt only an exact definition observed at creation,
++                # never merely a familiar name. This also covers backup-to-memory fixtures.
++                for _, sql in definitions(schema, trigger):
++                    identity = self.trigger_definitions.get(sql)
++                    if identity is not None:
++                        self.triggers[key] = identity
++            return self.triggers.get(key, ("<unknown-trigger>", trigger))
+ 
+         def remember():
+             if database_key not in self.pending:
+                 return
+             self.pending.discard(database_key)
+             for schema in ("main", "temp"):
+-                for name, sql in sqlite3.Connection.execute(
+-                        connection, f"SELECT name, sql FROM {schema}.sqlite_master WHERE type='trigger'"):
++                for name, sql in definitions(schema):
+                     identity = self.triggers.get((database_key, schema, name))
+                     if identity is not None:
+                         self.trigger_definitions[sql] = identity
+@@ -102,10 +118,10 @@ class CustodyGuard:
+                 self.pending.add(database_key)
+             if action in ACTIONS and table in TABLES:
+                 if trigger is not None:
+-                    creator = self.triggers.get((database_key, schema, trigger), ("<unknown-trigger>", trigger))
++                    trigger_creator = creator(schema, trigger)
+                     # Fixture-created triggers cannot lend test exemption to a production caller.
+-                    if not creator[0].startswith("tests."):
+-                        identity = creator
++                    if not trigger_creator[0].startswith("tests."):
++                        identity = trigger_creator
+                 entry = (*identity, ACTIONS[action], table)
+                 self.observed.append(entry)
+                 # Test fixture setup is not a production writer. Production frames are never skipped
+@@ -118,10 +134,10 @@ class CustodyGuard:
+         def replace(authorizer_callback):
+             nonlocal external
+             external = authorizer_callback
+-            sqlite3.Connection.set_authorizer(connection, authorize)
++            install_authorizer(authorize)
+ 
+         connection.set_authorizer = replace
+-        sqlite3.Connection.set_authorizer(connection, authorize)
++        install_authorizer(authorize)
+ 
+     def factory(self, real_connect):
+         guard = self
+@@ -129,18 +145,27 @@ class CustodyGuard:
+         class Guarded(_RememberConnection, sqlite3.Connection):
+             pass
+ 
++        classes = {sqlite3.Connection: Guarded}
++
+         def connect(database, *args, **kwargs):
+             # Positional cached_statements/factory are deliberately unsupported rather than silently
+             # leave a connection unguarded. The Board opens connections with keyword options.
+             if len(args) > 4:
+                 raise TypeError("custody guard requires keyword factory/cached_statements")
+             base = kwargs.pop("factory", sqlite3.Connection)
+-            cls = base if issubclass(base, _RememberConnection) else (
+-                Guarded if base is sqlite3.Connection else type("CustodyGuarded", (_RememberConnection, base), {}))
++            if issubclass(base, _RememberConnection):
++                cls = base
++            else:
++                if base not in classes:
++                    classes[base] = type("CustodyGuarded", (_RememberConnection, base), {})
++                cls = classes[base]
+             kwargs["factory"] = cls
+             kwargs["cached_statements"] = 0
+             connection = real_connect(database, *args, **kwargs)
+             guard.install(connection, database)
+             return connection
+ 
++        # Safety tests explicitly probe SQLite below the existing home-I/O guard.
++        # Preserve that escape hatch; ordinary calls always install this observer.
++        connect.__wrapped__ = getattr(real_connect, "__wrapped__", real_connect)
+         return connect
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_sites.py b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+index bc1cedde3e..2765f08036 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_sites.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+@@ -12,7 +12,7 @@ from tests.hermes_cli.custody_authorizer import CustodyGuard
+ @pytest.fixture
+ def guarded(monkeypatch):
+     guard = CustodyGuard()
+-    monkeypatch.setattr(sqlite3, "connect", guard.factory(sqlite3.connect))
++    monkeypatch.setattr(sqlite3, "connect", guard.factory(sqlite3.dbapi2.connect))
+     conn = sqlite3.connect(":memory:")
+     conn.executescript('''
+         CREATE TABLE kanban_sync_outbox (id INTEGER PRIMARY KEY, x INTEGER);
+@@ -136,6 +136,87 @@ def test_fixture_trigger_cannot_exempt_a_production_writer(guarded):
+         writer('c.execute("INSERT INTO domain VALUES (1)")')(conn, "kanban_sync_outbox")
+ 
+ 
++@pytest.mark.parametrize("kind", ["corrupt", "locked", "non_utf8"])
++def test_connect_does_not_read_schema(tmp_path, kind):
++    path = tmp_path / "fixture.db"
++    raw_connect = sqlite3.dbapi2.connect
++    lock = None
++    if kind == "corrupt":
++        path.write_bytes(b"not a database")
++    else:
++        lock = raw_connect(path)
++        if kind == "locked":
++            lock.execute("CREATE TABLE ordinary (x)")
++            lock.commit()
++            lock.execute("BEGIN EXCLUSIVE")
++        else:
++            lock.executescript("PRAGMA writable_schema=ON; CREATE TABLE ordinary(x); "
++                               "UPDATE sqlite_master SET sql=CAST(x'ff' AS TEXT) WHERE name='ordinary';")
++            lock.commit()
++    connection = None
++    try:
++        connection = CustodyGuard().factory(raw_connect)(path, timeout=0)
++    finally:
++        if connection is not None:
++            connection.close()
++        if lock is not None:
++            lock.close()
++
++
++def test_guard_does_not_leave_a_reader_that_blocks_checkpoint(tmp_path):
++    connect = CustodyGuard().factory(sqlite3.dbapi2.connect)
++    conn = connect(tmp_path / "checkpoint.db")
++    try:
++        conn.execute("PRAGMA journal_mode=WAL").fetchall()
++        conn.executescript("CREATE TABLE domain(x); CREATE TRIGGER fixture AFTER INSERT ON domain "
++                           "BEGIN SELECT 1; END;")
++        conn.execute("INSERT INTO domain VALUES (1)")
++        conn.commit()
++        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall() == [(0, 0, 0)]
++    finally:
++        conn.close()
++
++
++def test_successful_backup_retains_exact_trigger_creator(guarded):
++    guard, source = guarded
++    writer('c.executescript("CREATE TABLE domain(x); CREATE TRIGGER audited AFTER INSERT ON domain "'
++           ' + "BEGIN INSERT INTO " + table + " VALUES (2, 1); END;")',
++           "install_triggers", "hermes_cli.kanban_db_sync")(source, "kanban_sync_outbox")
++    source.commit()
++    target = sqlite3.connect(":memory:")
++    try:
++        source.backup(target)
++        target.execute("INSERT INTO domain VALUES (1)")
++        assert target.execute("SELECT x FROM kanban_sync_outbox WHERE id=2").fetchall() == [(1,)]
++        assert not guard.violations
++    finally:
++        target.close()
++
++
++def test_custom_connection_class_is_stable_across_opens():
++    class Custom(sqlite3.Connection):
++        pass
++
++    connect = CustodyGuard().factory(sqlite3.dbapi2.connect)
++    first = connect(":memory:", factory=Custom)
++    second = connect(":memory:", factory=Custom)
++    try:
++        assert type(first) is type(second)
++        assert isinstance(first, Custom)
++    finally:
++        first.close()
++        second.close()
++
++
++def test_connect_keeps_existing_explicit_unwrapped_probe_interface():
++    def wrapper(*args, **kwargs):
++        return sqlite3.dbapi2.connect(*args, **kwargs)
++
++    wrapper.__wrapped__ = sqlite3.dbapi2.connect
++    connect = CustodyGuard().factory(wrapper)
++    assert connect.__wrapped__ is wrapper.__wrapped__
++
++
+ def test_dispositions_and_original_candidates_remain_bounded():
+     assert set(inventory.SITES.values()) <= inventory.DISPOSITIONS
+     for (_, _, verb, _), disposition in inventory.SITES.items():
+-- 
+2.43.0
+

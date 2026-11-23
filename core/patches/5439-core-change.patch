@@ -1,0 +1,256 @@
+From cc749878e6dbe0dbdd3c76c4f30d3f70c36400dc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:58:04 +0000
+Subject: [PATCH] fix(always-on): demoted backends never re-adopted, stopped
+ after 30 min [daveey]
+
+Review of the unresponsive-roll change (#3920):
+
+- A backend rolled away from for not answering is recorded in demoted.json.
+  pick_port never adopts it again, and reap_superseded stops it after
+  DEMOTED_HARD_S (30 min; SIGTERM checkpoints its turns) instead of 6 h, so
+  starved backends that never pass their idle fence cannot fill BACKEND_PORTS.
+- supervise() counts confirmations per reason kind: commit-drift polls never
+  complete an unresponsive count, and the reverse.
+- The reset test now runs one supervise() with a scripted fail/ok/fail health
+  sequence; it fails when the reset is removed (the old split calls could not).
+- Drop the redundant `body and` guards after the early return.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/always_on_rollover.py            | 54 ++++++++++++--
+ tests/hermes_cli/test_always_on_rollover.py | 79 +++++++++++++++++----
+ 2 files changed, 113 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index cacc5d8b4a..d873fb53c1 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -84,6 +84,11 @@ FAILED_ROLL_BACKOFF_S = 300.0
+ SUPERSEDED_GRACE_S = 900.0   # a superseded backend not retired by then is retired by the roller through its idle fence
+ SUPERSEDED_HARD_S = 6 * 3600.0  # ... and stopped (SIGTERM, turns checkpoint) once this old, busy or not
+ SUPERSEDED_NAME = "superseded.json"
++# Backends rolled away from because they stopped answering: never adopted again, and stopped after
++# DEMOTED_HARD_S (SIGTERM checkpoints their turns) instead of SUPERSEDED_HARD_S, so a starved backend that
++# never passes its idle fence cannot hold one of the four BACKEND_PORTS for hours.
++DEMOTED_NAME = "demoted.json"
++DEMOTED_HARD_S = 1800.0
+ LOOP_WATCH_TAIL_BYTES = 4 * 1024 * 1024
+ 
+ # Read-only GETs safe to replay into a warming backend. Anything else Desktop polls (a courier outbox
+@@ -605,9 +610,12 @@ class Roller:
+         or one the previous roll recorded as warming that is still booting, so restarts close together never
+         stack cold boots onto the pool. Else the first port with no unit; else None."""
+         warming = set(warming)
++        demoted = self._load_demoted()
+         others = [p for p in self.ports if p != active_port]
+         running = [p for p in others if self.unit_active(p)]
+         for port in running:
++            if port in demoted:
++                continue  # rolled away from for not answering: it holds its port until reaped, never serves again
+             body = self.health(port)
+             if body and self.same_commit(body.get("commit"), head):
+                 return port, True
+@@ -762,9 +770,9 @@ class Roller:
+             # times out until a roll moves new connections to a fresh backend.
+             return f"active backend :{port} {UNRESPONSIVE_REASON}"
+         head = self.head()
+-        if body and self.same_commit(body.get("commit"), head) is False:
++        if self.same_commit(body.get("commit"), head) is False:
+             return f"active backend :{port} runs {str(body.get('commit'))[:10]}, checkout is at {str(head)[:10]}"
+-        if body and self.runtime_intact(port) is False:
++        if self.runtime_intact(port) is False:
+             return f"active backend :{port} lost its runtime (runtimeIntact false)"
+         return None
+ 
+@@ -779,6 +787,25 @@ class Roller:
+             return {int(k): float(v) for k, v in data.items()}
+         return {}
+ 
++    def _demoted_path(self) -> Path:
++        return aod.state_dir(self.home) / DEMOTED_NAME
++
++    def _load_demoted(self) -> dict[int, float]:
++        """{port: wall time it was rolled away from for not answering}. Persisted like superseded.json."""
++        with contextlib.suppress(OSError, ValueError, TypeError):
++            data = json.loads(self._demoted_path().read_text(encoding="utf-8-sig"))
++            return {int(k): float(v) for k, v in data.items()}
++        return {}
++
++    def _save_demoted(self, since: dict[int, float]) -> None:
++        with contextlib.suppress(OSError):
++            aod._write_private(self._demoted_path(), json.dumps({str(k): v for k, v in since.items()}))
++
++    def demote(self, port: int) -> None:
++        demoted = self._load_demoted()
++        demoted.setdefault(int(port), self.wall())
++        self._save_demoted(demoted)
++
+     def _save_superseded(self, since: dict[int, float]) -> None:
+         with contextlib.suppress(OSError):
+             aod._write_private(self._superseded_path(), json.dumps({str(k): v for k, v in since.items()}))
+@@ -806,13 +833,19 @@ class Roller:
+             return []
+         live = {record["port"], *record["warming"]}
+         since = self._load_superseded()
++        demoted = self._load_demoted()
+         now, stopped = self.wall(), []
+         for port in self.ports:
+             if port in live or not self.unit_active(port):
+                 since.pop(port, None)
++                demoted.pop(port, None)
+                 continue
+             age = now - since.setdefault(port, now)
+-            if age >= hard_s:
++            if port in demoted and now - demoted[port] >= min(hard_s, DEMOTED_HARD_S):
++                log(f"backend :{port} demoted {now - demoted[port]:.0f}s ago for not answering; stopping it")
++                with contextlib.suppress(OSError, subprocess.SubprocessError):
++                    self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
++            elif age >= hard_s:
+                 log(f"backend :{port} still busy {age:.0f}s after it was superseded; stopping it")
+                 with contextlib.suppress(OSError, subprocess.SubprocessError):
+                     self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
+@@ -821,24 +854,33 @@ class Roller:
+             else:
+                 continue
+             since.pop(port, None)
++            demoted.pop(port, None)
+             stopped.append(port)
+         self._save_superseded(since)
++        self._save_demoted(demoted)
+         return stopped
+ 
+     def supervise(self, *, max_polls: Optional[int] = None) -> None:
+-        seen, polls, retry_at = 0, 0, 0.0
++        seen, kind, polls, retry_at = 0, None, 0, 0.0
+         while max_polls is None or polls < max_polls:
+             polls += 1
+             try:
+                 self.reap_superseded()
+                 reason = self.drift()
+                 dead = bool(reason) and "not running" in reason or reason == "no active backend recorded"
+-                seen = seen + 1 if reason else 0
+-                need = UNRESPONSIVE_CONFIRMATIONS if reason and UNRESPONSIVE_REASON in reason else DRIFT_CONFIRMATIONS
++                unresponsive = bool(reason) and UNRESPONSIVE_REASON in reason
++                # Each kind confirms on its own count: polls of one kind never complete the other's.
++                now_kind = ("unresponsive" if unresponsive else "drift") if reason else None
++                seen = seen + 1 if reason and now_kind == kind else (1 if reason else 0)
++                kind = now_kind
++                need = UNRESPONSIVE_CONFIRMATIONS if unresponsive else DRIFT_CONFIRMATIONS
+                 if reason and (dead or seen >= need) and self.clock() >= retry_at:
+                     seen = 0
++                    before = read_active(self.home)
+                     if not self.roll(reason):
+                         retry_at = self.clock() + FAILED_ROLL_BACKOFF_S
++                    elif unresponsive and before is not None:
++                        self.demote(before["port"])
+             # One bad poll (a malformed answer, a systemctl hiccup) must not end supervision.
+             except Exception:  # health: allow BLE001 -- supervisor loop boundary; traceback logged
+                 log(f"supervise: poll failed:\n{traceback.format_exc()}")
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 81589b53d6..48c4245880 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -371,34 +371,85 @@ def test_supervisor_rolls_on_a_dead_backend_and_on_confirmed_commit_drift(home):
+     assert rolls and "not running" in rolls[0]
+ 
+ 
++def _scripted_health(host, answers):
++    """host.answers follows *answers*, one entry per supervise poll (each poll asks /api/health once)."""
++    seq = list(answers)
++    real_get = host.get
++
++    def get(port, path, timeout):
++        if path == "/api/health" and seq:
++            host.answers = seq.pop(0)
++        return real_get(port, path, timeout)
++    return get
++
++
+ def test_supervisor_rolls_an_alive_backend_only_after_it_stops_answering_for_several_polls(home):
+-    # Observed live: the active backend stayed `active` but its loop was saturated by turns for ~2 h; every
+-    # Desktop call through the proxy timed out at 30 s and drift() saw no reason to roll (no health body).
++    # Observed live: the active backend stayed `active` but its threadpool was starved for ~2 h; every Desktop
++    # call through the proxy timed out at 30 s and drift() saw no reason to roll (no health body).
+     host = FakeHost(running={9148}, commits={9148: "c" * 40})
+     ro.write_active(9148)
+     roller = make_roller(home, host)
+     rolls = []
+     roller.roll = lambda reason: rolls.append(reason) or True  # type: ignore[method-assign]
+-    host.answers = False
+-    assert "does not answer" in roller.drift()
+-    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS - 1)
+-    assert rolls == []  # a short stall (a few slow polls) is not a reason to roll
+-    host.answers = True
+-    roller.supervise(max_polls=1)
+-    host.answers = False
+-    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS - 1)
+-    assert rolls == []  # one good answer resets the count
++    miss = [False] * (ro.UNRESPONSIVE_CONFIRMATIONS - 1)
++    roller.get = _scripted_health(host, [*miss, True, *miss])
++    roller.supervise(max_polls=2 * len(miss) + 1)  # one run: the count lives in supervise()
++    assert rolls == []  # short stalls, and one good answer between them resets the count
+ 
+ 
+-def test_supervisor_rolls_after_consecutive_unanswered_health_polls(home):
++def test_supervisor_rolls_after_consecutive_unanswered_health_polls_and_demotes_the_old_backend(home):
+     host = FakeHost(running={9148}, commits={9148: "c" * 40}, answers=False)
+     ro.write_active(9148)
+     roller = make_roller(home, host)
+     rolls = []
+-    roller.roll = lambda reason: rolls.append(reason) or True  # type: ignore[method-assign]
++
++    def roll(reason):
++        rolls.append(reason)
++        ro.write_active(9149, home=home)
++        return True
++    roller.roll = roll  # type: ignore[method-assign]
+     roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS)
+     assert len(rolls) == 1 and "does not answer" in rolls[0]
+-    assert ro.UNRESPONSIVE_CONFIRMATIONS > ro.DRIFT_CONFIRMATIONS
++    assert set(roller._load_demoted()) == {9148}
++
++
++def test_commit_drift_polls_do_not_complete_an_unresponsive_count(home):
++    host = FakeHost(running={9148}, commits={9148: "c" * 40})
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    rolls = []
++    roller.roll = lambda reason: rolls.append(reason) or True  # type: ignore[method-assign]
++    reasons = iter(["active backend :9148 runs aaaaaaaaaa, checkout is at cccccccccc"]
++                   + [f"active backend :9148 {ro.UNRESPONSIVE_REASON}"] * (ro.UNRESPONSIVE_CONFIRMATIONS - 1))
++    roller.drift = lambda: next(reasons)  # type: ignore[method-assign]
++    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS)
++    assert rolls == []
++
++
++def test_pick_port_never_adopts_a_demoted_backend(home):
++    host = FakeHost(running={9148, 9149}, commits={9148: "c" * 40, 9149: "c" * 40})
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    assert roller.pick_port(9148, "c" * 40) == (9149, True)  # control: an answering backend on HEAD is adopted
++    roller.demote(9149)
++    assert roller.pick_port(9148, "c" * 40) == (9150, False)
++
++
++def test_reap_stops_a_demoted_backend_after_the_short_hard_limit(home):
++    host = FakeHost(running={9148, 9149}, commits={9148: "c" * 40, 9149: "c" * 40})
++    ro.write_active(9149)
++    wall = [1000.0]
++    roller = make_roller(home, host)
++    roller.wall = lambda: wall[0]  # type: ignore[method-assign]
++    roller._retire_fenced = lambda port: False  # type: ignore[method-assign]  # busy: the fence refuses
++    roller.demote(9148)
++    assert roller.reap_superseded() == []
++    wall[0] += ro.DEMOTED_HARD_S
++    assert roller.reap_superseded() == [9148]
++    assert ("stop", "--no-block", ro.backend_unit(9148)) in host.calls
++    host.running.discard(9148)
++    roller.reap_superseded()
++    assert roller._load_demoted() == {}
+ 
+ 
+ def test_unanswered_health_mid_update_is_not_a_reason_to_roll(home):
+-- 
+2.43.0
+

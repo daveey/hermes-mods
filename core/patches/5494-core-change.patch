@@ -1,0 +1,534 @@
+From 1b4cc4543434f4722d67dad60167cec195486ddf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:42:28 +0000
+Subject: [PATCH] [daveey] Kanban: ready cards no machine can ever claim
+ (pinned_only-only labels) are refused at create/move and flagged in one sweep
+
+---
+ hermes_cli/kanban_chat_wait.py                |   3 +
+ hermes_cli/kanban_claimants.py                |  68 +++++++++
+ hermes_cli/kanban_move.py                     |  16 +-
+ hermes_cli/kanban_parent_unclaimed.py         |   2 +
+ hermes_cli/kanban_queue_position.py           |   9 +-
+ hermes_cli/kanban_runs_on_capabilities.py     |  25 ++--
+ hermes_cli/kanban_unclaimable_ready.py        | 113 ++++++++++++++
+ .../test_kanban_unclaimable_runs_on.py        | 138 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   7 +-
+ 9 files changed, 363 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/kanban_claimants.py
+ create mode 100644 hermes_cli/kanban_unclaimable_ready.py
+ create mode 100644 tests/hermes_cli/test_kanban_unclaimable_runs_on.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index a3161ca2c7..0fddf386af 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -95,6 +95,9 @@ def notice_text(payload: Any) -> str:
+     """Chat line for ``chat_wait_unclaimed`` (gateway and TUI notifiers share it)."""
+     payload = payload if isinstance(payload, dict) else {}
+     tid = str(payload.get("parent") or "<card>")[:64]
++    if payload.get("unclaimable"):
++        return (f"{tid}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min. "
++                f"{payload['unclaimable']}")
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{tid} ({title})" if title else tid
+     checkpoint = last_checkpoint.sentence(payload)  # before the advice (kanban-3debc730ab) [daveey]
+diff --git a/hermes_cli/kanban_claimants.py b/hermes_cli/kanban_claimants.py
+new file mode 100644
+index 0000000000..6c3939718c
+--- /dev/null
++++ b/hermes_cli/kanban_claimants.py
+@@ -0,0 +1,68 @@
++"""Which enrolled machines could ever claim a card, structurally. [daveey]
++
++Incident t_c193191791c511de: a hub card with ``runs_on=["macos"]`` sat ``ready`` for 24 h. Both macos
++machines (macbook, mini) are ``pinned_only`` and advertise no pickup, so they never copy another gateway's card
++(``kanban_worker_node.eligible``: ``pinned_only``), and no pool worker carries ``macos``. The create-time check and
++``kanban_creator_repin.stranded_refusal`` only asked whether SOME machine carries the labels, so the card was
++neither refused nor re-routed; the queue text even said "waiting for macbook, mini".
++
++This is the claimant contract those checks share. Temporary states (hold, drain, quota, offline) are waits, not
++structure, and never appear here.
++"""
++from __future__ import annotations
++
++from typing import Any, Mapping, Optional
++
++Machines = Mapping[str, Mapping[str, Any]]
++
++
++def refusals(labels: Optional[list[str]], machines: Optional[Machines], home: str, *,
++             pins: bool = True) -> dict[str, str]:
++    """``{machine: reason}`` for each machine carrying every label that could never claim a card homed on ``home``.
++
++    A ``pinned_only`` machine keeps other gateways' work off itself unless the card pins it (``machine:<name>``),
++    and a pin only works when the machine also advertises pickup (``pins=False`` leaves that case to
++    ``kanban_worker_node.check_machine_pins``, whose ``placement_unavailable`` refusal callers already surface).
++    The home gateway's own entry is never refused."""
++    from hermes_cli import kanban_worker_node as wn
++    wanted, out = set(labels or ()), {}
++    for name, entry in (machines or {}).items():
++        if name == home or not (entry or {}).get("pinned_only") or not wanted <= wn.effective_labels(entry, name):
++            continue
++        if f"machine:{name}" not in wanted:
++            out[name] = "pinned_only"
++        elif pins and not wn.advertises_pickup(entry):
++            out[name] = "pinned_only, no pickup"
++    return out
++
++
++def claimants(labels: Optional[list[str]], machines: Optional[Machines], home: str) -> list[str]:
++    """Machines that carry every label and could, structurally, claim a card homed on ``home``."""
++    from hermes_cli import kanban_worker_node as wn
++    wanted, refused = set(labels or ()), refusals(labels, machines, home)
++    return sorted(name for name, entry in (machines or {}).items()
++                  if name not in refused and wanted <= wn.effective_labels(entry, name))
++
++
++def message(labels: list[str], machines: Machines, home: str) -> str:
++    """Why ``labels`` can never be claimed from ``home``: each carrier's reason, then the cross-gateway remedy."""
++    why = refusals(labels, machines, home)
++    if not why:
++        return (f"runs_on={labels}: no enrolled machine carries all these labels. Nothing was written. "
++                "Use placement='<gateway>' to name a gateway, or runs_on=['machine:<registered-name>'] "
++                "to pin a Board machine; bare strings are capability labels, not gateway aliases.")
++    named = "; ".join(f"{n}: {r}" for n, r in sorted(why.items()))
++    return (f"runs_on={labels}: no enrolled machine can claim this card ({named}). Those machines run only cards "
++            f"created on their own gateway and never pick up {home}'s. Nothing was written. Remedy: create the "
++            f"card on that machine's own gateway (cross-gateway create: placement='{sorted(why)[0]}'), or drop "
++            "the label. A machine:<name> pin from here does not help unless that machine advertises pickup.")
++
++
++def stranded_text(task_id: str, labels: list[str], why: Mapping[str, str]) -> str:
++    """Chat/alarm sentence for a READY card nobody can claim: plain, with each candidate's reason and the remedy.
++    ``why`` is :func:`refusals` (empty: no machine carries the labels at all)."""
++    named = ", ".join(f"{n}: {r}" for n, r in sorted(why.items())) or "no machine carries these labels"
++    return (f"NO MACHINE CAN CLAIM {task_id} (runs_on {labels}): {named}. Waiting will not start it. Remedy: "
++            + (f"re-create it on the Mac's own gateway (cross-gateway create, placement='{sorted(why)[0]}'), "
++               if why else "re-place it onto labels a machine carries (`kanban_move`), ")
++            + "or drop the label.")
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index e670db963e..0584abfd6b 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -96,18 +96,25 @@ def history(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+ 
+ 
+ def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str,
+-                      exclude_me: bool = True, now: Optional[float] = None) -> list[str]:
++                      exclude_me: bool = True, now: Optional[float] = None,
++                      home: Optional[str] = None) -> list[str]:
+     """Active, unheld registry machines carrying every label; running moves exclude ``me``.
+ 
+     A machine that has published ``metrics.claiming == 0`` is not taking portable cards. A pin to
+     that machine (``machine:<name>`` in ``runs_on``) stays, because a batch or worktree may be there.
++    With ``home`` (the card's home gateway) a ``pinned_only`` machine that would never claim a card of that home
++    is no match (``kanban_claimants``).
+     """
++    from hermes_cli import kanban_claimants as kc
+     from hermes_cli import kanban_worker_node as wn
+     out = []
+     now = time.time() if now is None else now
++    never = kc.refusals(runs_on, machines, home, pins=False) if home else {}
+     for name, entry in machines.items():
+         if (exclude_me and name == me) or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+             continue
++        if name in never:
++            continue
+         if _not_claiming(entry, now=now) and f"machine:{name}" not in runs_on:
+             continue
+         if set(runs_on) <= wn.effective_labels(entry, name):
+@@ -207,9 +214,14 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     if capacity_wait and not force:
+         raise MoveRefused(klb.MOVE_REFUSED, capacity_wait)
+     exclude_me = row["status"] == "running"
+-    matches = matching_machines(labels, pool, me=me, exclude_me=exclude_me)
++    home = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] or me
++    matches = matching_machines(labels, pool, me=me, exclude_me=exclude_me, home=home)
+     if not matches:
+         other = f" other than {me}" if exclude_me else ""
++        from hermes_cli import kanban_claimants as kc
++        if kc.refusals(labels, pool, home, pins=False):
++            raise MoveRefused("no_machine", f"no active, unheld machine{other} can claim a card of {home}: "
++                              + kc.message(labels, pool, home))
+         raise MoveRefused("no_machine", f"no active, unheld machine{other} has every label in {labels}")
+     try:
+         wn.check_machine_pins(conn, labels, machines=pool, me=me)
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index ec0989764f..8527520138 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -229,6 +229,8 @@ def safe_sweep(conn) -> int:
+         posted = 0
+     from hermes_cli import kanban_pickup_stall
+     kanban_pickup_stall.safe_sweep(conn)  # pinned foreign cards this worker node has not picked up [daveey]
++    from hermes_cli import kanban_unclaimable_ready
++    kanban_unclaimable_ready.safe_sweep(conn)  # ready cards no machine can ever claim (structural)
+     from hermes_cli import worker_resources_unknown_alarm
+     worker_resources_unknown_alarm.safe_sweep(conn)  # every claim here refused worker_resources_unknown
+     from hermes_cli import turn_urgency_status_alarm
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 84a7588d3d..b3c1b71cd3 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -118,7 +118,8 @@ def placement(conn: sqlite3.Connection, task_id: str, *, backlog: bool = True) -
+     wanted = set(labels)
+     if wanted <= carried[me]:
+         return None
+-    fits = sorted(name for name, have in carried.items() if wanted <= have)
++    from hermes_cli import kanban_claimants as kc
++    fits = kc.claimants(labels, machines, str(me))
+     if fits:
+         place: dict[str, Any] = {"lane": "machine", "runs_on": labels, "machines": fits}
+         held = [name for name in fits if (machines.get(name) or {}).get("hold")]
+@@ -139,8 +140,9 @@ def placement(conn: sqlite3.Connection, task_id: str, *, backlog: bool = True) -
+                 place["backlog"] = queue
+         return place
+     every = set().union(*carried.values())
++    refused = kc.refusals(labels, machines, str(me))
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+-            "machines": sorted(machines)}
++            "machines": sorted(machines), **({"refused": refused} if refused else {})}
+ 
+ 
+ def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+@@ -368,6 +370,9 @@ def _describe_lane(place: Optional[dict[str, Any]]) -> Optional[str]:
+                 "the dispatcher skips a ready card with a claim_lock. Its leftover-claim sweep clears a dead local "
+                 "claim on the next tick; if this line persists, the claim belongs to a live or foreign worker")
+     if lane == "unplaceable":
++        if place.get("refused"):
++            from hermes_cli import kanban_claimants as kc
++            return kc.stranded_text(place.get("task_id") or "<id>", place.get("runs_on") or [], place["refused"])
+         missing = place.get("missing") or []
+         what = (f"label(s) {', '.join(missing)} carried by no machine" if missing
+                 else "no machine carries all of " + ", ".join(place.get("runs_on") or []))
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index 3d32670ea5..da41dd46b9 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -134,16 +134,19 @@ def check(runs_on: Optional[list[str]], *, assignee: Optional[str], requires, wo
+     raise PlacementCapabilityMismatch(assignee, list(runs_on), {n: v for n, v in verdicts.items() if v})
+ 
+ 
+-def impossible(labels: Optional[list[str]], machines: Optional[Mapping[str, Mapping[str, Any]]], me: str) -> bool:
+-    """True when the registry is known and NO enrolled machine carries every label (a typo'd or alias label such as
+-    ``hermes-hub``), so the card can never be leased. No candidates is not evidence of missing profile tools
+-    (:func:`check` deliberately allows unknown tools), but it IS evidence of an impossible label conjunction.
+-    Held/inactive machines count: temporary unavailability is not a typo. An empty registry or a missing self entry
+-    is incomplete evidence (as in :func:`runs_elsewhere`), so it never says impossible."""
+-    from hermes_cli import kanban_worker_node as wn
++def impossible(labels: Optional[list[str]], machines: Optional[Mapping[str, Mapping[str, Any]]], me: str,
++               home: Optional[str] = None) -> bool:
++    """True when the registry is known and NO enrolled machine could claim the card: none carries every label (a
++    typo'd or alias label such as ``hermes-hub``), or the only carriers are ``pinned_only`` machines that never copy
++    a card of ``home`` (default ``me``; ``kanban_claimants``), e.g. ``['macos']`` from the hub. No candidates is not
++    evidence of missing profile tools (:func:`check` deliberately allows unknown tools), but it IS evidence of an
++    impossible label conjunction. Held/inactive machines count: temporary unavailability is not a typo. An empty
++    registry or a missing self entry is incomplete evidence (as in :func:`runs_elsewhere`), so it never says
++    impossible."""
++    from hermes_cli import kanban_claimants as kc
+     if not labels or not machines or not machines.get(me):
+         return False
+-    return not any(set(labels) <= wn.effective_labels(entry, name) for name, entry in machines.items())
++    return not kc.claimants(labels, machines, home or me)
+ 
+ 
+ def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_kind: str = "scratch") -> None:
+@@ -162,10 +165,8 @@ def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_
+     machines = reg.get("machines") if reg is not None else None
+     me = wn._own(conn)
+     if impossible(labels, machines, me):
+-        raise ValueError(
+-            f"runs_on={labels}: no enrolled machine carries all these labels. Nothing was written. "
+-            "Use placement='<gateway>' to name a gateway, or runs_on=['machine:<registered-name>'] "
+-            "to pin a Board machine; bare strings are capability labels, not gateway aliases.")
++        from hermes_cli import kanban_claimants as kc
++        raise ValueError(kc.message(labels or [], machines or {}, me))
+     check(labels, assignee=assignee, requires=requires, workspace_kind=workspace_kind, me=wn._own(conn),
+           machines=machines)
+ 
+diff --git a/hermes_cli/kanban_unclaimable_ready.py b/hermes_cli/kanban_unclaimable_ready.py
+new file mode 100644
+index 0000000000..eb77b3a819
+--- /dev/null
++++ b/hermes_cli/kanban_unclaimable_ready.py
+@@ -0,0 +1,113 @@
++"""Dispatcher sweep: a READY card no enrolled machine can ever claim is flagged at once, not after hours. [daveey]
++
++Incident t_c193191791c511de: ``runs_on=["macos"]`` on the hub; the only macos machines are
++``pinned_only`` (``kanban_claimants``). It sat ready 24 h, and the one notice that fired said "waiting for macbook,
++mini", so its owner kept expecting a Mac. This sweep runs each dispatcher tick, covers every way a card gets into
++that state (create before the check existed, edit, move, a worker-scaler rehome onto the hub), and:
++
++* posts ONE ``chat_wait_unclaimed`` notice per (card, labels) to the creator's chats, naming each candidate machine's
++  reason and the cross-gateway create remedy (``kanban_chat_wait.notice_text``);
++* on the hub (the operator lane), keeps ONE agent-owned alarm card open for the class: a new card is added to it
++  by comment (``kanban_pickup_stall._create``), never a second alarm.
++
++Temporary states (hold, drain, quota, offline) never count: ``kanban_claimants`` reads structure only.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import time
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++KEY = "unclaimable-ready:"
++HOWTO = (
++    "Each listed card is ready but no enrolled machine can ever claim it, so waiting will not start it. For each: "
++    "if its work needs a Mac, create a new card on that Mac's own gateway (cross-gateway create, "
++    "placement='<machine>') and archive the stranded one with a comment naming the replacement; otherwise "
++    "`kanban_move` it to labels an active pool worker carries. Do not change Mac policy (pinned_only) to make it "
++    "claimable. Comment on this alarm with what you did for each card.")
++
++
++def stranded(conn, machines, me: str) -> list[dict[str, Any]]:
++    """Ready, unclaimed cards of this board whose stored ``runs_on`` no machine could ever claim."""
++    from hermes_cli import kanban_claimants as kc
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    from hermes_cli import kanban_worker_node as wn
++    out = []
++    for row in conn.execute("SELECT id, title, tenant, runs_on, created_on, created_at FROM tasks WHERE status = 'ready' "
++                            "AND runs_on IS NOT NULL AND claim_lock IS NULL AND lease_holder IS NULL "
++                            "AND current_run_id IS NULL"):
++        labels = wn._parse(row["runs_on"])
++        home = row["created_on"] or me
++        if labels and roc.impossible(labels, machines, me, home):
++            out.append({"id": row["id"], "title": row["title"], "tenant": row["tenant"], "runs_on": labels,
++                        "created_at": row["created_at"], "why": kc.refusals(labels, machines, home)})
++    return out
++
++
++def _notify(conn, card: dict[str, Any], now: float) -> bool:
++    from hermes_cli import kanban_claimants as kc
++    from hermes_cli import kanban_parent_unclaimed as pu
++    from hermes_cli.kanban_chat_wait import NOTICE_KIND
++    waited = max(0.0, now - pu.ready_since(conn, card["id"], card["created_at"]))
++    return pu.post_notice(
++        conn, card["id"], card["id"], wait_key="unclaimable:" + json.dumps(card["runs_on"]),
++        waited_seconds=waited, ready_seconds=waited, parent_title=card["title"], kind=NOTICE_KIND,
++        extra={"unclaimable": kc.stranded_text(card["id"], card["runs_on"], card["why"])})
++
++
++def _alarm(conn, cards: list[dict[str, Any]], own: str, now_ms: int) -> Optional[str]:
++    from hermes_cli import kanban_claimants as kc
++    from hermes_cli import kanban_pickup_stall as kps
++    key = f"{kps.KEY_PREFIX}{own}:{KEY}"
++    existing = kps._covering_repair(conn, key, now_ms)
++    if existing:
++        body = (conn.execute("SELECT body FROM tasks WHERE id = ?", (existing,)).fetchone()[0] or "")
++        seen = {r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (existing,))}
++        if all(c["id"] in body or any(c["id"] in s for s in seen if s) for c in cards):
++            return existing  # every card is already on the open alarm: one alarm, no repeat comments
++    listed = "\n".join(f"- {c['id']} ({c['title']}): " + kc.stranded_text(c["id"], c["runs_on"], c["why"])
++                       for c in cards)
++    body = (f"{len(cards)} ready card(s) on {own} that no enrolled machine can ever claim (structural, not a wait):"
++            f"\n\n{listed}\n\n{HOWTO}")
++    return kps._create(conn, key=key, title=f"Ready cards no machine can claim on {own} ({len(cards)})", body=body,
++                       tenant=cards[0]["tenant"], own=own, now_ms=now_ms, howto=HOWTO)
++
++
++def sweep(conn, *, now: Optional[float] = None) -> list[str]:
++    """Notify each stranded ready card's chats once and keep the hub's single alarm current; returns card ids."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary":
++        return []
++    try:
++        reg = wn.registry()
++    except Exception:  # health: allow BLE001 -- unknown registry is never evidence of impossibility
++        return []
++    machines = (reg or {}).get("machines") or None
++    me = wn._own(conn)
++    if not machines or not me:
++        return []
++    now = time.time() if now is None else now
++    cards = stranded(conn, machines, me)
++    if not cards:
++        return []
++    for card in cards:
++        try:
++            _notify(conn, card, now)
++        except Exception:  # health: allow BLE001 -- one card's notice never blocks the alarm
++            _log.warning("kanban unclaimable notice failed for %s", card["id"], exc_info=True)
++    if me == kps.OPERATOR_LANE:
++        _alarm(conn, cards, me, int(now * 1000))
++    return [c["id"] for c in cards]
++
++
++def safe_sweep(conn) -> list[str]:
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- the detector must never stop dispatch
++        _log.warning("kanban dispatcher: unclaimable-ready sweep failed", exc_info=True)
++        return []
+diff --git a/tests/hermes_cli/test_kanban_unclaimable_runs_on.py b/tests/hermes_cli/test_kanban_unclaimable_runs_on.py
+new file mode 100644
+index 0000000000..5543ede899
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_unclaimable_runs_on.py
+@@ -0,0 +1,138 @@
++"""A label carried only by pinned_only machines is unclaimable from another gateway (silent starvation). [daveey]
++
++t_c193191791c511de (runs_on=["macos"]) sat ready 24 h on the hub: the only macos machines are pinned_only with no
++pickup, and no pool worker carries ``macos``. Create/move refuse it, the dispatcher flags a ready one in a single
++sweep (chat notice + ONE alarm card), and the stranded reroute grant covers it.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_claimants as kc
++from hermes_cli import kanban_creator_repin as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_runs_on_capabilities as roc
++from hermes_cli import kanban_unclaimable_ready as ur
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, Gateway
++
++OTHER_WORKER_TASK = "t_0e119394bdc0e026"
++
++
++@pytest.fixture
++def svc(monkeypatch):
++    # The alarm queues on a capable pool worker (kanban_pickup_stall.alarm_placement): give worker-1 its labels.
++    alarm = ["capability:file", "capability:hub-write", "capability:kanban", "capability:terminal", "pool:worker",
++             "profile:default"]
++    monkeypatch.setitem(MACHINES, "worker-1", {**MACHINES["worker-1"], "labels": ["linux", *alarm]})
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    g = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    yield g
++    g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _ready_macos_card(hub, labels=("macos",)):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="Build the Mac app", assignee="default")
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, list(labels))  # a row written before the check, or rehomed onto the hub
++    return tid
++
++
++def _events(conn, tid, kind):
++    return [json.loads(r[0] or "{}") for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (tid, kind))]
++
++
++def test_label_only_pinned_only_machines_carry_is_impossible():
++    assert MACHINES["macbook"]["pinned_only"] and not MACHINES["macbook"].get("pickup")
++    assert roc.impossible(["macos"], MACHINES, HUB)
++    assert kc.refusals(["macos"], MACHINES, HUB) == {"macbook": "pinned_only"}
++    assert kc.claimants(["macos"], MACHINES, HUB) == []
++
++
++def test_the_machines_own_cards_and_carried_labels_stay_claimable():
++    assert not roc.impossible(["macos"], MACHINES, HUB, home="macbook")  # its own gateway's card
++    assert not roc.impossible(["linux"], MACHINES, HUB)
++    assert roc.impossible(["hermes-hub"], MACHINES, HUB)  # unchanged: nothing carries it
++    pool = {**MACHINES, "worker-2": {"labels": ["macos"], "pinned_only": False, "pickup": "all", "hold": False}}
++    assert not roc.impossible(["macos"], pool, HUB)  # a pool worker carrying it makes it claimable
++
++
++def test_a_pin_needs_pickup_to_count():
++    pickup = {**MACHINES, "macbook": {**MACHINES["macbook"], "pickup": "explicit"}}
++    assert not roc.impossible(["macos", "machine:macbook"], pickup, HUB)
++    assert roc.impossible(["macos", "machine:macbook"], MACHINES, HUB)
++
++
++def test_create_is_refused_with_the_cross_gateway_remedy(hub):
++    hub.enter()
++    before = hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    with pytest.raises(ValueError, match="no enrolled machine can claim") as err:
++        kb.create_task(hub.conn, title="mac", assignee="default", requires=[], runs_on=["macos"])
++    assert "macbook: pinned_only" in str(err.value) and "cross-gateway create" in str(err.value)
++    assert hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++
++
++def test_move_to_such_labels_is_refused(hub):
++    tid = _ready_macos_card(hub, ["linux"])
++    res = km.move_queued(hub.conn, tid, runs_on=["macos"], reason="needs xcode")
++    assert not res["ok"] and res["reason_code"] == "no_machine" and "cross-gateway create" in res["error"]
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["linux"]
++
++
++def test_sweep_flags_a_ready_card_once_and_keeps_one_alarm(hub):
++    tid = _ready_macos_card(hub)
++    assert ur.sweep(hub.conn) == [tid]
++    notices = _events(hub.conn, tid, "chat_wait_unclaimed")
++    assert len(notices) == 1 and "macbook: pinned_only" in notices[0]["unclaimable"]
++    from hermes_cli import kanban_chat_wait as cw
++    text = cw.notice_text(notices[0])
++    assert "NO MACHINE CAN CLAIM" in text and "waiting for macbook" not in text
++    alarms = [r[0] for r in hub.conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'pickup-stall:hub:"
++                                             "unclaimable-ready:%'")]
++    assert len(alarms) == 1 and tid in kb.get_task(hub.conn, alarms[0]).body
++    ur.sweep(hub.conn)
++    assert len(_events(hub.conn, tid, "chat_wait_unclaimed")) == 1  # once per card and labels
++    assert len(list(hub.conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'pickup-stall:hub:"
++                                     "unclaimable-ready:%'"))) == 1
++    second = _ready_macos_card(hub, ["macos", "xcode"])
++    ur.sweep(hub.conn)
++    assert len(list(hub.conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'pickup-stall:hub:"
++                                     "unclaimable-ready:%'"))) == 1  # the new card goes on the open alarm
++    assert any(second in c.body for c in kb.list_comments(hub.conn, alarms[0])) \
++        or second in kb.get_task(hub.conn, alarms[0]).body
++
++
++def test_sweep_ignores_claimable_and_unready_cards(hub):
++    ok = _ready_macos_card(hub, ["linux"])
++    parked = _ready_macos_card(hub)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (parked,))
++    assert ur.sweep(hub.conn) == []
++    assert not _events(hub.conn, ok, "chat_wait_unclaimed")
++
++
++def test_unknown_registry_flags_nothing(hub):
++    _ready_macos_card(hub)
++    wn.set_registry_fetch(lambda: (_ for _ in ()).throw(OSError("board down")))
++    assert ur.sweep(hub.conn) == []
++
++
++def test_a_worker_may_reroute_the_stranded_card(hub):
++    tid = _ready_macos_card(hub)
++    assert kcr.stranded_refusal(hub.conn, tid) is None
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index da62c810c6..dd7671ed13 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -983,9 +983,12 @@ KANBAN_CREATE_SCHEMA = _schema(
+         )),
+         "runs_on": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9:._-]{0,63}$"},
+                     "description": "Machine labels the card needs (all of them), on a board that syncs to the "
+-                    "Board service: e.g. ['linux'], ['macos', 'xcode'], ['machine:<name>'] for one machine, "
++                    "Board service: e.g. ['linux'], ['capability:git'], ['machine:<name>'] for one machine, "
+                     "[] for any machine. Omit for the default: it runs here, or on a machine like this one "
+-                    "if it waits too long. 'machine:<name>' is refused (placement_unavailable) unless that "
++                    "if it waits too long. Labels carried only by pinned_only machines (the Macs: 'macos', "
++                    "'xcode') are refused: those machines run only cards created on their own gateway, so a card "
++                    "from here never starts; create it on that machine's gateway instead (placement='<name>'). "
++                    "'machine:<name>' is refused (placement_unavailable) unless that "
+                     "machine picks up this board; then use placement='<name>'."},
+         "placement": _prop("string", (
+                 "Where the card runs. 'auto' uses configured worker pools for portable work, queueing without hub overflow. "
+-- 
+2.43.0
+

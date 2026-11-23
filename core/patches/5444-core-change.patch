@@ -1,0 +1,817 @@
+From f7467b620eae1ffb9e90773f52401ed5be467fd9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:21:38 +0000
+Subject: [PATCH] [daveey] Record bounded per-pass dispatcher candidate
+ refusals
+
+Observe existing pickup/claim gates and existing score results without policy changes or additional graph scans. Keep local receipt/pass tables bounded by count and age; expose a read-only JSON export for Phase B.
+
+Proof: test-first main import failure recorded; 271 focused tests across 14 files pass, plus 89 in four dispatch/admission files; full scripts/check passes. Replay fixtures cover mac label mismatch and a pool-compatible coach missing-profile prefilter. Live skipped-card readback remains a post-deploy acceptance gate.
+---
+ docs/kanban-candidate-receipts.md             |  59 +++++
+ hermes_cli/kanban_candidate_receipts.py       | 235 ++++++++++++++++++
+ hermes_cli/kanban_db_dispatch.py              |  59 +++--
+ hermes_cli/kanban_db_dispatch_preclaim.py     |  17 ++
+ hermes_cli/kanban_dispatch_priority.py        |   5 +-
+ hermes_cli/kanban_hub_admission_claim.py      |   4 +
+ hermes_cli/kanban_pickup_gate.py              |   2 +
+ hermes_cli/kanban_worker_node.py              |  13 +-
+ .../test_kanban_candidate_receipts.py         | 131 ++++++++++
+ ...test_kanban_candidate_receipts_dispatch.py | 107 ++++++++
+ 10 files changed, 599 insertions(+), 33 deletions(-)
+ create mode 100644 docs/kanban-candidate-receipts.md
+ create mode 100644 hermes_cli/kanban_candidate_receipts.py
+ create mode 100644 tests/hermes_cli/test_kanban_candidate_receipts.py
+ create mode 100644 tests/hermes_cli/test_kanban_candidate_receipts_dispatch.py
+
+diff --git a/docs/kanban-candidate-receipts.md b/docs/kanban-candidate-receipts.md
+new file mode 100644
+index 0000000000..0f0e3d9b51
+--- /dev/null
++++ b/docs/kanban-candidate-receipts.md
+@@ -0,0 +1,59 @@
++# Dispatcher candidate refusal receipts
++
++`hermes_cli.kanban_candidate_receipts` observes dispatcher decisions without
++changing eligibility, priority, scoring or the number of ranking/graph queries.
++It records the first refusal actually reached for an unclaimed **ready** card,
++including pool pickup candidates that are not pinned to this executor.
++Successful claims suppress earlier observations in the same pass. Review cards
++are not refusal records in this version.
++
++## Read/export for Phase B
++
++Run in the installed Hermes environment, on each executor holding the evidence:
++
++```sh
++python -m hermes_cli.kanban_candidate_receipts --db ~/.hermes/kanban.db --limit 1000
++python -m hermes_cli.kanban_candidate_receipts --db ~/.hermes/kanban.db --task-id TASK_ID
++```
++
++This opens SQLite with `mode=ro`. The Python API is `read(conn, task_id=None,
++limit=1000)`. Output is a version-1 JSON object with `receipts` and `passes` arrays
++(newest first). Tables are machine-local, deliberately outside task events and
++the sync feed; gather from compatible executors rather than only the hub replica.
++An absent table yields empty arrays, not fabricated decisions.
++
++Each receipt has `pass_id`, `worker` (registered gateway ID, or hostname on an
++unsynced board), `pass_time_ms` (UTC Unix epoch milliseconds), `task_id`, `score`,
++`score_status`, `gate`, `reason`, and `stage` (`global`, `pickup`, `screen`,
++`eligibility`, `claim`). Gates are `prefilter`, `labels`, `capability`,
++`budget/pacing`, `capacity`, `provenance`, `containment`; an unclassified claim
++refusal is explicitly `unknown`. `reason` preserves the actual gate detail.
++
++`score` is the total already computed by the existing admission ranker. It is
++null with `score_status=not_observed` when a gate precedes ranking, ranking fell
++back, or the bounded score observation window was full. Receipt collection does
++**not** recompute a score. A global capacity refusal and a full pickup window
++can precede compatibility/policy checks: the receipt names that first reached
++gate, not a hypothetical later decision. Missing data never certifies eligibility.
++
++## Bounds and gaps
++
++Each pass retains at most 512 distinct refused candidates and 512 score samples.
++`passes.dropped` counts refused observations beyond that window (not unique
++unseen cards). Detail strings are capped at 400 characters. Every successful
++non-dry pass trims the journal to seven days, 20,000 refusal rows and 2,000 pass
++rows. Readers default to 1,000 rows per array; request a larger limit (maximum
++20,000) for collection. Pass metadata may age out before a remaining receipt;
++there is no completeness guarantee across retention or reader limits. SQLite
++reuses freed pages; this bounds logical retained data, not historical file size.
++Persistence errors warn without stopping scheduling. Dry runs write nothing.
++
++## Replay
++
++`test_kanban_candidate_receipts.py::test_replay_unknown_shapes` freezes the two
++Phase A shapes: a macOS label refusal and a pool/coach card compatible by labels
++but rejected by a missing-profile prefilter. It asserts the worker, common pass
++time, observed score and first refusing gate survive export. This is a fixture
++proof, **not** a claim to recover the unrecorded historical reasons for the two
++original cards. The integration tests exercise non-pinned pickup, real combined
++lane dispatch, capacity tails, claim suppression and capped local ready queues.
+diff --git a/hermes_cli/kanban_candidate_receipts.py b/hermes_cli/kanban_candidate_receipts.py
+new file mode 100644
+index 0000000000..657b9ce9e0
+--- /dev/null
++++ b/hermes_cli/kanban_candidate_receipts.py
+@@ -0,0 +1,235 @@
++"""Bounded machine-local dispatcher evidence, never an admission input.
++
++Observe actual short-circuit decisions and scores already computed by ranking.
++No graph queries, policy replays, task events or sync-feed writes. A missing
++receipt/score is unknown, not evidence of eligibility. Times are epoch ms.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++import logging
++import sqlite3
++import time
++import uuid
++
++MAX_ROWS = 20000
++MAX_PASSES = 2000
++RETENTION_MS = 7 * 86400 * 1000
++PER_PASS = 512
++TABLE = 'kanban_candidate_receipts'
++PASSES = 'kanban_candidate_passes'
++_LOG = logging.getLogger(__name__)
++
++
++@dataclass
++class Capture:
++    worker: str
++    pass_time_ms: int
++    limit: int = PER_PASS
++    pass_id: str = field(default_factory=lambda: uuid.uuid4().hex)
++    records: dict = field(default_factory=dict)
++    ranked: dict = field(default_factory=dict)
++    claimed_ids: set = field(default_factory=set)
++    dropped: int = 0
++
++
++_current: ContextVar[Capture | None] = ContextVar('candidate_receipts', default=None)
++
++
++@contextmanager
++def collect(*, worker: str, now_ms=None, limit=PER_PASS):
++    capture = Capture(worker, int(time.time() * 1000) if now_ms is None else now_ms, limit)
++    token = _current.set(capture)
++    try:
++        yield capture
++    finally:
++        _current.reset(token)
++
++
++def scores(ranked) -> None:
++    """Tap an existing rank result; do not call rank again for diagnostics."""
++    capture = _current.get()
++    if capture is not None:
++        for row, parts in ranked:
++            tid = row['id']
++            if tid in capture.ranked or len(capture.ranked) < capture.limit:
++                capture.ranked[tid] = parts.total
++
++
++def note(task_id, gate, reason, *, stage, status='ready') -> None:
++    capture = _current.get()
++    if capture is None or status != 'ready' or task_id in capture.records or task_id in capture.claimed_ids:
++        return
++    if len(capture.records) >= capture.limit:
++        capture.dropped += 1
++        return
++    capture.records[task_id] = dict(task_id=task_id, gate=gate, reason=str(reason)[:400], stage=stage)
++
++
++def claimed(task_id) -> None:
++    capture = _current.get()
++    if capture is not None:
++        capture.records.pop(task_id, None)
++        capture.ranked.pop(task_id, None)
++        # Only candidates within the bounded observation window need suppression.
++        if len(capture.claimed_ids) < capture.limit:
++            capture.claimed_ids.add(task_id)
++
++
++def pickup_facts(task_id, facts, *, status) -> None:
++    """The first acquired refusing fact, not a guessed gate from English prose."""
++    stages = (('already_local', 'prefilter'), ('default_placement', 'prefilter'),
++              ('review_disabled', 'prefilter'), ('placement_refusal', 'labels'),
++              ('missing_profile', 'prefilter'), ('capability_refusal', 'capability'),
++              ('source_refusal', 'provenance'))
++    for name, gate in stages:
++        if name not in facts:
++            continue
++        value = facts[name]
++        if (name in ('already_local', 'default_placement', 'review_disabled') and value is True) or (
++                name not in ('already_local', 'default_placement', 'review_disabled') and value is not None):
++            if name == 'already_local':
++                return  # copied here already; local claim gates own its disposition
++            if name == 'placement_refusal' and value != 'labels_mismatch':
++                gate = 'capacity' if value == 'held' else 'prefilter'
++            note(task_id, gate, f'{name}: {value}', stage='pickup', status=status)
++            return
++
++
++def pickup_skip(task_id, reason, *, status='ready') -> None:
++    code, detail = reason
++    if not code:
++        return  # suppression/already-local is not a refusal
++    gate = 'prefilter'
++    if code in ('quota_hold',) or str(detail).startswith('llm_paced:'):
++        gate = 'budget/pacing'
++    elif code in ('budget_exhausted', 'hold'):
++        gate = 'capacity'
++    elif 'containment' in str(detail):
++        gate = 'containment'
++    elif code == 'guard_held':
++        gate = 'prefilter'
++    note(task_id, gate, f'{code}: {detail}', stage='pickup', status=status)
++
++
++# Result buckets contain actual decisions; no hypothetical gate is re-evaluated.
++_BUCKETS = (('skipped_nonspawnable', 'prefilter'), ('capsule_refused', 'capability'),
++            ('no_progress_held', 'budget/pacing'), ('pinned_quota_held', 'budget/pacing'),
++            ('llm_paced', 'budget/pacing'), ('skipped_per_profile_capped', 'capacity'),
++            ('respawn_guarded', 'prefilter'), ('owner_down', 'prefilter'),
++            ('quiet_deferred', 'capacity'), ('claim_deferred', 'prefilter'))
++
++
++def lane_refused(task_id, result, *, status):
++    for bucket, gate in _BUCKETS:
++        for entry in getattr(result, bucket, ()):
++            tid = entry if isinstance(entry, str) else entry[0]
++            if tid != task_id:
++                continue
++            reason = bucket if isinstance(entry, str) else str(entry[1:])
++            if bucket == 'claim_deferred':
++                code = entry[1]
++                gate = ('capacity' if code in ('capacity', 'lease_held') else
++                        'labels' if code == 'labels_mismatch' else
++                        'containment' if 'containment' in code else
++                        'provenance' if 'source' in code or 'provenance' in code else
++                        'capability' if 'capability' in code else 'prefilter')
++            note(task_id, gate, f'{bucket}: {reason}', stage='claim', status=status)
++            return
++    note(task_id, 'unknown', 'claim path refused without a classified result', stage='claim', status=status)
++
++
++def global_hold(conn, reason, *, gate='capacity'):
++    """Bounded indexed ready-row census, not a scoring/graph pass."""
++    if _current.get() is None:
++        return
++    for row in conn.execute("SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL LIMIT ?",
++                            (PER_PASS + 1,)):
++        note(row[0], gate, reason, stage='global')
++
++
++def capacity_tail(rows, lane_by_id, reason):
++    for row in rows:
++        note(row['id'], 'capacity', reason, stage='claim', status=lane_by_id.get(row['id'], 'ready'))
++
++
++def persist(conn, capture):
++    """One bounded write per pass. Local tables deliberately have no task FKs."""
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(f'CREATE TABLE IF NOT EXISTS {PASSES} (pass_id TEXT PRIMARY KEY, worker TEXT NOT NULL, '
++                     'pass_time_ms INTEGER NOT NULL, dropped INTEGER NOT NULL)')
++        conn.execute(f'CREATE INDEX IF NOT EXISTS candidate_pass_time ON {PASSES}(pass_time_ms)')
++        conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (id INTEGER PRIMARY KEY, pass_id TEXT NOT NULL, '
++                     'worker TEXT NOT NULL, pass_time_ms INTEGER NOT NULL, task_id TEXT NOT NULL, '
++                     'score REAL, score_status TEXT NOT NULL, gate TEXT NOT NULL, reason TEXT NOT NULL, '
++                     'stage TEXT NOT NULL)')
++        conn.execute(f'CREATE INDEX IF NOT EXISTS candidate_receipt_task ON {TABLE}(task_id, id)')
++        conn.execute(f'CREATE INDEX IF NOT EXISTS candidate_receipt_time ON {TABLE}(pass_time_ms)')
++        conn.execute(f'INSERT INTO {PASSES} VALUES (?, ?, ?, ?)',
++                     (capture.pass_id, capture.worker, capture.pass_time_ms, capture.dropped))
++        conn.executemany(f'INSERT INTO {TABLE} (pass_id, worker, pass_time_ms, task_id, score, score_status, '
++                         'gate, reason, stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
++                         [(capture.pass_id, capture.worker, capture.pass_time_ms, tid,
++                           capture.ranked.get(tid), 'observed' if tid in capture.ranked else 'not_observed',
++                           row['gate'], row['reason'], row['stage']) for tid, row in capture.records.items()])
++        cutoff = capture.pass_time_ms - RETENTION_MS
++        for table in (TABLE, PASSES):
++            conn.execute(f'DELETE FROM {table} WHERE pass_time_ms < ?', (cutoff,))
++        conn.execute(f'DELETE FROM {TABLE} WHERE id IN (SELECT id FROM {TABLE} ORDER BY id DESC LIMIT -1 OFFSET ?)',
++                     (MAX_ROWS,))
++        conn.execute(f'DELETE FROM {PASSES} WHERE rowid IN '
++                     f'(SELECT rowid FROM {PASSES} ORDER BY rowid DESC LIMIT -1 OFFSET ?)', (MAX_PASSES,))
++
++
++def read(conn, *, task_id=None, limit=1000):
++    """Phase B JSON-compatible read API; absence and truncation remain explicit."""
++    out = dict(version=1, receipts=[], passes=[])
++    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    for table, key in ((TABLE, 'receipts'), (PASSES, 'passes')):
++        if table not in tables:
++            continue
++        where, args = (' WHERE task_id = ?', [task_id]) if task_id is not None and table == TABLE else ('', [])
++        cursor = conn.execute(f'SELECT * FROM {table}{where} ORDER BY rowid DESC LIMIT ?',
++                              (*args, max(0, min(int(limit), MAX_ROWS))))
++        columns = [d[0] for d in cursor.description]
++        out[key] = [dict(zip(columns, row)) for row in cursor]
++    return out
++
++
++@contextmanager
++def dispatch_pass(conn, *, dry_run=False):
++    import socket
++    from hermes_cli.kanban_db_sync import sync_state
++    state = sync_state(conn)
++    worker = str(state['gateway_id']) if state else socket.gethostname()
++    with collect(worker=worker) as capture:
++        yield
++    if not dry_run:
++        try:
++            persist(conn, capture)
++        except (sqlite3.Error, OSError):
++            _LOG.warning('could not persist dispatcher candidate receipts', exc_info=True)
++
++
++def main():
++    """Read-only export for acceptance collectors; never tick the live dispatcher."""
++    import argparse
++    import json
++    from pathlib import Path
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--db', required=True)
++    parser.add_argument('--task-id')
++    parser.add_argument('--limit', type=int, default=1000)
++    args = parser.parse_args()
++    conn = sqlite3.connect(Path(args.db).expanduser().resolve().as_uri() + '?mode=ro', uri=True)
++    try:
++        print(json.dumps(read(conn, task_id=args.task_id, limit=args.limit), sort_keys=True))
++    finally:
++        conn.close()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 61f7f328c7..59957399d6 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1824,21 +1824,16 @@ def dispatch_once(
+     resolved DB path so unrelated boards tick in parallel.
+     """
+     def _locked_tick() -> DispatchResult:
+-        result = _dispatch_once_locked(
+-            conn,
+-            spawn_fn=spawn_fn,
+-            ttl_seconds=ttl_seconds,
+-            dry_run=dry_run,
+-            max_spawn=max_spawn,
+-            max_in_progress=max_in_progress,
+-            failure_limit=failure_limit,
+-            stale_timeout_seconds=stale_timeout_seconds,
+-            board=board,
+-            default_assignee=default_assignee,
+-            max_in_progress_per_profile=max_in_progress_per_profile,
+-            reconcile_orphans=reconcile_orphans,
+-            spawn_quota=spawn_quota,
+-        )
++        from hermes_cli.kanban_candidate_receipts import dispatch_pass
++        with dispatch_pass(conn, dry_run=dry_run):
++            result = _dispatch_once_locked(
++                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
++                max_spawn=max_spawn, max_in_progress=max_in_progress,
++                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
++                board=board, default_assignee=default_assignee,
++                max_in_progress_per_profile=max_in_progress_per_profile,
++                reconcile_orphans=reconcile_orphans, spawn_quota=spawn_quota,
++            )
+         from hermes_cli.kanban_capacity_evidence import observe_dispatch
+         observe_dispatch(conn, result, board=board, dry_run=dry_run,
+                          update_drain=observation_update_drain)
+@@ -1919,6 +1914,8 @@ def _dispatch_lane_task(
+         if deferral is not None:  # the lane decides whether this refusal permits later candidates
+             result.claim_deferred.append((task_id, deferral))
+         return False
++    from hermes_cli.kanban_candidate_receipts import claimed as note_claimed
++    note_claimed(task_id)
+     try:  # R4b: a grant snapshot with custody or a manifest routes to the source resolver before any kind branch
+         workspace, resolved_branch_name, source = _source_dispatch.resolve(conn, claimed, board=board, kbw=_kbw)
+     except Exception as exc:
+@@ -2099,18 +2096,8 @@ def _any_spawnable_review(
+ 
+ 
+ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
+-    """``kanban.default_assignee`` when it names a real profile this home may
+-    claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
+-    gate). Otherwise ``None`` so an unassigned shared-board card is never
+-    written to. Profiles unimportable: trust the config if no allowlist is set
+-    (the downstream check still buckets a missing profile as nonspawnable),
+-    else ``None`` — the fail-closed gate claims nothing (#147531)."""
+-    name = (default_assignee or "").strip() or None
+-    if name:
+-        profile_exists = _profile_exists_fn()
+-        if profile_exists is not None and not profile_exists(name):
+-            return None
+-    return name
++    from hermes_cli.kanban_db_dispatch_preclaim import resolve_default_assignee
++    return resolve_default_assignee(default_assignee, _profile_exists_fn)
+ 
+ 
+ # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
+@@ -2171,10 +2158,14 @@ def _dispatch_once_locked(
+     from hermes_cli.kanban_gateway_drain import core_update_hold
+     result.core_update_drain_hold = core_update_hold()
+     if result.core_update_drain_hold is not None:  # every caller (CLI, dashboard, gateway) claims nothing
++        from hermes_cli.kanban_candidate_receipts import global_hold
++        global_hold(conn, "core update drain")
+         return result
+     may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                                                  board=board, spawn_quota=spawn_quota)
+     if not may_spawn:
++        from hermes_cli.kanban_candidate_receipts import global_hold
++        global_hold(conn, result.at_capacity or result.memory_pressure or "spawn capacity refused")
+         return _kb._sync.worker_pickup_capped(conn, result, dry_run, _profile_exists_fn)  # record why cards wait
+ 
+     result.scheduling_admitted = not dry_run
+@@ -2227,10 +2218,14 @@ def _dispatch_once_locked(
+     )
+     default_assignee = _resolve_default_assignee(default_assignee)
+     spawned = 0
+-    for row in rows:
++    from hermes_cli.kanban_candidate_receipts import note, lane_refused, capacity_tail
++    for index, row in enumerate(rows):
+         if spawn_budget is not None and spawned >= spawn_budget:
++            capacity_tail(rows[index:], lane_by_id, "spawn budget exhausted")
+             break
+         if not pool_admits(result, row):
++            note(row["id"], "capacity", "admission pool full", stage="claim",
++                 status=lane_by_id.get(row["id"], "ready"))
+             continue
+         lane = lane_by_id.get(row["id"], "ready")
+         row_assignee = row["assignee"]
+@@ -2240,11 +2235,15 @@ def _dispatch_once_locked(
+                 continue
+             row_assignee = _kbda.fill_default_assignee(conn, row["id"], default_assignee, result, dry_run=dry_run)
+             if not row_assignee:
++                note(row["id"], "prefilter", "unassigned", stage="claim", status=lane)
+                 continue
+         if _dispatch_lane_task(conn, row, row_assignee, result, lane=lane, **lane_kwargs):
+             spawned += pool_take(result, row)
+-        elif (row["id"], "capacity") in result.claim_deferred:
+-            break  # a mid-pass slot release must not reward a lower-ranked row
++        else:
++            lane_refused(row["id"], result, status=lane)
++            if (row["id"], "capacity") in result.claim_deferred:
++                capacity_tail(rows[index + 1:], lane_by_id, "earlier claim exhausted capacity")
++                break  # a mid-pass slot release must not reward a lower-ranked row
+     return result
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_preclaim.py b/hermes_cli/kanban_db_dispatch_preclaim.py
+index f1db1ce1ff..140b3b7577 100644
+--- a/hermes_cli/kanban_db_dispatch_preclaim.py
++++ b/hermes_cli/kanban_db_dispatch_preclaim.py
+@@ -4,6 +4,20 @@ from __future__ import annotations
+ import sqlite3
+ 
+ 
++def resolve_default_assignee(default_assignee, profile_exists_fn):
++    """Resolve the configured default only when this home's profile allowlist admits it.
++
++    Unimportable profiles trust config only without an allowlist; the downstream
++    spawn gate still classifies missing profiles as nonspawnable.
++    """
++    name = (default_assignee or "").strip() or None
++    if name:
++        profile_exists = profile_exists_fn()
++        if profile_exists is not None and not profile_exists(name):
++            return None
++    return name
++
++
+ def note_nonspawnable(conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool) -> None:
+     """Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving the card in
+     ``ready`` with zero board evidence (#122422). Unlike a respawn guard the condition never expires on
+@@ -40,6 +54,9 @@ def eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str
+                 from hermes_cli.kanban_repin_owner import wait_reason
+                 reason = wait_reason(conn, row["id"])
+             result.skipped_ineligible.append((row["id"], reason))
++            from hermes_cli.kanban_candidate_receipts import note
++            note(row["id"], "labels" if reason == "labels_mismatch" else "prefilter", reason,
++                 stage="eligibility", status=status)
+             if reason == "labels_mismatch" and getattr(result, "scheduling_admitted", False):
+                 note_unplaceable(conn, row["id"])
+     return kept
+diff --git a/hermes_cli/kanban_dispatch_priority.py b/hermes_cli/kanban_dispatch_priority.py
+index 1f63ed409f..4eb20b8ec7 100644
+--- a/hermes_cli/kanban_dispatch_priority.py
++++ b/hermes_cli/kanban_dispatch_priority.py
+@@ -18,7 +18,10 @@ def order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row])
+     try:
+         from hermes_cli.kanban_admission_score import rank
+ 
+-        return [row for row, _parts in rank(conn, rows)]
++        ranked = rank(conn, rows)
++        from hermes_cli.kanban_candidate_receipts import scores
++        scores(ranked)
++        return [row for row, _parts in ranked]
+     except (sqlite3.Error, OSError, ValueError):
+         _LOG.warning("could not score dispatch candidates; using priority ordering", exc_info=True)
+     try:
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 868b0f81a8..2a02522a4f 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -346,6 +346,10 @@ def screened_lanes(conn: sqlite3.Connection, dry_run: bool, review_enabled: bool
+     deferred = set(deferred)
+     if not dry_run and board_mode(conn) == "primary":
+         deferred.update(safe_screen(conn, ready + review))
++    from hermes_cli.kanban_candidate_receipts import note
++    for row in ready:
++        if row["id"] in deferred:
++            note(row["id"], "prefilter", "hub admission screen deferred", stage="screen")
+     return ([row for row in ready if row["id"] not in deferred],
+             [row for row in review if row["id"] not in deferred], deferred)
+ 
+diff --git a/hermes_cli/kanban_pickup_gate.py b/hermes_cli/kanban_pickup_gate.py
+index 2b24be0233..71ad99b77d 100644
+--- a/hermes_cli/kanban_pickup_gate.py
++++ b/hermes_cli/kanban_pickup_gate.py
+@@ -130,6 +130,8 @@ def decide(card, conn, own, machines, *, mode, review_enabled, profile_exists, p
+                                      placement=placement)
+     finally:
+         record(card['id'], facts)
++        from hermes_cli.kanban_candidate_receipts import pickup_facts
++        pickup_facts(card['id'], facts, status=card['status'])
+ 
+ 
+ def _read_fact(name, card, conn, own, machines, *, mode, review_enabled, profile_exists, placement):
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index d9edeaa341..b763cbb696 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -626,6 +626,9 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     for card in listed:
+         full = not room.admits(row_class(card))
+         if full and card["id"] not in mine:
++            from hermes_cli.kanban_candidate_receipts import note
++            note(card["id"], "capacity", "pickup window full; later gates not evaluated",
++                 stage="pickup", status=card["status"])
+             continue
+         reason = _skip_reason(conn, card, own, reg["machines"], mode=mode, review_enabled=review_enabled,
+                               profile_exists=profile_exists)
+@@ -648,8 +651,11 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+         if reason is None:
+             picked.append(card["id"])
+             room.take(row_class(card))
+-        elif reason[0] and card["id"] in mine:
+-            skips[card["id"]] = reason
++        else:
++            from hermes_cli.kanban_candidate_receipts import pickup_skip
++            pickup_skip(card["id"], reason, status=card["status"])
++            if reason[0] and card["id"] in mine:
++                skips[card["id"]] = reason
+     return picked, skips
+ 
+ 
+@@ -788,6 +794,9 @@ def pickup(conn: sqlite3.Connection, *, budget: Any,
+     skips.update({tid: ("other", "import failed") for tid in picked if tid not in imported})
+     skips.update({tid: ("other", why) for tid, why in refused.items()})
+     skips.update(denied)
++    from hermes_cli.kanban_candidate_receipts import pickup_skip
++    for tid, why in skips.items():
++        pickup_skip(tid, why)
+     imported = [tid for tid in imported if tid not in denied]
+     kph.remember({tid: sig for tid, sig in held.items() if tid in imported})
+     _record_skips(conn, {tid: why for tid, why in skips.items() if tid not in imported})
+diff --git a/tests/hermes_cli/test_kanban_candidate_receipts.py b/tests/hermes_cli/test_kanban_candidate_receipts.py
+new file mode 100644
+index 0000000000..65d0c3a7f9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_candidate_receipts.py
+@@ -0,0 +1,131 @@
++"""Per-pass refusal evidence, including the two Phase A UNKNOWN shapes."""
++import sqlite3
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_candidate_receipts as receipts
++from hermes_cli import kanban_worker_node as node
++
++
++def connection():
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    return conn
++
++
++def test_replay_unknown_shapes(monkeypatch):
++    from hermes_cli import kanban_runs_on_capabilities as capabilities
++    from hermes_cli import kanban_workspace_source as source
++    conn = connection()
++    lookup = Mock()
++    lookup.execute.return_value.fetchone.return_value = None
++    monkeypatch.setattr(node, 'eligible', lambda card, *args: 'labels_mismatch' if card['id'] == 'mac' else None)
++    monkeypatch.setattr(capabilities, 'claim_refusal', lambda *args, **kwargs: None)
++    monkeypatch.setattr(source, 'pickup_skip', lambda *args: None)
++    with receipts.collect(worker='worker-a1', now_ms=123000) as capture:
++        for tid in ('mac', 'coach'):
++            card = dict(id=tid, status='ready', runs_on=['os:macos'] if tid == 'mac' else ['pool:worker'], assignee='default')
++            receipts.scores([(card, Mock(total=125.0))])
++            reason = node._skip_reason(lookup, card, 'worker-a1', {}, mode='pool', review_enabled=True,
++                                       profile_exists=lambda _: False)
++            assert reason is not None
++    receipts.persist(conn, capture)
++    rows = receipts.read(conn)['receipts']
++    assert {r['task_id']: r['gate'] for r in rows} == {'mac': 'labels', 'coach': 'prefilter'}
++    assert all(r['score'] == 125.0 and r['worker'] == 'worker-a1' and r['pass_time_ms'] == 123000 for r in rows)
++    assert len({r['pass_id'] for r in rows}) == 1
++
++
++def test_first_gate_score_and_claim_suppression():
++    conn = connection()
++    with receipts.collect(worker='a2', now_ms=1000) as capture:
++        receipts.note('one', 'prefilter', 'profile missing', stage='pickup')
++        receipts.note('one', 'budget/pacing', 'later hold', stage='claim')
++        receipts.note('claimed', 'capacity', 'old refusal', stage='pickup')
++        receipts.claimed('claimed')
++    receipts.persist(conn, capture)
++    row, = receipts.read(conn)['receipts']
++    assert row['gate'] == 'prefilter' and row['stage'] == 'pickup'
++    assert row['score'] is None and row['score_status'] == 'not_observed'
++
++
++def test_retention_row_age_and_pass_bounds(monkeypatch):
++    conn = connection()
++    monkeypatch.setattr(receipts, 'MAX_ROWS', 3)
++    monkeypatch.setattr(receipts, 'MAX_PASSES', 2)
++    for now in (1000, 2000, 3000):
++        with receipts.collect(worker='a1', now_ms=now, limit=2) as capture:
++            for tid in ('a', 'b', 'c'):
++                receipts.note(tid, 'capacity', 'full', stage='pickup')
++        receipts.persist(conn, capture)
++    result = receipts.read(conn)
++    assert len(result['receipts']) == 3 and len(result['passes']) == 2
++    assert all(p['dropped'] == 1 for p in result['passes'])
++    with receipts.collect(worker='a1', now_ms=receipts.RETENTION_MS + 4000) as capture:
++        pass
++    receipts.persist(conn, capture)
++    assert receipts.read(conn)['receipts'] == []
++    assert len(receipts.read(conn)['passes']) == 1
++
++
++def test_reader_empty_and_filtered_and_dry_scope():
++    conn = connection()
++    assert receipts.read(conn) == {'version': 1, 'receipts': [], 'passes': []}
++    receipts.note('outside', 'labels', 'not active', stage='pickup')
++    with receipts.collect(worker='a1', now_ms=1000) as outer:
++        receipts.note('outer', 'labels', 'x', stage='pickup')
++        with receipts.collect(worker='a2', now_ms=2000) as inner:
++            receipts.note('inner', 'capability', 'y', stage='pickup')
++    receipts.persist(conn, outer)
++    receipts.persist(conn, inner)
++    assert [r['task_id'] for r in receipts.read(conn, task_id='inner')['receipts']] == ['inner']
++    assert len(receipts.read(conn)['receipts']) == 2
++
++
++@pytest.mark.parametrize('fact,value,gate', [('default_placement', True, 'prefilter'),
++    ('placement_refusal', 'labels_mismatch', 'labels'), ('capability_refusal', 'missing gpu', 'capability'),
++    ('source_refusal', 'source custody', 'provenance')])
++def test_gate_facts_classification(fact, value, gate):
++    with receipts.collect(worker='a1', now_ms=1000) as capture:
++        receipts.pickup_facts('x', {fact: value}, status='ready')
++    assert capture.records['x']['gate'] == gate
++
++
++@pytest.mark.parametrize('code,detail,gate', [('quota_hold', 'quota', 'budget/pacing'),
++    ('other', 'llm_paced: reserve', 'budget/pacing'), ('budget_exhausted', 'full', 'capacity'),
++    ('hold', 'held', 'capacity'), ('other', 'containment uncertified', 'containment'),
++    ('guard_held', 'cooldown', 'prefilter'), ('other', 'import failed', 'prefilter')])
++def test_pickup_later_gate(code, detail, gate):
++    with receipts.collect(worker='a1') as capture:
++        receipts.pickup_skip('x', (code, detail))
++    assert capture.records['x']['gate'] == gate
++
++
++def test_suppression_and_unknown_are_not_invented_decisions():
++    from hermes_cli.kanban_db_dispatch import DispatchResult
++    with receipts.collect(worker='a1') as capture:
++        receipts.pickup_skip('local', ('', None))
++        receipts.pickup_facts('local', {'already_local': True}, status='ready')
++        receipts.lane_refused('unclassified', DispatchResult(), status='ready')
++        receipts.pickup_facts('held', {'placement_refusal': 'held'}, status='ready')
++    assert 'local' not in capture.records
++    assert capture.records['unclassified']['gate'] == 'unknown'
++    assert capture.records['held']['gate'] == 'capacity'
++
++
++def test_cli_readonly_export(tmp_path, monkeypatch, capsys):
++    import json
++    import sys
++    path = tmp_path / 'evidence.db'
++    conn = sqlite3.connect(path)
++    with receipts.collect(worker='a1', now_ms=1000) as capture:
++        receipts.note('wanted', 'labels', 'mismatch', stage='pickup')
++    receipts.persist(conn, capture)
++    conn.close()
++    before = path.read_bytes()
++    monkeypatch.setattr(sys, 'argv', ['receipts', '--db', str(path), '--task-id', 'wanted'])
++    receipts.main()
++    out = json.loads(capsys.readouterr().out)
++    assert out['receipts'][0]['task_id'] == 'wanted'
++    assert path.read_bytes() == before
+diff --git a/tests/hermes_cli/test_kanban_candidate_receipts_dispatch.py b/tests/hermes_cli/test_kanban_candidate_receipts_dispatch.py
+new file mode 100644
+index 0000000000..1698cdd9c5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_candidate_receipts_dispatch.py
+@@ -0,0 +1,107 @@
++"""Real dispatcher and pickup integration for bounded candidate receipts."""
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_candidate_receipts as receipts
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_worker_node as node
++from tests.hermes_cli import test_kanban_runs_on_dispatch as support
++
++gws = support.gws
++svc = support.svc
++
++
++def test_real_tick_records_capacity_and_suppresses_claimed(gws):
++    hub, _ = gws
++    hub.enter()
++    high = kb.create_task(hub.conn, title='first', assignee='default', priority=900)
++    low = kb.create_task(hub.conn, title='later', assignee='default', priority=100)
++    hub.round()
++    result = hub.tick(max_in_progress=1)
++    assert support._spawned(result) == [high]
++    rows = receipts.read(hub.conn)['receipts']
++    by_id = {r['task_id']: r for r in rows}
++    assert high not in by_id
++    assert by_id[low]['gate'] == 'capacity'
++    assert by_id[low]['score_status'] == 'observed'
++    assert by_id[low]['score'] is not None
++    # Next pass has no slots; capacity observation still covers local ready cards.
++    hub.tick(max_in_progress=1)
++    assert receipts.read(hub.conn, task_id=low)['receipts'][0]['stage'] == 'global'
++
++
++def test_score_tap_does_not_rerank(monkeypatch):
++    from hermes_cli import kanban_admission_score as score
++    from hermes_cli import kanban_dispatch_priority as priority
++    rows = [dict(id='x')]
++    rank = Mock(return_value=[(rows[0], Mock(total=123.0))])
++    monkeypatch.setattr(score, 'rank', rank)
++    with receipts.collect(worker='a1') as capture:
++        assert priority.order_with_remote_waiters(None, rows) == rows
++        receipts.note('x', 'prefilter', 'test', stage='claim')
++    rank.assert_called_once_with(None, rows)
++    assert capture.ranked == {'x': 123.0}
++
++
++def test_pool_nonpinned_prefilter_and_capacity(monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_dispatch_priority as priority
++    from hermes_cli import kanban_pickup_held as held
++    cards = [dict(id='coach', status='ready', assignee='missing', runs_on=['pool:worker']),
++             dict(id='pool-full', status='ready', assignee='default', runs_on=['pool:worker'])]
++    monkeypatch.setattr(node, '_unimported_pinned', lambda *a: set())
++    monkeypatch.setattr(node, 'registry', lambda: dict(machines={}))
++    monkeypatch.setattr(node, 'candidates', lambda *a: cards)
++    monkeypatch.setattr(dispatch, 'review_dispatch_enabled', lambda: True)
++    monkeypatch.setattr(priority, 'order_with_remote_waiters', lambda conn, rows: rows)
++    monkeypatch.setattr(node, '_skip_reason', lambda conn, card, *a, **kw:
++                        ('profile_ineligible', 'missing profile') if card['id'] == 'coach' else None)
++    for name in ('_quota_held', '_review_walled', '_paced'):
++        monkeypatch.setattr(node, name, lambda *a: None)
++    monkeypatch.setattr(held, 'board_hold', lambda *a: None)
++    with receipts.collect(worker='a1') as capture:
++        picked, skips = node._evaluate(None, None, 'a1', mode='pool', limit=1,
++                                      profile_exists=None, full_detail='full')
++    assert picked == ['pool-full'] and skips == {}
++    assert capture.records['coach']['gate'] == 'prefilter'
++    with receipts.collect(worker='a1') as capture:
++        picked, skips = node._evaluate(None, None, 'a1', mode='pool', limit=0,
++                                      profile_exists=None, full_detail='full')
++    assert not picked
++    assert {r['gate'] for r in capture.records.values()} == {'capacity'}
++
++
++@pytest.mark.parametrize('bucket,entry,gate', [
++    ('skipped_nonspawnable', 'x', 'prefilter'), ('capsule_refused', ('x', 'missing'), 'capability'),
++    ('no_progress_held', ('x', 'spend'), 'budget/pacing'), ('pinned_quota_held', ('x', 'quota'), 'budget/pacing'),
++    ('llm_paced', ('x', 'wall'), 'budget/pacing'), ('skipped_per_profile_capped', ('x', 'default', 1), 'capacity'),
++    ('respawn_guarded', ('x', 'cooldown'), 'prefilter'), ('owner_down', ('x', 'default', 'down'), 'prefilter'),
++    ('quiet_deferred', ('x', 'quiet'), 'capacity'), ('claim_deferred', ('x', 'labels_mismatch'), 'labels'),
++    ('claim_deferred', ('x', 'containment'), 'containment'), ('claim_deferred', ('x', 'source_missing'), 'provenance'),
++    ('claim_deferred', ('x', 'capacity'), 'capacity'), ('claim_deferred', ('x', 'capability_missing'), 'capability'),
++])
++def test_actual_lane_result_classification(bucket, entry, gate):
++    from hermes_cli.kanban_db_dispatch import DispatchResult
++    result = DispatchResult()
++    getattr(result, bucket).append(entry)
++    with receipts.collect(worker='a1') as capture:
++        receipts.lane_refused('x', result, status='ready')
++        receipts.lane_refused('review', result, status='review')
++    assert capture.records['x']['gate'] == gate
++    assert 'review' not in capture.records
++
++
++def test_dry_run_and_write_failure_are_nonintrusive(monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_worker_node
++    monkeypatch.setattr(kanban_worker_node, '_own', lambda _: 'a1')
++    conn = sqlite3.connect(':memory:')
++    with receipts.dispatch_pass(conn, dry_run=True):
++        receipts.note('x', 'labels', 'no', stage='pickup')
++    assert receipts.read(conn)['passes'] == []
++    def fail(*args):
++        raise sqlite3.OperationalError('read only')
++    monkeypatch.setattr(receipts, 'persist', fail)
++    with receipts.dispatch_pass(conn):
++        receipts.note('x', 'labels', 'no', stage='pickup')
+-- 
+2.43.0
+

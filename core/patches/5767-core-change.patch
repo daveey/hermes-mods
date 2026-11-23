@@ -1,0 +1,199 @@
+From 04129360f386701c6e37938eca42d069d070a782 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:46:08 +0000
+Subject: [PATCH] [daveey] Annotation parts and board stamps: fix three review
+ regressions
+
+Review of 422817272d (PR #4054) reproduced three regressions against the
+base. Each has a test here that fails without the fix.
+
+1. stamp_boards kept session_external's own 5 s memo answer under the new
+   board signature. When a commit removed the board's last scheduled card
+   but other parked cards remained, the pre-commit external count was
+   served until the board's next commit (base bound: 5 s). A read made
+   under a known signature now bypasses that memo; the stored contribution
+   is the only memo on that path. The memo still serves the
+   unknown-signature path, as on the base.
+
+2. The counts renewal read _cache_read_at, the active count slot's field,
+   which belongs to whichever scope was read last. It now reads this
+   scope's own read time (kanban_counts_scopes.read_at_locked); no counts
+   for the scope means renew.
+
+3. A wake for a scope with no demand dropped its clock deadlines but kept
+   its part keys, so a deadline that came due in the gap forced nothing
+   when demand returned. The keys are now dropped with the deadlines.
+
+Tests: test_an_external_card_that_left_is_gone_on_the_next_request_and_
+stays_gone (and the existing new-card test no longer clears the memo by
+hand), test_the_renewal_reads_this_scopes_counts_age_not_the_last_scope_
+read, test_deadlines_dropped_while_nobody_polled_force_the_read_when_
+demand_returns. Without the three product edits: 4 of 18 fail; with them
+18 pass. 182 test files that import the touched modules: 3306 passed,
+0 failed, 1 skipped. scripts/check --base origin/main: 21 checks ok.
+
+As deployed today the attention part is still read on every wake:
+hermes-mods kanban-honest-done registers its done check with no watch
+paths, so no key can vouch for it. Declaring them is the hermes-mods half
+of t_28eb8d66d577eab3.
+
+Hermes-Card: t_28eb8d66d577eab3
+---
+ hermes_cli/kanban_annotation_host.py          |  7 ++++-
+ hermes_cli/kanban_counts_scopes.py            | 12 ++++++++
+ hermes_cli/kanban_external_activity.py        |  4 ++-
+ .../test_kanban_annotation_parts.py           | 29 +++++++++++++++++++
+ .../test_kanban_external_activity.py          | 25 ++++++++++++++--
+ 5 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index f56d99e84a..75714d45ee 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -690,6 +690,8 @@ def _event_refresh(events) -> float | None:
+         def refresh_scope():
+             if not _scope_interested(scope):
+                 _clock_deadlines.pop(scope, None)
++                # A deadline dropped here may have come due unseen: the part keys vouch for nothing after it.
++                _parts.failed(scope)
+                 return None
+             if not _ksa._annotate_refresh_lock.acquire(blocking=False):
+                 return _scope_retry(scope)
+@@ -706,9 +708,12 @@ def _event_refresh(events) -> float | None:
+             # not one: it re-takes the keys, which is what shows a commit the first read was too early for. The
+             # counts are also read once their last read is ``STRICT_REFRESH_AGE_S`` old, so the published
+             # ``read_at`` is renewed before exact adopters drop the copy at ``_COUNTS_MAX_AGE_S``.
++            # The age is this scope's own: the active count slot belongs to whichever scope was read last.
++            with _ksa._cache_lock:
++                read_at = _ksa._count_scopes.read_at_locked(scope)
+             forced, part_keys = _parts.plan(
+                 scope, clock=len(_holder_ctx.deadlines) != len(pending),
+-                renew=time.monotonic() - _ksa._cache_read_at >= STRICT_REFRESH_AGE_S)
++                renew=read_at is None or time.monotonic() - read_at >= STRICT_REFRESH_AGE_S)
+             _ksa._revalidate.force_read.scope = scope
+             _ksa._revalidate.force_read.parts = forced
+             try:
+diff --git a/hermes_cli/kanban_counts_scopes.py b/hermes_cli/kanban_counts_scopes.py
+index 7f13f6e537..d5dee57d57 100644
+--- a/hermes_cli/kanban_counts_scopes.py
++++ b/hermes_cli/kanban_counts_scopes.py
+@@ -59,6 +59,18 @@ def restore_locked(scope: tuple[str, ...]) -> None:
+     _entries.move_to_end(scope)
+ 
+ 
++def read_at_locked(scope: tuple[str, ...]) -> float | None:
++    """Monotonic time of the read behind ``scope``'s counts, whichever scope owns the active slot; None = none."""
++    from hermes_cli import kanban_session_activity as ksa
++
++    if ksa._cache is None:
++        return None
++    if ksa._cache_scope == scope:
++        return ksa._cache_read_at
++    saved = _entries.get(scope)
++    return None if saved is None else saved[0][_FIELDS.index("_cache_read_at")]
++
++
+ def result_locked(include_waiting: bool, include_snapshot: bool) -> tuple:
+     """Annotation identities travel with their count generation; caller holds the cache lock."""
+     from hermes_cli import kanban_session_activity as ksa
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+index 0b79e02a4b..663e280596 100644
+--- a/hermes_cli/kanban_external_activity.py
++++ b/hermes_cli/kanban_external_activity.py
+@@ -149,7 +149,9 @@ def _board_external(path, open_ro, parked_pairs, signature, wall: float) -> dict
+         return {}
+     try:
+         pairs = parked_pairs(conn)
+-        found = session_external(conn, pairs, key=key) if pairs else {}
++        # With a signature the stored contribution is the only memo: ``session_external``'s own ``_TTL_S`` memo
++        # would hand back the answer from before the commit that moved the signature, to be kept under the new one.
++        found = session_external(conn, pairs, key=key if sig is None else "", now=wall) if pairs else {}
+         clocked = bool(pairs) and _clocked(conn, pairs)
+     except sqlite3.Error:
+         logger.debug("kanban external read failed for %s", path, exc_info=True)
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index f8506f4d56..5563f2245c 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -200,6 +200,35 @@ def test_an_old_counts_read_is_renewed_so_the_published_read_time_stays_adoptabl
+     assert _reads(world) == (2, 1, 1)
+ 
+ 
++def test_the_renewal_reads_this_scopes_counts_age_not_the_last_scope_read(world, monkeypatch):
++    _refresh()
++    assert world.counts == 1
++    monkeypatch.setattr(host, 'STRICT_REFRESH_AGE_S', 5.0)
++    with ksa._cache_lock:  # this scope's counts were read a while ago
++        ksa._cache_read_at -= 10.0
++        ksa._count_scopes.remember_locked()
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('annotation-parts-test', 'other'))
++    ksa._all_counts()  # another profile's poll now owns the active count slot, read just now
++    assert world.counts == 2
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: SCOPE)
++    _refresh()
++    assert world.counts == 3, "this scope's old counts were not renewed"
++
++
++def test_deadlines_dropped_while_nobody_polled_force_the_read_when_demand_returns(world, monkeypatch):
++    _refresh()
++    world.deadline = time.time() + 30  # a done check's declared wall-time boundary
++    _refresh()
++    interested = host._scope_interested
++    monkeypatch.setattr(host, '_scope_interested', lambda scope: False)
++    _refresh()  # a source write wakes the holder meanwhile: the scope's deadlines are dropped
++    assert SCOPE not in host._clock_deadlines
++    world.flagged, world.deadline = False, None  # the verdict moved at a boundary nobody is waiting for now
++    monkeypatch.setattr(host, '_scope_interested', interested)
++    _refresh(source=False)  # demand is back
++    assert _published()[10] == {}, 'a verdict that moved at a declared wall time was served from the cache'
++
++
+ def test_a_burst_of_board_writes_is_a_bounded_number_of_reads_and_the_last_write_shows(world, monkeypatch):
+     monkeypatch.setattr(host, 'SETTLE_S', (0.25, host.HOLDER_INTERVAL_S))
+     monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(world.board), str(world.plain)], []))
+diff --git a/tests/hermes_cli/test_kanban_external_activity.py b/tests/hermes_cli/test_kanban_external_activity.py
+index eae28ac4a6..fac07ccf76 100644
+--- a/tests/hermes_cli/test_kanban_external_activity.py
++++ b/tests/hermes_cli/test_kanban_external_activity.py
+@@ -176,8 +176,6 @@ def test_a_cached_board_answers_byte_identically_and_a_new_external_card_shows_o
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET session_id='s1' WHERE id=?", (b,))
+         tick(conn, gh, clock, 0)
+-        with kea._lock:
+-            kea._memo.clear()  # session_external's own 5 s memo predates this change; not under test
+         got = stamp(rows())
+         assert got[0]["kanban_external"] == 2
+         assert json.dumps(got, sort_keys=True) == json.dumps(_fresh_stamp(conn, rows()), sort_keys=True)
+@@ -201,6 +199,29 @@ def test_a_board_with_a_scheduled_card_is_reread_after_the_ttl_because_its_state
+         assert len(opens) == 2
+ 
+ 
++def test_an_external_card_that_left_is_gone_on_the_next_request_and_stays_gone(kanban_home, gh, clock, monkeypatch):
++    """The read a moved signature asks for must not be answered by ``session_external``'s own 5 s memo: that
++    pre-commit answer would be kept under the new signature until the board's next commit."""
++    with kbc.connect_closing() as conn:
++        a = park(conn, 9001)
++        other = kb.create_task(conn, title="blocked sibling", assignee="worker")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='s1' WHERE id=?", (a,))
++            conn.execute("UPDATE tasks SET status='blocked', session_id='s1' WHERE id=?", (other,))
++        tick(conn, gh, clock, 0)
++        stamp, _opens = _counting(monkeypatch, conn)
++        wall = [time.time()]
++        monkeypatch.setattr(kea.time, "time", lambda: wall[0])
++        rows = lambda: [{"id": "s1", "kanban_parked": 2}]
++        assert stamp(rows())[0].get("kanban_external") == 1
++        wall[0] += 2.0
++        with kb.write_txn(conn):  # the last scheduled card leaves; a parked sibling keeps the board in play
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (a,))
++        for step in (1.0, 6.0, 60.0, 600.0):
++            wall[0] += step
++            assert "kanban_external" not in stamp(rows())[0], step
++
++
+ def test_an_unknown_signature_reads_the_board_every_time(kanban_home, monkeypatch):
+     with kbc.connect_closing() as conn:
+         _session_card(conn, "s1")
+-- 
+2.43.0
+

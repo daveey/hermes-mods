@@ -1,0 +1,152 @@
+From 17f725e055a7bd16c71812aea1c91de61273823d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:37:28 +0000
+Subject: [PATCH] fix(dashboard): lane review nits: own cancels only, served
+ counts runs, deterministic race test [daveey]
+
+Third review of #3936 (approved), non-blocking points:
+- _admit compares task.cancelling() with its count at entry, so an older
+  un-cleared cancel on the request task never fails an admission.
+- served counts only calls whose work ran (not ones cancelled before a thread
+  picked them up).
+- The disconnect-vs-hand-off test is deterministic: the poll's sleep and the
+  hand-off happen in one synchronous step, in both orders. It fails on the
+  first reviewed head.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/web_thread_lanes.py            | 13 +++--
+ tests/hermes_cli/test_web_thread_lanes.py | 60 ++++++++++++-----------
+ 2 files changed, 39 insertions(+), 34 deletions(-)
+
+diff --git a/hermes_cli/web_thread_lanes.py b/hermes_cli/web_thread_lanes.py
+index 3b02919a16..af2f239bdf 100644
+--- a/hermes_cli/web_thread_lanes.py
++++ b/hermes_cli/web_thread_lanes.py
+@@ -172,6 +172,8 @@ async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, re
+     was taken is ignored (the call runs; nothing leaks)."""
+     acquired = False
+     gone = False
++    task = asyncio.current_task()
++    cancels_before = task.cancelling() if task is not None else 0
+     try:
+         # A free slot is taken without awaiting: anyio's uncontended acquire passes a shielded checkpoint, and a
+         # native cancel landing there makes it release on behalf of the wrong borrower (RuntimeError, slot
+@@ -206,8 +208,7 @@ async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, re
+                     tg.cancel_scope.cancel()
+                 # A native cancel of this task that the task group's own (already cancelled) scope absorbed
+                 # must still reach the caller.
+-                task = asyncio.current_task()
+-                if task is not None and task.cancelling():
++                if task is not None and task.cancelling() > cancels_before:
+                     raise asyncio.CancelledError()
+     except BaseException:
+         if acquired:
+@@ -249,12 +250,12 @@ async def run_in_lane(lane: str, fn: Callable[..., Any], *args: Any, request: An
+     state_lock = threading.Lock()
+     state = {"entered": False, "skipped": False, "done": False}
+ 
+-    def finish() -> None:
++    def finish(ran: bool = True) -> None:
+         with state_lock:
+             if state["done"]:
+                 return
+             state["done"] = True
+-        entry._add(in_use=-1, served=1)
++        entry._add(in_use=-1, served=1 if ran else 0)  # served: calls whose work ran
+         gate.release_on_behalf_of(token)
+ 
+     def call() -> Any:
+@@ -281,7 +282,9 @@ async def run_in_lane(lane: str, fn: Callable[..., Any], *args: Any, request: An
+                 state["skipped"] = True
+         # Not started (now never will) or already finished (fn raised): release now. Started and the caller
+         # was cancelled: the thread releases when it returns.
+-        if not entered or not isinstance(exc, (asyncio.CancelledError, anyio.get_cancelled_exc_class())):
++        if not entered:
++            finish(ran=False)
++        elif not isinstance(exc, (asyncio.CancelledError, anyio.get_cancelled_exc_class())):
+             finish()
+         raise
+     finish()
+diff --git a/tests/hermes_cli/test_web_thread_lanes.py b/tests/hermes_cli/test_web_thread_lanes.py
+index 2d649a67b3..6cb6c48512 100644
+--- a/tests/hermes_cli/test_web_thread_lanes.py
++++ b/tests/hermes_cli/test_web_thread_lanes.py
+@@ -212,38 +212,39 @@ async def test_a_cancel_right_after_the_hand_off_never_leaks_the_slot(turns):
+     assert await asyncio.wait_for(lanes.run_in_lane("sessions", lambda: "next"), 2) == "next"
+ 
+ 
+-class _GoneWhen:
+-    """Disconnected once ``gone()`` is true; answers without yielding, as uvicorn does once it knows."""
+-
+-    def __init__(self, gone):
+-        self.gone = gone
+-
+-    async def is_disconnected(self):
+-        return self.gone()
+-
+-
+ @pytest.mark.asyncio
+-async def test_a_disconnect_seen_with_the_hand_off_never_leaks_the_slot(monkeypatch):
++@pytest.mark.parametrize("hand_off_first", [True, False], ids=["hand-off-then-poll", "poll-then-hand-off"])
++async def test_a_disconnect_seen_with_the_hand_off_never_leaks_the_slot(monkeypatch, hand_off_first):
+     # Review of #3936: when the slot was handed over in the same loop turn the disconnect poll woke, the poll
+-    # overwrote the acquisition with 'disconnected' and the slot was never released. The client reads as gone
+-    # from the hand-off on (the gate has dequeued the waiter); repeated so both orderings come up.
+-    monkeypatch.setattr(lanes, "DISCONNECT_POLL_S", 0)
++    # overwrote the acquisition with 'disconnected' and the slot was never released. Deterministic: the poll's
++    # sleep and the hand-off happen in one synchronous step, in both orders.
++    tick = asyncio.Event()
++
++    async def poll_sleep(_seconds):
++        await tick.wait()
++        tick.clear()
++
++    monkeypatch.setattr(anyio, "sleep", poll_sleep)
+     gate, _runner = lanes._lane("sessions").limiters()
+-    for _ in range(20):
+-        work, started, release = _blocker()
+-        holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
+-        await _until(started.is_set)
+-        handed = _GoneWhen(lambda: gate.statistics().tasks_waiting == 0)
+-        waiter = asyncio.create_task(lanes.run_in_lane("sessions", lambda: "ran", request=handed))
+-        await _until(lambda: gate.statistics().tasks_waiting == 1)
+-        release.set()
+-        await holder
+-        try:
+-            await asyncio.wait_for(waiter, 2)
+-        except lanes.LaneBusy as busy:
+-            assert busy.detail["reason"] == "disconnected"
+-        await _until(lambda: lanes.stats()["sessions"]["in_use"] == 0)
+-        assert _borrowed("sessions") == 0
++    dummy = object()
++    await gate.acquire_on_behalf_of(dummy)
++    request = _Request()
++    ran = []
++    waiter = asyncio.create_task(lanes.run_in_lane("sessions", lambda: ran.append(1), request=request))
++    await _until(lambda: gate.statistics().tasks_waiting == 1)
++    request.gone = True
++    if hand_off_first:
++        gate.release_on_behalf_of(dummy)
++        tick.set()
++    else:
++        tick.set()
++        gate.release_on_behalf_of(dummy)
++    try:
++        await asyncio.wait_for(waiter, 2)
++    except lanes.LaneBusy as busy:
++        assert busy.detail["reason"] == "disconnected" and ran == []
++    await _until(lambda: lanes.stats()["sessions"]["in_use"] == 0)
++    assert _borrowed("sessions") == 0
+ 
+ 
+ @pytest.mark.asyncio
+@@ -310,4 +311,5 @@ async def test_work_cancelled_before_a_thread_picks_it_up_never_runs(monkeypatch
+     with pytest.raises(asyncio.CancelledError):
+         await task
+     assert lanes.stats()["sessions"]["in_use"] == 0 and _borrowed("sessions") == 0
++    assert lanes.stats()["sessions"]["served"] == 0  # it never ran
+     assert picked[0]() is None and ran == []  # a late pickup does nothing
+-- 
+2.43.0
+

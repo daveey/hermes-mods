@@ -1,0 +1,457 @@
+From 383d2a4ee735fa55f86a9a9960f4df173d2a3322 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:56:29 +0000
+Subject: [PATCH] perf(workers): defer Codex quota recovery during managed boot
+ [daveey]
+
+Problem: round4 natural post-load traces still spent 2.46s/1.91s in quota
+recovery HTTPS; frozen original-query n55 median 7.435295s misses <=4s.
+Why: the negative-only memo suppresses warm probes but every cold, stale,
+invalid or changed-evidence miss falls through to synchronous HTTP. Fresh
+workers cannot rely on that memo. Earlier coverage proved memo reuse, not
+absence of network on construction, so the implementation contract was
+incomplete despite local savings.
+
+Scope deferral to authenticated managed Kanban construction, not environment
+heuristics. Both quota GET and expired-token pre-probe refresh return
+fail-closed without network in that scope. Queue one context-bound daemon
+refresh against a separately loaded pool on scope exit. Reuse ordinary
+refresh, cooldown proof and generation-aware persistence; never share
+positive memo evidence or mutate the constructing agent's pool. Skip the
+exception recovery retry only after a Codex recovery was actually deferred.
+Other surfaces and ordinary recovery retain inline behavior. A daemon may
+end with its worker; failure/unknown evidence leaves cooldowns intact and
+ordinary external recovery remains available. No RPC or receipt fences move.
+
+Proof: corrected fail-without-fix run 16 failed/5 passed, including all eight
+cold/missing/stale/invalid x exhausted/healthy-peer controls, expired token
+and constructor error retry. GREEN21; current consumer sweep70 files848
+passed/5 skipped with no per-file retries; full21 static checks pass.
+Controls cover newer failure during HTTP, 429/500/missing/closed windows,
+ordinary inline recovery, eventual persisted recovery, usable-only boot,
+nested exceptions, failed thread start and bounded real-thread deduplication.
+
+No performance acceptance claimed: after exact-head review/CI/canonical
+landing, await natural five-host loading and >=50 real original-query
+sessions through one scheduler wake check. Preserve previous failed cohort,
+per-route reporting, <=4s target and accepted no-RPC-change disposition.
+
+Hermes-Card: t_a6708e888000e5ba
+---
+ agent/codex_boot_recovery.py                  |  79 +++++++++
+ agent/managed_worker.py                       |  27 ++--
+ hermes_cli/auth_codex.py                      |   6 +
+ tests/agent/test_codex_boot_recovery.py       | 153 ++++++++++++++++++
+ .../test_codex_boot_recovery_controls.py      |  92 +++++++++++
+ 5 files changed, 345 insertions(+), 12 deletions(-)
+ create mode 100644 agent/codex_boot_recovery.py
+ create mode 100644 tests/agent/test_codex_boot_recovery.py
+ create mode 100644 tests/agent/test_codex_boot_recovery_controls.py
+
+diff --git a/agent/codex_boot_recovery.py b/agent/codex_boot_recovery.py
+new file mode 100644
+index 0000000000..80d65e15c3
+--- /dev/null
++++ b/agent/codex_boot_recovery.py
+@@ -0,0 +1,79 @@
++"""Keep exhausted Codex recovery off managed Kanban construction's critical path.
++
++A boot never promotes an exhausted row from missing evidence. Recovery runs on a
++separately loaded pool after construction, using the ordinary generation-aware
++persistence path; no shared positive evidence or live agent pool is mutated.
++"""
++from __future__ import annotations
++
++import contextlib
++import logging
++import threading
++from contextvars import ContextVar, copy_context
++
++_pending: ContextVar[list | None] = ContextVar('codex_boot_recovery', default=None)
++_lock = threading.Lock()
++_running: set[str] = set()
++
++
++def defer_recovery() -> bool:
++    pending = _pending.get()
++    if pending is None:
++        return False
++    pending[:] = [True]
++    return True
++
++
++def recovery_deferred() -> bool:
++    return bool(_pending.get())
++
++
++def _recover() -> None:
++    from agent.credential_pool import load_pool
++    pool = load_pool('openai-codex')
++    # A fresh pool, not the constructing agent's pool/lock. The ordinary path
++    # persists rotated tokens and merges clears against newer failure stamps.
++    with pool._lock:
++        pool._available_entries(clear_expired=True, refresh=False)
++
++
++def _start(context) -> None:
++    from hermes_cli.config import get_hermes_home
++    home = str(get_hermes_home())
++    with _lock:
++        if home in _running:
++            return
++        _running.add(home)
++
++    def run():
++        try:
++            context.run(_recover)
++        except Exception:
++            logging.getLogger(__name__).debug('Deferred Codex recovery failed', exc_info=True)
++        finally:
++            with _lock:
++                _running.discard(home)
++
++    from agent.memory_provider import spawn_context_thread
++    try:
++        spawn_context_thread(run, name='codex-boot-recovery', daemon=True).start()
++    except Exception:
++        with _lock:
++            _running.discard(home)
++        logging.getLogger(__name__).debug('Could not start deferred Codex recovery', exc_info=True)
++
++
++@contextlib.contextmanager
++def construction_scope(enabled: bool):
++    if not enabled or _pending.get() is not None:
++        yield
++        return
++    pending: list[bool] = []
++    token = _pending.set(pending)
++    try:
++        yield
++    finally:
++        _pending.reset(token)
++        if pending:
++            # Preserve profile/route context, but not the deferral scope itself.
++            _start(copy_context())
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index ae8c522e51..025cf8a442 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -471,18 +471,21 @@ def _construct_agent(frame, factory, policy, **kwargs):
+     still books the one-shot exit mapping (quota wall 75, re-login 78) before the crash."""
+     from gateway.session_worker_construct import worker_route
+     from hermes_cli.kanban_quota_recovery import recover_exception
+-    for attempt in range(2):
+-        try:
+-            return factory(**{**kwargs, **worker_route(policy, kwargs)})
+-        except Exception as exc:
+-            if json.loads(frame['policy'].get('kanban_json') or 'null') is not None:
+-                healed = attempt == 0 and recover_exception(exc)
+-                exc._kanban_quota_probe_attempted = True
+-                if healed:
+-                    continue
+-            from gateway.session_kanban import record_start_failure
+-            record_start_failure(frame, exc)
+-            raise
++    from agent.codex_boot_recovery import construction_scope, recovery_deferred
++    kanban = json.loads(frame['policy'].get('kanban_json') or 'null') is not None
++    with construction_scope(kanban):
++        for attempt in range(2):
++            try:
++                return factory(**{**kwargs, **worker_route(policy, kwargs)})
++            except Exception as exc:
++                if kanban:
++                    healed = attempt == 0 and not recovery_deferred() and recover_exception(exc)
++                    exc._kanban_quota_probe_attempted = True
++                    if healed:
++                        continue
++                from gateway.session_kanban import record_start_failure
++                record_start_failure(frame, exc)
++                raise
+ 
+ 
+ def hello():
+diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
+index 178d24bad6..0378cc87f9 100644
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -765,6 +765,9 @@ def _probe_codex_quota_restored(
+     Probes are throttled per access token (module-local cache) so the hot selection path can fire
+     this freely.
+     """
++    from agent.codex_boot_recovery import defer_recovery
++    if defer_recovery():
++        return False
+     from hermes_cli.auth import _codex_quota_probe_cache, _nonempty_str
+     token = _stripped(access_token)
+     # Real Codex access tokens are JWTs. Refusing to probe non-JWT tokens avoids pointless
+@@ -828,6 +831,9 @@ def _refresh_expired_codex_probe_token(
+     the stale token's probe slot, so neither the refresh nor the doomed 401 probe fire again
+     until the interval has elapsed.
+     """
++    from agent.codex_boot_recovery import defer_recovery
++    if defer_recovery():
++        return None
+     from hermes_cli.auth import _codex_quota_probe_cache
+     token, refresh = _stripped(access_token), _stripped(refresh_token)
+     if not token or not refresh or not _codex_access_token_is_expiring(token, 0):
+diff --git a/tests/agent/test_codex_boot_recovery.py b/tests/agent/test_codex_boot_recovery.py
+new file mode 100644
+index 0000000000..95f4775a0f
+--- /dev/null
++++ b/tests/agent/test_codex_boot_recovery.py
+@@ -0,0 +1,153 @@
++"""Managed construction must never wait for exhausted-account recovery HTTP."""
++import json
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from agent import codex_boot_recovery as boot
++from agent.credential_pool import load_pool
++from agent.managed_worker import _construct_agent
++from hermes_cli import auth_codex, auth_codex_quota_negative as negative
++from tests.hermes_cli.test_auth_codex_quota_probe import (
++    _jwt, _pool_only_rate_limited_store, _write_auth_store,
++)
++
++
++@pytest.fixture
++def setup_pool(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    row = _pool_only_rate_limited_store()
++    exhausted = row['credential_pool']['openai-codex'][0]
++    exhausted['access_token'] = _jwt({'exp': time.time() + 3600})
++    _write_auth_store(home, row)
++    monkeypatch.setattr('gateway.session_worker_construct.worker_route', lambda *a: {})
++    monkeypatch.setattr('gateway.session_kanban.record_start_failure', lambda *a: None)
++    auth_codex._codex_quota_probe_cache.clear()
++    auth_codex._codex_quota_probe_evidence.clear()
++    return home, row
++
++
++def construct(factory, kanban=True):
++    policy = SimpleNamespace()
++    frame = {'policy': {'kanban_json': json.dumps({'task_id': 'fixture'}) if kanban else 'null'}}
++    return _construct_agent(frame, factory, policy)
++
++
++@pytest.mark.parametrize('memo', ['cold', 'missing', 'stale', 'invalid'])
++@pytest.mark.parametrize('usable', [False, True])
++def test_managed_boot_never_enters_recovery_http(setup_pool, monkeypatch, memo, usable):
++    home, store = setup_pool
++    if usable:
++        row = dict(store['credential_pool']['openai-codex'][0])
++        row.update(id='usable', priority=1, last_status=None, last_error_code=None,
++                   last_error_reason=None, last_error_message=None, last_error_reset_at=None)
++        store['credential_pool']['openai-codex'].append(row)
++        _write_auth_store(home, store)
++    row = store['credential_pool']['openai-codex'][0]
++    key = negative.key(row['access_token'], auth_codex._codex_usage_probe_url(None),
++                       row['last_error_reset_at'], row['last_status_at'])
++    if memo != 'cold':
++        path = negative._path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text({'missing': '{}', 'stale': json.dumps({key: time.time() - 600}),
++                         'invalid': '{broken'}[memo])
++    assert not negative.hit(key, 300)
++    starts, calls = [], []
++    monkeypatch.setattr(boot, '_start', lambda ctx: starts.append(ctx))
++    def forbidden(**kwargs):
++        calls.append(memo)
++        raise AssertionError('boot entered recovery HTTP')
++    monkeypatch.setattr(auth_codex, '_codex_http_client', forbidden)
++    chosen = construct(lambda **kw: load_pool('openai-codex').select())
++    assert calls == []
++    assert chosen.id == 'usable' if usable else chosen is None
++    assert len(starts) == 1
++    assert boot._pending.get() is None
++
++
++def test_expired_recovery_refresh_also_deferred(setup_pool, monkeypatch):
++    home, store = setup_pool
++    entry = store['credential_pool']['openai-codex'][0]
++    entry.update(access_token=_jwt({'exp': time.time() - 3600}), refresh_token='fixture-refresh')
++    _write_auth_store(home, store)
++    calls = []
++    monkeypatch.setattr(boot, '_start', lambda ctx: None)
++    def refresh(*a):
++        calls.append(True)
++        raise AssertionError('boot refreshed exhausted token')
++    monkeypatch.setattr(auth_codex, 'refresh_codex_oauth_pure', refresh)
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    assert calls == []
++
++
++def test_failed_boot_does_not_run_synchronous_completion_recovery(setup_pool, monkeypatch):
++    monkeypatch.setattr(boot, '_start', lambda ctx: None)
++    calls = []
++    def recovery(exc):
++        calls.append(exc)
++        return False
++    monkeypatch.setattr('hermes_cli.kanban_quota_recovery.recover_exception', recovery)
++    def factory(**kw):
++        assert load_pool('openai-codex').select() is None
++        raise RuntimeError('quota exhausted')
++    with pytest.raises(RuntimeError, match='quota exhausted'):
++        construct(factory)
++    assert calls == []
++
++
++def test_background_recovery_is_off_boot_and_eventually_persisted(setup_pool, monkeypatch):
++    from tests.hermes_cli.test_auth_codex_quota_probe import _StubClient, _StubResponse
++    queued, calls = [], []
++    monkeypatch.setattr(boot, '_start', lambda ctx: queued.append(ctx))
++    monkeypatch.setattr(auth_codex, '_codex_http_client',
++                        lambda **kw: _StubClient(calls, _StubResponse(200, {'rate_limit': {'primary_window': {
++                            'used_percent': 0, 'reset_at': time.time() + 86400 * 30}}})))
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    assert calls == []
++    queued.pop().run(boot._recover)
++    assert len(calls) == 1
++    chosen = construct(lambda **kw: load_pool('openai-codex').select())
++    assert chosen is not None
++    assert chosen.last_status == 'ok'
++
++
++def test_non_kanban_retains_inline_recovery(setup_pool, monkeypatch):
++    from tests.hermes_cli.test_auth_codex_quota_probe import _StubClient, _StubResponse
++    calls = []
++    monkeypatch.setattr(auth_codex, '_codex_http_client',
++                        lambda **kw: _StubClient(calls, _StubResponse(200, {'rate_limit': {'primary_window': {
++                            'used_percent': 0, 'reset_at': time.time() + 86400 * 30}}})))
++    chosen = construct(lambda **kw: load_pool('openai-codex').select(), kanban=False)
++    assert chosen is not None
++    assert len(calls) == 1
++
++
++def test_background_start_is_nonblocking_and_deduplicated(setup_pool, monkeypatch):
++    from contextvars import copy_context
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    def recover():
++        calls.append(True)
++        assert boot._pending.get() is None
++        entered.set()
++        release.wait(5)
++        finished.set()
++    monkeypatch.setattr(boot, '_recover', recover)
++    thread = None
++    try:
++        with boot.construction_scope(True):
++            assert boot.defer_recovery()
++            assert not entered.is_set()
++        assert entered.wait(2)
++        thread = next(t for t in threading.enumerate() if t.name == 'codex-boot-recovery')
++        boot._start(copy_context())
++        assert len(calls) == 1
++    finally:
++        release.set()
++        assert finished.wait(2)
++        if thread is not None:
++            thread.join(2)
++            assert not thread.is_alive()
+diff --git a/tests/agent/test_codex_boot_recovery_controls.py b/tests/agent/test_codex_boot_recovery_controls.py
+new file mode 100644
+index 0000000000..a469b5f781
+--- /dev/null
++++ b/tests/agent/test_codex_boot_recovery_controls.py
+@@ -0,0 +1,92 @@
++"""Fail-closed and lifecycle controls for the off-boot Codex probe."""
++from contextvars import copy_context
++import threading
++import time
++
++import pytest
++
++from agent import codex_boot_recovery as boot
++from agent.credential_pool import load_pool
++from hermes_cli import auth_codex
++from tests.agent.test_codex_boot_recovery import construct, setup_pool as _setup_pool
++from tests.hermes_cli.test_auth_codex_quota_probe import _StubClient, _StubResponse, _write_auth_store
++
++
++setup_pool = _setup_pool
++
++
++@pytest.mark.parametrize('status,payload', [
++    (429, {}), (500, {}), (200, {}),
++    (200, {'rate_limit': {'primary_window': {'used_percent': 100, 'reset_at': 9999999999}}}),
++])
++def test_unknown_or_exhausted_background_evidence_never_selects(setup_pool, monkeypatch, status, payload):
++    queued, calls = [], []
++    monkeypatch.setattr(boot, '_start', queued.append)
++    monkeypatch.setattr(auth_codex, '_codex_http_client',
++                        lambda **kw: _StubClient(calls, _StubResponse(status, payload)))
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    queued.pop().run(boot._recover)
++    assert len(calls) == 1
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    assert len(calls) == 1
++
++
++def test_new_failure_during_background_probe_wins(setup_pool, monkeypatch):
++    home, store = setup_pool
++    queued, calls = [], []
++    monkeypatch.setattr(boot, '_start', queued.append)
++
++    class RacingClient(_StubClient):
++        def get(self, url, headers=None):
++            row = store['credential_pool']['openai-codex'][0]
++            row['last_status_at'] = time.time() + 100
++            _write_auth_store(home, store)
++            return super().get(url, headers)
++
++    monkeypatch.setattr(auth_codex, '_codex_http_client', lambda **kw: RacingClient(
++        calls, _StubResponse(200, {'rate_limit': {'primary_window': {
++            'used_percent': 0, 'reset_at': 9999999999}}})))
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    queued.pop().run(boot._recover)
++    assert len(calls) == 1
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++
++
++def test_usable_only_construction_schedules_nothing(setup_pool, monkeypatch):
++    home, store = setup_pool
++    store['credential_pool']['openai-codex'][0].update(
++        last_status='ok', last_error_reset_at=None)
++    _write_auth_store(home, store)
++    queued = []
++    monkeypatch.setattr(boot, '_start', queued.append)
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is not None
++    assert queued == []
++
++
++def test_nested_scope_queues_once_and_restores_context(monkeypatch):
++    queued = []
++    monkeypatch.setattr(boot, '_start', queued.append)
++    with pytest.raises(ValueError):
++        with boot.construction_scope(True):
++            with boot.construction_scope(True):
++                assert boot.defer_recovery()
++            assert queued == []
++            raise ValueError('fixture')
++    assert len(queued) == 1
++    assert boot._pending.get() is None
++    assert queued[0].run(boot.defer_recovery) is False
++
++
++def test_thread_start_failure_is_fail_closed_and_releases_slot(setup_pool, monkeypatch):
++    class BrokenThread:
++        def __init__(self, **kwargs):
++            pass
++
++        def start(self):
++            raise RuntimeError('fixture start failure')
++
++    monkeypatch.setattr(threading, 'Thread', BrokenThread)
++    boot._start(copy_context())
++    assert not boot._running
++    assert construct(lambda **kw: load_pool('openai-codex').select()) is None
++    assert not boot._running
+-- 
+2.43.0
+

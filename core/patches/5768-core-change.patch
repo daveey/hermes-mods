@@ -1,0 +1,272 @@
+From c3961a1bf1f84d6f2103ecaa7b2a856f77565592 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:54:09 +0000
+Subject: [PATCH] [daveey] Done checks: key declared boards and replicas by
+ content, one read pass per count
+
+Two things the hermes-mods half of t_28eb8d66d577eab3 needs from core
+before kanban-honest-done can stop running on every holder wake.
+
+1. kanban_annotation_parts._done_key keyed every declared file by its
+   change signature (stat, header counter, WAL-index header).
+   kanban-honest-done reads the boards and their sync replicas, and those
+   files are rewritten several times a second by bookkeeping (claims,
+   heartbeats, pull stamps): declaring them would have rerun every done
+   check on each of those writes, the same rate as declaring nothing. A
+   declared board is now left to the attention key's own content
+   revisions, and a declared sync replica is keyed by its content
+   revision (SHADOW_TABLES). A replica whose revision cannot vouch (stat
+   fallback not yet settled, unreadable) makes the key unequal to
+   everything, so the checks run. Any other declared file keeps the
+   change signature.
+
+2. attention_task_counts enters each check's optional attention_pass (a
+   context manager factory carried on the check function) around all the
+   cards of one count and closes it with the count. kanban-honest-done
+   uses it to share one connection per database across the count instead
+   of opening several per card (19% of the annotation thread's samples
+   were its ro_connect). A pass that cannot be entered is skipped; the
+   check then reads on its own. Nothing is held between counts.
+
+Tests (test_kanban_annotation_parts):
+test_a_declared_board_or_replica_reruns_the_checks_on_content_not_on_
+bookkeeping and test_a_check_that_offers_a_read_pass_gets_one_around_
+all_its_cards_and_it_is_closed. Mutants: keying replicas by stat again
+fails the first; keeping declared boards in the stat key fails the
+first; not entering the pass fails the second. 182 test files importing
+the touched modules: 3308 passed, 0 failed, 1 skipped. scripts/check
+--base origin/main: 21 checks ok.
+
+Hermes-Card: t_28eb8d66d577eab3
+---
+ hermes_cli/kanban_annotation_parts.py         | 34 ++++++++--
+ .../kanban_session_activity_attention.py      | 41 +++++++++---
+ .../test_kanban_annotation_parts.py           | 62 +++++++++++++++++++
+ 3 files changed, 125 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index dd4d129c2b..40e7be526d 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -11,7 +11,8 @@ inputs that part reads, and forces a part only when its key differs from the one
+ 
+ - ``counts``: the boards' and sync shadows' content revisions, the origin ledger, and the plain inputs below;
+ - ``links``: the boards' content revisions, the origin ledger and the plain inputs;
+-- ``attention``: the boards' content revisions and the files the done checks declared.
++- ``attention``: the boards' content revisions and the files the done checks declared (a declared board or sync
++  replica by its content revision, never its stat).
+ 
+ Plain inputs are everything else the holder watches for the scope (state.db, the hub database, config files, the
+ mutation cue), keyed by ``kanban_annotation_watch.signature`` (stat, header change counter, WAL-index header). A
+@@ -29,6 +30,7 @@ from __future__ import annotations
+ import logging
+ import os
+ import time
++from pathlib import Path
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -60,8 +62,24 @@ def _plain_key(scope: tuple[str, ...]) -> str:
+     return _signature(scope, {*dbs, *files, *(str(p) for p in discovery)} - keyed)
+ 
+ 
+-def _done_key(scope: tuple[str, ...]) -> object:
+-    """The done checks' declared files; unequal to everything while any check is undeclared."""
++def _replica_dir() -> str | None:
++    """Where this host's sync replicas live; None when that cannot be told."""
++    try:
++        from hermes_cli import kanban_sync_client as ksc
++        return str(ksc.shadow_path("x").parent)
++    except Exception:  # health: allow BLE001 -- unknown layout: declared replicas stay keyed by their file stat
++        return None
++
++
++def _done_key(scope: tuple[str, ...], wall: float) -> object:
++    """The done checks' declared inputs; unequal to everything while any check is undeclared.
++
++    A declared board is left out: the attention key carries every board's content revision. A declared sync
++    replica is keyed by its content revision as well. Both files are rewritten several times a second by
++    bookkeeping (claims, heartbeats, pull stamps) that moves no row a reader selects, and a stat key over them
++    would rerun every done check on each of those writes. A replica whose revision cannot vouch (no counter and a
++    stat not yet settled, or unreadable) makes the key unequal to everything. Any other declared file is keyed by
++    its change signature."""
+     from hermes_cli import kanban_annotation_host as host
+     from hermes_cli import kanban_session_activity as ksa
+ 
+@@ -71,7 +89,13 @@ def _done_key(scope: tuple[str, ...]) -> object:
+         if declared is None or declared[0] is not fn:
+             return object()
+         paths.update(str(p) for p in declared[1]())
+-    return (tuple(sorted(ksa._done_checks)), _signature(scope, paths))
++    paths -= {str(p) for p in ksa._board_db_paths()}
++    shadow_dir = _replica_dir()
++    replicas = sorted(p for p in paths if p.endswith(".db") and os.path.dirname(p) == shadow_dir)
++    content = tuple((p, ksa._board_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
++    if not ksa._revalidate.revalidatable(content, wall):
++        return object()
++    return (tuple(sorted(ksa._done_checks)), content, _signature(scope, paths - set(replicas)))
+ 
+ 
+ def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
+@@ -86,7 +110,7 @@ def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+     return {COUNTS: (local, shadows, ledger, plain), LINKS: (local, ledger, plain),
+-            ATTENTION: (local, _done_key(scope))}
++            ATTENTION: (local, _done_key(scope, wall))}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index 493e095a0c..d66d0e5a26 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -13,6 +13,7 @@ laptop-1 every expiry re-ran every check (~125 ms of CPU each 30 s) while no lo
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import logging
+ import math
+ import threading
+@@ -128,6 +129,22 @@ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
+     return _dispose
+ 
+ 
++def _check_passes(checks) -> contextlib.ExitStack:
++    """One read pass for every check that offers one: a check function may carry ``attention_pass``, a context
++    manager factory inside which its calls share their reads (kanban-honest-done: one connection per database
++    instead of several per card). Entered around all the cards of one count and closed with it, so nothing is held
++    between counts. A pass that cannot be entered is skipped: the check then reads on its own, as before."""
++    stack = contextlib.ExitStack()
++    for check in checks:
++        factory = getattr(check, "attention_pass", None)
++        if callable(factory):
++            try:
++                stack.enter_context(factory())
++            except Exception:  # health: allow BLE001 -- a plugin's pass is an optimisation, never a requirement
++                _log.debug("kanban done check pass unavailable", exc_info=True)
++    return stack
++
++
+ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     """``{session_id: completed cards a registered check flags}`` over the last ``activity.ATTENTION_WINDOW_S``. Cached;
+     a check that raises counts as False."""
+@@ -153,6 +170,23 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     boards = tuple(str(p) for p in paths)
+     pairs: set[tuple[str, str]] = set()
+     windows: list[float] = []
++    passes = _check_passes(checks)
++    try:
++        _flag_recent_done(activity, paths, since, checks, boards, scope, mono, forced, pairs, windows)
++    finally:
++        passes.close()
++    counts: dict[str, int] = {}
++    for sid, _tid in pairs:
++        counts[sid] = counts.get(sid, 0) + 1
++    window = min(windows, default=None)
++    activity._attention.put(scope, mono, counts, inputs, window=window)
++    activity._host_copy.note_deadline(window)
++    return counts
++
++
++def _flag_recent_done(activity, paths, since, checks, boards, scope, mono, forced, pairs, windows) -> None:
++    """Add the flagged ``(session, card)`` of every board's recent done cards to ``pairs`` and each card's window
++    boundary to ``windows``."""
+     for path in paths:
+         try:
+             recent = activity._recent_done.memoized(path, since, activity._read_recent_done, activity._revalidate.board_memo_key, scope)  # [daveey]
+@@ -172,10 +206,3 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+             key = (boards, str(path), str(card["id"]), card.get("completed_at"), card.get("title"), card.get("summary"))
+             if activity._attention.verdict(key, mono, lambda card=card: activity._run_done_checks(checks, card), force=forced):
+                 pairs.add((sid, key[2]))
+-    counts: dict[str, int] = {}
+-    for sid, _tid in pairs:
+-        counts[sid] = counts.get(sid, 0) + 1
+-    window = min(windows, default=None)
+-    activity._attention.put(scope, mono, counts, inputs, window=window)
+-    activity._host_copy.note_deadline(window)
+-    return counts
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 5563f2245c..48b0b9d916 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -6,6 +6,7 @@ back to back (51% CPU in the ``kanban-annotation`` thread).
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import contextvars
+ import threading
+ import time
+@@ -229,6 +230,67 @@ def test_deadlines_dropped_while_nobody_polled_force_the_read_when_demand_return
+     assert _published()[10] == {}, 'a verdict that moved at a declared wall time was served from the cache'
+ 
+ 
++def test_a_declared_board_or_replica_reruns_the_checks_on_content_not_on_bookkeeping(world, monkeypatch, tmp_path):
++    """kanban-honest-done declares the boards and their sync replicas. Both files are rewritten several times a
++    second by bookkeeping; keyed by stat, every such write reran every done check."""
++    shadow = tmp_path / 'sync-shadow'
++    shadow.mkdir()
++    replica = helpers._board(shadow / 'b.db', [('r1', 'running', 's9')])
++    try:
++        monkeypatch.setattr(parts, '_replica_dir', lambda: str(shadow))
++        check = ksa._done_checks['fixture']
++        monkeypatch.setattr(host, '_done_event_sources', {
++            'fixture': (check, lambda: [world.board, shadow / 'b.db', world.declared], lambda: None)})
++        for conn in (world.conn, replica):
++            conn.execute('CREATE TABLE IF NOT EXISTS bookkeeping_stamp (at REAL)')
++        _refresh()
++        _refresh()
++        before = world.checks
++        for conn in (world.conn, replica):  # each file moves; no row a reader selects does
++            conn.execute('INSERT INTO bookkeeping_stamp VALUES (1.0)')
++        _refresh()
++        assert world.checks == before, 'a bookkeeping write to a declared board or replica reran the done checks'
++        world.flagged = False
++        replica.execute("UPDATE tasks SET status = 'done' WHERE id = 'r1'")  # replica content the check may read
++        _refresh()
++        assert world.checks == before + 1
++        assert _published()[10] == {}
++    finally:
++        replica.close()
++
++
++def test_a_check_that_offers_a_read_pass_gets_one_around_all_its_cards_and_it_is_closed(world, monkeypatch):
++    seen: list[str] = []
++
++    @contextlib.contextmanager
++    def one_pass():
++        seen.append('open')
++        try:
++            yield
++        finally:
++            seen.append('close')
++
++    def check(card):
++        seen.append(f"check {card['id']}")
++        return True
++    check.attention_pass = one_pass
++    monkeypatch.setattr(ksa, '_done_checks', {'fixture': check})
++    monkeypatch.setattr(host, '_done_event_sources', {})  # undeclared: every refresh runs the checks
++    monkeypatch.setattr(ksa._recent_done, 'memoized', lambda path, since, *a: [
++        ('s1', {'id': f'd{n}', 'completed_at': time.time() - 60, 'title': 'done', 'summary': 'ok'}) for n in (1, 2)])
++    _refresh()
++    assert seen == ['open', 'check d1', 'check d2', 'close']
++    assert _published()[10] == {'s1': 2}
++
++    def broken():
++        raise RuntimeError('no pass today')
++    check.attention_pass = broken  # the pass is an optimisation: without it the check still answers
++    del seen[:]
++    _refresh()
++    assert seen == ['check d1', 'check d2']
++    assert _published()[10] == {'s1': 2}
++
++
+ def test_a_burst_of_board_writes_is_a_bounded_number_of_reads_and_the_last_write_shows(world, monkeypatch):
+     monkeypatch.setattr(host, 'SETTLE_S', (0.25, host.HOLDER_INTERVAL_S))
+     monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(world.board), str(world.plain)], []))
+-- 
+2.43.0
+

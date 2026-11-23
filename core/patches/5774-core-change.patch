@@ -1,0 +1,261 @@
+From d04b102508634eb06cee7668c5a34a6fec10114b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:03:34 +0000
+Subject: [PATCH] [daveey] BoardWatch keep: prove the schema rows are
+ unchanged, or reopen (review of b212e4dbf1)
+
+The exact-head review of b212e4dbf1 (t_34151b4d71dd65e1) found invariant I5 false. A kept
+reader answered wrong rows, with no error, where a new connection and main answer correctly.
+
+Why:
+1. A checkpoint and a same-inode raw restore fell in one probe interval. The wal-index proved
+   the checkpoint, so the reader was kept.
+2. The keep dropped the page cache and the answers but kept the parsed schema, on the claim
+   that SQLite revalidates it against the file's schema cookie.
+3. The cookie is a counter each database keeps for itself. A restored image can carry the
+   same number over another schema: tables with swapped root pages, or another column list.
+4. SQLite then sees no schema change and runs the stale parse against the new pages:
+   `SELECT v FROM t` returned u's row, or t's other column.
+5. The I5 test restored an image of the same schema, so nothing compared the kept reader
+   with a new one when the schema itself differed.
+
+Fix: the reader stores the `sqlite_schema` rows it was parsed from. Before a keep, after the
+page cache is dropped, it reads those rows again through the same connection and reopens
+unless they are equal. The rows are plain table content at page 1: reading them does not go
+through the parsed schema, so they show what the file holds now. A read error reopens. The
+stored rows are trusted only if the file still has the stat identity the reader is stored
+with once they are read (a file that moved while the reader opened is never kept).
+
+I5 now reads: on keep, the reader drops every unpinned page and its answers, and its parsed
+schema is proven equal to the file's schema rows; otherwise it reopens. What a kept reader
+still carries from before is only state SQLite re-reads with page 1 (page size, the header).
+
+Cost of the check: 0.17 ms of thread CPU per keep on the hub board's 239 schema rows,
+against 2.6 ms for the reopen it replaces (same process, same file). A schema change made
+through SQLite now costs one reopen at the next checkpoint; before this PR every checkpoint
+reopened.
+
+Proof:
+- test_restore_of_another_schema_under_the_same_cookie_reopens (swapped roots and another
+  column list, PASSIVE and TRUNCATE, both orders: 8 cases) is RED on b212e4dbf1 and GREEN
+  here. Each asserts the two schema cookies are equal and compares with a new connection.
+- test_schema_change_through_sqlite_reopens_at_the_next_checkpoint and
+  test_file_moving_while_the_reader_opens_is_never_kept: RED on b212e4dbf1, GREEN here.
+- Mutants, exact anchor: M8 (the row comparison removed) fails the 8 cases above; M9 (the
+  stat recheck at open removed) fails test_file_moving_while_the_reader_opens_is_never_kept;
+  M3 (shrink_memory removed) still fails the same-interval test.
+- The reviewer's probe (28 scenarios against the real BoardWatch): 28 SAME, 0 DIFF; it was
+  20 SAME, 8 DIFF on b212e4dbf1.
+
+Also the review's nit: the `_conns` comment now lists all seven tuple fields.
+
+Hermes-Card: t_20097f02b6abaa50
+---
+ hermes_cli/kanban_sync_board_watch.py         | 47 ++++++++--
+ .../test_kanban_sync_checkpoint_keep.py       | 91 +++++++++++++++++++
+ 2 files changed, 132 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 3a786a764e..8dc6e50b86 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -27,6 +27,18 @@ def path_gone(path: str) -> bool:
+     return False
+ 
+ 
++def schema_rows(conn: sqlite3.Connection) -> list:
++    """The ``sqlite_schema`` rows as *conn* reads them from the file now.
++
++    The rows are plain table content at page 1, read without consulting what the connection
++    parsed from them earlier, so a kept reader can be asked whether its parsed schema still
++    describes the file. The schema cookie cannot answer that: a restored image carries its own
++    counter, which can equal the live one over a different schema. Kept as rows and compared
++    with ``==``: hashing them cost four times the read (0.63 ms against 0.16 ms for the hub
++    board's 239 rows during an observation)."""
++    return conn.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid").fetchall()
++
++
+ class BoardWatch:
+     """One long-lived read-only connection per board file, for the sync loop's cheap questions.
+ 
+@@ -43,7 +55,9 @@ class BoardWatch:
+ 
+     def __init__(self) -> None:
+         self._lock = threading.Lock()
+-        self._conns: dict[str, tuple] = {}  # path -> (file identity, reader, generation, wal state)
++        # path -> (file identity, reader, generation, wal state, data_version of that wal state,
++        #          resolved path, schema rows or None)
++        self._conns: dict[str, tuple] = {}
+         self._gen = 0
+         self._answers: dict[str, dict[str, tuple[Any, Any]]] = {}  # path -> tag -> (data_version, answer)
+ 
+@@ -85,10 +99,26 @@ class BoardWatch:
+         # The checkpoint baseline is read after the stat it is stored with: whatever moves the
+         # file between the two leaves the next comparison without proof, so it reopens.
+         real = os.path.realpath(key)  # SQLite names the sidecars by the resolved path
+-        self._conns[key] = (identity, conn, gen, _wal_evidence.read(real), None, real)
++        self._conns[key] = (identity, conn, gen, _wal_evidence.read(real), None, real,
++                            self._opened_schema(conn, key, identity))
+         _sync_cpu.note_reader_open(time.thread_time() - began, reason)
+         return conn, gen
+ 
++    @staticmethod
++    def _opened_schema(conn: sqlite3.Connection, key: str, identity: tuple[int, int, int, int]) -> Optional[list]:
++        """The schema rows this new reader parsed, for a later keep to compare; None = never keep.
++
++        This first statement makes the reader parse the schema and then reads the rows. A file that
++        moved since the stat may have been swapped between those two steps, so the rows are only
++        trusted when the file still has the identity the reader is stored with. An unreadable schema
++        is left for the caller's own first read to report."""
++        try:
++            rows = schema_rows(conn)
++            st = os.stat(key)
++        except (sqlite3.Error, OSError):
++            return None
++        return rows if (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size) == identity else None
++
+     def _kept_over_checkpoint(self, key: str, ent: tuple, identity: tuple[int, int, int, int]) -> bool:
+         """Keep the reader when SQLite's wal-index proves the main file moved in a checkpoint.
+ 
+@@ -97,8 +127,11 @@ class BoardWatch:
+         Kept only for the same inode, no smaller, with proof from ``kanban_sync_wal_evidence``;
+         a raw copy or restore shows none and takes the reopen path above. The proof says a
+         checkpoint ran, not that nothing else wrote the file, so the kept reader also gives up
+-        its page cache and its answers, as a new one would: only its parsed schema survives,
+-        and SQLite checks that against the file's schema cookie on the next read."""
++        its page cache and its answers, as a new one would. Only its parsed schema survives,
++        and only while the file's ``sqlite_schema`` rows, read again here, are the ones it was
++        parsed from: a restored image with another schema under the same schema cookie reopens
++        (SQLite's own cookie check would let the stale parse answer from the wrong pages). A
++        reader stored without rows (None) compares unequal and is never kept."""
+         if ent[0][:2] != identity[:2] or identity[3] < ent[0][3]:
+             return False
+         began = time.thread_time()
+@@ -107,10 +140,12 @@ class BoardWatch:
+             return False
+         try:
+             ent[1].execute("PRAGMA shrink_memory")
++            if schema_rows(ent[1]) != ent[6]:
++                return False
+         except sqlite3.Error:
+             return False
+         self._answers.pop(key, None)
+-        self._conns[key] = (identity, ent[1], ent[2], now, ent[4], ent[5])
++        self._conns[key] = (identity, ent[1], ent[2], now, ent[4], ent[5], ent[6])
+         _sync_cpu.note_reader_keep(time.thread_time() - began)
+         return True
+ 
+@@ -122,7 +157,7 @@ class BoardWatch:
+         after ``_conn`` accepted the file as it is, so the baseline still follows its stat."""
+         ent = self._conns.get(key)
+         if ent is not None and ent[4] != version:
+-            self._conns[key] = (*ent[:3], _wal_evidence.read(ent[5]), version, ent[5])
++            self._conns[key] = (*ent[:3], _wal_evidence.read(ent[5]), version, *ent[5:])
+ 
+     def _drop(self, key: str) -> None:
+         self._answers.pop(key, None)
+diff --git a/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py b/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
+index ff20b9b569..c407034957 100644
+--- a/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
++++ b/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
+@@ -139,6 +139,97 @@ def test_restore_with_checkpoint_in_same_interval_matches_fresh_reader(board):
+     assert _runs("sync.reader_keep/checkpoint") == 1
+ 
+ 
++SWAPPED = ("CREATE TABLE u (v TEXT)", "CREATE TABLE t (v TEXT)", "CREATE TABLE pad (v TEXT)",
++           "INSERT INTO t VALUES ('img-t')", "INSERT INTO u VALUES ('img-u')")  # t and u trade root pages
++WIDER = ("CREATE TABLE t (z TEXT, v TEXT)", "CREATE TABLE u (v TEXT)", "CREATE TABLE pad (v TEXT)",
++         "INSERT INTO t VALUES ('img-z', 'img-t')")  # v is t's second column
++
++
++def _image(tmp_path, statements):
++    """The bytes of another database: its own schema, written by its own connection."""
++    other = tmp_path / "image.db"
++    conn = sqlite3.connect(other, isolation_level=None)
++    for statement in statements:
++        conn.execute(statement)
++    conn.close()
++    return other.read_bytes()
++
++
++@pytest.mark.parametrize("statements", [SWAPPED, WIDER], ids=["swapped-roots", "other-columns"])
++@pytest.mark.parametrize("mode", ["PASSIVE", "TRUNCATE"])
++@pytest.mark.parametrize("restore_first", [False, True], ids=["checkpoint-then-restore", "restore-then-checkpoint"])
++def test_restore_of_another_schema_under_the_same_cookie_reopens(board, tmp_path, statements, mode, restore_first):
++    """A checkpoint and a raw restore in one interval, the image's schema cookie equal to the
++    live one: SQLite sees no schema change, so the reader's parsed schema must not be kept."""
++    path, writer, watch = board
++    image = _image(tmp_path, statements)
++    _two_images(writer, path)
++    assert path.read_bytes()[40:44] == image[40:44]  # equal schema cookies: SQLite's check passes
++    writer.execute("INSERT INTO u VALUES ('pending')")  # frames the checkpoint will backfill
++    gen, row = watch.query(path, VALUE)
++    assert row == ("b",)
++    old = _reader(watch, path)
++    if restore_first:
++        _rewrite(path, image)
++        _checkpoint(writer, mode)
++    else:
++        _checkpoint(writer, mode)
++        _rewrite(path, image)
++    fresh = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
++    try:
++        expected = fresh.execute(VALUE).fetchall()
++    finally:
++        fresh.close()
++    assert _moved(watch, path)
++    assert watch.read(path, VALUE, lambda conn: conn.execute(VALUE).fetchall()) == (gen, expected)
++    assert _reader(watch, path) is not old
++    assert _runs("sync.reader_open.reason/changed") == 1
++    assert _runs("sync.reader_keep/checkpoint") == 0
++
++
++def test_schema_change_through_sqlite_reopens_at_the_next_checkpoint(board):
++    path, writer, watch = board
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("a",)
++    old = _reader(watch, path)
++    writer.execute("ALTER TABLE t ADD COLUMN w TEXT DEFAULT 'new'")
++    writer.execute("INSERT INTO pad VALUES (?)", (PAD,))
++    _checkpoint(writer, "PASSIVE")
++    assert _moved(watch, path)
++    assert watch.query(path, "SELECT v, w FROM t", unchanged_ok=True) == (gen, ("a", "new"))
++    assert _reader(watch, path) is not old
++    assert _runs("sync.reader_keep/checkpoint") == 0
++
++
++def test_file_moving_while_the_reader_opens_is_never_kept(board, monkeypatch):
++    """The schema rows are read after the stat the reader is stored with: a file that moved in between
++    may not be the one the schema was parsed from, so the next checkpoint reopens."""
++    from hermes_cli import kanban_sync_board_watch as module
++
++    path, writer, watch = board
++    real = module.schema_rows
++
++    def moved_under_the_read(conn):
++        rows = real(conn)
++        stat = os.stat(path)
++        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
++        return rows
++
++    monkeypatch.setattr(module, "schema_rows", moved_under_the_read)
++    writer.execute("INSERT INTO pad VALUES (?)", (PAD,))  # frames outstanding: the checkpoint below is provable
++    assert watch.query(path, VALUE, unchanged_ok=True)[1] == ("a",)
++    monkeypatch.setattr(module, "schema_rows", real)
++    assert watch._conns[str(path)][6] is None
++    old = _reader(watch, path)
++    base = evidence.read(path)
++    _checkpoint(writer, "PASSIVE")
++    assert evidence.checkpointed(base, evidence.read(path))
++    assert watch.query(path, VALUE, unchanged_ok=True)[1] == ("a",)
++    assert _reader(watch, path) is not old
++    assert watch._conns[str(path)][6] == real(_reader(watch, path))
++    assert _runs("sync.reader_keep/checkpoint") == 0
++
++
+ def test_wal_restart_with_backfilled_baseline_is_not_proof(board):
+     path, writer, watch = board
+     _checkpoint(writer, "PASSIVE")
+-- 
+2.43.0
+

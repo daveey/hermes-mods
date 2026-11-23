@@ -1,0 +1,253 @@
+From fde1ba22f6761af14d706994ab53df408674d900 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:10:25 -0800
+Subject: [PATCH] [daveey] kanban: stranded-park: bound the stale-sweep
+ deferral
+
+- A card that keeps getting events (comments) is never idle for
+  sweep_stale_triage, so waiting on that sweep deferred it forever. The wait now
+  lasts only while the park episode is younger than
+  kanban.stranded_stale_defer_seconds (21600); after that the card is escalated
+  even if stale triage has not run.
+- awaiting_stale_sweep is false for a card with any stored human_request: the
+  stale sweep skips those, so an invalid request is the stranded sweep's to
+  replace (it judges asks with card_is_open_human_ask).
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/config_defaults.py                 |  6 +--
+ hermes_cli/kanban_stranded_park.py            | 41 ++++++++++------
+ hermes_cli/kanban_triage_sweep.py             |  7 ++-
+ tests/hermes_cli/test_kanban_stranded_park.py | 49 ++++++++++++++++++-
+ 4 files changed, 81 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 6acbcbba6d..643753bd7b 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1922,10 +1922,10 @@ DEFAULT_CONFIG = {
+         "worker_log_backup_count": 1,
+         # Root/orchestration task profile after Triage decomposition ("" = default); not the decomposer LLM path.
+         "orchestrator_profile": "",
+-        # kanban_stranded_park: parked > stranded_park_seconds, no valid request/live owner -> one request per episode, swept
+-        # <= once per stranded_sweep_interval_seconds; ended local chats own until idle; desk chat "<gw>/<profile>/<session>".
++        # kanban_stranded_park: parked > stranded_park_seconds, no valid request/live owner -> one request per episode (sweep
++        # interval; ended chats own until idle; stale triage waited for <= defer; desk "<gw>/<profile>/<session>").
+         "stranded_park_seconds": 7200, "stranded_sweep_interval_seconds": 300, "stranded_owner_idle_seconds": 86400,
+-        "triage_owner_chat": "",
++        "stranded_stale_defer_seconds": 21600, "triage_owner_chat": "",
+         # Assignee when the orchestrator can't match one to an installed profile ("" = default); never None.
+         "default_assignee": "",
+         # Global concurrency cap (#33488): a positive int caps the HOST's 'running' tasks across every active board
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 135ecb9f03..48cdac5e72 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -38,6 +38,9 @@ PARK_ENTRY_EVENTS = (
+ DEFAULT_PARK_SECONDS = 7200
+ DEFAULT_OWNER_IDLE_SECONDS = 86400
+ DEFAULT_SWEEP_INTERVAL_SECONDS = 300
++# How long a park waits for the stale-triage sweep before this backstop escalates it anyway: a card that keeps
++# getting events (comments) is never idle enough for that sweep, and it only runs while the dispatcher may spawn.
++DEFAULT_STALE_DEFER_SECONDS = 21600
+ SHEPHERD_KIND = "shepherd"
+ _SPEND_KEYS = ("limit", "runs", "runs_with_usage", "cost_usd")
+ 
+@@ -54,9 +57,9 @@ def _seconds(value: Any, default: int) -> int:
+     return out if out > 0 else default
+ 
+ 
+-def settings(cfg: Optional[dict] = None) -> tuple[int, int, str, int]:
+-    """``(stranded_park_seconds, stranded_owner_idle_seconds, triage_owner_chat, stranded_sweep_interval_seconds)``
+-    from ``cfg`` (the full config dict) or the on-disk config."""
++def settings(cfg: Optional[dict] = None) -> tuple[int, int, str, int, int]:
++    """``(stranded_park_seconds, stranded_owner_idle_seconds, triage_owner_chat, stranded_sweep_interval_seconds,
++    stranded_stale_defer_seconds)`` from ``cfg`` (the full config dict) or the on-disk config."""
+     if cfg is None:
+         try:
+             from hermes_cli.config import load_config_readonly
+@@ -69,7 +72,8 @@ def settings(cfg: Optional[dict] = None) -> tuple[int, int, str, int]:
+     return (_seconds(kanban.get("stranded_park_seconds"), DEFAULT_PARK_SECONDS),
+             _seconds(kanban.get("stranded_owner_idle_seconds"), DEFAULT_OWNER_IDLE_SECONDS),
+             desk.strip() if isinstance(desk, str) else "",
+-            _seconds(kanban.get("stranded_sweep_interval_seconds"), DEFAULT_SWEEP_INTERVAL_SECONDS))
++            _seconds(kanban.get("stranded_sweep_interval_seconds"), DEFAULT_SWEEP_INTERVAL_SECONDS),
++            _seconds(kanban.get("stranded_stale_defer_seconds"), DEFAULT_STALE_DEFER_SECONDS))
+ 
+ 
+ # --- chat liveness -------------------------------------------------------------------------------------------------
+@@ -300,28 +304,30 @@ def _leased(row: dict, now: int) -> bool:
+     return bool(row.get("lease_holder")) and (expires is None or int(expires) > now)
+ 
+ 
+-def _agent_owned(conn: sqlite3.Connection, task_id: str) -> bool:
++def _agent_owned(conn: sqlite3.Connection, task_id: str, *, age: int, defer: int) -> bool:
+     """An agent route still owns the park: its open kernel recovery card (continuation_exhausted or
+     goal_unachievable), an enforced lane gate, or the stale-triage sweep that will release it. Escalating these
+     would turn agent work into a human ask (a recovery card's resume then refuses with human_gate, and the
+     requester skips a card with a human_request). A judged goal hold whose recovery card is done owns nothing:
+     ``kanban_goal_recovery.current_park`` stays true after recovery ends and that card's brief leaves the source
+-    parked, so only this escalation surfaces it."""
++    parked, so only this escalation surfaces it. The stale-triage sweep is waited for only while the park episode
++    is younger than ``defer`` (``kanban.stranded_stale_defer_seconds``): it never releases a card that keeps
++    getting events, and it only runs while the dispatcher may spawn."""
+     from hermes_cli.kanban_lanes import gate_refusal
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+     from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep
+     return bool(open_recovery_card(conn, task_id) or gate_refusal(conn, task_id)
+-                or awaiting_stale_sweep(conn, task_id))
++                or (age < defer and awaiting_stale_sweep(conn, task_id)))
+ 
+ 
+-def _excluded(conn: sqlite3.Connection, row: dict, now: int) -> bool:
++def _excluded(conn: sqlite3.Connection, row: dict, now: int, *, age: int, defer: int) -> bool:
+     from hermes_cli.kanban_open_asks import card_is_open_human_ask
+     tid, kind = row["id"], row.get("block_kind")
+     if _leased(row, now) or card_is_open_human_ask(row["status"], kind, row.get("human_request")):
+         return True
+     if kind in ("time", "lane_gate") or (kind == "dependency" and _dependency_open(conn, tid)):
+         return True
+-    return _armed_wake(conn, tid) or _agent_owned(conn, tid)
++    return _armed_wake(conn, tid) or _agent_owned(conn, tid, age=age, defer=defer)
+ 
+ 
+ def _shared_blocker(entry: Optional[dict]) -> bool:
+@@ -404,8 +410,8 @@ def _request(conn: sqlite3.Connection, row: dict, entry: Optional[dict], age: in
+     }, kind=kind)
+ 
+ 
+-def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now: int, age: int, desk,
+-              contained: bool) -> bool:
++def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now: int, age: int, defer: int,
++              desk, contained: bool) -> bool:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_ask_resolved import store_request
+     from hermes_cli.kanban_human_request import NONHUMAN_KINDS
+@@ -417,7 +423,8 @@ def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now
+         if fresh is None:
+             return False
+         fresh = dict(fresh)
+-        if fresh["status"] not in PARKED or _excluded(conn, fresh, now) or _escalated(conn, tid, entry):
++        if (fresh["status"] not in PARKED or _excluded(conn, fresh, now, age=age, defer=defer)
++                or _escalated(conn, tid, entry)):
+             return False
+         if not contained:
+             kind = fresh.get("block_kind")
+@@ -468,7 +475,7 @@ def sweep_stranded_parks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+     from hermes_cli.kanban_origin import gateway_names
+     from hermes_cli.kanban_wake_check import foreign_ids
+ 
+-    park_s, idle_s, desk_ref, interval = settings(cfg)
++    park_s, idle_s, desk_ref, interval, defer_s = settings(cfg)
+     now = int(now if now is not None else time.time())
+     if not _due(conn, now, interval):
+         return []
+@@ -481,16 +488,18 @@ def sweep_stranded_parks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+     with Liveness(now=now, idle=idle_s) as liveness:
+         for row in rows:
+             tid = row["id"]
+-            if tid in copies or _excluded(conn, row, now):
++            if tid in copies:
+                 continue
+             entry = park_entry(conn, tid)
+             start = entry["created_at"] if entry else int(row.get("created_at") or 0)
+-            if now - start < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry):
++            age = now - start
++            if (age < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry)
++                    or _excluded(conn, row, now, age=age, defer=defer_s)):
+                 continue
+             try:
+                 if live_owner(conn, tid, own=own, liveness=liveness):
+                     continue
+-                if _escalate(conn, row, entry, now=now, age=now - start, desk=desk,
++                if _escalate(conn, row, entry, now=now, age=age, defer=defer_s, desk=desk,
+                              contained=containment.held(conn, tid)):
+                     escalated.append(tid)
+             except Exception:  # health: allow BLE001 -- one card's failure must not stop the backstop for the rest
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 94f80d408f..95a35d2e8d 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -250,10 +250,13 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+ 
+ def awaiting_stale_sweep(conn: sqlite3.Connection, task_id: str) -> bool:
+     """True when :func:`sweep_stale_triage` will still release this card on its own (once idle long enough): in
+-    triage, not gate-held, re-entered since its last sweep and not capped, and not a hold the sweep skips (spend
++    triage with no stored human_request, not gate-held, re-entered since its last sweep and not capped, and not a
++    hold the sweep skips (spend
+     decision, containment, an open kernel recovery card, a judged goal hold). Such a card is agent-owned; it is not
+     stranded."""
+-    if conn.execute("SELECT 1 FROM tasks t WHERE t.id = ? AND t.status = 'triage' " + _gate_exclusion()
++    # Any stored human_request (even an invalid one) makes the sweep skip the card, so it is not the sweep's.
++    if conn.execute("SELECT 1 FROM tasks t WHERE t.id = ? AND t.status = 'triage' AND t.human_request IS NULL "
++                    + _gate_exclusion()
+                     + "AND " + _PENDING, (task_id, *_PENDING_ARGS)).fetchone() is None:
+         return False
+     from hermes_cli.kanban_containment_connections import held as containment_held
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index 39115b1802..b8be04e848 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -322,7 +322,7 @@ def test_thresholds_come_from_config(kanban_home, own_gateway):
+         assert _sweep(conn, now=_later(3), cfg=cfg) == []
+         assert _sweep(conn, now=_later(5), cfg=cfg) == [tid]
+     assert stranded.settings({}) == (stranded.DEFAULT_PARK_SECONDS, stranded.DEFAULT_OWNER_IDLE_SECONDS, "",
+-                                     stranded.DEFAULT_SWEEP_INTERVAL_SECONDS)
++                                     stranded.DEFAULT_SWEEP_INTERVAL_SECONDS, stranded.DEFAULT_STALE_DEFER_SECONDS)
+ 
+ 
+ def test_sweep_failure_never_breaks_the_tick(kanban_home, monkeypatch, caplog):
+@@ -515,3 +515,50 @@ def test_spend_pending_unblock_answer_routes_to_promote(kanban_home, own_gateway
+         assert _row(conn, tid)[0] == "triage" and _row(conn, tid)[2]
+         assert kb.promote_task(conn, tid, actor="operator", reason="rescoped")[0]
+         assert kb.get_task(conn, tid).status == "ready"
++
++
++# --- the stale-sweep deferral is bounded -----------------------------------------------------------------------------
++
++def test_busy_card_waits_for_stale_sweep_only_up_to_the_defer_bound(kanban_home, own_gateway):
++    """A re-entered, uncapped triage card that gets a comment every 30 min is never idle for sweep_stale_triage, so
++    waiting on that sweep would defer it forever: it is escalated once its park passes 6 h, not before."""
++    from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep, sweep_stale_triage
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, capped=False)
++        start = int(time.time())
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (start, tid))
++        for k in range(1, 17):  # every 30 min for 8 h
++            kb.add_comment(conn, tid, "someone", f"still looking ({k})")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE task_events SET created_at=? WHERE id=(SELECT MAX(id) FROM task_events "
++                             "WHERE task_id=?)", (start + k * 1800, tid))
++        assert awaiting_stale_sweep(conn, tid)
++        assert sweep_stale_triage(conn, now=start + 8 * HOUR) == []  # never idle an hour
++        assert _sweep(conn, now=start + 3 * HOUR, cfg={}) == []
++        assert _sweep(conn, now=start + 6 * HOUR - 60, cfg={}) == []
++        assert _sweep(conn, now=start + 6 * HOUR, cfg={}) == [tid]
++        assert card_is_open_human_ask(*_row(conn, tid))
++
++
++def test_defer_bound_comes_from_config(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, capped=False)
++        cfg = {"kanban": {"stranded_stale_defer_seconds": 4 * HOUR}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == []
++        assert _sweep(conn, now=_later(4.1), cfg=cfg) == [tid]
++
++
++def test_invalid_human_request_is_not_left_to_the_stale_sweep(kanban_home, own_gateway):
++    """sweep_stale_triage skips any card with a stored human_request, so an invalid one is not the sweep's: it is
++    escalated after the normal 2 h and replaced by a valid request."""
++    from hermes_cli.kanban_triage_sweep import awaiting_stale_sweep
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, capped=False)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps({"action": "half an ask"}), tid))
++        assert not card_is_open_human_ask(*_row(conn, tid))
++        assert not awaiting_stale_sweep(conn, tid)
++        assert _sweep(conn, now=_later(1), cfg={}) == []
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert card_is_open_human_ask(*_row(conn, tid))
+-- 
+2.43.0
+

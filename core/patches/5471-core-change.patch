@@ -1,0 +1,112 @@
+From 2484c88d9d3fb2ffa3e3a4ab1a4ff7fadd9f2041 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:12:30 +0000
+Subject: [PATCH] fix(sync): preserve repair windows across watcher checkpoint
+ refresh [daveey]
+
+Review found mtime/size pager refresh also advanced repair-input generation, forcing full scans across ordinary WAL checkpoints. Keep the existing generation for same-device/inode refresh, but discard query answers and reopen the pager. Replacement and failed-read recovery still advance generation.
+
+Proof: original autocheckpoint-enabled burst regression and explicit checkpoint generation test fail before the fix; 59 focused tests and 2081 tests across 86 sync consumer files pass after. Three exact-anchor mutants killed: generation churn, replacement reuse, and omitted pager refresh. Equal-header same-inode restore remains covered. Live Mac acceptance remains pending.
+---
+ hermes_cli/kanban_sync_board_watch.py             | 14 +++++++++++---
+ tests/hermes_cli/test_kanban_sync_empty_outbox.py | 15 +++++++++++++++
+ .../hermes_cli/test_kanban_sync_repair_window.py  |  9 ---------
+ .../test_kanban_sync_targeted_rounds.py           |  4 ++--
+ 4 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 71177a23b7..f0b942eeac 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -63,9 +63,17 @@ class BoardWatch:
+             self._drop(next(iter(self._conns)))
+         conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
+                                          check_same_thread=False)
+-        self._gen += 1
+-        self._conns[key] = (identity, conn, self._gen)
+-        return conn, self._gen
++        # Pager freshness is not a repair-input generation: checkpoints change
++        # mtime/size without replacing the database. _drop already discarded
++        # answers; keep the generation so ordinary checkpoints respect repair
++        # windows. Replacement, reset and failed-read recovery get a new one.
++        if ent is not None and ent[0][:2] == identity[:2]:
++            gen = ent[2]
++        else:
++            self._gen += 1
++            gen = self._gen
++        self._conns[key] = (identity, conn, gen)
++        return conn, gen
+ 
+     def _drop(self, key: str) -> None:
+         self._answers.pop(key, None)
+diff --git a/tests/hermes_cli/test_kanban_sync_empty_outbox.py b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+index c775803e72..d61fe4d78a 100644
+--- a/tests/hermes_cli/test_kanban_sync_empty_outbox.py
++++ b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+@@ -27,6 +27,21 @@ def board(tmp_path, monkeypatch):
+     client.reset_board_watch()
+ 
+ 
++def test_checkpoint_refreshes_answers_without_rearming_repair_generation(board):
++    path, conn = board
++    sql = "SELECT 1 FROM kanban_sync_outbox WHERE state='pending' LIMIT 1"
++    first = client._WATCH.query(path, sql, unchanged_ok=True)
++    assert first is not None and first[1] is None
++    old = client._WATCH._conns[os.path.realpath(path)][1]
++    _insert(conn)
++    assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
++    current = client._WATCH.query(path, sql, unchanged_ok=True)
++    assert current == (first[0], (1,))
++    assert client._WATCH._conns[os.path.realpath(path)][1] is not old
++    with pytest.raises(sqlite3.ProgrammingError):
++        old.execute("SELECT 1")
++
++
+ def test_empty_sample_does_not_reopen_schema(board, monkeypatch):
+     path, _conn = board
+     opened = Mock(wraps=kbc.connect_closing)
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_window.py b/tests/hermes_cli/test_kanban_sync_repair_window.py
+index 31e45edd13..ba6dd3f6bf 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_window.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_window.py
+@@ -158,15 +158,6 @@ def test_a_local_write_after_its_window_repairs_at_once(live, svc, kanban_home,
+ def test_a_burst_of_local_writes_runs_one_repair_pass_per_window(live, svc, kanban_home, monkeypatch, clock, mode):
+     """Hub 2026-11-13: writes by other processes ran 80 full passes in 601 s on a 5,428-card board."""
+     monkeypatch.setattr(win, "LOCAL_WRITE_REPAIR_MIN_S", 10.0)  # shorter than the feed window: told apart below
+-    # This case isolates WAL commits from main-file replacement/checkpoint
+-    # invalidation. Observe every opener, not only the fixture's writer.
+-    live.execute("PRAGMA wal_autocheckpoint=0")
+-    connect = kbc.connect
+-    def without_checkpoint(*args, **kwargs):
+-        conn = connect(*args, **kwargs)
+-        conn.execute("PRAGMA wal_autocheckpoint=0")
+-        return conn
+-    monkeypatch.setattr(kbc, "connect", without_checkpoint)
+     parent, _ = _settle(live, svc, kanban_home, mode)
+     clock[0] += 60
+     calls = _spy(monkeypatch, HEAVY)
+diff --git a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+index 3802762e4e..f97166d0a8 100644
+--- a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
++++ b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+@@ -117,7 +117,7 @@ def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path,
+         writer.close()
+ 
+ 
+-def test_checkpoint_reopens_watcher_generation(tmp_path):
++def test_checkpoint_preserves_watcher_generation(tmp_path):
+     import sqlite3
+     path = tmp_path / 'checkpoint.db'
+     writer = sqlite3.connect(path)
+@@ -137,7 +137,7 @@ def test_checkpoint_reopens_watcher_generation(tmp_path):
+         assert result[0] == 0
+         checkpointed = watch.query(path, 'SELECT value FROM probe', unchanged_ok=True)
+         assert checkpointed[1] == (2,)
+-        assert checkpointed[0] != first[0]  # a main-image change cannot certify old history
++        assert checkpointed[0] == first[0]  # pager refresh must not bypass repair windows
+     finally:
+         watch.reset()
+         writer.close()
+-- 
+2.43.0
+

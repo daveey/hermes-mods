@@ -1,0 +1,148 @@
+From 448ce58adcbb61fcad2ffc8fa3ca133bb8625bb1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:46:42 +0000
+Subject: [PATCH] test(kanban): exercise capsule claim races with authentic
+ source custody [daveey]
+
+---
+ .../test_kanban_capsule_admission.py          | 29 ++++++++++++++++++-
+ .../test_kanban_capsule_claim_race.py         | 15 ++++++----
+ .../test_kanban_dispatch_claim_window.py      |  8 +++--
+ 3 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_capsule_admission.py b/tests/hermes_cli/test_kanban_capsule_admission.py
+index 06b85dcc37..f121b22481 100644
+--- a/tests/hermes_cli/test_kanban_capsule_admission.py
++++ b/tests/hermes_cli/test_kanban_capsule_admission.py
+@@ -43,9 +43,11 @@ def _repo(path: Path) -> Path:
+ 
+ 
+ def _profile(home: Path, name: str, config: str) -> Path:
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++
+     path = home / "profiles" / name
+     path.mkdir(parents=True)
+-    (path / "config.yaml").write_text(config, encoding="utf-8")
++    (path / "config.yaml").write_text(config + _managed_yaml(), encoding="utf-8")
+     return path.resolve()
+ 
+ 
+@@ -76,6 +78,7 @@ class Env:
+         self.conn = kbc.connect(self.db)
+         set_dispatch_owner(self.db, OWNER)
+         self.calls: list[tuple[str, str]] = []
++        self.routes = {}
+         self.spawn = self._record  # one callable object: dispatch binds callable identity
+ 
+     @property
+@@ -85,6 +88,7 @@ class Env:
+ 
+     def _record(self, task, workspace, board=None):
+         self.calls.append((task.id, workspace))
++        self.routes[task.id] = (task.model_override, task.provider_override)
+ 
+     def register(self, **overrides):
+         args = dict(board_path=self.db, dispatch_owner=OWNER,
+@@ -348,6 +352,29 @@ def _untouched(env, tid, status="ready"):
+     assert not Path(task.workspace_path).exists()
+ 
+ 
++def _admitted_review(env):
++    """Source-linked downstream review keeps the capsule itself unclaimed/unmaterialized."""
++    from hermes_cli.kanban_review_model import implementer_models
++
++    source = kb.create_task(env.conn, title="Capsule implementation", assignee="localdev")
++    result = kbd.dispatch_once(env.conn, spawn_fn=env.spawn, dispatcher_id=OWNER, max_spawn=1)
++    assert [row[0] for row in result.spawned] == [source], result
++    source_task = kb.get_task(env.conn, source)
++    assert source_task is not None and source_task.current_run_id is not None
++    run = source_task.current_run_id
++    kb._append_event(env.conn, source, "worker_result",
++                     {"route_model": "claude-sonnet-5-5", "route_provider": "anthropic"}, run_id=run)
++    assert kb.complete_task(env.conn, source, summary="Fixture implementation complete")
++    handle = env.register()
++    with handle.create_scope():
++        tid = env.create(title="Independent capsule review", creator_task_id=source)
++    assert kb.request_review(env.conn, tid)
++    assert implementer_models(env.conn, kb.get_task(env.conn, tid)) == {"claude-sonnet-5-5"}
++    env.calls.clear()  # implementation is not part of the capsule claim under test
++    _untouched(env, tid, status="review")
++    return handle, tid
++
++
+ def test_registered_dispatch_spawns_exact_worktree(env):
+     _, tid = _admitted(env)
+     result = kbd.dispatch_once(env.conn, spawn_fn=env.spawn, dispatcher_id=OWNER)
+diff --git a/tests/hermes_cli/test_kanban_capsule_claim_race.py b/tests/hermes_cli/test_kanban_capsule_claim_race.py
+index d4f0e111f1..d489f11317 100644
+--- a/tests/hermes_cli/test_kanban_capsule_claim_race.py
++++ b/tests/hermes_cli/test_kanban_capsule_claim_race.py
+@@ -18,7 +18,7 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_gateway_drain as drain
+ from hermes_cli.kanban_capabilities import CapabilityMismatchError
+-from tests.hermes_cli.test_kanban_capsule_admission import OWNER, _admitted, _untouched
++from tests.hermes_cli.test_kanban_capsule_admission import OWNER, _admitted, _admitted_review, _untouched
+ from tests.hermes_cli import test_kanban_capsule_admission as _admission
+ 
+ env = _admission.env  # shared fixture
+@@ -90,8 +90,7 @@ def test_ready_row_mutated_between_admission_and_claim_is_refused(env, monkeypat
+ @pytest.mark.parametrize("case", ["workspace", "assignee", "closed"])
+ def test_review_row_mutated_between_admission_and_claim_is_refused(env, monkeypatch, case):
+     monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+-    handle, tid = _admitted(env)
+-    assert kb.request_review(env.conn, tid) is True  # real transition, no reviewer reassignment
++    handle, tid = _admitted_review(env)
+     mutate, code, escape = _mutations(env, handle, tid)[case]
+     fired = _mutate_before_claim(monkeypatch, mutate)
+     result = kbd.dispatch_once(env.conn, spawn_fn=env.spawn, dispatcher_id=OWNER)
+@@ -111,12 +110,18 @@ def test_unmutated_row_still_claims_through_the_recheck(env, monkeypatch):
+ 
+ def test_review_lane_dispatches_registered_capsule(env, monkeypatch):
+     monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+-    _, tid = _admitted(env)
+-    assert kb.request_review(env.conn, tid) is True
++    _, tid = _admitted_review(env)
+     result = kbd.dispatch_once(env.conn, spawn_fn=env.spawn, dispatcher_id=OWNER)
+     assert [t for t, _a, _w in result.spawned] == [tid]
+     assert result.capsule_refused == []
+     assert kb.get_task(env.conn, tid).status == "running"
++    from hermes_cli.kanban_review_model import _routable_models, implementer_models
++    task = kb.get_task(env.conn, tid)
++    model, provider = env.routes[tid]
++    assert model in _routable_models(task.assignee)
++    assert model not in implementer_models(env.conn, task)
++    assert provider in {"anthropic", "openai-codex"}
++    assert (task.model_override, task.provider_override) == (None, None)
+ 
+ 
+ def test_review_reassignment_cannot_carry_host_repo(env):
+diff --git a/tests/hermes_cli/test_kanban_dispatch_claim_window.py b/tests/hermes_cli/test_kanban_dispatch_claim_window.py
+index 669979d7f2..8a4cbda0b9 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_claim_window.py
++++ b/tests/hermes_cli/test_kanban_dispatch_claim_window.py
+@@ -28,6 +28,10 @@ def kanban_home(tmp_path, monkeypatch):
+     (home / "config.yaml").write_text(
+         "kanban:\n  dispatch_profiles: [worker-a]\n", encoding="utf-8",
+     )
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    profile = home / "profiles" / "worker-a"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text(_managed_yaml())
+     kb.init_db()
+     return home
+ 
+@@ -40,8 +44,8 @@ def test_reassign_inside_claim_window_does_not_spawn_unvetted_profile(
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="card", assignee="worker-a")
+         if lane == "review":
+-            with kb.write_txn(conn):
+-                conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
++            from tests.hermes_cli.test_kanban_model_tier import _review_source
++            _review_source(conn, tid)
+         real_guard = kbd.check_respawn_guard
+ 
+         def guard_then_reassign(c, task_id, **kw):
+-- 
+2.43.0
+

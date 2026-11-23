@@ -1,0 +1,450 @@
+From c51610af52bb011ca138a53a832b51f047b4f526 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:16:37 +0000
+Subject: [PATCH] [daveey] Session status: a retained card with an explained
+ wait is not a human ask; acknowledged exits leave failures
+
+A chat stayed red (human_ask) for card t_2c750e700cdf6fae: a decision_retained
+triage card with an open parent. Why: the stranded-park sweep wrote its generic
+"decide this parked card" human_request because _excluded only honoured an
+open parent for block_kind=dependency, not for a retained triage card. The
+status reducer then read that request as a decision. Same card: `kanban
+schedule` printed "Scheduled" with the card still triage, and a failed launch
+process stayed in `failures` after `process_manage poll acknowledge=true`.
+
+- kanban_retained_wait.explanation: a triage card whose latest run ended in
+  decision_retained is explained by an open parent, or by an awaiting card
+  (not closed) or clock recorded by a park after the retain.
+- session outcome: such a card whose ask is the sweep's generated one
+  (stranded_park_escalated newer than the retain) is a wait (`waiting_on`),
+  not a decision. A request anyone else filed, a retained card with no parent
+  or recorded wait, and a card with a done parent still show red.
+- stranded-park sweep: no longer writes an ask on an explained retained card.
+- canonical status: a failed process whose exit the agent consumed
+  (poll acknowledge / wait / log) is dropped from work and from retained
+  failures.
+- `kanban schedule` reads the card back and exits non-zero with a clear error
+  when the park was reported but the card did not reach scheduled.
+
+Tests: tests/hermes_cli/test_kanban_retained_wait_status.py (open parent
+non-red; no parent/no wait red; done parent red; recorded card/clock non-red;
+stale or closed waits red; real request red; sweep exclusion; schedule parks;
+schedule that changes nothing errors) and test_session_status_refresh.py
+(acknowledged failed process). Six of them fail on the previous code.
+---
+ hermes_cli/kanban.py                          |  16 +-
+ hermes_cli/kanban_retained_wait.py            |  88 +++++++++
+ hermes_cli/kanban_session_outcome_tasks.py    |   2 +
+ hermes_cli/kanban_stranded_park.py            |   3 +
+ hermes_state_outcome.py                       |   5 +-
+ hermes_state_session_status_snapshot.py       |  11 +-
+ .../test_kanban_retained_wait_status.py       | 167 ++++++++++++++++++
+ .../test_session_status_refresh.py            |  15 ++
+ 8 files changed, 303 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_retained_wait.py
+ create mode 100644 tests/hermes_cli/test_kanban_retained_wait_status.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 5a26ac906e..7d9e4b925a 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1495,7 +1495,21 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2], comment=comment)),
+             awaiting=awaiting, reason=reason)
+         from hermes_cli.kanban_reason_comment import human_answer_refusal
+-        return _bulk_apply(ids, op, _parked_msg(conn, "Scheduled", suffix),
++        from hermes_cli import kanban_awaiting as kaw
++        parked = op
++
++        def verified(tid):
++            """A park that reports success but leaves the card where it was is a failure, not "Scheduled"."""
++            if not parked(tid):
++                return False
++            task = kb.get_task(conn, tid)
++            if (task is not None and task.status == "scheduled") or kaw.escalated_owner(conn, tid):
++                return True
++            refused[tid] = (f"cannot schedule {tid}: the park was accepted but the card is still "
++                            f"{task.status if task else 'missing'}, so nothing changed")
++            return False
++
++        return _bulk_apply(ids, verified, _parked_msg(conn, "Scheduled", suffix),
+                            lambda tid: (refused.get(tid) or human_answer_refusal(conn, tid, "schedule")
+                                         or f"cannot schedule {tid}"), conn=conn)
+ 
+diff --git a/hermes_cli/kanban_retained_wait.py b/hermes_cli/kanban_retained_wait.py
+new file mode 100644
+index 0000000000..4c8d947f42
+--- /dev/null
++++ b/hermes_cli/kanban_retained_wait.py
+@@ -0,0 +1,88 @@
++"""A retained (scope-stopped) triage card whose wait is explained is agent work, not a human ask. [daveey]
++
++``kanban_retain`` parks a card in ``triage`` (``decision_retained``). With no live owner the stranded-park sweep
++(``kanban_stranded_park``) writes a generic "decide this parked card" ``human_request`` on it, and the session stripe
++went red (``human_ask``) although the card's open parent, or the wait recorded by its ``kanban schedule --awaiting``,
++already said what it waits for (t_2c750e700cdf6fae, the observation window).
++
++:func:`explanation` answers, for one triage card, what explains its wait: an open parent, a recorded awaiting card
++or clock, or None. It applies only to a card whose latest run ended in ``decision_retained`` and only to the
++request the sweep generated (its ``stranded_park_escalated`` event is newer than the retain); a request anyone else
++filed stays a human ask.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Optional
++
++RETAINED = "decision_retained"
++SWEEP_EVENT = "stranded_park_escalated"
++_CLOSED = ("done", "archived")
++_PARKS = ("scheduled", "continued")
++_WAITS = ("card", "clock")
++
++
++def _latest(conn: sqlite3.Connection, task_id: str, kinds: tuple[str, ...]) -> Optional[tuple[int, str, str]]:
++    marks = ",".join("?" for _ in kinds)
++    return conn.execute(f"SELECT id, kind, payload FROM task_events WHERE task_id=? AND kind IN ({marks}) "
++                        "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
++
++
++def _open_parent(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    row = conn.execute(
++        "SELECT l.parent_id FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id=? "
++        f"AND COALESCE(p.status, '') NOT IN ({','.join('?' for _ in _CLOSED)}) ORDER BY l.parent_id LIMIT 1",
++        (task_id, *_CLOSED)).fetchone()
++    return row[0] if row else None
++
++
++def _recorded_wait(conn: sqlite3.Connection, task_id: str, after: int) -> Optional[str]:
++    """The awaiting card (not yet closed) or clock a park recorded after the retain, as ``card:<id>``/``clock``."""
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind IN (?, ?) AND id > ? "
++                       "ORDER BY id DESC LIMIT 1", (task_id, *_PARKS, after)).fetchone()
++    try:
++        awaiting = (json.loads(row[0] or "{}") if row else {}).get("awaiting")
++    except ValueError:
++        return None
++    if not isinstance(awaiting, dict) or awaiting.get("kind") not in _WAITS:
++        return None
++    if awaiting["kind"] == "clock":
++        return "clock"
++    ref = str(awaiting.get("ref") or "").strip()
++    if not ref:
++        return None
++    closed = conn.execute("SELECT status FROM tasks WHERE id=?", (ref,)).fetchone()
++    return None if closed is not None and closed[0] in _CLOSED else f"card:{ref}"
++
++
++def explanation(conn: sqlite3.Connection, task_id: str, *, generated_only: bool = True) -> Optional[str]:
++    """What explains this triage card's wait (``card:<id>`` or ``clock``), or None when nothing does.
++
++    ``generated_only``: apply only while the card's ask is the sweep's generic one. A card with no such ask
++    (nothing to suppress) still gets its explanation, which the generator uses to leave it alone."""
++    retained = _latest(conn, task_id, (RETAINED, "claimed", "promoted_manual", "unblocked"))
++    if retained is None or retained[1] != RETAINED:
++        return None
++    if generated_only:
++        swept = _latest(conn, task_id, (SWEEP_EVENT,))
++        if swept is None or swept[0] < retained[0]:
++            return None
++    parent = _open_parent(conn, task_id)
++    if parent:
++        return f"card:{parent}"
++    return _recorded_wait(conn, task_id, retained[0])
++
++
++def annotate(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++    """Stamp ``retained_wait`` on the triage cards of ``found`` (id -> row) that an open parent or recorded wait
++    explains. Missing tables degrade to no annotation: the card then stays an ask."""
++    for tid, row in found.items():
++        if row.get("status") != "triage":
++            continue
++        try:
++            why = explanation(conn, tid)
++        except sqlite3.Error:
++            continue
++        if why:
++            row["retained_wait"] = why
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index 2fdd257822..6fde745f7d 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -87,6 +87,8 @@ def _read_lean_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ..
+     with closing(_open_ro(path, timeout=0.5)) as conn, _execution_transaction(conn):
+         conn.row_factory = sqlite3.Row
+         found = select_listed_local_tasks(conn, ids, statuses)
++        from hermes_cli.kanban_retained_wait import annotate as _retained_wait
++        _retained_wait(conn, found)  # a retained triage card an open parent or recorded wait explains is no ask
+         try:
+             for tid, info in _local_wait_info(conn, found).items():
+                 found[tid]["wait"] = info
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 48cdac5e72..af9b6c28f5 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -327,6 +327,9 @@ def _excluded(conn: sqlite3.Connection, row: dict, now: int, *, age: int, defer:
+         return True
+     if kind in ("time", "lane_gate") or (kind == "dependency" and _dependency_open(conn, tid)):
+         return True
++    from hermes_cli.kanban_retained_wait import explanation
++    if row["status"] == "triage" and explanation(conn, tid, generated_only=False):
++        return True  # a retained card its open parent or recorded wait explains owns no ask (t_2c750e700cdf6fae)
+     return _armed_wake(conn, tid) or _agent_owned(conn, tid, age=age, defer=defer)
+ 
+ 
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 3ae66f3427..9fcfac5099 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -368,12 +368,15 @@ def _read_card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+         status = str(card.get("status") or "")
+         wait = card.get("wait") if isinstance(card.get("wait"), dict) else {}
+         human = card_is_open_human_ask(status, card.get("block_kind"), request)
+-        if human:
++        explained = card.get("retained_wait") if isinstance(card.get("retained_wait"), str) else None
++        if human and not explained:
+             req = request if isinstance(request, dict) else {}
+             decisions.append({"id": f"card:{tid}", "question": _str(req.get("action")) or _str(card.get("title")),
+                               "choices": _choices(req.get("choices")), "card_id": tid, "state": "open"})
+             continue
+         item = {"kind": "card", "id": tid, "label": _str(card.get("title")) or tid, "state": status}
++        if explained:
++            item["waiting_on"] = explained  # retained scope stop: an open parent or recorded wait, agent work
+         eta = wait.get("until") or wait.get("eta")
+         if isinstance(eta, (int, float)) and not isinstance(eta, bool):
+             item["eta"] = float(eta)
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index 140248a9c0..f36e73066a 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -174,8 +174,11 @@ def _process_items(db: Any, tip: str) -> list[dict]:
+             state = "running"
+         else:
+             state = "succeeded" if row.get("exit_code") == 0 else "failed"
+-        items.append({"kind": "process", "id": f"process:{row['session_id']}", "state": state,
+-                      "at": float(row.get("exited_at") or 0)})
++        item = {"kind": "process", "id": f"process:{row['session_id']}", "state": state,
++                "at": float(row.get("exited_at") or 0)}
++        if state == "failed" and process_registry.is_completion_consumed(row["session_id"]):
++            item["acknowledged"] = True  # the agent read this exit (poll acknowledge / wait / log): handled
++        items.append(item)
+     return items
+ 
+ 
+@@ -258,6 +261,8 @@ def canonical_status(db: Any, tip: str, stored: Optional[dict], *, trigger: str,
+     control_asks, control_waits = read("controls", lambda: _control_items(tip), ([], []))
+     subagents, lost_before = read("subagents", lambda: _subagent_items(db, ids, since), ([], []))
+     processes = read("processes", lambda: _process_items(db, tip), [])
++    acknowledged = {p["id"] for p in processes if p.get("acknowledged")}
++    processes = [p for p in processes if p["id"] not in acknowledged]
+     goals = read("goals", lambda: _goal_items(db, ids), [])
+     # Work that failed before this generation's request is retained failure, cleared only by this
+     # generation's own successful completion; it is not this generation's linked work.
+@@ -280,6 +285,8 @@ def canonical_status(db: Any, tip: str, stored: Optional[dict], *, trigger: str,
+                          **({"coverage": "unknown", "reason": errors[name]} if name in errors
+                             else {"coverage": "complete"})}
+     base = deepcopy(prior) if prior is not None else {"status_version": STATUS_VERSION}
++    # An acknowledged failed exit is handled work: it leaves the retained failures too.
++    base["failures"] = [f for f in base.get("failures") or () if f.get("id") not in acknowledged]
+     known = {failure.get("id") for failure in base.get("failures") or ()}
+     base["failures"] = list(base.get("failures") or ()) + [
+         {"id": item["id"], "generation": max(0, generation - 1), "state": item["state"]}
+diff --git a/tests/hermes_cli/test_kanban_retained_wait_status.py b/tests/hermes_cli/test_kanban_retained_wait_status.py
+new file mode 100644
+index 0000000000..5bc6158bb6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_retained_wait_status.py
+@@ -0,0 +1,167 @@
++"""A retained (scope-stopped) triage card whose wait an open parent or recorded wait explains is agent work, not a
++human ask; an acknowledged exited process leaves ``failures``; ``kanban schedule`` never prints success for a park
++that changed nothing. [daveey]
++
++t_2c750e700cdf6fae (the observation window): a ``decision_retained`` triage card with an open parent kept a chat red
++(``human_ask``) because the stranded-park sweep had written its generic ask; ``kanban schedule`` printed "Scheduled"
++and the card stayed triage; ``process_manage poll acknowledge=true`` did not clear the failed launch from ``failures``.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_stranded_park as ksp
++from tests.hermes_cli import test_kanban_awaiting as _awaiting_tests
++from tests.hermes_cli.test_kanban_awaiting import _running
++
++kanban_home = _awaiting_tests.kanban_home
++
++# What the stranded-park sweep stores on a card with no live owner.
++SWEEP_ASK = {
++    "action": "Decide this parked card (x): release it, archive it, or re-scope it. Unblock = back to work.",
++    "why_human": "Parked 3h with no live owner and no request (decision_retained)",
++    "interaction": "approval", "scope": "This card only", "evidence": "retained"}
++
++
++@pytest.fixture
++def board(kanban_home, monkeypatch):
++    path = kb.kanban_db_path()
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [path])
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    yield path
++    ksa._reset_cache_for_tests()
++
++
++def _retained(conn, *, parent=None, swept=True, request=SWEEP_ASK) -> str:
++    tid = _running(conn)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage', session_id='s1', block_kind='needs_input', claim_lock=NULL, current_run_id=NULL, "
++                     "human_request=? WHERE id=?", (json.dumps(request), tid))
++        kb._append_event(conn, tid, "decision_retained", {"disposition": {"reason": "scope_stopped"}})
++        if swept:
++            kb._append_event(conn, tid, ksp.EVENT, {"request": True})
++        if parent:
++            conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, tid))
++    return tid
++
++
++def _items():
++    ksa._reset_cache_for_tests()
++    return so._read_card_items(["s1"])
++
++
++def test_a_retained_card_with_an_open_parent_is_agent_work_not_a_human_ask(board) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn, parent=_running(conn))
++    decisions, waits = _items()
++    assert decisions == []
++    assert [(w["id"], w["state"]) for w in waits] == [(tid, "triage")]
++
++
++def test_a_retained_card_with_no_parent_and_no_wait_still_asks(board) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn)
++    decisions, waits = _items()
++    assert [d["card_id"] for d in decisions] == [tid]
++    assert waits == []
++
++
++def test_a_retained_card_whose_parent_is_done_still_asks(board) -> None:
++    with kbc.connect_closing() as conn:
++        parent = _running(conn)
++        assert kb.complete_task(conn, parent, summary="done")
++        tid = _retained(conn, parent=parent)
++    decisions, _ = _items()
++    assert [d["card_id"] for d in decisions] == [tid]
++
++
++@pytest.mark.parametrize("awaiting", [{"kind": "clock", "why": "soak"}, "card"])
++def test_a_retained_card_with_a_recorded_awaiting_card_or_clock_is_agent_work(board, awaiting) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn)
++        if awaiting == "card":
++            awaiting = {"kind": "card", "ref": _running(conn)}
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "scheduled", {"reason": "waiting", "awaiting": awaiting})
++    decisions, waits = _items()
++    assert decisions == [] and [w["id"] for w in waits] == [tid]
++
++
++def test_a_wait_recorded_before_the_retain_or_on_a_closed_card_does_not_explain_it(board) -> None:
++    with kbc.connect_closing() as conn:
++        closed = _running(conn)
++        assert kb.complete_task(conn, closed, summary="done")
++        early = _running(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, early, "scheduled", {"awaiting": {"kind": "clock", "why": "old"}})
++        tid = _retained(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET task_id=? WHERE task_id=? AND kind='scheduled'", (tid, early))
++            kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "card", "ref": closed}})
++    decisions, _ = _items()
++    assert [d["card_id"] for d in decisions] == [tid]
++
++
++def test_a_real_request_on_a_retained_card_still_asks_with_an_open_parent(board) -> None:
++    """Not the sweep's generated ask (no ``stranded_park_escalated`` after the retain): somebody asked the operator."""
++    real = dict(SWEEP_ASK, action="Approve the restart of the hub gateway. Unblock = restart; archive = skip.",
++                why_human="Only the operator can approve a gateway restart")
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn, parent=_running(conn), swept=False, request=real)
++    decisions, _ = _items()
++    assert [d["card_id"] for d in decisions] == [tid]
++
++
++def test_the_sweep_writes_no_ask_on_a_retained_card_an_open_parent_explains(board) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn, parent=_running(conn), swept=False)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=NULL WHERE id=?", (tid,))
++        row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++        assert ksp._excluded(conn, row, 10**10, age=10**6, defer=0)
++        orphan = _retained(conn, swept=False)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=NULL WHERE id=?", (orphan,))
++        row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (orphan,)).fetchone())
++        assert not ksp._excluded(conn, row, 10**10, age=10**6, defer=0)
++
++
++def _schedule(args):
++    from hermes_cli import kanban as kcli
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    return kcli.kanban_command(parser.parse_args(["kanban", "schedule", *args]))
++
++
++def test_schedule_on_a_triage_card_parks_it(kanban_home, capsys) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn, parent=_running(conn))
++        parent = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (tid,)).fetchone()[0]
++    assert _schedule([tid, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the parent",
++                      "--awaiting", f"card:{parent}"]) == 0
++    assert f"Scheduled {tid}" in capsys.readouterr().out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
++
++
++def test_schedule_that_changes_nothing_is_an_error_not_scheduled(kanban_home, capsys, monkeypatch) -> None:
++    """The reported symptom: the park call said yes, the card stayed triage."""
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn, parent=_running(conn))
++        parent = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (tid,)).fetchone()[0]
++    monkeypatch.setattr(kb, "schedule_task", lambda *a, **k: True)
++    rc = _schedule([tid, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the parent", "--awaiting", f"card:{parent}"])
++    out = capsys.readouterr()
++    assert rc != 0
++    assert "Scheduled" not in out.out
++    assert "still triage" in out.err and "nothing changed" in out.err
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "triage"
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+index 321dd61307..4194fef352 100644
+--- a/tests/hermes_state/test_session_status_refresh.py
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -551,3 +551,18 @@ def test_linked_work_and_ask_transitions_publish_one_revision_each(db, board):
+     assert {s["generation"] for s in seen} == {seen[0]["generation"]}
+     assert all(s["coverage"]["state"] == "complete" for s in seen)
+     assert refresh(db, "manual") == seen[-1]
++
++
++def test_an_acknowledged_failed_process_is_not_listed_in_failures(db, receipts):
++    """``process_manage poll acknowledge=true`` says the exit was handled: it leaves ``failures`` and the verdict."""
++    registry = registry_module.process_registry
++    dead = ProcessSession(id="proc_dead", command="launch", cwd="/", task_id="task", parent_session_id="chat",
++                          exited=True, exit_code=1, started_at=time.time() - 5)
++    registry._finished[dead.id] = dead
++    turn(db)
++    failed = refresh(db, "manual")
++    assert [f["id"] for f in failed["failures"]] == ["process:proc_dead"]
++    assert registry.poll("proc_dead", acknowledge=True)["status"] == "exited"
++    status = refresh(db, "manual")
++    assert status["failures"] == []
++    assert_done(status)
+-- 
+2.43.0
+

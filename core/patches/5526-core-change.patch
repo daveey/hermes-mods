@@ -1,0 +1,801 @@
+From 506ee2e879b8cebfe241c718cf4536d134f60b23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:16:34 +0000
+Subject: [PATCH] perf(worker): read session context without durable write
+ receipts [daveey]
+
+Why: real dispatched Kanban whole-boot trace run18579 spends ~0.67s in
+get_session through compression.context. Read observations currently queue
+and acknowledge a durable journal entry and write an owner receipt carrying
+the session snapshot. This creates fsync and SQLite write work for a fresh
+observation and permits immutable replay of what should be current context.
+
+Add authenticated worker.sessionContext on the existing owner transport.
+Verify live producer/adoption, current serving epoch, execution generation,
+status and readable lineage; assignment and context use one read snapshot.
+Serialize worker reads behind acknowledged writes and reject pending or failed
+journals. Preserve bounded transport retries as fresh reads, never write
+fallback. Only explicit JSON-RPC -32601 negotiates the old receipt path for
+rolling upgrades. No worker process, claim, pid/birth or durable-write fences
+change. No new config or preload policy.
+
+Proof: new query suite RED (23 failed,6 passed) on base then GREEN. 47 direct
+store/RPC consumer files pass 751 tests; authority/contract/generator suites
+also pass. Ten anchored mutants killed (pending/failure ordering, downgrade,
+retry, owner epoch/status, read snapshot, wire error code). scripts/check:
+21 checks OK on staged change. Real deployed >=50-session latency acceptance
+remains outstanding; do not interpret these as whole-boot latency results.
+
+Warm pool not built: real trace has no meaningful allowed SDK-only share;
+previous audited prototype gain0.127s/62MB could not justify its bootstrap
+fidelity risks. No run_agent/model_tools/plugin/MCP/config preloading.
+---
+ agent/runtime_session_compression.py          |  29 ++-
+ agent/runtime_session_store.py                |   2 +
+ apps/shared/src/gateway-contract.generated.ts |  17 ++
+ apps/shared/src/gateway-contract.openrpc.json |  87 ++++++++
+ gateway/session_controls.py                   |   5 +
+ gateway/session_worker.py                     |   9 +-
+ hermes_state_worker_observations.py           |  22 ++
+ .../test_managed_class_fallback_sidecars.py   |   3 +-
+ tests/agent/test_runtime_session_store.py     |   3 +-
+ .../agent/test_worker_session_context_rpc.py  |  76 +++++++
+ .../test_worker_session_context_query.py      | 196 ++++++++++++++++++
+ tests/hermes_cli/serve_handler_ledger.json    |   3 +-
+ .../test_runtime_worker_context.py            |   6 +-
+ .../test_runtime_worker_history.py            |  16 +-
+ tests/worker_store_rpc.py                     |  17 ++
+ tui_gateway/contracts/canonical.py            |  13 ++
+ .../docs/developer-guide/session-storage.md   |   9 +-
+ 17 files changed, 498 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_state_worker_observations.py
+ create mode 100644 tests/agent/test_worker_session_context_rpc.py
+ create mode 100644 tests/gateway/test_worker_session_context_query.py
+ create mode 100644 tests/worker_store_rpc.py
+
+diff --git a/agent/runtime_session_compression.py b/agent/runtime_session_compression.py
+index 764ff104d3..105dcead2d 100644
+--- a/agent/runtime_session_compression.py
++++ b/agent/runtime_session_compression.py
+@@ -26,12 +26,29 @@ class RuntimeSessionCompressionMixin:
+         return result['count']
+ 
+     def get_session(self, session_id):
+-        if session_id != self.scope['session_id']:
+-            from agent.runtime_session_store import WorkerPersistenceError
+-            ids = self._apply('compression.lineage', {'target': self.scope['session_id']})['readable_ids']
+-            if session_id not in ids:
+-                raise WorkerPersistenceError('permission_denied')
+-        return self._apply('compression.context', {'target': session_id})['session']
++        from agent.runtime_session_store import (
++            WorkerPersistenceError, is_retryable_owner_error, _RETRYABLE_ATTEMPTS, _retryable_owner_errors,
++        )
++        with self.lock:
++            # A read may not overtake an unacknowledged write or hide its sticky failure.
++            if self.failure:
++                raise WorkerPersistenceError(self.failure)
++            if self.journal['pending']:
++                raise WorkerPersistenceError('pending_receipt')
++            if not getattr(self, '_legacy_session_context', False):
++                for attempt in range(_RETRYABLE_ATTEMPTS):
++                    try:
++                        return self.rpc('worker.sessionContext', **self.scope, target=session_id)['session']
++                    except WorkerPersistenceError as exc:
++                        # Only an explicit old-owner unknown-method reply permits downgrade.
++                        if exc.code != -32601:
++                            raise
++                        self._legacy_session_context = True
++                        break
++                    except _retryable_owner_errors() as exc:
++                        if not is_retryable_owner_error(exc) or attempt + 1 == _RETRYABLE_ATTEMPTS:
++                            raise
++            return self._apply('compression.context', {'target': session_id})['session']
+ 
+     def get_compression_lineage(self, session_id):
+         return self._apply('compression.lineage', {'target': session_id})['lineage']
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index b4d3b9ee1c..1e27837946 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -45,6 +45,7 @@ def apply_row_annotations(messages, annotations):
+                 message[key] = value
+ 
+ class WorkerPersistenceError(RuntimeError):
++    code = None  # JSON-RPC code, retained for explicit old-owner compatibility only
+     data = {}  # the owner's structured ``error.data`` (field, detail, expected_sequence) when it refused
+ 
+ 
+@@ -328,6 +329,7 @@ class WorkerRPC:
+                                    method, params.get('operation'), params.get('sequence'),
+                                    error.get('message'), data.get('field'), data.get('detail'))
+                 failure = WorkerPersistenceError(error.get('message', 'persistence_failed'))
++                failure.code = error.get('code')
+                 failure.data = data  # the str stays the bare wire code; recovery reads the structure
+                 raise failure
+             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 91b6a61782..74b7269a51 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -5222,6 +5222,20 @@ export interface WorkerScopeParams {
+   birth: number
+   secret: string
+ }
++export interface WorkerSessionContextParams {
++  profile_id: string
++  session_id: string
++  execution_id: string
++  generation: number
++  pid: number
++  birth: number
++  secret: string
++  epoch: number
++  target: string
++}
++export interface WorkerSessionContextResult {
++  session: Record<string, unknown>
++}
+ export interface WorkerTurnLeaseParams {
+   profile_id: string
+   session_id: string
+@@ -7404,6 +7418,8 @@ export interface CanonicalRpcMethods {
+   'worker.persist': { params: WorkerPersistParams; result: WorkerPersistResult }
+   /** Register a compute worker execution on an idle session. */
+   'worker.register': { params: WorkerRegisterParams; result: WorkerExecution }
++  /** Fresh owner-fenced lineage session context, without write receipts or sequence changes. */
++  'worker.sessionContext': { params: WorkerSessionContextParams; result: WorkerSessionContextResult }
+   /** Fresh owner-fenced exact-holder turn lease expiry; never a persistence receipt. */
+   'worker.turnLease': { params: WorkerTurnLeaseParams; result: WorkerTurnLeaseResult }
+ }
+@@ -7463,6 +7479,7 @@ export const CANONICAL_RPC_METHODS = [
+   'worker.nativeOrigin',
+   'worker.persist',
+   'worker.register',
++  'worker.sessionContext',
+   'worker.turnLease'
+ ] as const satisfies readonly CanonicalRpcMethod[]
+ 
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 9b0e192e17..39c6e12e3b 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -51306,6 +51306,75 @@
+         "title": "WorkerScopeParams",
+         "type": "object"
+       },
++      "WorkerSessionContextParams": {
++        "additionalProperties": false,
++        "properties": {
++          "profile_id": {
++            "title": "Profile Id",
++            "type": "string"
++          },
++          "session_id": {
++            "title": "Session Id",
++            "type": "string"
++          },
++          "execution_id": {
++            "title": "Execution Id",
++            "type": "string"
++          },
++          "generation": {
++            "title": "Generation",
++            "type": "integer"
++          },
++          "pid": {
++            "title": "Pid",
++            "type": "integer"
++          },
++          "birth": {
++            "title": "Birth",
++            "type": "number"
++          },
++          "secret": {
++            "title": "Secret",
++            "type": "string"
++          },
++          "epoch": {
++            "title": "Epoch",
++            "type": "integer"
++          },
++          "target": {
++            "title": "Target",
++            "type": "string"
++          }
++        },
++        "required": [
++          "profile_id",
++          "session_id",
++          "execution_id",
++          "generation",
++          "pid",
++          "birth",
++          "secret",
++          "epoch",
++          "target"
++        ],
++        "title": "WorkerSessionContextParams",
++        "type": "object"
++      },
++      "WorkerSessionContextResult": {
++        "additionalProperties": false,
++        "properties": {
++          "session": {
++            "additionalProperties": true,
++            "title": "Session",
++            "type": "object"
++          }
++        },
++        "required": [
++          "session"
++        ],
++        "title": "WorkerSessionContextResult",
++        "type": "object"
++      },
+       "WorkerTurnLeaseParams": {
+         "additionalProperties": false,
+         "properties": {
+@@ -52405,6 +52474,24 @@
+         }
+       }
+     },
++    {
++      "name": "worker.sessionContext",
++      "summary": "Fresh owner-fenced lineage session context, without write receipts or sequence changes.",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/WorkerSessionContextParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/WorkerSessionContextResult"
++        }
++      }
++    },
+     {
+       "name": "worker.turnLease",
+       "summary": "Fresh owner-fenced exact-holder turn lease expiry; never a persistence receipt.",
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 6a88cfa3f4..f6a1060be8 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -248,6 +248,7 @@ class AuthorityConnection:
+                     'worker.register': self.worker_register, 'worker.adopt': self.worker_adopt,
+                     'worker.persist': self.worker_persist, 'worker.turnLease': self.worker_turn_lease,
+                     'worker.nativeOrigin': self.worker_native_origin,
++                    'worker.sessionContext': self.worker_session_context,
+                     'setup.status': self.setup_status, 'setup.runtime_check': self.setup_runtime_check,
+                     'session.resume': self.resume, 'session.detach': self.detach,
+                     'prompt.submit': self.submit,
+@@ -484,6 +485,10 @@ class AuthorityConnection:
+         from gateway.session_worker import worker_request
+         return await worker_request(self, ref, params, operation='turnLease')
+ 
++    async def worker_session_context(self, ref, params):
++        from gateway.session_worker import worker_request
++        return await worker_request(self, ref, params, operation='sessionContext')
++
+     async def worker_native_origin(self, ref, params):
+         from gateway.session_worker import worker_request
+         return await worker_request(self, ref, params, operation='nativeOrigin')
+diff --git a/gateway/session_worker.py b/gateway/session_worker.py
+index cf32fabc77..5c7b96df61 100644
+--- a/gateway/session_worker.py
++++ b/gateway/session_worker.py
+@@ -122,7 +122,8 @@ async def _worker_request(connection, ref, params, *, operation):
+         from gateway.session_worker_child import worker_child_request
+         return await worker_child_request(connection, ref, params)
+     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'},
+-             'turnLease': {'epoch', 'holder'}, 'nativeOrigin': {'epoch', 'holder'}}[operation]
++             'turnLease': {'epoch', 'holder'}, 'nativeOrigin': {'epoch', 'holder'},
++             'sessionContext': {'epoch', 'target'}}[operation]
+     if set(params) != _SCOPE | extra:
+         raise RuntimeStoreError('invalid_params')
+     claim = _claim(connection, ref, params)
+@@ -141,6 +142,12 @@ async def _worker_request(connection, ref, params, *, operation):
+     if 'worker:adopt' not in connection.actor.capabilities:
+         raise RuntimeStoreError('permission_denied')
+     _verify(connection, ref, params, claim)
++    if operation == 'sessionContext':
++        from hermes_state_worker_observations import worker_session_context
++        if type(params['epoch']) is not int or params['epoch'] != authority.epoch:
++            raise RuntimeStoreError('stale_epoch')
++        return await asyncio.to_thread(worker_session_context, authority.db, epoch=authority.epoch,
++                                       **scope, target=params['target'])
+     if operation in ('turnLease', 'nativeOrigin'):
+         from hermes_state_runtime import worker_turn_lease
+         if type(params['epoch']) is not int or params['epoch'] != authority.epoch:
+diff --git a/hermes_state_worker_observations.py b/hermes_state_worker_observations.py
+new file mode 100644
+index 0000000000..136fc38b95
+--- /dev/null
++++ b/hermes_state_worker_observations.py
+@@ -0,0 +1,22 @@
++"""Fresh worker reads fenced by the owner, without replayable write receipts."""
++
++
++def worker_session_context(db, *, epoch, execution_id, session_id, generation, target):
++    """Read assignment and authorized lineage context at one consistent database cut."""
++    from hermes_state_runtime import RuntimeStoreError, _epoch, _worker_assignment
++    from hermes_state_worker_compression import worker_lineage_context
++    with db._read_ctx() as conn:
++        began = not conn.in_transaction
++        if began:
++            conn.execute('BEGIN')
++        try:
++            _epoch(conn, epoch)
++            row = _worker_assignment(conn, execution_id, session_id, generation)
++            if row['owner_epoch'] != epoch:
++                raise RuntimeStoreError('stale_epoch')
++            if row['status'] not in ('registered', 'running'):
++                raise RuntimeStoreError('stale_generation')
++            return worker_lineage_context(db, conn, session_id, {'target': target})
++        finally:
++            if began and conn.in_transaction:
++                conn.execute('ROLLBACK')
+diff --git a/tests/agent/test_managed_class_fallback_sidecars.py b/tests/agent/test_managed_class_fallback_sidecars.py
+index f559190512..ace2f984d1 100644
+--- a/tests/agent/test_managed_class_fallback_sidecars.py
++++ b/tests/agent/test_managed_class_fallback_sidecars.py
+@@ -32,7 +32,8 @@ def worker_store(tmp_path):
+     epoch = begin_runtime_epoch(db, instance_id="fixture")
+     scope = dict(epoch=epoch, execution_id="worker", session_id="managed-class", generation=0)
+     register_worker_execution(db, **scope, kind="compute", adoption_secret="test-secret")
+-    store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / "outbox")
++    from tests.worker_store_rpc import worker_store_rpc
++    store = RuntimeSessionStore(lambda method, **p: worker_store_rpc(db, method, **p), scope, tmp_path / "outbox")
+     try:
+         yield db, store
+     finally:
+diff --git a/tests/agent/test_runtime_session_store.py b/tests/agent/test_runtime_session_store.py
+index 408d829105..401f96c199 100644
+--- a/tests/agent/test_runtime_session_store.py
++++ b/tests/agent/test_runtime_session_store.py
+@@ -129,7 +129,8 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
+         epoch = begin_runtime_epoch(db, instance_id='fixture')
+         scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
+         register_worker_execution(db, **scope, kind='compute', adoption_secret='test-secret')
+-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        from tests.worker_store_rpc import worker_store_rpc
++        store = RuntimeSessionStore(lambda method, **p: worker_store_rpc(db, method, **p), scope, tmp_path / 'outbox')
+         try:
+             tools = [{'type': 'function', 'function': {'name': n, 'parameters': {}}}
+                      for n in ('terminal', 'tool_search', 'tool_describe', 'tool_call')]
+diff --git a/tests/agent/test_worker_session_context_rpc.py b/tests/agent/test_worker_session_context_rpc.py
+new file mode 100644
+index 0000000000..effdabf878
+--- /dev/null
++++ b/tests/agent/test_worker_session_context_rpc.py
+@@ -0,0 +1,76 @@
++"""Focused RPC error-code and retry tests for fresh session observations."""
++from contextlib import contextmanager
++
++import pytest
++
++from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, WorkerRPC
++
++
++@pytest.mark.parametrize('code', [-32601, 4001, -32603])
++def test_rpc_preserves_exact_wire_error_code(tmp_path, monkeypatch, code):
++    class Link:
++        def send(self, request_id, message):
++            pass
++
++        def receive(self, timeout):
++            return {'error': {'code': code, 'message': 'Method not found'}}
++
++    rpc = WorkerRPC(tmp_path)
++    monkeypatch.setattr(rpc, '_connection', Link)
++    with pytest.raises(WorkerPersistenceError) as caught:
++        rpc('worker.sessionContext')
++    assert caught.value.code == code
++
++
++def test_context_query_holds_scope_lock(tmp_path, monkeypatch):
++    held = []
++
++    @contextmanager
++    def lock():
++        held.append(True)
++        try:
++            yield
++        finally:
++            held.pop()
++
++    def rpc(method, **params):
++        assert held == [True]
++        assert method == 'worker.sessionContext'
++        assert params == {'session_id': 'owned', 'epoch': 7, 'target': 'owned'}
++        return {'session': {'id': 'owned'}}
++
++    store = RuntimeSessionStore(rpc, {'session_id': 'owned', 'epoch': 7}, tmp_path / 'outbox')
++    monkeypatch.setattr(store, 'lock', lock())
++    assert store.get_session('owned') == {'id': 'owned'}
++    assert held == []
++    # Restore before closing; the fixture lock is deliberately single-use.
++    import threading
++    store.lock = threading.RLock()
++    store.close()
++
++
++@pytest.mark.parametrize('kind', ['timeout', 'closed', 'connection', 'other_timeout'])
++def test_context_failed_read_never_falls_back_to_a_write(tmp_path, kind):
++    from websockets.exceptions import ConnectionClosedError
++    errors = {'timeout': TimeoutError('worker_receipt_timeout'),
++              'closed': ConnectionClosedError(None, None),
++              'connection': ConnectionError('closed'), 'other_timeout': TimeoutError('unrelated')}
++    error = errors[kind]
++    calls = []
++
++    def rpc(method, **params):
++        calls.append(method)
++        raise error
++
++    store = RuntimeSessionStore(rpc, {'session_id': 'owned'}, tmp_path / 'outbox')
++    before = store.path.read_bytes()
++    try:
++        with pytest.raises(type(error)) as caught:
++            store.get_session('owned')
++        assert caught.value is error
++        assert calls == ['worker.sessionContext'] * (1 if kind == 'other_timeout' else 2)
++        assert store.path.read_bytes() == before
++        assert store.failure is None
++        assert store.journal['pending'] == []
++    finally:
++        store.close()
+diff --git a/tests/gateway/test_worker_session_context_query.py b/tests/gateway/test_worker_session_context_query.py
+new file mode 100644
+index 0000000000..d40b76cec0
+--- /dev/null
++++ b/tests/gateway/test_worker_session_context_query.py
+@@ -0,0 +1,196 @@
++"""Session context is a fresh owner observation, not a replayable write receipt."""
++import asyncio
++import copy
++from dataclasses import replace
++
++import pytest
++
++from agent.runtime_session_store import WorkerPersistenceError
++from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
++from tests.gateway import test_worker_turn_lease_query as fixtures
++
++worker = fixtures.worker
++
++
++def test_context_read_is_fresh_without_journal_receipt_or_revision_writes(worker):
++    store, db = worker.store, worker.db
++    before = copy.deepcopy(store.journal)
++    disk = store.path.read_bytes()
++    sequence = db._read_one('SELECT last_sequence FROM worker_executions')[0]
++    receipts = db._read_one('SELECT COUNT(*) FROM worker_receipts')[0]
++    revision = db.get_session('owned')['runtime_revision']
++    assert store.get_session('owned')['title'] == db.get_session('owned')['title']
++    db._write_sql("UPDATE sessions SET title='fresh' WHERE id='owned'")
++    assert store.get_session('owned')['title'] == 'fresh'
++    assert store.journal == before and store.path.read_bytes() == disk
++    assert db._read_one('SELECT last_sequence FROM worker_executions')[0] == sequence
++    assert db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == receipts
++    assert db.get_session('owned')['runtime_revision'] == revision
++
++
++@pytest.mark.parametrize(('changes', 'reason'), [
++    ({'session_id': 'foreign'}, 'permission_denied'),
++    ({'profile_id': 'foreign'}, 'profile_mismatch'),
++    ({'generation': 1}, 'stale_generation'),
++    ({'generation': True}, 'stale_generation'),
++    ({'epoch': 0}, 'stale_epoch'),
++    ({'epoch': True}, 'stale_epoch'),
++    ({'secret': 'x' * 32}, 'permission_denied'),
++    ({'birth': -1}, 'permission_denied'),
++    ({'execution_id': 'missing'}, 'not_found'),
++    ({'target': ''}, 'invalid_params'),
++    ({'target': None}, 'invalid_params'),
++    ({'sequence': 1}, 'invalid_params'),
++])
++def test_context_rejects_invalid_scope(worker, changes, reason):
++    with pytest.raises(RuntimeStoreError, match=f'^{reason}$'):
++        worker.rpc('worker.sessionContext', **(dict(worker.store.scope, target='owned') | changes))
++
++
++@pytest.mark.parametrize(('sql', 'reason'), [
++    ('UPDATE sessions SET runtime_generation=runtime_generation+1', 'stale_generation'),
++    ('UPDATE worker_executions SET owner_epoch=0', 'stale_epoch'),
++    ("UPDATE worker_executions SET status='unknown'", 'stale_generation'),
++    ("UPDATE worker_executions SET status='terminal'", 'stale_generation'),
++])
++def test_context_refuses_invalidated_execution(worker, sql, reason):
++    assert worker.store.get_session('owned')
++    worker.db._write_sql(sql)
++    with pytest.raises(RuntimeStoreError, match=f'^{reason}$'):
++        worker.store.get_session('owned')
++
++
++def test_context_refuses_new_epoch_and_old_serving_connection(worker):
++    worker.authority.epoch -= 1
++    with pytest.raises(RuntimeStoreError, match='^stale_epoch$'):
++        worker.store.get_session('owned')
++    worker.authority.epoch += 1
++    begin_runtime_epoch(worker.db, instance_id='replacement')
++    with pytest.raises(RuntimeStoreError, match='^stale_epoch$'):
++        worker.store.get_session('owned')
++
++
++def test_context_requires_producer_capability_principal_and_liveness(worker):
++    actor = worker.connection.actor
++    worker.connection.actor = replace(actor, capabilities=frozenset({'session:control'}))
++    with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
++        worker.store.get_session('owned')
++    worker.connection.actor = replace(actor, subject='other')
++    with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
++        worker.store.get_session('owned')
++    worker.connection.actor = actor
++    worker.child.terminate()
++    worker.child.wait(timeout=5)
++    with pytest.raises(RuntimeStoreError, match='^worker_not_live$'):
++        worker.store.get_session('owned')
++
++
++def test_context_lineage_authorization_and_rotation(worker):
++    store = worker.store
++    worker.db.create_session('foreign', 'cli')
++    with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
++        store.get_session('foreign')
++    old = dict(store.scope)
++    assert store.try_acquire_compression_lock('owned', 'compressor')
++    store.publish_compression_child(parent_session_id='owned', child_session_id='child', source='cli',
++        messages=[{'role': 'assistant', 'content': 'summary'}], compression_lock_holder='compressor')
++    assert store.get_session('child')['id'] == 'child'
++    assert store.get_session('owned')['id'] == 'owned'
++    with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
++        worker.rpc('worker.sessionContext', **old, target='owned')
++
++
++@pytest.mark.parametrize('failed', [True, False])
++def test_context_cannot_overtake_failed_or_pending_writes(worker, failed):
++    store = worker.store
++    if failed:
++        store.failure = 'previous_write_failed'
++    else:
++        store.journal['pending'] = [{'sequence': 1, 'operation': 'test'}]
++    calls = []
++    store.rpc = lambda *args, **kwargs: calls.append(args)
++    with pytest.raises(WorkerPersistenceError, match='previous_write_failed' if failed else 'pending_receipt'):
++        store.get_session('owned')
++    assert calls == []
++
++
++def test_context_legacy_owner_fallback_only_for_method_not_found(worker):
++    store, original = worker.store, worker.store.rpc
++    calls = []
++
++    def legacy(method, **params):
++        calls.append(method)
++        if method == 'worker.sessionContext':
++            error = WorkerPersistenceError('Method not found')
++            error.code = -32601
++            raise error
++        return original(method, **params)
++
++    store.rpc = legacy
++    assert store.get_session('owned')
++    assert store.get_session('owned')
++    assert calls.count('worker.sessionContext') == 1
++    assert calls.count('worker.persist') == 2
++
++
++@pytest.mark.parametrize('code', [None, 4001, -32603])
++def test_context_does_not_downgrade_other_owner_errors(worker, code):
++    calls = []
++    error = WorkerPersistenceError('Method not found')
++    error.code = code
++
++    def refused(method, **params):
++        calls.append(method)
++        raise error
++
++    worker.store.rpc = refused
++    with pytest.raises(WorkerPersistenceError) as caught:
++        worker.store.get_session('owned')
++    assert caught.value is error
++    assert calls == ['worker.sessionContext']
++
++
++def test_context_transport_retry_is_a_fresh_read_not_a_write(worker):
++    store, original = worker.store, worker.store.rpc
++    before = copy.deepcopy(store.journal)
++    calls = []
++
++    def once(method, **params):
++        calls.append(method)
++        if len(calls) == 1:
++            worker.db._write_sql("UPDATE sessions SET title='after reconnect' WHERE id='owned'")
++            raise ConnectionError('owner link closed')
++        return original(method, **params)
++
++    store.rpc = once
++    assert store.get_session('owned')['title'] == 'after reconnect'
++    assert calls == ['worker.sessionContext', 'worker.sessionContext']
++    assert store.journal == before
++
++
++def test_context_single_read_transaction(worker, monkeypatch):
++    import hermes_state_runtime as runtime
++    original = runtime._worker_assignment
++    observed = []
++
++    def race(conn, *args):
++        row = original(conn, *args)
++        observed.append(conn.in_transaction)
++        worker.db._write_sql("UPDATE sessions SET title='later' WHERE id='owned'")
++        return row
++
++    first = worker.db.get_session('owned')['title']
++    monkeypatch.setattr(runtime, '_worker_assignment', race)
++    assert worker.store.get_session('owned')['title'] == first
++    assert observed == [True]
++    monkeypatch.setattr(runtime, '_worker_assignment', original)
++    assert worker.store.get_session('owned')['title'] == 'later'
++
++
++def test_context_authenticated_wire_contract(worker):
++    params = dict(worker.store.scope, target='owned')
++    request = {'jsonrpc': '2.0', 'id': 'context', 'method': 'worker.sessionContext', 'params': params}
++    reply = asyncio.run(worker.connection.dispatch(request))
++    assert reply['result']['session']['id'] == 'owned'
++    refused = asyncio.run(worker.connection.dispatch(dict(request, params=dict(params, sequence=1))))
++    assert refused['error']['data']['reason'] == 'invalid_params'
+diff --git a/tests/hermes_cli/serve_handler_ledger.json b/tests/hermes_cli/serve_handler_ledger.json
+index 27688f6dd5..3dd33f4e73 100644
+--- a/tests/hermes_cli/serve_handler_ledger.json
++++ b/tests/hermes_cli/serve_handler_ledger.json
+@@ -5,7 +5,7 @@
+    "undecided": 354
+   },
+   "rpc": {
+-   "authority": 114,
++   "authority": 115,
+    "keep-host-wide": 1,
+    "undecided": 184
+   },
+@@ -685,6 +685,7 @@
+   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "worker.nativeOrigin", "kind": "rpc", "ref": ""},
+   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "worker.persist", "kind": "rpc", "ref": ""},
+   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "worker.register", "kind": "rpc", "ref": ""},
++  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "worker.sessionContext", "kind": "rpc", "ref": ""},
+   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "worker.turnLease", "kind": "rpc", "ref": ""}
+  ]
+ }
+diff --git a/tests/hermes_state/test_runtime_worker_context.py b/tests/hermes_state/test_runtime_worker_context.py
+index 51b8cc96d5..9b2f141875 100644
+--- a/tests/hermes_state/test_runtime_worker_context.py
++++ b/tests/hermes_state/test_runtime_worker_context.py
+@@ -15,7 +15,8 @@ def test_worker_context_preserves_authority_identity_and_prompt_receipts(tmp_pat
+         epoch = begin_runtime_epoch(db, instance_id='fixture')
+         scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
+         register_worker_execution(db, **scope, kind='child', adoption_secret='test-secret')
+-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        from tests.worker_store_rpc import worker_store_rpc
++        store = RuntimeSessionStore(lambda method, **p: worker_store_rpc(db, method, **p), scope, tmp_path / 'outbox')
+         try:
+             assert store.get_session('owned')['system_prompt'] == 'prefix'
+             with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+@@ -58,7 +59,8 @@ def test_worker_constructor_restores_persisted_compressor_guards(tmp_path):
+         epoch = begin_runtime_epoch(db, instance_id='fixture')
+         scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
+         register_worker_execution(db, **scope, kind='compute', adoption_secret='test-secret')
+-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        from tests.worker_store_rpc import worker_store_rpc
++        store = RuntimeSessionStore(lambda method, **p: worker_store_rpc(db, method, **p), scope, tmp_path / 'outbox')
+         try:
+             compressor = ContextCompressor(model='fixture', config_context_length=100000, quiet_mode=True)
+             compressor.bind_session_state(store, 'owned')
+diff --git a/tests/hermes_state/test_runtime_worker_history.py b/tests/hermes_state/test_runtime_worker_history.py
+index 7112a85519..34c167781c 100644
+--- a/tests/hermes_state/test_runtime_worker_history.py
++++ b/tests/hermes_state/test_runtime_worker_history.py
+@@ -25,7 +25,13 @@ def test_history_and_lineage_keep_cache_scope_distinct_from_attribution(tmp_path
+         epoch = begin_runtime_epoch(db, instance_id='fixture')
+         scope = dict(epoch=epoch, execution_id='worker', session_id='tip', generation=0)
+         register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
+-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        def rpc(method, **params):
++            if method == 'worker.sessionContext':
++                from hermes_state_worker_observations import worker_session_context
++                return worker_session_context(db, **params)
++            return mutate_worker_execution(db, **params)
++
++        store = RuntimeSessionStore(rpc, scope, tmp_path / 'outbox')
+         try:
+             assert store.get_messages_as_conversation('tip', include_row_ids=True) == db.get_messages_as_conversation('tip', include_row_ids=True)
+             assert store.get_compression_lineage('tip') == db.get_compression_lineage('tip') == ['child', 'tip']
+@@ -54,7 +60,13 @@ def test_declared_cache_boundary_matches_local_database(tmp_path):
+         epoch = begin_runtime_epoch(db, instance_id='fixture')
+         scope = dict(epoch=epoch, execution_id='worker', session_id='next', generation=0)
+         register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
+-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        def rpc(method, **params):
++            if method == 'worker.sessionContext':
++                from hermes_state_worker_observations import worker_session_context
++                return worker_session_context(db, **params)
++            return mutate_worker_execution(db, **params)
++
++        store = RuntimeSessionStore(rpc, scope, tmp_path / 'outbox')
+         try:
+             assert store.latest_conversation_boundary('chat', 'cli') == db.latest_conversation_boundary('chat', 'cli')
+             def agent(handle):
+diff --git a/tests/worker_store_rpc.py b/tests/worker_store_rpc.py
+new file mode 100644
+index 0000000000..46fd9426fa
+--- /dev/null
++++ b/tests/worker_store_rpc.py
+@@ -0,0 +1,17 @@
++"""Direct owner operations with the worker RPC's error envelope for store fixtures."""
++from agent.runtime_session_store import WorkerPersistenceError
++from hermes_state_runtime import RuntimeStoreError, mutate_worker_execution
++from hermes_state_worker_observations import worker_session_context
++
++
++def worker_store_rpc(db, method, **params):
++    try:
++        if method == 'worker.sessionContext':
++            return worker_session_context(db, **params)
++        if method == 'worker.persist':
++            return mutate_worker_execution(db, **params)
++        raise AssertionError(f'unimplemented fixture RPC: {method}')
++    except RuntimeStoreError as exc:
++        failure = WorkerPersistenceError(str(exc))
++        failure.data = getattr(exc, 'data', {})
++        raise failure from exc
+diff --git a/tui_gateway/contracts/canonical.py b/tui_gateway/contracts/canonical.py
+index cbdbffdba0..d6ff7f6104 100644
+--- a/tui_gateway/contracts/canonical.py
++++ b/tui_gateway/contracts/canonical.py
+@@ -536,6 +536,19 @@ class WorkerTurnLeaseParams(WorkerScopeParams):
+     holder: str
+ 
+ 
++class WorkerSessionContextParams(WorkerScopeParams):
++    epoch: int
++    target: str
++
++
++class WorkerSessionContextResult(Result):
++    session: dict[str, JsonValue]
++
++
++canonical_method("worker.sessionContext", params=WorkerSessionContextParams, result=WorkerSessionContextResult,
++                 doc="Fresh owner-fenced lineage session context, without write receipts or sequence changes.")
++
++
+ class WorkerTurnLeaseResult(Result):
+     expires_at: float | None
+ 
+diff --git a/website/docs/developer-guide/session-storage.md b/website/docs/developer-guide/session-storage.md
+index 9a7589ada8..23ec2491fb 100644
+--- a/website/docs/developer-guide/session-storage.md
++++ b/website/docs/developer-guide/session-storage.md
+@@ -9,7 +9,14 @@ the TUI, Desktop (local), the API server, ACP, cron, Bot Chat and Kanban workers
+ clients that admit input to its session authority over `/api/ws` (see
+ [Gateway local sessions](./gateway-local-sessions.md)). Out-of-process managed
+ workers write through that owner (`RuntimeSessionStore` RPC), never by opening
+-`state.db` for transcript writes themselves.
++`state.db` for transcript writes themselves. Their session-context reads use
++`worker.sessionContext`: the owner verifies the live producer, epoch, execution
++generation and readable lineage in a consistent read snapshot. These fresh
++observations neither consume a write sequence nor create durable replay receipts.
++The worker serializes them after acknowledged writes and refuses a read while a
++write is pending or failed. During rolling upgrades, only an explicit unknown-method
++reply selects the older journaled `compression.context` path; authorization and
++transport failures never downgrade to it.
+ 
+ Source files: `hermes_state.py` (facade) plus the `hermes_state_*.py` siblings (schema, fts, search, compression, portability, gateway, ...)
+ 
+-- 
+2.43.0
+

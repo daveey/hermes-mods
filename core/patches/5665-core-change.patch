@@ -1,0 +1,181 @@
+From 80cee31f98d6678a5020a08edb18f437b6a53177 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:23:40 +0000
+Subject: [PATCH] fix(workers): require explicit tool credential opt-in
+ [daveey]
+
+Managed worker tool_environment previously treated implicit CLI default tools
+as credential authorization, staging unrelated profile tool API keys. Resolve
+explicit request/platform toolsets separately, then intersect their tools with
+the effective child policy. Keep platform bot/app tokens and Slack/Telegram
+credentials with the owner even when their tools are explicitly selected.
+
+Preserve route-key staging and owner-authenticated hydration. Update the
+existing web compatibility fixture to declare its opt-in rather than mocking
+only the effective catalog.
+
+Proof: original core produced 11 failures in the initial regression matrix.
+48 managed-worker/turn and credential-consumer test files: 239 passed.
+Eight source mutants killed (default fallback, implicit tools, request
+precedence, internal secret, Slack, Telegram, bot and app token exclusions).
+Full scripts/check --base origin/main passed.
+---
+ gateway/session_worker_credentials.py         | 17 +++-
+ .../gateway/test_managed_worker_env_compat.py |  4 +-
+ .../test_managed_worker_tool_credentials.py   | 97 +++++++++++++++++++
+ 3 files changed, 114 insertions(+), 4 deletions(-)
+ create mode 100644 tests/gateway/test_managed_worker_tool_credentials.py
+
+diff --git a/gateway/session_worker_credentials.py b/gateway/session_worker_credentials.py
+index bc785cac5a..1a2f645881 100644
+--- a/gateway/session_worker_credentials.py
++++ b/gateway/session_worker_credentials.py
+@@ -161,13 +161,24 @@ def hydrate_credentials(frame, rpc):
+ 
+ 
+ def tool_environment(authority, policy, config):
+-    """Only credential requirements of tools selected by the child's frozen policy."""
++    """Only explicitly selected tool credentials; platform delivery stays with the owner."""
+     from tools.registry import registry
+     from toolsets import resolve_toolset
++    from hermes_cli.toolset_validation import parse_platform_toolsets_value
+     from tools.environments.local_env_policy import _is_hermes_internal_secret
+-    selected = {name for toolset in policy.current_toolsets(config) for name in resolve_toolset(toolset)}
++    request = json.loads(policy.request_json)
++    platform = 'acp' if policy.source == 'acp' else 'cli'
++    explicit = request.get('toolsets') if 'toolsets' in request else (
++        (config.get('platform_toolsets') or {}).get(platform))
++    explicit = parse_platform_toolsets_value(explicit)
++    if not explicit:
++        return {}
++    permitted = {name for toolset in explicit for name in resolve_toolset(toolset)}
++    selected = {name for toolset in policy.current_toolsets(config) for name in resolve_toolset(toolset)} & permitted
+     names = {name for entry in registry.get_all_entries() if entry.name in selected
+-             for name in entry.requires_env if isinstance(name, str) and not _is_hermes_internal_secret(name)}
++             for name in entry.requires_env if isinstance(name, str) and not _is_hermes_internal_secret(name)
++             and not name.upper().startswith(('SLACK_', 'TELEGRAM_'))
++             and not name.upper().endswith(('_BOT_TOKEN', '_APP_TOKEN'))}
+     values = _profile_values(authority, policy)
+     return {name: values[name] for name in names if values.get(name) is not None}
+ 
+diff --git a/tests/gateway/test_managed_worker_env_compat.py b/tests/gateway/test_managed_worker_env_compat.py
+index 5138db712a..190b53f865 100644
+--- a/tests/gateway/test_managed_worker_env_compat.py
++++ b/tests/gateway/test_managed_worker_env_compat.py
+@@ -65,7 +65,9 @@ def test_declared_tool_credentials_are_owner_hydrated_not_bootstrapped(tmp_path,
+     import toolsets
+     _, (authority, ref, row, policy, scope) = assignment(tmp_path, monkeypatch)
+     values = {'FIRECRAWL_API_KEY': 'synthetic-declared-tool-key', 'GH_TOKEN': 'synthetic-undeclared-key'}
+-    policy = replace(policy, ignore_user_config=False)
++    config = json.loads(policy.config_json)
++    config['platform_toolsets'] = {'cli': ['web']}
++    policy = replace(policy, ignore_user_config=False, config_json=json.dumps(config))
+     monkeypatch.setattr('tools.environments.local._is_routed_home', lambda home: routed)
+     monkeypatch.setattr('tui_gateway.launch_profile_policy.launch_secret_scope', lambda home: values)
+     own = {'FIRECRAWL_API_KEY': 'synthetic-routed-tool-key'} if routed else {}
+diff --git a/tests/gateway/test_managed_worker_tool_credentials.py b/tests/gateway/test_managed_worker_tool_credentials.py
+new file mode 100644
+index 0000000000..d712587dfc
+--- /dev/null
++++ b/tests/gateway/test_managed_worker_tool_credentials.py
+@@ -0,0 +1,97 @@
++"""Tool credentials require explicit selection; platform delivery remains owner-only."""
++import json
++from dataclasses import replace
++from types import SimpleNamespace
++
++import pytest
++
++from tests.gateway.test_managed_turn_contract import assignment
++
++
++@pytest.mark.parametrize('selection, expected', [
++    ({}, {}),
++    ({'platform_toolsets': {'cli': ['web']}}, {'EXA_API_KEY': 'synthetic-search'}),
++    ({'platform_toolsets': {'cli': "['web']"}}, {'EXA_API_KEY': 'synthetic-search'}),
++    ({'platform_toolsets': {'acp': ['web']}}, {}),
++    ({'platform_toolsets': {'cli': []}}, {}),
++    ({'platform_toolsets': {'cli': 'invalid'}}, {}),
++    ({'platform_toolsets': {'cli': ['discord']}}, {}),
++])
++def test_worker_stages_only_explicit_tool_credentials(tmp_path, monkeypatch, selection, expected):
++    from gateway import session_worker_credentials as credentials
++    from gateway.session_managed_worker import _bootstrap
++    from gateway.session_policy import _resolve_toolsets
++    from tools.registry import registry
++
++    _, (authority, ref, row, policy, scope) = assignment(tmp_path, monkeypatch)
++    values = {'OPENAI_API_KEY': 'synthetic-route', 'EXA_API_KEY': 'synthetic-search',
++              'DISCORD_BOT_TOKEN': 'synthetic-discord'}
++    config = {'model': {'provider': 'custom', 'base_url': 'https://route.invalid'}, **selection}
++    policy = replace(policy, source='cli', config_json=json.dumps(config), request_json='{}',
++                     toolsets=tuple(_resolve_toolsets({}, config, 'cli', False)))
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: values)
++    monkeypatch.setattr(registry, 'get_all_entries', lambda: [
++        SimpleNamespace(name='web_search', requires_env=['EXA_API_KEY']),
++        SimpleNamespace(name='discord', requires_env=['DISCORD_BOT_TOKEN'])])
++    _bootstrap(authority, ref, row, policy, scope)
++    material = credentials.resolve_credentials(authority, scope)
++    assert material['environment'] == {'OPENAI_API_KEY': 'synthetic-route', **expected}
++
++
++@pytest.mark.parametrize('name', [
++    'DISCORD_BOT_TOKEN', 'SLACK_TOKEN', 'SLACK_SIGNING_SECRET', 'TELEGRAM_TOKEN',
++    'OTHER_BOT_TOKEN', 'OTHER_APP_TOKEN', 'other_bot_token', 'slack_token', 'HERMES_MODEL_API_KEY',
++])
++def test_explicit_tools_cannot_stage_platform_or_internal_secrets(tmp_path, monkeypatch, name):
++    from gateway import session_worker_credentials as credentials
++    from tools.registry import registry
++    import toolsets
++
++    policy = SimpleNamespace(request_json='{"toolsets": ["fixture"]}', source='cli',
++                             current_toolsets=lambda config: ('fixture',))
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: {name: 'synthetic-owner-only'})
++    monkeypatch.setattr(toolsets, 'resolve_toolset', lambda toolset: ['fixture'])
++    monkeypatch.setattr(registry, 'get_all_entries', lambda: [
++        SimpleNamespace(name='fixture', requires_env=[name])])
++    assert credentials.tool_environment(SimpleNamespace(profile_id=str(tmp_path)), policy, {}) == {}
++
++
++@pytest.mark.parametrize('source, launch, config, expected', [
++    ('acp', {}, {'platform_toolsets': {'acp': ['web']}}, True),
++    ('acp', {}, {'platform_toolsets': {'cli': ['web']}}, False),
++    ('gui', {}, {'platform_toolsets': {'cli': ['web']}}, True),
++    ('cli', {'toolsets': ['web']}, {}, True),
++    ('cli', {'toolsets': []}, {'platform_toolsets': {'cli': ['web']}}, False),
++    ('cli', {'toolsets': ['other']}, {'platform_toolsets': {'cli': ['web']}}, False),
++])
++def test_explicit_request_precedence_and_surface_resolution(tmp_path, monkeypatch, source, launch, config, expected):
++    from gateway import session_worker_credentials as credentials
++    from tools.registry import registry
++    import toolsets
++
++    policy = SimpleNamespace(request_json=json.dumps(launch), source=source,
++                             current_toolsets=lambda config: ('web',))
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: {'SEARCH_KEY': 'synthetic-search'})
++    monkeypatch.setattr(toolsets, 'resolve_toolset', lambda toolset: [toolset])
++    monkeypatch.setattr(registry, 'get_all_entries', lambda: [
++        SimpleNamespace(name='web', requires_env=['SEARCH_KEY'])])
++    assert credentials.tool_environment(SimpleNamespace(profile_id=str(tmp_path)), policy, config) == (
++        {'SEARCH_KEY': 'synthetic-search'} if expected else {})
++
++
++def test_explicit_selection_does_not_grant_implicitly_added_or_disabled_tools(tmp_path, monkeypatch):
++    from gateway import session_worker_credentials as credentials
++    from tools.registry import registry
++    import toolsets
++
++    policy = SimpleNamespace(request_json='{"toolsets": ["web", "disabled"]}', source='cli',
++                             current_toolsets=lambda config: ('web', 'implicit'))
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: {
++        'SEARCH_KEY': 'synthetic-search', 'IMPLICIT_KEY': 'synthetic-implicit',
++        'DISABLED_KEY': 'synthetic-disabled'})
++    monkeypatch.setattr(toolsets, 'resolve_toolset', lambda toolset: [toolset])
++    monkeypatch.setattr(registry, 'get_all_entries', lambda: [
++        SimpleNamespace(name=tool, requires_env=[key]) for tool, key in
++        [('web', 'SEARCH_KEY'), ('implicit', 'IMPLICIT_KEY'), ('disabled', 'DISABLED_KEY')]])
++    assert credentials.tool_environment(SimpleNamespace(profile_id=str(tmp_path)), policy, {}) == {
++        'SEARCH_KEY': 'synthetic-search'}
+-- 
+2.43.0
+

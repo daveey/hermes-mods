@@ -1,0 +1,82 @@
+From 0fc2f646c4a0f7e77b3ba64a664b74a6889477cc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:35:26 +0000
+Subject: [PATCH] fix(desktop): keep queued ownership precheck out of detached
+ takeover [daveey]
+
+Problem: independent review of PR4026 found a lock inversion in the new
+queued-drain transient ownership precheck.
+Why 1: admission holds history_lock, while _ensure_active_session_slot's
+default detached takeover acquires _session_resume_lock.
+Why 2: redrive_update_queues takes resume then history, so concurrent
+redrive and drain could deadlock.
+Root (happened): a custody-only precheck used the takeover-capable default.
+Root (not caught): ownership tests stubbed the helper rather than exercising
+its real registry refusal and detached takeover branch under admission.
+Recurrence: introduced in PR4026, caught before landing by independent
+review t_f0967d4e44b65e3a.
+Countermeasures: use allow_takeover=False for this precheck; the normal
+subsequent dispatch retains its existing ownership admission. Regression
+uses the real helper and asserts no resume acquisition under history.
+Proof: new test fails on c8961695 at session_lifecycle.py:454; after the fix,
+91 ownership/queue tests pass, no per-file retries. Full 21-check guard passes.
+---
+ .../test_transient_queue_lock_order.py        | 31 +++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  3 +-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tui_gateway/test_transient_queue_lock_order.py
+
+diff --git a/tests/tui_gateway/test_transient_queue_lock_order.py b/tests/tui_gateway/test_transient_queue_lock_order.py
+new file mode 100644
+index 0000000000..4dafc90cb5
+--- /dev/null
++++ b/tests/tui_gateway/test_transient_queue_lock_order.py
+@@ -0,0 +1,31 @@
++"""Queued ownership retry preserves the resume -> history lock order."""
++from hermes_cli import active_sessions, admission_fence
++from tests.tui_gateway.test_update_hold_submit_queue import _submit
++from tests.tui_gateway.test_update_hold_submit_queue import held as held  # noqa: PLC0414 -- pytest fixture re-export
++from tui_gateway import server
++
++
++def test_queue_drain_does_not_take_resume_under_history(held, monkeypatch):
++    _submit()
++    admission_fence.clear_hold(held.home)
++    held.session.pop("active_session_lease", None)
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: None)
++    monkeypatch.setattr(server, "_durable_owner_refusal", lambda session: None)
++    refusal = active_sessions.ActiveSessionRefusal("foreign slot", "SESSION_NOT_OWNED")
++    refusal.ownership_cause = "lease_foreign"
++    refusal.holder_pid = 123
++    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **kw: (None, refusal))
++
++    class ResumeLock:
++        def __enter__(self):
++            assert not held.session["history_lock"]._is_owned(), (
++                "drain must not acquire resume_lock under history_lock: "
++                "redrive_update_queues acquires them in the reverse order"
++            )
++            return self
++
++        def __exit__(self, *args):
++            return False
++
++    monkeypatch.setattr(server, "_session_resume_lock", ResumeLock())
++    server._drain_queued_prompt("review", "sid", held.session)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 45b963580a..12a99ed026 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -961,7 +961,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+             return retry_queued_prompt(rid, sid, session)
+         if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+             return False
+-        if _transient_ownership_refusal(_ensure_active_session_slot(sid, session)):
++        # Admission holds history_lock; detached takeover takes resume_lock (redrive takes them in reverse).
++        if _transient_ownership_refusal(_ensure_active_session_slot(sid, session, allow_takeover=False)):
+             from tui_gateway.admission_retry import retry_queued_prompt
+             return retry_queued_prompt(rid, sid, session)
+         queue_generation = int(session.get("_queued_prompt_generation", 0))
+-- 
+2.43.0
+

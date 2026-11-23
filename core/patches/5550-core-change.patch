@@ -1,0 +1,408 @@
+From a04d89d1679034b0cf8b2bf84925d9f41480200f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:03:40 +0000
+Subject: [PATCH] fix(sidebar): never auto-group internal or temporary
+ workspaces [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use one realpath/normcase policy for git roots, session cwds and cached
+repo discovery. Internal/temp sessions go to Home even when a linked
+worktree resolves to an external common repo. Explicit user projects stay
+honored. Normalize copied tree inputs/resolver results before ownership
+and lane grouping, so symlink spellings do not create duplicate lanes.
+Include sibling profile homes, including externally symlinked profiles.
+
+Five whys:
+1. The reported desktop chat had cwd ~/.hermes/cache/scratch.noindex and
+   recent activity, so it appeared under a scratch.noindex auto group.
+2. Tier 2 promoted every non-git cwd not rejected by is_junk_cwd.
+3. _is_session_cwd_junk excluded only HERMES_HOME itself, while
+   _is_repo_junk excluded descendants: inconsistent policy.
+4. Darwin ensure_spotlight_noindex_dir makes scratch a symlink to
+   scratch.noindex. A real-symlink fixture confirms that the old grouping
+   can split both spellings into distinct lanes/projects.
+5. There was no single never-a-workspace policy. Existing coverage omitted
+   home descendants, profile scratch, worktrees and OS temp roots.
+Related recurrence: deleted-workspace phantoms and private
+subagent scratch cwds. No sweeping or archiving is introduced.
+
+Proof:
+- RED on main 106bf5b0b97f2e3748767e2a46b6cc3e40a1f9f5:
+  bash scripts/run_tests.sh tests/tui_gateway/test_project_non_workspace.py
+  => 11 failed, 1 passed (expected auto-project/alias assertions).
+- Additional sibling-profile symlink boundary RED: 1 failed, 14 passed
+  before profile-target enumeration.
+- GREEN (HERMES_TEST_FILE_RETRIES=0): project non-workspace/tree/RPC,
+  profiles_sidebar_scope, projects_tree_prewarm, session_surface_lists,
+  subagent_session_activity, gui_sidebar_provenance: 127 passed, 0 failed.
+- Desktop placement/nested/overview sidebar oracle suites: 106 passed,
+  3 files, Node 26.12.1, isolated lockfile-installed dependency worktree.
+- scripts/hermes-python scripts/check --base origin/main: 21 checks pass.
+- Read-only laptop cwd inventory: most distinct cwds newly classify as
+  internal (mostly Hermes-owned, a few temp), across all stored sessions. This is
+  a classifier inventory, not a count of visible sidebar changes.
+
+Secondary attribution investigation:
+The supposed dormant-chat/wrong-parent premise is refuted. Active
+message_count omits retained history: read-only laptop inspection found
+tens of thousands of message rows in the reported parent, including its own
+earlier assistant delegate_task calls (independently checked). Investigation
+matched every child's goal to that parent's persisted spawn calls, with child
+creation seconds later. Parent is passed explicitly by run_agent into delegate_task, not
+selected from inherited HERMES_SESSION_ID on this path. No attribution
+repair, archive, or producer rewrite is justified for these rows.
+
+Deployment acceptance remains on the owning card: canonical ship,
+independent exact-head review, exact-head CI, and post-deploy laptop
+projects/tree readback showing no scratch/internal/temp auto group.
+
+Hermes-Card: t_ec11fd0a038b8fd3
+---
+ .../tui_gateway/test_project_non_workspace.py | 162 ++++++++++++++++++
+ tests/tui_gateway/test_projects_rpc.py        |  10 ++
+ tui_gateway/methods_projects.py               |  67 +++++---
+ tui_gateway/project_tree.py                   |   7 +-
+ 4 files changed, 222 insertions(+), 24 deletions(-)
+ create mode 100644 tests/tui_gateway/test_project_non_workspace.py
+
+diff --git a/tests/tui_gateway/test_project_non_workspace.py b/tests/tui_gateway/test_project_non_workspace.py
+new file mode 100644
+index 0000000000..da1beb9a4f
+--- /dev/null
++++ b/tests/tui_gateway/test_project_non_workspace.py
+@@ -0,0 +1,162 @@
++"""Never auto-promote internal paths; explicit project selection remains authoritative."""
++from __future__ import annotations
++
++import os
++import subprocess
++import tempfile
++
++import pytest
++
++from tui_gateway import server
++
++
++@pytest.fixture
++def workspace_paths(tmp_path, monkeypatch):
++    import hermes_constants
++
++    home = tmp_path / "user"
++    internal = home / ".hermes"
++    temp = tmp_path / "system-temp"
++    env_temp = tmp_path / "env-temp"
++    for path in (home, internal, temp, env_temp):
++        path.mkdir(parents=True, exist_ok=True)
++    monkeypatch.setenv("TMPDIR", str(env_temp))
++    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: internal)
++    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: internal)
++    return home, internal, temp, env_temp
++
++
++def _tree(monkeypatch, sessions, projects=(), discovered=()):
++    monkeypatch.setattr(server, "_project_tree_inputs", lambda *a, **k: (
++        sessions, list(projects), list(discovered), None))
++    monkeypatch.setattr(server.git_probe, "warm_roots", lambda *a: None)
++
++    def resolve(path):
++        root = os.path.realpath(path)
++        return {"repo_root": root, "worktree_root": root} if os.path.isdir(
++            os.path.join(root, ".git")) else None
++
++    monkeypatch.setattr(server.git_probe, "resolve", resolve)
++    return server._build_project_tree(
++        None, preview_limit=3, hydrate=True, session_limit=100, include_discovered=True)[0]
++
++
++@pytest.mark.parametrize("kind", [
++    "scratch", "noindex", "scratch-link", "kanban", "profile", "temp", "env-temp",
++    "posix-temp", "private-temp", "darwin-temp"])
++def test_internal_cwd_stays_home(workspace_paths, monkeypatch, kind):
++    _, internal, temp, env_temp = workspace_paths
++    paths = {
++        "scratch": internal / "cache/scratch",
++        "noindex": internal / "cache/scratch.noindex",
++        "scratch-link": internal / "cache/scratch",
++        "kanban": internal / "cache/scratch.noindex/.worktrees/t_ab12",
++        "profile": internal / "profiles/other/cache/scratch",
++        "temp": temp / "child", "env-temp": env_temp / "child",
++        "posix-temp": "/tmp/x", "private-temp": "/private/tmp/x",
++        "darwin-temp": "/var/folders/ab/cache",
++    }
++    path = paths[kind]
++    if not isinstance(path, str):
++        if kind == "scratch-link":
++            target = paths["noindex"]
++            target.mkdir(parents=True)
++            path.symlink_to(target, target_is_directory=True)
++        else:
++            path.mkdir(parents=True)
++        if kind == "kanban":
++            (path / ".git").mkdir()
++    # Synthetic cross-platform roots need not exist on this host.
++    monkeypatch.setattr(server, "_dir_exists_cached", lambda p: True)
++    row = {"id": kind, "cwd": str(path)}
++    tree = _tree(monkeypatch, [row], discovered=[{"root": str(path)}])
++    assert [p["id"] for p in tree["projects"]] == ["__no_project__"]
++    assert tree["projects"][0]["sessionIds"] == [kind]
++
++
++def test_controls_explicit_internal_and_symlink_lanes(workspace_paths, monkeypatch):
++    home, internal, _, _ = workspace_paths
++    repo, prose = home / "repo", home / "notes"
++    scratch = internal / "cache/scratch.noindex"
++    for path in (repo / ".git", prose, scratch):
++        path.mkdir(parents=True)
++    subprocess.run(["git", "init", "-q", str(repo)], check=True)
++    alias = home / "notes-link"
++    alias.symlink_to(prose, target_is_directory=True)
++    scratch_alias = scratch.with_name("scratch")
++    scratch_alias.symlink_to(scratch, target_is_directory=True)
++    rows = [{"id": str(i), "cwd": str(path)} for i, path in enumerate(
++        (repo, prose, alias, scratch, scratch_alias))]
++    explicit = {"id": "explicit", "name": "Chosen internal", "primary_path": str(scratch),
++                "folders": [{"path": str(scratch)}]}
++    tree = _tree(monkeypatch, rows, [explicit])
++    by_id = {p["id"]: p for p in tree["projects"]}
++    assert set(by_id) == {"explicit", str(repo), str(prose)}
++    assert by_id[str(repo)]["sessionIds"] == ["0"]
++    assert by_id[str(prose)]["sessionIds"] == ["1", "2"]
++    assert by_id["explicit"]["sessionIds"] == ["3", "4"]
++    assert len(by_id["explicit"]["repos"][0]["groups"]) == 1
++    assert all(len(p["repos"]) == 1 for p in by_id.values())
++
++
++def test_discovery_payload_drops_internal_cache(workspace_paths, monkeypatch):
++    from hermes_cli import projects_db
++
++    home, internal, _, _ = workspace_paths
++    repo = home / "repo"
++    repo.mkdir()
++    alias = home / "repo-link"
++    alias.symlink_to(repo, target_is_directory=True)
++    roots = [internal / "cache/scratch", repo, alias]
++    monkeypatch.setattr(projects_db, "list_discovered_repos", lambda c: [
++        {"root": str(path), "label": path.name} for path in roots])
++    result = server._discover_repos_payload(None, conn=object(), backfill=False)
++    assert [r["root"] for r in result] == [str(repo)]
++
++
++def test_profile_scope_still_excludes_sibling_profiles(workspace_paths, monkeypatch):
++    import hermes_constants
++    home, internal, temp, env_temp = workspace_paths
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: internal / "profiles/current")
++    for root in (internal, internal / "profiles/other/cache", temp, env_temp):
++        assert server._is_non_workspace_path(str(root))
++    for path in (home / ".hermes-other", temp.with_name("system-temp-other")):
++        assert not server._is_non_workspace_path(str(path))
++    assert server._is_non_workspace_path("")
++    # A sibling profile may itself be symlinked outside the default home.
++    outside = home / "profile-storage"
++    outside.mkdir()
++    profiles = internal / "profiles"
++    profiles.mkdir()
++    (profiles / "linked").symlink_to(outside, target_is_directory=True)
++    assert server._is_non_workspace_path(str(profiles / "linked/cache"))
++    assert server._is_non_workspace_path(str(outside / "cache"))
++
++
++def test_internal_worktree_cannot_escape_through_external_git_root(workspace_paths, monkeypatch):
++    home, internal, _, _ = workspace_paths
++    root, worktree = home / "repo", internal / "worktrees/t_ab12"
++    root.mkdir()
++    worktree.mkdir(parents=True)
++    monkeypatch.setattr(server, "_project_tree_inputs", lambda *a, **k: (
++        [{"id": "worker", "cwd": str(worktree), "git_repo_root": str(root)}], [],
++        [{"root": str(worktree)}], None))
++    monkeypatch.setattr(server.git_probe, "warm_roots", lambda *a: None)
++    monkeypatch.setattr(server.git_probe, "resolve", lambda p: {
++        "repo_root": str(root), "worktree_root": str(worktree)})
++    tree = server._build_project_tree(
++        None, preview_limit=3, hydrate=True, session_limit=100, include_discovered=True)[0]
++    assert [p["id"] for p in tree["projects"]] == ["__no_project__"]
++
++
++def test_discovery_ignores_internal_cwd_with_external_root(workspace_paths, monkeypatch):
++    from types import SimpleNamespace
++    home, internal, _, _ = workspace_paths
++    repo, cwd = str(home / "repo"), str(internal / "worktrees/t_ab12")
++    db = SimpleNamespace(distinct_session_cwds=lambda: [
++        {"cwd": cwd, "sessions": 7}, {"cwd": repo, "sessions": 2}])
++    monkeypatch.setattr(server.git_probe, "warm_roots", lambda *a: None)
++    monkeypatch.setattr(server.git_probe, "common_repo_root", lambda p: repo)
++    result = server._discover_repos_payload(db, backfill=False, include_cached=False)
++    assert [(r["root"], r["sessions"]) for r in result] == [(repo, 2)]
+diff --git a/tests/tui_gateway/test_projects_rpc.py b/tests/tui_gateway/test_projects_rpc.py
+index 4ae2461b9a..095c517e85 100644
+--- a/tests/tui_gateway/test_projects_rpc.py
++++ b/tests/tui_gateway/test_projects_rpc.py
+@@ -21,6 +21,16 @@ def _call(method, params=None):
+     return resp["result"]
+ 
+ 
++@pytest.fixture(autouse=True)
++def _workspace_temp_policy(tmp_path, monkeypatch):
++    """Fixture workspaces are not OS scratch: reserve a distinct disposable temp root."""
++    import tempfile
++    root = tmp_path / "os-temp"
++    root.mkdir()
++    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(root))
++    monkeypatch.setenv("TMPDIR", str(root))
++
++
+ @pytest.fixture(autouse=True)
+ def _fast_git_probe(monkeypatch):
+     """Replace real git subprocess probes with a cheap .git-directory check.
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index a35dba4c4c..f400eabf50 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -139,29 +139,38 @@ def _non_workspace_dirs() -> set[str]:
+     return {os.path.normcase(os.path.realpath(path)) for path in candidates if path}
+ 
+ 
+-def _is_repo_junk(root: str) -> bool:
+-    """A git root never auto-surfaced as a project: a non-workspace dir or anything under
+-    HERMES_HOME. User-created projects pointing there are still honored."""
+-    if not root:
++def _canonical_workspace_path(path: str) -> str:
++    """Resolve local aliases before policy checks and project/repo/lane keying."""
++    return os.path.normcase(os.path.realpath(path)) if path else ""
++
++
++def _is_non_workspace_path(path: str) -> bool:
++    """One auto-discovery policy; explicit user-created projects bypass this filter."""
++    import tempfile
++    from pathlib import Path
++    from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
++    real = _canonical_workspace_path(path)
++    if not real or real in _non_workspace_dirs():
+         return True
+-    from hermes_constants import get_hermes_home
+-    real = os.path.realpath(root)
+-    hermes_home = os.path.realpath(str(get_hermes_home()))
+-    return (
+-        os.path.normcase(real) in _non_workspace_dirs()
+-        or real == hermes_home
+-        or real.startswith(hermes_home + os.sep))
++    # Resolve sibling profile homes too: a profile can be symlinked outside the base home.
++    default_home = _get_platform_default_hermes_home()
++    profile_homes = tuple(str(p) for p in (Path(default_home) / "profiles").glob("*"))
++    roots = (str(get_hermes_home()), str(default_home), *profile_homes,
++             # no-tmp: ok — classify OS temp roots, not scratch-file creation.
++             tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", os.getenv("TMPDIR", ""))
++    return any(real == root or real.startswith(root.rstrip(os.sep) + os.sep)
++               for root in {_canonical_workspace_path(p) for p in roots if p})
++
++
++def _is_repo_junk(root: str) -> bool:
++    """Git roots use the same never-a-workspace policy as non-git session cwds."""
++    return _is_non_workspace_path(root)
+ 
+ 
+ def _is_session_cwd_junk(cwd: str) -> bool:
+-    """A non-git cwd that stays in flat Recents. A DESCENDANT of HERMES_HOME may be an
+-    intentional prose/data workspace, so only HERMES_HOME itself is excluded here."""
+-    if not cwd:
+-        return True
+-    from hermes_constants import get_hermes_home
+-    real = os.path.normcase(os.path.realpath(cwd))
+-    hermes_home = os.path.normcase(os.path.realpath(str(get_hermes_home())))
+-    return real in _non_workspace_dirs() or real == hermes_home
++    """Internal and temporary cwds stay in Home. A workspace under HERMES_HOME
++    requires an explicit user-created project, including prose/data folders."""
++    return _is_non_workspace_path(cwd)
+ 
+ 
+ def _repo_discovery_policy(raw: dict | None = None) -> dict:
+@@ -271,6 +280,7 @@ def _discover_repos_payload(
+     repos: dict[str, dict] = {}
+ 
+     def _agg(root: str) -> dict:
++        root = _canonical_workspace_path(root)
+         return repos.setdefault(
+             root, {"root": root, "label": "", "sessions": 0, "last_active": 0.0})
+     # ``db`` is None for a profile whose session store was never initialized (read-only foreign
+@@ -281,7 +291,9 @@ def _discover_repos_payload(
+     cwd_to_root: dict[str, str] = {}
+     for row in cwd_rows:
+         cwd = str(row.get("cwd") or "")
+-        root = git_probe.common_repo_root(cwd)
++        if _is_non_workspace_path(cwd):
++            continue
++        root = _canonical_workspace_path(git_probe.common_repo_root(cwd))
+         if not root:
+             continue
+         cwd_to_root[cwd] = root
+@@ -304,7 +316,7 @@ def _discover_repos_payload(
+             from hermes_cli import projects_db as pdb
+             with (contextlib.nullcontext(conn) if conn is not None else pdb.connect_closing()) as c:
+                 for entry in pdb.list_discovered_repos(c):
+-                    root = str(entry.get("root") or "")
++                    root = _canonical_workspace_path(str(entry.get("root") or ""))
+                     if root and not _is_repo_junk(root):
+                         agg = _agg(root)
+                         if entry.get("label"):
+@@ -437,12 +449,23 @@ def _build_project_tree(
+     _DIR_EXISTS_CACHE.clear()
+     sessions, projects, discovered, active_id = _project_tree_inputs(
+         db, session_limit, include_discovered=include_discovered)
++    # Normalize copies, not persisted rows: aliases must share ownership and lane identities.
++    def paths(row: dict, *keys: str) -> dict:
++        return {**row, **{k: _canonical_workspace_path(str(row.get(k) or "")) for k in keys}}
++    sessions = [paths(s, "cwd", "git_repo_root") for s in sessions]
++    projects = [{**p, "folders": [paths(f, "path") for f in p.get("folders") or []]}
++                for p in projects]
++    discovered = [paths(r, "root") for r in discovered]
++
++    def resolve(path: str):
++        info = git_probe.resolve(path)
++        return paths(info, "repo_root", "worktree_root") if info else None
+     # build_tree also resolves declared project folders and discovered roots — warm them too.
+     git_probe.warm_roots(
+         [str(f.get("path") or "") for p in projects for f in (p.get("folders") or [])]
+         + [str(r.get("root") or "") for r in discovered])
+     tree = project_tree.build_tree(
+-        projects, sessions, discovered, git_probe.resolve, preview_limit=preview_limit,
++        projects, sessions, discovered, resolve, preview_limit=preview_limit,
+         hydrate=hydrate, is_junk_root=_is_repo_junk, is_junk_cwd=_is_session_cwd_junk,
+         exists=_dir_exists_cached)
+     return tree, active_id
+diff --git a/tui_gateway/project_tree.py b/tui_gateway/project_tree.py
+index 22737a320b..3a822f9e87 100644
+--- a/tui_gateway/project_tree.py
++++ b/tui_gateway/project_tree.py
+@@ -377,6 +377,9 @@ def _auto_buckets(
+     by_auto_root: dict[str, dict] = {}
+     homeless: list[dict] = []
+     for session in unowned:
++        if junk_cwd(_field(session, "cwd")) and _field(session, "cwd"):
++            homeless.append(session)
++            continue
+         root = _session_repo_root(session, resolve)
+         if root:
+             # Stricter repo policy for real git roots; a root gone from disk is stale and
+@@ -418,7 +421,7 @@ def build_tree(
+     """Build the authoritative project tree -> ``{"projects", "scoped_session_ids"}``.
+ 
+     ``is_junk_root`` flags git roots that must never become an AUTO project; ``is_junk_cwd``
+-    is the narrower non-git policy (explicit projects are honored regardless); ``exists``
++    flags session cwds that cannot create auto projects (explicit projects are honored regardless); ``exists``
+     keeps a DELETED workspace from becoming a phantom AUTO project (omit on remote backends).
+     ``hydrate`` False empties lane ``sessions`` but keeps counts + ``previewSessions``.
+     """
+@@ -476,7 +479,7 @@ def build_tree(
+     # Tier 3: discovered repos with no loaded sessions, folded to their common root.
+     for repo in discovered_repos or []:
+         raw_root = _field(repo, "root")
+-        if not raw_root:
++        if not raw_root or _junk(raw_root):
+             continue
+         info = resolve(raw_root) if resolve else None
+         root = (info or {}).get("repo_root") or raw_root
+-- 
+2.43.0
+

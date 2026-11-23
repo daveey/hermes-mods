@@ -1,0 +1,438 @@
+From d75c106ca021eb803d765b6248774ada8a6905e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:57:40 +0000
+Subject: [PATCH] fix(desktop): hold archive marker custody across peer windows
+ [daveey]
+
+Address independent review of PR4059 at d5614d916e83845bb2414e4afaef76bf9e9a35de.
+The win query parameter identifies a window type, not unique ownership. A
+fresh peer or second secondary renderer could report a still-live archive
+cancelled, delete its restart marker, then leave that archive running.
+
+Hold an origin-wide Web Lock for each queued attempt before persisting its
+marker. Drop reporters acquire the same lock non-blockingly, so they only
+retire orphan markers after Chromium releases a destroyed renderer's locks.
+No safety verdict or mutation is replayed; restart still uses the explicit
+visible drop-note branch. Disposal releases custody, including storage
+failure, and late acquisition cannot persist an already disposed intent.
+Unsupported custody fails visibly instead of pretending persistence works.
+
+Proof: three initial cross-window/orphan tests RED on reviewed head.
+Additional real-preflight six-minute outage plus peer mount RED there too.
+All 42 action test files / 369 cases GREEN with the fix; renderer tsc and
+applicable eslint pass. Test setup supplies the dependency-free nonblocking
+Web Locks subset missing from jsdom. This is simulated renderer coverage,
+not laptop native/live acceptance. Live gate remains OPEN/UNPROVEN.
+
+The PR's five-whys and transport investigation remain unchanged: exact
+Mac-to-hub transport cause UNDETERMINED, no transport fix in this change.
+Hermes-Card: t_d0a526d6697c2a0c
+---
+ .../archive-durable-queue.test.ts             |   6 +-
+ .../archive-queue-lifetime.test.ts            |  17 ++-
+ .../archive-queue-lifetime.ts                 |  45 ++++---
+ .../use-session-actions/archive-queue-lock.ts |  19 +++
+ .../archive-queue-peer.test.ts                | 112 ++++++++++++++++++
+ .../archive-reconnect.test.ts                 |   6 +-
+ .../hooks/use-session-actions/index.ts        |   2 +-
+ .../reconnect-archive-preflight.ts            |   2 +-
+ apps/desktop/src/test/web-locks.ts            |  20 ++++
+ apps/desktop/vitest.setup.ts                  |   5 +
+ 10 files changed, 206 insertions(+), 28 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lock.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-peer.test.ts
+ create mode 100644 apps/desktop/src/test/web-locks.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-durable-queue.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-durable-queue.test.ts
+index 0d6c378bdc..3154fec227 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-durable-queue.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-durable-queue.test.ts
+@@ -114,13 +114,13 @@ it.each(['button', 'dismiss'])('cancels through %s, restores immediately and ign
+   expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index) ?? '').filter(k => k.startsWith('hermes:archive-preflight-queue:'))).toHaveLength(0)
+ })
+ 
+-it('reports restart loss from durable storage even without sessionStorage, and leaves other windows alone', () => {
++it('reports orphaned restart markers across window types without sessionStorage', async () => {
+   localStorage.setItem('hermes:archive-preflight-queue:main:old-attempt', row.id)
+   localStorage.setItem('hermes:archive-preflight-queue:other-window:active-attempt', 'other')
+-  reportDroppedArchiveQueues()
++  await reportDroppedArchiveQueues()
+   expect($notifications.get().find(n => n.id === 'archive-queue-reload')?.message).toBe(en.desktop.archiveQueueDropped)
+   expect(localStorage.getItem('hermes:archive-preflight-queue:main:old-attempt')).toBeNull()
+-  expect(localStorage.getItem('hermes:archive-preflight-queue:other-window:active-attempt')).toBe('other')
++  expect(localStorage.getItem('hermes:archive-preflight-queue:other-window:active-attempt')).toBeNull()
+ })
+ 
+ it('keeps non-transport unknown as a warning confirmation, never automatic permission', async () => {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.test.ts
+index 5fdebbf447..5ee5316a9c 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.test.ts
+@@ -2,9 +2,13 @@ import { afterEach, expect, it, vi } from 'vitest'
+ 
+ import { en } from '@/i18n/en'
+ import { $notifications } from '@/store/notifications'
++import { archiveQueueLocksFixture } from '@/test/web-locks'
+ 
+ import { archiveQueueLifetime } from './archive-queue-lifetime'
+ 
++const queueLocks = archiveQueueLocksFixture()
++Object.defineProperty(navigator, 'locks', { configurable: true, value: queueLocks.locks })
++
+ afterEach(() => {
+   localStorage.clear()
+   sessionStorage.clear()
+@@ -14,19 +18,20 @@ afterEach(() => {
+ 
+ it('shows a restart drop note from the marker written by a real queue, with a new renderer module and no sessionStorage', async () => {
+   const queue = archiveQueueLifetime('renderer-before-restart', 'restart-chat', en.desktop)
+-  queue.enqueue()
+-  expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index) ?? '')).toContain('hermes:archive-preflight-queue:main:renderer-before-restart')
++  await queue.enqueue()
++  expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index) ?? '')).toContain('hermes:archive-preflight-queue:renderer-before-restart')
+   sessionStorage.clear()
++  queueLocks.held.clear() // Renderer destruction releases Chromium's locks.
+   // A reload/app restart loses module memory, but not the durable marker.
+   vi.resetModules()
+   const { reportDroppedArchiveQueues } = await import('./archive-queue-lifetime')
+   const { $notifications: freshNotifications } = await import('@/store/notifications')
+-  reportDroppedArchiveQueues()
++  await reportDroppedArchiveQueues()
+   expect(freshNotifications.get().find(n => n.id === 'archive-queue-reload')).toMatchObject({
+     kind: 'warning', persistent: true, message: en.desktop.archiveQueueDropped
+   })
+-  expect(localStorage.getItem('hermes:archive-preflight-queue:main:renderer-before-restart')).toBeNull()
+-  reportDroppedArchiveQueues()
++  expect(localStorage.getItem('hermes:archive-preflight-queue:renderer-before-restart')).toBeNull()
++  await reportDroppedArchiveQueues()
+   expect(freshNotifications.get().filter(n => n.id === 'archive-queue-reload')).toHaveLength(1)
+   queue.dispose()
+   freshNotifications.set([])
+@@ -35,7 +40,7 @@ it('shows a restart drop note from the marker written by a real queue, with a ne
+ it('cancels a queued backoff immediately, without leaving its timer or marker behind', async () => {
+   vi.useFakeTimers()
+   const queue = archiveQueueLifetime('backoff-cancel', 'cancel-chat', en.desktop)
+-  queue.enqueue()
++  await queue.enqueue()
+   const baselineTimers = vi.getTimerCount()
+   const waiting = queue.sleep(10_000).then(() => 'slept', error => error.message)
+   $notifications.get().find(n => n.message === en.desktop.archiveQueued)?.action?.onClick()
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.ts
+index cd7341dfce..fed268e6e2 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lifetime.ts
+@@ -2,26 +2,34 @@ import { translateNow } from '@/i18n'
+ import type { Translations } from '@/i18n/types'
+ import { dismissNotification, notify } from '@/store/notifications'
+ 
++import { holdArchiveQueueLock } from './archive-queue-lock'
++
+ const PREFIX = 'hermes:archive-preflight-queue:'
+ const active = new Set<string>()
+ const storageKeys = (storage: Storage) => Array.from({ length: storage.length }, (_, index) => storage.key(index) ?? '')
+-const windowPrefix = () => `${PREFIX}${encodeURIComponent(new URLSearchParams(window.location.search).get('win') ?? 'main')}:`
+ 
+-/** Persist the existence, not a safety verdict or a mutation to replay. A new
+- * renderer explicitly drops its window's old intents with a standing notice. */
+-export function reportDroppedArchiveQueues(): void {
++/** Locks, unlike URL window types or module memory, distinguish live renderers
++ * from reload/restart orphans. Never retire a peer's still-running intent. */
++export async function reportDroppedArchiveQueues(): Promise<void> {
++  const dropped = () => notify({ id: 'archive-queue-reload', kind: 'warning', persistent: true, durationMs: 0,
++    message: translateNow('desktop.archiveQueueDropped') })
++
+   const legacy = storageKeys(sessionStorage).filter(key => key.startsWith(PREFIX) && !active.has(key))
+-  const keys = storageKeys(localStorage).filter(key => key.startsWith(windowPrefix()) && !active.has(key))
+ 
+-  if (!keys.length && !legacy.length) {return}
+-  notify({ id: 'archive-queue-reload', kind: 'warning', persistent: true, durationMs: 0,
+-    message: translateNow('desktop.archiveQueueDropped') })
+-  keys.forEach(key => localStorage.removeItem(key))
+-  legacy.forEach(key => sessionStorage.removeItem(key))
++  if (legacy.length) {dropped(); legacy.forEach(key => sessionStorage.removeItem(key))}
++
++  if (!navigator.locks) {return}
++  await Promise.all(storageKeys(localStorage).filter(key => key.startsWith(PREFIX) && !active.has(key)).map(key =>
++    navigator.locks.request(key, { ifAvailable: true }, lock => {
++      if (!lock || localStorage.getItem(key) === null) {return}
++      dropped()
++      localStorage.removeItem(key)
++    })))
+ }
+ 
+ export function archiveQueueLifetime(attemptId: string, id: string, copy: Translations['desktop']) {
+-  const key = `${windowPrefix()}${attemptId}`
++  const key = `${PREFIX}${attemptId}`
++  let release: (() => void) | undefined
+   let queued = false
+   let disposed = false
+   const controller = new AbortController()
+@@ -51,10 +59,18 @@ export function archiveQueueLifetime(attemptId: string, id: string, copy: Transl
+         clearTimeout(timer)
+       }
+     },
+-    enqueue: () => {
++    enqueue: async () => {
+       if (queued) {return false}
++      release = await holdArchiveQueueLock(key, controller.signal)
++
++      if (disposed || controller.signal.aborted) {
++        release()
++        controller.signal.throwIfAborted()
++        throw new Error(copy.archiveQueueCancelled)
++      }
++
+       // If persistence is unavailable, fail visibly rather than silently losing
+-      // an intent on restart. Window-scoped keys don't retire other windows' work.
++      // an intent on restart. The held lock, not a URL label, owns this marker.
+       localStorage.setItem(key, id)
+       queued = true
+       notify({ id: key, kind: 'info', persistent: true, durationMs: 0,
+@@ -66,7 +82,8 @@ export function archiveQueueLifetime(attemptId: string, id: string, copy: Transl
+     dispose: () => {
+       disposed = true
+       active.delete(key)
+-      localStorage.removeItem(key)
++
++      try {localStorage.removeItem(key)} finally {release?.()}
+ 
+       if (queued) {dismissNotification(key)}
+     }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lock.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lock.ts
+new file mode 100644
+index 0000000000..894843bfc6
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-lock.ts
+@@ -0,0 +1,19 @@
++/** The callback remains pending until disposal or renderer death. Chromium
++ * releases Web Locks on context destruction, including reload and app exit. */
++export async function holdArchiveQueueLock(key: string, signal: AbortSignal): Promise<() => void> {
++  if (!navigator.locks) {throw new Error('Archive queue persistence requires Web Locks')}
++  let release!: () => void
++  const held = new Promise<void>(resolve => {release = resolve})
++  let acquired!: () => void
++  let failed!: (error: unknown) => void
++  const ready = new Promise<void>((resolve, reject) => {acquired = resolve; failed = reject})
++  void navigator.locks.request(key, { ifAvailable: true }, async lock => {
++    if (!lock) {throw new Error('Archive queue already owned by another renderer')}
++    signal.throwIfAborted()
++    acquired()
++    await held
++  }).catch(failed)
++  await ready
++
++  return release
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-peer.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-peer.test.ts
+new file mode 100644
+index 0000000000..64d1d47ce8
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-queue-peer.test.ts
+@@ -0,0 +1,112 @@
++import { afterEach, expect, it, vi } from 'vitest'
++
++import { en } from '@/i18n/en'
++import { archiveQueueLocksFixture } from '@/test/web-locks'
++
++const markers = () => Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)!).filter(k => k.startsWith('hermes:archive-preflight-queue:'))
++
++afterEach(() => {
++  vi.useRealTimers()
++  localStorage.clear()
++  sessionStorage.clear()
++  vi.unstubAllGlobals()
++})
++
++it.each(['?peer=1', '?win=secondary'])('does not cancel another live renderer with the same window type: %s', async search => {
++  const fixture = archiveQueueLocksFixture()
++  vi.stubGlobal('navigator', { locks: fixture.locks })
++  vi.stubGlobal('window', new Proxy(window, { get(target, prop) {
++    return prop === 'location' ? { search } : Reflect.get(target, prop)
++  } }))
++  vi.resetModules()
++  const owner = await import('./archive-queue-lifetime')
++  const queue = owner.archiveQueueLifetime('live-attempt', 'live-chat', en.desktop)
++  await queue.enqueue()
++  const key = markers()[0]
++  expect(key).toBeTruthy()
++  vi.resetModules()
++  const peer = await import('./archive-queue-lifetime')
++  const { $notifications } = await import('@/store/notifications')
++  await peer.reportDroppedArchiveQueues()
++  expect(localStorage.getItem(key)).toBe('live-chat')
++  expect($notifications.get().find(n => n.id === 'archive-queue-reload')).toBeUndefined()
++  expect(queue.signal.aborted).toBe(false)
++  queue.dispose()
++  await vi.waitFor(() => expect(fixture.held.size).toBe(0))
++  $notifications.set([])
++})
++
++it('a peer mount during a six-minute outage preserves the queue until fresh preflight recovers', async () => {
++  vi.useFakeTimers()
++  const fixture = archiveQueueLocksFixture()
++  vi.stubGlobal('navigator', { locks: fixture.locks })
++  let online = false
++
++  const api = vi.fn(async ({ path }: { path: string }) => {
++    if (!online) {throw new Error('socket hang up')}
++
++    return path.includes('session-kanban-tasks') ? { tasks: [] } : { id: 'peer-chat' }
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  vi.resetModules()
++  const { confirmLinkedArchive } = await import('./confirm-linked-archive')
++  const pending = confirmLinkedArchive('peer-chat', { id: 'peer-chat', connection_id: 'hub', profile: 'work', kanban_unknown: true } as never, 'work', en.desktop)
++  await vi.advanceTimersByTimeAsync(360_000)
++  const key = markers()[0]
++  expect(localStorage.getItem(key)).toBe('peer-chat')
++  vi.resetModules()
++  const peer = await import('./archive-queue-lifetime')
++  const { $notifications } = await import('@/store/notifications')
++  await peer.reportDroppedArchiveQueues()
++  expect(localStorage.getItem(key)).toBe('peer-chat')
++  expect($notifications.get().find(n => n.id === 'archive-queue-reload')).toBeUndefined()
++  online = true
++  await vi.advanceTimersByTimeAsync(10_000)
++  expect(await pending).toBe(true)
++  expect(localStorage.getItem(key)).toBeNull()
++  $notifications.set([])
++})
++
++it('a new app renderer reports an orphan after its old renderer releases custody', async () => {
++  const fixture = archiveQueueLocksFixture()
++  vi.stubGlobal('navigator', { locks: fixture.locks })
++  const key = 'hermes:archive-preflight-queue:vanished-renderer:attempt'
++  localStorage.setItem(key, 'orphan-chat')
++  sessionStorage.clear()
++  vi.resetModules()
++  const fresh = await import('./archive-queue-lifetime')
++  const { $notifications } = await import('@/store/notifications')
++  await fresh.reportDroppedArchiveQueues()
++  expect(localStorage.getItem(key)).toBeNull()
++  expect($notifications.get().find(n => n.id === 'archive-queue-reload')?.message).toBe(en.desktop.archiveQueueDropped)
++  $notifications.set([])
++})
++
++it('fails visibly rather than queueing without origin-wide custody support', async () => {
++  vi.stubGlobal('navigator', {})
++  const { archiveQueueLifetime } = await import('./archive-queue-lifetime')
++  const queue = archiveQueueLifetime('unsupported', 'chat', en.desktop)
++  await expect(queue.enqueue()).rejects.toThrow('requires Web Locks')
++  expect(markers()).toHaveLength(0)
++  queue.dispose()
++})
++
++it('does not persist an intent disposed while its lock acquisition was pending', async () => {
++  const fixture = archiveQueueLocksFixture()
++  let grant!: () => void
++  const waiting = new Promise<void>(resolve => {grant = resolve})
++  vi.stubGlobal('navigator', { locks: { request: async (...args: Parameters<typeof fixture.locks.request>) => {
++    await waiting
++
++    return fixture.locks.request(...args)
++  } } })
++  const { archiveQueueLifetime } = await import('./archive-queue-lifetime')
++  const queue = archiveQueueLifetime('disposed', 'chat', en.desktop)
++  const enqueue = queue.enqueue()
++  queue.dispose()
++  grant()
++  await expect(enqueue).rejects.toThrow(en.desktop.archiveQueueCancelled)
++  expect(markers()).toHaveLength(0)
++  await vi.waitFor(() => expect(fixture.held.size).toBe(0))
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+index 60c3942fc3..39d7a7f269 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+@@ -167,16 +167,16 @@ it('drops reload markers with a visible note, without replay, once; active remou
+   sessionStorage.setItem('hermes:archive-preflight-queue:old-attempt', row.id)
+   const api = vi.fn(async (_request: HermesApiRequest) => {throw new Error('socket hang up')})
+   vi.stubGlobal('hermesDesktop', { api })
+-  reportDroppedArchiveQueues()
++  await reportDroppedArchiveQueues()
+   expect($notifications.get().find(n => n.id === 'archive-queue-reload')?.message).toBe(en.desktop.archiveQueueDropped)
+   expect(api).not.toHaveBeenCalled()
+-  reportDroppedArchiveQueues()
++  await reportDroppedArchiveQueues()
+   expect($notifications.get().filter(n => n.id === 'archive-queue-reload')).toHaveLength(1)
+   const result = confirmLinkedArchive(row.id, row, 'work', en.desktop).catch(error => error)
+   await vi.advanceTimersByTimeAsync(0)
+   const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index) ?? '')
+   expect(keys).toHaveLength(1)
+-  reportDroppedArchiveQueues()
++  await reportDroppedArchiveQueues()
+   expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index) ?? '')).toEqual(keys)
+   await vi.advanceTimersByTimeAsync(70_000)
+   $notifications.get().find(n => n.message === en.desktop.archiveQueued)?.action?.onClick()
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index fd86c2ddd1..4d16fe3bd0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -430,7 +430,7 @@ export function useSessionActions({
+ 
+   // Drop the create/fork guard once the router catches up — or if the user
+   // navigates somewhere other than the pending id (left the pre-create route).
+-  useEffect(reportDroppedArchiveQueues, [])
++  useEffect(() => {void reportDroppedArchiveQueues()}, [])
+   useEffect(() => {
+     const pending = pendingCreatedStoredSessionIdRef.current
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+index 022deb14d8..a531241e4b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+@@ -29,7 +29,7 @@ export async function reconnectArchivePreflight(id: string, row: SessionInfo | u
+           trace?.('preflight=waiting-reconnect')
+           queued = true
+ 
+-          if (queue.enqueue()) {trace?.('queued')}
++          if (await queue.enqueue()) {trace?.('queued')}
+         }
+ 
+         throw error
+diff --git a/apps/desktop/src/test/web-locks.ts b/apps/desktop/src/test/web-locks.ts
+new file mode 100644
+index 0000000000..8b556b166d
+--- /dev/null
++++ b/apps/desktop/src/test/web-locks.ts
+@@ -0,0 +1,20 @@
++// Shared origin-wide lock fixture; separate module instances/renderers see the
++// same manager, while a reload can release the old renderer's held callbacks.
++export function archiveQueueLocksFixture() {
++  const held = new Set<string>()
++
++  const locks = {
++    request: async (name: string, options: LockOptions, callback: (lock: Lock | null) => unknown) => {
++      if (held.has(name)) {
++        if (options.ifAvailable) {return callback(null)}
++        throw new Error('duplicate fixture lock')
++      }
++
++      held.add(name)
++
++      try {return await callback({ name, mode: 'exclusive' } as Lock)} finally {held.delete(name)}
++    }
++  }
++
++  return { locks, held }
++}
+diff --git a/apps/desktop/vitest.setup.ts b/apps/desktop/vitest.setup.ts
+index 57f93713c1..3003d79d6d 100644
+--- a/apps/desktop/vitest.setup.ts
++++ b/apps/desktop/vitest.setup.ts
+@@ -6,6 +6,11 @@ import { resetSingleTabsForTests } from './src/components/pane-shell/tree/single
+ import { clearPlaybackSourceCache } from './src/lib/playback-source-cache'
+ import { resetParkRowsForTests } from './src/store/session-park-rows'
+ import { InertResizeObserver } from './src/test/jsdom'
++import { archiveQueueLocksFixture } from './src/test/web-locks'
++
++// Chromium supplies origin-wide Web Locks; jsdom does not. No feature/store
++// imports here: per-file mocks must still run before the action graph loads.
++Object.defineProperty(navigator, 'locks', { configurable: true, value: archiveQueueLocksFixture().locks })
+ 
+ // Shared tooltips measure their arrow through Radix's useSize hook.
+ // Geometry assertions still belong in a real browser, not this inert observer. Assigned,
+-- 
+2.43.0
+

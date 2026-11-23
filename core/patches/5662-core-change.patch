@@ -1,0 +1,392 @@
+From 200145bd465ab734b7e52f8a3f72676c1a9002c2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:48:37 +0000
+Subject: [PATCH] feat(kanban): adopt local decision ownership from interactive
+ chats [daveey]
+
+Timer-filed cards can have observer subscriptions but no chat responsible for
+spend decisions. Recommending notify-subscribe leaves them ownerless and creates
+another paid supervisor card at every spend stop.
+
+Add origin-adopt TASK --local, using only the current session with fresh local
+interactive provenance. Refuse worker/delegated/machine/unknown contexts and
+conflicting existing ownership inside the write transaction. Upgrade the exact
+observer row to origin without changing card state, routing or notify cursors.
+Name this owning path in courier-only tool refusal guidance.
+
+Proof: 11 behavioral tests RED on baseline, then GREEN; expanded local suite
+18 passing. 37 import-consumer files: 896 passed, 5 skipped; final changed-owner
+and local suites: 54 passed. scripts/check: all 21 checks passed.
+---
+ hermes_cli/kanban_local_adoption.py           | 100 ++++++++++++
+ hermes_cli/kanban_origin.py                   |   2 +-
+ hermes_cli/kanban_origin_owner.py             |   5 +
+ hermes_cli/kanban_parser.py                   |   6 +-
+ .../hermes_cli/test_kanban_local_adoption.py  | 154 ++++++++++++++++++
+ .../hermes_cli/test_kanban_origin_adoption.py |  11 +-
+ 6 files changed, 268 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_local_adoption.py
+ create mode 100644 tests/hermes_cli/test_kanban_local_adoption.py
+
+diff --git a/hermes_cli/kanban_local_adoption.py b/hermes_cli/kanban_local_adoption.py
+new file mode 100644
+index 0000000000..eaf0ae1a40
+--- /dev/null
++++ b/hermes_cli/kanban_local_adoption.py
+@@ -0,0 +1,100 @@
++"""Authenticated same-gateway decision ownership, separate from courier adoption."""
++from __future__ import annotations
++
++import json
++import os
++import re
++
++from hermes_cli.kanban_origin import OriginError
++
++
++_ROUTING_CONTEXTS = ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT')
++
++
++def adopt(conn, task_id: str) -> dict:
++    """Only the current interactive chat may own an ownerless local card.
++
++    CLI callers inherit the tool subprocess's session identity; no argument can
++    nominate another chat. OS-local execution is the trust boundary, as for the
++    courier CLI. Machine provenance wins over a copied interactive session ID.
++    """
++    from gateway.session_context import get_session_env
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_notify import _owning_sub_clause
++    from hermes_cli.kanban_foreign_card import check as assert_local_card
++    from hermes_cli.kanban_session_provenance import _read_sources, is_machine_session
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.profiles import get_active_profile_name
++
++    sid = str(get_session_env('HERMES_SESSION_ID', '') or '')
++    if (any(os.environ.get(key) or get_session_env(key, '') for key in _ROUTING_CONTEXTS)
++            or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', sid)):
++        raise OriginError('origin_interactive_required', 'local adoption requires the current interactive chat')
++    # Fresh, positive proof, not the notification classifier's legacy unknown-ID allowance/cache.
++    sources, readable = _read_sources(str(get_hermes_home() / 'state.db'), [sid])
++    if not readable or sources.get(sid) not in {'desktop', 'cli', 'tui', 'acp', 'gui'}:
++        raise OriginError('origin_interactive_required', 'local adoption requires local interactive session provenance')
++    me, profile = gateway_names()[0], get_active_profile_name()
++    with kb.write_txn(conn, allow_nested=True):
++        assert_local_card(conn, task_id)
++        task = kb.get_task(conn, task_id)
++        if task is None:
++            raise OriginError('origin_task_missing', 'exact local task does not exist')
++        conflicts = []
++        if task.session_id and task.session_id != sid and not is_machine_session(None, task.session_id):
++            conflicts.append(task.session_id)
++        for row in conn.execute(
++                'SELECT s.platform,s.chat_id FROM kanban_notify_subs s JOIN tasks p ON p.id=s.task_id '
++                f'WHERE s.task_id=? AND {_owning_sub_clause()}', (task_id,)):
++            same = ((row['platform'] == 'tui' and row['chat_id'] == sid)
++                    or (me and row['platform'] == 'hub' and row['chat_id'] == f'{me}/{profile}/{sid}'))
++            if not same:
++                conflicts.append(row['chat_id'])
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++            # An unreleased creator link also owns, even before its subscription is projected.
++
++            for row in conn.execute("SELECT * FROM task_chat_links WHERE task_id=? AND released=0 AND kind='created'", (task_id,)):
++                if (row['chat_gateway'], row['chat_profile'] or 'default', row['chat_session']) != (me, profile, sid):
++                    conflicts.append(row['chat_session'])
++        if conflicts:
++            raise OriginError('origin_adoption_conflict', 'another chat already owns this card; local adoption never transfers ownership')
++        # Preserve routing anchors and notification cursor when upgrading a shepherd row.
++        row = conn.execute("SELECT delivery_metadata FROM kanban_notify_subs WHERE task_id=? AND platform='tui' "
++                           "AND chat_id=? AND thread_id=''", (task_id, sid)).fetchone()
++        try:
++            metadata = json.loads(row[0]) if row and row[0] else {}
++        except (TypeError, ValueError):
++            raise OriginError('origin_adoption_conflict', 'existing subscription metadata is unreadable') from None
++        if not isinstance(metadata, dict):
++            raise OriginError('origin_adoption_conflict', 'existing subscription metadata is unreadable')
++        metadata['reason'] = 'origin'
++        conn.execute("INSERT INTO kanban_notify_subs "
++                     "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++                     "VALUES (?,'tui',?,'','notify',?,unixepoch(),"
++                     "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?)) "
++                     "ON CONFLICT(task_id,platform,chat_id,thread_id) DO UPDATE SET delivery_metadata=excluded.delivery_metadata",
++                     (task_id, sid, json.dumps(metadata), task_id))
++        if not row or json.loads(row[0] or '{}').get('reason') != 'origin':
++            kb._append_event(conn, task_id, 'local_origin_adopted', {'session_id': sid})
++    return {'ok': True, 'adopted': True, 'task_id': task_id, 'session_id': sid, 'ownership': 'decision'}
++
++
++def command(args) -> int:
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_foreign_card import ForeignCardError
++    from hermes_cli import kanban_db as kb
++    try:
++        if not args.task_id or args.request_file:
++            raise OriginError('origin_request_invalid', 'use origin-adopt TASK --local without --request-file')
++        board = getattr(args, 'board', None)
++        if board and not kb.board_exists(board):
++            raise OriginError('origin_task_missing', 'local adoption requires an existing board')
++        with connect_closing(board=board) as conn:
++            result = adopt(conn, args.task_id)
++    except OriginError as exc:
++        result = {'ok': False, 'code': exc.code, 'error': str(exc)}
++    except ForeignCardError as exc:
++        result = {'ok': False, 'code': 'foreign_card', 'error': str(exc)}
++    print(json.dumps(result))
++    return 0 if result['ok'] else 1
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index f60a7f637b..891b48c60a 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -338,7 +338,7 @@ def adopt_next_step(task_id: str, board: str, *, env: Optional[Mapping[str, str]
+     if me and owner_gw == me and (not worker or run_on == me):
+         # Card and chat on the same gateway: a tui subscription binds them, no courier involved.
+         pflag = "" if owner_profile == my_profile else f"-p {owner_profile} "
+-        step = f"hermes {pflag}kanban --board {board} notify-subscribe {task_id} --platform tui --chat-id {session}"
++        step = f"hermes {pflag}kanban --board {board} origin-adopt {task_id} --local"
+         who = ("A worker is fenced from that on its own board: report to the chat with cross_session instead, or "
+                "have the chat run it:" if worker else "Bind this chat to it by running in a terminal here:")
+         return {"next_step": step, "run_on": me, "complete": "<" not in step,
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index fd7ef30a71..fab53c500a 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -130,6 +130,9 @@ def snapshot_command(args) -> int:
+ 
+ 
+ def command(args) -> int:
++    if args.kanban_action == 'origin-adopt' and getattr(args, 'local', False):
++        from hermes_cli.kanban_local_adoption import command as local_command
++        return local_command(args)
+     if args.kanban_action == 'selfwork-producer':
+         from hermes_cli.kanban_selfwork_producer import command as producer_command
+         return producer_command(args)
+@@ -142,6 +145,8 @@ def command(args) -> int:
+     if args.kanban_action == 'ownership-snapshot':
+         return snapshot_command(args)
+     try:
++        if args.kanban_action == 'origin-adopt' and (getattr(args, 'task_id', None) or not args.request_file):
++            raise ValueError('origin_request_invalid')
+         raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text(encoding="utf-8-sig")
+         request = json.loads(raw)
+         expected = {'origin-create': 'create', 'origin-adopt': 'origin-adopt'}.get(args.kanban_action)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index a1539fc642..80565aec7a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -222,8 +222,10 @@ _SPECS = [
+         _arg("--json", action="store_true", help="Return structured pending creation (always JSON)"),
+     ], help="Create owner work through registered tools, pending origin receipt"),
+     _cmd("origin-adopt", [
+-        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+-        _arg("--json", action="store_true", help="Return pending adoption (always JSON)"),
++        _arg("task_id", nargs="?", help="Existing local card (requires --local)"),
++        _arg("--local", action="store_true", help="Current interactive chat takes decision ownership of an ownerless local card"),
++        _arg("--request-file", help="Trusted courier envelope file ('-' = stdin); incompatible with --local"),
++        _arg("--json", action="store_true", help="Return adoption result (always JSON)"),
+     ], help="Attach existing owner work through registered tools, pending origin receipt"),
+     _cmd("ownership-snapshot", [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+diff --git a/tests/hermes_cli/test_kanban_local_adoption.py b/tests/hermes_cli/test_kanban_local_adoption.py
+new file mode 100644
+index 0000000000..6753120715
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_adoption.py
+@@ -0,0 +1,154 @@
++"""Local decision adoption never lends interactive authority to machine runs."""
++import argparse
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_notify import add_notify_sub
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli import kanban_origin_owner as owner
++from hermes_cli import kanban_spend_decision as spend
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_KANBAN_DB',
++                'HERMES_KANBAN_BOARD', 'HERMES_DELEGATED_CHILD_CONTEXT'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv('HERMES_SESSION_ID', 'chat')
++    with sqlite3.connect(tmp_path / 'state.db') as db:
++        db.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, created_source TEXT)')
++        db.execute("INSERT INTO sessions VALUES ('chat','desktop','desktop')")
++    kb.init_db()
++    with connect_closing() as conn:
++        tid = kb.create_task(conn, title='Timer card')
++        add_notify_sub(conn, task_id=tid, platform='tui', chat_id='chat',
++                          delivery_metadata={'reason': 'shepherd'})
++        yield conn, tid, tmp_path
++
++
++def adopt(tid, capsys):
++    args = argparse.Namespace(kanban_action='origin-adopt', local=True, task_id=tid,
++                              request_file=None, board='default')
++    owner.command(args)
++    return json.loads(capsys.readouterr().out)
++
++
++def test_shepherd_spend_stop_then_local_adoption(world, capsys):
++    conn, tid, _ = world
++    before = spend.producer(conn, tid, 'budget stopped')
++    assert before['kind'] == 'supervisor'
++    count = conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    result = adopt(tid, capsys)
++    assert result.get('adopted') is True, result
++    assert result['session_id'] == 'chat'
++    assert spend.producer(conn, tid, 'budget stopped again') == {'kind': 'chats'}
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == count
++    assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == task
++    row = conn.execute('SELECT delivery_metadata FROM kanban_notify_subs WHERE task_id=?', (tid,)).fetchone()
++    assert json.loads(row[0])['reason'] == 'origin'
++    assert adopt(tid, capsys)['adopted'] is True
++
++
++@pytest.mark.parametrize('source', ['kanban', 'oneshot', 'cron', 'subagent', None])
++def test_machine_or_unknown_session_refused(world, capsys, source):
++    conn, tid, home = world
++    with sqlite3.connect(home / 'state.db') as db:
++        db.execute('UPDATE sessions SET source=?,created_source=?', (source, source))
++    result = adopt(tid, capsys)
++    assert result['code'] == 'origin_interactive_required'
++    assert json.loads(conn.execute('SELECT delivery_metadata FROM kanban_notify_subs').fetchone()[0]) == {'reason': 'shepherd'}
++
++
++@pytest.mark.parametrize('key', ['HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT'])
++def test_worker_cannot_nominate_a_human_chat(world, capsys, monkeypatch, key):
++    _, tid, _ = world
++    monkeypatch.setenv(key, 'worker')
++    assert adopt(tid, capsys)['code'] == 'origin_interactive_required'
++
++
++@pytest.mark.parametrize('kind', ['subscription', 'creator'])
++def test_another_chat_owner_refused(world, capsys, kind):
++    conn, tid, _ = world
++    if kind == 'subscription':
++        add_notify_sub(conn, task_id=tid, platform='tui', chat_id='other', delivery_metadata={'reason': 'origin'})
++    else:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='other' WHERE id=?", (tid,))
++    result = adopt(tid, capsys)
++    assert result['code'] == 'origin_adoption_conflict'
++    assert json.loads(conn.execute("SELECT delivery_metadata FROM kanban_notify_subs WHERE chat_id='chat'").fetchone()[0]) == {'reason': 'shepherd'}
++
++
++def test_actual_parser_accepts_local_and_retains_courier_route():
++    from hermes_cli.kanban_parser import build_parser
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers(dest='command'))
++    args = parser.parse_args(['kanban', 'origin-adopt', 't_existing', '--local'])
++    assert args.task_id == 't_existing' and args.local and args.request_file is None
++    courier = parser.parse_args(['kanban', 'origin-adopt', '--request-file', '-'])
++    assert courier.request_file == '-' and not courier.local
++
++
++def test_turn_identity_wins_over_process_environment(world, capsys, monkeypatch):
++    from gateway.session_context import set_session_vars, clear_session_vars
++    _, tid, _ = world
++    monkeypatch.setenv('HERMES_SESSION_ID', 'wrong_chat')
++    tokens = set_session_vars(session_id='chat', session_key='chat', source='desktop')
++    try:
++        assert adopt(tid, capsys)['session_id'] == 'chat'
++    finally:
++        clear_session_vars(tokens)
++
++
++def test_machine_creation_source_wins_over_interactive_resume(world, capsys):
++    _, tid, home = world
++    with sqlite3.connect(home / 'state.db') as db:
++        db.execute("UPDATE sessions SET source='desktop',created_source='oneshot'")
++    assert adopt(tid, capsys)['code'] == 'origin_interactive_required'
++
++
++def test_unreadable_state_fails_closed(world, capsys):
++    _, tid, home = world
++    (home / 'state.db').unlink()
++    assert adopt(tid, capsys)['code'] == 'origin_interactive_required'
++
++
++def test_existing_cursor_routing_and_mode_preserved(world, capsys):
++    conn, tid, _ = world
++    add_notify_sub(conn, task_id=tid, platform='tui', chat_id='chat', delivery_mode='notify+wake',
++                   delivery_metadata={'route': 'keep'})
++    before = dict(conn.execute('SELECT * FROM kanban_notify_subs').fetchone())
++    assert adopt(tid, capsys)['adopted']
++    after = dict(conn.execute('SELECT * FROM kanban_notify_subs').fetchone())
++    metadata = json.loads(after.pop('delivery_metadata'))
++    before.pop('delivery_metadata')
++    assert after == before
++    assert metadata == {'reason': 'origin', 'route': 'keep'}
++
++
++def test_no_subscription_is_created_and_missing_task_refused(world, capsys):
++    conn, tid, _ = world
++    with kb.write_txn(conn):
++        conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=?', (tid,))
++    assert adopt(tid, capsys)['adopted']
++    assert adopt('t_missing', capsys)['code'] == 'origin_task_missing'
++
++
++def test_conflicting_created_link_refused(world, capsys):
++    conn, tid, _ = world
++    from hermes_cli.kanban_chat_links import link_uid
++    with kb.write_txn(conn):
++        conn.execute('CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT NOT NULL, '
++                     'chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, kind TEXT NOT NULL, '
++                     'released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)')
++        conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                     "VALUES (?,?,?,?,?,'created',0,1)",
++                     (link_uid(tid, 'remote', 'default', 'other', 'created'), tid, 'remote', 'default', 'other'))
++    assert adopt(tid, capsys)['code'] == 'origin_adoption_conflict'
++
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index 9977d044af..4daf824394 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -258,8 +258,7 @@ def test_chat_refusal_for_card_on_this_gateway_subscribes_instead(board, tmp_pat
+     _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}")])
+     monkeypatch.setenv("HERMES_SESSION_ID", "s_local")
+     refused = _refuse(tid)
+-    assert refused["next_step"] == (f"hermes kanban --board default notify-subscribe {tid} "
+-                                    "--platform tui --chat-id s_local")
++    assert refused["next_step"] == f"hermes kanban --board default origin-adopt {tid} --local"
+     assert refused["run_on"] == "hub"
+ 
+ 
+@@ -267,8 +266,7 @@ def test_chat_refusal_for_card_on_another_local_profile_names_it(board, tmp_path
+     _hub_state(tmp_path, monkeypatch, "hub", [("hub", "work/release/t_rel1")])
+     monkeypatch.setenv("HERMES_SESSION_ID", "s_local")
+     refused = _refuse("t_rel1", board="release")
+-    assert refused["next_step"] == ("hermes -p work kanban --board release notify-subscribe t_rel1 "
+-                                    "--platform tui --chat-id s_local")
++    assert refused["next_step"] == "hermes -p work kanban --board release origin-adopt t_rel1 --local"
+ 
+ 
+ def test_worker_refusal_points_at_origin_gateway_cli(board, tmp_path, monkeypatch):
+@@ -320,7 +318,7 @@ def test_worker_with_origin_on_same_gateway_gets_no_self_addressed_delegate(boar
+     monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:default@hub/s_here")
+     refused = _refuse(tid)
+     assert "delegate" not in refused
+-    assert refused["next_step"] == f"hermes kanban --board default notify-subscribe {tid} --platform tui --chat-id s_here"
++    assert refused["next_step"] == f"hermes kanban --board default origin-adopt {tid} --local"
+     assert "cross_session" in refused["error"]
+ 
+ 
+@@ -342,5 +340,4 @@ def test_chat_refusal_names_this_turns_chat_not_the_process_env(board, tmp_path,
+             sc.clear_session_vars(tokens)
+ 
+     refused = contextvars.copy_context().run(turn)
+-    assert refused["next_step"] == (f"hermes kanban --board default notify-subscribe {tid} "
+-                                    "--platform tui --chat-id s_this_chat"), refused
++    assert refused["next_step"] == f"hermes kanban --board default origin-adopt {tid} --local", refused
+-- 
+2.43.0
+

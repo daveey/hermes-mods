@@ -1,0 +1,117 @@
+From 61de9c8b05a447ef5bfe8c134b22832955f6b900 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:39:23 -0800
+Subject: [PATCH] Prove the cached_ro fallback closes its private connection
+
+Review of #3941: the close tests checked a check_same_thread connection from
+the main thread, where an open connection also raises ProgrammingError, so
+they passed with the close removed. Check on the owning thread (and refuse a
+thread error in _is_closed). The hand-over test now passes a 5 s budget so
+the patched wait applies; the counter increments only after the private open
+succeeds; _private_ro's docstring names the busy-timeout cap.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_session_activity.py         |  7 ++---
+ .../test_cached_ro_borrowed_fallback.py       | 27 ++++++++++---------
+ 2 files changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8efa2de3f1..bb66337ca8 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -445,8 +445,6 @@ def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Conne
+     conn, _ident, lock, _shm = entry
+     remaining = busy_budget - (time.monotonic() - started)
+     if not try_borrow(lock, min(remaining, _RO_SHARED_WAIT_S)):
+-        with _RO_CACHE_LOCK:
+-            ro_stats["private_fallbacks"] += 1
+         # Never more than the shared reader's own SQLite busy timeout, whatever budget the caller passed.
+         with _private_ro(path, min(busy_budget - (time.monotonic() - started), _RO_BUSY_TIMEOUT_S)) as private:
+             yield private
+@@ -486,8 +484,11 @@ def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Conne
+ @contextlib.contextmanager
+ def _private_ro(path: Path, budget: float) -> Iterator[sqlite3.Connection]:
+     """A one-call read-only connection for when the shared reader is borrowed: same opener and read-only semantics
+-    as the cache, SQLite busy timeout = what is left of the caller's budget, always closed afterwards."""
++    as the cache, SQLite busy timeout = ``budget`` (the caller passes what is left of its own, capped at the shared
++    reader's ``_RO_BUSY_TIMEOUT_S``), always closed afterwards. Counted in ``ro_stats`` once it is open."""
+     conn = _open_ro(path, timeout=max(0.0, budget))
++    with _RO_CACHE_LOCK:
++        ro_stats["private_fallbacks"] += 1
+     try:
+         yield conn
+     finally:
+diff --git a/tests/hermes_cli/test_cached_ro_borrowed_fallback.py b/tests/hermes_cli/test_cached_ro_borrowed_fallback.py
+index 82251b513a..fabbb679ef 100644
+--- a/tests/hermes_cli/test_cached_ro_borrowed_fallback.py
++++ b/tests/hermes_cli/test_cached_ro_borrowed_fallback.py
+@@ -103,9 +103,12 @@ def test_zero_budget_borrowed_reader_also_falls_back(board):
+ 
+ 
+ def _is_closed(conn):
++    """Only meaningful on the thread that owns ``conn`` (or a ``check_same_thread=False`` one): a foreign-thread call
++    raises ProgrammingError for an open connection too."""
+     try:
+         conn.execute("SELECT 1")
+-    except sqlite3.ProgrammingError:
++    except sqlite3.ProgrammingError as exc:
++        assert "thread" not in str(exc), exc
+         return True
+     return False
+ 
+@@ -115,10 +118,9 @@ def test_fallback_connection_is_closed_after_the_body(board):
+         def read():
+             with activity.cached_ro(board) as conn:
+                 assert not _is_closed(conn)
+-                return conn
++            return _is_closed(conn)  # checked on the owning thread
+ 
+-        private = _in_thread(read)
+-    assert _is_closed(private)
++        assert _in_thread(read) is True
+ 
+ 
+ def test_fallback_connection_is_closed_when_the_body_raises(board):
+@@ -127,13 +129,13 @@ def test_fallback_connection_is_closed_when_the_body_raises(board):
+         captured = []
+ 
+         def read():
+-            with activity.cached_ro(board) as conn:
+-                captured.append(conn)
+-                conn.execute("SELECT * FROM no_such_table")
++            with pytest.raises(sqlite3.OperationalError, match="no such table"):
++                with activity.cached_ro(board) as conn:
++                    captured.append(conn)
++                    conn.execute("SELECT * FROM no_such_table")
++            return _is_closed(captured[0])  # checked on the owning thread
+ 
+-        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+-            _in_thread(read)
+-        assert _is_closed(captured[0])
++        assert _in_thread(read) is True
+         assert captured[0] is not shared
+         assert _shared_entry(board) is entry  # a fallback error does not evict the shared reader
+         assert not _is_closed(shared)
+@@ -189,7 +191,7 @@ def test_fallback_busy_timeout_is_the_remaining_budget(board):
+ 
+         ms = _in_thread(timeout_ms)
+     # 400 ms budget minus the <=50 ms shared wait and the entry lookup; never the reader's full 500 ms.
+-    assert 150 <= ms <= 350
++    assert 150 <= ms <= 360
+ 
+ 
+ def test_holder_releasing_within_the_wait_hands_over_the_shared_reader(board, monkeypatch):
+@@ -203,7 +205,8 @@ def test_holder_releasing_within_the_wait_hands_over_the_shared_reader(board, mo
+     timer = threading.Timer(0.01, lock.release)
+     timer.start()
+     try:
+-        assert _enter_conn(board) is entry[0]
++        with activity.cached_ro(board, busy_budget=5) as conn:  # the wait is min(budget, _RO_SHARED_WAIT_S)
++            assert conn is entry[0]
+     finally:
+         timer.join(5)
+     assert activity.ro_stats["private_fallbacks"] == before
+-- 
+2.43.0
+

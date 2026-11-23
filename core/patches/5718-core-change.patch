@@ -1,0 +1,287 @@
+From 1147c879913bf13ad0e38eafb30a8f099baff580 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:17:56 +0000
+Subject: [PATCH] [daveey] Cache goal activity by request-time source changes
+
+Replace global two-second answer TTL and repeated profile glob/realpath walks with bounded directory membership and per-database main/WAL/journal signature caches. Reads remain batched and short-lived; changed or failed sources invalidate before reread, and racing writes prevent publication. Proof: prior head failed immediate-commit and unchanged-expired-read regressions; 10 focused tests pass including WAL changes, replacement/removal, retry, race and closed handles. Live CPU acceptance remains pending.
+---
+ hermes_cli/goal_session_activity.py           | 106 +++++++++++-------
+ .../hermes_cli/test_goal_session_activity.py  | 103 +++++++++++++++++
+ 2 files changed, 168 insertions(+), 41 deletions(-)
+
+diff --git a/hermes_cli/goal_session_activity.py b/hermes_cli/goal_session_activity.py
+index c0fb927285..5abea01b7b 100644
+--- a/hermes_cli/goal_session_activity.py
++++ b/hermes_cli/goal_session_activity.py
+@@ -11,7 +11,8 @@ Paused, done and cleared goals don't count: nothing resumes them unasked.
+ [daveey]
+ 
+ Read-only and cheap: one primary-key range scan of ``state_meta`` per profile
+-database, cached for a couple of seconds because the sidebar polls.
++database, cached by file change signals checked only on requests. No timer or
++retained SQLite handle is needed.
+ """
+ 
+ from __future__ import annotations
+@@ -20,45 +21,59 @@ import json
+ import logging
+ import sqlite3
+ import threading
+-import time
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+ _log = logging.getLogger(__name__)
+ 
+ _KEY_PREFIX = "goal:"
+-_CACHE_TTL_S = 2.0
+ _cache_lock = threading.Lock()
+-_cache: tuple[float, frozenset[str]] | None = None
++# Only immutable answers are retained; SQLite connections close after each scan.
++_cache: dict[Path, tuple[tuple, frozenset[str]]] = {}
++_directories: dict[Path, tuple[tuple, tuple[Path, ...]]] = {}
++_MAX_CACHED_PATHS = 128
+ 
+ 
+-def _state_db_paths() -> list[Path]:
+-    from hermes_constants import get_default_hermes_root, get_hermes_home
++def _stamp(path: Path) -> tuple:
++    try:
++        st = path.stat()
++    except (FileNotFoundError, NotADirectoryError):
++        return ()
++    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
++
++
++def _db_stamp(path: Path) -> tuple:
++    return _stamp(path), _stamp(Path(str(path) + "-wal")), _stamp(Path(str(path) + "-journal"))
++
++
++def _profile_candidates(directory: Path) -> tuple[Path, ...]:
++    before = _stamp(directory)
++    prior = _directories.get(directory)
++    if prior is not None and prior[0] == before:
++        return prior[1]
++    _directories.pop(directory, None)
++    # Include missing state.db candidates: creating one in an existing profile
++    # need not change the profiles directory's mtime.
++    paths = tuple(sorted(p / "state.db" for p in directory.iterdir())) if before else ()
++    if before == _stamp(directory) and len(paths) <= _MAX_CACHED_PATHS:
++        if len(_directories) >= _MAX_CACHED_PATHS:
++            _directories.clear()
++        _directories[directory] = before, paths
++    return paths
+ 
+-    paths: list[Path] = []
+-    seen: set[str] = set()
+ 
+-    def add(p: Path) -> None:
+-        key = str(p.resolve()) if p.exists() else ""
+-        if key and key not in seen:
+-            seen.add(key)
+-            paths.append(p)
++def _state_db_paths() -> list[Path]:
++    from hermes_constants import get_default_hermes_root, get_hermes_home
+ 
+-    roots = [get_hermes_home()]
+-    try:
+-        roots.append(get_default_hermes_root())
+-    except Exception:  # pragma: no cover - defensive
+-        pass
++    roots = dict.fromkeys((Path(get_hermes_home()), Path(get_default_hermes_root())))
++    paths: dict[Path, None] = {}
+     for root in roots:
+-        add(Path(root) / "state.db")
+-        prof = Path(root) / "profiles"
++        paths[root / "state.db"] = None
+         try:
+-            if prof.is_dir():
+-                for p in sorted(prof.glob("*/state.db")):
+-                    add(p)
++            paths.update(dict.fromkeys(_profile_candidates(root / "profiles")))
+         except OSError:
+-            pass
+-    return paths
++            _directories.pop(root / "profiles", None)
++    return list(paths)
+ 
+ 
+ def _read_active(path: Path) -> set[str]:
+@@ -84,21 +99,30 @@ def _read_active(path: Path) -> set[str]:
+ 
+ def active_goal_sessions() -> frozenset[str]:
+     """Session ids (across every profile) whose standing goal is still active."""
+-    global _cache
+-    now = time.monotonic()
+-    with _cache_lock:
+-        if _cache is not None and now < _cache[0]:
+-            return _cache[1]
+-    ids: set[str] = set()
+-    for path in _state_db_paths():
+-        try:
+-            ids |= _read_active(path)
+-        except sqlite3.Error as exc:  # no state_meta yet, a locked file
+-            _log.debug("goal activity read failed for %s: %s", path, exc)
+-    result = frozenset(ids)
+     with _cache_lock:
+-        _cache = (now + _CACHE_TTL_S, result)
+-    return result
++        paths = _state_db_paths()
++        for removed in _cache.keys() - set(paths):
++            del _cache[removed]
++        ids: set[str] = set()
++        for path in paths:
++            try:
++                before = _db_stamp(path)
++                prior = _cache.get(path)
++                if prior is not None and prior[0] == before:
++                    ids.update(prior[1])
++                    continue
++                _cache.pop(path, None)
++                if not before[0]:
++                    continue
++                active = frozenset(_read_active(path))
++                ids.update(active)
++                if before == _db_stamp(path) and len(_cache) < _MAX_CACHED_PATHS:
++                    _cache[path] = before, active
++            except (OSError, sqlite3.Error) as exc:
++                # Never certify errors; the next request retries even without a write.
++                _cache.pop(path, None)
++                _log.debug("goal activity read failed for %s: %s", path, exc)
++        return frozenset(ids)
+ 
+ 
+ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+@@ -128,6 +152,6 @@ def annotate_goal_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+ 
+ 
+ def _reset_cache_for_tests() -> None:
+-    global _cache
+     with _cache_lock:
+-        _cache = None
++        _cache.clear()
++        _directories.clear()
+diff --git a/tests/hermes_cli/test_goal_session_activity.py b/tests/hermes_cli/test_goal_session_activity.py
+index 2b8e55f1fc..d8951bda51 100644
+--- a/tests/hermes_cli/test_goal_session_activity.py
++++ b/tests/hermes_cli/test_goal_session_activity.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import sqlite3
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -60,6 +61,108 @@ def test_annotates_rows_by_lineage_and_clears_stale_stamps(home):
+     assert "goal_active" not in rows[2]
+ 
+ 
++def test_committed_goal_change_is_visible_without_ttl(home):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    assert gsa.active_goal_sessions() == {"s"}
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE state_meta SET value=? WHERE key='goal:s'",
++                     (json.dumps({"goal": "g", "status": "done"}),))
++    assert gsa.active_goal_sessions() == set()
++
++
++def test_unchanged_requests_do_not_repeat_sql_or_profile_glob(home, monkeypatch):
++    _make_state_db(home / "state.db", {"s": {"goal": "g", "status": "active"}})
++    _make_state_db(home / "profiles" / "work" / "state.db", {})
++    assert gsa.active_goal_sessions() == {"s"}
++    monkeypatch.setattr(gsa, "_read_active", lambda _: pytest.fail("unchanged SQL read"))
++    monkeypatch.setattr(Path, "glob", lambda *a: pytest.fail("unchanged profile glob"))
++    monkeypatch.setattr(Path, "iterdir", lambda *a: pytest.fail("unchanged directory scan"))
++    # Advancing time must not force a reread; the database change is the signal.
++    monkeypatch.setattr(time, "monotonic", lambda: 1e12)
++    assert gsa.active_goal_sessions() == {"s"}
++
++
++def test_profile_add_remove_and_database_created_in_existing_profile(home):
++    profile = home / "profiles" / "work"
++    profile.mkdir(parents=True)
++    assert not gsa.active_goal_sessions()
++    path = profile / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    assert gsa.active_goal_sessions() == {"s"}
++    path.unlink()
++    assert not gsa.active_goal_sessions()
++    _make_state_db(home / "profiles" / "new" / "state.db",
++                   {"new": {"goal": "g", "status": "active"}})
++    assert gsa.active_goal_sessions() == {"new"}
++
++
++def test_error_is_not_cached(home, monkeypatch):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    original = gsa._read_active
++    def failed(_):
++        raise sqlite3.OperationalError("busy")
++    monkeypatch.setattr(gsa, "_read_active", failed)
++    assert not gsa.active_goal_sessions()
++    monkeypatch.setattr(gsa, "_read_active", original)
++    assert gsa.active_goal_sessions() == {"s"}
++
++
++def test_wal_commit_and_replacement(home):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("PRAGMA journal_mode=WAL")
++        assert gsa.active_goal_sessions() == {"s"}
++        conn.execute("DELETE FROM state_meta")
++        conn.commit()
++        assert not gsa.active_goal_sessions()
++    finally:
++        conn.close()
++    replacement = home / "replacement.db"
++    _make_state_db(replacement, {"other": {"goal": "g", "status": "active"}})
++    replacement.replace(path)
++    assert gsa.active_goal_sessions() == {"other"}
++
++
++def test_write_during_read_is_not_certified(home, monkeypatch):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    original = gsa._read_active
++    def raced(p):
++        result = original(p)
++        conn = sqlite3.connect(p)
++        try:
++            conn.execute("DELETE FROM state_meta")
++            conn.commit()
++        finally:
++            conn.close()
++        return result
++    monkeypatch.setattr(gsa, "_read_active", raced)
++    assert gsa.active_goal_sessions() == {"s"}
++    assert path not in gsa._cache
++    monkeypatch.setattr(gsa, "_read_active", original)
++    assert not gsa.active_goal_sessions()
++
++
++def test_reads_close_connections(home, monkeypatch):
++    _make_state_db(home / "state.db", {})
++    opened = []
++    original = sqlite3.connect
++    def connect(*a, **kw):
++        conn = original(*a, **kw)
++        opened.append(conn)
++        return conn
++    monkeypatch.setattr(gsa.sqlite3, "connect", connect)
++    assert not gsa.active_goal_sessions()
++    assert opened
++    for conn in opened:
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute("SELECT 1")
++
++
+ def test_missing_or_schemaless_db_is_harmless(home):
+     sqlite3.connect(home / "state.db").close()  # no state_meta table
+     rows = [{"id": "s1"}]
+-- 
+2.43.0
+

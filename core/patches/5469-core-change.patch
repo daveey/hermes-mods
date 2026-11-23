@@ -1,0 +1,187 @@
+From 2803b43ae7d03e3eacfc5e8798d5a44c264b4b5d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:51:40 +0000
+Subject: [PATCH] perf(sync): skip proven-empty outbox observation opens
+ [daveey]
+
+WIP implementation checkpoint, not a live CPU acceptance claim. Retain fresh positive/deadline work and use existing data_version observation. Reopen BoardWatch on main-file mtime/size movement to reject equal-header restore reuse. Proof: empty reopen count RED (2 vs 0), GREEN; equal-header restore RED then expanded consumer GREEN. Remaining: attribution, comprehensive mutants, review, CI, collector and mature-idle gate.
+---
+ hermes_cli/kanban_sync_board_watch.py         |  10 +-
+ hermes_cli/kanban_sync_outbox_age.py          |   7 ++
+ .../test_kanban_sync_empty_outbox.py          | 110 ++++++++++++++++++
+ 3 files changed, 124 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_empty_outbox.py
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 5607c19551..71177a23b7 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -40,7 +40,7 @@ class BoardWatch:
+ 
+     def __init__(self) -> None:
+         self._lock = threading.Lock()
+-        self._conns: dict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = {}
++        self._conns: dict[str, tuple[tuple[int, int, int, int], sqlite3.Connection, int]] = {}
+         self._gen = 0
+         self._answers: dict[str, tuple[int, str, Any]] = {}
+ 
+@@ -51,8 +51,12 @@ class BoardWatch:
+         except OSError:
+             self._drop(key)
+             return None
++        # A same-inode restore can retain SQLite's header counter while changing
++        # the contents. Reopen the pager, not just its answer memo, on main-file
++        # movement; ordinary WAL commits still use data_version below.
++        identity = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+         ent = self._conns.get(key)
+-        if ent is not None and ent[0] == (st.st_dev, st.st_ino):
++        if ent is not None and ent[0] == identity:
+             return ent[1], ent[2]
+         self._drop(key)
+         if len(self._conns) >= self.MAX:
+@@ -60,7 +64,7 @@ class BoardWatch:
+         conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
+                                          check_same_thread=False)
+         self._gen += 1
+-        self._conns[key] = ((st.st_dev, st.st_ino), conn, self._gen)
++        self._conns[key] = (identity, conn, self._gen)
+         return conn, self._gen
+ 
+     def _drop(self, key: str) -> None:
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index 1caad1bc0b..09e48a132c 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -100,6 +100,13 @@ def _sample(path: Path) -> Optional[tuple[str, float]]:
+     if not Path(path).exists():
+         return None
+     try:
++        # Only an empty structural answer is reusable. A positive answer still
++        # follows the original clock/backlog/sendability path below.
++        from hermes_cli.kanban_sync_client import _WATCH
++        empty = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1",
++                             unchanged_ok=True)
++        if empty is not None and empty[1] is None:
++            return None
+         with kbc.connect_closing(path) as conn:
+             conn.row_factory = sqlite3.Row
+             rows = [dict(r) for r in conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_sync_empty_outbox.py b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+new file mode 100644
+index 0000000000..1cc6d8d80f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+@@ -0,0 +1,110 @@
++"""Empty outbox observations skip schema opens, not positive/deadline work."""
++from unittest.mock import Mock
++import os
++import shutil
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_outbox_age as age
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    path = home / "kanban.db"
++    conn = kbc.connect(path)
++    client.ensure_identity(conn, "default", "macbook")
++    sync.set_mode(conn, "primary")
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    yield path, conn
++    conn.close()
++    client.reset_board_watch()
++
++
++def test_empty_sample_does_not_reopen_schema(board, monkeypatch):
++    path, _conn = board
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    assert age._sample(path) is None
++    assert age._sample(path) is None
++    assert opened.call_count == 0
++
++
++def _insert(conn, op="op", retry=None):
++    conn.execute(
++        "INSERT INTO kanban_sync_outbox "
++        "(op_id, table_name, row_uid, op, fields, hlc, created_at, retry_after) "
++        "VALUES (?, 'tasks', 't_probe', 'upsert', '{}', '', 1000, ?)", (op, retry))
++
++
++def test_empty_proof_sees_external_insert_and_delete(board, monkeypatch):
++    path, conn = board
++    monkeypatch.setattr(age, "_since", lambda created: float(created))
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    assert age._sample(path) is None
++    _insert(conn)
++    assert age._sample(path) == ("op", 1000.0)
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    assert age._sample(path) is None
++    _insert(conn, "next")
++    assert age._sample(path) == ("next", 1000.0)
++
++
++def test_unknown_empty_proof_falls_back_to_original_read(board, monkeypatch):
++    path, conn = board
++    _insert(conn)
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    monkeypatch.setattr(client._WATCH, "query", lambda *args, **kwargs: None)
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    assert age._sample(path)[0] == "op"
++    assert opened.call_count == 1
++
++
++def test_pending_answers_are_never_used_as_empty_deadline_proof(board, monkeypatch):
++    path, conn = board
++    _insert(conn, retry=100)
++    now = [50]
++    monkeypatch.setattr(age.time, "time", lambda: now[0])
++    sendable = Mock(side_effect=lambda conn, hub, slug, rows, evidence: (rows, []))
++    monkeypatch.setattr(client.backlog, "behind", lambda path: True)
++    monkeypatch.setattr(client.backlog, "sendable_before_head", sendable)
++    assert age._sample(path) is None
++    assert sendable.call_args.args[3] == []
++    now[0] = 100
++    assert age._sample(path) is None  # deferred rows do not alarm, but eligibility is recomputed
++    assert len(sendable.call_args.args[3]) == 1
++    assert sendable.call_count == 2
++
++
++def test_same_inode_restore_cannot_reuse_empty_proof(board, monkeypatch):
++    source, conn = board
++    path = source.with_name("closed-empty.db")
++    target = sqlite3.connect(path)
++    conn.backup(target)
++    target.execute("PRAGMA journal_mode=DELETE")
++    target.close()
++    image = path.with_name("restored.db")
++    shutil.copyfile(path, image)
++    with sqlite3.connect(image) as restored:
++        _insert(restored)
++    restored.close()
++    # Both branches advance once from the same image: the header counter alone
++    # cannot distinguish this replacement from the cached empty branch.
++    with sqlite3.connect(path) as empty_branch:
++        empty_branch.execute("UPDATE kanban_sync_state SET cursor=cursor+1")
++    empty_branch.close()
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    assert age._sample(path) is None
++    before = path.stat()
++    shutil.copyfile(image, path)
++    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
++    assert path.stat().st_ino == before.st_ino
++    sample = age._sample(path)
++    assert sample is not None and sample[0] == "op"
+-- 
+2.43.0
+

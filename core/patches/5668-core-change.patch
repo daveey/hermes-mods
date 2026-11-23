@@ -1,0 +1,616 @@
+From 207dbedb809a0d459b2a3aefbb9d2d3b49c64fdd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:15:11 +0000
+Subject: [PATCH] [daveey] Fence card answers with recorded-operation
+ provenance and proof validators
+
+---
+ hermes_cli/kanban_card_answer.py              |  20 +++-
+ hermes_cli/kanban_card_answer_proof.py        |  48 +++++++++
+ hermes_cli/kanban_card_answer_source.py       |  62 +++++++++++
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_archive.py               |   3 +-
+ hermes_cli/kanban_db_comment_ids.py           |   8 ++
+ hermes_cli/kanban_no_progress.py              |   3 +-
+ hermes_cli/kanban_reason_comment.py           |  27 ++++-
+ .../test_kanban_card_answer_proof.py          |  92 ++++++++++++++++
+ .../test_kanban_card_answer_provenance.py     |  70 ++++++++++++
+ .../test_kanban_card_answer_source.py         | 101 ++++++++++++++++++
+ 11 files changed, 430 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_card_answer_proof.py
+ create mode 100644 hermes_cli/kanban_card_answer_source.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_proof.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_provenance.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_source.py
+
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index 4e30c7fcb0..345574c607 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -56,6 +56,15 @@ def snapshot(conn, task: str) -> dict | None:
+             "generation": digest({"lifecycle": identities, "ask": ask, "status": row["status"]})}
+ 
+ 
++def validate_provenance(value: dict, task: str) -> None:
++    """Shape fence for the private comment hook; the adapter establishes truth."""
++    fields = {"ownerGateway", "ownerProfile", "board", "task", "generation", "choice", "operationId", "originGateway"}
++    if (not isinstance(value, dict) or set(value) != fields or value.get("task") != task
++            or any(not isinstance(value[k], str) or not value[k] for k in fields)
++            or len(value["generation"]) != 64):
++        raise AnswerRefused("invalid_decision_provenance")
++
++
+ def _receipt(conn, task, operation_id, fingerprint):
+     for row in conn.execute(
+         "SELECT payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived') ORDER BY id DESC",
+@@ -118,13 +127,22 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+     note = "Choice recorded in Desktop (remote): " + encoded(choices[0]) + "\nOperation: " + request["operationId"]
+ 
+     def fence(c):
++        from hermes_cli.kanban_spend_decision import pending
++        row = c.execute("SELECT * FROM tasks WHERE id=?", (request["task"],)).fetchone()
++        if row is None or ("containment_episode" in row.keys() and row["containment_episode"]):
++            return "containment_hold"
++        if not archive and pending(c, request["task"]):
++            return "spend_decision_pending"
+         if _receipt(c, request["task"], request["operationId"], fingerprint):
+             return "already_recorded"
+         fresh = snapshot(c, request["task"])
+         return None if fresh == current else "stale_ask"
+ 
+     transition = kb.archive_task if archive else kb.unblock_task
+-    transition(conn, request["task"], precondition=fence, comment=("user-steps", note),
++    from hermes_cli.kanban_reason_comment import RecordedDecisionComment
++    provenance = {**request, "originGateway": origin}
++    comment = RecordedDecisionComment("user-steps", note, provenance)
++    transition(conn, request["task"], precondition=fence, comment=comment,
+                event_extra={FIELD: receipt})
+     recorded = _receipt(conn, request["task"], request["operationId"], fingerprint)
+     if not recorded:
+diff --git a/hermes_cli/kanban_card_answer_proof.py b/hermes_cli/kanban_card_answer_proof.py
+new file mode 100644
+index 0000000000..280177e571
+--- /dev/null
++++ b/hermes_cli/kanban_card_answer_proof.py
+@@ -0,0 +1,48 @@
++"""Validate independently fetched courier records, not JSON submitted as proof.
++
++The read_request seam is private and must use the enrolled gateway's authenticated
++Hub API. This module does not expose a tool/CLI that can manufacture user evidence.
++"""
++from __future__ import annotations
++
++from hermes_cli.kanban_card_answer import AnswerRefused
++
++
++def verify(answer: dict, *, request_id: str, proof_id: str, owner_gateway: str, read_request) -> dict:
++    """Bind the immutable source request to an owner-requested source readback.
++
++    An enrolled source can submit a request, but only its operation-store reader
++    produces the completed proof. Failed/pending proof never authorizes a write.
++    """
++    original = read_request(request_id)
++    proof = read_request(proof_id)
++    if not isinstance(original, dict) or not isinstance(proof, dict):
++        raise AnswerRefused("source_proof_unavailable")
++    args = original.get("args")
++    if not isinstance(args, dict) or set(args) != {"answer", "source"}:
++        raise AnswerRefused("source_request_invalid")
++    source = args["source"]
++    if (not isinstance(source, dict) or set(source) != {"gateway", "profile", "session"}
++            or any(not isinstance(v, str) or not v or "/" in v for v in source.values())):
++        raise AnswerRefused("source_request_invalid")
++    if (original.get("id") != request_id or original.get("coll") != "tasks"
++            or original.get("action") != "card-answer"
++            or original.get("from") != "gw:" + source["gateway"]
++            or original.get("to_gw") != owner_gateway or answer.get("ownerGateway") != owner_gateway
++            or original.get("key") != f"{answer['ownerProfile']}/{answer['board']}/{answer['task']}"
++            or args["answer"] != answer):
++        raise AnswerRefused("source_request_mismatch")
++    expected = {"answer": answer, "source": source, "requestId": request_id}
++    if (proof.get("id") != proof_id or proof.get("coll") != "sessions"
++            or proof.get("action") != "card-answer-proof" or proof.get("from") != "gw:" + owner_gateway
++            or proof.get("to_gw") != source["gateway"]
++            or proof.get("key") != f"{source['profile']}/{source['session']}"
++            or proof.get("args") != expected):
++        raise AnswerRefused("source_proof_mismatch")
++    if proof.get("state") != "done":
++        raise AnswerRefused("source_proof_unavailable")
++    result = proof.get("result")
++    wanted = {**expected, "gateway": source["gateway"], "recorded": True}
++    if not isinstance(result, dict) or result != wanted or result.get("recorded") is not True:
++        raise AnswerRefused("unverified_user_decision")
++    return result
+diff --git a/hermes_cli/kanban_card_answer_source.py b/hermes_cli/kanban_card_answer_source.py
+new file mode 100644
+index 0000000000..a1ed3a7fad
+--- /dev/null
++++ b/hermes_cli/kanban_card_answer_source.py
+@@ -0,0 +1,62 @@
++"""Read a recorded user-steps operation without creating/migrating its store.
++
++Only the owner-bound courier calls this private adapter. A claimed sourceRef or
++caller-supplied recorded flag is never consulted. Source and path come from the
++receiving gateway's profile configuration, not from the request body.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++from hermes_cli.kanban_card_answer import AnswerRefused
++
++
++def recorded(path: Path, *, source: dict, owner_gateway: str, request_id: str, answer: dict) -> dict:
++    """Exact namespace/session operation + producer-owned remote binding.
++
++    The binding's snapshot.remote contains version=1, target (the six owner/ask
++    coordinates), and choiceValues (request choice ID -> exact owner choice).
++    The ordinary projection row and immutable frozen request still apply.
++    """
++    ns = json.dumps([source['gateway'], source['profile']], separators=(',', ':'), ensure_ascii=False)
++    conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
++    conn.row_factory = sqlite3.Row
++    try:
++        conn.execute('BEGIN')
++        row = conn.execute('SELECT body FROM operations WHERE namespace=? AND session=? AND id=?',
++                           (ns, source['session'], answer['operationId'])).fetchone()
++        if row is None:
++            raise AnswerRefused('source_operation_missing')
++        op = json.loads(row['body'])
++        expected_owner = dict(gatewayId=source['gateway'], profile=source['profile'], storedSessionId=source['session'])
++        if (op.get('owner') != expected_owner or op.get('operationId') != answer['operationId']
++                or op.get('dispatchState') == 'cancelled' or not op.get('recordedAt')):
++            raise AnswerRefused('source_operation_mismatch')
++        bound = conn.execute('SELECT * FROM kanban_projections WHERE namespace=? AND session=? AND request_id=?',
++                             (ns, source['session'], op['requestId'])).fetchone()
++        intent = op['intent']
++        if bound is None or json.loads(bound['request']) != intent['request']:
++            raise AnswerRefused('source_binding_missing')
++        frozen = json.loads(bound['request'])
++        remote = json.loads(bound['snapshot']).get('remote')
++        target = {k: v for k, v in answer.items() if k not in ('choice', 'operationId')}
++        if (not isinstance(remote, dict) or type(remote.get('version')) is not int or remote['version'] != 1
++                or remote.get('target') != target or target['ownerGateway'] != owner_gateway
++                or bound['board'] != target['board'] or bound['task'] != target['task']):
++            raise AnswerRefused('source_target_mismatch')
++        decision = op['decision']
++        if (op.get('revision') != frozen['revision'] or decision.get('expectedRevision') != frozen['revision']
++                or decision.get('requestId') != frozen['requestId'] or op['requestId'] != frozen['requestId']):
++            raise AnswerRefused('source_revision_mismatch')
++        choices = [ch for ch in frozen['choices'] if ch['id'] == decision.get('choiceId')]
++        values = remote.get('choiceValues')
++        if (len(choices) != 1 or choices[0].get('effect') != 'answer'
++                or not isinstance(values, dict) or values.get(decision.get('choiceId')) != answer['choice']
++                or intent.get('effect') != 'answer' or intent.get('revisionText') != choices[0]['label']
++                or intent.get('executionAuthorized') is not False or intent.get('permissionGrants') != []):
++            raise AnswerRefused('source_choice_mismatch')
++        return dict(answer=answer, source=source, requestId=request_id, gateway=source['gateway'], recorded=True)
++    finally:
++        conn.close()
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index a7b75fbf52..1aaf37c639 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3234,7 +3234,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
+     return "ready" if _parents_satisfied(conn, task_id) else "todo"
+ 
+ 
+-def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tuple[str, str]] = None,
++def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: ReasonComment = None,
+                  event_extra: Optional[dict] = None,
+                  precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+     """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent re-gated; ``review`` when
+@@ -3856,7 +3856,7 @@ from hermes_cli.kanban_db_list import list_task_rows, list_tasks
+ from hermes_cli.kanban_db_schedule import schedule_task
+ from hermes_cli.kanban_db_review_reopen import reopen_review_task
+ from hermes_cli.kanban_db_edit import PriorityLowerRefused, PriorityRaisePacedRefused, edit_task, paced_raise_refusal
+-from hermes_cli.kanban_reason_comment import _awaiting_human_answer
++from hermes_cli.kanban_reason_comment import Comment as ReasonComment, _awaiting_human_answer
+ from hermes_cli.kanban_db_notify import _inherit_notify_subs, _owning_sub_clause
+ from hermes_cli.kanban_db_boards import (
+     _default_board_display_name,
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index 83f9083cb2..2a90d9e1e1 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -5,11 +5,12 @@ import sqlite3
+ from typing import Callable, Optional
+ 
+ from hermes_cli.kanban_outcome_refresh import refreshes_origin_outcomes
++from hermes_cli.kanban_reason_comment import Comment
+ 
+ 
+ @refreshes_origin_outcomes
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
+-                 event_extra: Optional[dict] = None, comment: Optional[tuple[str, str]] = None,
++                 event_extra: Optional[dict] = None, comment: Comment = None,
+                  precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+     """Archive a task; a *running* task's host-local worker is terminated.
+ 
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index e7b406e782..7b9923aa3a 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -98,6 +98,7 @@ def agent_comment_ids(conn: sqlite3.Connection, task_id: str, comment_ids: list[
+ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+                 origin_gateway: Optional[str] = None, writer_kind: Optional[str] = None,
+                 writer_session: Optional[str] = None, relayed_human: Optional[dict] = None,
++                recorded_decision: Optional[dict] = None,
+                 system: bool = False) -> int:
+     """Append a comment (moved from ``kanban_db``; re-exported there). ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
+     sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]
+@@ -115,6 +116,11 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+     so the live comment bridge still delivers it to that run. [daveey]"""
+     if relayed_human is not None and writer_kind != "agent":
+         raise ValueError("relayed_human marks an agent's relay of the user's message; it needs writer_kind='agent'")
++    if recorded_decision is not None:
++        from hermes_cli.kanban_card_answer import validate_provenance
++        validate_provenance(recorded_decision, task_id)
++        if writer_kind != "agent" or relayed_human is not None:
++            raise ValueError("recorded decision is an agent relay, not a transcript message")
+     if not body or not body.strip():
+         raise ValueError("comment body is required")
+     if not author or not author.strip():
+@@ -160,6 +166,8 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+                 payload["writer_session"] = str(writer_session)
+         if relayed_human:
+             payload["relayed_human"] = dict(relayed_human)
++        if recorded_decision is not None:
++            payload["recorded_decision"] = dict(recorded_decision)
+         _kb._append_event(conn, task_id, "commented", payload)
+         return cid
+ 
+diff --git a/hermes_cli/kanban_no_progress.py b/hermes_cli/kanban_no_progress.py
+index 1abc287555..162ffb1790 100644
+--- a/hermes_cli/kanban_no_progress.py
++++ b/hermes_cli/kanban_no_progress.py
+@@ -88,7 +88,8 @@ def progress_marker(conn: sqlite3.Connection, task_id: str, *, before: Optional[
+         f"SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND created_at < ? "
+         f"AND (kind IN ({_marks(CARD_PROGRESS_EVENTS)}) "
+         "OR (kind = 'commented' AND (json_extract(payload, '$.writer_kind') = 'human' "
+-        "OR json_extract(payload, '$.relayed_human') IS NOT NULL)))",
++        "OR json_extract(payload, '$.relayed_human') IS NOT NULL "
++        "OR json_extract(payload, '$.recorded_decision.operationId') IS NOT NULL)))",
+         (task_id, cut, *CARD_PROGRESS_EVENTS),
+     ).fetchone()[0]
+     linked = conn.execute(
+diff --git a/hermes_cli/kanban_reason_comment.py b/hermes_cli/kanban_reason_comment.py
+index 4c1e11897f..3de0bcc2dd 100644
+--- a/hermes_cli/kanban_reason_comment.py
++++ b/hermes_cli/kanban_reason_comment.py
+@@ -13,9 +13,24 @@ import contextlib
+ import secrets
+ import sqlite3
+ import time
++from dataclasses import dataclass
+ from typing import Iterator, Optional
+ 
+-Comment = Optional[tuple[str, str]]  # (author, body)
++
++@dataclass(frozen=True)
++class RecordedDecisionComment:
++    """Internal verified-operation provenance; never a caller-supplied tool payload.
++
++    The owner adapter must verify the source operation before constructing this.
++    It marks an answer, not an operator grant or a transcript message.
++    """
++
++    author: str
++    body: str
++    provenance: dict
++
++
++Comment = Optional[tuple[str, str] | RecordedDecisionComment]  # legacy (author, body) remains valid
+ 
+ 
+ class _ReasonComment:
+@@ -39,7 +54,12 @@ def reason_comment(conn: sqlite3.Connection, task_id: str, comment: Comment) ->
+     from hermes_cli import kanban_db as kb
+ 
+     state = _ReasonComment()
+-    if not (comment and comment[1] and conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()):
++    decision = comment if isinstance(comment, RecordedDecisionComment) else None
++    if isinstance(comment, RecordedDecisionComment):
++        author, body = comment.author, comment.body
++    else:
++        author, body = comment or ("", "")
++    if not (body and conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()):
+         yield state
+         return
+     # A savepoint, not a DELETE: on a synced board the insert triggers queue outbox rows for the
+@@ -47,7 +67,8 @@ def reason_comment(conn: sqlite3.Connection, task_id: str, comment: Comment) ->
+     # block/schedule/unblock write nothing before refusing, so this undoes only the comment.
+     savepoint = f"reason_comment_{secrets.token_hex(6)}"
+     conn.execute(f"SAVEPOINT {savepoint}")
+-    state.comment_id = kb.add_comment(conn, task_id, comment[0], comment[1])
++    extra = ({"recorded_decision": decision.provenance, "writer_kind": "agent"} if decision else {})
++    state.comment_id = kb.add_comment(conn, task_id, author, body, **extra)
+     try:
+         yield state
+     except BaseException:
+diff --git a/tests/hermes_cli/test_kanban_card_answer_proof.py b/tests/hermes_cli/test_kanban_card_answer_proof.py
+new file mode 100644
+index 0000000000..c10848b6d0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_proof.py
+@@ -0,0 +1,92 @@
++"""Courier identity and source-operation proof fencing (no live Board writes)."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_proof as proof
++
++
++def records():
++    answer = dict(ownerGateway='owner', ownerProfile='default', board='default', task='t_example',
++                  generation='a' * 64, choice='plan-a', operationId='operation-one')
++    source = dict(gateway='origin', profile='work', session='chat-one')
++    original = dict(id='original', coll='tasks', action='card-answer', key='default/default/t_example',
++                    to_gw='owner', args=dict(answer=answer, source=source), **{'from': 'gw:origin'})
++    expected = dict(answer=answer, source=source, requestId='original')
++    receipt = dict(id='proof', coll='sessions', action='card-answer-proof', key='work/chat-one',
++                   to_gw='origin', args=copy.deepcopy(expected), state='done',
++                   result=dict(copy.deepcopy(expected), gateway='origin', recorded=True), **{'from': 'gw:owner'})
++    return answer, {'original': original, 'proof': receipt}
++
++
++def verify(answer, rows):
++    calls = []
++    def read(rid):
++        calls.append(rid)
++        return rows.get(rid)
++    result = proof.verify(answer, request_id='original', proof_id='proof', owner_gateway='owner', read_request=read)
++    assert calls == ['original', 'proof']
++    return result
++
++
++def test_exact_authenticated_records_accept():
++    answer, rows = records()
++    assert verify(answer, rows) == rows['proof']['result']
++
++
++@pytest.mark.parametrize('record,field,value', [
++    ('original', 'id', 'other'), ('original', 'coll', 'sessions'),
++    ('original', 'action', 'unblock'), ('original', 'from', 'gw:attacker'),
++    ('original', 'to_gw', 'wrong'), ('original', 'key', 'wrong/default/t_example'),
++    ('proof', 'id', 'other'), ('proof', 'coll', 'tasks'),
++    ('proof', 'action', 'card-answer'), ('proof', 'from', 'gw:origin'),
++    ('proof', 'to_gw', 'owner'), ('proof', 'key', 'default/chat-one'),
++    ('proof', 'state', 'pending'), ('proof', 'state', 'rejected'),
++    ('proof', 'result', {'recorded': True}),
++])
++def test_identity_mutations_refuse(record, field, value):
++    answer, rows = records()
++    rows[record][field] = value
++    with pytest.raises(ca.AnswerRefused):
++        verify(answer, rows)
++
++
++@pytest.mark.parametrize('field', ['ownerGateway', 'ownerProfile', 'board', 'task', 'generation', 'choice', 'operationId'])
++@pytest.mark.parametrize('where', ['original', 'proof-args', 'result'])
++def test_every_answer_coordinate_is_bound(field, where):
++    answer, rows = records()
++    rows = copy.deepcopy(rows)
++    target = (rows['original']['args']['answer'] if where == 'original' else
++              rows['proof']['args']['answer'] if where == 'proof-args' else rows['proof']['result']['answer'])
++    target[field] = 'changed'
++    with pytest.raises(ca.AnswerRefused):
++        verify(answer, rows)
++
++
++@pytest.mark.parametrize('where', ['args', 'result'])
++@pytest.mark.parametrize('field', ['gateway', 'profile', 'session'])
++def test_source_namespace_and_session_are_bound(where, field):
++    answer, rows = records()
++    rows['proof'][where]['source'][field] = 'changed'
++    with pytest.raises(ca.AnswerRefused):
++        verify(answer, rows)
++
++
++@pytest.mark.parametrize('value', [False, 1, 'true', None])
++def test_recorded_requires_true_boolean(value):
++    answer, rows = records()
++    rows['proof']['result']['recorded'] = value
++    with pytest.raises(ca.AnswerRefused):
++        verify(answer, rows)
++
++
++def test_missing_and_malformed_records_fail_closed():
++    answer, rows = records()
++    del rows['proof']
++    with pytest.raises(ca.AnswerRefused, match='source_proof_unavailable'):
++        verify(answer, rows)
++    answer, rows = records()
++    rows['original']['args']['source']['session'] = 'nested/session'
++    with pytest.raises(ca.AnswerRefused, match='source_request_invalid'):
++        verify(answer, rows)
+diff --git a/tests/hermes_cli/test_kanban_card_answer_provenance.py b/tests/hermes_cli/test_kanban_card_answer_provenance.py
+new file mode 100644
+index 0000000000..e37adc1d65
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_provenance.py
+@@ -0,0 +1,70 @@
++"""Recorded UI decisions are human answers, never transcript or spend grants."""
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_card_answer as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_truthful_non_transcript_provenance_and_accounting(kanban_home):
++    from hermes_cli import kanban_no_progress as progress
++    from hermes_cli import kanban_spend_budget as spend
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        note = [e for e in kb.list_events(conn, req['task']) if e.kind == 'commented'][-1]
++        assert note.payload['writer_kind'] == 'agent'
++        assert 'relayed_human' not in note.payload
++        assert note.payload['recorded_decision'] == {**req, 'originGateway': 'origin'}
++        # Isolate the comment's accounting from the simultaneous transition.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at=2000000000 WHERE task_id=? AND kind='commented' AND id="
++                         "(SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='commented')",
++                         (req['task'], req['task']))
++        assert progress.progress_marker(conn, req['task'], before=2_000_000_001) == 2_000_000_000
++        assert spend._window_start(conn, req['task'], 2_000_000_001) < 2_000_000_000
++
++
++def test_spend_hold_survives_verified_answer(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, req['task'], 'spend_budget_triaged', {'reason': 'independent budget hold'})
++        before = helpers.comments(conn, req['task'])
++        with pytest.raises(ca.AnswerRefused, match='ask_changed_or_held'):
++            helpers.apply(conn, req)
++        assert helpers.comments(conn, req['task']) == before
++        assert kb.get_task(conn, req['task']).human_request
++
++
++@pytest.mark.parametrize('archive', [False, True])
++def test_containment_marker_blocks_release(kanban_home, archive):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn, choices=not archive)
++        if archive:
++            req['choice'] = 'archive'
++        with kb.write_txn(conn):
++            cols = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
++            if 'containment_episode' not in cols:
++                conn.execute('ALTER TABLE tasks ADD COLUMN containment_episode TEXT')
++            conn.execute("UPDATE tasks SET containment_episode='independent-episode' WHERE id=?", (req['task'],))
++        before = helpers.comments(conn, req['task'])
++        with pytest.raises(ca.AnswerRefused, match='ask_changed_or_held'):
++            helpers.apply(conn, req)
++        assert helpers.comments(conn, req['task']) == before
++        assert kb.get_task(conn, req['task']).status == 'blocked'
++
++
++def test_provenance_rejects_impersonation(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        p = {**req, 'originGateway': 'origin'}
++        for kwargs in ({'writer_kind': 'human'}, {'writer_kind': 'agent', 'relayed_human': {'message_id': 123}}):
++            with pytest.raises(ValueError, match='agent relay'):
++                kb.add_comment(conn, req['task'], 'user-steps', 'answer', recorded_decision=p, **kwargs)
++        with pytest.raises(ca.AnswerRefused, match='invalid_decision_provenance'):
++            kb.add_comment(conn, req['task'], 'user-steps', 'answer', writer_kind='agent',
++                           recorded_decision={'operationId': 'forged'})
+diff --git a/tests/hermes_cli/test_kanban_card_answer_source.py b/tests/hermes_cli/test_kanban_card_answer_source.py
+new file mode 100644
+index 0000000000..3167708945
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_source.py
+@@ -0,0 +1,101 @@
++"""Read-only SQLite proof tests using disposable action-store-shaped rows."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_source as source
++
++
++def fixture(tmp_path):
++    path = tmp_path / 'actions.sqlite3'
++    answer = dict(ownerGateway='owner', ownerProfile='default', board='default', task='t_example',
++                  generation='a' * 64, choice='plan-a', operationId='operation-one')
++    origin = dict(gateway='origin', profile='work', session='chat-one')
++    owner = dict(gatewayId='origin', profile='work', storedSessionId='chat-one')
++    request = dict(requestId='request-one', revision=1, choices=[dict(id='a', effect='answer', label='Apply A')])
++    op = dict(owner=owner, operationId='operation-one', recordedAt='2026-01-01T00:00:00+00:00',
++              requestId='request-one', revision=1, dispatchState='pending',
++              decision=dict(requestId='request-one', expectedRevision=1, choiceId='a'),
++              intent=dict(request=request, effect='answer', revisionText='Apply A',
++                          executionAuthorized=False, permissionGrants=[]))
++    remote = dict(version=1, target={k: v for k, v in answer.items() if k not in ('choice', 'operationId')},
++                  choiceValues={'a': 'plan-a'})
++    ns = json.dumps(['origin', 'work'], separators=(',', ':'))
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE operations(namespace TEXT,session TEXT,id TEXT,body TEXT)')
++        conn.execute('CREATE TABLE kanban_projections(namespace TEXT,session TEXT,request_id TEXT,board TEXT,task TEXT,snapshot TEXT,request TEXT)')
++        conn.execute('INSERT INTO operations VALUES (?,?,?,?)', (ns, 'chat-one', 'operation-one', json.dumps(op)))
++        conn.execute('INSERT INTO kanban_projections VALUES (?,?,?,?,?,?,?)',
++                     (ns, 'chat-one', 'request-one', 'default', 't_example', json.dumps(dict(remote=remote)), json.dumps(request)))
++    return path, answer, origin, op, remote
++
++
++def read(path, answer, origin):
++    return source.recorded(path, source=origin, owner_gateway='owner', request_id='original', answer=answer)
++
++
++def test_exact_operation_and_binding_read_only(tmp_path):
++    path, answer, origin, _, _ = fixture(tmp_path)
++    before = path.read_bytes()
++    result = read(path, answer, origin)
++    assert result == dict(answer=answer, source=origin, requestId='original', gateway='origin', recorded=True)
++    assert path.read_bytes() == before
++    assert not (tmp_path / 'actions.sqlite3-wal').exists()
++    assert not (tmp_path / 'actions.sqlite3-shm').exists()
++
++
++@pytest.mark.parametrize('field', ['gateway', 'profile', 'session'])
++def test_no_cross_namespace_search(tmp_path, field):
++    path, answer, origin, _, _ = fixture(tmp_path)
++    origin[field] = 'another'
++    with pytest.raises(ca.AnswerRefused, match='source_operation_missing'):
++        read(path, answer, origin)
++
++
++@pytest.mark.parametrize('field,value', [('owner', {}), ('operationId', 'other'), ('dispatchState', 'cancelled'),
++                                        ('recordedAt', ''), ('revision', 2)])
++def test_changed_operation_refuses(tmp_path, field, value):
++    path, answer, origin, op, _ = fixture(tmp_path)
++    op[field] = value
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    with pytest.raises(ca.AnswerRefused):
++        read(path, answer, origin)
++
++
++@pytest.mark.parametrize('field,value', [('effect', 'approve'), ('revisionText', 'other'),
++                                        ('executionAuthorized', True), ('permissionGrants', ['network'])])
++def test_informational_only_no_execution_grants(tmp_path, field, value):
++    path, answer, origin, op, _ = fixture(tmp_path)
++    op['intent'][field] = value
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    with pytest.raises(ca.AnswerRefused, match='source_choice_mismatch'):
++        read(path, answer, origin)
++
++
++@pytest.mark.parametrize('field', ['ownerGateway', 'ownerProfile', 'board', 'task', 'generation'])
++def test_frozen_target_cannot_be_redirected(tmp_path, field):
++    path, answer, origin, _, remote = fixture(tmp_path)
++    remote['target'][field] = 'changed'
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE kanban_projections SET snapshot=?', (json.dumps(dict(remote=remote)),))
++    with pytest.raises(ca.AnswerRefused, match='source_target_mismatch'):
++        read(path, answer, origin)
++
++
++def test_unbound_operation_is_not_authority(tmp_path):
++    path, answer, origin, _, _ = fixture(tmp_path)
++    with sqlite3.connect(path) as conn:
++        conn.execute('DELETE FROM kanban_projections')
++    with pytest.raises(ca.AnswerRefused, match='source_binding_missing'):
++        read(path, answer, origin)
++
++
++def test_missing_store_never_created(tmp_path):
++    path = tmp_path / 'missing.sqlite3'
++    with pytest.raises(sqlite3.OperationalError):
++        read(path, {}, dict(gateway='origin', profile='work', session='chat-one'))
++    assert not path.exists()
+-- 
+2.43.0
+

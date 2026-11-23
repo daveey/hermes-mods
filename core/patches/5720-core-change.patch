@@ -1,0 +1,460 @@
+From e9bc1fbccae2e4f968105a401e35a9589b16c058 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:07:35 +0000
+Subject: [PATCH] fix(ownership): defer update and unidentified lease owners
+ without takeover [daveey]
+
+Problem: ownership cards recurred during two observation windows
+despite #3894, #3926 and #3930.
+
+Why 1: the producer treated SESSION_NOT_OWNED as an actionable foreign
+owner unless a narrow automatic-turn update-marker exception matched.
+Evidence: prompt_turn._admit_prompt_turn; RED regressions for typed
+update custody and opaque/PID-zero owners (red.log, eight failures).
+Why 2: the durable refusal assigned lease_foreign without holder
+identity. Its logged PID zero is missing telemetry, not proof that the
+actual writer had no PID (session_lifecycle._durable_owner_refusal).
+Why 3: no shared distinction separated a custody fence from positive
+foreign-owner evidence for typed queue admission and automatic replay.
+Root (happened): owner refusal classification also selected takeover UI;
+a fail-closed refusal was incorrectly treated as takeover evidence.
+Root (not caught): the watcher excluded every lease_foreign line, and
+existing typed-update tests expected an error/card. Both encoded the
+same invalid assumption, so the later incidents escaped detection.
+Recurrence: #3894/#3926/#3930 addressed ledger/self-orphan/attested
+update cases, not all typed and unidentified durable-holder paths.
+
+Historical evidence boundary: both earlier card lines were
+followed by automatic-turn refusals, not demonstrated typed entries.
+A process served the same chat shortly beforehand and was its marker
+writer; the available logs do not bind it to the earlier retirement.
+In the later window a backend accepted auto_continue, held that chat's
+marker and subsequently released its durable turn lease.
+The competing PID-zero line cannot alone prove that exact
+holder identity; no historical holder string was retained in that line.
+Do not infer missing historical lease ownership from update timing.
+
+Countermeasures:
+- symptom: silent automatic deferral and durable typed queue/retry for
+  attested updating/retiring or unidentified holders; no lease stealing.
+- root: shared transient classification, verified PID/birth/install
+  retirement evidence, positive remote evidence keeps foreign UI.
+- retry: leave queued input intact while the owner fence still refuses.
+- detection: add event-time holder_state to ownership-card logs; companion
+  state watcher tests detect PID-zero and attested update/retirement
+  foreign lines while excluding positive remote conflicts.
+Proof: canonical six-file no-retry run: 206 passed; scripts/check: 21
+checks OK. New queue integration retries twice before holder release.
+Watcher RED: five failures; GREEN watcher/producer/installer: 72 passed.
+Independent exact-head review, required CI and deployed 24h audit remain
+landing/operational gates, not claims established by these local tests.
+---
+ hermes_cli/active_sessions.py                 |  1 +
+ .../test_ownership_card_warning.py            |  2 +-
+ .../test_self_orphan_turn_lease.py            | 17 +++-
+ .../tui_gateway/test_transient_lease_owner.py | 99 +++++++++++++++++++
+ tests/tui_gateway/test_update_marker_defer.py | 10 +-
+ tui_gateway/methods_prompt.py                 |  8 ++
+ tui_gateway/ownership_card_log.py             | 15 ++-
+ tui_gateway/prompt_turn.py                    | 14 ++-
+ tui_gateway/session_auto_continue.py          |  9 +-
+ tui_gateway/session_lifecycle.py              | 13 ++-
+ tui_gateway/update_marker_owner.py            | 25 ++++-
+ 11 files changed, 195 insertions(+), 18 deletions(-)
+ create mode 100644 tests/tui_gateway/test_transient_lease_owner.py
+
+diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
+index 77baee42b7..11faae5b2a 100644
+--- a/hermes_cli/active_sessions.py
++++ b/hermes_cli/active_sessions.py
+@@ -682,6 +682,7 @@ def try_acquire_active_session(
+                 )
+                 # Carry the recorded incarnation, never a newly observed birth for a bare PID.
+                 refusal.holder_pid = existing.get("pid")
++                refusal.holder_remote = bool(existing.get("host") and str(existing["host"]) != owner_host())
+                 refusal.holder_start_time = existing.get("process_start_time")
+                 if (refusal.holder_start_time is not None
+                         and _pid_liveness(refusal.holder_pid, refusal.holder_start_time) is True):
+diff --git a/tests/tui_gateway/test_ownership_card_warning.py b/tests/tui_gateway/test_ownership_card_warning.py
+index 84519734e7..b5e9d608a9 100644
+--- a/tests/tui_gateway/test_ownership_card_warning.py
++++ b/tests/tui_gateway/test_ownership_card_warning.py
+@@ -29,7 +29,7 @@ def test_each_emitted_ownership_card_has_one_structured_warning(monkeypatch, cap
+             error_surface={"layer": "gateway", "code": "SESSION_NOT_OWNED", "retryable": False}, retire_marker=False)
+     assert len(frames) == 1 and frames[0][0] == "message.complete"
+     warnings = [r.message for r in caplog.records if "session_ownership_card shown" in r.message]
+-    assert warnings == [f"session_ownership_card shown session=owned-chat cause={expected} holder_pid={pid or 0}"]
++    assert warnings == [f"session_ownership_card shown session=owned-chat cause={expected} holder_pid={pid or 0} holder_state={expected}"]
+ 
+ 
+ def test_nonownership_error_has_no_ownership_warning(monkeypatch, caplog):
+diff --git a/tests/tui_gateway/test_self_orphan_turn_lease.py b/tests/tui_gateway/test_self_orphan_turn_lease.py
+index e2cadacf93..383d36499f 100644
+--- a/tests/tui_gateway/test_self_orphan_turn_lease.py
++++ b/tests/tui_gateway/test_self_orphan_turn_lease.py
+@@ -73,8 +73,8 @@ def test_different_holder_even_in_same_process_stays_fenced(orphan, monkeypatch)
+     refusal = server._durable_owner_refusal(orphan.session)
+     assert calls == []
+     assert refusal.reason == 'SESSION_NOT_OWNED'
+-    assert refusal.ownership_cause == 'lease_foreign'
+-    assert getattr(refusal, 'holder_pid', None) is None
++    assert refusal.ownership_cause == 'lease_unknown'
++    assert refusal.holder_pid == 0
+     assert orphan.db.session_turn_lease_owner('root')['holder'] == foreign
+ 
+ 
+@@ -99,7 +99,7 @@ def test_receipt_cannot_authorize_a_different_custodian(orphan, monkeypatch, tmp
+     monkeypatch.setattr(target, 'release_session_turn_lease', lambda *args: calls.append(args))
+     refusal = server._durable_owner_refusal(orphan.session)
+     assert refusal.reason == 'SESSION_NOT_OWNED'
+-    assert refusal.ownership_cause == 'lease_foreign'
++    assert refusal.ownership_cause == 'lease_unknown'
+     assert calls == []
+ 
+ 
+@@ -114,6 +114,17 @@ def test_successor_racing_settlement_is_re_read_and_fenced(orphan, monkeypatch):
+     assert orphan.db.session_turn_lease_owner('root')['holder'] == 'successor'
+ 
+ 
++def test_unidentified_durable_holder_defers_without_releasing_it(orphan, monkeypatch):
++    orphan.release('root', orphan.holder)
++    assert orphan.db.try_acquire_session_turn_lease('root', 'opaque-holder')
++    calls = []
++    monkeypatch.setattr(orphan.db, 'release_session_turn_lease', lambda *a: calls.append(a))
++    assert server._admit_prompt_turn('ui', orphan.session, 'notice', [], None, None, None) is None
++    assert orphan.errors == []
++    assert calls == []
++    assert orphan.db.session_turn_lease_owner('root')['holder'] == 'opaque-holder'
++
++
+ def test_live_exact_holder_is_not_settled(orphan, monkeypatch):
+     orphan.agent._active_session_turn_lease_holder = orphan.holder
+     calls = []
+diff --git a/tests/tui_gateway/test_transient_lease_owner.py b/tests/tui_gateway/test_transient_lease_owner.py
+new file mode 100644
+index 0000000000..8de3016490
+--- /dev/null
++++ b/tests/tui_gateway/test_transient_lease_owner.py
+@@ -0,0 +1,99 @@
++"""A lease fence is not evidence that a person must take a chat over."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import active_sessions, host_loop_lease
++from tests.tui_gateway import test_automatic_ledger_defer as ledger_tests
++from tests.tui_gateway import test_update_marker_defer as marker_tests
++from tests.tui_gateway import test_update_hold_submit_queue as queue_tests
++from tui_gateway import server, update_marker_owner
++
++held = queue_tests.held
++
++admission = ledger_tests.admission
++custody = marker_tests.custody
++
++
++@pytest.mark.parametrize('automatic', [False, True])
++def test_updating_owner_never_publishes_a_card(custody, admission, automatic):
++    admission.session['_synthesized_turn'] = automatic
++    admission.refusal = custody.classify()
++    assert ledger_tests._admit(admission) is None
++    assert admission.errors == []
++    assert admission.starts == []
++
++
++@pytest.mark.parametrize('automatic', [False, True])
++def test_unknown_owner_never_publishes_a_card(admission, automatic, tmp_path):
++    refusal = active_sessions.ActiveSessionRefusal('owned', 'SESSION_NOT_OWNED')
++    refusal.ownership_cause, refusal.holder_pid = 'lease_foreign', 0
++    admission.refusal = update_marker_owner.classify_refusal(tmp_path, 'chat', refusal)
++    admission.session['_synthesized_turn'] = automatic
++    assert ledger_tests._admit(admission) is None
++    assert admission.errors == []
++    assert admission.starts == []
++
++
++def test_same_install_retirement_needs_no_chat_pause_marker(custody, monkeypatch):
++    from tui_gateway import turn_marker
++    turn_marker.clear_turn_marker(custody.home, 'chat')
++    custody.lock.release()
++    monkeypatch.setattr(host_loop_lease, 'retiring_reason', lambda pid, home=None: 'superseded')
++    assert custody.classify().ownership_cause == 'lease_retiring'
++
++
++def test_remote_unknown_pid_is_not_local_update(tmp_path):
++    refusal = active_sessions.ActiveSessionRefusal('remote owner', 'SESSION_NOT_OWNED')
++    refusal.holder_pid, refusal.holder_remote = 0, True
++    assert update_marker_owner.classify_refusal(tmp_path, 'chat', refusal) is refusal
++
++
++@pytest.mark.parametrize('cause', ['update_marker', 'lease_retiring', 'lease_unknown'])
++def test_typed_slot_refusal_queues_instead_of_auto_takeover(admission, monkeypatch, cause):
++    calls = []
++    refusal = active_sessions.ActiveSessionRefusal('owned', 'SESSION_NOT_OWNED')
++    refusal.ownership_cause = cause
++    monkeypatch.setattr(server, '_queue_submit_behind_update_hold',
++                        lambda *a, **kw: calls.append((a, kw)) or {'result': {'status': 'queued'}})
++    monkeypatch.setattr(server, '_automation_holder_kind', lambda _: pytest.fail('must not take over'))
++    result = server._slot_refusal('rid', 'live', admission.session, 'typed', {}, refusal, False)
++    assert result == {'result': {'status': 'queued'}}
++    assert calls[0][1]['ownership_cause'] == cause
++
++
++@pytest.mark.parametrize('cause', ['update_marker', 'lease_unknown', 'lease_retiring'])
++def test_real_submit_keeps_queue_until_holder_clears(held, monkeypatch, cause):
++    from hermes_cli import admission_fence
++    admission_fence.clear_hold(held.home)
++    refusal = active_sessions.ActiveSessionRefusal('owned', 'SESSION_NOT_OWNED')
++    refusal.ownership_cause = cause
++    state = [refusal]
++    monkeypatch.setattr(server, '_ensure_active_session_slot', lambda *a: state[0])
++    reply = queue_tests._submit()
++    assert reply['result']['status'] == 'queued'
++    assert held.persisted == [('hello there', None)]
++    head = held.session['queued_prompt']
++    for _ in range(2):
++        held.timers.pop().target()
++        assert held.session['queued_prompt'] is head
++        assert not held.dispatched
++    state[0] = None
++    held.timers.pop().target()
++    assert held.dispatched == ['hello there']
++    assert not held.session.get('queued_prompt')
++
++
++def test_drain_rechecks_fence_before_consuming_queue(admission, monkeypatch):
++    from contextlib import nullcontext
++    head = {'text': 'typed'}
++    admission.session.update(running=False, queued_prompt=head)
++    admission.refusal = SimpleNamespace(reason='SESSION_NOT_OWNED', ownership_cause='lease_unknown')
++    monkeypatch.setattr(server, '_session_turn_admission', lambda _: nullcontext(True))
++    retries = []
++    from tui_gateway import admission_retry
++    monkeypatch.setattr(admission_retry, 'retry_queued_prompt', lambda *a: retries.append(a) or True)
++    assert server._drain_queued_prompt('rid', 'live', admission.session)
++    assert admission.session['queued_prompt'] is head
++    assert not admission.session['running']
++    assert len(retries) == 1
+diff --git a/tests/tui_gateway/test_update_marker_defer.py b/tests/tui_gateway/test_update_marker_defer.py
+index 67757a9ed6..f65339791c 100644
+--- a/tests/tui_gateway/test_update_marker_defer.py
++++ b/tests/tui_gateway/test_update_marker_defer.py
+@@ -76,7 +76,7 @@ def test_automatic_update_marker_refusal_defers(admission, caplog):
+     assert admission.errors == []
+     assert admission.starts == []
+     assert admission.session["_turn_owner_refusal"] == "SESSION_NOT_OWNED"
+-    assert "update marker writer pid 123" in caplog.text
++    assert "ownership coordination pending (update_marker, pid=123)" in caplog.text
+ 
+ 
+ def test_update_deferral_retries_and_recovers(custody, admission, monkeypatch):
+@@ -98,7 +98,7 @@ def test_update_deferral_retries_and_recovers(custody, admission, monkeypatch):
+     [True, False], ["SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE"],
+     ["update_marker", "lease_foreign", "unknown", None]))
+ def test_other_refusals_keep_their_card(admission, synthesized, reason, cause):
+-    if synthesized and reason == "SESSION_NOT_OWNED" and cause == "update_marker":
++    if reason == "SESSION_NOT_OWNED" and cause == "update_marker":
+         return  # the sole positive shape, independently exercised above
+     admission.session["_synthesized_turn"] = synthesized
+     admission.refusal = SimpleNamespace(reason=reason, ownership_cause=cause, holder_pid=123)
+@@ -237,7 +237,11 @@ def test_other_refusal_codes_do_not_probe_markers(custody, monkeypatch, reason):
+ def test_unknown_holder_identity_does_not_probe_markers(custody, monkeypatch, pid, birth):
+     custody.refusal.holder_pid, custody.refusal.holder_start_time = pid, birth
+     monkeypatch.setattr(update_marker_owner, "read_turn_marker", lambda *a: pytest.fail("unexpected marker probe"))
+-    assert custody.classify() is custody.refusal
++    result = custody.classify()
++    if pid is None:
++        assert result.ownership_cause == "lease_unknown"
++    else:
++        assert result is custody.refusal
+ 
+ 
+ def test_writer_dies_during_update_probe(custody, monkeypatch):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index ec17526582..e7956d1a56 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -807,6 +807,14 @@ def _slot_refusal(rid, sid, session, text, params, refusal, internal_hosted_subm
+     """The answer to a refused slot: a ledger refusal of a client submit goes to the owner's FIFO."""
+     if getattr(refusal, "ledger_status", None) is not None and not internal_hosted_submit:
+         return _submit_to_ledger_owner(rid, sid, session, text, params, refusal)
++    if (_transient_ownership_refusal(refusal) and not internal_hosted_submit
++            and not any(params.get(k) is not None for k in (
++                "truncate_before_row_id", "truncate_before_user_ordinal", "truncate_before_message_id", "rebind_message_ids"))):
++        if (queued := _queue_submit_behind_update_hold(
++                rid, sid, session, text, current_transport() or session.get("transport"),
++                turn_author=params.get("turn_author"), display_kind=params.get("display_kind"),
++                ownership_cause=refusal.ownership_cause)) is not None:
++            return queued
+     reason = getattr(refusal, "reason", None)
+     data = {"reason": reason} if reason else None
+     if reason == "SESSION_NOT_OWNED" and not internal_hosted_submit and params.get("display_kind") is None:
+diff --git a/tui_gateway/ownership_card_log.py b/tui_gateway/ownership_card_log.py
+index 1703f7c5f4..1412d581a2 100644
+--- a/tui_gateway/ownership_card_log.py
++++ b/tui_gateway/ownership_card_log.py
+@@ -12,8 +12,17 @@ def log_ownership_card(session: dict, error) -> None:
+     cause = getattr(error, "ownership_cause", None)
+     if status in FORWARDABLE_LEDGER_STATES:
+         cause = f"ledger_{status}"
+-    elif cause not in ("lease_foreign", "lease_self_orphan", "update_marker"):
++    elif cause not in ("lease_foreign", "lease_self_orphan", "update_marker", "lease_unknown", "lease_retiring"):
+         cause = "unknown"
++    state = cause
++    if getattr(error, "holder_remote", False):
++        state = "remote"
++    elif cause == "lease_foreign":
++        from tui_gateway import server
++        from tui_gateway.update_marker_owner import classify_refusal
++        classified = classify_refusal(server._session_home(session), session.get("session_key") or "", error)
++        state = getattr(classified, "ownership_cause", cause)
+     pid = getattr(error, "holder_pid", None)
+-    logger.warning("session_ownership_card shown session=%s cause=%s holder_pid=%s",
+-                   session.get("session_key") or "", cause, pid if isinstance(pid, int) and pid > 0 else 0)
++    logger.warning("session_ownership_card shown session=%s cause=%s holder_pid=%s holder_state=%s",
++                   session.get("session_key") or "", cause,
++                   pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else 0, state)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0e8bba4435..78996ace3f 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -177,10 +177,16 @@ def _admit_prompt_turn(
+                 getattr(ownership_refusal, "ledger_status", None) in owner_forward.FORWARDABLE_LEDGER_STATES):
+             logger.info("automatic turn for %s deferred: gateway queue holds %s work",
+                         session.get("session_key") or sid, ownership_refusal.ledger_status)
+-        elif (session.get("_synthesized_turn") and reason == "SESSION_NOT_OWNED"
+-              and getattr(ownership_refusal, "ownership_cause", None) == "update_marker"):
+-            logger.info("automatic turn for %s deferred: update marker writer pid %s is still updating",
+-                        session.get("session_key") or sid, ownership_refusal.holder_pid)
++        elif _transient_ownership_refusal(ownership_refusal):
++            logger.info("turn for %s deferred: ownership coordination pending (%s, pid=%s)",
++                        session.get("session_key") or sid, ownership_refusal.ownership_cause,
++                        getattr(ownership_refusal, "holder_pid", 0))
++            if not session.get("_synthesized_turn"):
++                with session["history_lock"]:
++                    _clear_inflight_turn(session)
++                _emit("message.complete", sid, {
++                    "text": "Hermes is updating or checking this chat's owner. This message has not run; please send it again when the update finishes.",
++                    "status": "complete", "usage": {}})
+         elif report_ownership_refusal:
+             # [daveey] retire_marker=False: this submit wrote no marker; the one on disk is a live turn's.
+             _emit_terminal_turn_error(
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 6ad1dfe826..45b963580a 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -882,7 +882,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
+ 
+ 
+ def _queue_submit_behind_update_hold(rid, sid: str, session: dict, text: Any, transport: Any,
+-                                     turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
++                                     turn_author: dict | None = None, display_kind: str | None = None,
++                                     ownership_cause: str | None = None) -> dict | None:
+     """An idle ``prompt.submit`` refused ONLY by the core-update admission hold is queued, not bounced.
+ 
+     The update drainer holds admission for a bounded drain window while the turns in flight finish
+@@ -896,7 +897,8 @@ def _queue_submit_behind_update_hold(rid, sid: str, session: dict, text: Any, tr
+     # Only a refusal by the update hold itself is labelled: a briefly busy or unreadable fence queues as
+     # before (the retry admits it within a tick) but is not "waiting for an update". Read before any other
+     # reservation in this context can overwrite the reason.
+-    held_by_update = last_refusal() == "held"
++    held_by_update = (ownership_cause in {"update_marker", "lease_retiring"}
++                      if ownership_cause is not None else last_refusal() == "held")
+     if not retirement.acquire():
+         return None
+     retirement.release()
+@@ -959,6 +961,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+             return retry_queued_prompt(rid, sid, session)
+         if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+             return False
++        if _transient_ownership_refusal(_ensure_active_session_slot(sid, session)):
++            from tui_gateway.admission_retry import retry_queued_prompt
++            return retry_queued_prompt(rid, sid, session)
+         queue_generation = int(session.get("_queued_prompt_generation", 0))
+         _ac_set_queue(session, session.get("queued_prompts") or [])
+         session["running"] = True
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 66602edc6a..f0f2392c9a 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -110,6 +110,11 @@ def _install_borrowed_lease(sid: str, session: dict, frame: dict) -> None:
+         surface=str(frame.get("source") or "desktop"), enabled=False)
+ 
+ 
++def _transient_ownership_refusal(refusal) -> bool:
++    from tui_gateway.update_marker_owner import is_transient
++    return is_transient(refusal)
++
++
+ def _foreign_turn_owner(session: dict):
+     key = str(session.get("session_key") or "")
+     if not key:
+@@ -150,7 +155,13 @@ def _durable_owner_refusal(session: dict):
+         f"Details: session {owner['conversation_id']} opened by {surface}. "
+         f"Writer: {holder}", SESSION_NOT_OWNED)
+     refusal.ownership_cause = "lease_foreign"
+-    return refusal
++    # A namespace-qualified remote writer is positive foreign evidence. An opaque
++    # holder is not: keep its fence, but do not offer a destructive takeover.
++    from hermes_state_pidns import pid_namespace_id
++    namespace = next((part[6:] for part in holder.split(":") if part.startswith("pidns=")), None)
++    refusal.holder_remote = bool(namespace and pid_namespace_id() and namespace != pid_namespace_id())
++    from tui_gateway.update_marker_owner import classify_refusal
++    return classify_refusal(_session_home(session), str(session.get("session_key") or ""), refusal)
+ 
+ 
+ #: Display kinds of turns Hermes starts on its own (no human typed them): the turn-starting notices
+diff --git a/tui_gateway/update_marker_owner.py b/tui_gateway/update_marker_owner.py
+index b48f6d12c2..420ed592ec 100644
+--- a/tui_gateway/update_marker_owner.py
++++ b/tui_gateway/update_marker_owner.py
+@@ -14,13 +14,24 @@ def classify_refusal(home, key, refusal, *, install_root=None):
+     """
+     if getattr(refusal, "reason", None) != active_sessions.SESSION_NOT_OWNED:
+         return refusal
++    if getattr(refusal, "holder_remote", False):
++        return refusal
+     pid = getattr(refusal, "holder_pid", None)
++    if pid is None or (isinstance(pid, int) and not isinstance(pid, bool) and pid == 0):
++        return _label(refusal, "lease_unknown", 0, None)
+     birth = finite_deadline(getattr(refusal, "holder_start_time", None))
+     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or birth is None:
+         return refusal
+     from hermes_cli._startup_fast import project_root_str
+     root = Path(install_root) if install_root is not None else Path(project_root_str())
+     try:
++        rows = process_identity.ledger_entries(project_root=root, verified_only=True)
++        same_backend = any(row.get("pid") == pid and row.get("create_time") == birth
++                           and row.get("install") == process_identity.install_id(root)
++                           and row.get("purpose") in ("serve", "gateway", "dashboard") for row in rows)
++        from hermes_cli.host_loop_lease import retiring_reason
++        if same_backend and retiring_reason(pid, home=home):
++            return _label(refusal, "lease_retiring", pid, birth)
+         marker = read_turn_marker(home, key)
+         if (not marker or marker.get("reason") != "core_update_pause"
+                 or marker.get("writer_pid") != pid or marker.get("writer_start_time") != birth
+@@ -53,8 +64,20 @@ def classify_refusal(home, key, refusal, *, install_root=None):
+             return refusal
+     except (OSError, ValueError, TypeError):
+         return refusal
++    return _label(refusal, "update_marker", pid, birth)
++
++
++WAIT_CAUSES = frozenset({"update_marker", "lease_retiring", "lease_unknown"})
++
++
++def is_transient(refusal):
++    return (getattr(refusal, "reason", None) == active_sessions.SESSION_NOT_OWNED
++            and getattr(refusal, "ownership_cause", None) in WAIT_CAUSES)
++
++
++def _label(refusal, cause, pid, birth):
+     result = active_sessions.ActiveSessionRefusal(str(refusal), refusal.reason)
+-    result.ownership_cause = "update_marker"
++    result.ownership_cause = cause
+     result.holder_pid = pid
+     result.holder_start_time = birth
+     return result
+-- 
+2.43.0
+

@@ -1,0 +1,182 @@
+From 5d904f00721ed603bb8e9f3bbf900f25bcb9f6de Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 18:10:01 +0000
+Subject: [PATCH] [daveey] Resolve copied trigger identities outside SQLite
+ authorization
+
+The runtime custody observer recursively queried sqlite_master from its
+SQLite authorizer when an older connection first saw newly installed triggers.
+That reentrant preparation crashes the interpreter when another trigger calls
+an unavailable writer-revision UDF. Required CI and a local canonical runner
+both reproduce a native fault in test_kanban_sync_writer_gate.py.
+
+Move exact-definition adoption ahead of statement preparation, and cover cursor
+execution as well as connection shortcuts. The authorizer now uses in-memory
+identities only; unknown writers remain refused. Internal schema readers close
+before the caller operation, and corrupt/locked database handling stays with
+that caller rather than the observer.
+
+RED: two real backup-to-memory tests detect nested authorizer depth 2 instead
+of 1, covering connection and cursor operations. Existing writer-gate suite
+crashes natively on the published base. GREEN: inventory gate and unchanged
+writer-gate tests 55 passed; recovery/omissions/storage/client 167 passed.
+No production activation, capture certification, deployment or protocol change.
+---
+ tests/hermes_cli/custody_authorizer.py        | 60 +++++++++++++------
+ .../test_kanban_sync_capture_sites.py         | 39 ++++++++++++
+ 2 files changed, 80 insertions(+), 19 deletions(-)
+
+diff --git a/tests/hermes_cli/custody_authorizer.py b/tests/hermes_cli/custody_authorizer.py
+index ca1c9251ef..4a13f0cf7e 100644
+--- a/tests/hermes_cli/custody_authorizer.py
++++ b/tests/hermes_cli/custody_authorizer.py
+@@ -25,30 +25,41 @@ def caller():
+     return "<unknown>", "<unknown>"
+ 
+ 
+-class _RememberConnection:
++class _RememberExecution:
++    def _connection(self):
++        return self.connection if isinstance(self, sqlite3.Cursor) else self
++
+     def execute(self, *args, **kwargs):
++        connection = self._connection()
++        connection._custody_before()
+         try:
+             return super().execute(*args, **kwargs)
+         finally:
+-            after = getattr(self, "_custody_after", None)
+-            if after:
+-                after()
++            connection._custody_after()
+ 
+     def executemany(self, *args, **kwargs):
++        connection = self._connection()
++        connection._custody_before()
+         try:
+             return super().executemany(*args, **kwargs)
+         finally:
+-            after = getattr(self, "_custody_after", None)
+-            if after:
+-                after()
++            connection._custody_after()
+ 
+     def executescript(self, *args, **kwargs):
++        connection = self._connection()
++        connection._custody_before()
+         try:
+             return super().executescript(*args, **kwargs)
+         finally:
+-            after = getattr(self, "_custody_after", None)
+-            if after:
+-                after()
++            connection._custody_after()
++
++
++class _RememberConnection(_RememberExecution):
++    def cursor(self, factory=sqlite3.Cursor):
++        classes = self._custody_cursor_classes
++        if factory not in classes:
++            classes[factory] = type("CustodyCursor", (_RememberExecution, factory), {})
++        return super().cursor(factory=classes[factory])
+ 
+ 
+ class CustodyGuard:
+@@ -87,16 +98,25 @@ class CustodyGuard:
+             finally:
+                 cursor.close()
+ 
++        def adopt():
++            # Never issue SQL from an authorizer: recursive preparation can crash SQLite/Python
++            # when another trigger has an unresolved UDF. Resolve backup/reopen identities before
++            # the caller's statement, retaining fail-closed unknown identities.
++            for schema in ("main", "temp"):
++                try:
++                    rows = definitions(schema)
++                except sqlite3.DatabaseError:
++                    # The caller, not this observer, owns corrupt/locked database handling.
++                    continue
++                for name, sql in rows:
++                    key = (database_key, schema, name)
++                    if key not in self.triggers:
++                        identity = self.trigger_definitions.get(sql)
++                        if identity is not None:
++                            self.triggers[key] = identity
++
+         def creator(schema, trigger):
+-            key = (database_key, schema, trigger)
+-            if key not in self.triggers:
+-                # A backup/reopen can adopt only an exact definition observed at creation,
+-                # never merely a familiar name. This also covers backup-to-memory fixtures.
+-                for _, sql in definitions(schema, trigger):
+-                    identity = self.trigger_definitions.get(sql)
+-                    if identity is not None:
+-                        self.triggers[key] = identity
+-            return self.triggers.get(key, ("<unknown-trigger>", trigger))
++            return self.triggers.get((database_key, schema, trigger), ("<unknown-trigger>", trigger))
+ 
+         def remember():
+             if database_key not in self.pending:
+@@ -108,7 +128,9 @@ class CustodyGuard:
+                     if identity is not None:
+                         self.trigger_definitions[sql] = identity
+ 
++        connection._custody_before = adopt
+         connection._custody_after = remember
++        connection._custody_cursor_classes = {}
+ 
+         def authorize(action, table, column, schema, trigger):
+             identity = caller()
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_sites.py b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+index 2765f08036..30090eeb49 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_sites.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+@@ -193,6 +193,45 @@ def test_successful_backup_retains_exact_trigger_creator(guarded):
+         target.close()
+ 
+ 
++@pytest.mark.parametrize("use_cursor", [False, True])
++def test_backup_trigger_adoption_never_reenters_sqlite_authorizer(use_cursor):
++    depths = []
++
++    class Observe(sqlite3.Connection):
++        def set_authorizer(self, callback):
++            depth = 0
++
++            def observed(*args):
++                nonlocal depth
++                depth += 1
++                depths.append(depth)
++                try:
++                    return callback(*args)
++                finally:
++                    depth -= 1
++
++            return super().set_authorizer(observed if callback else None)
++
++    connect = CustodyGuard().factory(sqlite3.dbapi2.connect)
++    source = connect(":memory:", factory=Observe)
++    target = connect(":memory:", factory=Observe)
++    try:
++        source.executescript("CREATE TABLE domain(x); CREATE TABLE kanban_sync_outbox(x); "
++                             "CREATE TRIGGER fixture AFTER INSERT ON domain "
++                             "BEGIN INSERT INTO kanban_sync_outbox VALUES(new.x); END;")
++        source.backup(target)
++        depths.clear()
++        executor = target.cursor() if use_cursor else target
++        executor.execute("INSERT INTO domain VALUES(7)")
++        assert target.execute("SELECT x FROM kanban_sync_outbox").fetchall() == [(7,)]
++        assert max(depths) == 1, "schema SQL must run outside the authorizer callback"
++        if use_cursor:
++            executor.close()
++    finally:
++        source.close()
++        target.close()
++
++
+ def test_custom_connection_class_is_stable_across_opens():
+     class Custom(sqlite3.Connection):
+         pass
+-- 
+2.43.0
+

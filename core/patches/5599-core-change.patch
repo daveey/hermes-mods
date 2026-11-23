@@ -1,0 +1,318 @@
+From 226556dcfa959fbe3c03866b1665bfe6d1345986 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:34:21 +0000
+Subject: [PATCH] test(kanban): preserve synced claim ordering with authentic
+ review sources [daveey]
+
+---
+ tests/hermes_cli/kanban_review_fixture.py     | 22 ++++++++-
+ .../hermes_cli/test_kanban_capacity_order.py  | 27 ++++++-----
+ .../test_kanban_hub_claim_wake_race.py        |  8 +++-
+ .../test_kanban_review_lifecycle.py           | 48 ++++++++++++++-----
+ .../test_kanban_runs_on_dispatch.py           | 11 ++++-
+ 5 files changed, 90 insertions(+), 26 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_review_fixture.py b/tests/hermes_cli/kanban_review_fixture.py
+index 2738887d96..21dc7b1261 100644
+--- a/tests/hermes_cli/kanban_review_fixture.py
++++ b/tests/hermes_cli/kanban_review_fixture.py
+@@ -14,7 +14,7 @@ def completed_source(conn):
+     result = dispatch.dispatch_once(conn, max_spawn=1, spawn_fn=lambda task, ws: seen.append(task.id))
+     assert seen == [tid], result
+     task = kb.get_task(conn, tid)
+-    assert task.current_run_id is not None
++    assert task is not None and task.current_run_id is not None
+     # Simulated completion output from this actual dispatched source run.
+     kb._append_event(conn, tid, "worker_result", {"route_model": AUTHOR, "route_provider": "anthropic"},
+                      run_id=task.current_run_id)
+@@ -24,6 +24,26 @@ def completed_source(conn):
+     return tid
+ 
+ 
++def completed_gateway_source(gateway, **kwargs):
++    """Publish and lease a real source run before synced candidate/race setup."""
++    gateway.enter()
++    conn = gateway.conn
++    tid = kb.create_task(conn, title=SOURCE_TITLE, assignee="default", **kwargs)
++    gateway.round()
++    result = gateway.tick(max_spawn=1)
++    assert [row[0] for row in result.spawned] == [tid], result
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.current_run_id is not None
++    kb._append_event(conn, tid, "worker_result", {"route_model": AUTHOR, "route_provider": "anthropic"},
++                     run_id=task.current_run_id)
++    assert kb.request_review(conn, tid, summary="Fixture implementation ready",
++                             expected_run_id=task.current_run_id)
++    assert implementer_models(conn, kb.get_task(conn, tid)) == {AUTHOR}
++    assert kb.complete_task(conn, tid, summary="Fixture source complete")
++    gateway.round()
++    return tid
++
++
+ def source_id(conn):
+     row = conn.execute("SELECT id FROM tasks WHERE title=? AND status='done'", (SOURCE_TITLE,)).fetchone()
+     assert row is not None, "Set up a real dispatched source before candidates"
+diff --git a/tests/hermes_cli/test_kanban_capacity_order.py b/tests/hermes_cli/test_kanban_capacity_order.py
+index cd754bd12c..5f57f5552e 100644
+--- a/tests/hermes_cli/test_kanban_capacity_order.py
++++ b/tests/hermes_cli/test_kanban_capacity_order.py
+@@ -7,11 +7,20 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as client
+ from tests.hermes_cli import test_kanban_runs_on_dispatch as support
++from tests.hermes_cli.kanban_review_fixture import create_review
+ 
+-gws = support.gws
++dispatch_gws = support.gws
+ svc = support.svc
+ 
+ 
++@pytest.fixture
++def gws(dispatch_gws):
++    from tests.hermes_cli.kanban_review_fixture import completed_gateway_source
++    hub, _ = dispatch_gws
++    completed_gateway_source(hub)
++    return dispatch_gws
++
++
+ @pytest.mark.parametrize("lane", ["ready", "review"])
+ @pytest.mark.parametrize("inherited", [False, True])
+ def test_capacity_release_restarts_in_priority_order(gws, monkeypatch, lane, inherited):
+@@ -19,11 +28,10 @@ def test_capacity_release_restarts_in_priority_order(gws, monkeypatch, lane, inh
+     hub.enter()
+     cards = {}
+     for priority in (0, 530, 150, 900, 460):
+-        tid = kb.create_task(hub.conn, title=f"priority {priority}", assignee="default",
++        create = create_review if lane == "review" else kb.create_task
++        tid = create(hub.conn, title=f"priority {priority}", assignee="default",
+                              priority=0 if inherited and priority == 900 else priority)
+         cards[priority] = tid
+-        if lane == "review":
+-            assert kb.request_review(hub.conn, tid, summary="review")
+     if inherited:
+         kb.create_task(hub.conn, title="urgent waiter", assignee="default", priority=900, parents=[cards[900]])
+     hub.round()
+@@ -55,11 +63,9 @@ def test_capacity_release_restarts_in_priority_order(gws, monkeypatch, lane, inh
+ def test_card_specific_refusals_do_not_fence_other_candidates(gws, monkeypatch, lane, reason):
+     hub, _ = gws
+     hub.enter()
+-    high = kb.create_task(hub.conn, title="higher", assignee="default", priority=900)
+-    low = kb.create_task(hub.conn, title="lower", assignee="default", priority=100)
+-    if lane == "review":
+-        for tid in (high, low):
+-            assert kb.request_review(hub.conn, tid, summary="review")
++    create = create_review if lane == "review" else kb.create_task
++    high = create(hub.conn, title="higher", assignee="default", priority=900)
++    low = create(hub.conn, title="lower", assignee="default", priority=100)
+     hub.round()
+     acquire = client.HubLeaseClient.acquire
+ 
+@@ -81,8 +87,7 @@ def test_capacity_fence_covers_combined_ranked_pass(gws, monkeypatch, refused_la
+     hub.enter()
+     ready = [kb.create_task(hub.conn, title=f"ready {p}", assignee="default", priority=p)
+              for p in (900, 530, 100)]
+-    review = kb.create_task(hub.conn, title="ranked review", assignee="default", priority=700)
+-    assert kb.request_review(hub.conn, review, summary="review")
++    review = create_review(hub.conn, title="ranked review", assignee="default", priority=700)
+     # This exercises Board capacity, not the per-tick admission budget. Pre-admit
+     # the review row so all four candidates can reach the lease boundary.
+     from hermes_cli import kanban_hub_admission_claim as admission
+diff --git a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+index a5d0573139..0f88c2c784 100644
+--- a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
++++ b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+@@ -15,7 +15,13 @@ _claim_screen_first = helpers._claim_screen_first
+ 
+ 
+ def _park(hub, lane, monkeypatch):
+-    tid = helpers._hub_card(hub)
++    if lane == "review":
++        from tests.hermes_cli.kanban_review_fixture import completed_gateway_source, create_review
++        completed_gateway_source(hub, runs_on=[f"machine:{hub.name}"])
++        tid = create_review(hub.conn, "refactor the dashboard table", "default",
++                            body="Portable repo work: edit, test, PR.")
++    else:
++        tid = helpers._hub_card(hub)
+     now = int(time.time())
+     cmd = "test -f ~/.hermes/cache/ready.flag"
+     with kb.write_txn(hub.conn):
+diff --git a/tests/hermes_cli/test_kanban_review_lifecycle.py b/tests/hermes_cli/test_kanban_review_lifecycle.py
+index d86ce89e7c..c04ae5e197 100644
+--- a/tests/hermes_cli/test_kanban_review_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle.py
+@@ -54,6 +54,24 @@ def _row(conn, tid):
+     ).fetchone()
+ 
+ 
++@pytest.fixture
++def routed_home(kanban_home):
++    """Actual eligible profiles and a completed source before dispatch/cap tests."""
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from tests.hermes_cli.kanban_review_fixture import completed_source
++    (kanban_home / "config.yaml").write_text(_managed_yaml())
++    for name in ("worker", "reviewer", "dev", "closer", "builder"):
++        assert _assignee_config(name) is None
++        profile = kanban_home / "profiles" / name
++        profile.mkdir(parents=True)
++        (profile / "config.yaml").write_text(_managed_yaml())
++        assert _assignee_config(name)["model_routing"]["enabled"] is True
++    with kbc.connect() as conn:
++        completed_source(conn)
++    return kanban_home
++
++
+ def _events(conn, tid, kind=None):
+     rows = conn.execute(
+         "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+@@ -382,7 +400,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
+ 
+ 
+ def test_review_dispatch_gate_prevents_phantom_reviewer(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+     """With ``kanban.review_dispatch=false`` the dispatcher must NOT claim a
+     task parked in ``review`` (this deployment explicitly waits for a human).
+@@ -392,7 +410,9 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
+     import hermes_cli.profiles as profmod
+ 
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="park", assignee="worker")
++        from tests.hermes_cli.kanban_review_fixture import source_id
++        tid = kb.create_task(conn, title="Independent review of park", assignee="worker",
++                             creator_task_id=source_id(conn))
+         kb.claim_task(conn, tid)
+         kb.request_review(
+             conn, tid, summary="done",
+@@ -424,7 +444,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
+ 
+ 
+ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+     """B2 regression: a fresh PR-URL comment must not block reviewer spawns.
+ 
+@@ -446,7 +466,9 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
+ 
+     with kbc.connect() as conn:
+         # Review-lane task with a fresh PR comment.
+-        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
++        from tests.hermes_cli.kanban_review_fixture import source_id
++        review_id = kb.create_task(conn, title="Independent review of feature", assignee="reviewer",
++                                   creator_task_id=source_id(conn))
+         claimed = kb.claim_task(conn, review_id)
+         assert claimed is not None
+         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
+@@ -495,7 +517,7 @@ def _backdate_comments(conn, tid, seconds=60):
+ 
+ 
+ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+     """A ready card whose PR is open spawns the profile it was handed to.
+ 
+@@ -537,7 +559,7 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
+ 
+ 
+ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Only a handoff to a DIFFERENT profile lifts ``active_pr``.
+ 
+@@ -635,7 +657,7 @@ def test_dispatch_json_exposes_suppression_reasons(
+ 
+ 
+ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+     import hermes_cli.config as cfgmod
+     import hermes_cli.profiles as profmod
+@@ -653,10 +675,12 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+         captured.append(list(task.skills or []))
+ 
+     with kbc.connect() as conn:
++        from tests.hermes_cli.kanban_review_fixture import source_id
+         task_id = kb.create_task(
+             conn,
+-            title="domain review",
++            title="Independent review of domain feature",
+             assignee="reviewer",
++            creator_task_id=source_id(conn),
+             skills=["domain-specific-review"],
+         )
+         implementation = kb.claim_task(conn, task_id)
+@@ -687,7 +711,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+ 
+ 
+ def test_review_dispatch_honors_global_and_per_profile_caps(
+-    kanban_home: Path,
++    routed_home: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     import hermes_cli.config as cfgmod
+@@ -706,8 +730,10 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
+         assert running is not None
+ 
+         review_ids: list[str] = []
++        from tests.hermes_cli.kanban_review_fixture import source_id
+         for title in ("review one", "review two"):
+-            task_id = kb.create_task(conn, title=title, assignee="reviewer")
++            task_id = kb.create_task(conn, title=f"Independent review of {title}", assignee="reviewer",
++                                     creator_task_id=source_id(conn))
+             implementation = kb.claim_task(conn, task_id)
+             assert implementation is not None
+             assert kb.request_review(
+@@ -933,7 +959,7 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
+ 
+ 
+ def test_active_pr_guard_lifts_when_the_card_is_unblocked_after_the_pr(
+-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
++    routed_home: Path, monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """A worker opens its PR, blocks waiting for the merge, and is unblocked.
+ 
+diff --git a/tests/hermes_cli/test_kanban_runs_on_dispatch.py b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
+index e3848a5d48..e1ddaccd9d 100644
+--- a/tests/hermes_cli/test_kanban_runs_on_dispatch.py
++++ b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
+@@ -54,7 +54,12 @@ def _review_card_pinned_to_worker(hub, worker):
+     assert tid in _spawned(worker.tick())
+     worker.enter()
+     run_id = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    from tests.hermes_cli.kanban_review_fixture import AUTHOR
++    from hermes_cli.kanban_review_model import implementer_models
++    kb._append_event(worker.conn, tid, "worker_result",
++                     {"route_model": AUTHOR, "route_provider": "anthropic"}, run_id=run_id)
+     assert kb.request_review(worker.conn, tid, summary="implemented", expected_run_id=run_id)
++    assert implementer_models(worker.conn, kb.get_task(worker.conn, tid)) == {AUTHOR}
+     worker.round()
+     hub.round()
+     assert kb.get_task(hub.conn, tid).status == "review"
+@@ -133,8 +138,9 @@ def test_a_deferred_review_claim_hands_its_slot_to_ready_work(gws, svc):
+     reserved slot goes to the next ready card instead of ending the tick."""
+     hub, _ = gws
+     hub.enter()
+-    review = kb.create_task(hub.conn, title="needs review", assignee="default")
+-    assert kb.request_review(hub.conn, review, summary="x")
++    from tests.hermes_cli.kanban_review_fixture import completed_gateway_source, create_review
++    completed_gateway_source(hub)
++    review = create_review(hub.conn, title="needs review", assignee="default")
+     hub.round()
+     svc.board(BOARD)["leases"][review] = {"task_id": review, "holder": "mini", "run_uid": "r-mini", "lane": "review",
+                                           "expires": 9e12}
+@@ -161,6 +167,7 @@ def test_unsynced_boards_are_unaffected(tmp_path, monkeypatch):
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "normal")
+     home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_routed_sync_config(home, False)
+     conn = kbc.connect(home / "kanban.db")
+     try:
+         tid = kb.create_task(conn, title="plain", assignee="default")
+-- 
+2.43.0
+

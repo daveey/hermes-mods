@@ -1,0 +1,179 @@
+From 1a324c2388403e50a54a8d67c1786641bd40c027 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 10:27:07 +0000
+Subject: [PATCH] [daveey] Distinguish live provider retries from backend crash
+ recovery
+
+Pass invocation-local refusal evidence from the retry timer, retain the machine-note prefix and leave cold crash replay unchanged. No durable marker or attempt policy changes.
+
+Proof: new regression red on base (retry falsely claims backend stopped; crash control passes); 96 focused retry, crash and outcome tests pass.
+---
+ .../test_outcome_late_turn_end_refresh.py     |  2 +-
+ .../hermes_state/test_outcome_run_custody.py  |  2 +-
+ tests/tui_gateway/test_refused_retry_note.py  | 41 +++++++++++++++++++
+ tests/tui_gateway/test_refused_turn_retry.py  |  8 ++--
+ tui_gateway/session_auto_continue.py          | 15 ++++---
+ 5 files changed, 57 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tui_gateway/test_refused_retry_note.py
+
+diff --git a/tests/hermes_state/test_outcome_late_turn_end_refresh.py b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+index 58ee34128c..db2e7be106 100644
+--- a/tests/hermes_state/test_outcome_late_turn_end_refresh.py
++++ b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+@@ -323,7 +323,7 @@ def _arm_refused_retry(db, monkeypatch, timers, concluding):
+ 
+     monkeypatch.setattr(server, "_hermes_home", db.db_path.parent)
+     _tui_scope(monkeypatch, db)
+-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
+     monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
+     session = {"session_key": "chat", "agent": None, "_refused_turn_delay": 45.0}
+     server._schedule_refused_turn_retry("chat", session, "retry-marker-key", concluding)
+diff --git a/tests/hermes_state/test_outcome_run_custody.py b/tests/hermes_state/test_outcome_run_custody.py
+index 60bd6950aa..a55294176d 100644
+--- a/tests/hermes_state/test_outcome_run_custody.py
++++ b/tests/hermes_state/test_outcome_run_custody.py
+@@ -24,7 +24,7 @@ timers = late.timers
+ @pytest.mark.parametrize("explicit", [False, True])
+ def test_retry_targets_frozen_sid_after_agent_replacement(db, monkeypatch, timers, explicit):
+     late._tui_scope(monkeypatch, db)
+-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
+     monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
+     session = {"session_key": "root", "agent": SimpleNamespace(session_id="old-tip"),
+                "_refused_turn_delay": 45}
+diff --git a/tests/tui_gateway/test_refused_retry_note.py b/tests/tui_gateway/test_refused_retry_note.py
+new file mode 100644
+index 0000000000..26c64df2bb
+--- /dev/null
++++ b/tests/tui_gateway/test_refused_retry_note.py
+@@ -0,0 +1,41 @@
++"""A live retryable refusal is not evidence that the backend crashed."""
++
++import pytest
++
++from tui_gateway import server
++from tui_gateway.turn_marker import record_turn_start
++from tests.tui_gateway import test_refused_turn_retry as helpers
++from tests.tui_gateway.test_auto_continue import _session
++
++emits = helpers.emits
++turn_env = helpers.turn_env
++marker_home = helpers.marker_home
++timers = helpers.timers
++
++
++@pytest.mark.parametrize("refused", [True, False])
++def test_live_refusal_retry_and_crash_replay_have_distinct_notes(
++        emits, turn_env, marker_home, timers, monkeypatch, refused):
++    session = _session(agent=helpers._agent(), _refused_turn_delay=45.0)
++    record_turn_start(marker_home, "session-key", "archive receipts")
++    seen = []
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_adopt_stored_continuation_source", lambda *a: None)
++    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: seen.append((a[3], k)))
++    if refused:
++        server._schedule_refused_turn_retry("sid", session, "session-key")
++        timers[-1][1]()
++    else:
++        server._maybe_schedule_auto_continue("sid", session, "session-key")
++    text, kwargs = seen[0]
++    assert text.startswith("[System note: Your previous turn was interrupted mid-run")
++    assert text.endswith("archive receipts")
++    assert kwargs["display_kind"] == "auto_continue"
++    assert session["_auto_continue_attempt"] == 1
++    assert ("backend process stopped" in text) is not refused
++    assert ("the provider refused the turn with a retryable error" in text) is refused
++    assert ("the backend did not stop" in text) is refused
++
+diff --git a/tests/tui_gateway/test_refused_turn_retry.py b/tests/tui_gateway/test_refused_turn_retry.py
+index 3267528606..b038c4a439 100644
+--- a/tests/tui_gateway/test_refused_turn_retry.py
++++ b/tests/tui_gateway/test_refused_turn_retry.py
+@@ -408,7 +408,7 @@ def test_a_new_message_that_works_ends_the_replay(emits, turn_env, marker_home,
+     session["running"] = True
+     server._run_prompt_submit("rid", "sid", session, "something else")
+     assert read_turn_marker(marker_home, "session-key") is None
+-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: calls.append(a))
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: calls.append(a))
+     monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
+     monkeypatch.setattr("tui_gateway.turn_outcome.refresh_turn_outcome", lambda *a, **kw: None)
+     timers[0][1]()
+@@ -424,11 +424,11 @@ def _armed(marker_home, timers, monkeypatch):
+ 
+ def test_the_wait_replays_through_auto_continue(emits, turn_env, marker_home, timers, monkeypatch):
+     seen = []
+-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: seen.append(a) or {"attempt": 1})
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: seen.append((a, k)) or {"attempt": 1})
+     monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
+     session, fire = _armed(marker_home, timers, monkeypatch)
+     fire()
+-    assert seen == [("sid", session, "session-key")]
++    assert seen == [(("sid", session, "session-key"), {"refused_retry": True})]
+ 
+ 
+ def test_a_skewed_backend_leaves_the_marker_for_the_boot_sweep(emits, turn_env, marker_home, timers, monkeypatch):
+@@ -446,7 +446,7 @@ def test_a_marker_that_aged_out_settles_the_outcome(emits, turn_env, marker_home
+     monkeypatch.setattr("tui_gateway.turn_outcome.refresh_turn_outcome", lambda *a, **kw: refreshed.append(a))
+     _, fire = _armed(marker_home, timers, monkeypatch)
+ 
+-    def aged_out(sid, sess, key):
++    def aged_out(sid, sess, key, **kwargs):
+         server.clear_turn_marker(marker_home, key)
+ 
+     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", aged_out)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 12a99ed026..a58a05374e 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -136,7 +136,7 @@ def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str,
+         from tui_gateway.update_pause import _detect_skew
+         if _detect_skew() is not None:
+             return
+-        if _maybe_schedule_auto_continue(sid, session, marker_key) is None \
++        if _maybe_schedule_auto_continue(sid, session, marker_key, refused_retry=True) is None \
+                 and read_turn_marker(_session_home(session), marker_key) is None:
+             from tui_gateway.turn_outcome import refresh_turn_outcome
+             refresh_turn_outcome(session, concluding_turn=concluding, session_id=outcome_sid)
+@@ -146,10 +146,12 @@ def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str,
+     timer.start()
+ 
+ 
+-def _auto_continue_note(prompt: str) -> str:
++def _auto_continue_note(prompt: str, *, refused_retry: bool = False) -> str:
+     # Same opening as the gateway's recovery notes (transcript tooling recognizes both). The prompt is embedded: a hard
+     # crash persists nothing else of the turn.
+-    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process stopped before the turn could finish. "
++    cause = ("the provider refused the turn with a retryable error; the backend did not stop. " if refused_retry
++             else "the app or its backend process stopped before the turn could finish. ")
++    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — {cause}"
+             "Some of the work may already be complete; check the current state before redoing anything, then "
+             f"finish the task. The interrupted request was:]\n\n{prompt}")
+ 
+@@ -209,7 +211,8 @@ def _adopt_stored_continuation_source(sid: str, session: dict, session_key: str)
+ from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_MAX_AGE_S, UPDATE_HOLD_QUEUE_REASON
+ 
+ 
+-def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
++def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str, *,
++                                   refused_retry: bool = False) -> dict | None:
+     """Kick off a continuation turn for a crash-interrupted session (session.resume cold paths). Returns a descriptor
+     for the resume payload when scheduled, else None. The turn runs on a background thread after the deferred agent
+     build via _run_prompt_submit, so the client that just resumed streams it."""
+@@ -279,7 +282,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     elif receipt:
+         attempt, text = marker["attempts"], jobs_stopped_note(marker.get("killed_jobs"))
+     else:
+-        attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
++        # Only the live timer knows this was a handled refusal, not a backend death.
++        # Invocation-local evidence cannot survive a crash or contaminate another replay.
++        attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"], refused_retry=refused_retry)
+     if not (paused or receipt) and marker.get("killed_jobs"):
+         from tui_gateway.update_pause import killed_jobs_report
+         text += "\n\n" + killed_jobs_report(marker["killed_jobs"], "Background jobs stopped when the turn was "
+-- 
+2.43.0
+

@@ -1,0 +1,348 @@
+From d0797e289bc08d74d3b8542d7215c9623b5f3788 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 07:33:03 +0000
+Subject: [PATCH] fix(kanban): route origin chat comments to their bound owner
+ [daveey]
+
+The owner decision notice already reaches remote origin chats, but their
+kanban_comment tool still refused replica-only targets. Add a comment-only
+courier route scoped to a validated, unreleased local origin binding and the
+current chat's continuation. Unrelated chats and workers keep their existing
+paths; this grants no unblock or human-answer authority.
+
+Reuse one durable transport request for identical text on the same owner ask.
+Distinguish queued/unknown and unconfirmed outcomes from owner-confirmed
+application. Reject oversized payloads before the legacy courier can truncate.
+
+Proof: 18 new tests, existing origin-decision and notice regressions; removing
+the tool route produces two failing tool-entry tests. scripts/check passes.
+The transport boundary is simulated; owner-side add_comment and gateway-aware
+comment probe are real SQLite operations, not a fabricated success receipt.
+
+Hermes-Card: t_7bdfdcdd4ec572a5
+---
+ hermes_cli/kanban_origin_comment.py           | 105 +++++++++++
+ .../hermes_cli/test_kanban_origin_comment.py  | 168 ++++++++++++++++++
+ tools/kanban_tools.py                         |  10 +-
+ 3 files changed, 278 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_comment.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_comment.py
+
+diff --git a/hermes_cli/kanban_origin_comment.py b/hermes_cli/kanban_origin_comment.py
+new file mode 100644
+index 0000000000..1685bbd6b4
+--- /dev/null
++++ b/hermes_cli/kanban_origin_comment.py
+@@ -0,0 +1,105 @@
++"""Comment-only courier for an interactive chat's accepted foreign origin binding. [daveey]
++
++No replica write, unblock or human-answer authority. Identical text for the same
++binding and owner ask reuses one durable courier ID, including after a timeout.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sqlite3
++import subprocess
++from contextlib import closing
++from pathlib import Path
++
++
++def bound_owner(path: Path, *, task_id: str, board: str, gateway: str,
++                profile: str, session: str, resolve_session) -> dict | None:
++    """Read accepted, unreleased bindings; never infer authority from a replica."""
++    from hermes_cli.kanban_origin_ledger import _binding_key, binding_hash, validate_binding
++    try:
++        path.lstat()
++    except FileNotFoundError:
++        return None
++    matches = {}
++    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
++        for key, digest, raw, task_raw in db.execute(
++                'SELECT binding_id,binding_hash,binding_json,task_json FROM origin_obligations WHERE released=0'):
++            binding = json.loads(raw)
++            validate_binding(binding)
++            if key != _binding_key(binding) or digest != binding_hash(binding):
++                raise ValueError('origin_binding_invalid')
++            owner, origin = binding['owner'], binding['origin']
++            if (owner['task_id'] != task_id or owner['board'] != board
++                    or owner['gateway'] == gateway or origin['gateway'] != gateway
++                    or origin['profile'] != profile):
++                continue
++            if resolve_session(origin['session']) != session:
++                continue
++            task = json.loads(task_raw)
++            ask = task.get('ask_notice') or {}
++            route = {**owner, 'binding_hash': digest, 'ask_event': ask.get('event_id')}
++            matches[json.dumps(owner, sort_keys=True)] = route
++    if len(matches) > 1:
++        raise ValueError('origin_comment_ambiguous')
++    return next(iter(matches.values()), None)
++
++
++def send(route: dict, *, session: str, body: str) -> dict:
++    """Queue exactly once. Submission is not application; only owner outcomes confirm it."""
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli.kanban_placement import _sent_row
++    if len(body) > 8000:
++        raise ValueError('origin_comment_too_long')  # courier's legacy receiver truncates beyond this
++    cli = reg.hub_cli_path()
++    if not cli:
++        raise ValueError('origin_comment_transport_unavailable')
++    frozen = json.dumps([route, session, body], sort_keys=True, ensure_ascii=False)
++    rid = 'origin-comment-' + hashlib.sha256(frozen.encode()).hexdigest()
++    prior = _sent_row(rid)
++    if not prior or prior[0] in ('local', 'queued'):
++        env = dict(os.environ, HERMES_AGENT='1', HERMES_SESSION_ID=session)
++        argv = [str(cli), 'request', route['gateway'], 'tasks',
++                f"{route['profile']}/{route['board']}/{route['task_id']}", 'comment',
++                '--arg', 'text=' + body, '--id', rid]
++        try:
++            subprocess.run(argv, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
++                           timeout=30, check=False, stdin=subprocess.DEVNULL)
++        except (OSError, subprocess.TimeoutExpired):
++            pass  # acceptance may be unknown: never replace the request ID
++    row = _sent_row(rid)
++    state = row[0] if row else 'unknown'
++    result = {'task_id': route['task_id'], 'request_id': rid, 'forwarded_to': route['gateway']}
++    if state == 'done':
++        return {**result, 'status': 'comment_applied', 'message': 'Owner courier confirms comment application.'}
++    if state in ('rejected', 'failed', 'expired'):
++        return {**result, 'status': 'comment_unconfirmed', 'message':
++                'Courier ended without confirmed application; inspect this exact request before retrying.'}
++    return {**result, 'status': 'comment_pending', 'message':
++            'Comment queued or outcome unknown; not yet confirmed on the owner. Retry identical text to inspect the same request.'}
++
++
++def forward(conn, task_id: str, args: dict, body: str) -> dict | None:
++    """Only interactive origin chats; workers retain their scoped operator route."""
++    from gateway.session_context import get_session_env
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_origin_adapter import _gateway, _resolve_session
++    if os.environ.get('HERMES_KANBAN_TASK') or conn.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
++        return None
++    session = get_session_env('HERMES_SESSION_ID', '')
++    home = get_hermes_home()
++    ledger = home / 'kanban/origin-ledger.db'
++    if not session or not ledger.exists():
++        return None
++    replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
++    route = bound_owner(ledger, task_id=task_id, board=args.get('board') or 'default',
++                        gateway=_gateway(replica), profile=get_active_profile_name(),
++                        session=_resolve_session(home / 'state.db', session),
++                        resolve_session=lambda sid: _resolve_session(home / 'state.db', sid))
++    if route is None:
++        return None
++    if args.get('relays_user_message') or args.get('relayed_human'):
++        raise ValueError('origin_comment_human_relay_unsupported')
++    return send(route, session=session, body=body)
+diff --git a/tests/hermes_cli/test_kanban_origin_comment.py b/tests/hermes_cli/test_kanban_origin_comment.py
+new file mode 100644
+index 0000000000..2d82fe3137
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_comment.py
+@@ -0,0 +1,168 @@
++"""Interactive-origin answers use accepted bindings and the existing comment courier."""
++import json
++import sqlite3
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_origin_comment as comments
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli.test_kanban_origin_ledger import world as _world, publish, accept
++from tests.hermes_cli.test_kanban_decision_ask import kanban_home as _kanban_home
++
++world = _world
++kanban_home = _kanban_home
++
++
++@pytest.fixture
++def bound(world):
++    publish(world[1], world[2])
++    accept(world)
++    return world
++
++
++def lookup(bound, **changes):
++    args = dict(task_id='t_one', board='build', gateway='origin', profile='default',
++                session='s_current', resolve_session=lambda _: 's_current')
++    args.update(changes)
++    return comments.bound_owner(bound[0], **args)
++
++
++def test_accepted_binding_resolves_compression_continuation(bound):
++    route = lookup(bound)
++    assert route['gateway'] == 'owner' and route['profile'] == 'work'
++    assert route['board'] == 'build' and route['task_id'] == 't_one'
++
++
++@pytest.mark.parametrize('change', [dict(task_id='t_other'), dict(board='other'),
++    dict(gateway='other'), dict(profile='other'), dict(session='unrelated')])
++def test_other_origin_or_target_not_authorized(bound, change):
++    assert lookup(bound, **change) is None
++
++
++@pytest.mark.parametrize('sql', [
++    'UPDATE origin_obligations SET released=1',
++    "UPDATE origin_obligations SET binding_hash='forged'",
++    "UPDATE origin_obligations SET binding_id='forged'",
++])
++def test_released_or_corrupt_binding_cannot_route(bound, sql):
++    with sqlite3.connect(bound[0]) as db:
++        db.execute(sql)
++    if 'released' in sql:
++        assert lookup(bound) is None
++    else:
++        with pytest.raises(ValueError, match='origin_binding_invalid'):
++            lookup(bound)
++
++
++def test_missing_ledger_does_not_create_one(tmp_path):
++    path = tmp_path / 'absent.db'
++    assert comments.bound_owner(path, task_id='t_one', board='build', gateway='origin',
++        profile='default', session='s_current', resolve_session=lambda x: x) is None
++    assert not path.exists()
++
++
++@pytest.fixture
++def courier(monkeypatch):
++    rows, calls = {}, []
++    monkeypatch.setattr(comments, 'send', comments.send)
++    monkeypatch.setattr(placement, '_sent_row', lambda rid: rows.get(rid))
++    monkeypatch.setattr('hermes_cli.kanban_capability_registry.hub_cli_path', lambda: '/courier')
++    def run(argv, **kw):
++        calls.append((argv, kw))
++        rows[argv[-1]] = ('queued', None)
++        return subprocess.CompletedProcess(argv, 0, 'queued', '')
++    monkeypatch.setattr(comments.subprocess, 'run', run)
++    return rows, calls
++
++
++def test_submission_is_pending_until_owner_receipt_and_retries_same_id(bound, courier):
++    rows, calls = courier
++    route = lookup(bound)
++    pending = comments.send(route, session='s_current', body='Choose option B')
++    assert pending['status'] == 'comment_pending'
++    argv, kw = calls[0]
++    assert argv[1:6] == ['request', 'owner', 'tasks', 'work/build/t_one', 'comment']
++    assert 'text=Choose option B' in argv
++    assert kw['env']['HERMES_AGENT'] == '1'
++    assert kw['env']['HERMES_SESSION_ID'] == 's_current'
++    assert comments.send(route, session='s_current', body='Choose option B')['request_id'] == pending['request_id']
++    rows[pending['request_id']] = ('done', json.dumps({'output': 'Comment added'}))
++    assert comments.send(route, session='s_current', body='Choose option B')['status'] == 'comment_applied'
++    assert len(calls) == 2  # no re-submission once done
++
++
++@pytest.mark.parametrize('state', ['rejected', 'failed', 'expired'])
++def test_uncertain_terminal_outcome_never_reissues(bound, courier, state):
++    rows, calls = courier
++    route = lookup(bound)
++    first = comments.send(route, session='s_current', body='B')
++    rows[first['request_id']] = (state, '{}')
++    assert comments.send(route, session='s_current', body='B')['status'] == 'comment_unconfirmed'
++    assert len(calls) == 1
++
++
++def test_timeout_keeps_frozen_id(bound, courier, monkeypatch):
++    seen = []
++    def timeout(argv, **kw):
++        seen.append(argv[-1])
++        raise subprocess.TimeoutExpired(argv, 30)
++    monkeypatch.setattr(comments.subprocess, 'run', timeout)
++    for _ in range(2):
++        assert comments.send(lookup(bound), session='s_current', body='B')['status'] == 'comment_pending'
++    assert seen[0] == seen[1]
++
++
++@pytest.mark.parametrize('human', [False, True])
++def test_origin_tool_comment_reaches_owner_only_as_agent(kanban_home, world, monkeypatch, tmp_path, human):
++    import shutil
++    from gateway.session_context import scoped_current_session_id
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_origin_adapter as adapter
++    from hermes_cli.kanban_comment_origin import find_comment
++    from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++    with kbc.connect_closing(tmp_path / 'owner.db') as owner:
++        tid = helpers._running(owner)
++        binding = world[2]
++        binding['owner'].update(task_id=tid, board='default')
++        binding['task_record_key'] = f'work/default/{tid}'
++        publish(world[1], binding)
++        accept(world)
++        home = get_hermes_home()
++        (home / 'kanban').mkdir(exist_ok=True)
++        shutil.copyfile(world[0], home / 'kanban/origin-ledger.db')
++        helpers._session('s_old')
++        monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++        monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++        rows = {}
++        monkeypatch.setattr(placement, '_sent_row', lambda rid: rows.get(rid))
++        monkeypatch.setattr('hermes_cli.kanban_capability_registry.hub_cli_path', lambda: '/courier')
++        def deliver(argv, **kw):
++            # Transport boundary: server stamps the sender; real owner writer and probe read.
++            assert kw['env']['HERMES_AGENT'] == '1'
++            assert argv[4] == f'work/default/{tid}'
++            body = argv[7].removeprefix('text=')
++            kb.add_comment(owner, tid, author='hub:gw:origin', body=body,
++                writer_kind='agent', writer_session=kw['env']['HERMES_SESSION_ID'], origin_gateway='origin')
++            rows[argv[-1]] = ('done', '{}')
++            return subprocess.CompletedProcess(argv, 0, '', '')
++        monkeypatch.setattr(comments.subprocess, 'run', deliver)
++        with scoped_current_session_id('s_old'):
++            out = helpers._tool('comment', {'task_id': tid, 'body': 'Choose B', 'relays_user_message': human})
++        hit = find_comment(owner, tid, from_gateway='origin', skip_system=True)
++        if human:
++            assert hit is None
++            assert 'origin_comment_human_relay_unsupported' in out.get('error', '')
++        else:
++            assert out['status'] == 'comment_applied', out
++            assert hit['body'] == 'Choose B'
++            assert kb.get_task(owner, tid).status == 'running'  # no unblock/status authority
++
++
++def test_oversize_text_is_refused_not_truncated(bound, courier):
++    with pytest.raises(ValueError, match='origin_comment_too_long'):
++        comments.send(lookup(bound), session='s_current', body='x' * 8001)
++    assert courier[1] == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 71440471b9..82c717cc6a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1351,20 +1351,20 @@ def _handle_comment(args: dict, **kw) -> str:
+     _reject_delegated_child_mutation("kanban_comment", args)
+     tid = args.get("task_id")
+     if not tid:
+-        # A comment writes to the board, so a bare call must stay an error — but
+-        # point at kanban_list, not an env var a chat caller cannot set (#91431).
++        # Comments are per-task; a chat has no dispatcher default.
+         raise _Reject(
+             "task_id is required: comments are per-task and this session has no "
+             "dispatcher-assigned task to default to. Discover task ids with "
+             "kanban_list, or pass the task id you mean.")
+     body = _redact(_require_text(args, "body"))
+-    # Author comes from the worker's runtime identity (``_persisted_identity``), never caller args: comments are
+-    # injected into future workers' system prompts (``build_worker_context``), so an ``args["author"]`` override
+-    # could forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted. See #19713.
++    # Runtime identity only: caller-supplied authors could forge worker directives (#19713).
+     author = _persisted_identity()
+     with _board(args.get("board")) as (kb, conn):
+         from hermes_cli import kanban_foreign_card as _kfc
+         from hermes_cli import kanban_relayed_human as _krh
++        from hermes_cli.kanban_origin_comment import forward
++        if forwarded := forward(conn, str(tid), args, str(body)):
++            return _ok(**forwarded)
+         foreign = _kfc.refusal(conn, str(tid))  # [daveey] only a replica copy here: name the owner
+         if foreign:
+             raise _Reject(foreign, _kfc.REJECTION)
+-- 
+2.43.0
+

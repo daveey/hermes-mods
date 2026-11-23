@@ -1,0 +1,182 @@
+From 699b7de0787e6f2809ed967e14570833c000d583 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:30:13 +0000
+Subject: [PATCH] [daveey] lanes: one spend scan per projection; reuse
+ request-derived PR url per card
+
+The lanes flow projection ran the whole worker_result spend aggregate once per lane
+(spent_today in a loop) and re-derived each card's PR url from its full history although
+Evidence already holds it. On a 156-open-card board that is about 0.3 s and 0.2 s of a ~1 s
+expanded projection; on the loaded hub the same projection took ~3 s and was the dominant stage
+of the lanes push change->frame latency (t_45b2ec2f725df5fd).
+
+- lanes.spent_by_lane: one scan, same rounding and per-lane association as spent_today
+  (which now delegates); flow.snapshot uses it once.
+- flow._pr_snapshot(url=): _card_from_row passes the evidence-derived URL (identical derivation).
+
+Proof: tests compare the single scan to the legacy per-lane scan for known/unknown tenants,
+assert one worker_result scan, and compare evidence vs plain flow PR urls. RED before
+(spent_by_lane missing), GREEN after; test_kanban_lanes{,_flow,_sources}: 106 passed.
+---
+ hermes_cli/kanban_lanes.py                 | 20 +++++--
+ hermes_cli/kanban_lanes_flow.py            | 11 ++--
+ tests/hermes_cli/test_kanban_lanes_flow.py | 65 ++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index 601745458d..c13a7f6616 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -545,19 +545,27 @@ def cards_today(conn, lane: str, *, now: Optional[float] = None, pol=None) -> in
+     return count(conn, lane, now=now, pol=pol)
+ 
+ 
+-def spent_today(conn, pol: Policy, lane: str, *, now: Optional[float] = None) -> float:
+-    """Run spend charged to ``lane`` since local midnight (same receipts ``usage`` uses)."""
++def spent_by_lane(conn, pol: Policy, *, now: Optional[float] = None) -> dict[str, float]:
++    """Run spend charged to every lane since local midnight, from ONE scan of the receipts. [daveey]
++
++    ``spent_today`` per lane re-ran this whole aggregate once for each lane in every lanes projection.
++    """
+     start = day_start(now)
+-    total = 0.0
++    totals = {name: 0.0 for name in pol.lanes}
+     for tenant, cost in conn.execute(
+             "SELECT tenant, SUM(cost) FROM ("
+             "SELECT t.tenant AS tenant, MAX(COALESCE(json_extract(e.payload, '$.usage.cost_usd'), 0)) AS cost "
+             "FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE e.kind = 'worker_result' "
+             "AND e.created_at >= ? AND json_extract(e.payload, '$.usage') IS NOT NULL "
+             "GROUP BY e.task_id, e.run_id) GROUP BY tenant", (start,)):
+-        if pol.lane_of(tenant) == lane:
+-            total += float(cost or 0)
+-    return round(total, 2)
++        name = pol.lane_of(tenant)
++        totals[name] = totals.get(name, 0.0) + float(cost or 0)
++    return {name: round(total, 2) for name, total in totals.items()}
++
++
++def spent_today(conn, pol: Policy, lane: str, *, now: Optional[float] = None) -> float:
++    """Run spend charged to ``lane`` since local midnight (same receipts ``usage`` uses)."""
++    return spent_by_lane(conn, pol, now=now).get(lane, 0.0)
+ 
+ 
+ def _daily_limit_reason(conn, pol: Policy, lane_name: str, opts: dict) -> Optional[str]:
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index 74b7c4d8bb..43da95b471 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -186,9 +186,10 @@ def _pr_url(task, events) -> Optional[str]:
+     return None
+ 
+ 
+-def _pr_snapshot(task, events, awaiting, reader=None) -> Optional[dict]:
++def _pr_snapshot(task, events, awaiting, reader=None, *, url=None) -> Optional[dict]:
+     snap: dict[str, Any] = {}
+-    url = _pr_url(task, events)
++    # A caller holding the card's already derived URL (request evidence) skips re-deriving it from the history.
++    url = url or _pr_url(task, events)
+     if not url and isinstance(awaiting, dict):
+         ref = awaiting.get("ref")
+         if isinstance(ref, str) and ref.startswith("https://github.com/") and "/pull/" in ref:
+@@ -269,7 +270,8 @@ def _card_from_row(conn, task, now: float, reader=None, pol=None, *, evidence=No
+     creator = next((_payload(dict(e)).get("creator_task_id") for e in events if e["kind"] == "created"), None)
+     human = _json_obj(task["human_request"] if "human_request" in task.keys() else None)
+     age = max(0.0, (now - float(task["created_at"] or now)) / 3600.0)
+-    pr = _pr_snapshot(task, events, awaited, reader)
++    pr = _pr_snapshot(task, events, awaited, reader,
++                      url=None if evidence is None else evidence.pr_url(task))
+     event_dicts = [{"kind": e["kind"], "payload": e["payload"]} for e in events]
+     return {
+         "id": task["id"], "title": task["title"], "status": task["status"],
+@@ -339,6 +341,7 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+             blockers = evidence.blockers(card["id"])
+             cards[-1].update(blockers=blockers, blocker=blockers[0] if blockers else None)
+     out_lanes = {}
++    spent = lanes.spent_by_lane(conn, pol, now=now)
+     for name, spec in pol.lanes.items():
+         row = usage[name]
+         out_lanes[name] = {
+@@ -348,6 +351,6 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+             "limits": {"cards_per_day": spec.cards_per_day, "usd_per_day": spec.usd_per_day,
+                        "max_workers": spec.max_workers},
+             "usage": {"cards_today": lanes.cards_today(conn, name, now=now, pol=pol),
+-                      "usd_today": lanes.spent_today(conn, pol, name, now=now)},
++                      "usd_today": spent.get(name, 0.0)},
+         }
+     return {"window": window, "cards": cards, "lanes": out_lanes}
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow.py b/tests/hermes_cli/test_kanban_lanes_flow.py
+index 0bdbc3d7b4..b0dea26fb4 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow.py
+@@ -164,3 +164,68 @@ def test_set_persists_daily_limits(conn, configured):
+ def test_unknown_window_is_rejected():
+     with pytest.raises(SystemExit):
+         cli("lanes", "flow", "--json", "--window", "2h")
++
++
++def _legacy_spent(conn, pol, lane, now):
++    """The per-lane scan spent_today used before one aggregate served every lane."""
++    total = 0.0
++    for tenant, cost in conn.execute(
++            "SELECT tenant, SUM(cost) FROM (SELECT t.tenant AS tenant, "
++            "MAX(COALESCE(json_extract(e.payload, '$.usage.cost_usd'), 0)) AS cost FROM task_events e "
++            "JOIN tasks t ON t.id = e.task_id WHERE e.kind = 'worker_result' AND e.created_at >= ? "
++            "AND json_extract(e.payload, '$.usage') IS NOT NULL GROUP BY e.task_id, e.run_id) GROUP BY tenant",
++            (lanes.day_start(now),)):
++        if pol.lane_of(tenant) == lane:
++            total += float(cost or 0)
++    return round(total, 2)
++
++
++def test_spend_comes_from_one_scan_and_equals_the_per_lane_scan(conn, configured):
++    configured()
++    now = int(time.time())
++    pol = lanes.policy()
++    for lane, cost in (("myapp", 1.25), ("myapp", 2.5), ("other", 0.1), ("stranger", 7.0)):
++        tid = base._ready_in(conn, lane, f"spend {lane} {cost}")
++        conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at) VALUES (?, 'done', ?, ?)",
++                     (tid, now - 10, now - 1))
++        run_id = conn.execute("SELECT MAX(id) FROM task_runs").fetchone()[0]
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
++                     (tid, run_id, "worker_result", json.dumps({"usage": {"cost_usd": cost}}), now - 1))
++    conn.commit()
++    scans = []
++    conn.set_trace_callback(lambda sql: scans.append(sql) if "worker_result" in sql else None)
++    spent = lanes.spent_by_lane(conn, pol, now=now)
++    assert len(scans) == 1
++    assert set(spent) >= set(pol.lanes)
++    for name in pol.lanes:
++        assert spent[name] == _legacy_spent(conn, pol, name, now) == lanes.spent_today(conn, pol, name, now=now)
++    assert spent["myapp"] == 3.75 and spent[pol.lane_of("stranger")] >= 7.0
++    scans.clear()
++    snap = flow.snapshot(conn, window="6h", now=now, pol=pol, reader=type("R", (), {
++        "prefetch": lambda self, urls: None, "get": lambda self, url: {}})())
++    assert len([s for s in scans if "GROUP BY e.task_id, e.run_id" in s and "created_at >= " in s]) >= 1
++    assert snap["lanes"]["myapp"]["usage"]["usd_today"] == 3.75
++
++
++def test_evidence_projection_equals_plain_projection_with_pr_urls(conn, configured):
++    configured()
++    now = int(time.time())
++    pol = lanes.policy()
++    published = base._ready_in(conn, "myapp", "published")
++    waiting = base._ready_in(conn, "myapp", "waiting on ci")
++    base._ready_in(conn, "myapp", "plain")
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'review_requested', ?, ?)",
++                 (published, json.dumps({"metadata": {"pr": "https://github.com/example/repo/pull/7"}}), now))
++    conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (waiting,))
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', ?, ?)",
++                 (waiting, json.dumps({"awaiting": {"kind": "ci", "ref": "https://github.com/example/repo/pull/8"}}), now))
++    conn.commit()
++    reader = type("R", (), {"prefetch": lambda self, urls: None, "get": lambda self, url: {}})()
++    from hermes_cli.kanban_lanes_flow_evidence import Evidence
++    with_evidence = flow.snapshot(conn, window="6h", now=now, pol=pol, reader=reader, evidence=Evidence(conn))
++    plain_cards = [flow._card_from_row(conn, row, now, reader, pol) for row in
++                   conn.execute(f"SELECT * FROM tasks WHERE status IN {flow._OPEN} ORDER BY created_at, id")]
++    by_id = {c["id"]: c["pr"] for c in with_evidence["cards"]}
++    assert by_id[published] == "https://github.com/example/repo/pull/7"
++    assert by_id[waiting] == "https://github.com/example/repo/pull/8"
++    assert by_id == {c["id"]: (c["pr"] or {}).get("url") for c in plain_cards}
+-- 
+2.43.0
+

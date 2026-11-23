@@ -1,0 +1,1058 @@
+From 1ce762ba46395db4a3fcde29db690db800f5b43a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:33:58 -0800
+Subject: [PATCH] [daveey] kanban: escalate stranded parked cards once per park
+ episode
+
+A card parked in triage/blocked past kanban.stranded_park_seconds (7200) with no
+valid human_request and no live owner now gets one generated approval request
+(promote / archive / re-scope), an optional triage-desk binding
+(kanban.triage_owner_chat) and a stranded_park_escalated event per park episode
+(kanban_stranded_park, run last in sweep_blocked_cards, isolated from the tick).
+The sweep does real work at most once per
+kanban.stranded_sweep_interval_seconds (300) per board per process, and opens
+each state.db at most once per pass (Liveness cache).
+
+A live owner is an unreleased chat link whose chat is live (local: state.db row
+present, not archived/auto_archived/hidden, and open or active within
+kanban.stranded_owner_idle_seconds; remote: assumed live) or an open
+spend-decision supervisor card for the current spend episode. The spend decision
+producer no longer binds or counts a dead local chat, so it falls through to the
+supervisor card.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/config_defaults.py                 |  16 +-
+ hermes_cli/kanban_block_policy.py             |   9 +-
+ hermes_cli/kanban_spend_decision.py           |  42 +-
+ hermes_cli/kanban_stranded_park.py            | 464 ++++++++++++++++++
+ .../test_kanban_spend_decision_routing.py     |  40 ++
+ tests/hermes_cli/test_kanban_stranded_park.py | 368 ++++++++++++++
+ 6 files changed, 921 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/kanban_stranded_park.py
+ create mode 100644 tests/hermes_cli/test_kanban_stranded_park.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 1f747448d5..6acbcbba6d 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1915,18 +1915,18 @@ DEFAULT_CONFIG = {
+         "review_dispatch": True,
+         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
+         "dispatch_interval_seconds": 60,
+-        # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
+-        # crashed) for the same task/profile. Reassignment resets the streak.
++        # Auto-block after N consecutive non-success runs (spawn_failed/timed_out/crashed) per task/profile; reassign resets.
+         "failure_limit": 2,
+-        # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
+-        # early failure evidence from long-running workers.
++        # Worker stdout/stderr log rotation at spawn (2 MiB + one backup); raise to keep more early failure evidence.
+         "worker_log_rotate_bytes": 2 * 1024 * 1024,
+         "worker_log_backup_count": 1,
+-        # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
+-        # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
++        # Root/orchestration task profile after Triage decomposition ("" = default); not the decomposer LLM path.
+         "orchestrator_profile": "",
+-        # Assignee when the orchestrator can't match one to an installed profile; "" = default
+-        # profile. A task never ends up with assignee=None.
++        # kanban_stranded_park: parked > stranded_park_seconds, no valid request/live owner -> one request per episode, swept
++        # <= once per stranded_sweep_interval_seconds; ended local chats own until idle; desk chat "<gw>/<profile>/<session>".
++        "stranded_park_seconds": 7200, "stranded_sweep_interval_seconds": 300, "stranded_owner_idle_seconds": 86400,
++        "triage_owner_chat": "",
++        # Assignee when the orchestrator can't match one to an installed profile ("" = default); never None.
+         "default_assignee": "",
+         # Global concurrency cap (#33488): a positive int caps the HOST's 'running' tasks across every active board
+         # and both ready/review lanes (workers share one machine's memory; OOF-30). Unset (None) derives it from
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index a2fd11c294..4eeef23edc 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -574,7 +574,8 @@ def sweep_standing_asks(conn: sqlite3.Connection) -> list[str]:
+ 
+ def sweep_blocked_cards(conn: sqlite3.Connection, result) -> None:
+     """Dispatcher-tick entry for the parked-card sweeps; each is isolated so one failing never skips the others.
+-    The third gives each continuation_exhausted park its resume requester (``kanban_resume_requester``)."""
++    The third gives each continuation_exhausted park its resume requester (``kanban_resume_requester``); the last
++    escalates parks with no request and no live owner (``kanban_stranded_park``)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_resume_requester import ensure_recovery_cards
+     for name, sweep, out in (("agent-owned block", sweep_agent_owned_blocks, result.agent_block_escalated),
+@@ -584,3 +585,9 @@ def sweep_blocked_cards(conn: sqlite3.Connection, result) -> None:
+             out.extend(sweep(conn))
+         except sqlite3.Error:
+             kb._log.exception("kanban: %s sweep failed", name)
++    # Last: the backstop that no parked card stays invisible (``kanban_stranded_park``) sees what the passes left.
++    try:
++        from hermes_cli.kanban_stranded_park import sweep_stranded_parks
++        sweep_stranded_parks(conn)
++    except Exception:  # health: allow BLE001 -- the stranded-park backstop never breaks the dispatcher tick
++        kb._log.warning("kanban: stranded-park sweep failed", exc_info=True)
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 8413164faf..2aa01c3924 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -151,7 +151,6 @@ def notice(payload: dict) -> str:
+ 
+ def producer(conn, task_id: str, note: str) -> dict:
+     """Inside the stop transaction: one chat-notice route OR one supervisor, never both."""
+-    from hermes_cli.kanban_db_notify import is_headless_session
+     from hermes_cli.profiles import get_active_profile_name
+     import json
+     role = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='administrative_decision' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+@@ -167,28 +166,53 @@ def producer(conn, task_id: str, note: str) -> dict:
+             "VALUES (?,?,?,'','notify','{\"reason\":\"origin\"}',unixepoch(),"
+             "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
+             (task_id, platform, chat_id, task_id))
+-    from hermes_cli.kanban_creator_chats import _chat_links
+     from hermes_cli.kanban_origin import gateway_names
+-    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++    from hermes_cli.kanban_stranded_park import Liveness, local_chat_dead, settings
+ 
+     task = kb.get_task(conn, task_id)
+     assert task is not None
++    own = gateway_names()[0]
++    active = get_active_profile_name()
++    with Liveness(idle=settings()[1]) as liveness:
++        return _route(conn, task_id, task, own, active, bind, note,
++                      lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own, liveness=liveness))
++
++
++def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
++    """``producer`` body after setup. ``dead``: a chat of this gateway that is archived/hidden/missing, or ended and
++    idle, is no route for the decision: the notice would sit unread (kanban_stranded_park). One ``Liveness`` per
++    call: each state.db is opened at most once."""
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++
+     # Bind legacy origin sessions before appending the notice so its cursor cannot skip this event.
+-    if task.session_id and not is_headless_session(task.session_id):
++    if task.session_id and not is_headless_session(task.session_id) and not dead(own, active, task.session_id):
+         bind("tui", task.session_id)
+-    own = gateway_names()[0]
+     links = (_chat_links(conn, task_id) if conn.execute(
+         "SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() else [])
+     for link in links:
+         session = link["chat_session"]
+         gw, profile = link["chat_gateway"], link["chat_profile"] or "default"
+         chat_id = f"{gw}/{profile}/{session}"
+-        if not is_headless_session(chat_id):
+-            local = gw == own and profile == get_active_profile_name()
++        if not is_headless_session(chat_id) and not dead(gw, link["chat_profile"], session):
++            local = gw == own and profile == active
+             bind("tui" if local else "hub", session if local else chat_id)
+     from hermes_cli.kanban_db_notify import _owning_sub_clause
+-    if conn.execute("SELECT 1 FROM kanban_notify_subs s JOIN tasks p ON p.id=s.task_id "
+-                    f"WHERE s.task_id=? AND {_owning_sub_clause()} LIMIT 1", (task_id,)).fetchone():
++    from hermes_cli.kanban_origin import OriginError, parse_origin
++    for sub in conn.execute("SELECT s.platform, s.chat_id, s.notifier_profile FROM kanban_notify_subs s "
++                            f"JOIN tasks p ON p.id=s.task_id WHERE s.task_id=? AND {_owning_sub_clause()}",
++                            (task_id,)).fetchall():
++        platform, chat_id, notifier = sub[0], sub[1], sub[2]
++        if platform == "tui" and dead(own, notifier, chat_id):
++            continue
++        if platform == "hub":
++            try:
++                origin = parse_origin(chat_id)
++            except OriginError:
++                origin = None
++            if origin is not None and dead(origin.gateway, origin.profile, origin.session):
++                continue
+         return {"kind": "chats"}
+     episode = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+     from hermes_cli.kanban_refusal_receipt import restricted
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+new file mode 100644
+index 0000000000..ba53c148a2
+--- /dev/null
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -0,0 +1,464 @@
++"""No parked card stays invisible: a stranded park gets one generated human ask per park episode. [daveey]
++
++Owner decision: every parked card (``triage``/``blocked``) is either red somewhere (a valid
++``human_request``, shown on every chat it is linked to) or has a live owner. 61 hub cards sat in triage with neither:
++spend stops routed to chats that had ended, supervisor decision cards that completed while the source stayed parked,
++cards created straight into triage, transient re-kinds and containment holds.
++
++``sweep_stranded_parks`` runs from the dispatcher's parked-card sweeps (``kanban_block_policy.sweep_blocked_cards``).
++A card on this gateway's own board that has been parked longer than ``kanban.stranded_park_seconds`` with no valid
++request and no live owner gets, once per park episode, a generated approval request (promote / archive / re-scope),
++an optional binding to the triage desk chat (``kanban.triage_owner_chat``) and a ``stranded_park_escalated`` event.
++
++The park episode starts at the newest park-entry event (``PARK_ENTRY_EVENTS``), never at the newest event of any
++kind: a comment does not reset the clock. A live owner is an unreleased chat link whose chat is live
++(``chat_live``) or an open spend-decision supervisor card for the card's current spend episode.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++EVENT = "stranded_park_escalated"
++PARKED = ("triage", "blocked")
++CLOSED = ("done", "archived")
++# ``containment_episode`` is a tasks column, not an event kind; the containment hold's own event is ``contained``.
++# Both are listed so a future event of either name opens an episode.
++PARK_ENTRY_EVENTS = (
++    "blocked", "gave_up", "spend_budget_triaged", "spend_budget_held", "decision_retained", "safety_refused",
++    "no_progress_escalated", "agent_block_escalated", "ask_rechecked", "supervisor_escalated",
++    "block_loop_detected", "containment_episode", "contained", "created",
++)
++DEFAULT_PARK_SECONDS = 7200
++DEFAULT_OWNER_IDLE_SECONDS = 86400
++DEFAULT_SWEEP_INTERVAL_SECONDS = 300
++SHEPHERD_KIND = "shepherd"
++CHOICES = [{"label": "Release (promote)", "value": "promote"},
++           {"label": "Archive", "value": "archive"},
++           {"label": "Re-scope", "value": "rescope"}]
++_SPEND_KEYS = ("limit", "runs", "runs_with_usage", "cost_usd")
++
++
++# --- settings ------------------------------------------------------------------------------------------------------
++
++def _seconds(value: Any, default: int) -> int:
++    if isinstance(value, bool):
++        return default
++    try:
++        out = int(value)
++    except (TypeError, ValueError):
++        return default
++    return out if out > 0 else default
++
++
++def settings(cfg: Optional[dict] = None) -> tuple[int, int, str, int]:
++    """``(stranded_park_seconds, stranded_owner_idle_seconds, triage_owner_chat, stranded_sweep_interval_seconds)``
++    from ``cfg`` (the full config dict) or the on-disk config."""
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++            cfg = load_config_readonly() or {}
++        except Exception:  # health: allow BLE001 -- unreadable config: the defaults keep the backstop running
++            logger.warning("kanban: stranded-park sweep could not read config; using defaults", exc_info=True)
++            cfg = {}
++    kanban = (cfg.get("kanban") if isinstance(cfg, dict) else None) or {}
++    desk = kanban.get("triage_owner_chat")
++    return (_seconds(kanban.get("stranded_park_seconds"), DEFAULT_PARK_SECONDS),
++            _seconds(kanban.get("stranded_owner_idle_seconds"), DEFAULT_OWNER_IDLE_SECONDS),
++            desk.strip() if isinstance(desk, str) else "",
++            _seconds(kanban.get("stranded_sweep_interval_seconds"), DEFAULT_SWEEP_INTERVAL_SECONDS))
++
++
++# --- chat liveness -------------------------------------------------------------------------------------------------
++
++def _open_store(path: Path) -> sqlite3.Connection:
++    from hermes_cli import kanban_lockguard
++    db = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
++    db.row_factory = sqlite3.Row
++    return db
++
++
++class Liveness:
++    """Chat liveness answers for one pass (a sweep, a producer call): each ``state.db`` is opened at most once and
++    each ``(profile, session)`` is judged at most once. Use as a context manager; ``close`` releases the stores."""
++
++    def __init__(self, *, now: Optional[int] = None, idle: Optional[int] = None):
++        self.now = int(now if now is not None else time.time())
++        self.idle = DEFAULT_OWNER_IDLE_SECONDS if idle is None else int(idle)
++        self._dbs: dict[str, Optional[sqlite3.Connection]] = {}
++        self._answers: dict[tuple, bool] = {}
++
++    def __enter__(self) -> Liveness:
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.close()
++
++    def close(self) -> None:
++        for db in self._dbs.values():
++            if db is not None:
++                db.close()
++        self._dbs.clear()
++
++    def _db(self, path: Path) -> Optional[sqlite3.Connection]:
++        key = str(path)
++        if key not in self._dbs:
++            try:
++                self._dbs[key] = _open_store(path)
++            except (sqlite3.Error, OSError) as exc:
++                logger.info("kanban: stranded-park liveness cannot read %s (%s)", path, exc)
++                self._dbs[key] = None
++        return self._dbs[key]
++
++    def _state(self, path: Path, session: str):
++        """True (live) / False (archived, auto-archived, hidden, or ended and idle past ``idle``) for a session found
++        in ``path`` (its compression tip); ``"missing"`` when absent; None when the store is unreadable."""
++        from hermes_cli.kanban_origin_adapter import _resolve_session
++
++        db = self._db(path)
++        if db is None:
++            return None
++        try:
++            tip = _resolve_session(path, session, db)
++            row = db.execute("SELECT * FROM sessions WHERE id=?", (tip,)).fetchone()
++        except ValueError as exc:
++            return "missing" if str(exc) == "origin_session_missing" else None
++        except sqlite3.Error:
++            return None
++        if row is None:
++            return "missing"
++        data = dict(row)
++        if any(data.get(flag) for flag in ("archived", "auto_archived", "hidden")):
++            return False
++        if data.get("ended_at") is None:
++            return True
++        # ``ended_at`` alone is no death: a CLI chat closed with end_reason cli_close resumes in Desktop.
++        last = data.get("last_activity_at")
++        last = data.get("ended_at") if last is None else last
++        try:
++            return self.now - float(last) <= self.idle
++        except (TypeError, ValueError):
++            return True
++
++    def live(self, profile: Optional[str], session: str) -> bool:
++        """Is this gateway's chat ``session`` live? Dead only when every readable store that could hold it says so
++        (or none holds it); an unknown profile, a missing or unreadable store is never proof of death."""
++        key = (profile, session)
++        if key not in self._answers:
++            self._answers[key] = self._judge(profile, session)
++        return self._answers[key]
++
++    def _judge(self, profile: Optional[str], session: str) -> bool:
++        stores = _stores(profile)
++        if stores is None:
++            return True
++        readable = False
++        for path in stores:
++            if not path.exists():
++                continue
++            state = self._state(path, session)
++            if state is None:
++                return True
++            readable = True
++            if state is True:
++                return True
++        return not readable
++
++
++def _stores(profile: Optional[str]) -> Optional[list[Path]]:
++    from hermes_cli.kanban_repin_owner import _local_stores
++    if not profile:
++        return _local_stores()
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name, get_profile_dir
++    try:
++        home = get_hermes_home() if profile == get_active_profile_name() else get_profile_dir(profile)
++    except (OSError, ValueError):
++        return None
++    return [Path(home) / "state.db"]
++
++
++def chat_live(profile: Optional[str], session: str, *, now: Optional[int] = None,
++              idle: Optional[int] = None) -> bool:
++    """One-off :meth:`Liveness.live`."""
++    with Liveness(now=now, idle=idle) as liveness:
++        return liveness.live(profile, session)
++
++
++def local_chat_dead(gateway: str, profile: Optional[str], session: str, *, own: str,
++                    liveness: Liveness) -> bool:
++    """A chat of this gateway proven dead by the liveness rule. Another gateway's chat cannot be checked here."""
++    return bool(own) and gateway == own and not liveness.live(profile, session)
++
++
++# --- ownership -----------------------------------------------------------------------------------------------------
++
++def _live_chat(conn: sqlite3.Connection, task_id: str, *, own: str, liveness: Liveness) -> Optional[str]:
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        return None
++    for link in _chat_links(conn, task_id):
++        gw, profile, session = link["chat_gateway"], link["chat_profile"], link["chat_session"]
++        chat_id = f"{gw}/{profile or 'default'}/{session}"
++        if is_placeholder_session(session) or is_headless_session(chat_id):
++            continue
++        if gw != own or liveness.live(profile, session):
++            return chat_id
++    return None
++
++
++def open_decision_card(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The open spend-decision supervisor card of the card's current spend episode, if any. A done one is no owner:
++    its decision did not release the source."""
++    from hermes_cli.kanban_spend_decision import NOTICE, pending_episode
++
++    stop = pending_episode(conn, task_id)
++    if stop is None:
++        return None
++    episode = stop.get("uid") or str(stop["id"])
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++        "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1", (task_id, NOTICE, episode)).fetchone()
++    producer = _payload(row[0]).get("producer") if row else None
++    if not isinstance(producer, dict) or producer.get("kind") != "supervisor" or not producer.get("task_id"):
++        return None
++    sup = conn.execute("SELECT status FROM tasks WHERE id=?", (producer["task_id"],)).fetchone()
++    return producer["task_id"] if sup is not None and sup[0] not in CLOSED else None
++
++
++def live_owner(conn: sqlite3.Connection, task_id: str, *, own: str, liveness: Liveness) -> Optional[str]:
++    """What owns this parked card (``"<gw>/<profile>/<session>"`` or ``"supervisor <id>"``), else None."""
++    chat = _live_chat(conn, task_id, own=own, liveness=liveness)
++    if chat:
++        return chat
++    sup = open_decision_card(conn, task_id)
++    return f"supervisor {sup}" if sup else None
++
++
++# --- park episode --------------------------------------------------------------------------------------------------
++
++def _payload(raw: Any) -> dict:
++    try:
++        data = json.loads(raw) if raw else {}
++    except (TypeError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def park_entry(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """The newest park-entry event (``{id, kind, payload, created_at}``); ``created`` counts only for a card created
++    parked."""
++    marks = ",".join("?" for _ in PARK_ENTRY_EVENTS)
++    for row in conn.execute(f"SELECT id, kind, payload, created_at FROM task_events WHERE task_id=? "
++                            f"AND kind IN ({marks}) ORDER BY id DESC", (task_id, *PARK_ENTRY_EVENTS)):
++        payload = _payload(row[2])
++        if row[1] == "created" and payload.get("status") not in PARKED:
++            continue
++        return {"id": int(row[0]), "kind": row[1], "payload": payload, "created_at": int(row[3] or 0)}
++    return None
++
++
++def _reason(entry: Optional[dict]) -> str:
++    if entry is None:
++        return "no park event recorded"
++    data = entry["payload"]
++    why = data.get("reason") or data.get("error") or data.get("reason_code") or "(no reason recorded)"
++    return f"{entry['kind']}: {' '.join(str(why).split())[:300]}"
++
++
++def _evidence(entry: Optional[dict], owner_note: str) -> str:
++    parts = [f"Park-entry event {_reason(entry)}"]
++    data = entry["payload"] if entry else {}
++    spend = [f"{k}={data[k]}" for k in _SPEND_KEYS if data.get(k) is not None]
++    if spend:
++        parts.append("spend " + ", ".join(spend))
++    parts.append(owner_note)
++    return ". ".join(parts) + "."
++
++
++def _armed_wake(conn: sqlite3.Connection, task_id: str) -> bool:
++    from hermes_cli.kanban_wake_check import get_state
++    return get_state(conn, task_id) is not None
++
++
++def _dependency_open(conn: sqlite3.Connection, task_id: str) -> bool:
++    return conn.execute(
++        "SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id=? "
++        "AND COALESCE(p.status, '') NOT IN ('done','archived') LIMIT 1", (task_id,)).fetchone() is not None
++
++
++def _leased(row: dict, now: int) -> bool:
++    if row.get("current_run_id") is not None or row.get("claim_lock"):
++        return True
++    expires = row.get("lease_expires")
++    return bool(row.get("lease_holder")) and (expires is None or int(expires) > now)
++
++
++def _excluded(conn: sqlite3.Connection, row: dict, now: int) -> bool:
++    from hermes_cli.kanban_open_asks import card_is_open_human_ask
++    tid, kind = row["id"], row.get("block_kind")
++    if _leased(row, now) or card_is_open_human_ask(row["status"], kind, row.get("human_request")):
++        return True
++    if kind == "time" or (kind == "dependency" and _dependency_open(conn, tid)):
++        return True
++    return _armed_wake(conn, tid)
++
++
++# --- desk binding --------------------------------------------------------------------------------------------------
++
++def _desk(desk: str, own: str):
++    """``(origin, local)`` for the configured triage desk chat, or None."""
++    if not desk:
++        return None
++    from hermes_cli.kanban_origin import OriginError, parse_origin
++    from hermes_cli.profiles import get_active_profile_name
++    try:
++        origin = parse_origin(desk)
++    except OriginError:
++        logger.warning("kanban: kanban.triage_owner_chat %r is not <gateway>/<profile>/<session>", desk)
++        return None
++    return origin, bool(own) and origin.gateway == own and origin.profile == get_active_profile_name()
++
++
++def _subscribe_desk(conn: sqlite3.Connection, task_id: str, desk) -> None:
++    """Local delivery for the desk chat: before the escalation event, so the subscription's cursor includes it."""
++    from hermes_cli.kanban_db_notify import add_notify_sub
++    origin, local = desk
++    add_notify_sub(conn, task_id=task_id, platform="tui" if local else "hub",
++                   chat_id=origin.session if local else f"{origin.gateway}/{origin.profile}/{origin.session}",
++                   delivery_metadata={"reason": SHEPHERD_KIND})
++
++
++def _link_desk(conn: sqlite3.Connection, task_id: str, desk, now: int) -> None:
++    """The synced ``shepherd`` link to the desk chat; this gateway's own link carries no profile, as
++    ``kanban_chat_links._local_links`` wants it (else reconcile would release it). Caller holds the write txn."""
++    from hermes_cli.kanban_chat_links import link_uid
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        return
++    origin, local = desk
++    profile = None if local else origin.profile
++    uid = link_uid(task_id, origin.gateway, profile, origin.session, SHEPHERD_KIND)
++    conn.execute(
++        "INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, released, "
++        "created_at) SELECT ?, ?, ?, ?, ?, ?, 0, ? WHERE NOT EXISTS (SELECT 1 FROM task_chat_links WHERE uid = ?)",
++        (uid, task_id, origin.gateway, profile, origin.session, SHEPHERD_KIND, now, uid))
++    conn.execute("UPDATE task_chat_links SET released = 0 WHERE uid = ? AND released != 0", (uid,))
++
++
++# --- the sweep -----------------------------------------------------------------------------------------------------
++
++def _request(row: dict, entry: Optional[dict], age: int, owner_note: str, kind) -> dict:
++    from hermes_cli.kanban_human_request import validate_human_request
++    title = " ".join(str(row.get("title") or "").split())[:200]
++    return validate_human_request({
++        "action": f"Decide this parked card: release it (promote), archive it, or re-scope it: {title}",
++        "why_human": f"Parked {age // 3600}h with no live owner and no request ({_reason(entry)})",
++        "interaction": "approval",
++        "scope": "This card only",
++        "evidence": _evidence(entry, owner_note),
++        "choices": CHOICES,
++    }, kind=kind)
++
++
++def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now: int, age: int, desk,
++              contained: bool) -> bool:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_ask_resolved import store_request
++    from hermes_cli.kanban_human_request import NONHUMAN_KINDS
++
++    tid = row["id"]
++    if desk is not None:
++        _subscribe_desk(conn, tid, desk)
++    desk_chat = f"{desk[0].gateway}/{desk[0].profile}/{desk[0].session}" if desk is not None else None
++    with kb.write_txn(conn):
++        fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        if fresh is None:
++            return False
++        fresh = dict(fresh)
++        if fresh["status"] not in PARKED or _excluded(conn, fresh, now) or _escalated(conn, tid, entry):
++            return False
++        if not contained:
++            kind = fresh.get("block_kind")
++            if kind in NONHUMAN_KINDS:
++                kind = "needs_input"
++                conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (kind, tid))
++            store_request(conn, tid, _request(fresh, entry, age, "No unreleased chat link to a live chat and no "
++                                              "open spend-decision supervisor card", kind))
++        if desk is not None:
++            _link_desk(conn, tid, desk, now)
++        kb._append_event(conn, tid, EVENT, {
++            "episode_start": entry["created_at"] if entry else int(fresh.get("created_at") or 0),
++            "reason": _reason(entry), "desk_chat": desk_chat, "request": not contained})
++    return True
++
++
++def _escalated(conn: sqlite3.Connection, task_id: str, entry: Optional[dict]) -> bool:
++    return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND id > ? LIMIT 1",
++                        (task_id, EVENT, entry["id"] if entry else 0)).fetchone() is not None
++
++
++# board key -> ``now`` of the last sweep that did work in this process (``sweep_stranded_parks`` throttle).
++_LAST_RUN: dict[str, int] = {}
++
++
++def _board_key(conn: sqlite3.Connection) -> str:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    return _main_db_file(conn) or f"conn:{id(conn)}"
++
++
++def _due(conn: sqlite3.Connection, now: int, interval: int) -> bool:
++    """At most one working sweep per ``interval`` per board per process: the dispatcher ticks every 60 s and the
++    per-card ownership reads (state.db) need not run that often on a loaded hub. Claims the slot when due."""
++    key = _board_key(conn)
++    last = _LAST_RUN.get(key)
++    if last is not None and 0 <= now - last < interval:
++        return False
++    _LAST_RUN[key] = now
++    return True
++
++
++def sweep_stranded_parks(conn: sqlite3.Connection, *, now: Optional[int] = None,
++                         cfg: Optional[dict] = None) -> list[str]:
++    """Escalate this gateway's stranded parked cards once per park episode; returns the escalated task ids.
++    Throttled to one working pass per ``kanban.stranded_sweep_interval_seconds`` per board (``_due``)."""
++    from hermes_cli import kanban_containment_connections as containment
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_wake_check import foreign_ids
++
++    park_s, idle_s, desk_ref, interval = settings(cfg)
++    now = int(now if now is not None else time.time())
++    if not _due(conn, now, interval):
++        return []
++    # A retained copy of another gateway's card has no policy authority here: only the card's home escalates it.
++    copies = foreign_ids(conn)
++    own = gateway_names()[0]
++    desk = _desk(desk_ref, own)
++    escalated: list[str] = []
++    rows = [dict(r) for r in conn.execute("SELECT * FROM tasks WHERE status IN ('triage','blocked')").fetchall()]
++    with Liveness(now=now, idle=idle_s) as liveness:
++        for row in rows:
++            tid = row["id"]
++            if tid in copies or _excluded(conn, row, now):
++                continue
++            entry = park_entry(conn, tid)
++            start = entry["created_at"] if entry else int(row.get("created_at") or 0)
++            if now - start < park_s or _escalated(conn, tid, entry):
++                continue
++            try:
++                if live_owner(conn, tid, own=own, liveness=liveness):
++                    continue
++                if _escalate(conn, row, entry, now=now, age=now - start, desk=desk,
++                             contained=containment.held(conn, tid)):
++                    escalated.append(tid)
++            except Exception:  # health: allow BLE001 -- one card's failure must not stop the backstop for the rest
++                logger.warning("kanban: stranded-park escalation failed for %s", tid, exc_info=True)
++    return escalated
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_routing.py b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+index 641c14dd8d..a8d8dbfc9f 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision_routing.py
++++ b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+@@ -129,3 +129,43 @@ def test_tui_poller_delivers_the_decision_notice(kanban_home):
+     assert "promote" in texts[0] and "archive" in texts[0]
+     assert [t for t in server._collect_kanban_notifications({"session_key": "desk-spend"})
+             if "recorded decision" in t] == []
++
++
++def _state_session(home, sid, *, ended_ago=None, **flags):
++    from tests.hermes_cli.test_kanban_stranded_park import _session
++    _session(home, sid, ended_ago=ended_ago, active_ago=ended_ago, **flags)
++
++
++@pytest.mark.parametrize("dead", ["ended-idle", "archived", "missing"])
++def test_dead_local_chat_is_no_route_and_a_supervisor_decides(kanban_home, own_gateway, dead):
++    """A chat of this gateway that is ended and idle past kanban.stranded_owner_idle_seconds, archived, or absent
++    from a readable state.db is not bound or counted: the decision goes to a supervisor card (kanban_stranded_park)."""
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        if dead == "missing":
++            _state_session(kanban_home, "someone-else")
++        else:
++            _state_session(kanban_home, "human-chat", **({"ended_ago": 2 * 86400} if dead == "ended-idle"
++                                                         else {"archived": 1}))
++        _links(conn, tid, (OWN, "default", "human-chat"))
++        notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="human-chat")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='human-chat' WHERE id=?", (tid,))
++        assert budget.hold(conn, tid) == "triage"
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        producer = event.payload["producer"]
++        assert producer["kind"] == "supervisor"
++        assert kb.get_task(conn, producer["task_id"]).status not in ("done", "archived")
++
++
++@pytest.mark.parametrize("ended_ago", [None, 3600], ids=["open", "ended-recently"])
++def test_live_local_chat_in_state_db_is_the_route(kanban_home, own_gateway, ended_ago):
++    """An open chat, or one closed recently (a CLI chat closed with cli_close resumes in Desktop), still owns it."""
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        _state_session(kanban_home, "human-chat", ended_ago=ended_ago)
++        _links(conn, tid, (OWN, "default", "human-chat"))
++        assert budget.hold(conn, tid) == "triage"
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        assert event.payload["producer"] == {"kind": "chats"}
++        assert _subs(conn, tid) == [("tui", "human-chat")]
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+new file mode 100644
+index 0000000000..beb88dfea7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -0,0 +1,368 @@
++"""No parked card stays invisible: the stranded-park backstop (``kanban_stranded_park``). [daveey]"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_block_policy as policy
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_stranded_park as stranded
++from hermes_cli.kanban_ask_resolved import store_request
++from hermes_cli.kanban_open_asks import card_is_open_human_ask
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++from tests.hermes_cli import test_kanban_spend_budget_hold as hold_helpers
++
++kanban_home = helpers.kanban_home
++stopped = hold_helpers.stopped
++
++OWN = "own-gw"
++HOUR = 3600
++DESK = f"{OWN}/default/desk-chat"
++
++
++@pytest.fixture
++def own_gateway(kanban_home, monkeypatch):
++    """This gateway's name, on a board that carries the synced chat-link table (as a Board-synced board does)."""
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (OWN, {OWN, "remote"}))
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, "
++                     "task_id TEXT NOT NULL, chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, "
++                     "kind TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
++
++
++def _sweep(conn, **kw):
++    """A working sweep: these tests exercise one pass each, so the per-board throttle is cleared first."""
++    stranded._LAST_RUN.clear()
++    return stranded.sweep_stranded_parks(conn, **kw)
++
++
++def _session(home, sid, *, ended_ago=None, active_ago=None, **flags):
++    """A chat in this gateway's state.db; ``ended_ago``/``active_ago`` in seconds before the real clock."""
++    from hermes_state import SessionDB
++    db = SessionDB(home / "state.db")
++    try:
++        if db.get_session(sid) is None:
++            db.create_session(sid, source="desktop")
++    finally:
++        db.close()
++    now = time.time()
++    conn = sqlite3.connect(home / "state.db")
++    try:
++        conn.execute("UPDATE sessions SET ended_at=?, end_reason=?, last_activity_at=? WHERE id=?",
++                     (None if ended_ago is None else now - ended_ago, None if ended_ago is None else "cli_close",
++                      None if active_ago is None else now - active_ago, sid))
++        for flag, value in flags.items():
++            conn.execute(f"UPDATE sessions SET {flag}=? WHERE id=?", (int(value), sid))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _link(conn, tid, gw, profile, session):
++    from hermes_cli.kanban_chat_links import link_uid
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, ?, ?, ?, ?, 'created', 0, 0)",
++                     (link_uid(tid, gw, profile, session, "created"), tid, gw, profile, session))
++
++
++def _events(conn, tid, kind):
++    return [json.loads(r[0] or "{}") for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
++
++
++def _row(conn, tid):
++    return conn.execute("SELECT status, block_kind, human_request FROM tasks WHERE id=?", (tid,)).fetchone()
++
++
++def _later(hours):
++    return int(time.time()) + int(hours * HOUR)
++
++
++def _parked(conn, *, kind="transient", status="triage", event="agent_block_escalated"):
++    tid = kb.create_task(conn, title="Parked work", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=?, block_kind=? WHERE id=?", (status, kind, tid))
++        kb._append_event(conn, tid, event, {"reason": "retry needed"})
++    return tid
++
++
++def _spend_stopped_on_dead_chat(conn, home):
++    """A spend stop routed to a then-live chat that later ended and went idle (the hub's stranded shape)."""
++    tid = stopped(conn)
++    _session(home, "human-chat")
++    _link(conn, tid, OWN, None, "human-chat")
++    assert budget.hold(conn, tid) == "triage"
++    (notice,) = _events(conn, tid, decision.NOTICE)
++    assert notice["producer"] == {"kind": "chats"}
++    _session(home, "human-chat", ended_ago=2 * 86400, active_ago=2 * 86400)
++    return tid
++
++
++def test_spend_stop_on_dead_chat_gets_request_and_desk(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        cfg = {"kanban": {"triage_owner_chat": DESK}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == [tid]
++        status, kind, raw = _row(conn, tid)
++        assert status == "triage"
++        assert card_is_open_human_ask(status, kind, raw)
++        request = json.loads(raw)
++        assert request["interaction"] == "approval" and request["scope"] == "This card only"
++        assert request["action"].startswith("Decide this parked card: release it (promote), archive it, or re-scope")
++        assert "Bounded work" in request["action"]
++        assert request["why_human"].startswith("Parked 3h with no live owner and no request (spend_budget_triaged")
++        assert "spend_budget_triaged" in request["evidence"] and "runs=" in request["evidence"]
++        assert [c["value"] for c in request["choices"]] == ["promote", "archive", "rescope"]
++        # The desk chat is bound: a synced shepherd link (no profile, as local reconcile wants it) and a tui sub.
++        links = conn.execute("SELECT chat_gateway, chat_profile, chat_session, kind, released FROM task_chat_links "
++                             "WHERE task_id=? AND kind='shepherd'", (tid,)).fetchall()
++        assert [tuple(r) for r in links] == [(OWN, None, "desk-chat", "shepherd", 0)]
++        (event,) = _events(conn, tid, stranded.EVENT)
++        assert event["request"] is True and event["desk_chat"] == DESK
++        assert event["reason"].startswith("spend_budget_triaged")
++        _, seen = notify.unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id="desk-chat",
++                                               kinds=(stranded.EVENT,))
++        assert [e.kind for e in seen] == [stranded.EVENT]
++
++
++def test_remote_desk_is_a_hub_subscription(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        cfg = {"kanban": {"triage_owner_chat": "remote/default/desk"}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == [tid]
++        subs = conn.execute("SELECT platform, chat_id FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchall()
++        assert [tuple(r) for r in subs] == [("hub", "remote/default/desk")]
++        links = conn.execute("SELECT chat_gateway, chat_profile, chat_session FROM task_chat_links "
++                             "WHERE task_id=? AND kind='shepherd'", (tid,)).fetchall()
++        assert [tuple(r) for r in links] == [("remote", "default", "desk")]
++
++
++def test_young_park_untouched_and_comment_does_not_reset_clock(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(1), cfg={}) == []
++        assert _row(conn, tid)[2] is None
++        kb.add_comment(conn, tid, "someone", "still looking")
++        later = _later(3)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at=? WHERE id=(SELECT MAX(id) FROM task_events "
++                         "WHERE task_id=?)", (later - 1800, tid))
++        assert _sweep(conn, now=later, cfg={}) == [tid]
++
++
++@pytest.mark.parametrize("where", ["own-live", "own-ended-recent", "remote"])
++def test_live_chat_owner_leaves_card_alone(kanban_home, own_gateway, where):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        if where == "remote":
++            _link(conn, tid, "remote", "default", "their-chat")
++        else:
++            ended = 3600 if where == "own-ended-recent" else None
++            _session(kanban_home, "live-chat", ended_ago=ended, active_ago=ended)
++            _link(conn, tid, OWN, None, "live-chat")
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, tid)[2] is None
++
++
++@pytest.mark.parametrize("flag", ["archived", "auto_archived", "hidden"])
++def test_archived_or_hidden_chat_is_no_owner(kanban_home, own_gateway, flag):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        _session(kanban_home, "gone-chat", **{flag: 1})
++        _link(conn, tid, OWN, None, "gone-chat")
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++
++
++def test_open_decision_card_owns_until_done(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        (notice,) = _events(conn, tid, decision.NOTICE)
++        sup = notice["producer"]["task_id"]
++        assert stranded.open_decision_card(conn, tid) == sup
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (sup,))
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert card_is_open_human_ask(*_row(conn, tid))
++
++
++def test_transient_triage_card_is_rekinded(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, kind="transient")
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        status, kind, raw = _row(conn, tid)
++        assert kind == "needs_input"
++        assert card_is_open_human_ask(status, kind, raw)
++        assert "agent_block_escalated: retry needed" in json.loads(raw)["why_human"]
++
++
++def test_created_parked_card_uses_creation_as_episode(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Straight into triage", assignee="default", triage=True)
++        assert _row(conn, tid)[0] == "triage"
++        assert stranded.park_entry(conn, tid)["kind"] == "created"
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++
++
++def _dependency_wait(conn, mp):
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    tid = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='blocked', block_kind='dependency' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, "blocked", {"reason": "waits on parent"})
++    return tid
++
++
++def _blocked(conn, *, kind="transient", sql=None):
++    tid = _parked(conn, kind=kind, status="blocked", event="blocked")
++    if sql:
++        with kb.write_txn(conn):
++            conn.execute(sql, (tid,))
++    return tid
++
++
++def _foreign(conn, mp):
++    from hermes_cli import kanban_wake_check
++    tid = _blocked(conn)
++    mp.setattr(kanban_wake_check, "foreign_ids", lambda conn, own=None: {tid})
++    return tid
++
++
++_EXCLUDED = {
++    "dependency": _dependency_wait,
++    "time": lambda conn, mp: _blocked(conn, kind="time"),
++    "wake_check": lambda conn, mp: _blocked(conn, sql="INSERT INTO task_wake_checks (task_id, cmd, every, next_at, "
++                                                       "fails, generation, purpose) VALUES (?, 'true', 600, 0, 0, 'g', 'wake')"),
++    "running": lambda conn, mp: _blocked(conn, sql="UPDATE tasks SET current_run_id=12345 WHERE id=?"),
++    "claimed": lambda conn, mp: _blocked(conn, sql="UPDATE tasks SET claim_lock='host:1' WHERE id=?"),
++    "foreign": _foreign,
++}
++
++
++@pytest.mark.parametrize("case", sorted(_EXCLUDED))
++def test_excluded_cards_are_untouched(kanban_home, own_gateway, monkeypatch, case):
++    with kbc.connect_closing() as conn:
++        tid = _EXCLUDED[case](conn, monkeypatch)
++        before = _row(conn, tid)
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert _row(conn, tid) == before
++        assert _events(conn, tid, stranded.EVENT) == []
++
++
++def test_dependency_with_closed_parents_is_escalated(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="parent", assignee="default")
++        tid = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++            conn.execute("UPDATE tasks SET status='blocked', block_kind='dependency' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "blocked", {"reason": "waits on parent"})
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert card_is_open_human_ask(*_row(conn, tid))
++        assert _row(conn, tid)[1] == "needs_input"
++
++
++def test_contained_card_gets_desk_link_only(kanban_home, own_gateway, monkeypatch):
++    from hermes_cli import kanban_containment_connections as containment
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        monkeypatch.setattr(containment, "held", lambda conn, task_id: task_id == tid)
++        before = _row(conn, tid)
++        cfg = {"kanban": {"triage_owner_chat": DESK}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == [tid]
++        assert _row(conn, tid) == before
++        assert conn.execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id=? AND kind='shepherd'",
++                            (tid,)).fetchone()[0] == 1
++        (event,) = _events(conn, tid, stranded.EVENT)
++        assert event["request"] is False and event["desk_chat"] == DESK
++        assert _sweep(conn, now=_later(3), cfg=cfg) == []
++
++
++def test_once_per_episode_and_again_on_a_new_episode(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        # The ask was cleared (an agent answered it) but the card stays parked in the same episode: no repeat.
++        with kb.write_txn(conn):
++            store_request(conn, tid, None)
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "blocked", {"reason": "parked again"})
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert len(_events(conn, tid, stranded.EVENT)) == 2
++        assert "blocked: parked again" in json.loads(_row(conn, tid)[2])["why_human"]
++
++
++def test_thresholds_come_from_config(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn)
++        cfg = {"kanban": {"stranded_park_seconds": 4 * HOUR}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == []
++        assert _sweep(conn, now=_later(5), cfg=cfg) == [tid]
++    assert stranded.settings({}) == (stranded.DEFAULT_PARK_SECONDS, stranded.DEFAULT_OWNER_IDLE_SECONDS, "",
++                                     stranded.DEFAULT_SWEEP_INTERVAL_SECONDS)
++
++
++def test_sweep_failure_never_breaks_the_tick(kanban_home, monkeypatch, caplog):
++    def boom(conn, **_):
++        raise RuntimeError("stranded boom")
++
++    monkeypatch.setattr(stranded, "sweep_stranded_parks", boom)
++    result = SimpleNamespace(agent_block_escalated=[], ask_rechecked=[])
++    with kbc.connect_closing() as conn, caplog.at_level(logging.WARNING):
++        policy.sweep_blocked_cards(conn, result)
++    record = next(r for r in caplog.records if "stranded-park sweep failed" in r.getMessage())
++    assert record.exc_info is not None
++
++
++def test_dispatcher_tick_runs_the_sweep(kanban_home, own_gateway, monkeypatch):
++    calls = []
++    monkeypatch.setattr(stranded, "sweep_stranded_parks", lambda conn, **_: calls.append(conn) or [])
++    result = SimpleNamespace(agent_block_escalated=[], ask_rechecked=[])
++    with kbc.connect_closing() as conn:
++        policy.sweep_blocked_cards(conn, result)
++    assert len(calls) == 1
++
++
++def test_sweep_is_throttled_per_board(kanban_home, own_gateway, monkeypatch):
++    """At most one working pass per kanban.stranded_sweep_interval_seconds: a second call inside the interval is a
++    no-op (no escalation, no ownership reads); after the interval it runs again."""
++    monkeypatch.setattr(stranded, "_LAST_RUN", {})
++    with kbc.connect_closing() as conn:
++        first = _later(3)
++        assert stranded.sweep_stranded_parks(conn, now=first, cfg={}) == []
++        tid = _parked(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at=created_at-? WHERE task_id=?", (4 * HOUR, tid))
++        cfg = {"kanban": {"stranded_sweep_interval_seconds": 600}}
++        assert stranded.sweep_stranded_parks(conn, now=first + 599, cfg=cfg) == []
++        assert _row(conn, tid)[2] is None
++        assert stranded.sweep_stranded_parks(conn, now=first + 600, cfg=cfg) == [tid]
++        # The default interval applies without config.
++        assert stranded.sweep_stranded_parks(conn, now=first + 600 + 299, cfg={}) == []
++
++
++def test_state_db_opened_once_per_sweep(kanban_home, own_gateway, monkeypatch):
++    opened = []
++    real = stranded._open_store
++    monkeypatch.setattr(stranded, "_open_store", lambda path: opened.append(path) or real(path))
++    with kbc.connect_closing() as conn:
++        tids = [_parked(conn) for _ in range(3)]
++        _session(kanban_home, "live-chat")
++        _session(kanban_home, "dead-chat", archived=1)
++        for tid, chat in zip(tids, ("live-chat", "dead-chat", "dead-chat")):
++            _link(conn, tid, OWN, None, chat)
++        assert sorted(_sweep(conn, now=_later(3), cfg={})) == sorted(tids[1:])
++    assert len(opened) == 1 and opened[0].name == "state.db"
+-- 
+2.43.0
+

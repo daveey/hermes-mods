@@ -1,0 +1,463 @@
+From 026ed78966262de11ab6877776b265526b2adb7b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:20:13 -0800
+Subject: [PATCH] Fall back to a private reader when the shared cached_ro
+ reader is borrowed
+
+Concurrent dashboard readers on hermes-hub (session-panel feed, /session-cards,
+sidebar) collided on the one shared read-only connection per board and raised
+"database is locked: cached reader is borrowed" (165 times in one errors.log),
+flipping Desktop status panels to unknown.
+
+cached_ro now waits at most 50 ms (or the remaining budget) for the shared
+connection, then opens a private read-only connection with the same opener and
+the rest of the budget as its busy timeout, yields it and always closes it. The
+shared cache entry is untouched by the fallback. borrow_lock keeps its raising
+contract on top of a new try_borrow helper. ro_stats["private_fallbacks"]
+counts fallbacks so live contention is visible.
+
+replica_task_resolution moves unchanged to
+kanban_session_activity_replica_resolution.py (re-exported) to keep
+kanban_session_activity.py under its 2000-line health cap.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_reader_lifecycle.py         |   7 +-
+ hermes_cli/kanban_session_activity.py         |  65 ++---
+ ...ban_session_activity_replica_resolution.py |  41 +++
+ .../test_cached_ro_borrowed_fallback.py       | 256 ++++++++++++++++++
+ 4 files changed, 336 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_replica_resolution.py
+ create mode 100644 tests/hermes_cli/test_cached_ro_borrowed_fallback.py
+
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index 598398d2be..e985edc054 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -7,10 +7,15 @@ import threading
+ from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access, retry_open
+ 
+ 
++def try_borrow(lock, budget) -> bool:
++    """Acquire ``lock`` within ``budget`` seconds (never negative); False when another reader still holds it."""
++    return lock.acquire(timeout=max(0.0, budget))
++
++
+ @contextlib.contextmanager
+ def borrow_lock(lock, budget):
+     """Python coordination is part of the reader budget, not an unbounded prelude."""
+-    if not lock.acquire(timeout=max(0.0, budget)):
++    if not try_borrow(lock, budget):
+         raise sqlite3.OperationalError("database is locked: cached reader is borrowed")
+     try:
+         yield
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5b820e6d22..8efa2de3f1 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -411,35 +411,7 @@ def _hub_db_path() -> Path | None:
+     return path if path.is_file() else None
+ 
+ 
+-def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[set[str], bool]:
+-    """Which ``t_<hex>`` ids exist as tasks in the hermes-hub replica of any gateway (same file ``_remote_links``
+-    reads; replica keys are ``[profile/]board/<id>``, so qualified ``@task:p@gw/<id>`` refs resolve by id).
+-
+-    Returns ``(found, authoritative)``; False when a replica exists but can't answer (unreadable, offline, or not
+-    synced within ``HUB_STALE_AFTER_S``): absent ids are *unknown*, never flagged. No replica is authoritative only
+-    when ``kanban.sync`` is off; a Board-synced host (worker node: no hub sync) holds a partial board. [daveey]"""
+-    path = _hub_db_path()
+-    if path is None or not ids:  # sync_enabled never raises: an unreadable config reads as sync off (standalone)
+-        return set(), not ids or not _board_sync_enabled()
+-    try:
+-        from hermes_cli.kanban_board_replica_refs import hub_tasks_found, with_reader
+-
+-        def read(conn: sqlite3.Connection) -> tuple:
+-            conn.execute("BEGIN")  # one snapshot: the task-row probe must describe the rows the lookups read
+-            try:
+-                offline = _meta_float(conn, "offline_since")
+-                synced = max(filter(None, (_meta_float(conn, "last_ok"), _meta_float(conn, "last_digest"))),
+-                             default=None)
+-                return offline, synced, hub_tasks_found(conn, path, ids)
+-            finally:
+-                conn.execute("ROLLBACK")
+-
+-        offline, synced, found = with_reader(path, read)  # kept reader: ~2 ms an open on every board GET
+-    except sqlite3.Error:
+-        return set(), False
+-    now = time.time() if now is None else now
+-    fresh = offline is None and synced is not None and now - synced <= HUB_STALE_AFTER_S
+-    return found, fresh
++from hermes_cli.kanban_session_activity_replica_resolution import replica_task_resolution
+ 
+ 
+ from hermes_cli.kanban_generation import open_ro as _open_ro
+@@ -462,13 +434,24 @@ def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Conne
+     """A shared read-only connection to ``path``, held exclusively for the ``with`` body. Reopened when the file is
+     replaced (new inode: a rebuilt replica), after any sqlite error, or when its ``-shm`` generation is gone (the
+     connection is stranded on a deleted WAL index and would fail with ``disk I/O error`` or read stale rows until
+-    restart; kanban-759104eb56). Raises ``sqlite3.OperationalError`` when the file is missing, like ``_open_ro``."""
+-    from hermes_cli.kanban_reader_lifecycle import borrow_lock, cached_entry
++    restart; kanban-759104eb56). Raises ``sqlite3.OperationalError`` when the file is missing, like ``_open_ro``.
++    While another thread holds the shared connection past ``_RO_SHARED_WAIT_S``, the body gets a private read-only
++    connection instead (closed afterwards; the shared entry is untouched), so concurrent dashboard readers never fail
++    with "cached reader is borrowed" (hub errors.log)."""
++    from hermes_cli.kanban_reader_lifecycle import cached_entry, try_borrow
+ 
+     started = time.monotonic()
+     key, entry = cached_entry(path, busy_budget)
+     conn, _ident, lock, _shm = entry
+-    with borrow_lock(lock, busy_budget - (time.monotonic() - started)):
++    remaining = busy_budget - (time.monotonic() - started)
++    if not try_borrow(lock, min(remaining, _RO_SHARED_WAIT_S)):
++        with _RO_CACHE_LOCK:
++            ro_stats["private_fallbacks"] += 1
++        # Never more than the shared reader's own SQLite busy timeout, whatever budget the caller passed.
++        with _private_ro(path, min(busy_budget - (time.monotonic() - started), _RO_BUSY_TIMEOUT_S)) as private:
++            yield private
++        return
++    try:
+         with _RO_CACHE_LOCK:
+             if _RO_CACHE.get(key) is not entry:
+                 from hermes_cli.kanban_generation import DeletedWalGenerationError
+@@ -496,10 +479,28 @@ def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Conne
+                         if _RO_CACHE.get(key) is entry:
+                             del _RO_CACHE[key]
+                     _close_quietly(conn)
++    finally:
++        lock.release()
++
++
++@contextlib.contextmanager
++def _private_ro(path: Path, budget: float) -> Iterator[sqlite3.Connection]:
++    """A one-call read-only connection for when the shared reader is borrowed: same opener and read-only semantics
++    as the cache, SQLite busy timeout = what is left of the caller's budget, always closed afterwards."""
++    conn = _open_ro(path, timeout=max(0.0, budget))
++    try:
++        yield conn
++    finally:
++        _close_quietly(conn)
+ 
+ 
+ # The cached reader's own SQLite busy timeout, set when ``kanban_reader_lifecycle`` opens it.
+ _RO_BUSY_TIMEOUT_S = 0.5
++# How long a reader waits for another thread to hand back the shared connection before it opens its own. Short:
++# a private open costs ~2.5 ms, so waiting longer than a few reads only queues dashboard threads behind each other.
++_RO_SHARED_WAIT_S = 0.05
++# Private fallback opens (``cached_ro`` while the shared reader is borrowed): shows contention on a live host.
++ro_stats = {"private_fallbacks": 0}
+ 
+ 
+ def _close_quietly(conn: sqlite3.Connection) -> None:
+diff --git a/hermes_cli/kanban_session_activity_replica_resolution.py b/hermes_cli/kanban_session_activity_replica_resolution.py
+new file mode 100644
+index 0000000000..db6de29f72
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_replica_resolution.py
+@@ -0,0 +1,41 @@
++"""Hub-replica task-id resolution for ``kanban_session_activity`` (re-exported there).
++
++Facade names (``_hub_db_path``, ``_board_sync_enabled``, ``_meta_float``, ``HUB_STALE_AFTER_S``) are read through
++the module at call time, so tests and callers that patch them on ``kanban_session_activity`` keep working."""
++from __future__ import annotations
++
++import sqlite3
++import time
++
++
++def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[set[str], bool]:
++    """Which ``t_<hex>`` ids exist as tasks in the hermes-hub replica of any gateway (same file ``_remote_links``
++    reads; replica keys are ``[profile/]board/<id>``, so qualified ``@task:p@gw/<id>`` refs resolve by id).
++
++    Returns ``(found, authoritative)``; False when a replica exists but can't answer (unreadable, offline, or not
++    synced within ``HUB_STALE_AFTER_S``): absent ids are *unknown*, never flagged. No replica is authoritative only
++    when ``kanban.sync`` is off; a Board-synced host (worker node: no hub sync) holds a partial board. [daveey]"""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    path = _ksa._hub_db_path()
++    if path is None or not ids:  # sync_enabled never raises: an unreadable config reads as sync off (standalone)
++        return set(), not ids or not _ksa._board_sync_enabled()
++    try:
++        from hermes_cli.kanban_board_replica_refs import hub_tasks_found, with_reader
++
++        def read(conn: sqlite3.Connection) -> tuple:
++            conn.execute("BEGIN")  # one snapshot: the task-row probe must describe the rows the lookups read
++            try:
++                meta = _ksa._meta_float
++                offline = meta(conn, "offline_since")
++                synced = max(filter(None, (meta(conn, "last_ok"), meta(conn, "last_digest"))), default=None)
++                return offline, synced, hub_tasks_found(conn, path, ids)
++            finally:
++                conn.execute("ROLLBACK")
++
++        offline, synced, found = with_reader(path, read)  # kept reader: ~2 ms an open on every board GET
++    except sqlite3.Error:
++        return set(), False
++    now = time.time() if now is None else now
++    fresh = offline is None and synced is not None and now - synced <= _ksa.HUB_STALE_AFTER_S
++    return found, fresh
+diff --git a/tests/hermes_cli/test_cached_ro_borrowed_fallback.py b/tests/hermes_cli/test_cached_ro_borrowed_fallback.py
+new file mode 100644
+index 0000000000..82251b513a
+--- /dev/null
++++ b/tests/hermes_cli/test_cached_ro_borrowed_fallback.py
+@@ -0,0 +1,256 @@
++"""A borrowed shared reader never fails a concurrent ``cached_ro`` call: the caller gets a private connection.
++
++Hub: concurrent dashboard readers (session-panel feed, /session-cards, sidebar) raised
++"database is locked: cached reader is borrowed" 165 times in one errors.log, flipping status panels to unknown.
++"""
++
++import contextlib
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.fixture
++def board(tmp_path):
++    activity._reset_cache_for_tests()
++    path = tmp_path / "board.db"
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE t(v TEXT)")
++        conn.executemany("INSERT INTO t VALUES (?)", [("a",), ("b",)])
++        conn.commit()
++    yield path
++    activity._reset_cache_for_tests()
++
++
++def _shared_entry(path):
++    return activity._RO_CACHE[str(path)]
++
++
++@contextlib.contextmanager
++def _held_by_other_thread(path):
++    """Thread A holds ``cached_ro(path)`` open until the block exits; yields A's connection."""
++    holding, release = threading.Event(), threading.Event()
++    seen = []
++
++    def hold():
++        with activity.cached_ro(path) as conn:
++            seen.append(conn)
++            holding.set()
++            release.wait(10)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert holding.wait(10)
++        yield seen[0]
++    finally:
++        release.set()
++        thread.join(10)
++    assert not thread.is_alive()
++
++
++def _in_thread(call):
++    result, errors = [], []
++
++    def run():
++        try:
++            result.append(call())
++        except BaseException as exc:  # surfaced to the test thread below
++            errors.append(exc)
++
++    thread = threading.Thread(target=run)
++    thread.start()
++    thread.join(10)
++    assert not thread.is_alive()
++    if errors:
++        raise errors[0]
++    return result[0]
++
++
++def _enter_conn(path):
++    with activity.cached_ro(path) as conn:
++        return conn
++
++
++def test_borrowed_reader_falls_back_to_a_private_connection(board):
++    with _held_by_other_thread(board) as shared:
++        entry = _shared_entry(board)
++
++        def read():
++            with activity.cached_ro(board) as conn:
++                return conn, sorted(r[0] for r in conn.execute("SELECT v FROM t"))
++
++        private, rows = _in_thread(read)
++        assert private is not shared
++        assert rows == ["a", "b"]
++        assert _shared_entry(board) is entry  # the fallback never touches the shared cache entry
++        assert entry[0] is shared
++
++
++def test_zero_budget_borrowed_reader_also_falls_back(board):
++    with _held_by_other_thread(board) as shared:
++        def read():
++            with activity.cached_ro(board, busy_budget=0) as conn:
++                return conn, conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
++
++        private, count = _in_thread(read)
++        assert private is not shared
++        assert count == 2
++
++
++def _is_closed(conn):
++    try:
++        conn.execute("SELECT 1")
++    except sqlite3.ProgrammingError:
++        return True
++    return False
++
++
++def test_fallback_connection_is_closed_after_the_body(board):
++    with _held_by_other_thread(board):
++        def read():
++            with activity.cached_ro(board) as conn:
++                assert not _is_closed(conn)
++                return conn
++
++        private = _in_thread(read)
++    assert _is_closed(private)
++
++
++def test_fallback_connection_is_closed_when_the_body_raises(board):
++    with _held_by_other_thread(board) as shared:
++        entry = _shared_entry(board)
++        captured = []
++
++        def read():
++            with activity.cached_ro(board) as conn:
++                captured.append(conn)
++                conn.execute("SELECT * FROM no_such_table")
++
++        with pytest.raises(sqlite3.OperationalError, match="no such table"):
++            _in_thread(read)
++        assert _is_closed(captured[0])
++        assert captured[0] is not shared
++        assert _shared_entry(board) is entry  # a fallback error does not evict the shared reader
++        assert not _is_closed(shared)
++
++
++def test_shared_entry_is_kept_and_reused_after_contention(board):
++    with _held_by_other_thread(board) as shared:
++        entry = _shared_entry(board)
++        assert _in_thread(lambda: _enter_conn(board)) is not shared
++    assert _shared_entry(board) is entry
++    with activity.cached_ro(board) as conn:
++        assert conn is entry[0]
++        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
++
++
++def test_uncontended_calls_reuse_the_cached_connection(board):
++    with activity.cached_ro(board) as first:
++        pass
++    with activity.cached_ro(board) as second:
++        assert second.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
++    assert first is second is _shared_entry(board)[0]
++    assert not _is_closed(first)
++    assert _in_thread(lambda: _enter_conn(board)) is first  # another thread, uncontended: same shared reader
++
++
++def test_shared_lock_is_released_after_the_body(board):
++    with activity.cached_ro(board):
++        pass
++    lock = _shared_entry(board)[2]
++    assert lock.acquire(blocking=False)
++    lock.release()
++
++
++def test_fallback_is_read_only_and_counted(board):
++    before = activity.ro_stats["private_fallbacks"]
++    with _held_by_other_thread(board):
++        def write():
++            with activity.cached_ro(board) as conn:
++                conn.execute("INSERT INTO t VALUES ('c')")
++
++        with pytest.raises(sqlite3.OperationalError, match="readonly|read-only|query_only"):
++            _in_thread(write)
++    assert activity.ro_stats["private_fallbacks"] == before + 1
++    with activity.cached_ro(board) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
++
++
++def test_fallback_busy_timeout_is_the_remaining_budget(board):
++    with _held_by_other_thread(board):
++        def timeout_ms():
++            with activity.cached_ro(board, busy_budget=0.4) as conn:
++                return conn.execute("PRAGMA busy_timeout").fetchone()[0]
++
++        ms = _in_thread(timeout_ms)
++    # 400 ms budget minus the <=50 ms shared wait and the entry lookup; never the reader's full 500 ms.
++    assert 150 <= ms <= 350
++
++
++def test_holder_releasing_within_the_wait_hands_over_the_shared_reader(board, monkeypatch):
++    monkeypatch.setattr(activity, "_RO_SHARED_WAIT_S", 5)  # a late timer thread on a loaded runner is not a fallback
++    with activity.cached_ro(board):
++        pass
++    entry = _shared_entry(board)
++    lock = entry[2]
++    before = activity.ro_stats["private_fallbacks"]
++    assert lock.acquire(blocking=False)
++    timer = threading.Timer(0.01, lock.release)
++    timer.start()
++    try:
++        assert _enter_conn(board) is entry[0]
++    finally:
++        timer.join(5)
++    assert activity.ro_stats["private_fallbacks"] == before
++
++
++def test_missing_board_still_raises(tmp_path):
++    activity._reset_cache_for_tests()
++    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
++        with activity.cached_ro(tmp_path / "absent.db"):
++            pass
++
++
++def test_borrow_lock_keeps_its_raising_contract():
++    from hermes_cli.kanban_reader_lifecycle import borrow_lock, try_borrow
++
++    lock = threading.Lock()
++    with lock:
++        assert try_borrow(lock, 0) is False
++        with pytest.raises(sqlite3.OperationalError, match="cached reader is borrowed"):
++            with borrow_lock(lock, 0):
++                pass
++    with borrow_lock(lock, 0):
++        assert lock.locked()
++    assert not lock.locked()
++
++
++def test_fallback_busy_timeout_never_exceeds_the_shared_readers(board):
++    with _held_by_other_thread(board):
++        def timeout_ms():
++            with activity.cached_ro(board, busy_budget=5) as conn:
++                return conn.execute("PRAGMA busy_timeout").fetchone()[0]
++
++        assert _in_thread(timeout_ms) == int(activity._RO_BUSY_TIMEOUT_S * 1000)
++
++
++def test_fallback_opens_through_the_cache_opener(board, monkeypatch):
++    opened = []
++    real = activity._open_ro
++
++    def spy(path, *args, **kwargs):
++        conn = real(path, *args, **kwargs)
++        opened.append(conn)
++        return conn
++
++    with activity.cached_ro(board):
++        pass
++    monkeypatch.setattr(activity, "_open_ro", spy)
++    with _held_by_other_thread(board):
++        private = _in_thread(lambda: _enter_conn(board))
++    assert opened == [private]
+-- 
+2.43.0
+

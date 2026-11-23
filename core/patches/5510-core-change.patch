@@ -1,0 +1,463 @@
+From d7fb062e427aa7631270a3746c9385d69acbfb0a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:19:21 +0000
+Subject: [PATCH] fix(kanban): persist first-send envelopes across uncertain
+ retries [daveey]
+
+Problem: receipt expiry lets a fresh-HLC retransmission overwrite newer edits.
+Why: the sender rebuilt hydrated payloads and clocks on every transmission;
+only expiring server receipts tied those bytes to their mutation identity.
+Root (happened): first-send ordering and payload were not durable. Root (not
+caught): receipt-hit and cleanup tests missed lost-response plus restart and
+competing-writer composition. Recurrence: known PR160 expiry-replay gap.
+
+Persist outbox wire envelopes before network I/O and preserve synthetic parent
+identity across uncertainty. Ack/prune cleans pending records. Definitively
+rejected parents enter existing bounded retry/remap handling rather than
+replaying cached refusal forever. Do not invent capture-time migration for
+legacy attempted rows or silently rebuild corrupt/unknown envelopes.
+
+Proof: original unchanged-base sender RED 2 failed/1 passed; fixed sender and
+edge/compat controls GREEN; lease and neutral release selection 33 passed.
+Synthetic-parent bounded rejection edge RED 1 failed/3 passed before repair.
+Full scripts/check passed. Broader consumer selection and exact-head CI/review
+remain required. This is sender-only: Worker child/delete/lifecycle replay
+arbitration and supported deployment remain the service owner's open scope.
+---
+ docs/kanban-first-send-envelopes.md           | 50 ++++++++++
+ hermes_cli/kanban_db_sync.py                  |  6 ++
+ hermes_cli/kanban_sync_client.py              | 16 ++-
+ hermes_cli/kanban_sync_compat.py              |  9 +-
+ hermes_cli/kanban_sync_envelope.py            | 46 +++++++++
+ tests/hermes_cli/test_kanban_sync_envelope.py | 80 +++++++++++++++
+ .../test_kanban_sync_envelope_edges.py        | 98 +++++++++++++++++++
+ .../test_kanban_sync_forbidden_field.py       | 11 ++-
+ 8 files changed, 307 insertions(+), 9 deletions(-)
+ create mode 100644 docs/kanban-first-send-envelopes.md
+ create mode 100644 hermes_cli/kanban_sync_envelope.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_envelope.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_envelope_edges.py
+
+diff --git a/docs/kanban-first-send-envelopes.md b/docs/kanban-first-send-envelopes.md
+new file mode 100644
+index 0000000000..4852ef1db2
+--- /dev/null
++++ b/docs/kanban-first-send-envelopes.md
+@@ -0,0 +1,50 @@
++# First-send Board envelopes
++
++The sync sender persists each outbox operation's first transmitted envelope in
++`kanban_sync_outbox.wire_json` inside the write transaction that precedes network
++I/O. An uncertain response, subsequent round or process restart reuses its op ID,
++HLC and payload without consulting the current task/child row or generating a new
++clock. Acknowledgement removes the outbox row and its envelope together.
++
++Synthetic parent upserts have the same pending-transport contract in
++`kanban_sync_parent_envelopes`: a lost response cannot mint a fresh parent ID.
++Acknowledgement removes the parent envelope; pruning removes envelopes whose task
++is gone or already acknowledged. A definitive rejection transfers the parent to
++the existing bounded outbox rejection path. Only a confirmed rejection or explicit
++schema/lifecycle repair may advance mutation identity. Transport errors, including
++uncertain HTTP failures, never silently clear a saved envelope.
++
++These are pending transport records, not a permanent per-operation receipt ledger.
++Malformed saved envelopes fail closed: reconstructing unknown transmitted bytes
++could re-execute a mutation. Do not clear them automatically to make sync green.
++
++## Compatibility and limits
++
++An existing pending row with no saved envelope acquires one on its next send.
++The original envelope of a row already sent by pre-upgrade core cannot be
++reconstructed. No capture-time migration or UUID-age expiry rejection is used:
++a genuinely never-sent offline edit must retain first-send LWW ordering.
++
++Deploy the sender before Worker replay arbitration. An old Worker plus the new
++sender preserves task-field LWW on replay. It does not provide child/delete or
++lifecycle replay-effect protection; those require the separate Worker change.
++This sender patch alone is not end-to-end replay-after-receipt-expiry safety.
++
++## Failure analysis and proof
++
++Problem: receipt reclamation followed by the former sender's fresh-HLC retry can
++replace another gateway's newer edit (hermes-hub historical real-DO fixture).
++Why: receipt miss reexecutes the op; the fresh HLC wins field LWW; core rebuilt
++payload and clock on every transmission. Root (happened): first-send mutation
++identity/order was not durable across the expiring receipt boundary. Root (not
++caught): receipt-hit and retention tests did not compose lost responses, restart,
++receipt expiry and a competing writer. Recurrence: the PR160 review's known gap;
++not a diagnostic-deployment regression.
++
++`test_kanban_sync_envelope.py` failed on unchanged core for regenerated clock and
++synthetic parent identity (2 failed/1 passed). The fixed sender passes. The edge
++suite independently reads the DB at network entry to prove commit-before-send,
++checks run/delete retries across reopening, acknowledgement/pruning, and rejects
++an immortal synthetic-parent cached rejection (RED before that correction).
++Lease and neutral-release behavioral suites remain required controls. End-to-end
++Worker expiry/lifecycle tests and its normal review/CI/deploy gates are separate.
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 75cf91c1ee..73cafc093d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -195,6 +195,11 @@ CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
+     state        TEXT NOT NULL DEFAULT 'pending'
+ );
+ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON kanban_sync_outbox(state, created_at);
++-- First-send synthetic parents are pending transport, not a permanent receipt ledger.
++CREATE TABLE IF NOT EXISTS kanban_sync_parent_envelopes (
++    task_id TEXT PRIMARY KEY,
++    wire TEXT NOT NULL
++);
+ CREATE TABLE IF NOT EXISTS kanban_sync_omissions (
+     original_op_id TEXT PRIMARY KEY,
+     table_name TEXT NOT NULL,
+@@ -261,6 +266,7 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "workspace_source", "workspace_source TEXT"),
+     ("tasks", "workspace_custody", "workspace_custody TEXT"),
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
++    ("kanban_sync_outbox", "wire_json", "wire_json TEXT"),
+     # 1 once repair_ms_timestamps ran on this file (the one-time repair of rows applied before the guard).
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+     # Wall time of the last successful feed pull into this file (replicas): readers derive staleness from it. [daveey]
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 47bb045053..122eca0c75 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -652,8 +652,10 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+         task = conn.execute("SELECT * FROM tasks WHERE id = ? AND sync_version IS NULL", (tid,)).fetchone()
+         if task is None:
+             continue
+-        op = {"client_op_id": sync.uuid7(), "table": "tasks", "uid": tid, "op": "upsert",
+-              "fields": _wire_fields("tasks", _row_fields(conn, "tasks", task)), "hlc": _next_hlc(conn, gateway)}
++        saved = conn.execute("SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?", (tid,)).fetchone()
++        op = json.loads(saved[0]) if saved else {
++            "client_op_id": sync.uuid7(), "table": "tasks", "uid": tid, "op": "upsert",
++            "fields": _wire_fields("tasks", _row_fields(conn, "tasks", task)), "hlc": _next_hlc(conn, gateway)}
+         out.append((op, tid))
+     return out
+ 
+@@ -707,8 +709,12 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             break
+         with write_txn(conn):
+             from hermes_cli.kanban_terminal_guard import strip_stale_push  # no wake reopens a done card [daveey]
+-            wire = [strip_stale_push(conn, translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway))) for r in rows]
+-            rows, wire, parents = _within_batch(conn, rows, wire, gateway)
++            from hermes_cli import kanban_sync_envelope as envelopes
++            envelopes.prune_parents(conn)
++            rows, _wire, parents = _within_batch(conn, rows, [{} for _r in rows], gateway)
++            wire = [envelopes.outbound(conn, r, lambda r=r: strip_stale_push(
++                conn, translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)))) for r in rows]
++            parents = [(envelopes.parent(conn, tid, lambda op=op: op), tid) for op, tid in parents]
+             wire = [op for op, _tid in parents] + wire
+         try:
+             resp = hub.ops(board, wire)
+@@ -756,7 +762,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     remap(conn, op_id, new_id)
+                     from hermes_cli.kanban_sync_reserved_key import remap as remap_key_recovery
+                     remap_key_recovery(conn, op_id, new_id)
+-                    conn.execute("UPDATE kanban_sync_outbox SET op_id = ?, attempts = attempts + 1, last_error = ?, "
++                    conn.execute("UPDATE kanban_sync_outbox SET op_id = ?, wire_json = NULL, attempts = attempts + 1, last_error = ?, "
+                                  "retry_after = ? WHERE op_id = ?",
+                                  (new_id, f"retrying: {reason}"[:500], int(time.time()) + _backoff_s(row["attempts"]), op_id))
+                     out.deferred += 1
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index d552abba71..88a70e5d16 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -17,8 +17,15 @@ def rejected_parent(conn: sqlite3.Connection, parents: list[tuple[dict, str]], r
+         if result.get("status") in ("applied", "merged") and result.get("version"):
+             conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+                          (result["version"], tid))
+-        if result.get("status") != "rejected" or result.get("reason") != "forbidden_field":
++        from hermes_cli.kanban_sync_envelope import retire_parent
++        if result.get("status") in ("applied", "merged"):
++            retire_parent(conn, tid)
++        if result.get("status") != "rejected":
+             return None
++        # A definitive refusal is not an uncertain send. Move synthetic parents
++        # into the normal bounded rejection/remap path rather than replaying a
++        # cached refusal forever under their frozen id.
++        retire_parent(conn, tid)
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, hlc, created_at) "
+             "VALUES (?, 'tasks', ?, 'upsert', ?, ?, ?)",
+diff --git a/hermes_cli/kanban_sync_envelope.py b/hermes_cli/kanban_sync_envelope.py
+new file mode 100644
+index 0000000000..807423b967
+--- /dev/null
++++ b/hermes_cli/kanban_sync_envelope.py
+@@ -0,0 +1,46 @@
++"""Durable first-send envelopes, committed by push before network I/O. [daveey]
++
++Only pending transport is retained: acknowledged outbox rows are deleted normally;
++synthetic parents are removed on acknowledgement or when their task disappears.
++This cannot reconstruct envelopes already transmitted by an older core.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from collections.abc import Callable
++
++
++def outbound(conn: sqlite3.Connection, row: dict, build: Callable[[], dict]) -> dict:
++    """Rebuild neither a transmitted payload nor its ordering clock on uncertain retry."""
++    saved = conn.execute("SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?", (row["op_id"],)).fetchone()
++    if saved and saved[0] is not None:
++        wire = json.loads(saved[0])
++        if wire["client_op_id"] == row["op_id"]:
++            return wire
++        # Explicit lifecycle/schema repair can replace an op's identity in place.
++        # Its former envelope belongs to the retired id, never the replacement.
++    wire = build()
++    conn.execute("UPDATE kanban_sync_outbox SET wire_json=?, hlc=? WHERE op_id=?",
++                 (json.dumps(wire, separators=(",", ":")), wire.get("hlc", ""), row["op_id"]))
++    return wire
++
++
++def parent(conn: sqlite3.Connection, task_id: str, build: Callable[[], dict]) -> dict:
++    """A synthesized parent is pending work too; a lost answer must not mint a new op."""
++    saved = conn.execute("SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?", (task_id,)).fetchone()
++    if saved:
++        return json.loads(saved[0])
++    wire = build()
++    conn.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES (?,?)",
++                 (task_id, json.dumps(wire, separators=(",", ":"))))
++    return wire
++
++
++def retire_parent(conn: sqlite3.Connection, task_id: str) -> None:
++    conn.execute("DELETE FROM kanban_sync_parent_envelopes WHERE task_id=?", (task_id,))
++
++
++def prune_parents(conn: sqlite3.Connection) -> None:
++    conn.execute("DELETE FROM kanban_sync_parent_envelopes WHERE NOT EXISTS "
++                 "(SELECT 1 FROM tasks WHERE id=task_id AND sync_version IS NULL)")
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope.py b/tests/hermes_cli/test_kanban_sync_envelope.py
+new file mode 100644
+index 0000000000..0e7a60d7df
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_envelope.py
+@@ -0,0 +1,80 @@
++"""First-send envelopes survive lost responses and local row changes. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "sender")
++    yield conn, home
++    conn.close()
++
++
++class LostReply:
++    def __init__(self):
++        self.batches = []
++
++    def ops(self, board, wire):
++        self.batches.append(json.dumps(wire, separators=(",", ":")))
++        raise OSError("response lost after server applied the batch")
++
++
++def send(conn, hub):
++    with pytest.raises(OSError, match="response lost"):
++        client.push(conn, hub, "default", "sender", primary=False)
++
++
++def test_lost_response_freezes_payload_and_clock_before_network_and_across_restart(board, monkeypatch):
++    conn, home = board
++    tid = kb.create_task(conn, title="original", assignee="worker")
++    hub = LostReply()
++    send(conn, hub)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET title='newer local edit' WHERE id=?", (tid,))
++    conn.close()
++    reopened = kbc.connect(home / "kanban.db")
++    try:
++        monkeypatch.setattr(client, "_next_hlc", lambda *_: pytest.fail("retry generated a new clock"))
++        # Restrict this batch to the operations actually transmitted before restart.
++        old_ids = [op["client_op_id"] for op in json.loads(hub.batches[0])]
++        with kbc.write_txn(reopened):
++            reopened.execute("DELETE FROM kanban_sync_outbox WHERE op_id NOT IN (" + ",".join("?" for _ in old_ids) + ")", old_ids)
++        send(reopened, hub)
++        assert hub.batches[1] == hub.batches[0]
++    finally:
++        reopened.close()
++
++
++def test_synthesized_parent_identity_and_payload_survive_lost_reply(board):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child needs parent")
++    hub = LostReply()
++    send(conn, hub)
++    send(conn, hub)
++    assert hub.batches[1] == hub.batches[0]
++    assert any(op.get("table") == "tasks" for op in json.loads(hub.batches[0]))
++
++
++def test_release_retries_preserve_entire_envelope(board):
++    conn, _ = board
++    from hermes_cli import kanban_db_sync as sync
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) VALUES (?,?,?,?,?,?,?)",
++                     (sync.uuid7(), "tasks", "t_release", "release", json.dumps({"run_uid": "run-1", "reason": "failure"}), "", 1))
++    hub = LostReply()
++    send(conn, hub)
++    send(conn, hub)
++    assert hub.batches[1] == hub.batches[0]
++    assert json.loads(hub.batches[0])[0]["op"] == "release"
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope_edges.py b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+new file mode 100644
+index 0000000000..e4d4934d10
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+@@ -0,0 +1,98 @@
++"""Explicit rejections may advance identity; uncertain sends may not. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_sync_envelope as fixtures
++
++board = fixtures.board
++
++
++class ParentRejected:
++    def __init__(self):
++        self.batches = []
++
++    def ops(self, board, wire):
++        self.batches.append(wire)
++        return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
++                             "reason": "storage_error"} for op in wire]}
++
++
++def test_rejected_synthetic_parent_enters_bounded_retry_path(board):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    hub = ParentRejected()
++    result = client.push(conn, hub, "default", "sender", primary=False)
++    assert result.deferred >= 2
++    original = next(op for op in hub.batches[0] if op["table"] == "tasks")
++    saved = conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()
++    assert saved and saved["op_id"] != original["client_op_id"]
++    assert saved["attempts"] == 1
++    assert saved["wire_json"] is None
++    assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
++
++
++def test_envelopes_commit_before_io_and_ack_cleans_pending_storage(board):
++    conn, home = board
++    kb.create_task(conn, title="durable", assignee="worker")
++
++    class Ack:
++        def ops(self, board, wire):
++            independent = kbc.connect(home / "kanban.db")
++            try:
++                for op in wire:
++                    saved = independent.execute("SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?",
++                                                (op["client_op_id"],)).fetchone()
++                    assert saved and json.loads(saved[0]) == op
++            finally:
++                independent.close()
++            return {"results": [{"client_op_id": op["client_op_id"], "status": "applied", "version": 1}
++                                for op in wire]}
++
++    assert client.push(conn, Ack(), "default", "sender", primary=False).applied
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
++
++
++def test_delete_and_run_retries_freeze_payload_across_reopen(board, monkeypatch):
++    conn, home = board
++    tid = kb.create_task(conn, title="lifecycle", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET sync_version=1 WHERE id=?", (tid,))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++        for table, uid, op, fields in [("task_runs", "run-frozen", "upsert", {"task_id": tid, "status": "running"}),
++                                        ("task_chat_links", "delete-frozen", "delete", {})]:
++            conn.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) VALUES (?,?,?,?,?,?,?)",
++                         (sync.uuid7(), table, uid, op, json.dumps(fields), "", 1))
++    hub = fixtures.LostReply()
++    fixtures.send(conn, hub)
++    conn.close()
++    reopened = kbc.connect(home / "kanban.db")
++    try:
++        monkeypatch.setattr(client, "_next_hlc", lambda *_: pytest.fail("lifecycle retry re-clocked"))
++        fixtures.send(reopened, hub)
++        assert hub.batches[0] == hub.batches[1]
++        assert {op["op"] for op in json.loads(hub.batches[0])} == {"upsert", "delete"}
++    finally:
++        reopened.close()
++
++
++def test_parent_ack_and_pruning_remove_finished_pending_envelopes(board):
++    from hermes_cli import kanban_sync_compat as compat
++    from hermes_cli import kanban_sync_envelope as envelope
++    conn, _ = board
++    tid = kb.create_task(conn, title="synthetic", assignee="worker")
++    wire = {"client_op_id": sync.uuid7(), "fields": {"title": "synthetic"}}
++    with kbc.write_txn(conn):
++        assert envelope.parent(conn, tid, lambda: wire) == wire
++        compat.rejected_parent(conn, [(wire, tid)], {"client_op_id": wire["client_op_id"], "status": "applied", "version": 3})
++        assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
++        envelope.parent(conn, "t_missing", lambda: wire)
++        envelope.prune_parents(conn)
++        assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
+diff --git a/tests/hermes_cli/test_kanban_sync_forbidden_field.py b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+index 649e110591..bcf67a413c 100644
+--- a/tests/hermes_cli/test_kanban_sync_forbidden_field.py
++++ b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+@@ -81,7 +81,7 @@ def test_other_rejections_do_not_get_compatibility_retries(live, reason, detail,
+ 
+ 
+ @pytest.mark.parametrize("reason", ["live_claim", "not_found", "storage_error"])
+-def test_synthetic_parent_non_schema_rejections_retain_existing_retry_handling(live, reason):
++def test_synthetic_parent_non_schema_rejections_use_bounded_outbox_handling(live, reason):
+     kb.create_task(live, title="synthetic parent", assignee="worker")
+     live.execute("DELETE FROM kanban_sync_outbox WHERE table_name='tasks'")
+     live.commit()
+@@ -89,7 +89,9 @@ def test_synthetic_parent_non_schema_rejections_retain_existing_retry_handling(l
+         return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
+                              "reason": reason, "detail": "no task missing"} for op in batch]}
+     client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
+-    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0] == 0
++    [parent] = live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
++    assert parent["attempts"] == 1
++    assert parent["state"] == ("rejected" if reason == "live_claim" else "pending")
+ 
+ 
+ @pytest.mark.parametrize("state", ["pending", "rejected"])
+@@ -118,7 +120,10 @@ def test_synthetic_parent_acknowledgement_is_successful_version_only(live, statu
+     result = {"client_op_id": "parent-op", "status": status}
+     if version is not None:
+         result["version"] = version
+-    assert compat.rejected_parent(live, [({"client_op_id": "parent-op"}, tid)], result) is None
++    parent = {"client_op_id": "parent-op", "fields": {"title": "parent acknowledgement"},
++              "hlc": "0000000000001-0000-macbook"}
++    queued = compat.rejected_parent(live, [(parent, tid)], result)
++    assert (queued is not None) == (status == "rejected")
+     assert live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0] == expected
+ 
+ 
+-- 
+2.43.0
+

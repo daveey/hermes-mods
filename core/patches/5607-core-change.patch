@@ -1,0 +1,233 @@
+From 46abc77179bd896e4be25a06129d5f6931c43f4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:39:48 +0000
+Subject: [PATCH] fix(kanban): remove forbidden repin advice from class wall
+ notices [daveey]
+
+---
+ hermes_cli/kanban_dispatch_skip.py            |  8 ++--
+ tests/hermes_cli/test_kanban_dispatch_skip.py | 46 ++++++++++++-------
+ .../test_kanban_pickup_pinned_first.py        | 30 ++++++++----
+ 3 files changed, 56 insertions(+), 28 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index e950c43082..d2e68f8bff 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -336,6 +336,8 @@ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+         reason = LLM_PACED
+     detail = skip.get("detail") or "no detail"
+     text = _WORDS.get(reason, "skipped: {reason} ({detail})").format(reason=reason, detail=detail)
++    if reason == PINNED_QUOTA_WALL and str(detail).startswith('class:'):
++        text = f"held: eligible class routes {detail} quota-walled"
+     if reason == "claim_deferred" and _local_gate(skip):
+         text = f"skipped: this host's admission gate deferred its claim ({detail})"
+     if skip.get("until"):
+@@ -370,14 +372,14 @@ def advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     ``now`` (default ``time.time()``) drops "starts on its own when that wall resets": :func:`pool_replace_helps`
+     offers the pool re-place for it at the same ``now`` (PR #1865 review). [daveey]"""
+     if _wall_passed(skip, now):
+-        return ("that wall's reset has passed; the next dispatcher tick re-checks the pin. Priority changes do not "
++        return ("that wall's reset has passed; the next dispatcher tick re-checks eligible routes. Priority changes do not "
+                 "clear a quota wall. Do not run its work outside the dispatcher")
+     if skip.get("reason") == LLM_PACED:
+         return ("it starts on its own once its provider pool is back on pace or a paced slot frees; priority changes "
+                 "do not lift a pacing hold. Do not run its work outside the dispatcher")
+     if skip.get("reason") == PINNED_QUOTA_WALL:
+-        return ("it starts on its own when that wall resets. Re-pin it (`hermes kanban set-model <id> ...`) only if it "
+-                "cannot wait; priority changes do not clear a quota wall. Do not run its work outside the dispatcher")
++        return ("it starts on its own when an eligible class route becomes available; priority changes do not clear "
++                "a quota wall. Do not run its work outside the dispatcher")
+     if skip.get("reason") == "review_provider_wall":
+         return ("it starts on its own when an independent reviewer is available on this host; priority changes do not "
+                 "clear a reviewer wall. Do not run its work outside the dispatcher")
+diff --git a/tests/hermes_cli/test_kanban_dispatch_skip.py b/tests/hermes_cli/test_kanban_dispatch_skip.py
+index e3979e1ac1..04a5f3ff13 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_skip.py
++++ b/tests/hermes_cli/test_kanban_dispatch_skip.py
+@@ -46,11 +46,21 @@ def _walled(monkeypatch, until=RESET):
+ 
+     def wall(provider, model):
+         calls.append((provider, model))
+-        return until if (model, provider) == PIN else None
++        # Both standard-class candidates are genuinely walled; deep remains eligible.
++        return until if until is not None and until > kb.time.time() and (provider, model) in {
++            ('anthropic', 'claude-sonnet-5-5'), ('openai-codex', 'gpt-test')} else None
+     monkeypatch.setattr(walls, "live_quota_wall", wall)
+     return calls
+ 
+ 
++def _legacy(conn, **kw):
++    tid = kb.create_task(conn, title="historical selector", assignee="a", **kw)
++    # Disposable historical evidence, not a supported live mutation.
++    conn.execute("UPDATE tasks SET model_override=?, provider_override=? WHERE id=?", (*PIN, tid))
++    conn.commit()
++    return tid
++
++
+ def _notice(conn, tid):
+     row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                        (tid, cw.NOTICE_KIND)).fetchone()
+@@ -64,32 +74,32 @@ def test_fresh_pin_on_quota_wall_is_held_with_one_reason_and_the_notice_names_it
+     calls = _walled(monkeypatch)
+     monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (4, 7))
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="bb-tuner pinned", assignee="a", model_override=PIN[0],
+-                             provider_override=PIN[1], session_id="chat")
+-        free = kb.create_task(conn, title="unpinned sibling", assignee="a")
++        tid = _legacy(conn, session_id="chat")
++        free = kb.create_task(conn, title="security sibling", assignee="a")
+         spawned = []
+         for _ in range(4):
+             spawned += _tick(conn)
+             clock[0] += 60
+         assert tid not in spawned and free in spawned  # free slots: only the walled pin is held
+-        assert ("anthropic", "claude-opus-5-5") in calls
+-        assert _skips(conn, tid) == [{"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)",
+-                                      "model": PIN[0], "provider": PIN[1], "until": RESET}]
++        assert {("anthropic", "claude-sonnet-5-5"), ("openai-codex", "gpt-test")} <= set(calls)
++        assert _skips(conn, tid) == [{"reason": "pinned_quota_wall", "detail": "class:standard (auto)",
++                                      "model": "class:standard", "provider": "auto", "until": RESET}]
+         task = kb.get_task(conn, tid)
+         assert task.status == "ready" and not task.claim_lock
+         place = qp.position(conn, task)
+         assert place["lane"] == "local" and place["skip"]["reason"] == "pinned_quota_wall"
+         line = qp.describe(place)
+-        assert "held: pinned model claude-opus-5-5 (anthropic) quota-walled until 10:00Z" in line
++        assert "held: eligible class routes class:standard (auto) quota-walled until 10:00Z" in line
+         assert not any(w in line for w in PRIORITY_WORDS)
+ 
+         clock[0] = START + 31 * 60
+         assert cw.sweep(conn, now=clock[0]) == 1
+         payload = _notice(conn, tid)
+-        assert payload["dispatch_skip"] == {"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)",
++        assert payload["dispatch_skip"] == {"reason": "pinned_quota_wall", "detail": "class:standard (auto)",
+                                             "until": RESET}
+         for text in (cw.notice_text(payload), pu.notice_text(payload), pu.ready_hint(conn, task, now=clock[0])):
+-            assert "held: pinned model claude-opus-5-5 (anthropic) quota-walled until 10:00Z" in text
++            assert "held: eligible class routes class:standard (auto) quota-walled until 10:00Z" in text
++            assert "set-model" not in text and "Re-pin" not in text
+             assert not any(w in text for w in PRIORITY_WORDS), text
+             assert skips.UNRECORDED not in text
+ 
+@@ -99,11 +109,13 @@ def test_walled_pin_dry_run_holds_without_writing(board, monkeypatch, all_assign
+     routing(monkeypatch)
+     _walled(monkeypatch)
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="pinned", assignee="a", model_override=PIN[0], provider_override=PIN[1])
++        tid = _legacy(conn)
++        before = list(conn.iterdump())
+         res = dispatch.dispatch_once(conn, spawn_fn=lambda *_a: None, dry_run=True)
+-        assert res.pinned_quota_held == [(tid, PIN[0], PIN[1], float(RESET))]
++        assert res.pinned_quota_held == [(tid, "class:standard", "auto", float(RESET))]
+         assert res.clock_held[tid] == ("pinned_quota_wall", RESET)
+         assert res.spawned == [] and _skips(conn, tid) == []
++        assert list(conn.iterdump()) == before
+ 
+ 
+ @pytest.mark.parametrize("case", ["wall_cleared", "wall_past", "unpinned", "has_run"])
+@@ -112,15 +124,16 @@ def test_pin_hold_only_for_a_fresh_pin_on_a_live_wall(board, monkeypatch, all_as
+     routing(monkeypatch)
+     _walled(monkeypatch, until={"wall_cleared": None, "wall_past": START - 1}.get(case, RESET))
+     with kbc.connect() as conn:
+-        pin = {} if case == "unpinned" else {"model_override": PIN[0], "provider_override": PIN[1]}
+-        tid = kb.create_task(conn, title="pinned", assignee="a", **pin)
++        tid = (kb.create_task(conn, title="unrestricted", assignee="a")
++               if case == "unpinned" else _legacy(conn))
+         if case == "has_run":
+             assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None  # opens a run
+             with kb.write_txn(conn):
+                 conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, current_run_id=NULL WHERE id=?",
+                              (tid,))
+             clock[0] += 1
+-        assert skips.pinned_quota_hold(conn, tid) is None
++        expected = ("class:standard", "auto", float(RESET)) if case in {"unpinned", "has_run"} else None
++        assert skips.pinned_quota_hold(conn, tid) == expected
+ 
+ 
+ def test_per_profile_capped_row_gets_one_event(board, monkeypatch, all_assignees_spawnable):
+@@ -229,7 +242,8 @@ def test_review_lane_is_never_pin_held(board, monkeypatch):
+     _clock(monkeypatch)
+     _walled(monkeypatch)
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="pinned", assignee="a", model_override=PIN[0], provider_override=PIN[1])
++        routing(monkeypatch)
++        tid = _legacy(conn)
+         res = dispatch.DispatchResult()
+         assert not skips.hold_pinned_quota(conn, tid, res, lane="review")
+         assert skips.hold_pinned_quota(conn, tid, res, lane="ready") and res.pinned_quota_held
+diff --git a/tests/hermes_cli/test_kanban_pickup_pinned_first.py b/tests/hermes_cli/test_kanban_pickup_pinned_first.py
+index 0caaf207de..7b191aef75 100644
+--- a/tests/hermes_cli/test_kanban_pickup_pinned_first.py
++++ b/tests/hermes_cli/test_kanban_pickup_pinned_first.py
+@@ -41,7 +41,8 @@ def imports(monkeypatch):
+ def walled_model(monkeypatch):
+     until = int(time.time()) + WALL_S
+     monkeypatch.setattr(walls, "live_quota_wall",
+-                        lambda provider, model: until if (model, provider) == MODEL else None)
++                        lambda provider, model: until if (provider, model) in {
++                            ('anthropic', 'claude-sonnet-5-5'), ('openai-codex', 'gpt-6.1-sol')} else None)
+     return until
+ 
+ 
+@@ -50,12 +51,22 @@ def _status(conn, tid):
+     return t.status if t else None
+ 
+ 
+-def test_a_mandatory_pin_on_a_walled_model_with_no_episode_is_not_copied(gws, imports, walled_model):
++def _legacy(hub, **kw):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="historical selector", assignee="default", runs_on=PIN, **kw)
++    hub.conn.execute("UPDATE tasks SET model_override=?, provider_override=?, model_pin_mandatory=1 WHERE id=?",
++                     (*MODEL, tid))
++    hub.conn.commit()
++    hub.round()
++    return tid
++
++
++def test_all_class_routes_walled_with_no_episode_is_not_copied(gws, imports, walled_model):
+     hub, worker = gws
+     # Both pinned to this machine, so ranking alone cannot save the eligible one: the walled card is ahead of it.
+-    walled = support._hub_card(hub, title="mandatory pin, walled, never run", priority=1000, runs_on=PIN,
+-                               model_override=MODEL[0], provider_override=MODEL[1], pin_mandatory=True)
+-    pinned = support._hub_card(hub, title="pinned, eligible", priority=0, runs_on=PIN)
++    walled = _legacy(hub, priority=1000)
++    pinned = support._hub_card(hub, title="machine bound, deep eligible", priority=0, runs_on=PIN,
++                               model_override="class:deep", provider_override="auto")
+     worker.round()
+     worker.enter()
+     # Parity: on a copy, the local dispatcher holds the walled card pre-claim (pinned_quota_wall).
+@@ -65,7 +76,8 @@ def test_a_mandatory_pin_on_a_walled_model_with_no_episode_is_not_copied(gws, im
+         assert wn.import_cards(worker.conn, replica, [walled]) == [walled]
+     finally:
+         replica.close()
+-    assert kds.pinned_quota_hold(worker.conn, walled) == (*MODEL, float(walled_model))
++    assert kds.pinned_quota_hold(worker.conn, walled) == ('class:standard', 'auto', float(walled_model))
++    assert kb.get_task(worker.conn, walled).model_override == MODEL[0]
+     assert wn.evict(worker.conn) == [walled]
+     imports.clear()
+     # Budget 1: the first tick copies and starts the pinned card, not the walled one.
+@@ -79,17 +91,17 @@ def test_a_mandatory_pin_on_a_walled_model_with_no_episode_is_not_copied(gws, im
+     assert _status(worker.conn, walled) is None
+     skip = kps.latest(worker.conn, walled)
+     assert skip is not None and skip["reason"] == "quota_hold"
+-    assert skip["detail"].startswith("pinned_quota_wall gpt-6-astra (openai-codex) until ")
++    assert skip["detail"].startswith("pinned_quota_wall class:standard (auto) until ")
+ 
+ 
+ def test_a_fresh_pin_with_no_wall_is_copied(gws, imports, monkeypatch):
+     hub, worker = gws
+     monkeypatch.setattr(walls, "live_quota_wall", lambda provider, model: None)
+-    tid = support._hub_card(hub, title="mandatory pin, no wall", priority=10, runs_on=PIN,
+-                            model_override=MODEL[0], provider_override=MODEL[1], pin_mandatory=True)
++    tid = _legacy(hub, priority=10)
+     worker.round()
+     worker.enter()
+     assert wn.pickup(worker.conn, budget=1) == [tid]
++    assert kb.get_task(worker.conn, tid).model_override == MODEL[0]
+ 
+ 
+ @pytest.mark.parametrize("age_s", [0, 3600])
+-- 
+2.43.0
+

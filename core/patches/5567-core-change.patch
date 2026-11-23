@@ -1,0 +1,3179 @@
+From d58bf49c45c52fcd74a358257144bcb0032077a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:31:34 +0000
+Subject: [PATCH] test(kanban): migrate consumer fixtures to model-neutral
+ policy [daveey]
+
+---
+ tests/hermes_cli/test_kanban_class_routing.py |  35 +-
+ .../test_kanban_class_unroutable.py           |   5 +-
+ .../test_kanban_edit_priority_paced.py        |   8 +-
+ .../test_kanban_llm_pacing_followups.py       |  11 +-
+ .../hermes_cli/test_kanban_llm_pacing_xai.py  |   8 +-
+ .../test_kanban_managed_pin_policy.py         |  86 +--
+ tests/hermes_cli/test_kanban_mandatory_pin.py |  54 ++
+ .../test_kanban_model_tier_paced_reroute.py   |  90 +--
+ .../test_kanban_notice_pacing_admission.py    |  51 +-
+ tests/hermes_cli/test_kanban_pace_reroute.py  |  34 +-
+ .../hermes_cli/test_kanban_pacing_recovery.py |   4 +-
+ .../test_kanban_pickup_stall_repin.py         |  16 +-
+ .../test_kanban_pin_history_recovery.py       |  12 +-
+ tests/hermes_cli/test_kanban_pin_provider.py  |  38 +-
+ tests/hermes_cli/test_kanban_pin_reroute.py   | 525 +++++-------------
+ tests/hermes_cli/test_kanban_placement.py     |   6 +-
+ tests/hermes_cli/test_kanban_pool_queue.py    |  31 +-
+ tests/hermes_cli/test_kanban_profile_pace.py  |  15 +-
+ .../hermes_cli/test_kanban_provider_walls.py  |  73 ++-
+ .../hermes_cli/test_kanban_quota_deadlines.py |  16 +-
+ tests/hermes_cli/test_kanban_quota_episode.py |  55 +-
+ .../test_kanban_quota_episode_walls.py        | 101 ++--
+ tests/hermes_cli/test_kanban_ratio_routing.py |  77 ++-
+ .../test_kanban_review_handoff_validation.py  |  13 +-
+ .../test_kanban_review_model_cycles.py        |  12 +-
+ .../test_kanban_review_paced_reroute.py       |  45 +-
+ .../test_kanban_review_pin_admission.py       |  27 +-
+ .../test_kanban_review_retry_custody.py       |   4 +
+ .../test_kanban_review_source_replica.py      |   8 +-
+ .../test_kanban_review_tier_fallback.py       |  15 +-
+ .../hermes_cli/test_kanban_shared_blockers.py |  95 ++--
+ tests/hermes_cli/test_kanban_strong_tier.py   |  85 +--
+ tests/hermes_cli/test_kanban_sweep_gate.py    |   9 +-
+ tests/tools/test_kanban_blocker_metadata.py   |  10 +-
+ 34 files changed, 849 insertions(+), 825 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_class_routing.py b/tests/hermes_cli/test_kanban_class_routing.py
+index 40df1ef90e..23bdfbddec 100644
+--- a/tests/hermes_cli/test_kanban_class_routing.py
++++ b/tests/hermes_cli/test_kanban_class_routing.py
+@@ -91,26 +91,41 @@ def test_dispatch_tick_reads_class_default_and_keeps_review_deep(board, routable
+ 
+ 
+ @pytest.mark.parametrize("lane", ["ready", "review"])
+-def test_explicit_lane_pin_survives_class_default(board, monkeypatch, lane):
++def test_legacy_concrete_lane_pin_is_ignored_for_class_default(board, monkeypatch, lane):
++    """Concrete pins/handoff models are retired: refused at ingress, ignored if found on an old row."""
+     with kbc.connect() as conn:
+-        task = kb.get_task(conn, kb.create_task(conn, title="review", assignee="default",
+-                            model_override="author-model" if lane == "review" else "unknown-exact-model",
+-                            provider_override="custom"))
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title="review", assignee="default", model_override="unknown-exact-model",
++                           provider_override="custom")
++        tid = kb.create_task(conn, title="review", assignee="default")
++        # Historical author row, seeded raw in this isolated DB; its provenance must survive dispatch.
++        conn.execute("UPDATE tasks SET model_override=?, provider_override='custom' WHERE id=?",
++                     ("author-model" if lane == "review" else "unknown-exact-model", tid))
++        conn.commit()
++        task = kb.get_task(conn, tid)
+         if lane == "review":
+             kb.claim_task(conn, task.id)
+-            kb.request_review(conn, task.id, metadata={"review_model": "unknown-exact-model",
+-                                                       "review_provider": "custom"})
++            with pytest.raises(ValueError):
++                kb.request_review(conn, task.id, metadata={"review_model": "unknown-exact-model",
++                                                           "review_provider": "custom"})
++            kb.request_review(conn, task.id, metadata={"review_model": "class:deep"})
+             task = kb.claim_review_task(conn, task.id)
+         tier.apply_model_tier(conn, task, lane=lane, cfg={"default_model": "class:standard"})
+-        assert owner_pin(task, conn) == ("unknown-exact-model", "custom")
++        # The review class resolves to a concrete execution receipt (never the legacy author-model pin).
++        assert owner_pin(task, conn) == (("claude-opus-5-5", "anthropic") if lane == "review"
++                                         else ("class:standard", "auto"))
++        assert kb.get_task(conn, tid).provider_override == "custom"
+ 
+ 
+-def test_invalid_class_provider_refused_before_launch(board, monkeypatch):
++def test_class_with_concrete_provider_is_refused_at_ingress_and_ignored_at_launch(board, monkeypatch):
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title="bad", assignee="default", model_override="class:deep",
++                           provider_override="openrouter")
+         task.model_override, task.provider_override = "class:deep", "openrouter"
+-        with pytest.raises(ValueError, match="auto"):
+-            owner_pin(task, conn)
++        # A stale concrete provider can never steer a class: the launch is always ``auto``.
++        assert owner_pin(task, conn) == ("class:deep", "auto")
+ 
+ 
+ @pytest.mark.parametrize("exhausted", [False, True])
+diff --git a/tests/hermes_cli/test_kanban_class_unroutable.py b/tests/hermes_cli/test_kanban_class_unroutable.py
+index cff6895a73..fc365dd0ce 100644
+--- a/tests/hermes_cli/test_kanban_class_unroutable.py
++++ b/tests/hermes_cli/test_kanban_class_unroutable.py
+@@ -84,11 +84,12 @@ def test_review_with_only_eligible_standard_route_uses_tier_fallback(board):
+ 
+ 
+ def test_card_pinned_class_is_left_to_the_card(board):
+-    """An explicit card pin is the creator's choice; the tier fallback does not rewrite it."""
++    """A card's own class selector is the creator's choice (the only per-card route spec left): the tier fallback
++    records it as unroutable here but never rewrites the card's class."""
+     _write(board, {"enabled": True})
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="x", assignee="default", model_override="class:deep",
+                                                 provider_override="auto"))
+         reason = tier.apply_model_tier(conn, task, lane="ready")
+-    assert reason == "pinned"
++    assert reason == "class+unroutable:class:deep:no_eligible_routes"
+     assert task.model_override == "class:deep"
+diff --git a/tests/hermes_cli/test_kanban_edit_priority_paced.py b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+index f9ee90bd10..8227591f03 100644
+--- a/tests/hermes_cli/test_kanban_edit_priority_paced.py
++++ b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+@@ -21,7 +21,7 @@ from hermes_cli import kanban_llm_pacing as lp
+ from hermes_cli import kanban_llm_pacing_dispatch as pd
+ from hermes_cli.kanban_parser import build_parser
+ from tests.hermes_cli import test_kanban_model_tier as model_tier
+-from tests.hermes_cli.test_kanban_notice_pacing_admission import OPUS, _store
++from tests.hermes_cli.test_kanban_notice_pacing_admission import _store
+ 
+ board = model_tier.board  # one unsynced gateway: every card is its own to lease
+ 
+@@ -35,8 +35,7 @@ def _main(argv: list[str]) -> int:
+ @pytest.fixture
+ def paced_card(board):
+     with kbc.connect_closing() as conn:
+-        tid = kb.create_task(conn, title="paced", assignee="default", priority=900, model_override=OPUS,
+-                             provider_override="anthropic")
++        tid = kb.create_task(conn, title="paced", assignee="default", priority=900)
+     _store(("anthropic", lp.HELD))  # every candidate pool at reserve: the only state that holds a start
+     with kbc.connect_closing() as conn:
+         assert pd.paced_pools(conn, tid), "precondition: the governor holds the card"
+@@ -81,8 +80,7 @@ def test_lowering_and_same_value_on_paced_card_unchanged(paced_card, capsys):
+ 
+ def test_raise_on_unpaced_card_needs_no_reason(board, capsys):
+     with kbc.connect_closing() as conn:
+-        tid = kb.create_task(conn, title="open", assignee="default", priority=900, model_override=OPUS,
+-                             provider_override="anthropic")
++        tid = kb.create_task(conn, title="open", assignee="default", priority=900)
+     _store(("anthropic", lp.OPEN))
+     assert _main(["edit", tid, "--priority", "1000"]) == 0, capsys.readouterr().err
+     assert _state(tid)[0] == 1000
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_followups.py b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+index 464121adab..d8b13015f2 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_followups.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+@@ -100,7 +100,12 @@ def paced_board(board, monkeypatch):
+ 
+ def _config(home, **extra):
+     # JSON is valid YAML (the test venv may have no PyYAML).
+-    home.joinpath("config.yaml").write_text(json.dumps({"kanban": {}, **extra}), encoding="utf-8")
++    # Cards are model-neutral: they route on ``class:standard`` unless the test brings its own policy, so give them
++    # an isolated Anthropic-only standard class (the pool the paced-hold assertions name).
++    default = {"model_routing": {"enabled": True, "routes": {"standard": [
++        {"provider": "anthropic", "model": OPUS, "billing": "subscription", "weight": 1, "eligible": True,
++         "funding_verified": True, "capabilities": {"tools": True, "streaming": True, "context_tokens": 1000000}}]}}}
++    home.joinpath("config.yaml").write_text(json.dumps({"kanban": {}, **default, **extra}), encoding="utf-8")
+ 
+ 
+ def _held_reads(monkeypatch):
+@@ -121,8 +126,8 @@ def _tick(conn):
+ 
+ 
+ def _opus(conn, title, **kw):
+-    return kb.create_task(conn, title=title, assignee="default", model_override=OPUS, provider_override="anthropic",
+-                          **kw)
++    """A plain default card: model-neutral, it lands on the isolated ``class:standard`` Anthropic route."""
++    return kb.create_task(conn, title=title, assignee="default", **kw)
+ 
+ 
+ def _skips(conn, tid):
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_xai.py b/tests/hermes_cli/test_kanban_llm_pacing_xai.py
+index 2aae887d1e..ce8acb8093 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_xai.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_xai.py
+@@ -122,11 +122,13 @@ def test_read_pool_judges_the_xai_pool_instead_of_unknown(monkeypatch):
+ 
+ def test_a_grok_card_is_held_when_the_grok_pool_is_past_its_reserve(paced_board, monkeypatch):
+     import time
+-    _config(paced_board)  # no llm_pacing override: the defaults must govern xai-oauth
++    # no llm_pacing override: the defaults must govern xai-oauth; the default class resolves to the Grok pool only
++    _config(paced_board, model_routing={"enabled": True, "routes": {"standard": [
++        {"provider": "xai-oauth", "model": "grok-4.6", "billing": "subscription", "weight": 1, "eligible": True,
++         "funding_verified": True, "capabilities": {"tools": True, "streaming": True, "context_tokens": 1000000}}]}})
+     _xai_pool(monkeypatch, 90.0, time.time() + DAY)
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="grok work", assignee="default", model_override="grok-4.6",
+-                             provider_override="xai-oauth")
++        tid = kb.create_task(conn, title="grok work", assignee="default")
+         seen, _ = _tick(conn)
+         assert tid not in seen
+         events = [e.payload for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index e53d1245c5..04bafa55d8 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -34,7 +34,7 @@ def board(tmp_path, monkeypatch):
+     home.mkdir()
+     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+     monkeypatch.setenv('HERMES_HOME', str(home))
+-    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: supervisor\n')
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: supervisor\n' + _managed_yaml())
+ 
+     def configure(enforce=True):
+         for name in ('worker', 'supervisor'):
+@@ -59,26 +59,25 @@ def _count(conn):
+ @pytest.mark.parametrize('provider', [None, 'anthropic'])
+ def test_create_refuses_retired_pin_under_managed_policy(board, provider):
+     conn, _ = board
+-    with pytest.raises(ValueError, match='model_pin_not_in_routing_registry') as info:
++    with pytest.raises(ValueError, match='model-neutral') as info:
+         kb.create_task(conn, title='Check live', assignee='worker',
+                        model_override='claude-sonnet-4-5', provider_override=provider)
+     message = str(info.value)
+-    assert 'claude-sonnet-5-5' in message and 'claude-opus-5-5' in message
+-    assert 'leave model out' in message
++    assert 'class/tier' in message
+     assert _count(conn) == 0
+ 
+ 
+-def test_create_accepts_registered_pin(board):
++def test_create_refuses_registered_pin(board):
+     conn, _ = board
+-    tid = kb.create_task(conn, title='Review', assignee='worker',
+-                         model_override='claude-sonnet-5-5', provider_override='anthropic')
+-    task = kb.get_task(conn, tid)
+-    assert (task.model_override, task.provider_override) == ('claude-sonnet-5-5', 'anthropic')
++    with pytest.raises(ValueError, match='model-neutral'):
++        kb.create_task(conn, title='Review', assignee='worker',
++                       model_override='claude-sonnet-5-5', provider_override='anthropic')
++    assert _count(conn) == 0
+ 
+ 
+ def test_create_refuses_registered_model_on_unregistered_provider(board):
+     conn, _ = board
+-    with pytest.raises(ValueError, match='model_pin_not_in_routing_registry'):
++    with pytest.raises(ValueError, match='model-neutral'):
+         kb.create_task(conn, title='Review', assignee='worker',
+                        model_override='claude-sonnet-5-5', provider_override='openrouter')
+ 
+@@ -90,18 +89,19 @@ def test_class_selector_and_unpinned_cards_are_untouched(board):
+     assert _count(conn) == 2
+ 
+ 
+-def test_policy_off_keeps_old_behaviour(board):
++def test_policy_off_still_rejects_concrete_restrictions(board):
+     conn, configure = board
+     configure(enforce=False)
+-    tid = kb.create_task(conn, title='Legacy', assignee='worker',
+-                         model_override='claude-sonnet-4-5', provider_override='anthropic')
+-    assert kb.get_task(conn, tid).model_override == 'claude-sonnet-4-5'
++    with pytest.raises(ValueError, match='model-neutral'):
++        kb.create_task(conn, title='Legacy', assignee='worker',
++                       model_override='claude-sonnet-4-5', provider_override='anthropic')
++    assert _count(conn) == 0
+ 
+ 
+ def test_set_model_override_refuses_retired_pin(board):
+     conn, _ = board
+     tid = kb.create_task(conn, title='Card', assignee='worker')
+-    with pytest.raises(ValueError, match='model_pin_not_in_routing_registry'):
++    with pytest.raises(ValueError, match='model-neutral'):
+         kb.set_model_override(conn, tid, 'claude-sonnet-4-5', provider='anthropic')
+     assert kb.get_task(conn, tid).model_override is None
+ 
+@@ -113,42 +113,41 @@ def test_kanban_create_tool_returns_typed_refusal(board, monkeypatch):
+     monkeypatch.setenv('HERMES_KANBAN_TASK', parent)
+     monkeypatch.setattr(tools, '_persisted_identity', lambda: 'worker')
+     result = json.loads(tools._handle_create({'title': 'Child', 'model': 'claude-sonnet-4-5'}))
+-    assert result['code'] == 'model_pin_not_in_routing_registry'
+-    assert 'claude-sonnet-5-5' in result['error']
++    assert 'model-neutral' in result['error']
+     assert _count(conn) == 1
+ 
+ 
+ def test_kanban_create_tool_model_description_names_the_registry():
+     from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+     description = KANBAN_CREATE_SCHEMA['parameters']['properties']['model']['description']
+-    assert "routing registry" in description and 'leave this out' in description.lower()
++    assert 'class' in description.lower() and 'concrete' in description.lower()
+ 
+ 
+ @pytest.mark.parametrize('lane', ['ready', 'review'])
+-def test_dispatch_blocks_bad_pin_already_in_db_without_spawning(board, lane):
+-    from hermes_cli.kanban_db_dispatch import dispatch_once, guard_hold_cap_seconds
++def test_dispatch_ignores_legacy_pin_without_rewriting_author_evidence(board, lane):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
+     conn, _ = board
+-    tid = kb.create_task(conn, title='Legacy pin', assignee='worker', session_id='chat')
++    tid = kb.create_task(conn, title='Legacy route', assignee='worker', session_id='chat')
+     conn.execute('UPDATE tasks SET model_override=?, status=? WHERE id=?', ('claude-sonnet-4-5', lane, tid))
+     conn.commit()
+     spawned = []
+-    dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args), max_spawn=1)
+-    assert spawned == []
+-    task = kb.get_task(conn, tid)
+-    assert task.status == 'todo'
+-    assert task.block_kind == 'assignment'
+-    assert guard_hold_cap_seconds('model_pin_not_in_routing_registry') is None
++    dispatch_once(conn, spawn_fn=lambda item, *args: spawned.append(item.model_override), max_spawn=1)
++    assert spawned == (['class:standard'] if lane == 'ready' else ['claude-opus-5-5'])
++    assert kb.get_task(conn, tid).model_override == 'claude-sonnet-4-5'
++    event = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]
++    if lane == 'review':
++        assert event['implementer_models'] == ['claude-sonnet-4-5']
+ 
+ 
+-def test_dispatch_dry_run_reports_bad_pin_without_writing(board):
++def test_dispatch_dry_run_ignores_bad_pin_without_writing(board):
+     from hermes_cli.kanban_db_dispatch import dispatch_once
+     conn, _ = board
+-    tid = kb.create_task(conn, title='Legacy pin', assignee='worker')
++    tid = kb.create_task(conn, title='Legacy route', assignee='worker')
+     conn.execute('UPDATE tasks SET model_override=? WHERE id=?', ('claude-sonnet-4-5', tid))
+     conn.commit()
+     before = list(conn.iterdump())
+     result = dispatch_once(conn, dry_run=True)
+-    assert (tid, 'model_pin_not_in_routing_registry') in result.respawn_guarded
++    assert (tid, 'model_pin_not_in_routing_registry') not in result.respawn_guarded
+     assert list(conn.iterdump()) == before
+ 
+ 
+@@ -211,12 +210,19 @@ FABLE = 'claude-fable-5-2'
+ def _hand_off_for_review(conn, metadata, *, pin=None):
+     """Implementer run spawned through dispatch (so its run_route receipt exists), then a review handoff."""
+     from hermes_cli.kanban_db_dispatch import dispatch_once
+-    tid = kb.create_task(conn, title='Browser build', assignee='worker', model_override=pin,
+-                         provider_override='anthropic' if pin else None)
++    tid = kb.create_task(conn, title='Browser build', assignee='worker')
++    if pin:
++        conn.execute("UPDATE tasks SET model_override=?, provider_override='anthropic' WHERE id=?", (pin, tid))
++        conn.commit()
+     dispatch_once(conn, spawn_fn=lambda *args: None, max_spawn=1)
+     assert kb.get_task(conn, tid).status == 'running'
+-    assert kb.request_review(conn, tid, summary=f'reviewer-model: wanted {FABLE}, set-model refused: '
+-                             'model_pin_not_in_routing_registry', metadata=metadata)
++    claimed = kb.get_task(conn, tid)
++    kb._append_event(conn, tid, 'worker_result', {'route_model': pin or 'claude-sonnet-5-5',
++                                               'route_provider': 'anthropic'}, run_id=claimed.current_run_id)
++    assert kb.request_review(conn, tid, summary='Ready for independent review')
++    conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                 (json.dumps(metadata or {}), tid))
++    conn.commit()
+     return tid
+ 
+ 
+@@ -231,11 +237,10 @@ def test_refused_review_override_falls_back_to_registered_independent_reviewer(b
+                   max_spawn=1)
+     assert seen == [('claude-opus-5-5', 'anthropic')]
+     tier = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]
+-    assert tier['reason'] == 'review_override_refused' and tier['lane'] == 'review'
++    assert tier['reason'] == 'review_unpinned' and tier['lane'] == 'review'
+     assert tier['model'] == 'claude-opus-5-5'
+-    assert tier['requested']['model'] == FABLE
+-    assert tier['requested']['code'] == 'model_pin_not_in_routing_registry'
+-    assert 'claude-opus-5-5' in tier['requested']['allowed']
++    assert 'requested' not in tier
++    assert tier['implementer_models'] == ['claude-sonnet-5-5']
+     assert kb.get_task(conn, tid).consecutive_failures == 0
+ 
+ 
+@@ -281,7 +286,7 @@ def test_registered_review_override_is_kept(board):
+     seen = []
+     dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
+     assert seen == ['claude-opus-5-5']
+-    assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == 'review_override'
++    assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == 'review_unpinned'
+ 
+ 
+ def _receipts(conn, tid, *, route=None, ran=None):
+@@ -289,6 +294,7 @@ def _receipts(conn, tid, *, route=None, ran=None):
+     run = conn.execute("SELECT id FROM task_runs WHERE task_id=? AND outcome='review_requested' "
+                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
+     if route:
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'", (tid, run))
+         conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND run_id=? AND kind='run_route'",
+                      (json.dumps({'model': route[0], 'provider': route[1], 'lane': 'ready',
+                                   'source': 'class' if route[0].startswith('class:') else 'pin'}), tid, run))
+@@ -320,7 +326,7 @@ def test_class_routed_implementer_receipts_do_not_gate_review_admission(board):
+     dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
+     assert seen == ['claude-opus-5-5']
+     assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == (
+-        'review_override_refused')
++        'review_unpinned')
+ 
+ 
+ def test_repeated_identical_review_refusal_moves_to_a_visible_block(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+index 23fc12d31a..4878f4ef7e 100644
+--- a/tests/hermes_cli/test_kanban_mandatory_pin.py
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -81,3 +81,57 @@ def test_legacy_pin_does_not_add_a_pickup_label(monkeypatch):
+ 
+ def test_courier_does_not_transport_new_mandatory_directives():
+     assert kp._uncarried({"title": "work", "pin_mandatory": True}, kp._Cfg({}), True) == ["pin_mandatory"]
++
++
++# Reusable replica/custody harness; legacy pin policy tests above remain independent.
++import json
++import time
++from pathlib import Path
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
++
++POOL = "pool:worker"
++CFG = {"worker_queue": {HUB: POOL}}
++PIN = {"model": "claude-opus-5-5", "provider": "anthropic"}
++
++
++def _attest(monkeypatch):
++    monkeypatch.setitem(MACHINES[WORKER], "labels", ["linux", POOL])
++    monkeypatch.setitem(MACHINES[WORKER], "last_seen", time.time() * 1000)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(kp, "config", lambda: CFG)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    # Explicit isolated routing registry, not this machine's profile defaults.
++    policy = "\nmodel_routing:\n  enabled: true\n  routes:\n    deep:\n"
++    for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
++        policy += (f"      - model: {model}\n        provider: anthropic\n        billing: subscription\n"
++                   "        weight: 1\n        eligible: true\n        funding_verified: true\n"
++                   "        capabilities: {tools: true, streaming: true}\n")
++    for gateway in (hub, worker):
++        path = gateway.home / "config.yaml"
++        path.write_text(path.read_text() + policy)
++    yield hub, worker
++    for gateway in (hub, worker):
++        gateway.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _route(conn, tid):
++    return [json.loads(row[0]) for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' ORDER BY id", (tid,))]
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+index 4e82683fbe..d08f292f88 100644
+--- a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -28,6 +28,9 @@ from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: P
+ 
+ PIN, PEER, GROK = pin_tests.PIN, pin_tests.PEER, pin_tests.GROK
+ HELD_FAR = 5 * 86400  # 11-15 16:52Z -> 11-20 22:40Z
++DEEP = ('class:deep', 'auto')  # kanban is model-neutral: default and strong tiers are class selectors
++CLASS_TIERS = {'default_model': 'class:deep', 'default_provider': 'auto', 'strong_model': 'class:deep',
++               'strong_provider': 'auto'}
+ 
+ 
+ @pytest.fixture
+@@ -52,7 +55,7 @@ def _pools(clock, **states):
+ 
+ 
+ def _deep(monkeypatch, cfg=None, grok=False):
+-    config, cfg = pin_tests._deep(monkeypatch, cfg)
++    config, cfg = pin_tests._deep(monkeypatch, {**CLASS_TIERS, **(cfg or {})})
+     if grok:
+         deep = config['model_routing']['routes']['deep']
+         deep.append(dict(deep[0], model=GROK[0], provider=GROK[1]))
+@@ -63,15 +66,17 @@ def _route(conn, tid, lane='ready'):
+     return tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane=lane)
+ 
+ 
+-def test_held_far_default_route_moves_to_the_unheld_class_peer(board, clock, monkeypatch, all_assignees_spawnable):
+-    """The resolver keeps a default route on the held pool (no ratio pick: no pool has a known rate here); the
+-    governor moves it at claim time to the class peer with room, under the same ``default+paced`` reason."""
++def test_held_far_default_class_route_starts_because_an_unheld_class_peer_has_room(board, clock, monkeypatch,
++                                                                                   all_assignees_spawnable):
++    """A default card is a class selector, so every pool of the class is a candidate: the resolver keeps
++    ``class:deep`` and, with codex held and anthropic paced (still starting), the governor starts it on the
++    class peer. Only when no peer has room does the governor hold it (next test)."""
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', HELD_FAR), anthropic=('paced', None))
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='default card', assignee='a')
+-        assert _route(conn, tid) == (*PIN, 'default')
+-        assert lpd.candidate_providers(conn, kb.get_task(conn, tid), 'ready') == ['openai-codex']
++        assert _route(conn, tid) == (*DEEP, 'default')
++        assert lpd.candidate_providers(conn, kb.get_task(conn, tid), 'ready') == ['anthropic', 'openai-codex']
+         assert pin_tests._tick(conn) == [PEER]
+         receipt = pin_tests._events(conn, tid, 'run_route')[-1]
+         assert (receipt['model'], receipt['provider'], receipt['tier_reason']) == (*PEER, 'default+paced:openai-codex')
+@@ -79,20 +84,30 @@ def test_held_far_default_route_moves_to_the_unheld_class_peer(board, clock, mon
+         assert (persisted.model_override, persisted.provider_override) == (None, None)  # the row never moves
+ 
+ 
++def test_every_candidate_pool_held_holds_the_default_class_card(board, clock, monkeypatch, all_assignees_spawnable):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR), anthropic=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='default card', assignee='a')
++        assert pin_tests._tick(conn) == []
++        assert pin_tests._events(conn, tid, 'run_route') == []
++        assert kb.get_task(conn, tid).status == 'ready'
++
++
+ @pytest.mark.parametrize('until', [None, HELD_FAR])
+ def test_pin_keeps_unknown_or_far_reset(board, clock, monkeypatch, until):
+     """A pin is never substituted even when a reset is distant or unknown."""
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', until))
+     with kbc.connect() as conn:
+-        assert _route(conn, pin_tests._pinned_card(conn)) == (None, None, 'pinned')
++        assert _route(conn, pin_tests._pinned_card(conn)) == (*DEEP, 'default')
+ 
+ 
+ def test_held_near_reset_keeps_the_pinned_route(board, clock, monkeypatch):
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', 1800))
+     with kbc.connect() as conn:
+-        assert _route(conn, pin_tests._pinned_card(conn)) == (None, None, 'pinned')
++        assert _route(conn, pin_tests._pinned_card(conn)) == (*DEEP, 'default')
+ 
+ 
+ def test_paced_route_never_moves_an_unpinned_default_route(board, clock, monkeypatch):
+@@ -101,8 +116,8 @@ def test_paced_route_never_moves_an_unpinned_default_route(board, clock, monkeyp
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title='d', assignee='a'))
+-        assert paced.paced_route(conn, task, (*PIN, 'default'), lane='ready', cfg=tier.load_tier_config()) is None
+-        assert _route(conn, task.id) == (*PIN, 'default')
++        assert paced.paced_route(conn, task, (*DEEP, 'default'), lane='ready', cfg=tier.load_tier_config()) is None
++        assert _route(conn, task.id) == (*DEEP, 'default')
+ 
+ 
+ @pytest.mark.parametrize('after, until, moved', [
+@@ -126,44 +141,51 @@ def test_a_pool_that_is_not_held_never_moves_the_route(board, clock, monkeypatch
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=(state, HELD_FAR))
+     with kbc.connect() as conn:
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
+ 
+ 
+-def test_non_mandatory_pin_on_a_held_provider_keeps_its_hold(board, clock, monkeypatch,
+-                                                                       all_assignees_spawnable):
++def test_legacy_pin_on_a_held_provider_is_ignored_and_the_card_starts_on_its_class(board, clock, monkeypatch,
++                                                                                  all_assignees_spawnable):
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = pin_tests._pinned_card(conn)
+-        assert _route(conn, tid) == (None, None, 'pinned')
+-        assert pin_tests._tick(conn) == []
+-        assert pin_tests._events(conn, tid, 'run_route') == []
++        seen = pin_tests._tick(conn)
++        assert seen == [PEER], (seen, pin_tests._events(conn, tid, "dispatch_skipped"))  # moved like an unpinned default
++        assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'default+paced:openai-codex'
+         task = kb.get_task(conn, tid)
+-        assert (task.model_override, task.provider_override) == PIN  # the pin itself is unchanged
+-        assert task is not None and task.status == 'ready'
++        assert task is not None
++        assert (task.model_override, task.provider_override) == PIN  # the author's historical pin is retained
+ 
+ 
+ @pytest.mark.parametrize('why', ['flag', 'marker'])
+-def test_mandatory_pin_keeps_its_held_provider(board, clock, monkeypatch, why):
++def test_legacy_mandatory_pin_has_no_authority_over_a_held_provider(board, clock, monkeypatch, why):
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = pin_tests._pinned_card(conn, mandatory=why == 'flag',
+                                      body=walls.REQUIRE_MODEL_MARKER if why == 'marker' else None)
+-        assert _route(conn, tid) == (None, None, 'pinned')  # the pin runs as pinned
++        assert _route(conn, tid) == (*DEEP, 'default')  # a retired mandate routes like any default
+ 
+ 
+-def test_require_model_default_card_keeps_its_held_route(board, clock, monkeypatch, all_assignees_spawnable):
+-    """The marker line keeps the card on its held route (the governor holds it); prose naming it still moves."""
++def test_require_model_marker_is_refused_at_ingress_and_ignored_on_legacy_rows(board, clock, monkeypatch,
++                                                                               all_assignees_spawnable):
++    """New ``require_model`` directives are refused; an old body line has no authority, so the card routes like
++    any default and its text stays as the author wrote it."""
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title='needs astra', body=f'astra only\n{walls.REQUIRE_MODEL_MARKER}', assignee='a')
+-        assert _route(conn, tid) == (*PIN, 'default')
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title='needs astra', body=f'astra only\n{walls.REQUIRE_MODEL_MARKER}', assignee='a')
++        tid = kb.create_task(conn, title='needs astra', assignee='a')
++        conn.execute('UPDATE tasks SET body=? WHERE id=?', (f'astra only\n{walls.REQUIRE_MODEL_MARKER}', tid))
++        conn.commit()
++        assert _route(conn, tid) == (*DEEP, 'default')
+         prose = kb.create_task(conn, title='prose', body='a card may say `require_model` in prose', assignee='a')
+-        assert pin_tests._tick(conn) == [PEER]
+-        assert pin_tests._events(conn, prose, 'run_route')[-1]['tier_reason'] == 'default+paced:openai-codex'
+-        assert pin_tests._events(conn, tid, 'run_route') == [] and kb.get_task(conn, tid).status == 'ready'
++        assert pin_tests._tick(conn) == [PEER, PEER]
++        for card in (tid, prose):
++            assert pin_tests._events(conn, card, 'run_route')[-1]['tier_reason'] == 'default+paced:openai-codex'
++        assert walls.REQUIRE_MODEL_MARKER in (kb.get_task(conn, tid).body or '')
+ 
+ 
+ @pytest.mark.parametrize('peer', ['held', 'walled', 'live_wall'])
+@@ -176,8 +198,8 @@ def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch,
+     elif peer == 'live_wall':
+         monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(clock[0] + 3600) if p == 'anthropic' else None)
+     with kbc.connect() as conn:
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
+-        assert _route(conn, pin_tests._pinned_card(conn)) == (None, None, 'pinned')
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
++        assert _route(conn, pin_tests._pinned_card(conn)) == (*DEEP, 'default')
+ 
+ 
+ def test_pin_is_not_substituted_regardless_of_peer_credentials(board, clock, monkeypatch):
+@@ -186,9 +208,9 @@ def test_pin_is_not_substituted_regardless_of_peer_credentials(board, clock, mon
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = pin_tests._pinned_card(conn)
+-        assert _route(conn, tid) == (None, None, 'pinned')
++        assert _route(conn, tid) == (*DEEP, 'default')
+         UNSERVED.update({'anthropic', 'xai-oauth'})
+-        assert _route(conn, tid) == (None, None, 'pinned')
++        assert _route(conn, tid) == (*DEEP, 'default')
+ 
+ 
+ def test_a_review_peer_with_no_live_pool_on_this_host_is_skipped(board, clock, monkeypatch):
+@@ -302,15 +324,15 @@ def test_review_unpinned_with_every_reviewer_held_or_walled_is_unavailable(board
+ def test_class_pins_and_other_tier_reasons_keep_their_route(board, clock, monkeypatch, card):
+     """Only default, review_unpinned and concrete pins move: a ``class:*`` pin is the allocator's to place, and a
+     strong-tier keep-pattern card (here on the held provider) keeps the tier its pattern chose."""
+-    _deep(monkeypatch, {'strong_model': PIN[0], 'strong_provider': PIN[1], 'default_model_keep_patterns': ['security']})
++    _deep(monkeypatch, {'default_model_keep_patterns': ['security']})
+     _pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         if card == 'class_pin':
+             tid = kb.create_task(conn, title='d', assignee='a', model_override='class:deep', provider_override='auto')
+-            assert _route(conn, tid)[2] == 'pinned'
++            assert _route(conn, tid)[2] == 'class'
+         else:
+             tid = kb.create_task(conn, title='security audit', assignee='a')
+-            assert _route(conn, tid) == (*PIN, 'pattern:security')
++            assert _route(conn, tid) == (*DEEP, 'pattern:security')
+ 
+ 
+ def test_route_words_resolve_nothing_while_no_pool_is_held(board, clock, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+index f527893f64..30cea0380b 100644
+--- a/tests/hermes_cli/test_kanban_notice_pacing_admission.py
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -33,12 +33,28 @@ from tests.hermes_cli import _placement_helpers as helpers
+ from tests.hermes_cli import test_kanban_label_backlog_wait as pool_wait
+ from tests.hermes_cli import test_kanban_model_tier as model_tier
+ 
+-hub = pool_wait.hub  # a hub that cannot lease ``pool:worker`` cards: the Board registry names two pool workers
++pool_hub = pool_wait.hub  # a hub that cannot lease ``pool:worker`` cards: the Board registry names two pool workers
+ board = model_tier.board  # one unsynced gateway: every card is its own to lease
+ 
+ 
+ LABELS = pool_wait.LABELS
+ OPUS = "claude-opus-5-5"
++ROUTE = {"model": OPUS, "provider": "anthropic", "weight": 1, "billing": "subscription", "eligible": True,
++         "funding_verified": True, "capabilities": {"tools": True, "streaming": True}}
++
++
++@pytest.fixture
++def hub(pool_hub, monkeypatch):
++    """The pool hub with an isolated class-routing policy: cards are model-neutral, so the providers a card may
++    land on come from ``model_routing`` (anthropic only here), not from a per-card model pin."""
++    pool_hub.home.joinpath("config.yaml").write_text(json.dumps({
++        "kanban": {"sync": {"enabled": True}},
++        "model_routing": {"enabled": True, "routes": {lvl: [ROUTE] for lvl in ("fast", "standard", "deep")}}}),
++        encoding="utf-8")
++    monkeypatch.setattr(pd, "_CLASS_CACHE", {})
++    return pool_hub
++
++
+ DAY = 86400
+ UNKNOWN = {"reason": None, "status": "unknown"}
+ READ_INTERVAL = lp.PacingConfig().read_interval
+@@ -58,13 +74,11 @@ def _store(*pools, age=0.0):
+ 
+ 
+ def _pool_card(conn, *, age=40 * 60, labels=None, title="waits on the pool", **kw):
+-    """A ready card pinned to the pool's labels and to anthropic, owned by a chat, ready for ``age`` seconds, with
+-    two older same-label cards ahead of it."""
++    """A ready model-neutral card on the pool's labels (class routes: anthropic), owned by a chat, ready for ``age``
++    seconds, with two older same-label cards ahead of it."""
+     now = int(time.time())
+     for i in range(2):
+         pool_wait._card(conn, f"older {i}", now - 3600 + i)
+-    kw.setdefault("model_override", OPUS)
+-    kw.setdefault("provider_override", "anthropic")
+     tid = kb.create_task(conn, title=title, assignee="default", runs_on=list(labels or LABELS),
+                          session_id="owner-chat", **kw)
+     with kb.write_txn(conn):
+@@ -234,8 +248,7 @@ def test_without_a_positive_governor_read_the_notice_is_as_before(hub, monkeypat
+ def test_a_card_this_gateway_can_lease_keeps_its_own_dispatchers_words(board):
+     _store(("anthropic", lp.HELD))
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="local", assignee="default", model_override=OPUS, provider_override="anthropic",
+-                             session_id="owner-chat")
++        tid = kb.create_task(conn, title="local", assignee="default", session_id="owner-chat")
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (int(time.time()) - 40 * 60, tid))
+             conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (int(time.time()) - 40 * 60, tid))
+@@ -413,10 +426,27 @@ def test_a_card_missing_from_the_shared_board_is_not_a_pacing_wait(hub):
+     assert _post(hub.conn, tid, missing_shared_board=True, sync_reject_reason="rejected")["admission"] == UNKNOWN
+ 
+ 
+-def test_an_ungoverned_provider_and_a_mandatory_pin_always_start_so_they_are_not_named(hub):
++def test_an_ungoverned_provider_always_starts_so_it_is_not_named(hub, monkeypatch):
++    _store(("anthropic", lp.HELD), ("zai", lp.HELD))
++    monkeypatch.setattr(pd, "candidate_providers", lambda *_a: ["zai"])  # class routes that only land on zai
++    assert _post(hub.conn, _pool_card(hub.conn))["admission"] == UNKNOWN
++
++
++def test_concrete_and_mandatory_pins_are_refused_and_legacy_ones_never_exempt_a_card_from_the_hold(hub):
++    """New pins are refused at ingress; an old pinned/mandatory row (raw, isolated DB) is judged by its class
++    routes like any other card, so the held pool is still named and the author row keeps its history."""
+     _store(("anthropic", lp.HELD), ("zai", lp.HELD))
+     for kw in ({"model_override": "glm-5", "provider_override": "zai"}, {"pin_mandatory": True}):
+-        assert _post(hub.conn, _pool_card(hub.conn, **kw))["admission"] == UNKNOWN, kw
++        with pytest.raises(ValueError):
++            _pool_card(hub.conn, **kw)
++    tid = _pool_card(hub.conn)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET model_override='glm-5', provider_override='zai', model_pin_mandatory=1 "
++                         "WHERE id = ?", (tid,))
++    assert _post(hub.conn, tid)["admission"]["providers"] == [{"provider": "anthropic", "state": "held"}]
++    row = hub.conn.execute("SELECT model_override, provider_override, model_pin_mandatory FROM tasks WHERE id = ?",
++                           (tid,)).fetchone()
++    assert tuple(row) == ("glm-5", "zai", 1)
+ 
+ 
+ # --- the governor read itself ---------------------------------------------------------------------------------------
+@@ -425,8 +455,7 @@ def test_an_ungoverned_provider_and_a_mandatory_pin_always_start_so_they_are_not
+ @pytest.fixture
+ def card(board):
+     with kbc.connect() as conn:
+-        yield conn, kb.create_task(conn, title="pinned", assignee="default", model_override=OPUS,
+-                                   provider_override="anthropic")
++        yield conn, kb.create_task(conn, title="routed", assignee="default")
+ 
+ 
+ def test_the_read_returns_every_candidate_pool_when_all_are_paced_or_held(card, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index e57f17efdb..e552d777d2 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -22,7 +22,7 @@ GROK = ("grok-4.7", "xai-oauth")
+ # The governor's claim-time move is judged here on its own: the resolver's far-hold move (kanban_paced_reroute, a
+ # pool held with its reset more than reroute_after_s away) would otherwise move these cards first. The two composed are
+ # covered by the ``resolver_first`` tests below.
+-POOL_CFG = {"default_model": "gpt-6-astra", "default_provider": "openai-codex",
++POOL_CFG = {"default_model": "class:standard", "default_provider": "auto",
+             "strong_model": "class:deep", "strong_provider": "auto", "llm_pacing": {"reroute_after_s": 1e12}}
+ RESOLVER_CFG = {k: v for k, v in POOL_CFG.items() if k != "llm_pacing"}
+ 
+@@ -230,17 +230,29 @@ def test_ineligible_grok_route_keeps_the_hold(pool, monkeypatch):
+     assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
+ 
+ 
+-@pytest.mark.parametrize("pin", ["override", "require_model"])
+-def test_pinned_cards_still_wait_for_their_pool(pool, monkeypatch, pin):
++@pytest.mark.parametrize("pin", ["override", "require_model", "mandatory"])
++def test_legacy_pinned_cards_are_ignored_and_move_like_any_default_card(pool, monkeypatch, pin):
++    """Concrete pins / ``require_model`` are refused at ingress; an old row carrying one is judged and moved like an
++    unpinned default (the pace governor never lets a retired restriction hold a card on its pool)."""
+     _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
+     with kbc.connect() as conn:
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title="needs opus", assignee="a", model_override="claude-opus-5-5",
++                           provider_override="anthropic")
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title="needs astra", assignee="a", body=walls.REQUIRE_MODEL_MARKER)
++        tid = kb.create_task(conn, title="legacy", assignee="a")
+         if pin == "override":
+-            tid = kb.create_task(conn, title="needs opus", assignee="a", model_override="claude-opus-5-5",
+-                                 provider_override="anthropic")
++            conn.execute("UPDATE tasks SET model_override='claude-opus-5-5', provider_override='anthropic' WHERE id=?",
++                         (tid,))
++        elif pin == "mandatory":
++            conn.execute("UPDATE tasks SET model_override='claude-opus-5-5', provider_override='anthropic', "
++                         "model_pin_mandatory=1 WHERE id=?", (tid,))
+         else:
+-            tid = kb.create_task(conn, title="needs astra", assignee="a", body=walls.REQUIRE_MODEL_MARKER)
++            conn.execute("UPDATE tasks SET body=? WHERE id=?", (walls.REQUIRE_MODEL_MARKER, tid))
++        conn.commit()
+         seen, result = _dispatch(conn)
+-    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++    assert seen == [(tid, *GROK)] and tid not in result.clock_held
+ 
+ 
+ def test_pickup_takes_a_card_the_claim_would_start_on_grok(pool, monkeypatch):
+@@ -253,7 +265,7 @@ def test_pickup_takes_a_card_the_claim_would_start_on_grok(pool, monkeypatch):
+     serving.discard("xai-oauth")
+     monkeypatch.setattr(pd, "_CACHE", {})
+     with kbc.connect() as conn:
+-        assert pd.pickup_hold(conn, conn, card) == "openai-codex held"
++        assert pd.pickup_hold(conn, conn, card) == "anthropic held, openai-codex held"
+ 
+ 
+ def test_alternate_probe_fault_keeps_the_hold(pool, monkeypatch):
+@@ -387,9 +399,9 @@ def test_an_earlier_ticks_offer_never_steers_an_ordinary_admission(pool, monkeyp
+     _pools(monkeypatch, {"anthropic": 5, "openai-codex": 5})
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="routine work", assignee="a")
+-        reroute.offer(tid, ("gpt-6-astra", "openai-codex"), (*GROK, "openai-codex"))  # left by a claim that never ran
++        reroute.offer(tid, ("class:standard", "auto"), (*GROK, "openai-codex"))  # left by a claim that never ran
+         seen, _ = _dispatch(conn)
+-        assert seen == [(tid, "gpt-6-astra", "openai-codex")]
++        assert seen == [(tid, "class:standard", "auto")]
+ 
+ 
+ @pytest.fixture
+@@ -424,4 +436,4 @@ def test_resolver_first_no_grok_credential_keeps_the_hold(pool, resolver_first,
+             assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
+         assert _route_receipt(conn, tid) is None
+         card = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+-        assert pd.pickup_hold(conn, conn, card) == "openai-codex held"
++        assert pd.pickup_hold(conn, conn, card) == "anthropic held, openai-codex held"
+diff --git a/tests/hermes_cli/test_kanban_pacing_recovery.py b/tests/hermes_cli/test_kanban_pacing_recovery.py
+index bf51c9e3a8..23f9faa8b7 100644
+--- a/tests/hermes_cli/test_kanban_pacing_recovery.py
++++ b/tests/hermes_cli/test_kanban_pacing_recovery.py
+@@ -24,7 +24,7 @@ def test_far_wall_reroutes_before_pacing_and_destination_limits_claims(
+     clock = _clock(monkeypatch)
+     config, _ = helpers.routing(monkeypatch)
+     route = config['model_routing']['routes']['standard'][0]
+-    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
++    config['model_routing']['routes'] = {'standard': [dict(route, model='claude-opus-5-5'),
+         dict(route, provider='openai-codex', model='gpt-6-astra')]}
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
+     monkeypatch.setattr(walls, 'active_walls', lambda **kw: {'openai-codex': float(clock[0] + 6 * 86400)})
+@@ -46,7 +46,7 @@ def test_far_wall_reroutes_before_pacing_and_destination_limits_claims(
+         seen = []
+         result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(
+             (task.id, task.model_override, task.provider_override)))
+-        assert consulted and set(consulted) == {'anthropic'}
++        assert consulted and set(consulted) == {'anthropic', 'openai-codex'}  # a class card judges every pool of its class
+         if destination == lp.HELD:
+             assert seen == []
+             assert len(result.llm_paced) == 2
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index 6ad118ea55..87db9d53c5 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -518,9 +518,10 @@ def test_the_alarms_run_may_not_move_an_unlisted_card_or_back_onto_the_stalled_m
+     assert place._pin(hub.conn, unlisted) == place._pin(hub.conn, a) == [f"machine:{M}"]
+ 
+ 
+-def test_the_alarms_pool_move_keeps_a_mandatory_pins_label(held, monkeypatch):
+-    # Review 5878972889 on #1622: the alarm may only ask for exactly [pool:worker]; the move must still carry
+-    # capability:mandatory-model-pin, or an old-core pool worker leases a pin it would run on another model.
++def test_the_alarms_pool_move_ignores_a_legacy_mandatory_pins_label(held, monkeypatch):
++    # A historical mandatory-pin row (seeded straight into the disposable DB) is never placement authority
++    # now: the alarm's pool move carries only [pool:worker], with no capability:mandatory-model-pin label,
++    # even to a worker that does not attest the old refusal.
+     from hermes_cli import kanban_mandatory_pin as mp
+     hub, _worker_gw, _alarm, (a, _b), _unlisted = held
+     with kb.write_txn(hub.conn):
+@@ -530,13 +531,10 @@ def test_the_alarms_pool_move_keeps_a_mandatory_pins_label(held, monkeypatch):
+     monkeypatch.setitem(support.MACHINES, X, pooled)
+     hub.enter()
+     out = _move(a, [POOL])  # worker-2 is on the pool but does not attest the mandatory-pin refusal
+-    assert out.get("ok") is not True and mp.LABEL in out["error"], out
+-    assert place._pin(hub.conn, a) == [f"machine:{M}"]
+-    monkeypatch.setitem(support.MACHINES, X, {**pooled, "labels": [*pooled["labels"], mp.LABEL]})
+-    hub.enter()
+-    out = _move(a, [POOL])
+     assert out.get("ok") is True, out
+-    assert place._pin(hub.conn, a) == sorted([POOL, mp.LABEL])
++    assert place._pin(hub.conn, a) == [POOL]
++    row = hub.conn.execute("SELECT model_pin_mandatory, model_override FROM tasks WHERE id = ?", (a,)).fetchone()
++    assert tuple(row) == (1, "claude-opus-5-5")  # author provenance retained
+ 
+ 
+ def test_the_alarms_run_leaves_a_card_whose_unpushed_tree_is_on_this_host(held, tmp_path, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_pin_history_recovery.py b/tests/hermes_cli/test_kanban_pin_history_recovery.py
+index 199b337432..a69d2b87cd 100644
+--- a/tests/hermes_cli/test_kanban_pin_history_recovery.py
++++ b/tests/hermes_cli/test_kanban_pin_history_recovery.py
+@@ -40,13 +40,15 @@ def test_recovered_pin_ignores_historical_wall(board, clock, monkeypatch, all_as
+         tid = pins._pinned_card(conn)
+         _history(conn, tid, kind, clock[0] + pacing.HELD_FAR)
+         before = conn.total_changes
+-        assert pacing._route(conn, tid) == (None, None, 'pinned')  # keep the row's explicit pin
++        task = kb.get_task(conn, tid)
++        assert pr.pinned_route(conn, task, lane='ready', now=clock[0], cfg=pins.HUB_CFG) is None
+         assert conn.total_changes == before
+-        assert lpd.candidate_providers(conn, kb.get_task(conn, tid), 'ready') == [pins.PIN[1]]
+-        assert pins._tick(conn) == [pins.PIN]
+-        assert pins.PIN in calls
++        # Recovered history remains available as evidence, never a future mandatory pin.
+         assert len(pins._events(conn, tid, kind)) == 1
+-        assert pins._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned'
++        assert pins.tier.resolve_model_tier(conn, task, lane='ready') == ('class:standard', 'auto', 'default')
++        assert (task.model_override, task.provider_override) == pins.PIN
++        assert pins.PIN in calls
++
+ 
+ 
+ @pytest.mark.parametrize('live_evidence', ['unknown', 'wall', 'current', 'provider_file'])
+diff --git a/tests/hermes_cli/test_kanban_pin_provider.py b/tests/hermes_cli/test_kanban_pin_provider.py
+index 8acfe84aaf..1f21827e27 100644
+--- a/tests/hermes_cli/test_kanban_pin_provider.py
++++ b/tests/hermes_cli/test_kanban_pin_provider.py
+@@ -66,53 +66,53 @@ def _parser():
+ 
+ def test_create_task_binds_anthropic_under_auto_config(auto_home, monkeypatch, tmp_path):
+     with kbc.connect_closing() as conn:
+-        task = kb.get_task(conn, kb.create_task(conn, title="t", assignee="default", model_override=OPUS))
+-    assert (task.model_override, task.provider_override) == (OPUS, "anthropic")
+-    assert _argv(monkeypatch, tmp_path, task) == (OPUS, "anthropic")
++        with pytest.raises(ValueError, match='model-neutral'):
++            kb.create_task(conn, title='t', assignee='default', model_override=OPUS)
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
+ 
+ 
+ def test_kanban_create_tool_binds_anthropic(auto_home):
+     from tools import kanban_tools as tools
+     out = json.loads(tools._handle_create({"title": "t", "assignee": "default", "model": OPUS}))
+-    assert out.get("task_id"), out
++    assert 'model-neutral' in out['error']
+     with kbc.connect_closing() as conn:
+-        assert kb.get_task(conn, out["task_id"]).provider_override == "anthropic"
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
+ 
+ 
+ def test_cli_create_and_set_model_bind_anthropic(auto_home, monkeypatch):
+     cli, parser = _parser()
+     monkeypatch.setattr(cli, "_check_dispatcher_presence", lambda: (True, ""))
+     assert cli._cmd_create(parser.parse_args(["kanban", "create", "via cli", "--assignee", "default",
+-                                              "--model", OPUS])) == 0
++                                              "--model", OPUS])) == 2
+     with kbc.connect_closing() as conn:
+-        tid = conn.execute("SELECT id FROM tasks WHERE title='via cli'").fetchone()[0]
+-        assert kb.get_task(conn, tid).provider_override == "anthropic"
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+         plain = kb.create_task(conn, title="plain", assignee="default")
+-    assert cli._cmd_set_model(parser.parse_args(["kanban", "set-model", plain, OPUS])) == 0
++    assert cli._cmd_set_model(parser.parse_args(["kanban", "set-model", plain, OPUS])) == 2
+     with kbc.connect_closing() as conn:
+         task = kb.get_task(conn, plain)
+-    assert (task.model_override, task.provider_override) == (OPUS, "anthropic")
++        assert (task.model_override, task.provider_override) == (None, None)
++
+ 
+ 
+ # --- refusals ---------------------------------------------------------------------------------------------
+ 
+ def test_unknown_model_is_refused_everywhere(auto_home, monkeypatch, capsys):
+     with kbc.connect_closing() as conn:
+-        with pytest.raises(PinProviderUnresolvedError, match="no known provider catalog") as exc:
++        with pytest.raises(ValueError, match='model-neutral') as exc:
+             kb.create_task(conn, title="t", assignee="default", model_override="no-such-model-zz9")
+-        assert "provider=" in str(exc.value)
++        assert 'concrete model/provider' in str(exc.value)
+         tid = kb.create_task(conn, title="keep", assignee="default")
+-        with pytest.raises(PinProviderUnresolvedError):
++        with pytest.raises(ValueError, match='model-neutral'):
+             kb.set_model_override(conn, tid, "no-such-model-zz9")
+         assert kb.get_task(conn, tid).model_override is None
+         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+     from tools import kanban_tools as tools
+     out = json.loads(tools._handle_create({"title": "t", "assignee": "default", "model": "no-such-model-zz9"}))
+-    assert out["code"] == "pin_provider_unresolved", out
++    assert 'model-neutral' in out['error'], out
+     cli, parser = _parser()
+     monkeypatch.setattr(cli, "_check_dispatcher_presence", lambda: (True, ""))
+     assert cli._cmd_create(parser.parse_args(["kanban", "create", "x", "--model", "no-such-model-zz9"])) == 2
+-    assert "pin_provider_unresolved" in capsys.readouterr().err
++    assert 'model-neutral' in capsys.readouterr().err
+ 
+ 
+ def test_ambiguous_model_is_refused_naming_the_providers(tmp_path, monkeypatch):
+@@ -157,7 +157,7 @@ def test_explicit_provider_is_kept(auto_home):
+ def test_class_selector_keeps_provider_auto(auto_home, monkeypatch, tmp_path):
+     with kbc.connect_closing() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="t", assignee="default", model_override="class:deep"))
+-    assert (task.model_override, task.provider_override) == ("class:deep", None)
++    assert (task.model_override, task.provider_override) == ('class:deep', 'auto')
+     assert _argv(monkeypatch, tmp_path, task) == ("class:deep", "auto")
+ 
+ 
+@@ -169,8 +169,8 @@ def test_dispatcher_binds_legacy_null_provider_row(auto_home, monkeypatch, tmp_p
+         conn.execute("UPDATE tasks SET model_override=?, provider_override=NULL WHERE id=?", (OPUS, tid))
+         conn.commit()
+         task = kb.claim_task(conn, tid)
+-        assert tier.apply_model_tier(conn, task, lane="ready", cfg={}) == "pinned+provider_resolved"
++        assert tier.apply_model_tier(conn, task, lane='ready', cfg={}).startswith('default')
+         ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='model_tier'",
+                           (tid,)).fetchone()
+-    assert json.loads(ev[0])["provider"] == "anthropic"
+-    assert _argv(monkeypatch, tmp_path, task) == (OPUS, "anthropic")
++    assert json.loads(ev[0])['reason'].startswith('default')
++    assert _argv(monkeypatch, tmp_path, task) == ('class:standard', 'auto')
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+index 6e8219c431..689583eabf 100644
+--- a/tests/hermes_cli/test_kanban_pin_reroute.py
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -55,8 +55,12 @@ def _deep(monkeypatch, cfg=None, extra=()):
+ 
+ 
+ def _pinned_card(conn, title='M4 pinned to astra', body=None, mandatory=False):
+-    return kb.create_task(conn, title=title, body=body, assignee='a', model_override=PIN[0],
+-                          provider_override=PIN[1], pin_mandatory=mandatory)
++    tid = kb.create_task(conn, title='Legacy route fixture', assignee='a')
++    # Replay only in the isolated test DB, never through policy-checked ingress.
++    conn.execute('UPDATE tasks SET title=?, body=?, model_override=?, provider_override=?, model_pin_mandatory=? WHERE id=?',
++                 (title, body, *PIN, 1 if mandatory else None, tid))
++    conn.commit()
++    return tid
+ 
+ 
+ def _events(conn, tid, kind):
+@@ -82,393 +86,151 @@ def _walled_card(conn, cfg, clock, hours=55, **kw):
+     return tid
+ 
+ 
+-def test_far_wall_reroutes_a_pin_in_class_and_records_it(board, monkeypatch, all_assignees_spawnable):
++# The historical wall utilities still serve evidence readers, not next-run pin authority.
++@pytest.mark.parametrize('hours,min_hours,moved', [(2, None, False), (5.9, None, False),
++                                                 (6.2, None, True), (2, 1, True),
++                                                 (2, 'bogus', False), (2, -1, False), (55, 100, False)])
++def test_historical_wall_threshold_helper(board, monkeypatch, hours, min_hours, moved):
+     clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        assert dispatch.check_respawn_guard(conn, tid) is None
+-        assert _tick(conn) == [PEER]
+-        task = kb.get_task(conn, tid)
+-        assert (task.model_override, task.provider_override) == PIN  # I2: row never written
+-        route = _events(conn, tid, 'run_route')[-1]
+-        assert (route['model'], route['provider']) == PEER
+-        assert route['tier_reason'] == 'pinned+pin_quota_reroute:openai-codex'
+-        assert tier.owner_model_pin(conn, task) == PEER  # the owner spawns the reroute's -m/--provider
+-        [event] = _events(conn, tid, 'model_reroute')
+-        assert event == {'from_model': PIN[0], 'from_provider': PIN[1], 'to_model': PEER[0],
+-                         'to_provider': PEER[1], 'walled_provider': 'openai-codex',
+-                         'resets_at': float(clock[0] - 301 + 55 * 3600),
+-                         'episode_id': episode(conn, tid)['episode_id'], 'run_id': task.current_run_id}
+-        [comment] = _comments(conn, tid)
+-        assert 'gpt-6-astra (openai-codex) is out until' in comment and 'claude-opus-5-5 (anthropic)' in comment
+-        assert f'set-model {tid} gpt-6-astra --provider openai-codex --mandatory' in comment
+-
+-
+-@pytest.mark.parametrize('why', ['flag', 'marker'])
+-def test_mandatory_pin_is_never_rerouted(board, monkeypatch, all_assignees_spawnable, why):
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
++    _, cfg = _deep(monkeypatch, cfg={} if min_hours is None else {'pin_quota_reroute_min_hours': min_hours})
+     with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock, mandatory=why == 'flag',
+-                           body='must run on astra\nrequire_model: true' if why == 'marker' else None)
+-        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+-        assert _tick(conn) == []
+-        assert _events(conn, tid, 'model_reroute') == [] and _comments(conn, tid) == []
++        tid = _pinned_card(conn)
++        current = {PIN[1]: clock[0] + hours * 3600}
++        assert pr.pinned_route(conn, kb.get_task(conn, tid), lane='ready', now=clock[0], cfg=cfg,
++                               current=current) == (PEER if moved else None)
+ 
+ 
+-@pytest.mark.parametrize('hours, min_hours, moved', [(2, None, False), (5.9, None, False), (6.2, None, True),
+-                                                      (2, 1, True), (2, 'bogus', False), (2, -1, False), (55, 100, False)])
+-def test_wall_shorter_than_the_threshold_holds(board, monkeypatch, all_assignees_spawnable, hours, min_hours, moved):
++@pytest.mark.parametrize('blocked', ['provider_file', 'live_pool', 'disabled', 'routing_off', 'none'])
++def test_historical_peer_helper_respects_current_eligibility(board, monkeypatch, blocked):
+     clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch, cfg={} if min_hours is None else {'pin_quota_reroute_min_hours': min_hours})
++    config, cfg = _deep(monkeypatch)
++    until = float(clock[0] + 55 * 3600)
++    controls = {
++        'provider_file': lambda: monkeypatch.setattr(walls, 'active_walls', lambda **kw: {'anthropic': until}),
++        'live_pool': lambda: monkeypatch.setattr(
++            walls, 'live_quota_wall', lambda p, m: until if p == 'anthropic' else None),
++        'disabled': lambda: config['providers'].update(anthropic={'enabled': False}),
++        'routing_off': lambda: config['model_routing'].update(enabled=False),
++        'none': lambda: None,
++    }
++    controls[blocked]()
+     with kbc.connect() as conn:
+         tid = _pinned_card(conn)
+-        reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + int(hours * 3600)))
+-        clock[0] += 301
+-        assert _tick(conn) == ([PEER] if moved else [])
++        assert pr.pinned_route(conn, kb.get_task(conn, tid), lane='ready', now=clock[0], cfg=cfg,
++                               current={PIN[1]: until}) == (PEER if blocked == 'none' else None)
+ 
+ 
+-def test_review_lane_selects_independent_model_despite_author_wall(board, monkeypatch):
++def test_historical_reroute_records_distinct_runs_and_one_comment(board, monkeypatch):
+     clock = _clock(monkeypatch)
+     _deep(monkeypatch)
+     with kbc.connect() as conn:
+         tid = _pinned_card(conn)
+-        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'model_reroute', {'walled_provider': PIN[1],
++                         'resets_at': clock[0] + 55 * 3600, 'episode_id': 213})
+         conn.commit()
+-        reap(conn, tid, lane='review', provider='openai-codex', **_codex_wall(clock[0] + 55 * 3600))
+-        clock[0] += 301
+-        assert dispatch.check_respawn_guard(conn, tid, lane='review') is None
+-        task = kb.get_task(conn, tid)
+-        assert tier.resolve_dispatch_tier(conn, task, lane='review') == (*PEER, 'review_unpinned')
+-        assert (task.model_override, task.provider_override) == PIN
+-        assert _events(conn, tid, 'model_reroute') == []
++        for _ in range(2):
++            task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            with kb.write_txn(conn):
++                event = pr.record(conn, task, PIN, PEER)
++            assert event['run_id'] == task.current_run_id
++            assert event['resets_at'] == clock[0] + 55 * 3600
++            kb.reclaim_task(conn, tid, reason='test')
++        recorded = _events(conn, tid, 'model_reroute')[1:]
++        assert len(recorded) == 2 and len({event['run_id'] for event in recorded}) == 2
++        assert len(_comments(conn, tid)) == 1
++        assert 'selected dynamically' in _comments(conn, tid)[0]
++        assert '--mandatory' not in _comments(conn, tid)[0]
+ 
+ 
+-def test_review_lane_after_a_closed_episode_allows_the_author_model(board, monkeypatch, all_assignees_spawnable):
+-    """A prior author run does not disqualify an otherwise available strong reviewer."""
++# Concrete legacy rows are evidence only. Class allocation happens in the owning worker;
++# the dispatcher must not resurrect mandatory/threshold/provider restrictions from a row.
++@pytest.mark.parametrize('mandatory', [False, True])
++@pytest.mark.parametrize('marker', [False, True])
++@pytest.mark.parametrize('hours', [2, 5.9, 6.2, 55])
++def test_legacy_restrictions_do_not_choose_or_rewrite_a_ready_route(board, monkeypatch, mandatory, marker, hours):
+     clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
++    _deep(monkeypatch)
+     with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        assert _tick(conn) == [PEER]
+-        kb.reclaim_task(conn, tid, reason='test')
++        tid = _pinned_card(conn, mandatory=mandatory, body='require_model: true' if marker else None)
++        _known_codex_wall(monkeypatch, 'live_pool', float(clock[0] + hours * 3600))
+         task = kb.get_task(conn, tid)
+-        assert tier.resolve_dispatch_tier(conn, task, lane='ready')[:2] == PEER
+-        assert tier.resolve_dispatch_tier(conn, task, lane='review') == (*PEER, 'review_unpinned')
++        before = conn.total_changes
++        assert tier.resolve_dispatch_tier(conn, task, lane='ready') == ('class:standard', 'auto', 'default')
++        assert conn.total_changes == before
+         assert (task.model_override, task.provider_override) == PIN
+-        # Only the preceding ready run was quota-rerouted; review is its own policy.
+-        assert len(_events(conn, tid, 'model_reroute')) == 1
++        assert not pr.is_mandatory_pin(task)
++        assert _events(conn, tid, 'model_reroute') == []
+ 
+ 
+-@pytest.mark.parametrize('classes', [0, 2])
+-def test_pin_in_no_class_or_two_classes_holds(board, monkeypatch, all_assignees_spawnable, classes):
+-    clock = _clock(monkeypatch)
+-    config, cfg = _deep(monkeypatch)
++@pytest.mark.parametrize('classes', [0, 1, 2])
++def test_legacy_model_class_membership_does_not_constrain_new_selection(board, monkeypatch, classes):
++    config, _ = _deep(monkeypatch)
+     routes = config['model_routing']['routes']
+     if classes == 0:
+-        routes['deep'] = [r for r in routes['deep'] if r['model'] != PIN[0]]
+-    else:
+-        routes['standard'] = [dict(routes['deep'][1]), dict(routes['deep'][0], model='claude-sonnet-5-5')]
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        assert _tick(conn) == []
+-        assert _events(conn, tid, 'model_reroute') == []
+-
+-
+-def _block_peer(blocked, monkeypatch, config, clock):
+-    """Take the anthropic class peer out of reach the ``blocked`` way."""
+-    until = float(clock[0] + 3600)
+-    {'provider_file': lambda: monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'anthropic': until}),
+-     'live_pool': lambda: monkeypatch.setattr(
+-         walls, 'live_quota_wall', lambda provider, model: until if provider == 'anthropic' else None),
+-     'disabled': lambda: config['providers'].__setitem__('anthropic', {'enabled': False}),
+-     'routing_off': lambda: config['model_routing'].__setitem__('enabled', False),
+-     'none': lambda: None}[blocked]()
+-
+-
+-@pytest.mark.parametrize('blocked', ['provider_file', 'live_pool', 'disabled', 'routing_off', 'none'])
+-def test_no_eligible_peer_holds_and_never_falls_back_to_tier_models(
+-        board, monkeypatch, all_assignees_spawnable, blocked):
+-    """Only the class peer counts: with it walled, disabled or routing off the pin waits, even though
+-    the tier's strong model (also opus here) is not walled; ``none`` is the moving control."""
+-    clock = _clock(monkeypatch)
+-    config, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        _walled_card(conn, cfg, clock)
+-        _block_peer(blocked, monkeypatch, config, clock)
+-        assert _tick(conn) == ([PEER] if blocked == 'none' else [])
+-
+-
+-def test_live_walled_first_peer_is_skipped_for_the_next(board, monkeypatch, all_assignees_spawnable):
+-    clock = _clock(monkeypatch)
+-    config, cfg = _deep(monkeypatch)
+-    sonnet = dict(config['model_routing']['routes']['deep'][0], model='grok-5', provider='xai-oauth')
+-    config['model_routing']['routes']['deep'].append(sonnet)
+-    monkeypatch.setattr(walls, 'live_quota_wall',
+-                        lambda provider, model: float(clock[0] + 3600) if provider == 'anthropic' else None)
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        assert _tick(conn) == [('grok-5', 'xai-oauth')]
+-        assert _events(conn, tid, 'model_reroute')[0]['to_provider'] == 'xai-oauth'
+-
+-
+-def test_an_expired_earlier_wall_does_not_rule_out_its_provider(board, monkeypatch, all_assignees_spawnable):
+-    """The card once hit anthropic (1 h, long over); now codex is out 55 h: anthropic is a free peer."""
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _pinned_card(conn)
+-        reap(conn, tid, admit=cfg, text='Anthropic usage limit resets in ~1h', provider='anthropic',
+-             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
+-        clock[0] += 2 * 3600
+-        reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + 55 * 3600))
+-        clock[0] += 301
+-        assert _tick(conn) == [PEER]
+-
+-
+-def test_pin_walled_only_by_another_cards_wall_holds(board, monkeypatch, all_assignees_spawnable):
+-    """The card's live episode walled anthropic; codex is walled only by another card's wall. That known
+-    codex wall counts for rule 1, but the only class peer is anthropic, behind the card's own wall: the pin
+-    waits, never into a second wall."""
+-    clock = _clock(monkeypatch)
+-    _deep(monkeypatch)
++        routes['deep'] = [route for route in routes['deep'] if route['model'] != PIN[0]]
++    elif classes == 2:
++        routes['standard'] = list(routes['deep'])
+     with kbc.connect() as conn:
+         tid = _pinned_card(conn)
+-        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
+-             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
+-        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 55 * 3600)})
+-        clock[0] += 301
+-        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+-        assert _tick(conn) == []
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane='ready') == (
++            'class:standard', 'auto', 'default')
+ 
+ 
+-def test_each_run_records_a_reroute_and_one_comment_per_episode(board, monkeypatch, all_assignees_spawnable):
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        assert _tick(conn) == [PEER]
+-        # The rerouted run is reclaimed (not a wall: the episode continues); the next tick reroutes again.
+-        kb.reclaim_task(conn, tid, reason='test')
+-        assert _tick(conn) == [PEER]
+-        reroutes = _events(conn, tid, 'model_reroute')
+-        assert len(reroutes) == 2 and len({r['run_id'] for r in reroutes}) == 2
+-        assert len({r['episode_id'] for r in reroutes}) == 1
+-        assert len(_comments(conn, tid)) == 1
+-
+-
+-def test_after_the_reset_the_run_is_back_on_the_pin(board, monkeypatch, all_assignees_spawnable):
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        clock[0] = int(episode(conn, tid)['until']) + 1
+-        assert dispatch.check_respawn_guard(conn, tid) is None
+-        assert _tick(conn) == [PIN]
+-        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned'
+-        assert _events(conn, tid, 'model_reroute') == []
+-
+-
+-def test_preview_matches_admission_and_writes_nothing(board, monkeypatch, all_assignees_spawnable):
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
++def test_preview_matches_admission_and_preserves_concrete_row(board, monkeypatch, all_assignees_spawnable):
++    import json
++    config, _ = _deep(monkeypatch)
++    config['model_routing']['routes']['standard'] = list(config['model_routing']['routes']['deep'])
++    (board / 'config.yaml').write_text(json.dumps(config))
+     with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
++        tid = _pinned_card(conn, mandatory=True)
+         before = conn.total_changes
+         preview = task_route(conn, tid)
+         assert conn.total_changes == before
++        assert _tick(conn) == [preview[:2]] == [('class:standard', 'auto')]
++        stored = kb.get_task(conn, tid)
++        assert (stored.model_override, stored.provider_override) == PIN
++        assert stored.model_pin_mandatory == 1
++        assert tier.owner_model_pin(conn, stored) == ('class:standard', 'auto')
++        route = _events(conn, tid, 'run_route')[-1]
++        assert route['model'] == 'class:standard' and route['tier_reason'] == 'default'
+         assert _events(conn, tid, 'model_reroute') == []
+-        assert _tick(conn) == [preview[:2]] == [PEER]
+-
+-
+-def test_failed_record_keeps_the_pin(board, monkeypatch, all_assignees_spawnable):
+-    """I3: a reroute that cannot be recorded does not happen; the run stays on its pin."""
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-
+-    def broken(*_a, **_k):
+-        raise RuntimeError('disk full')
+-    with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        monkeypatch.setattr(pr, 'record', broken)
+-        assert _tick(conn) == [PIN]
+-        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned+pin_quota_reroute_unrecorded'
+-        assert _events(conn, tid, 'model_tier')[-1]['reason'] != 'pinned+pin_quota_reroute:openai-codex'
+-
+ 
+-# --- a fresh card on a live-pool wall (kanban-dd62aef001) -----------------------------------------
+ 
+-def _live_codex_wall(monkeypatch, until):
+-    monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: until[0] if (m, p) == PIN else None)
+-
+-
+-def test_fresh_pin_on_a_far_live_wall_reroutes_on_its_first_run(board, monkeypatch, all_assignees_spawnable):
+-    """Review 5871917933: a fresh pin has no run to put the wall in its episode, so a pre-claim hold on the
+-    live wall used to wait the whole wall out. The live wall now stands in for rule 1 on a fresh card."""
+-    clock = _clock(monkeypatch)
++def test_review_lane_selects_independent_model_despite_author_wall(board, monkeypatch):
++    _clock(monkeypatch)
+     _deep(monkeypatch)
+-    until = [float(clock[0] + 55 * 3600)]
+-    _live_codex_wall(monkeypatch, until)
+     with kbc.connect() as conn:
+-        tid = _pinned_card(conn)
+-        assert _tick(conn) == [PEER]  # no exit-75 run into the wall first
+-        assert _events(conn, tid, 'dispatch_skipped') == []
++        tid = _pinned_card(conn, mandatory=True)
+         task = kb.get_task(conn, tid)
++        assert tier.resolve_dispatch_tier(conn, task, lane='review') == (*PEER, 'review_unpinned')
+         assert (task.model_override, task.provider_override) == PIN
+-        [event] = _events(conn, tid, 'model_reroute')
+-        assert (event['walled_provider'], event['resets_at'], event['episode_id']) == ('openai-codex', until[0], None)
+-        [comment] = _comments(conn, tid)
+-        assert 'gpt-6-astra (openai-codex) is out until' in comment
+-        # Its rerouted run ends: the card is no longer fresh, and its own reroute keeps it off the wall.
+-        kb.reclaim_task(conn, tid, reason='test')
+-        clock[0] += 3600
+-        assert _tick(conn) == [PEER]
+-        assert len(_events(conn, tid, 'model_reroute')) == 2 and len(_comments(conn, tid)) == 1
+-        # After the reset the pin is back, even though the card still carries the reroute history.
+-        kb.reclaim_task(conn, tid, reason='test')
+-        clock[0] = int(until[0]) + 1
+-        until[0] = None
+-        assert _tick(conn) == [PIN]
+-
+-
+-@pytest.mark.parametrize('case', ['mandatory', 'near_wall', 'no_peer'])
+-def test_fresh_pin_with_no_reroute_is_held_on_its_live_wall(board, monkeypatch, all_assignees_spawnable, case):
+-    from hermes_cli.kanban_diagnostics import compute_task_diagnostics
+-    clock = _clock(monkeypatch)
+-    config, _ = _deep(monkeypatch)
+-    if case == 'no_peer':
+-        _block_peer('disabled', monkeypatch, config, clock)
+-    until = [float(clock[0] + (4 if case == 'near_wall' else 55) * 3600)]
+-    _live_codex_wall(monkeypatch, until)
+-    with kbc.connect() as conn:
+-        tid = _pinned_card(conn, mandatory=case == 'mandatory')
+-        for _ in range(4):
+-            assert _tick(conn) == []
+-            clock[0] += 1800
+-        [skip] = _events(conn, tid, 'dispatch_skipped')
+-        assert (skip['reason'], skip['until']) == ('pinned_quota_wall', int(until[0]))
+         assert _events(conn, tid, 'model_reroute') == []
+-        # Board diagnostics read the deliberate hold as held_in_ready (warning), never stranded_in_ready.
+-        diags = compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid),
+-                                         kb.list_runs(conn, tid), now=clock[0])
+-        assert [(d.kind, d.severity) for d in diags] == [('held_in_ready', 'warning')]
+-        assert diags[0].data['hold_reason'] == 'pinned_quota_wall' and diags[0].data['hold_until'] == int(until[0])
+-
+-
+-# --- a non-fresh pin on a wall the host already knows (t_c21c170e, 2026-11-12) ---------------------------
+-
+-def _known_codex_wall(monkeypatch, evidence, until):
+-    if evidence == 'provider_file':
+-        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': until})
+-    else:
+-        monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: until if (m, p) == PIN else None)
+-
+-
+-def _card_with_an_earlier_run(conn, **kw):
+-    """A pinned card whose earlier run ended without any wall (it ran on its pin, then was reclaimed)."""
+-    tid = _pinned_card(conn, **kw)
+-    assert _tick(conn) == [PIN]
+-    kb.reclaim_task(conn, tid, reason='test')
+-    assert kb.get_task(conn, tid).status == 'ready'
+-    assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL',
+-                        (tid,)).fetchone()[0] == 1
+-    return tid
+-
+-
+-@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
+-def test_non_fresh_pin_on_a_known_wall_reroutes_before_its_next_spawn(
+-        board, monkeypatch, all_assignees_spawnable, evidence):
+-    """MBP run 13181: a pinned card with earlier runs, woken while provider_walls.json held codex, spawned on
+-    codex and exited 75; only run 13184 rerouted. The known wall on the pin's provider now counts for
+-    rule 1 whatever the card's history, so no run pays the wall to learn it."""
+-    clock = _clock(monkeypatch)
+-    _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _card_with_an_earlier_run(conn)
+-        until = float(clock[0] + 55 * 3600)
+-        _known_codex_wall(monkeypatch, evidence, until)
+-        clock[0] += 60
+-        assert _tick(conn) == [PEER]
+-        task = kb.get_task(conn, tid)
+-        assert (task.model_override, task.provider_override) == PIN
+-        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned+pin_quota_reroute:openai-codex'
+-        [event] = _events(conn, tid, 'model_reroute')
+-        assert (event['walled_provider'], event['resets_at'], event['episode_id']) == ('openai-codex', until, None)
+-        assert len(_comments(conn, tid)) == 1
+-
+-
+-@pytest.mark.parametrize('case', ['flag', 'marker', 'peer_walled', 'near_wall'])
+-def test_non_fresh_pin_on_a_known_wall_controls_never_move(board, monkeypatch, all_assignees_spawnable, case):
+-    """Controls: a mandatory pin (column or ``require_model: true`` line), a walled only peer, or a wall under
+-    the min-hours threshold keep the pin exactly as before."""
+-    clock = _clock(monkeypatch)
+-    _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        tid = _card_with_an_earlier_run(conn, mandatory=case == 'flag',
+-                                        body='must run on astra\nrequire_model: true' if case == 'marker' else None)
+-        hours = 2 if case == 'near_wall' else 55
+-        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + hours * 3600)})
+-        if case == 'peer_walled':
+-            monkeypatch.setattr(walls, 'live_quota_wall',
+-                                lambda p, m: float(clock[0] + 3600) if p == 'anthropic' else None)
+-        clock[0] += 60
+-        assert _tick(conn) == [PIN]
+-        assert _events(conn, tid, 'model_reroute') == [] and _comments(conn, tid) == []
+-
+-
+-@pytest.mark.parametrize('own_hours, file_hours', [(2, 55), (55, 2)])
+-def test_a_short_own_wall_never_hides_a_longer_known_wall(
+-        board, monkeypatch, all_assignees_spawnable, own_hours, file_hours):
+-    """Review nit on PR #1514: rule 1 read the provider file only when the card had no wall of its own on the
+-    pin's provider, so a 2 h own wall hid a 55 h provider-file wall and the pin waited out the 2 h only to
+-    spawn into the long wall. The later of the two now decides (and is the recorded reset); the card's own
+-    episode id is kept so the one-comment-per-episode rule still holds."""
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
+-    with kbc.connect() as conn:
+-        start = clock[0]
+-        tid = _walled_card(conn, cfg, clock, hours=own_hours)
+-        file_until = float(start + file_hours * 3600)
+-        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': file_until})
+-        assert _tick(conn) == [PEER]
+-        [event] = _events(conn, tid, 'model_reroute')
+-        assert event['resets_at'] == float(start + max(own_hours, file_hours) * 3600)
+-        live = episode(conn, tid)
+-        assert live and live['episode_id'] and event['episode_id'] == live['episode_id']
+-        assert len(_comments(conn, tid)) == 1
+ 
+ 
+ @pytest.mark.parametrize('file_hours, live_hours', [(3, 55), (55, 3)])
+-def test_known_wall_is_the_later_of_the_provider_file_and_the_live_pool(
+-        board, monkeypatch, all_assignees_spawnable, file_hours, live_hours):
+-    """PR #1535 verification gap G1: ``known_wall`` folds the provider file and the live pool into one reset,
+-    the later of the two. Taking the earlier one would let a 3 h file wall (under the 6 h threshold) hide a
+-    55 h live wall, and the fresh pin would spawn into it; either order must reroute and record +55 h."""
++def test_known_wall_is_the_later_of_the_provider_file_and_the_live_pool(board, monkeypatch, file_hours, live_hours):
+     clock = _clock(monkeypatch)
+     _deep(monkeypatch)
+     start = clock[0]
+-    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(start + file_hours * 3600)})
+-    monkeypatch.setattr(walls, 'live_quota_wall',
+-                        lambda p, m: float(start + live_hours * 3600) if (p, m) == (PIN[1], PIN[0]) else None)
+-    later = float(start + 55 * 3600)
+-    with kbc.connect() as conn:
+-        tid = _pinned_card(conn)
+-        assert _tick(conn) == [PEER]
+-        [event] = _events(conn, tid, 'model_reroute')
+-        assert event['resets_at'] == later
+-    assert pr.known_wall(PIN, start) == {'openai-codex': later}
++    monkeypatch.setattr(walls, 'active_walls', lambda **kw: {'openai-codex': float(start + file_hours * 3600)})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(start + live_hours * 3600) if (m, p) == PIN else None)
++    assert pr.known_wall(PIN, start) == {'openai-codex': float(start + 55 * 3600)}
++
+ 
++def _known_codex_wall(monkeypatch, evidence, until):
++    if evidence == 'provider_file':
++        monkeypatch.setattr(walls, 'active_walls', lambda **kw: {'openai-codex': until})
++    else:
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: until if (m, p) == PIN else None)
+ 
+-# --- the review lane on a known wall (hub run 174730, 2026-11-12) ---------------------------------------
+ 
+ GROK = ('grok-5', 'xai-oauth')
+ 
+ 
+ def _review_card(conn, body=None):
+-    """A card in review whose implementer ran opus; opus is also its eligible strong reviewer."""
+-    tid = kb.create_task(conn, title='review me', body=body, assignee='a', model_override=PEER[0],
+-                         provider_override=PEER[1])
++    """A legacy-pinned card whose author attribution does not constrain reviewer eligibility."""
++    tid = kb.create_task(conn, title='review me', assignee='a')
++    conn.execute('UPDATE tasks SET body=?, model_override=?, provider_override=? WHERE id=?', (body, *PEER, tid))
+     conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+     conn.commit()
+     return tid
+@@ -560,17 +322,7 @@ def test_review_unpinned_skips_an_alternative_walled_only_in_the_live_pool(board
+         assert route == (*GROK_MINI, 'review_unpinned')
+ 
+ 
+-# --- the mandatory mark: create, set-model, tool, sync ---------------------------------------------
+-
+-def test_create_flag_requires_a_pin_and_persists(board):
+-    with kbc.connect() as conn:
+-        with pytest.raises(ValueError, match='pin_mandatory requires a model pin'):
+-            kb.create_task(conn, title='no pin', assignee='a', pin_mandatory=True)
+-        tid = _pinned_card(conn, mandatory=True)
+-        assert kb.get_task(conn, tid).model_pin_mandatory == 1
+-        assert kb.get_task(conn, _pinned_card(conn)).model_pin_mandatory is None
+-
+-
++# New mandatory restrictions are rejected; a later clear is still permitted.
+ def _cli(*args):
+     from hermes_cli import kanban
+     from hermes_cli.kanban_parser import build_parser
+@@ -579,69 +331,52 @@ def _cli(*args):
+     return kanban.kanban_command(parser.parse_args(['kanban', *args]))
+ 
+ 
+-def _set_model(tid, model=None, provider=None, mandatory=None):
+-    args = ['set-model', tid] + ([model] if model else []) + (['--provider', provider] if provider else [])
+-    return _cli(*args, *({True: ['--mandatory'], False: ['--no-mandatory']}.get(mandatory, [])))
++def test_create_flag_rejects_without_creating_a_card(board):
++    with kbc.connect() as conn:
++        before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++        with pytest.raises(ValueError, match='model-neutral'):
++            kb.create_task(conn, title='no pin', assignee='a', pin_mandatory=True)
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
+ 
+ 
+-def test_set_model_mandatory_flags(board, capsys, monkeypatch):
+-    monkeypatch.setattr('hermes_cli.kanban_model_assignment.validate_task_pin',
+-                        lambda conn, tid, model, provider: (model, provider))
++def test_set_model_mandatory_refusal_is_atomic_and_clear_remains_possible(board, capsys):
+     with kbc.connect() as conn:
+-        tid = _pinned_card(conn)
+-    assert _set_model(tid, mandatory=True) == 0
+-    with kbc.connect() as conn:
+-        task = kb.get_task(conn, tid)
+-        assert task.model_pin_mandatory == 1 and (task.model_override, task.provider_override) == PIN
+-        assert _events(conn, tid, 'model_pin_mandatory_set') == [{'mandatory': True}]
+-    assert 'mandatory' in capsys.readouterr().out
+-    assert _set_model(tid, *PEER) == 0  # a new pin keeps the card's mark
++        tid = _pinned_card(conn, mandatory=True)
++        before = _events(conn, tid, 'model_pin_mandatory_set')
++    assert _cli('set-model', tid, '--mandatory') == 2
+     with kbc.connect() as conn:
+         assert kb.get_task(conn, tid).model_pin_mandatory == 1
+-    assert _set_model(tid, mandatory=False) == 0
++        assert _events(conn, tid, 'model_pin_mandatory_set') == before
++    assert _cli('set-model', tid, '--no-mandatory') == 0
+     with kbc.connect() as conn:
+         assert kb.get_task(conn, tid).model_pin_mandatory is None
+-    assert _set_model(tid, *PIN, mandatory=True) == 0
+-    assert _set_model(tid, 'none') == 0  # clearing the pin clears its mark
++    assert _cli('set-model', tid, 'class:deep') == 0
+     with kbc.connect() as conn:
+-        task = kb.get_task(conn, tid)
+-        assert task.model_override is None and task.model_pin_mandatory is None
+-    assert _set_model(tid, mandatory=True) == 2  # nothing to mark
+-    assert 'needs a model pin' in capsys.readouterr().err
++        assert kb.get_task(conn, tid).model_override == 'class:deep'
+ 
+ 
+-def test_cli_create_pin_mandatory(board, monkeypatch, all_assignees_spawnable):
+-    assert _cli('create', 'cli pin', '--assignee', 'a', '--model', PIN[0], '--provider', PIN[1],
+-                '--pin-mandatory') == 0
++def test_cli_create_pin_mandatory_is_refused_without_write(board, all_assignees_spawnable):
++    assert _cli('create', 'cli pin', '--assignee', 'a', '--model', PIN[0], '--provider', PIN[1], '--pin-mandatory') == 2
+     with kbc.connect() as conn:
+-        tid = conn.execute("SELECT id FROM tasks WHERE title='cli pin'").fetchone()[0]
+-        assert kb.get_task(conn, tid).model_pin_mandatory == 1
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
+ 
+ 
+-def test_kanban_create_tool_passes_pin_mandatory(board, monkeypatch):
+-    from tools import kanban_tools as kt
+-    seen = {}
+-    real = kb.create_task
+-
+-    def spy(conn, **kw):
+-        seen.update(kw)
+-        return real(conn, **kw)
+-    monkeypatch.setattr(kb, 'create_task', spy)
++def test_kanban_create_tool_refuses_mandatory_before_write(board):
+     import json
+-    out = json.loads(kt._handle_create({'title': 'tool pin', 'assignee': 'a', 'model': PIN[0],
+-                                        'provider': PIN[1], 'pin_mandatory': True, 'requires': []}))
+-    assert seen.get('pin_mandatory') is True, out
+-    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+-    assert KANBAN_CREATE_SCHEMA['parameters']['properties']['pin_mandatory']['type'] == 'boolean'
++    from tools import kanban_tools as kt
++    with kbc.connect() as conn:
++        before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++        out = json.loads(kt._handle_create({'title': 'tool pin', 'assignee': 'a', 'model': PIN[0],
++                                          'provider': PIN[1], 'pin_mandatory': True, 'requires': []}))
++        assert 'model-neutral' in out['error']
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
+ 
+ 
+-def test_board_sync_carries_the_mark_and_a_synced_mandatory_copy_holds(board, monkeypatch, all_assignees_spawnable):
++def test_board_sync_carries_legacy_evidence_without_dispatch_authority(board, monkeypatch):
+     assert 'model_pin_mandatory' in kbsync.SYNCED_COLUMNS['tasks']
+-    clock = _clock(monkeypatch)
+-    _, cfg = _deep(monkeypatch)
++    _deep(monkeypatch)
+     with kbc.connect() as conn:
+-        tid = _walled_card(conn, cfg, clock)
+-        # A pull from another machine lands the column as written there.
+-        conn.execute('UPDATE tasks SET model_pin_mandatory=1 WHERE id=?', (tid,))
+-        conn.commit()
+-        assert _tick(conn) == []
++        tid = _pinned_card(conn, mandatory=True)
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane='ready') == (
++            'class:standard', 'auto', 'default')
++        assert kb.get_task(conn, tid).model_pin_mandatory == 1
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index af0f3c72d1..ddb99cb26b 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -506,13 +506,13 @@ def test_new_client_carries_skills_goal_mode_and_pins_as_fields(mac):
+     mac["result"]["help"] = NEW_HELP
+     out = json.loads(kt._handle_create({
+         "title": "Regenerate the plugin index", "body": "Do it.", "skills": ["x"], "goal_mode": True,
+-        "goal_max_turns": 6, "model": "claude-opus-5-5", "provider": "anthropic", "max_runtime_seconds": 1800,
++        "goal_max_turns": 6, "model": "class:deep", "max_runtime_seconds": 1800,
+         "priority": 3, "session_id": "20261027_183000_abc123"}))
+     assert out["ok"] and out["placed"]["gateway"] == "hub", out
+     assert _local_count() == 0
+     argv = mac["calls"][0]
+-    assert _options(argv) == {"skills": ["x"], "goal_mode": True, "goal_max_turns": 6, "model": "claude-opus-5-5",
+-                              "provider": "anthropic", "max_runtime_seconds": 1800, "priority": 3}
++    assert _options(argv) == {"skills": ["x"], "goal_mode": True, "goal_max_turns": 6, "model": "class:deep",
++                              "max_runtime_seconds": 1800, "priority": 3}
+     body = argv[argv.index("--body") + 1]
+     assert "Skills to load first" not in body and "Runtime budget" not in body and "needs=[" in body
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 58a7db638f..656262beda 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -1269,24 +1269,31 @@ def test_pool_worker_keeps_a_home_marker_card_no_live_machine_can_claim(w2, monk
+         "decision": "keep", "class": "gateway-test-failed", "hit": "hermes-sync"}
+ 
+ 
+-def test_a_marker_card_another_reason_keeps_stays_kept(on_w2):
+-    """A pool worker re-checks every other portability reason: an unattested mandatory model pin still keeps a
+-    Keychain card here (no pool member carries capability:mandatory-model-pin)."""
+-    out = _create(title="rotate the CI token in the Keychain", model="claude-opus-5-5", provider="anthropic",
+-                  pin_mandatory=True)
+-    assert _runs_on(on_w2.conn, out["task_id"]) is None, out
++def _refused_mandatory_create(conn):
++    from hermes_cli.kanban_model_neutral import ERROR
++    from tools import kanban_tools as kt
++    before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++    out = json.loads(kt._handle_create({"assignee": "default", "requires": [],
++                                        "title": "rotate the CI token in the Keychain",
++                                        "model": "claude-opus-5-5", "provider": "anthropic",
++                                        "pin_mandatory": True}))
++    assert out.get("error") == ERROR and not out.get("ok"), out
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before  # refused before any card or placement
++
+ 
++def test_a_marker_card_mandatory_pin_is_refused_not_kept(on_w2):
++    """Mandatory model pins are no longer a portability reason (nor a creatable one): ingress refuses the card
++    before placement, so no pool-member label attestation can matter."""
++    _refused_mandatory_create(on_w2.conn)
+ 
+-def test_a_marker_card_stays_kept_when_one_pool_member_lacks_the_pin_label(w2, monkeypatch):
+-    """worker-1 alone attests the mandatory pin: one live machine holds the whole label set (cfc3d681ce), but the
+-    pin is unattested across the pool (every eligible member must carry it), so the card must still stay here."""
++
++def test_a_marker_card_mandatory_pin_is_refused_whatever_the_pool_attests(w2, monkeypatch):
++    """worker-1 alone attests the legacy pin label; ingress still refuses the pin, so the pool never decides."""
+     from hermes_cli.kanban_mandatory_pin import LABEL
+     machines = _pool_machines()
+     machines["worker-1"] = {**machines["worker-1"], "labels": [*LIVE, LABEL]}
+     _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, machines)
+-    out = _create(title="rotate the CI token in the Keychain", model="claude-opus-5-5", provider="anthropic",
+-                  pin_mandatory=True)
+-    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    _refused_mandatory_create(w2.conn)
+ 
+ 
+ def test_a_worker_keeps_a_card_naming_a_non_git_directory_under_wt(on_w2, tmp_path):
+diff --git a/tests/hermes_cli/test_kanban_profile_pace.py b/tests/hermes_cli/test_kanban_profile_pace.py
+index 8e08c1ed55..3659cab9d2 100644
+--- a/tests/hermes_cli/test_kanban_profile_pace.py
++++ b/tests/hermes_cli/test_kanban_profile_pace.py
+@@ -57,11 +57,20 @@ def test_profile_candidates_are_not_dispatcher_home_candidates(coach):
+ @pytest.mark.parametrize('pin', [{'model_override': 'grok-4.6', 'provider_override': 'xai-oauth'},
+                                   {'model_override': 'grok-4.6'},
+                                   {'model_override': 'class:standard', 'provider_override': 'xai-oauth'}])
+-def test_profile_pins_keep_the_hold(coach, pin):
++def test_legacy_profile_pins_are_ignored_and_the_card_escapes_the_held_pool(coach, pin):
++    """New concrete pins are refused at ingress; an old row carrying one routes like any default profile card."""
++    with pytest.raises(ValueError):
++        with kbc.connect() as conn:
++            kb.create_task(conn, title='routine work', assignee='coach', model_override='grok-4.6',
++                           provider_override='xai-oauth')
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title='routine work', assignee='coach', **pin)
++        tid = kb.create_task(conn, title='routine work', assignee='coach')
++        conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?',
++                     (pin['model_override'], pin.get('provider_override'), tid))
++        conn.commit()
+         seen, result = _dispatch(conn)
+-        assert seen == [] and tid in result.clock_held
++        assert seen == [(tid, 'claude-sonnet-5-5', 'anthropic')] and tid not in result.clock_held
++        assert kb.get_task(conn, tid).model_override == pin['model_override']  # author provenance retained
+ 
+ 
+ def test_no_usable_profile_peer_keeps_hold(coach):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index f36de2465c..a6c11a0cbe 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ import json
+ import time
+ 
++import pytest
++
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_provider_walls as walls
+@@ -22,6 +24,15 @@ def _wall(board, provider=CODEX, seconds=524389):
+     walls.record_wall(provider, seconds, path=board / "kanban" / "provider_walls.json")
+ 
+ 
++def _legacy(conn, tid, model=None, provider=None, body=None):
++    """Seed a historical concrete pin / ``require_model`` body raw in this isolated test DB.
++
++    Ingress refuses them now; dispatch must ignore them while the author row keeps its provenance."""
++    conn.execute("UPDATE tasks SET model_override=?, provider_override=?, body=COALESCE(?, body) WHERE id=?",
++                 (model, provider, body, tid))
++    conn.commit()
++
++
+ def test_parse_retry_after_takes_largest():
+     assert walls.parse_retry_after("quota exhausted (429); retry after 524389s") == 524389
+     assert walls.parse_retry_after("nothing here") is None
+@@ -46,21 +57,28 @@ def test_keep_pattern_card_preserves_strong_route_under_wall(board, monkeypatch)
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="security audit", assignee="default")
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == (None, None)
++    assert seen[tid][:2] == ("class:deep", "auto")
+     assert _tier_events(conn, tid)[-1]['reason'] == 'pattern:security'
+ 
+ 
+-def test_pinned_card_on_walled_provider_keeps_exact_pin(board, monkeypatch):
++def test_legacy_pinned_card_on_walled_provider_is_routed_by_class_not_its_pin(board, monkeypatch):
+     _write_cfg(board, default_model=SONNET, default_provider="anthropic")
+     monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
+     walls.record_wall(CODEX, 524389, path=board / "w.json")
+     conn = kbc.connect()
+-    a = kb.create_task(conn, title="a", assignee="default", model_override="gpt-6-astra", provider_override=CODEX)
+-    b = kb.create_task(conn, title="b", body="must stay on astra\nrequire_model: true", assignee="default",
+-                       model_override="gpt-6-astra", provider_override=CODEX)
++    a = kb.create_task(conn, title="a", assignee="default")
++    b = kb.create_task(conn, title="b", body="plain", assignee="default")
++    _legacy(conn, a, "gpt-6-astra", CODEX)
++    _legacy(conn, b, "gpt-6-astra", CODEX, "must stay on astra\nrequire_model: true")
++    with pytest.raises(ValueError):  # new concrete pins / mandatory directives are refused at ingress
++        kb.create_task(conn, title="c", assignee="default", model_override="gpt-6-astra", provider_override=CODEX)
+     seen = _dispatch(conn)
+-    assert seen[a][:2] == ("gpt-6-astra", CODEX)
+-    assert seen[b][:2] == ("gpt-6-astra", CODEX)
++    # Retired restrictions are ignored at dispatch: both run on the class route, never the legacy pin.
++    assert seen[a][:2] == ("class:standard", "auto")
++    assert seen[b][:2] == ("class:standard", "auto")
++    # Author provenance is retained untouched.
++    assert (kb.get_task(conn, a).model_override, kb.get_task(conn, a).provider_override) == ("gpt-6-astra", CODEX)
++    assert "require_model: true" in kb.get_task(conn, b).body
+ 
+ 
+ def test_no_wall_no_change(board, monkeypatch):
+@@ -69,7 +87,7 @@ def test_no_wall_no_change(board, monkeypatch):
+     monkeypatch.setattr(walls, "profile_provider", lambda: CODEX)
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="security audit", assignee="default")
+-    assert _dispatch(conn)[tid][0] is None
++    assert _dispatch(conn)[tid][0] == "class:deep"
+ 
+ 
+ def test_fallback_also_walled_leaves_task(board, monkeypatch):
+@@ -149,15 +167,16 @@ def test_storm_alert_body_does_not_opt_itself_out_of_wall_reroute(board):
+     assert not kanban_pin_reroute.is_mandatory_pin(task)
+ 
+ 
+-def test_requires_model_needs_a_deliberate_line():
++def test_requires_model_directive_has_no_routing_authority():
+     class T:
+         title = "require_model"
+         def __init__(self, body): self.body = body
+     assert not walls.requires_model(T("cards pinned to the walled provider (`require_model`)."))
+     assert not walls.requires_model(T("require_model: false"))
+     assert not walls.requires_model(T(None))
+-    assert walls.requires_model(T("must stay on astra\nrequire_model: true\n"))
+-    assert walls.requires_model(T(f"  {walls.REQUIRE_MODEL_MARKER.upper()}  "))
++    # Even a deliberate historical line is evidence, not a mandate: model-neutral policy ignores it.
++    assert not walls.requires_model(T("must stay on astra\nrequire_model: true\n"))
++    assert not walls.requires_model(T(f"  {walls.REQUIRE_MODEL_MARKER.upper()}  "))
+ 
+ 
+ def test_storm_alert_prints_wall_date_in_utc(board, monkeypatch):
+@@ -187,8 +206,11 @@ def test_storm_alert_prints_wall_date_in_utc(board, monkeypatch):
+     assert "openai-codex until 2099-11-18 05:59Z" in body
+ 
+ 
+-def test_default_tier_on_walled_default_provider_moves_to_strong_tier(board, monkeypatch):
+-    """2026-11-01: default_model was gpt-6-astra/openai-codex; a Codex wall had only Codex as fallback."""
++def test_default_tier_with_retired_concrete_config_stays_on_the_class_route_under_a_wall(board, monkeypatch):
++    """Earlier: default_model was gpt-6-astra/openai-codex; a Codex wall had only Codex as fallback.
++
++    Concrete default/strong names are retired: the card runs on ``class:standard``/auto and the allocator
++    (not a hard-coded provider) steps around the wall, so no concrete tuple is ever injected."""
+     _write_cfg(board, default_model="gpt-6-astra", default_provider=CODEX,
+                strong_model=OPUS, strong_provider="anthropic")
+     monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
+@@ -196,8 +218,8 @@ def test_default_tier_on_walled_default_provider_moves_to_strong_tier(board, mon
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="plain card", assignee="default")
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == (OPUS, "anthropic")
+-    assert "wall:openai-codex" in _tier_events(conn, tid)[-1]["reason"]
++    assert seen[tid][:2] == ("class:standard", "auto")
++    assert _tier_events(conn, tid)[-1]["reason"] == "default"
+ 
+ 
+ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch):
+@@ -208,26 +230,25 @@ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch)
+                         lambda p, m: time.time() + 200714 if p == CODEX else None)
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="plain card", assignee="default")
+-    pinned = kb.create_task(conn, title="pinned", assignee="default", model_override="gpt-6-astra",
+-                            provider_override=CODEX)
++    pinned = kb.create_task(conn, title="pinned", assignee="default")
++    _legacy(conn, pinned, "gpt-6-astra", CODEX)
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == (OPUS, "anthropic")
+-    # Exact pins keep their tuple: never rewritten. This fresh one has no same-class peer ("default" has no
+-    # routing policy), so it is held on the live wall (kanban_dispatch_skip); with a free class peer it is
+-    # rerouted instead (test_kanban_pin_reroute::test_fresh_pin_on_a_far_live_wall_reroutes_on_its_first_run).
+-    assert pinned not in seen
+-    assert [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? AND kind = 'dispatch_skipped'",
+-                                       (pinned,))] == ["dispatch_skipped"]
++    assert seen[tid][:2] == ("class:standard", "auto")
++    # A legacy concrete pin is ignored (no hold on the live wall, no crash) and its author row is untouched.
++    assert pinned in seen, [tuple(r) for r in conn.execute("SELECT kind, payload FROM task_events WHERE task_id=?", (pinned,))]
++    assert seen[pinned][:2] == ("class:standard", "auto")
++    assert (kb.get_task(conn, pinned).model_override, kb.get_task(conn, pinned).provider_override) == (
++        "gpt-6-astra", CODEX)
+ 
+ 
+-def test_every_fallback_exhausted_leaves_task_on_its_route(board, monkeypatch):
++def test_every_fallback_exhausted_leaves_task_on_its_class_route(board, monkeypatch):
+     _write_cfg(board, default_model="gpt-6-astra", default_provider=CODEX,
+                strong_model=OPUS, strong_provider="anthropic")
+     monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
+     monkeypatch.setattr(walls, "live_quota_wall", lambda p, m: time.time() + 3600)
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="plain card", assignee="default")
+-    assert _dispatch(conn)[tid][:2] == ("gpt-6-astra", CODEX)
++    assert _dispatch(conn)[tid][:2] == ("class:standard", "auto")
+ 
+ 
+ def test_live_quota_wall_reads_the_oauth_pool(monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_quota_deadlines.py b/tests/hermes_cli/test_kanban_quota_deadlines.py
+index 68fa6d70eb..95c1748522 100644
+--- a/tests/hermes_cli/test_kanban_quota_deadlines.py
++++ b/tests/hermes_cli/test_kanban_quota_deadlines.py
+@@ -109,10 +109,16 @@ def test_tier_selected_quota_does_not_consume_crash_budget(conn, monkeypatch, en
+     from hermes_cli.kanban_model_tier import apply_model_tier
+     now = int(time.time())
+     tid, task, frame = _claim(conn, 'ready')
+-    cfg = {'default_model': 'claude-sonnet-5-5', 'default_provider': 'anthropic',
+-           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic',
++    cfg = {'default_model': 'class:standard', 'strong_model': 'class:deep',
+            'default_model_keep_patterns': ['security']}
++    # Isolated enabled class routes: admission only selects a class the host can route.
++    route = dict(provider='anthropic', billing='subscription', weight=1, eligible=True, funding_verified=True,
++                 capabilities={'tools': True, 'streaming': True})
++    routing_cfg = {'model_routing': {'enabled': True, 'routes': {
++        'standard': [dict(route, model='claude-sonnet-5-5')], 'deep': [dict(route, model='claude-opus-5-5')]}}}
++    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective', lambda *a, **k: routing_cfg)
+     if entry == 'pinned':
++        # Historical raw selector seed: ignored, the neutral default decides.
+         task.model_override, task.provider_override = 'claude-opus-5-5', 'anthropic'
+     elif entry == 'pattern':
+         task.title = 'security review'
+@@ -122,12 +128,12 @@ def test_tier_selected_quota_does_not_consume_crash_budget(conn, monkeypatch, en
+             conn.execute("INSERT INTO task_runs (task_id, profile, started_at, ended_at, outcome, status) "
+                          "VALUES (?, 'w', ?, ?, 'crashed', 'crashed')", (tid, now - 20, now - 10))
+     reason = apply_model_tier(conn, task, lane='ready', cfg=cfg)
+-    expected = {'pinned': 'pinned', 'pattern': 'pattern:security',
++    expected = {'pinned': 'default', 'pattern': 'pattern:security',
+                 'retry': 'retry_after_run_crashed', 'standard': 'default'}
+     assert reason == expected[entry]
+-    assert task.model_override == ('claude-sonnet-5-5' if entry == 'standard' else 'claude-opus-5-5')
++    assert task.model_override == ('class:deep' if entry in {'pattern', 'retry'} else 'class:standard')
+     session_kanban.record_start_failure(
+-        frame, SubscriptionQuotaUnavailable('anthropic', task.model_override, now + 7200))
++        frame, SubscriptionQuotaUnavailable('anthropic', 'claude-sonnet-5-5', now + 7200))
+     assert tid not in dispatch.detect_crashed_workers(conn)
+     row = kb.get_task(conn, tid)
+     assert row.status == 'ready' and not row.consecutive_failures
+diff --git a/tests/hermes_cli/test_kanban_quota_episode.py b/tests/hermes_cli/test_kanban_quota_episode.py
+index 7ee8f24844..71fd21ca3e 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode.py
++++ b/tests/hermes_cli/test_kanban_quota_episode.py
+@@ -163,12 +163,15 @@ def routing(monkeypatch, *, blocked=False, profile=False):
+     config = {'model': {'default': 'class:standard', 'provider': 'auto'},
+               'model_routing': {'enabled': True, 'routes': {'standard': [
+                   route('anthropic', 'claude-sonnet-5-5'),
+-                  route('openai-codex', 'gpt-test')]}},
++                  route('openai-codex', 'gpt-test')],
++                  'deep': [route('anthropic', 'claude-opus-5-5')]}},
+               'providers': {'openai-codex': {'enabled': not blocked}}}
+-    cfg = {} if profile else {'default_model': 'class:standard', 'strong_model': 'claude-opus-5-5',
+-                              'strong_provider': 'anthropic', 'default_model_keep_patterns': ['security']}
++    cfg = {} if profile else {'default_model': 'class:standard', 'strong_model': 'class:deep',
++                              'default_model_keep_patterns': ['security']}
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
+     monkeypatch.setattr('hermes_cli.kanban_model_assignment._assignee_config', lambda _: config)
++    # Isolated enabled class routes for the host-level routability probe too (the home's own config is empty).
++    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective', lambda *a, **k: config)
+     return config, cfg
+ 
+ 
+@@ -182,6 +185,7 @@ def test_shared_admission_preview_and_owner_route(board, monkeypatch, entry):
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='security work' if entry == 'pattern' else 'quota', assignee='a')
+         if entry == 'pinned':
++            # Historical raw selector seed (disposable DB): dynamically ignored, author row retained.
+             conn.execute("UPDATE tasks SET model_override='claude-opus-5-5', provider_override='anthropic' WHERE id=?", (tid,))
+         elif entry == 'provider_pin':
+             conn.execute("UPDATE tasks SET provider_override='anthropic' WHERE id=?", (tid,))
+@@ -192,8 +196,8 @@ def test_shared_admission_preview_and_owner_route(board, monkeypatch, entry):
+             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+         conn.commit()
+         reap(conn, tid, text='resets in ~11h', lane=lane)
+-        # A real review without author attribution may use the free eligible route too.
+-        expected_reroute = entry in {'default', 'profile', 'review'}
++        # Legacy selectors and missing model attribution cannot constrain review dispatch.
++        expected_reroute = entry in {'default', 'profile', 'pinned', 'provider_pin', 'review'}
+         assert (dispatch.check_respawn_guard(conn, tid, lane=lane) is None) == expected_reroute
+         before = conn.total_changes
+         preview = task_route(conn, tid)
+@@ -208,8 +212,9 @@ def test_shared_admission_preview_and_owner_route(board, monkeypatch, entry):
+         if expected_reroute:
+             assert preview[:2] == ('gpt-test', 'openai-codex')
+             assert tier.owner_model_pin(conn, task) == ('gpt-test', 'openai-codex')
+-        elif entry in {'pinned', 'review', 'pattern', 'retry'}:
+-            assert preview[:2] == ('claude-opus-5-5', 'anthropic')
++        elif entry in {'review', 'pattern', 'retry'}:
++            assert preview[:2] == ('class:deep', None)
++            assert tier.owner_model_pin(conn, task) == ('class:deep', 'auto')
+         persisted = kb.get_task(conn, tid)
+         assert (persisted.model_override, persisted.provider_override) == original
+ 
+@@ -220,11 +225,12 @@ def test_walled_concrete_default_model_reroutes_to_class_peer(board, monkeypatch
+     clock = [1_800_000_000]
+     monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
+     config, _ = routing(monkeypatch)
+-    config['model_routing']['routes'] = {'deep': [
++    config['model_routing']['routes'] = {'standard': [
+         dict(config['model_routing']['routes']['standard'][0], model='claude-opus-5-5'),
+         dict(config['model_routing']['routes']['standard'][1], model='gpt-6-astra')]}
++    # A concrete default is ignored (neutral class:standard); only the legacy pin row is a raw seed.
+     cfg = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
+-           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++           'strong_model': 'class:deep'}
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
+     reset = clock[0] + 55 * 3600
+     with kbc.connect() as conn:
+@@ -239,12 +245,12 @@ def test_walled_concrete_default_model_reroutes_to_class_peer(board, monkeypatch
+         clock[0] += 301
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
+-        # A non-mandatory pin moves within its class too (t_01a19990897b9d9b); only its reason differs.
++        # A legacy pin row is ignored: both cards move within the class on the episode's wall.
+         assert seen == [('claude-opus-5-5', 'anthropic')]
+         route = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
+                              "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
+         assert '"provider": "anthropic"' in route
+-        assert ('pin_quota_reroute:openai-codex' if pinned else 'quota_reroute') in route
++        assert 'quota_reroute' in route
+ 
+ 
+ def test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it(board, monkeypatch, all_assignees_spawnable):
+@@ -259,8 +265,7 @@ def test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it(board,
+     monkeypatch.setattr(walls.time, 'time', lambda: clock[0])
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     routing(monkeypatch)
+-    cfg = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
+-           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++    cfg = {'default_model': 'class:standard', 'strong_model': 'class:deep'}
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
+     reset = clock[0] + 55 * 3600
+     with kbc.connect() as conn:
+@@ -278,10 +283,13 @@ def test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it(board,
+         conn.commit()
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.id, task.provider_override)))
+-        assert seen == [(new, 'anthropic')]
++        # Neutral admission stays a provider-unknown class (the worker allocates): the dispatcher never
++        # concretely pins the walled provider, and its receipt names no provider at all.
++        assert seen == [(new, 'auto')]
+         route = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
+                                            "ORDER BY id DESC LIMIT 1", (new,)).fetchone()[0])
+-        assert route['provider'] == 'anthropic' and route['tier_reason'] == 'default+wall:openai-codex'
++        assert route['provider'] is None and route['model'] == 'class:standard'
++        assert 'openai-codex' not in str(route)
+ 
+ 
+ @pytest.mark.parametrize('reroute', [False, True])
+@@ -405,26 +413,27 @@ def test_reroute_applies_worker_capability_requirements(board, monkeypatch, caps
+         assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+ 
+ 
+-@pytest.mark.parametrize('repin, held', [(('gpt-test', 'openai-codex'), False), (('claude-opus-5-5', 'anthropic'), True)])
+-def test_changed_explicit_pin_is_judged_by_its_own_provider(board, monkeypatch, repin, held):
++@pytest.mark.parametrize('repin', [('gpt-test', 'openai-codex'), ('claude-opus-5-5', 'anthropic')])
++def test_changed_legacy_pin_never_changes_the_runs_own_provider_judgement(board, monkeypatch, repin):
+     now = 1_800_000_000
+     monkeypatch.setattr(kb.time, 'time', lambda: now)
+     _, cfg = routing(monkeypatch)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='pinned', assignee='a')
+-        # Mandatory: a far wall would otherwise move this in-class pin (kanban_pin_reroute).
++        # Historical raw selector seed (disposable DB): ignored; the episode is judged by the run's receipt.
+         conn.execute("UPDATE tasks SET model_override='claude-sonnet-5-5', provider_override='anthropic', "
+                      "model_pin_mandatory=1 WHERE id=?", (tid,))
+         conn.commit()
+         reap(conn, tid, text='resets in ~11h')
+-        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        before = dispatch.check_respawn_guard(conn, tid)
+         conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?', (*repin, tid))
+         conn.commit()
+-        assert (dispatch.check_respawn_guard(conn, tid) is not None) == held
+-        task = kb.claim_task(conn, tid, claimer=kb._claimer_id()) if not held else kb.get_task(conn, tid)
++        assert dispatch.check_respawn_guard(conn, tid) == before  # a changed historical row moves nothing
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id()) if before is None else kb.get_task(conn, tid)
+         tier.apply_model_tier(conn, task, lane='ready', cfg=cfg)
+-        # The pin is never rewritten either way.
+-        assert tier.effective_route(task)[:2] == repin
++        # The author row is never rewritten, and never becomes the run's route.
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == repin
+ 
+ 
+ # --- Runtime-emitted reset phrasings: compound and minute windows are not cut short ---
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+index d9594038fd..81684e8dac 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_walls.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -18,8 +18,7 @@ from hermes_cli.kanban_db_dispatch_clock import guard_hold_until
+ from hermes_cli.kanban_quota_episode import episode
+ from tests.hermes_cli.test_kanban_quota_episode import board as board, reap, routing  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
+ 
+-HUB_CFG = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
+-           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++HUB_CFG = {'default_model': 'class:standard', 'strong_model': 'class:deep'}
+ 
+ 
+ def _codex_wall(reset) -> dict[str, Any]:
+@@ -41,17 +40,26 @@ def _hub_tier(monkeypatch):
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: HUB_CFG)
+ 
+ 
++def _class_routes(config, **by_class):
++    """Isolated enabled class routes (``{class: [(provider, model), ...]}``), also for the host routability probe."""
++    base = dict(billing='subscription', weight=1, eligible=True, funding_verified=True,
++                capabilities={'tools': True, 'streaming': True})
++    config['model_routing'] = {'enabled': True, 'routes': {
++        level: [dict(base, provider=p, model=m) for p, m in routes] for level, routes in by_class.items()}}
++
++
+ @pytest.mark.parametrize('why', ['routing_disabled', 'no_class_alternate'])
+ def test_episode_default_card_without_class_alternate_falls_back_to_strong_tier(
+         board, monkeypatch, all_assignees_spawnable, why):
+-    """(a) Routing off (or no class peer): the episode's own wall still moves an unpinned default card
+-    to the strong tier, even with no provider_walls.json entry and no live pool evidence."""
++    """(a) No class peer for the walled route: the episode's own wall still moves an unpinned default card
++    to the strong class, even with no provider_walls.json entry and no live pool evidence. With routing off
++    nothing can move it: it holds for the reset instead of spawning into the wall."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+     if why == 'routing_disabled':
+         config['model_routing']['enabled'] = False
+-    else:  # gpt-6-astra belongs to no class: alternate_route cannot place it
+-        config['model_routing']['routes'] = {'standard': [config['model_routing']['routes']['standard'][0]]}
++    else:  # the only standard route is the walled codex one; the strong class has room
++        _class_routes(config, standard=[('openai-codex', 'gpt-6-astra')], deep=[('anthropic', 'claude-opus-5-5')])
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     reset = clock[0] + 55 * 3600
+@@ -61,24 +69,29 @@ def test_episode_default_card_without_class_alternate_falls_back_to_strong_tier(
+         # Only the episode knows the wall: no provider file, no live pool evidence.
+         monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
+         clock[0] += 301
+-        assert dispatch.check_respawn_guard(conn, tid) is None
++        guard = dispatch.check_respawn_guard(conn, tid)
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        if why == 'routing_disabled':
++            assert guard == 'subscription_quota_reset' and seen == []
++            return
++        assert guard is None
+         assert seen == [('claude-opus-5-5', 'anthropic')]
+         route = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
+                                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
+         assert route['provider'] == 'anthropic' and 'quota_reroute' in route['tier_reason']
+ 
+ 
+-def test_episode_fallback_never_reroutes_an_explicit_pin(board, monkeypatch, all_assignees_spawnable):
+-    """(a) The strong-tier fallback is for unpinned default cards only; an Astra pin waits for the reset."""
++def test_episode_fallback_never_rewrites_a_legacy_pin_row(board, monkeypatch, all_assignees_spawnable):
++    """(a) A legacy Astra pin row (raw seed, dynamically ignored) neither reroutes nor is rewritten: with routing
++    off the card holds for the reset and the author row is retained."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+     config['model_routing']['enabled'] = False
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title='astra pin', assignee='a')
++        tid = kb.create_task(conn, title='legacy row card', assignee='a')
+         conn.execute("UPDATE tasks SET model_override='gpt-6-astra', provider_override='openai-codex' WHERE id=?", (tid,))
+         conn.commit()
+         reap(conn, tid, admit=HUB_CFG, **_codex_wall(clock[0] + 55 * 3600))
+@@ -120,7 +133,7 @@ def test_episode_still_admits_a_target_with_no_wall_anywhere(board, monkeypatch,
+     """(b) Control: with no wall on the default provider, the different provider is admitted as before."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    config['model_routing']['enabled'] = False
++    _class_routes(config, standard=[('anthropic', 'claude-opus-5-5'), ('openai-codex', 'gpt-6-astra')])
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+@@ -191,7 +204,7 @@ def test_expired_episode_still_honours_another_cards_wall(board, monkeypatch, al
+     episode is over, routing must still skip walled codex: the provider-wall reroute applies again."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    config['model_routing']['enabled'] = False
++    _class_routes(config, standard=[('anthropic', 'claude-opus-5-5'), ('openai-codex', 'gpt-6-astra')])
+     _hub_tier(monkeypatch)
+     codex_reset = float(clock[0] + 55 * 3600)
+     monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': codex_reset})
+@@ -232,7 +245,8 @@ def test_review_card_waits_when_its_strong_provider_is_walled_elsewhere(board, m
+     """(b) Review lane: the episode walled codex, the review route (strong tier, anthropic) is walled by
+     another card's wall. Holding beats sending the review into that wall."""
+     clock = _clock(monkeypatch)
+-    routing(monkeypatch)
++    config, _ = routing(monkeypatch)
++    _class_routes(config, standard=[('openai-codex', 'gpt-6-astra')], deep=[('anthropic', 'claude-opus-5-5')])
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     with kbc.connect() as conn:
+@@ -250,11 +264,10 @@ def test_review_card_waits_when_its_strong_provider_is_walled_elsewhere(board, m
+ 
+ 
+ def test_class_with_every_route_walled_falls_back_to_strong_tier(board, monkeypatch, all_assignees_spawnable):
+-    """(a) The default model's class exists but its only route is the walled one: the strong tier takes it."""
++    """(a) The default class exists but its only route is the walled one: the strong class takes it."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    codex_route = dict(config['model_routing']['routes']['standard'][1], model='gpt-6-astra')
+-    config['model_routing']['routes'] = {'deep': [codex_route]}
++    _class_routes(config, standard=[('openai-codex', 'gpt-6-astra')], deep=[('anthropic', 'claude-opus-5-5')])
+     _hub_tier(monkeypatch)
+     monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     with kbc.connect() as conn:
+@@ -267,21 +280,19 @@ def test_class_with_every_route_walled_falls_back_to_strong_tier(board, monkeypa
+         assert seen == [('claude-opus-5-5', 'anthropic')]
+ 
+ 
+-LIVE_CFG = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
+-            'strong_model': 'class:deep', 'strong_provider': 'auto'}
++LIVE_CFG = {'default_model': 'class:standard', 'strong_model': 'class:deep'}
+ 
+ 
+ @pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
+-def test_fresh_card_skips_a_known_wall_before_its_first_spawn(board, monkeypatch, all_assignees_spawnable, evidence):
+-    """A card with no quota episode of its own, default tier on walled codex, strong tier a class selector
+-    (the live MacBook config, 2026-11-10): the class alternate must place it before any worker spawns.
+-    Before the fix every fresh claim spawned into the codex wall once (exit 75) and only the second claim,
+-    judged by the card's own new episode, rerouted: 11 wasted rate_limited runs per hour."""
++def test_fresh_card_stays_a_provider_neutral_class_beside_a_known_wall(board, monkeypatch, all_assignees_spawnable,
++                                                                       evidence):
++    """A card with no quota episode of its own and a known codex wall (provider file or live pool): the neutral
++    default is a provider-unknown class that the worker allocates, so the dispatcher never concretely routes it
++    onto the walled provider (and, by design, no longer pre-places it on another one). Its receipt names none.
++    PRODUCTION GAP: the old pre-spawn class alternate (``_class_alternate_off_wall``) skips ``auto`` bases."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    route = config['model_routing']['routes']['standard'][0]
+-    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
+-                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    _class_routes(config, standard=[('anthropic', 'claude-opus-5-5'), ('openai-codex', 'gpt-6-astra')])
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
+     codex_reset = float(clock[0] + 5000)
+     if evidence == 'provider_file':
+@@ -292,49 +303,43 @@ def test_fresh_card_skips_a_known_wall_before_its_first_spawn(board, monkeypatch
+         monkeypatch.setattr(walls, 'live_quota_wall',
+                             lambda provider, model: codex_reset if provider == 'openai-codex' else None)
+     with kbc.connect() as conn:
+-        pinned = kb.create_task(conn, title='needs astra', body=f'{walls.REQUIRE_MODEL_MARKER}', assignee='a')
+-        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, pinned), lane='ready')[:2] == (
+-            'gpt-6-astra', 'openai-codex')  # a require_model card is never moved off its model
+-        conn.execute("DELETE FROM tasks WHERE id=?", (pinned,))
++        marked = kb.create_task(conn, title='needs astra card', assignee='a')
++        conn.execute("UPDATE tasks SET body=? WHERE id=?", (walls.REQUIRE_MODEL_MARKER, marked))  # raw legacy seed
++        conn.commit()
++        # The legacy require_model marker is only text now: it is never a concrete route.
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, marked), lane='ready')[:2] == (
++            'class:standard', 'auto')
++        conn.execute("DELETE FROM tasks WHERE id=?", (marked,))
+         conn.commit()
+         tid = kb.create_task(conn, title='fresh default card', assignee='a')
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
+-        assert seen == [('claude-opus-5-5', 'anthropic')]
++        assert seen == [('class:standard', 'auto')]
+         receipt = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
+                                              "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
+-        assert receipt['tier_reason'] == 'default+wall:openai-codex'
++        assert receipt['provider'] is None and 'openai-codex' not in str(receipt)
+ 
+ 
+ def test_class_alternate_ignores_require_model_named_in_prose(board, monkeypatch, all_assignees_spawnable):
+-    """Mutant M2f (t_01a1d00e5aa896fd): ``_class_alternate_off_wall`` must use the deliberate-line check, not a
+-    substring. A default card whose prose names `require_model` (the storm alert's own body did) still moves
+-    off the walled default provider before its first spawn; only the class alternate can move it here."""
+-    clock = _clock(monkeypatch)
++    """The deliberate-line check (not a substring) still decides ``requires_model``: prose naming
++    `require_model` is not a marker, and neither form turns the neutral class into a concrete pin."""
+     config, _ = routing(monkeypatch)
+-    route = config['model_routing']['routes']['standard'][0]
+-    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
+-                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    _class_routes(config, standard=[('anthropic', 'claude-opus-5-5'), ('openai-codex', 'gpt-6-astra')])
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
+-    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 5000)})
+-    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='storm alert', assignee='a', body=(
+             'Cards pinned to the walled provider (`require_model`) keep their route.\n'
+             'require_model: false'))
+         assert not walls.requires_model(kb.get_task(conn, tid))
+         assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane='ready') == (
+-            'claude-opus-5-5', 'anthropic', 'default+wall:openai-codex')
++            'class:standard', 'auto', 'default')
+ 
+ 
+ def test_fresh_card_class_alternate_never_lands_on_another_wall(board, monkeypatch, all_assignees_spawnable):
+-    """Control: the class alternate is walled too (live pool); with no usable route the card keeps its
+-    default route rather than being sent into a second wall."""
++    """Both class routes walled: the neutral class card is never concretely pinned onto either wall."""
+     clock = _clock(monkeypatch)
+     config, _ = routing(monkeypatch)
+-    route = config['model_routing']['routes']['standard'][0]
+-    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
+-                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    _class_routes(config, standard=[('anthropic', 'claude-opus-5-5'), ('openai-codex', 'gpt-6-astra')])
+     monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
+     monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 5000)})
+     monkeypatch.setattr(walls, 'live_quota_wall',
+@@ -343,4 +348,4 @@ def test_fresh_card_class_alternate_never_lands_on_another_wall(board, monkeypat
+         kb.create_task(conn, title='both walled', assignee='a')
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
+-        assert seen == [('gpt-6-astra', 'openai-codex')]
++        assert seen == [('class:standard', 'auto')]
+diff --git a/tests/hermes_cli/test_kanban_ratio_routing.py b/tests/hermes_cli/test_kanban_ratio_routing.py
+index a85e950c61..5fd9f7204f 100644
+--- a/tests/hermes_cli/test_kanban_ratio_routing.py
++++ b/tests/hermes_cli/test_kanban_ratio_routing.py
+@@ -28,7 +28,8 @@ from tests.hermes_cli.test_kanban_quota_episode import board as board, reap, rou
+ 
+ FABLE, OPUS = ('claude-fable-5-2', 'anthropic'), ('claude-opus-5-5', 'anthropic')
+ ASTRA, GROK = ('gpt-6-astra', 'openai-codex'), ('grok-4.7', 'xai-oauth')
+-HUB_CFG = {'default_model': ASTRA[0], 'default_provider': ASTRA[1], 'strong_model': OPUS[0], 'strong_provider': OPUS[1],
++DEEP = ('class:deep', 'auto')  # kanban is model-neutral: the default tier is a class selector the worker allocates
++HUB_CFG = {'default_model': 'class:deep', 'default_provider': 'auto', 'strong_model': 'class:deep',
+            'default_model_keep_patterns': ['security']}
+ TARGETS = {'anthropic': 0.5, 'openai-codex': 0.3, 'xai-oauth': 0.2}
+ UNSERVED: set = set()  # providers this host holds no live credential for, per test
+@@ -180,7 +181,7 @@ def test_a_pick_loads_each_candidate_credential_pool_once(hub, monkeypatch):
+     _budget(hub['clock'])
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title='d', assignee='a'))
+-        assert ratio.pick(conn, task, (*ASTRA, 'default'), lane='ready', cfg=hub['cfg']) == (FABLE[0], 'anthropic')
++        assert ratio.pick(conn, task, (*DEEP, 'default'), lane='ready', cfg=hub['cfg']) == (FABLE[0], 'anthropic')
+     assert sorted(loads) == sorted(TARGETS)
+ 
+ 
+@@ -222,7 +223,7 @@ def test_a_tick_whose_ratio_memo_cannot_start_fails_open_and_still_runs(hub, mon
+     monkeypatch.setattr(ratio, '_key', key)
+     with kbc.connect() as conn, caplog.at_level(logging.WARNING):
+         first = kb.create_task(conn, title='one', assignee='a')
+-        assert pin_tests._tick(conn) == [ASTRA]
++        assert pin_tests._tick(conn) == [DEEP]
+         assert pin_tests._events(conn, first, 'run_route')[-1]['tier_reason'] == 'default'
+         failed = [r for r in caplog.records if 'ratio routing tick start failed' in r.getMessage()]
+         assert failed and failed[0].exc_info is not None
+@@ -241,7 +242,7 @@ def test_record_run_route_never_raises_when_the_ratio_memo_key_fails(hub, monkey
+     monkeypatch.setattr(ratio, '_key', key)
+     with kbc.connect() as conn, caplog.at_level(logging.WARNING):
+         tid = kb.create_task(conn, title='d', assignee='a')
+-        assert pin_tests._tick(conn) == [ASTRA]
++        assert pin_tests._tick(conn) == [DEEP]
+         assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'default'
+         task = kb.get_task(conn, tid)
+         task.current_run_id = conn.execute('SELECT MAX(id) FROM task_runs').fetchone()[0]
+@@ -269,7 +270,7 @@ def _corrupt(clock, case):
+ def test_no_fresh_well_formed_budget_keeps_todays_route(hub, case):
+     _corrupt(hub['clock'], case)
+     with kbc.connect() as conn:
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*ASTRA, 'default')
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
+ 
+ 
+ def test_a_budget_just_inside_twenty_minutes_still_routes(hub):
+@@ -278,16 +279,13 @@ def test_a_budget_just_inside_twenty_minutes_still_routes(hub):
+         assert _route(conn, kb.create_task(conn, title='d', assignee='a'))[2] == 'default+ratio:anthropic'
+ 
+ 
+-@pytest.mark.parametrize('case', ['switch_off', 'pacing_off', 'no_class_level'])
++@pytest.mark.parametrize('case', ['switch_off', 'pacing_off'])
+ def test_ratio_routing_off_keeps_todays_route(hub, case):
+     _budget(hub['clock'])
+     changes = {'switch_off': {'llm_pacing': {'ratio_routing': False}}, 'pacing_off': {'llm_pacing': {'enabled': False}}}
+     hub['cfg'].update(changes.get(case, {}))
+-    if case == 'no_class_level':
+-        hub['config']['model_routing']['routes']['deep'] = [dict(r) for r in hub['config']['model_routing']['routes'][
+-            'deep'] if r['model'] != ASTRA[0]]
+     with kbc.connect() as conn:
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*ASTRA, 'default')
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
+ 
+ 
+ # --- a class-selector default (``kanban.default_model: class:standard``, provider ``auto``) ------------------------
+@@ -384,13 +382,13 @@ def test_a_fault_keeps_todays_route_and_is_logged_with_its_traceback(hub, monkey
+         raise fault
+     monkeypatch.setattr(ratio, 'count_starts', boom)
+     with kbc.connect() as conn, caplog.at_level(logging.WARNING, logger=ratio.logger.name):
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*ASTRA, 'default')
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
+     records = [r for r in caplog.records if r.name == ratio.logger.name and r.levelno == logging.WARNING]
+     assert records and records[0].exc_info is not None
+ 
+ 
+ def _review_card(conn):
+-    tid = kb.create_task(conn, title='review me', assignee='a', model_override=OPUS[0], provider_override=OPUS[1])
++    tid = kb.create_task(conn, title='review me', assignee='a')
+     conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+     conn.commit()
+     return tid
+@@ -403,21 +401,10 @@ def _retry_card(conn):
+     return tid
+ 
+ 
+-def _provider_only_card(conn):
+-    """A legacy row with a provider override and no model (create refuses one now; old rows may carry it)."""
+-    tid = kb.create_task(conn, title='p', assignee='a')
+-    conn.execute('UPDATE tasks SET provider_override=? WHERE id=?', (ASTRA[1], tid))
+-    conn.commit()
+-    return tid
+-
+-
+ CARDS = {
+-    'pinned': (lambda conn: kb.create_task(conn, title='p', assignee='a', model_override=ASTRA[0],
+-                                           provider_override=ASTRA[1]), 'ready', 'pinned'),
+-    'provider_override': (_provider_only_card, 'ready', 'default'),
+-    'require_model': (lambda conn: kb.create_task(conn, title='r', assignee='a',
+-                                                  body=f'astra only\n{walls.REQUIRE_MODEL_MARKER}'), 'ready', 'default'),
+-    'review': (_review_card, 'review', 'review_unpinned'),
++    'class_pin': (lambda conn: kb.create_task(conn, title='p', assignee='a', model_override='class:deep',
++                                              provider_override='auto'), 'ready', 'class'),
++    'review': (_review_card, 'review', 'review'),
+     'retry': (_retry_card, 'ready', 'retry_after_changes_requested'),
+     'keep_pattern': (lambda conn: kb.create_task(conn, title='security audit', assignee='a'), 'ready',
+                      'pattern:security'),
+@@ -426,8 +413,8 @@ CARDS = {
+ 
+ @pytest.mark.parametrize('card', sorted(CARDS))
+ def test_cards_outside_the_unpinned_default_tier_are_untouched(hub, card):
+-    """Pins, provider overrides, ``require_model``, reviews and the strong tier (retries, keep-patterns) keep the
+-    route they resolve to with ratio routing off."""
++    """Class pins, reviews and the strong tier (retries, keep-patterns) keep the route they resolve to with
++    ratio routing off."""
+     make, lane, reason = CARDS[card]
+     with kbc.connect() as conn:
+         tid = make(conn)
+@@ -438,6 +425,40 @@ def test_cards_outside_the_unpinned_default_tier_are_untouched(hub, card):
+     assert before[2] == reason
+ 
+ 
++def _legacy_card(conn, case):
++    """Old rows (raw, isolated DB) carrying retired restrictions: ingress refuses all of these now."""
++    tid = kb.create_task(conn, title='legacy', assignee='a')
++    row = {'concrete_pin': ('gpt-6-astra', 'openai-codex', None, None),
++           'provider_only': (None, 'openai-codex', None, None),
++           'mandatory_pin': ('gpt-6-astra', 'openai-codex', 1, None),
++           'require_model': (None, None, None, f'astra only\n{walls.REQUIRE_MODEL_MARKER}')}[case]
++    conn.execute('UPDATE tasks SET model_override=?, provider_override=?, model_pin_mandatory=?, '
++                 'body=COALESCE(?, body) WHERE id=?', (*row, tid))
++    conn.commit()
++    return tid
++
++
++@pytest.mark.parametrize('case', ['concrete_pin', 'provider_only', 'mandatory_pin', 'require_model'])
++def test_legacy_restrictions_are_ignored_and_the_card_routes_by_ratio_like_an_unpinned_default(hub, case):
++    with pytest.raises(ValueError):  # the same restrictions are refused at ingress
++        with kbc.connect() as conn:
++            kb.create_task(conn, title='new', assignee='a', model_override='gpt-6-astra', provider_override='openai-codex',
++                           pin_mandatory=True)
++    _budget(hub['clock'])
++    with kbc.connect() as conn:
++        legacy = _legacy_card(conn, case)
++        plain = kb.create_task(conn, title='plain', assignee='a')
++        ratio.begin_tick(conn)
++        assert _route(conn, legacy) == _route(conn, plain)
++        assert _route(conn, legacy)[2].startswith('default+ratio:')
++        persisted = kb.get_task(conn, legacy)  # author provenance is retained
++        assert persisted is not None
++        if case == 'require_model':
++            assert walls.REQUIRE_MODEL_MARKER in (persisted.body or '')
++        else:
++            assert persisted.provider_override == 'openai-codex'
++
++
+ def test_ratio_route_models_picks_the_model_each_pool_runs(hub):
+     hub['cfg']['llm_pacing'] = {'ratio_route_models': {'anthropic': OPUS[0], 'xai-oauth': 'grok-unregistered'}}
+     _budget(hub['clock'], {'anthropic': 0.5, 'xai-oauth': 0.5})
+diff --git a/tests/hermes_cli/test_kanban_review_handoff_validation.py b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+index ca19b0c6b5..618155d159 100644
+--- a/tests/hermes_cli/test_kanban_review_handoff_validation.py
++++ b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+@@ -11,7 +11,7 @@ from tests.hermes_cli import test_kanban_review_model as helpers
+ board = helpers.board
+ 
+ 
+-@pytest.mark.parametrize("provider", ["auto", "board-default", None])
++@pytest.mark.parametrize("provider", ["auto", None])
+ def test_class_provider_roundtrip(board, provider):
+     cfg = helpers.config(board)
+     with kbc.connect() as conn:
+@@ -40,8 +40,10 @@ def test_historical_board_default_handoff(board):
+ @pytest.mark.parametrize("metadata", [
+     {"review_model": "class:deep", "review_provider": "anthropic"},
+     {"review_model": "class:deep", "review_provider": "unknown-provider"},
+-    {"review_model": []},
+-    {"review_model": ""},
++    {"review_model": "class:deep", "review_provider": "board-default"},
++    {"review_model": helpers.OPUS},
++    {"review_model": ["class:deep"]},
++
+     {"review_model": helpers.OPUS, "review_provider": []},
+ ])
+ def test_invalid_handoff_refused_without_transition(board, metadata):
+@@ -51,9 +53,8 @@ def test_invalid_handoff_refused_without_transition(board, metadata):
+         kb.claim_task(conn, task.id)
+         before = kb.get_task(conn, task.id)
+         events = kb.list_events(conn, task.id)
+-        ok, reason = kb.request_review(conn, task.id, metadata=metadata, with_reason=True)
+-        assert not ok
+-        assert reason
++        with pytest.raises((ValueError, AttributeError)):
++            kb.request_review(conn, task.id, metadata=metadata, with_reason=True)
+         after = kb.get_task(conn, task.id)
+         assert (after.status, after.current_run_id, after.claim_lock) == (
+             before.status, before.current_run_id, before.claim_lock)
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index 587c22eeb9..42175088c2 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -71,8 +71,10 @@ def test_refused_spawn_is_not_a_review_boundary(board, outcome):
+ @pytest.mark.parametrize("pin", [None, MODELS[0]])
+ def test_missing_receipt_in_mixed_epoch_retains_earlier_authors(board, pin):
+     with kbc.connect() as conn:
+-        task = kb.get_task(conn, kb.create_task(conn, title="mixed epoch", assignee="default",
+-                                              model_override=pin, provider_override="anthropic" if pin else None))
++        task = kb.get_task(conn, kb.create_task(conn, title="mixed epoch", assignee="default"))
++        conn.execute("UPDATE tasks SET model_override=?, provider_override=? WHERE id=?",
++                     (pin, "anthropic" if pin else None, task.id))
++        task = kb.get_task(conn, task.id)
+         run(conn, task.id, MODELS[0])
+         run(conn, task.id, MODELS[1], "review")
+         run(conn, task.id, None)
+@@ -302,12 +304,14 @@ def _walled(monkeypatch):
+ 
+ 
+ def test_walled_override_with_no_other_candidate_is_retryable_not_exhausted(board, monkeypatch):
+-    cfg = helpers.config(board, strong=helpers.OPUS, routes=[helpers.OPUS])
++    cfg = helpers.config(board, strong=helpers.OPUS, routes=[helpers.OPUS, helpers.FABLE])
+     _walled(monkeypatch)
+     with kbc.connect() as conn:
+         task = helpers.task(conn, helpers.OPUS)
+         kb.claim_task(conn, task.id)
+-        assert kb.request_review(conn, task.id, metadata={"review_model": helpers.FABLE})
++        assert kb.request_review(conn, task.id)
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                     ('{"review_model": "class:deep"}', task.id))
+         with pytest.raises(review.ReviewModelUnavailable) as raised:
+             review.resolve_review_model(conn, kb.get_task(conn, task.id), cfg)
+         assert not isinstance(raised.value, review.ReviewModelsExhausted)
+diff --git a/tests/hermes_cli/test_kanban_review_paced_reroute.py b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+index 816538292f..c22dbab647 100644
+--- a/tests/hermes_cli/test_kanban_review_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+@@ -34,11 +34,18 @@ def _review_pools(clock, **states):
+ 
+ def _card(conn, entry, *, override=None):
+     """A Claude-implemented card under review on *entry*; ``override`` = the handoff's review_model/provider."""
+-    tid = kb.create_task(conn, title='review me', assignee='a', model_override=PEER[0], provider_override=PEER[1],
++    tid = kb.create_task(conn, title='review me', assignee='a',
+                          skills=['sdlc-review'] if entry == 'ready_skill' else None)
++    conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?', (*PEER, tid))
++    # Ready-skill cards need stored implementation evidence rather than treating the review skill as authorship.
++    from tests.hermes_cli import test_kanban_review_implementer_set as provenance
++    provenance._run(conn, tid, model=PEER[0], receipt=PEER[0])
+     if override is not None:
+         kb.claim_task(conn, tid)
+-        assert kb.request_review(conn, tid, metadata={'review_model': override[0], 'review_provider': override[1]})
++        assert kb.request_review(conn, tid)
++        import json
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                     (json.dumps({'review_model': override[0], 'review_provider': override[1]}), tid))
+     status = 'review' if entry == 'review_lane' else 'ready'
+     conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
+     conn.commit()
+@@ -128,11 +135,12 @@ def test_no_reviewer_free_of_holds_is_unavailable(
+     _review_pools(clock, **pools)
+     with kbc.connect() as conn:
+         tid = _card(conn, entry)
++        before_routes = pin_tests._events(conn, tid, 'run_route')
+         with pytest.raises(review.ReviewModelUnavailable):
+             _route(conn, tid, entry)
+         assert pin_tests._tick(conn) == []  # nothing spawns onto a held pool
+         assert pin_tests._events(conn, tid, 'model_tier') == []
+-        assert pin_tests._events(conn, tid, 'run_route') == []
++        assert pin_tests._events(conn, tid, 'run_route') == before_routes
+ 
+ 
+ @pytest.mark.parametrize('entry', ENTRIES)
+@@ -143,13 +151,13 @@ def test_a_held_review_override_is_not_taken_by_the_fast_return(board, clock, mo
+     _review_pools(clock, openai_codex=('held', HELD_FAR), anthropic=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = _card(conn, entry, override=PIN)
+-        assert tier.resolve_model_tier(conn, kb.get_task(conn, tid), lane=_lane(entry)) == (*GROK, 'review_override')
+-        assert _route(conn, tid, entry) == (*GROK, 'review_override')
++        assert tier.resolve_model_tier(conn, kb.get_task(conn, tid), lane=_lane(entry)) == (*GROK, 'review_unpinned')
++        assert _route(conn, tid, entry) == (*GROK, 'review_unpinned')
+         reason, route, tier_event, route_event = _apply(conn, tid, entry)
+         stored = kb.get_task(conn, tid)
+-    assert (reason, route) == ('review_override', GROK)
++    assert (reason, route) == ('review_unpinned', GROK)
+     assert 'paced' not in tier_event
+-    assert route_event['tier_reason'] == 'review_override'
++    assert route_event['tier_reason'] == 'review_unpinned'
+     assert (stored.model_override, stored.provider_override) == PEER  # the row never moves
+ 
+ 
+@@ -174,12 +182,12 @@ def test_a_review_override_on_a_held_pool_moves_only_to_a_registered_free_peer(
+         if case == 'require_model':
+             conn.execute('UPDATE tasks SET body=? WHERE id=?', (pin_tests.walls.REQUIRE_MODEL_MARKER, tid))
+             conn.commit()
+-        if case in ('no_free_peer', 'unregistered_peer'):
++        if case == 'no_free_peer':
+             with pytest.raises(review.ReviewModelUnavailable):
+                 _route(conn, tid, entry)
+             return
+-        expected = {'paced_only': (*PIN, 'review_override'), 'require_model': (*GROK, 'review_override'),
+-                    'class': (*GROK, 'review_override')}[case]
++        expected = {'paced_only': (*PIN, 'review_unpinned'), 'require_model': (*GROK, 'review_unpinned'),
++                    'unregistered_peer': (*GROK, 'review_unpinned'), 'class': (*GROK, 'review_override')}[case]
+         assert _route(conn, tid, entry) == expected
+ 
+ 
+@@ -208,10 +216,10 @@ def test_a_held_refused_override_substitute_moves_too(board, clock, monkeypatch,
+     with kbc.connect() as conn:
+         tid = _card(conn, 'review_lane', override=('claude-fable-5-2', 'anthropic'))
+         assert tier.resolve_model_tier(conn, kb.get_task(conn, tid), lane='review') == (
+-            *GROK, 'review_override_refused')
++            *GROK, 'review_unpinned')
+         reason, route, tier_event, _ = _apply(conn, tid, 'review_lane')
+-    assert (reason, route) == ('review_override_refused', GROK)
+-    assert tier_event['requested']['model'] == 'claude-fable-5-2'
++    assert (reason, route) == ('review_unpinned', GROK)
++    assert 'requested' not in tier_event
+     assert 'paced' not in tier_event
+ 
+ 
+@@ -241,14 +249,17 @@ def test_a_failed_paced_receipt_keeps_the_reroute_and_its_reason(board, clock, m
+ 
+ 
+ def test_only_review_receipts_carry_the_paced_block(board, clock, monkeypatch, all_assignees_spawnable):
+-    """A default route moved off the same hold keeps its existing receipt shape (``tier_reason`` only)."""
+-    paced_tests._deep(monkeypatch)
++    """Class selection is deferred to the owner; a stale concrete default is not a route pin."""
++    config, _cfg = paced_tests._deep(monkeypatch)
++    config['model_routing']['routes']['standard'] = config['model_routing']['routes']['deep']
++    import json
++    (board / 'config.yaml').write_text(json.dumps(config))
+     paced_tests._pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='default card', assignee='a')
+-        assert pin_tests._tick(conn) == [PEER]
++        assert pin_tests._tick(conn) == [('class:standard', 'auto')]
+         tier_event = pin_tests._events(conn, tid, 'model_tier')[-1]
+-    assert tier_event['reason'] == 'default+paced:openai-codex' and 'paced' not in tier_event
++    assert tier_event['reason'] == 'default' and 'paced' not in tier_event
+ 
+ 
+ @pytest.mark.parametrize('reason', ['review_unpinned', 'review_override', 'default', 'pinned+pin_quota_reroute'])
+diff --git a/tests/hermes_cli/test_kanban_review_pin_admission.py b/tests/hermes_cli/test_kanban_review_pin_admission.py
+index 625873ed18..21015adbc3 100644
+--- a/tests/hermes_cli/test_kanban_review_pin_admission.py
++++ b/tests/hermes_cli/test_kanban_review_pin_admission.py
+@@ -11,19 +11,20 @@ clock = helpers.clock
+ 
+ @pytest.mark.parametrize('pin,mandatory,expected', [
+     (helpers.OPUS, True, helpers.OPUS),
+-    (helpers.ASTRA, True, helpers.ASTRA),
+-    (helpers.ASTRA, False, helpers.ASTRA),
++    (helpers.ASTRA, True, helpers.OPUS),
++    (helpers.ASTRA, False, helpers.OPUS),
+ ])
+ def test_downstream_pin_dispatch(board, clock, monkeypatch, all_assignees_spawnable, pin, mandatory, expected):
+     helpers._routing(monkeypatch)
+     with kbc.connect() as conn:
+-        tid = helpers._mandatory_downstream(conn, pin=pin)
++        source = _legacy_card(conn, helpers.ASTRA)
++        tid = _legacy_card(conn, pin, title='Independent exact-head review', creator=source)
+         conn.execute('UPDATE tasks SET model_pin_mandatory=? WHERE id=?', (mandatory, tid))
+         # The implementation is evidence, not another runnable candidate.
+         conn.execute("UPDATE tasks SET status='done' WHERE id<>?", (tid,))
+         conn.commit()
+         spawned = helpers.pin_tests._tick(conn)
+-        # A reviewer pin that is also an author is used as-is (mandatory pins never move; a non-mandatory pin leads).
++        # Historical reviewer pins are ignored; the ordinary eligible route may equal the author model.
+         assert spawned == [(expected, helpers.PROVIDER[expected])]
+         event = helpers.pin_tests._events(conn, tid, 'model_tier')[-1]
+         assert event['reason'].startswith('review_')
+@@ -39,11 +40,11 @@ def test_downstream_missing_evidence_does_not_deny_the_spawn(
+         board, clock, monkeypatch, all_assignees_spawnable, missing, pin):
+     helpers._routing(monkeypatch)
+     with kbc.connect() as conn:
+-        creator = helpers._card(conn, helpers.ASTRA) if missing in {'evicted_source', 'partial_sources'} else None
+-        tid = helpers._card(conn, pin, title='Independent exact-head review', creator=creator)
++        creator = _legacy_card(conn, helpers.ASTRA) if missing in {'evicted_source', 'partial_sources'} else None
++        tid = _legacy_card(conn, pin, title='Independent exact-head review', creator=creator)
+         if creator:
+             if missing == 'partial_sources':
+-                other = helpers._card(conn, helpers.OPUS)
++                other = _legacy_card(conn, helpers.OPUS)
+                 helpers.kb.link_tasks(conn, tid, other)
+             original_get = helpers.kb.get_task
+             monkeypatch.setattr(helpers.kb, 'get_task',
+@@ -58,8 +59,8 @@ def test_downstream_missing_evidence_does_not_deny_the_spawn(
+                 raise sqlite3.OperationalError('author evidence unavailable')
+ 
+             monkeypatch.setattr(review, 'implementer_models', unavailable)
+-        # Missing author attribution is no refusal: the pin (or, unpinned, the strong route) spawns.
+-        expected = pin or helpers.OPUS
++        # Missing model attribution is no refusal: normal dynamic review policy chooses an eligible route.
++        expected = helpers.OPUS
+         assert helpers.pin_tests._tick(conn) == [(expected, helpers.PROVIDER[expected])]
+ 
+ 
+@@ -74,3 +75,11 @@ def test_downstream_review_with_every_pool_walled_still_never_spawns(
+         conn.commit()
+         assert helpers.pin_tests._tick(conn) == []
+         assert helpers.kb.get_task(conn, tid).consecutive_failures == 0
++
++
++def _legacy_card(conn, model, title="Implementation", creator=None):
++    tid = helpers.kb.create_task(conn, title=title, assignee='a', creator_task_id=creator)
++    conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?',
++                 (model, helpers.PROVIDER.get(model), tid))
++    conn.commit()
++    return tid
+diff --git a/tests/hermes_cli/test_kanban_review_retry_custody.py b/tests/hermes_cli/test_kanban_review_retry_custody.py
+index cc0c9b820c..36ee57a5d2 100644
+--- a/tests/hermes_cli/test_kanban_review_retry_custody.py
++++ b/tests/hermes_cli/test_kanban_review_retry_custody.py
+@@ -331,3 +331,7 @@ def test_manual_promotion_is_newest_lifecycle_phase(board):
+     assert kb._resume_status_from_events(conn, tid) == 'review'
+     kb._append_event(conn, tid, 'promoted_manual', {})
+     assert kb._resume_status_from_events(conn, tid) == 'ready'
++
++
++def _unavailable(*args):
++    raise review.ReviewModelUnavailable('fixture: temporary reviewer admission failure')
+diff --git a/tests/hermes_cli/test_kanban_review_source_replica.py b/tests/hermes_cli/test_kanban_review_source_replica.py
+index 3f73131c65..37368128ec 100644
+--- a/tests/hermes_cli/test_kanban_review_source_replica.py
++++ b/tests/hermes_cli/test_kanban_review_source_replica.py
+@@ -26,8 +26,7 @@ def _carried(gws):
+     kb._append_event(hub.conn, source, 'worker_result', {'route_model': AUTHOR}, run_id=claim.current_run_id)
+     assert kb.complete_task(hub.conn, source, result='implemented', expected_run_id=claim.current_run_id)
+     down = kb.create_task(hub.conn, title='Independent review: cache', assignee='default',
+-                          creator_task_id=source, model_override=pool.PIN['model'],
+-                          provider_override='anthropic')
++                          creator_task_id=source)
+     hub.conn.execute('UPDATE tasks SET model_pin_mandatory=1 WHERE id=?', (down,))
+     hub.conn.commit()
+     hub.round()
+@@ -92,8 +91,7 @@ def test_absent_replica_remains_fail_closed(gws, monkeypatch, fault):
+     assert pool._route(worker.conn, down) == []
+ 
+ 
+-def test_replica_author_pin_is_used_without_rewriting_pin(gws, monkeypatch):
+-    """The replica still carries the author, but a mandatory reviewer pin on the author's model is admitted as-is."""
++def test_replica_author_pin_is_ignored_without_rewriting_pin(gws, monkeypatch):
+     pool._attest(monkeypatch)
+     _, down, _ = _carried(gws)
+     _, worker = gws
+@@ -102,7 +100,7 @@ def test_replica_author_pin_is_used_without_rewriting_pin(gws, monkeypatch):
+     assert review.implementer_models(worker.conn, kb.get_task(worker.conn, down)) == {AUTHOR}
+     worker.tick()
+     routes = pool._route(worker.conn, down)
+-    assert len(routes) == 1 and routes[-1]['model'] == AUTHOR and routes[-1]['source'] == 'pin'
++    assert len(routes) == 1 and routes[0]['source'] != 'pin'
+     assert kb.get_task(worker.conn, down).model_override == AUTHOR
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_tier_fallback.py b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+index 83d5f3d1c8..8defb29e57 100644
+--- a/tests/hermes_cli/test_kanban_review_tier_fallback.py
++++ b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+@@ -68,17 +68,18 @@ def test_standard_availability_ignores_authorship_but_respects_pool_blocks(board
+             review.resolve_review_model(conn, t, cfg)
+ 
+ 
+-def test_author_mandatory_pin_is_honored(board):
++def test_legacy_mandatory_pin_is_audit_only_and_author_model_is_eligible(board):
+     cfg = fallback_config(board)
+     with kbc.connect() as conn:
+         author = author_task(conn)
+         tid = kb.create_task(conn, title="Independent review of fixture", assignee="default",
+-                             creator_task_id=author.id, model_override=DEEP[0],
+-                             provider_override="anthropic")
++                             creator_task_id=author.id)
++        conn.execute("UPDATE tasks SET model_override=?, provider_override='anthropic' WHERE id=?", (DEEP[0], tid))
+         conn.execute("UPDATE tasks SET model_pin_mandatory=1 WHERE id=?", (tid,))
+         conn.commit()
+         assert review.resolve_review_model(conn, kb.get_task(conn, tid), cfg) == (
+             DEEP[0], "anthropic", "review_unpinned")
++        assert kb.get_task(conn, tid).model_pin_mandatory == 1
+ 
+ 
+ @pytest.mark.parametrize("blocked", ["authored", "walled", "held", "live_wall", "ineligible"])
+@@ -155,6 +156,8 @@ def test_refused_override_retains_deep_only_recovery(board, monkeypatch):
+     with kbc.connect() as conn:
+         t = author_task(conn)
+         kb.claim_task(conn, t.id)
+-        assert kb.request_review(conn, t.id, metadata={"review_model": "claude-refused"})
+-        with pytest.raises(review.ReviewModelUnavailable, match="refused here"):
+-            review.resolve_review_model(conn, t, cfg)
++        assert kb.request_review(conn, t.id)
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                     ('{"review_model": "claude-refused"}', t.id))
++        assert review.resolve_review_model(conn, t, cfg) == (
++            STANDARD, "openai-codex", "review_tier_fallback")
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 671a402074..8f812888c8 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -247,16 +247,26 @@ def test_drifted_task_events_rebuild_keeps_the_assertion_index(kanban_home):
+         conn.close()
+ 
+ 
++def _enabled_routes():
++    route = {"billing": "subscription", "weight": 1, "eligible": True, "funding_verified": True,
++             "capabilities": {"tools": True, "streaming": True}}
++    return {"model_routing": {"enabled": True, "routes": {
++        level: [dict(route, provider="anthropic", model="claude-opus-4"),
++                dict(route, provider="openai-codex", model="gpt-5")] for level in ("fast", "standard", "deep")}}}
++
++
++_ENABLED_ROUTES = _enabled_routes()
++
++
+ @pytest.fixture
+ def scoped_routing(monkeypatch):
+     from hermes_cli import kanban_model_tier as tier
+     from hermes_cli import kanban_model_assignment as assignment
+     monkeypatch.setattr(tier, "load_tier_config", lambda: {
+-        "default_model": "gpt-5", "default_provider": "openai-codex",
+-        "strong_model": "claude-opus-4", "strong_provider": "anthropic",
+-    })
+-    monkeypatch.setattr(assignment, "_assignee_config", lambda _: {
+-        "model": {"default": "gpt-5", "provider": "openai-codex"}})
++        "default_model": "class:standard", "strong_model": "class:deep"})
++    monkeypatch.setattr(assignment, "_assignee_config", lambda _: _ENABLED_ROUTES)
++    # The host-level routability probe reads the same isolated enabled class routes.
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *a, **k: _ENABLED_ROUTES)
+ 
+ 
+ def _scope(conn, tid):
+@@ -285,8 +295,7 @@ def test_finished_other_route_wall_has_no_live_owner(kanban_home, scoped_routing
+         _route_run(conn, tid, "openai-codex")
+         run_id = kb._current_run_id(conn, tid)
+         kbd._set_worker_pid(conn, tid, os.getpid())
+-        viewer = kb.create_task(conn, title="review", assignee="default",
+-                                model_override="claude-opus-4", provider_override="anthropic")
++        viewer = kb.create_task(conn, title="review", assignee="default")
+         assert kb.claim_task(conn, viewer)
+         _route_run(conn, viewer, "anthropic")
+     with monkeypatch.context() as worker:
+@@ -342,8 +351,9 @@ def test_live_owner_wall_stays_open_and_renders(kanban_home, scoped_routing, sta
+         _scope(conn, tid)
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+-        viewer = kb.create_task(conn, title="review", assignee="default",
+-                                model_override="claude-opus-4", provider_override="anthropic")
++        viewer = kb.create_task(conn, title="review", assignee="default")
++        assert kb.claim_task(conn, viewer)
++        _route_run(conn, viewer, "anthropic")  # historical concrete receipt (neutral admission records class/auto)
+         st = ksb.blocker_states(conn)[BID]
+         assert st.is_open and set(st.behind) == {tid}
+         assert BID in ksb.render_blocker_context(conn, viewer)
+@@ -354,8 +364,9 @@ def test_live_owner_wall_stays_open_and_renders(kanban_home, scoped_routing, sta
+ def test_pinned_wall_preview_matches_dispatch(kanban_home, monkeypatch, tmp_path, blocker_provider):
+     from hermes_cli import kanban_model_tier as tier, kanban_provider_walls as walls
+ 
+-    cfg = {"default_model": "claude-sonnet-4", "default_provider": "anthropic"}
++    cfg = {"default_model": "class:standard", "strong_model": "class:deep"}
+     monkeypatch.setattr(tier, "load_tier_config", lambda: cfg)
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *a, **k: _ENABLED_ROUTES)
+     monkeypatch.setattr(walls, "walls_path", lambda: tmp_path / "walls.json")
+     walls.record_wall("openai-codex", 3600, path=tmp_path / "walls.json")
+     with kbc.connect_closing() as conn:
+@@ -372,10 +383,13 @@ def test_pinned_wall_preview_matches_dispatch(kanban_home, monkeypatch, tmp_path
+         task = kb.get_task(conn, tid)
+         assert task is not None
+         tier.apply_model_tier(conn, task, lane="ready", cfg=cfg)
+-        assert preview == (task.model_override, task.provider_override, "ready")
+-        assert preview == ("gpt-6-astra", "openai-codex", "ready")
+-        expected = ksb.GUARD_REASON if blocker_provider == "openai-codex" else None
+-        assert guard == expected
++        assert preview[:2] == tier.effective_route(task)[:2]
++        # The raw legacy pin row is ignored: the next route is the neutral class, provider unknown, so either
++        # provider-scoped wall conservatively holds it; the author row is retained.
++        assert preview == ("class:standard", None, "ready")
++        assert guard == ksb.GUARD_REASON
++        row = kb.get_task(conn, tid)
++        assert (row.model_override, row.provider_override) == ("gpt-6-astra", "openai-codex")
+ 
+ 
+ 
+@@ -386,17 +400,17 @@ def test_scoped_next_lane_and_context(kanban_home, scoped_routing):
+         st = ksb.blocker_states(conn)[BID]
+         assert (st.blocker_provider, st.blocker_model, st.blocker_lane) == (
+             "anthropic", "claude-sonnet-4", "review")
+-        assert ksb.shared_blocker_guard(conn, tid, interval=1800) is None
++        # Neutral admission leaves the next route provider-unknown (class): an anthropic-scoped wall holds it
++        # conservatively in every lane, and the context names the class and lane, never a guessed provider.
++        assert ksb.shared_blocker_guard(conn, tid, interval=1800) == ksb.GUARD_REASON
+         ctx = ksb.render_blocker_context(conn, tid)
+-        assert "provider=openai-codex" in ctx and "model=gpt-5" in ctx and "lane=ready" in ctx
+-        assert "not applicable" in ctx and "This run is the probe" not in ctx
+-        assert "later" in ctx
++        assert "model=class:standard" in ctx and "lane=ready" in ctx and "provider=openai-codex" not in ctx
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+         assert ksb.shared_blocker_guard(conn, tid, interval=1800) == ksb.GUARD_REASON
+         ctx = ksb.render_blocker_context(conn, tid)
+-        assert "provider=anthropic" in ctx and "model=claude-opus-4" in ctx and "lane=review" in ctx
+-        assert "This run is the probe" in ctx
++        # The review lane resolves concretely from the isolated enabled class routes: this run is the probe.
++        assert "lane=review" in ctx and "This run is the probe" in ctx
+ 
+ 
+ @pytest.mark.parametrize("finish", [False, True])
+@@ -439,7 +453,7 @@ def test_scheduled_review_uses_resume_lane(kanban_home, scoped_routing):
+         assert kb.claim_review_task(conn, tid)
+         assert continue_task(conn, tid, checkpoint="provider unavailable", resume_after_seconds=600,
+                              metadata={"blocker_id": BID, "blocker_provider": "anthropic"})["ok"]
+-        assert ksb.task_route(conn, tid) == ("claude-opus-4", "anthropic", "review")
++        assert ksb.task_route(conn, tid) == ("class:deep", None, "review")
+         assert ksb.shared_blocker_guard(conn, tid, interval=1800) == ksb.GUARD_REASON
+ 
+ 
+@@ -483,6 +497,7 @@ def test_historical_route_not_replaced_by_current_pin(kanban_home, scoped_routin
+                          "provider_override='anthropic' WHERE id=?", (tid,))
+         st = ksb.blocker_states(conn)[BID]
+         assert st.is_open and not st.probe_starts
++        # The review lane's route comes from the isolated enabled class routes, never the row's legacy pin.
+         assert ksb.task_route(conn, tid) == ("claude-opus-4", "anthropic", "review")
+ 
+ 
+@@ -492,8 +507,8 @@ def test_profile_default_when_tiering_off(kanban_home, scoped_routing, monkeypat
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "profile")
+         _scope(conn, tid)
+-        assert ksb.task_route(conn, tid) == ("gpt-5", "openai-codex", "ready")
+-        assert ksb.shared_blocker_guard(conn, tid) is None
++        assert ksb.task_route(conn, tid) == ("class:standard", None, "ready")  # a profile model is never the route
++        assert ksb.shared_blocker_guard(conn, tid) == ksb.GUARD_REASON
+ 
+ 
+ def test_running_other_provider_before_tier_receipt_is_not_probe(kanban_home, scoped_routing):
+@@ -515,7 +530,7 @@ def test_retry_uses_strong_tier_without_writing_routing(kanban_home, scoped_rout
+             kb._end_run(conn, tid, outcome="crashed")
+             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+         count = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+-        assert ksb.task_route(conn, tid) == ("claude-opus-4", "anthropic", "ready")
++        assert ksb.task_route(conn, tid) == ("class:deep", None, "ready")
+         assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == count
+         task = kb.get_task(conn, tid)
+         assert task is not None and task.model_override is None
+@@ -525,7 +540,7 @@ def test_profile_class_provider_remains_unknown(kanban_home, scoped_routing, mon
+     from hermes_cli import kanban_model_tier as tier, kanban_model_assignment as assignment
+     monkeypatch.setattr(tier, "load_tier_config", dict)
+     monkeypatch.setattr(assignment, "_assignee_config", lambda _: {
+-        "model": {"default": "class:standard", "provider": "openai-codex"}})
++        "model": {"default": "class:standard", "provider": "openai-codex"}, **_ENABLED_ROUTES})
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "class")
+         _scope(conn, tid)
+@@ -590,15 +605,17 @@ def _receipt(conn, tid):
+     return rows[-1]
+ 
+ 
+-@pytest.mark.parametrize("profile_model, profile_provider, clears", [
+-    ("gpt-5", "openai-codex", False),            # tier off, Codex profile default: not evidence
+-    ("class:standard", "", False),               # class default: provider unknown, not evidence
+-    ("claude-opus-4", "anthropic", True),        # control: matching provider clears
++@pytest.mark.parametrize("seeded, clears", [
++    (None, False),                    # real neutral admission: class receipt, provider unknown, not evidence
++    ("openai-codex", False),          # historical concrete Codex receipt: not evidence for an Anthropic wall
++    ("anthropic", True),              # control: a historical Anthropic receipt clears
+ ])
+-def test_admitted_route_decides_clear_evidence(kanban_home, spawns, profile_model, profile_provider, clears):
+-    """A card admitted on its profile default (tier off: no model_tier event) completing must not
+-    clear an Anthropic-scoped wall unless its receipt names Anthropic."""
+-    _write_home_cfg(kanban_home, profile_model=profile_model, profile_provider=profile_provider)
++def test_admitted_route_decides_clear_evidence(kanban_home, spawns, monkeypatch, seeded, clears):
++    """A card's admission receipt completing must not clear an Anthropic-scoped wall unless that receipt
++    names Anthropic. Neutral admission records a provider-unknown class; concrete receipts are historical
++    seeds written into the disposable DB."""
++    _write_home_cfg(kanban_home, profile_model="class:standard")
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *a, **k: _ENABLED_ROUTES)
+     _spawned, fake_spawn = spawns
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="probe card", assignee="default")
+@@ -608,9 +625,12 @@ def test_admitted_route_decides_clear_evidence(kanban_home, spawns, profile_mode
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert _spawned_ids(res) == [tid]
+         receipt = _receipt(conn, tid)
+-        assert receipt["model"] == profile_model and receipt["source"] == "profile_default"
+-        assert receipt["provider"] == (profile_provider or None)
+-        assert not [e for e in kb.list_events(conn, tid) if e.kind == "model_tier"]   # tier off
++        assert receipt["model"] == "class:standard" and receipt["source"] == "class" and receipt["provider"] is None
++        if seeded:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "run_route", {"model": "m", "provider": seeded, "lane": "ready",
++                                                          "source": "pin", "tier_reason": "legacy_receipt"},
++                                 run_id=kb._current_run_id(conn, tid))
+         st = ksb.blocker_states(conn)[WALL]
+         assert (tid in st.probe_starts) is clears
+         assert kb.complete_task(conn, tid, result="done")
+@@ -660,8 +680,7 @@ def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interva
+         seen[task.id] = (task.model_override, task.provider_override)
+ 
+     with kbc.connect_closing() as conn:
+-        opus = kb.create_task(conn, title="adversarial review", assignee="default",
+-                              model_override="claude-opus-4", provider_override="anthropic")
++        opus = kb.create_task(conn, title="adversarial review", assignee="default")
+         codex1 = kb.create_task(conn, title="impl one", assignee="default")
+         codex2 = kb.create_task(conn, title="impl two", assignee="default", priority=5)
+         for tid in (opus, codex1, codex2):
+diff --git a/tests/hermes_cli/test_kanban_strong_tier.py b/tests/hermes_cli/test_kanban_strong_tier.py
+index 69cbbd5f17..8b983dc042 100644
+--- a/tests/hermes_cli/test_kanban_strong_tier.py
++++ b/tests/hermes_cli/test_kanban_strong_tier.py
+@@ -1,9 +1,9 @@
+-"""Kanban strong tier names its model (kanban.strong_model / strong_provider) [daveey].
++"""Kanban strong tier is a class selector (kanban.strong_model) [daveey].
+ 
+-Review-lane, retry-after-failure and keep-pattern cards used to run on "the profile's model", so a change of
+-the profile default silently moved every strong run with it. With ``strong_model`` set they run on that model;
+-unset keeps the old behaviour. Entry paths: resolve_model_tier for each branch, and the dispatcher's
+-``model_tier`` event plus the claimed task's pin for a review-lane card.
++Review-lane, retry-after-failure and keep-pattern cards run on the strong class (``class:deep``) instead of
++following the profile's default. Kanban is model-neutral: concrete ``strong_model``/``strong_provider`` names
++are retired config and are ignored; only class selectors route. Entry paths: resolve_model_tier for each
++branch, and the dispatcher's ``model_tier`` event plus the claimed task's pin for a review-lane card.
+ """
+ from __future__ import annotations
+ 
+@@ -36,7 +36,14 @@ def board(tmp_path, monkeypatch):
+ 
+ 
+ def _cfg(**extra):
+-    return {"default_model": SONNET, "default_provider": "anthropic", **extra}
++    return {"default_model": "class:standard", "default_provider": "auto", **extra}
++
++
++def _legacy_pin(conn, tid, model, provider):
++    """Historical row seeded raw in this isolated test DB: ingress now refuses concrete pins."""
++    conn.execute("UPDATE tasks SET model_override=?, provider_override=? WHERE id=?", (model, provider, tid))
++    conn.commit()
++    return kb.get_task(conn, tid)
+ 
+ 
+ def _fail_once(conn, tid):
+@@ -47,8 +54,8 @@ def _fail_once(conn, tid):
+     conn.commit()
+ 
+ 
+-def test_strong_model_for_review_retry_and_keep_pattern(board):
+-    cfg = _cfg(strong_model=OPUS, strong_provider="anthropic", default_model_keep_patterns=["hermes-core-wt"])
++def test_strong_class_for_review_retry_and_keep_pattern(board):
++    cfg = _cfg(strong_model="class:deep", default_model_keep_patterns=["hermes-core-wt"])
+     with kbc.connect() as conn:
+         review = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
+         retry_id = kb.create_task(conn, title="flaky fix", assignee="default")
+@@ -61,47 +68,55 @@ def test_strong_model_for_review_retry_and_keep_pattern(board):
+         got_keep = tier.resolve_model_tier(conn, keep, lane="ready", cfg=cfg)
+         got_plain = tier.resolve_model_tier(conn, plain, lane="ready", cfg=cfg)
+     assert got_review == (OPUS, "anthropic", "review_unpinned")
+-    assert got_retry == (OPUS, "anthropic", "retry_after_run_crashed")
+-    assert got_keep == (OPUS, "anthropic", "pattern:hermes-core-wt")
+-    assert got_plain == (SONNET, "anthropic", "default")
++    assert got_retry == ("class:deep", "auto", "retry_after_run_crashed")
++    assert got_keep == ("class:deep", "auto", "pattern:hermes-core-wt")
++    assert got_plain == ("class:standard", "auto", "default")
+ 
+ 
+-def test_strong_provider_unset_is_inferred_from_strong_model(board):
++def test_concrete_strong_model_and_provider_config_are_ignored(board):
++    """Retired ``strong_model``/``strong_provider`` names never route: the class tier decides."""
+     with kbc.connect() as conn:
+         t = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
+         assert tier.resolve_model_tier(conn, t, lane="review", cfg=_cfg(strong_model=OPUS)) == (
+-            OPUS, "anthropic", "review_unpinned")
++            "class:deep", "auto", "review")
++        assert tier.resolve_model_tier(conn, t, lane="review",
++                                       cfg=_cfg(strong_model=OPUS, strong_provider="anthropic")) == (
++            "class:deep", "auto", "review")
+ 
+ 
+-def test_strong_model_unset_keeps_old_behaviour(board):
++def test_strong_model_unset_keeps_class_deep(board):
+     with kbc.connect() as conn:
+         t = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
+-        assert tier.resolve_model_tier(conn, t, lane="review", cfg=_cfg(strong_model="")) == (None, None, "review")
+-        assert tier.resolve_model_tier(conn, t, lane="review", cfg={"default_model": "class:standard"}) == (
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=_cfg(strong_model="")) == (
+             "class:deep", "auto", "review")
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg={"default_model": "class:standard"})[:2] == (
++            "class:deep", "auto")
+ 
+ 
+-def test_pins_and_out_of_scope_profiles_ignore_strong_model(board):
+-    cfg = _cfg(strong_model=OPUS, default_model_profiles=["default"])
++def test_class_pins_legacy_pins_and_out_of_scope_profiles_use_class_routes(board):
++    cfg = _cfg(strong_model="class:deep", default_model_profiles=["default"])
+     with kbc.connect() as conn:
+-        pinned = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override=SONNET,
+-                                                      provider_override="anthropic"))
++        classed = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override="class:fast",
++                                                   provider_override="auto"))
++        legacy = _legacy_pin(conn, kb.create_task(conn, title="old", assignee="default"), SONNET, "anthropic")
+         other = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="bb-dev"))
+-        assert tier.resolve_model_tier(conn, pinned, lane="ready", cfg=cfg) == (None, None, "pinned")
+-        assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=cfg) == (OPUS, "anthropic", "review_unpinned")
+-        assert tier.resolve_model_tier(conn, other, lane="ready", cfg=cfg) == (None, None, "profile_out_of_scope")
+-        assert tier.resolve_model_tier(conn, other, lane="review", cfg=cfg) == (OPUS, "anthropic", "review_unpinned")
+-        # Without a concrete strong route or enabled policy, legacy profile scope and pins still apply.
+-        legacy = {**cfg, "strong_model": ""}
+-        assert tier.resolve_model_tier(conn, other, lane="review", cfg=legacy) == (
+-            None, None, "profile_out_of_scope")
+-        assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=legacy) == (None, None, "pinned")
+-
+-
+-def test_dispatcher_review_lane_runs_on_strong_model_and_records_it(board):
+-    board.joinpath("config.yaml").write_text(
+-        "kanban:\n" + "".join(f"  {k}: {json.dumps(v)}\n" for k, v in _cfg(strong_model=OPUS).items()),
+-        encoding="utf-8")
++        with pytest.raises(ValueError):
++            kb.create_task(conn, title="no", assignee="default", model_override=SONNET, provider_override="anthropic")
++        assert tier.resolve_model_tier(conn, classed, lane="ready", cfg=cfg) == ("class:fast", "auto", "class")
++        # The retired concrete pin is ignored (routes as an unpinned default); the author row keeps it.
++        assert tier.resolve_model_tier(conn, legacy, lane="ready", cfg=cfg) == ("class:standard", "auto", "default")
++        assert (legacy.model_override, legacy.provider_override) == (SONNET, "anthropic")
++        assert tier.resolve_model_tier(conn, other, lane="review", cfg=cfg) == (
++            "class:standard", "auto", "profile_out_of_scope")
++
++
++def test_dispatcher_review_lane_runs_on_strong_class_and_records_it(board):
++    route = {"model": OPUS, "provider": "anthropic", "weight": 1, "billing": "subscription", "eligible": True,
++             "funding_verified": True, "capabilities": {"tools": True, "streaming": True}}
++    board.joinpath("config.yaml").write_text(json.dumps({
++        "kanban": _cfg(strong_model="class:deep"),
++        "model_routing": {"enabled": True, "routes": {lvl: [route] for lvl in ("fast", "standard", "deep")}},
++    }), encoding="utf-8")
+     seen = {}
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="impl", assignee="default")
+diff --git a/tests/hermes_cli/test_kanban_sweep_gate.py b/tests/hermes_cli/test_kanban_sweep_gate.py
+index ce300fb322..fb8972971a 100644
+--- a/tests/hermes_cli/test_kanban_sweep_gate.py
++++ b/tests/hermes_cli/test_kanban_sweep_gate.py
+@@ -362,9 +362,10 @@ def test_scoped_blocker_probe_reruns_when_a_route_enters_its_scope_with_no_board
+     from hermes_cli import kanban_timed_park as ktp
+     from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
+ 
+-    profile = {"model": {"default": "gpt-5", "provider": "openai-codex"}}  # the assignee's config.yaml
+-    monkeypatch.setattr(tier, "load_tier_config", dict)
+-    monkeypatch.setattr(assignment, "_assignee_config", lambda _a: profile)
++    # Neutral admission leaves a next route provider-unknown (class/auto), so the externally resolved route is an
++    # isolated seam here: a provider the next admission is known to use, readable outside the board's gate key.
++    external = {"provider": "openai-codex"}
++    monkeypatch.setattr(ksb, "task_route", lambda _conn, _tid: ("route-model", external["provider"], "ready"))
+     monkeypatch.setattr(ksb, "probe_interval_seconds", lambda cfg=None: 1800)
+     t0 = int(time.time())
+     with kbc.connect_closing() as conn:
+@@ -391,7 +392,7 @@ def test_scoped_blocker_probe_reruns_when_a_route_enters_its_scope_with_no_board
+         sweep_shared_blockers(conn, r)
+         assert _runs("dispatch.shared_blocker_probed")[1] == skips0 + 1
+ 
+-        profile["model"] = {"default": "claude-opus-4", "provider": "anthropic"}  # no board write
++        external["provider"] = "anthropic"  # no board write
+         assert ksb.task_applies(conn, st, tid)
+         assert _revision(conn) == revision
+         clock["t"] = t0 + 1801 + 300  # the stated cadence (ksb.ROUTE_RECHECK_SECONDS)
+diff --git a/tests/tools/test_kanban_blocker_metadata.py b/tests/tools/test_kanban_blocker_metadata.py
+index d9b2dbe151..8214dca4bd 100644
+--- a/tests/tools/test_kanban_blocker_metadata.py
++++ b/tests/tools/test_kanban_blocker_metadata.py
+@@ -75,11 +75,13 @@ def test_invalid_scope_refused_without_transition(board, tool, field):
+ 
+ 
+ def route(conn, tid):
+-    """The run's real admission receipt (``apply_model_tier``): this run is on Codex."""
++    """Historical concrete run receipt (disposable-DB seed: neutral admission now records class/auto)."""
+     from hermes_cli import kanban_model_tier as tier
+-    task = kb.get_task(conn, tid)
+-    tier.apply_model_tier(conn, task, lane="ready",
+-                          cfg={"default_model": "gpt-test", "default_provider": "openai-codex"})
++    run_id = kb._current_run_id(conn, tid)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, tier.RUN_ROUTE_EVENT,
++                         {"model": "gpt-test", "provider": "openai-codex", "lane": "ready",
++                          "source": "pin", "tier_reason": "legacy_receipt"}, run_id=run_id)
+     receipt = [e.payload for e in kb.list_events(conn, tid) if e.kind == tier.RUN_ROUTE_EVENT]
+     assert receipt and receipt[-1]["provider"] == "openai-codex"
+ 
+-- 
+2.43.0
+

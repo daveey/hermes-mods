@@ -1,0 +1,204 @@
+From 6d4a637396da01f8df0590464514f4e9697d52e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:05:38 +0000
+Subject: [PATCH] fix(kanban): isolate PR observations and contain failed
+ futures [daveey]
+
+Review: pop completed futures before reading results; any ordinary observer exception is unknown CI, not a dispatcher failure. Keep final head refresh isolated from dispatch-owned state dictionaries. Allow shorter operator caps without exceeding 35 minutes.
+
+Proof: fail-first exception/cap and real-pool tests; 45 focused tests green; 10 review mutants killed including head, publication identity, database and clear_cache keys. All 21 scripts/check gates pass. The conservative observation age includes reaping delay, deliberately rejecting old green data rather than extending its lifetime.
+---
+ hermes_cli/kanban_block_routing.py            |  4 +-
+ hermes_cli/kanban_pr_idle_checks.py           | 15 ++--
+ .../test_kanban_active_pr_idle_cache.py       | 69 +++++++++++++++++++
+ .../test_kanban_active_pr_idle_green.py       |  1 +
+ .../test_kanban_active_pr_idle_thread.py      | 30 ++++++++
+ 5 files changed, 114 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_idle_cache.py
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_idle_thread.py
+
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index 14f61bb43c..df50dceee3 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -165,7 +165,9 @@ def guard_hold_cap_seconds(reason: str) -> int | None:
+     """Keep active PR publication waits below the fairness limit, with a notice first."""
+     from hermes_cli import kanban_db_dispatch as dispatch
+     if reason == "active_pr":
+-        return 2100  # 35 min: existing 30-min notice precedes home-owned escalation
++        # Operators may shorten, but never extend, the 35-minute fairness bound.
++        return min(2100, dispatch._env_seconds(
++            "HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", dispatch.DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS))
+     if reason in dispatch._GUARD_HOLD_EXEMPT_REASONS:
+         return None
+     if reason in dispatch._GUARD_HOLD_SHORT_CAP_REASONS:
+diff --git a/hermes_cli/kanban_pr_idle_checks.py b/hermes_cli/kanban_pr_idle_checks.py
+index 9d9e90bea0..2c3ebe4757 100644
+--- a/hermes_cli/kanban_pr_idle_checks.py
++++ b/hermes_cli/kanban_pr_idle_checks.py
+@@ -29,14 +29,21 @@ def _clear_cache() -> None:
+     _pending.clear()
+ 
+ 
++def _fresh_head_matches(contract, assignee, head) -> bool:
++    # A pool thread must not mutate the dispatch thread's PR-state dictionaries.
++    from hermes_cli.kanban_pr_acceptance import _api, _assignee_profile_home
++    repo, number = contract.removeprefix("https://github.com/").rsplit("/pull/", 1)
++    data = _api(f"repos/{repo}/pulls/{number}", profile_home=_assignee_profile_home(assignee))
++    return data.get("state") == "open" and data.get("head", {}).get("sha") == head
++
++
+ def _collect(contract, assignee, head) -> bool:
+-    from hermes_cli import kanban_db_dispatch_pr_state as prs
+     from hermes_cli.kanban_pr_acceptance import collect_acceptance
+     receipt = collect_acceptance(contract, contract, assignee=assignee)
+     green = (receipt.get("ok") is True and receipt.get("pr_state") == "OPEN"
+              and receipt.get("pr_url") == contract and receipt.get("head_sha") == head
+              and bool(receipt.get("checks")))
+-    return bool(green and prs.pr_head(contract, max_age=0) == head)
++    return bool(green and _fresh_head_matches(contract, assignee, head))
+ 
+ 
+ def green(key, contract, assignee, head) -> bool:
+@@ -53,13 +60,13 @@ def _green(key, contract, assignee, head) -> bool:
+     # Reap finished jobs even if their original task never asks again.
+     for old, (started, future) in list(_pending.items()):
+         if future.done():
++            _pending.pop(old)  # A failed observer must not poison subsequent dispatch ticks.
+             try:
+                 passed = future.result() is True and now - started <= OBSERVATION_BUDGET_SECONDS
+-            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
++            except Exception:  # health: allow BLE001 -- pool observation failures mean unknown CI; exception text may contain credentials
+                 # Failed observation remains fail-closed; never retain exception text.
+                 passed = False
+             _cache[old] = (now + TTL_SECONDS, passed)
+-            _pending.pop(old)
+     while len(_cache) > MAX_ENTRIES:
+         _cache.popitem(last=False)
+     hit = _cache.get(key)
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_cache.py b/tests/hermes_cli/test_kanban_active_pr_idle_cache.py
+new file mode 100644
+index 0000000000..d5ac226eba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_cache.py
+@@ -0,0 +1,69 @@
++"""Cached green observations cannot cross head, publication, or database identities."""
++from concurrent.futures import Future
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_pr_idle_checks as checks
++from hermes_cli import kanban_pr_idle_green as idle
++from tests.hermes_cli import test_kanban_active_pr_idle_green as helpers
++
++kanban_home = helpers.kanban_home
++green = helpers.green
++pytestmark = pytest.mark.usefixtures("kanban_home")
++
++
++@pytest.mark.parametrize("error", [AttributeError, LookupError, AssertionError, ImportError])
++def test_failed_future_is_removed_and_other_cards_keep_running(green, error):
++    failed = Future()
++    failed.set_exception(error("must never escape the observer"))
++    checks._pending[("broken",)] = (checks.time.monotonic(), failed)
++    for _ in range(3):
++        assert not checks.green(("broken",), helpers.URL, "a", helpers.SHA)
++        assert ("broken",) not in checks._pending
++        assert checks.green(("healthy",), helpers.URL, "a", helpers.SHA)
++
++
++@pytest.mark.parametrize("component", ["head", "identity", "database"])
++def test_cached_green_is_not_reused_after_identity_changes(green, monkeypatch, component):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        states = {helpers.URL: "OPEN"}
++        assert idle.releases(conn, tid, states)
++        green[0]["ok"] = False
++        if component == "head":
++            monkeypatch.setattr(prs, "pr_head", lambda *a, **kw: "b" * 40)
++        elif component == "identity":
++            conn.execute("UPDATE tasks SET assignee='b' WHERE id=?", (tid,))
++            conn.commit()
++        else:
++            # Same task and publication on a distinct board: only PRAGMA differs.
++            class OtherBoard:
++                def execute(self, sql, *args):
++                    if sql == "PRAGMA database_list":
++                        return [(0, "main", "/other/board.db")]
++                    return conn.execute(sql, *args)
++            assert not idle.releases(OtherBoard(), tid, states)
++            assert len(green[1]) == 2
++            return
++        assert not idle.releases(conn, tid, states)
++        assert len(green[1]) == 2
++
++
++def test_pr_cache_clear_invalidates_cached_green_and_pending(green):
++    key = ("cached",)
++    assert checks.green(key, helpers.URL, "a", helpers.SHA)
++    pending = Future()
++    checks._pending[("pending",)] = (checks.time.monotonic(), pending)
++    green[0]["ok"] = False
++    prs.clear_cache()
++    assert not checks._cache and not checks._pending
++    assert pending.cancelled()
++    assert not checks.green(key, helpers.URL, "a", helpers.SHA)
++
++
++def test_operator_can_lower_active_pr_cap(monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", "900")
++    assert dispatch.guard_hold_cap_seconds("active_pr") == 900
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_green.py b/tests/hermes_cli/test_kanban_active_pr_idle_green.py
+index 6780e27e70..6cd9561124 100644
+--- a/tests/hermes_cli/test_kanban_active_pr_idle_green.py
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_green.py
+@@ -30,6 +30,7 @@ def green(monkeypatch):
+     monkeypatch.setattr(checks, "_pool", ImmediatePool())
+     monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
+     monkeypatch.setattr(prs, "pr_head", lambda url, **kw: SHA)
++    monkeypatch.setattr(checks, "_fresh_head_matches", lambda url, a, head: prs.pr_head(url) == head)
+     receipt = {"ok": True, "pr_state": "OPEN", "head_sha": SHA,
+                "pr_url": URL, "checks": [{"name": "required", "conclusion": "success"}]}
+     calls = []
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_thread.py b/tests/hermes_cli/test_kanban_active_pr_idle_thread.py
+new file mode 100644
+index 0000000000..5ace68b7a9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_thread.py
+@@ -0,0 +1,30 @@
++"""Real collection threads must not refresh dispatcher-owned PR dictionaries."""
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_pr_acceptance as acceptance
++from hermes_cli import kanban_pr_idle_checks as checks
++from tests.hermes_cli import test_kanban_active_pr_idle_green as helpers
++
++
++@pytest.mark.parametrize("state,head,expected", [
++    ("open", helpers.SHA, True), ("closed", helpers.SHA, False), ("open", "b" * 40, False),
++])
++def test_real_collect_pool_uses_isolated_final_head_read(monkeypatch, state, head, expected):
++    receipt = {"ok": True, "pr_state": "OPEN", "head_sha": helpers.SHA,
++               "pr_url": helpers.URL, "checks": ["required"]}
++    monkeypatch.setattr(acceptance, "collect_acceptance", lambda *a, **kw: receipt)
++    monkeypatch.setattr(acceptance, "_assignee_profile_home", lambda a: "/profile")
++    calls = []
++    def api(endpoint, **kwargs):
++        calls.append((endpoint, kwargs))
++        return {"state": state, "head": {"sha": head}}
++    monkeypatch.setattr(acceptance, "_api", api)
++    def forbidden(*a, **kw):
++        pytest.fail("pool thread touched dispatcher PR cache")
++    monkeypatch.setattr(prs, "pr_head", forbidden)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        assert pool.submit(checks._collect, helpers.URL, "a", helpers.SHA).result(timeout=5) is expected
++    assert calls == [("repos/example/project/pulls/19", {"profile_home": "/profile"})]
+-- 
+2.43.0
+

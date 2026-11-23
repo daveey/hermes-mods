@@ -1,0 +1,304 @@
+From 5faa7c56aa061d494ede6a7b3a1a136ac4ff194d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 20:58:26 +0000
+Subject: [PATCH] fix(kanban): reset ready age on manual and spend promotion
+ [daveey]
+
+A spend-triaged card promoted after a three-hour hold must start a new ready
+interval. Centralize ready-entry clock kinds and share the floor with diagnostic,
+chat-wait prefilter and admission scoring, retaining claimed/spawned observations
+and the existing conditional continued/unused-grant/run-end behavior.
+
+Why-chain
+- A hub card woke, entered spend triage, and was later promoted_manual after
+  a multi-hour hold. Seconds afterward its chat_wait_unclaimed notice still
+  used the original wake time as ready_since and reported the whole hold as
+  ready age; the card was claimed shortly after.
+- ready_since uses _last_ready_entry_ts, whose hand-maintained floor omitted
+  promoted_manual, written by both CLI promote and spend_promote.
+- Separate lists registered the new path inconsistently. There was no shared
+  ready-entry registry and no ready -> triage -> promote age regression.
+- Previous fixes (wake/claim, run end) and the
+  unused-grant exclusion each fixed one input, not registry completeness.
+- The same stale floor inflated admission age at 25 points/minute (uncapped),
+  starvation clocks and other wait diagnostics; no weights/thresholds/wording
+  or placement change is made here.
+
+Writer audit
+- Include promoted_manual: kanban_db_promote.promote_task and
+  kanban_spend_promote.apply explicitly UPDATE status='ready'.
+- Include triage_swept: sweep_stale_triage explicitly writes ready.
+- Include containment_released: resume_local writes the released resume status,
+  including ready, then appends that event.
+- Include review_reopened: reopen_review_task computes landing ready/todo and
+  writes it before the event.
+- Include reopened: reopen_done_task computes ready/todo/review and writes it.
+- Include changes_requested: request_changes ends review into ready/todo.
+- Exclude status: current lifecycle writer is descendant invalidation to todo,
+  not a ready entry. continued stays separately payload-gated on status=ready.
+- Keep created, promoted, reclaimed, unblocked, continuation_woken,
+  condition_met, wake_probe_stale, wake_check_stale, owner_restart_lost.
+- Requeue BLOCK_RELEASE_EVENTS, terminal_guard REOPEN_KINDS, lanes admission
+  history and capacity_metrics counting are different policies (including
+  payload-sensitive events), not the ready-age clock. Their memberships and
+  behavior are deliberately unchanged; substituting/unioning the clock registry
+  would change unrelated behavior.
+
+Tests
+Base: 5a584cd3fa06e58766a20c1acf5e5b4997305b9c.
+Both real promotion paths fail on baseline consumers; six missing-kind table
+rows also fail (8 failures total). New tests check zero admission age and no
+notice before threshold, one notice at threshold and deduplication afterward.
+The independently enumerated 15-kind floor table covers the audited entries.
+An AST inventory of status-writing functions rejects new unregistered literal
+event kinds, including parameterized-status SQL; four negative controls prove
+new-kind discovery with SQL whitespace and facade/bare-call variants.
+All existing tests are unmodified: no old-floor assertion rewritten.
+The eight required suites recount at this base to exactly the supplied counts:
+ready_wait_checkpoint 31, hub_admission 150, score_sources 19,
+starvation_index 13, spend_promote 29, wait_notice_board_counts 26,
+stranded_reroute 26, history_ready_reductions 81. All pass.
+Existing claimed/spawned/unblocked/run-end/unused-grant regression suites are
+retained, including ready_wait_restart_floor (10 cases).
+Full scripts/check --base origin/main: 21 checks green.
+
+Post-install acceptance remains on the implementation card: replay events/runs
+cut just after a promotion, expecting ready_since to equal the promotion time
+(not the original wake time), and list currently-ready cards whose floor changes.
+Read-only hub checks only; stop and post evidence if replay fails.
+
+Hermes-Card: t_2b1479e7b303fa38
+---
+ hermes_cli/kanban_admission_score.py          |   2 +-
+ hermes_cli/kanban_chat_wait.py                |   2 +-
+ hermes_cli/kanban_diagnostics.py              |   8 +-
+ hermes_cli/kanban_ready_events.py             |  18 +++
+ .../test_kanban_ready_entry_registry.py       | 146 ++++++++++++++++++
+ 5 files changed, 168 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_ready_events.py
+ create mode 100644 tests/hermes_cli/test_kanban_ready_entry_registry.py
+
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index a30099685f..cf6d38cdfd 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -215,7 +215,7 @@ def _descendants(tid, children):
+ 
+ 
+ def _ready_since(conn: sqlite3.Connection, ids: list[str]) -> dict[str, int]:
+-    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++    from hermes_cli.kanban_ready_events import READY_WAIT_FLOOR_KINDS as _READY_WAIT_FLOOR_KINDS
+ 
+     if not ids:
+         return {}
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 0fddf386af..cfe602d761 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -126,7 +126,7 @@ def notice_text(payload: Any) -> str:
+ 
+ 
+ def _floor_kinds() -> str:
+-    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++    from hermes_cli.kanban_ready_events import READY_WAIT_FLOOR_KINDS as _READY_WAIT_FLOOR_KINDS
+     return ", ".join(f"'{k}'" for k in sorted({*_READY_WAIT_FLOOR_KINDS, "continued"}))
+ 
+ 
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 07d32fd4dd..48e54c8f1b 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -723,12 +723,8 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+ # to a gateway restart (booked ``owner_restart_lost``, not ``reclaimed``: without it an 80-min
+ # run read as 80 min ready, hermes-hub 2026-11-10). Other run-ending requeues are bounded by
+ # the run's ``ended_at`` (``_last_run_end_ts``), never by kinds a pre-claim check may write. [daveey]
+-_READY_WAIT_FLOOR_KINDS = frozenset({
+-    "created", "promoted", "reclaimed", "unblocked",
+-    "claimed", "spawned", "continuation_woken", "condition_met", "wake_probe_stale",
+-    "wake_check_stale",
+-    "owner_restart_lost",
+-})
++# Compatibility export for diagnostic consumers; the registry lives outside this facade.
++from hermes_cli.kanban_ready_events import READY_WAIT_FLOOR_KINDS as _READY_WAIT_FLOOR_KINDS
+ 
+ 
+ def _last_run_end_ts(runs: Iterable[Any]) -> int:
+diff --git a/hermes_cli/kanban_ready_events.py b/hermes_cli/kanban_ready_events.py
+new file mode 100644
+index 0000000000..e93f4aa64c
+--- /dev/null
++++ b/hermes_cli/kanban_ready_events.py
+@@ -0,0 +1,18 @@
++"""Shared ready-entry clock registry (not a block-release or reopen policy).
++
++A now-ready card cannot have waited longer than its latest entry/release. Some
++entries may first land in todo/review/triage; a later ready entry still wins.
++``status`` is intentionally absent: its only lifecycle writer invalidates a
++descendant to todo. ``continued`` is conditional and must name status=ready.
++"""
++
++READY_ENTRY_EVENT_KINDS = frozenset({
++    "created", "promoted", "promoted_manual", "triage_swept",
++    "containment_released", "review_reopened", "reopened", "changes_requested",
++    "reclaimed", "unblocked", "continuation_woken", "condition_met",
++    "wake_probe_stale", "wake_check_stale", "owner_restart_lost",
++})
++
++# Execution observations also bound a now-unclaimed interval. Keep these out of
++# the entry registry: an unused Board grant is not execution (callers filter it).
++READY_WAIT_FLOOR_KINDS = READY_ENTRY_EVENT_KINDS | {"claimed", "spawned"}
+diff --git a/tests/hermes_cli/test_kanban_ready_entry_registry.py b/tests/hermes_cli/test_kanban_ready_entry_registry.py
+new file mode 100644
+index 0000000000..64fd3e118d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ready_entry_registry.py
+@@ -0,0 +1,146 @@
++"""Ready age starts at release, never at the beginning of a spend hold."""
++from __future__ import annotations
++
++import ast
++import re
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_admission_score as score
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_parent_unclaimed as pu
++from tests.hermes_cli import test_kanban_ready_wait_checkpoint as base
++from tests.hermes_cli import test_kanban_spend_promote as spend
++
++conn = base.conn
++fleet = spend.fleet
++
++
++def _assert_release(conn, tid, at):
++    assert pu.ready_since(conn, tid, at - 10800) == at
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert score.rank(conn, [row], now_ms=(at + 4) * 1000)[0][1].age_buckets == 0
++    base._subscribe(conn, tid)
++    assert cw.sweep(conn, now=at + 4) == 0
++    assert cw.sweep(conn, now=at + cw.THRESHOLD_SECONDS - 1) == 0
++    assert cw.sweep(conn, now=at + cw.THRESHOLD_SECONDS) == 1
++    assert cw.sweep(conn, now=at + cw.THRESHOLD_SECONDS + 1) == 0
++
++
++def test_manual_promote_resets_three_hour_spend_hold(conn, monkeypatch):
++    at = 1795292854
++    monkeypatch.setattr("time.time", lambda: at - 10800)
++    tid = kb.create_task(conn, title="bounded work", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, "spend_budget_triaged", {"reason": "runs"})
++    monkeypatch.setattr("time.time", lambda: at)
++    assert kb.promote_task(conn, tid, actor="user")[0]
++    _assert_release(conn, tid, at)
++
++
++def test_spend_promote_resets_three_hour_spend_hold(fleet, monkeypatch):
++    f = fleet
++    import time
++
++    at = int(time.time())
++    episode = spend._stop(f, at=at - 10800)
++    # Do not rewrite signed courier events or the fixture caller's live lease.
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET created_at=? WHERE id=?", (at - 10800, f.target))
++        f.h.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created'",
++                    (at - 10800, f.target))
++    cid = spend._decision_comment(f)
++    at = int(time.time())
++    monkeypatch.setattr("time.time", lambda: at)
++    spend._submit(f, spend._op(f, episode, cid))
++    spend._round(f)
++    assert kb.get_task(f.h, f.target).status == "ready"
++    _assert_release(f.h, f.target, at)
++
++
++def test_long_wait_after_promotion_notifies_exactly_once(conn, monkeypatch):
++    at = 1795292854
++    monkeypatch.setattr("time.time", lambda: at - 10800)
++    tid = kb.create_task(conn, title="long promotion wait", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, "spend_budget_triaged", {})
++    monkeypatch.setattr("time.time", lambda: at)
++    assert kb.promote_task(conn, tid, actor="user")[0]
++    base._subscribe(conn, tid)
++    assert cw.sweep(conn, now=at + cw.THRESHOLD_SECONDS) == 1
++    assert cw.sweep(conn, now=at + cw.THRESHOLD_SECONDS + 1) == 0
++
++
++# Independently enumerate the audited entry paths, not the registry under test.
++@pytest.mark.parametrize("kind", [
++    "created", "promoted", "promoted_manual", "triage_swept", "containment_released",
++    "review_reopened", "reopened", "changes_requested", "reclaimed", "unblocked",
++    "continuation_woken", "condition_met", "wake_probe_stale", "wake_check_stale", "owner_restart_lost",
++])
++def test_ready_entry_path_floor(conn, kind):
++    tid = kb.create_task(conn, title=kind, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_at=100 WHERE id=?", (tid,))
++        conn.execute("UPDATE task_events SET created_at=100 WHERE task_id=?", (tid,))
++        kb._append_event(conn, tid, kind, {"status": "ready"})
++        conn.execute("UPDATE task_events SET created_at=200 WHERE task_id=? AND kind=?", (tid, kind))
++    assert pu.ready_since(conn, tid, 100) >= 200
++    assert score._ready_since(conn, [tid])[tid] >= 200
++    assert f"'{kind}'" in cw._floor_kinds()
++
++
++# Non-entry observations in status-writing functions. New event kinds require an
++# explicit audit even when a writer uses a bound status parameter, different SQL
++# whitespace, or a bare (rather than facade-qualified) _append_event call.
++NON_ENTRY_WRITER_EVENTS = {
++    "continuation_exhausted", "blocked", "spend_budget_held", "gave_up",
++    "dependency_wait", "linked", "claim_rejected", "completed", "review_requested",
++    "descendant_invalidated", "status", "scheduled", "assigned", "supervisor_escalated",
++    "archive_worker_termination", "archived", "request_withdrawn", "claimed",
++    "agent_block_escalated", "timed_out", "stale", "reconciled", "parent_found",
++    "parent_missing", "status_healed",
++}
++
++
++def _writer_events(source):
++    for node in ast.walk(ast.parse(source)):
++        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            continue
++        strings = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
++        if not any(re.search(r"UPDATE\s+tasks\s+SET\s+(?:(?!WHERE).)*\bstatus\s*=", s, re.IGNORECASE | re.DOTALL)
++                   for s in strings):
++            continue
++        for call in ast.walk(node):
++            if not isinstance(call, ast.Call) or len(call.args) < 3:
++                continue
++            name = (call.func.attr if isinstance(call.func, ast.Attribute)
++                    else call.func.id if isinstance(call.func, ast.Name) else "")
++            if name == "_append_event" and isinstance(call.args[2], ast.Constant):
++                yield call.args[2].value
++
++
++def test_status_writers_register_new_event_kinds():
++    from hermes_cli.kanban_ready_events import READY_ENTRY_EVENT_KINDS
++
++    found = set()
++    for path in Path(kb.__file__).parent.glob("kanban*.py"):
++        events = set(_writer_events(path.read_text()))
++        assert events <= READY_ENTRY_EVENT_KINDS | NON_ENTRY_WRITER_EVENTS, (path.name, events)
++        found |= events
++    assert {"promoted_manual", "triage_swept", "review_reopened", "reopened", "changes_requested"} <= found
++
++
++@pytest.mark.parametrize("sql", ["status='ready'", "status = ?"])
++@pytest.mark.parametrize("writer", ["_append_event", "kb._append_event"])
++def test_writer_inventory_detects_unregistered_new_kind(sql, writer):
++    source = f'''def new_path(conn):
++        conn.execute("UPDATE tasks SET {sql} WHERE id=?")
++        {writer}(conn, tid, "new_ready_path", {{}})
++    '''
++    from hermes_cli.kanban_ready_events import READY_ENTRY_EVENT_KINDS
++
++    assert set(_writer_events(source)) - READY_ENTRY_EVENT_KINDS - NON_ENTRY_WRITER_EVENTS == {"new_ready_path"}
+-- 
+2.43.0
+

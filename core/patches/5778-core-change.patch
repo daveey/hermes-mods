@@ -1,0 +1,906 @@
+From 08e01e0f71642f5dabe4d7ed60d35b2ccbac1edc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 18:31:13 +0000
+Subject: [PATCH] fix(kanban): follow an in-place Board gateway rename [daveey]
+
+A Board gateway can now be renamed in place (`mini` -> `mac-mini-2`, same
+key and hub.db; `hermes-mail rename-self` writes the mail config and hub.db
+`meta.gateway`). Core assumed a gateway is never renamed. This makes core
+correct across a rename; it renames nothing and writes neither file.
+
+Why (five whys, short): parked probes and stored refs carry the gateway name
+as text -> the name was treated as immutable -> a rename leaves them naming a
+gateway that no longer has records -> wait-check reads an empty partition and
+wait-comment misses the reply -> the parked card sleeps to its backstop.
+
+What changed
+- kanban_gateway_alias (new): the local alias resolver over
+  `kanban.placement.aliases` (the map `canonical_pin` already reads). Config
+  on disk only, no network. A name is replaced by its target only once the
+  target has records in this host's hub.db, because the map is rolled out
+  before the cutover.
+- kanban_origin.gateway_name: the "never renamed in place" assumption is
+  gone. The memo key already changes when the mail config is rewritten; the
+  gap was a name read while config and `meta.gateway` disagree (rename half
+  written), which was kept for 10 minutes. Such a read is no longer kept.
+- kanban_origin.gateway_names: drops a renamed gateway's old partition (an
+  alias of another known gateway) from the known set; never this gateway's
+  own name. `resolve()` maps an origin ref written before the rename.
+- wait-check `--gateway <former>`: the replica read uses the current name;
+  the ssh destination stays the typed name (ssh aliases are their own
+  namespace), with the current gateway's built-in route as fallback.
+- wait-comment `--from-gateway <name>` (and the `hub:gw:<gateway>` author
+  form, and the comment-will-not-wake warning): matches every name of that
+  gateway, old and new.
+- kanban_overlap host map: `mac-mini-2` is the machine `mini`.
+
+Verified, not changed: review finding F10. A normal pull adopts a re-emitted
+`tasks` row carrying a new `created_on` onto the existing local row, and
+`own_partition` treats the card as own afterwards. The first full sync round
+under the new name, run while every local row still says the old name,
+sends 0 ops and deletes nothing (re-review R7 e), whichever gateway the
+Board stamps as the re-emit's writer. Against the test FakeService, not the
+real Board.
+
+Proof
+- RED at 4aa9d2a887 with only the new alias module present: 13 of 22 tests
+  in test_kanban_gateway_rename.py fail; GREEN 22/22 after.
+- test_kanban_sync_gateway_rename.py: 5/5, passing before and after (it
+  verifies existing behaviour; no sync code changed).
+- 150 test files that name the touched modules: 3,530 passed, 0 failed.
+- Replay on this host's live hub.db (read-only, 7 partitions, live aliases
+  `gateway-primary`, `gateway-small`): 0 names dropped from the known set, with and
+  without the planned `mini: mac-mini-2` entry; `mini` still resolves to
+  `mini` because `mac-mini-2` has no records yet.
+- A plain rename (both files written) was already picked up by the old memo:
+  that test passes before and after and is kept as the entry-path control.
+
+Limits
+- A `meta.gateway` edit that leaves the mail config untouched can still lag
+  up to 10 minutes; nothing supported does that and hermes-hub rewrites
+  `meta.gateway` from the config on every sync.
+- `wait-check --gateway <own former name>` still goes over ssh to the typed
+  host, as `--gateway <own name>` always has.
+---
+ hermes_cli/kanban_comment_origin.py           |  36 +-
+ hermes_cli/kanban_gateway_alias.py            |  99 ++++++
+ hermes_cli/kanban_origin.py                   |  59 +++-
+ hermes_cli/kanban_overlap.py                  |   1 +
+ hermes_cli/kanban_wait_check.py               |  25 +-
+ .../hermes_cli/test_kanban_gateway_rename.py  | 321 ++++++++++++++++++
+ .../test_kanban_sync_gateway_rename.py        | 143 ++++++++
+ 7 files changed, 661 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/kanban_gateway_alias.py
+ create mode 100644 tests/hermes_cli/test_kanban_gateway_rename.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_gateway_rename.py
+
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+index 11574ccc85..c6df11cb43 100644
+--- a/hermes_cli/kanban_comment_origin.py
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -147,6 +147,26 @@ def is_system_author(author: Optional[str]) -> bool:
+     return name.startswith(SYSTEM_AUTHOR_PREFIX) or name in SYSTEM_AUTHORS
+ 
+ 
++def gateway_spellings(gateway: Optional[str]) -> list[str]:
++    """Every name of ``gateway``, lowercased, the given one first: a gateway renamed in place wrote its earlier
++    comments under the old name (``origin_gateway`` ``mini``, author ``hub:gw:mini``) and writes the new one
++    after, and a probe parked on either name must match both (``kanban.placement.aliases``, no network)."""
++    name = (gateway or "").strip().lower()
++    if not name:
++        return []
++    try:
++        from hermes_cli import kanban_gateway_alias
++        return kanban_gateway_alias.spellings(name) or [name]
++    except ImportError:
++        return [name]
++
++
++def _names_gateway(spellings: list[str], origin: Optional[str], author: Optional[str]) -> bool:
++    """Whether a comment's ``origin_gateway`` is one of ``spellings`` or its author contains one."""
++    origin, author = (origin or "").lower(), (author or "").lower()
++    return any(gw == origin or gw in author for gw in spellings)
++
++
+ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, from_gateway: Optional[str] = None,
+                  contains: Optional[str] = None, from_card: Optional[str] = None,
+                  skip_system: bool = False) -> Optional[dict]:
+@@ -162,14 +182,14 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+             rows = [(*r, None) for r in conn.execute(
+                 "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ? "
+                 "ORDER BY id", (task_id, int(after_id or 0))).fetchall()]
+-        gw = (from_gateway or "").strip().lower()
++        gws = gateway_spellings(from_gateway)
+         for row in rows:
+             writer = writers.get(str(row[4])) if row[4] else writers.get(("id", int(row[0])))
+             if writer != card and not _from_card(row[1], card):
+                 continue
+             if skip_system and is_system_author(row[1]):
+                 continue
+-            if gw and gw != (row[2] or "").lower() and gw not in (row[1] or "").lower():
++            if gws and not _names_gateway(gws, row[2], row[1]):
+                 continue
+             if contains and contains.lower() not in (row[3] or "").lower():
+                 continue
+@@ -183,10 +203,11 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+         sql += (" AND substr(lower(trim(author)), 1, ?) != ? AND lower(trim(author)) NOT IN ("
+                 + ",".join("?" * len(SYSTEM_AUTHORS)) + ")")
+         params += [len(SYSTEM_AUTHOR_PREFIX), SYSTEM_AUTHOR_PREFIX, *sorted(SYSTEM_AUTHORS)]
+-    if from_gateway:
+-        gw = from_gateway.strip().lower()
+-        sql += " AND (lower(coalesce(origin_gateway, '')) = ? OR instr(lower(author), ?) > 0)"
+-        params += [gw, gw]
++    gws = gateway_spellings(from_gateway)
++    if gws:
++        sql += " AND (" + " OR ".join(
++            ["lower(coalesce(origin_gateway, '')) = ? OR instr(lower(author), ?) > 0"] * len(gws)) + ")"
++        params += [x for gw in gws for x in (gw, gw)]
+     if contains:
+         sql += " AND instr(lower(body), ?) > 0"
+         params.append(contains.lower())
+@@ -311,8 +332,7 @@ def comment_wake_note(conn: sqlite3.Connection, task_id: str, author: str, body:
+                 if not card or (own != card and not _from_card(author, card)):
+                     why.append(f"a comment from card {c['from_card']}")
+             if c["from_gateway"]:
+-                g = c["from_gateway"].strip().lower()
+-                if g != gw and g not in a:
++                if not _names_gateway(gateway_spellings(c["from_gateway"]), gw, a):
+                     why.append(f"a comment from gateway {c['from_gateway']}")
+             if not why:
+                 return None
+diff --git a/hermes_cli/kanban_gateway_alias.py b/hermes_cli/kanban_gateway_alias.py
+new file mode 100644
+index 0000000000..bf4866b52c
+--- /dev/null
++++ b/hermes_cli/kanban_gateway_alias.py
+@@ -0,0 +1,99 @@
++"""Former names of a Board gateway that was renamed in place. [daveey]
++
++A Board gateway can be renamed without re-enrolling (``mini`` became ``mac-mini-2``): the key, the cards and
++the hub.db file stay, only the name moves. Everything that stored the old name keeps it: a parked
++``hermes kanban wait-check task <id> --gateway mini``, a ``wait-comment ... --from-gateway mini``, a comment's
++``origin_gateway`` and its relay author ``hub:gw:mini``, an origin ref ``@session:default@mini/<id>``. The Board
++keeps the old name as a permanent alias on its side; this module is the local half.
++
++The map is ``kanban.placement.aliases`` (``{former or host-style name: gateway}``, the same map
++:func:`hermes_cli.kanban_placement.canonical_pin` reads). It is config, read from disk: nothing here opens a
++socket, so a wake probe can call it. Names compare case-insensitively and come back lowercased, as
++``canonical_pin`` does.
++
++The map is rolled out BEFORE the rename (so every host has it at the cutover), and other gateways learn the new
++name only when its records reach their hub.db. So a name is replaced by its target only once the target is a
++gateway this host knows (:func:`current`): until then the old name is still the live one.
++"""
++from __future__ import annotations
++
++from typing import Iterable, Optional
++
++_MAX_HOPS = 8  # ``mac-mini -> mini -> mac-mini-2``: chains are short; a longer one is a config loop
++
++
++def _norm(name) -> str:
++    return str(name or "").strip().lower()
++
++
++def aliases(cfg: Optional[dict] = None) -> dict[str, str]:
++    """``{name: target}`` from ``kanban.placement.aliases``, lowercased; ``{}`` when unset or unreadable."""
++    try:
++        if cfg is None:
++            from hermes_cli import kanban_placement
++            cfg = kanban_placement.config()
++        raw = cfg.get("aliases") if isinstance(cfg, dict) else None
++        if not isinstance(raw, dict):
++            return {}
++        out = {_norm(k): _norm(v) for k, v in raw.items()}
++        return {k: v for k, v in out.items() if k and v and k != v}
++    except (ImportError, AttributeError, TypeError, ValueError):  # no readable map = no aliases, never a failed probe
++        return {}
++
++
++def resolve(name, cfg: Optional[dict] = None, *, table: Optional[dict[str, str]] = None) -> str:
++    """The end of ``name``'s alias chain (``name`` itself when it has none, or when the chain loops)."""
++    table = aliases(cfg) if table is None else table
++    start = seen = _norm(name)
++    for _ in range(_MAX_HOPS):
++        nxt = table.get(seen)
++        if not nxt:
++            return seen
++        seen = nxt
++    return start
++
++
++def current(name, known: Iterable[str], cfg: Optional[dict] = None) -> str:
++    """``name``'s gateway today: its alias target once that target is in ``known``, else ``name`` unchanged.
++
++    ``known`` is the set of gateways this host has records of (``kanban_origin.gateway_names()[1]``).
++    """
++    raw = str(name or "").strip()
++    target = resolve(raw, cfg)
++    if target and target != _norm(raw):
++        for gw in known or ():
++            if _norm(gw) == target:
++                return str(gw)
++    return raw
++
++
++def former(known: Iterable[str], cfg: Optional[dict] = None) -> set[str]:
++    """The names in ``known`` that are aliases of another name in ``known``: a renamed gateway's old partition
++    that this host still holds rows of (the tombstones have not arrived, or a row was left behind)."""
++    table = aliases(cfg)
++    if not table:
++        return set()
++    names = [str(g) for g in known or () if g]
++    present = {_norm(g) for g in names}
++    out = set()
++    for gw in names:
++        target = resolve(gw, table=table)
++        if target != _norm(gw) and target in present:
++            out.add(gw)
++    return out
++
++
++def spellings(name, cfg: Optional[dict] = None) -> list[str]:
++    """Every name of ``name``'s gateway, lowercased, ``name`` first: its alias target and the other aliases of
++    that target. A comment written before the rename carries the old name and one written after it the new one;
++    a filter on either must match both."""
++    table = aliases(cfg)
++    first = _norm(name)
++    if not first:
++        return []
++    target = resolve(first, table=table)
++    out = [first]
++    for other in [target, *sorted(k for k in table if resolve(k, table=table) == target)]:
++        if other and other not in out:
++            out.append(other)
++    return out
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index 5f353856a7..0c0438d2a2 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -127,7 +127,12 @@ def gateway_names() -> tuple[str, set[str]]:
+ 
+     The answer is reused while its inputs (hub.db, its WAL, the mail config) keep their identity, size and mtime,
+     for at most ``_NAMES_MAX_AGE_S``: links reconcile, creator backfill and provenance checks ask once per row,
+-    and each uncached answer opens hub.db (4% of hub gateway CPU, 2026-11-12). [daveey]"""
++    and each uncached answer opens hub.db (4% of hub gateway CPU during an observation).
++
++    A gateway renamed in place leaves its old name behind in replica rows of the old partition this host still
++    holds (their tombstones have not arrived, or one was missed). The known set drops a name that
++    ``kanban.placement.aliases`` maps to another known gateway (:func:`hermes_cli.kanban_gateway_alias.former`):
++    the old partition is not a second live gateway. This gateway's own name is never dropped. [daveey]"""
+     global _names_memo
+     path, cfg = _hub_db(), _mail_config()
+     key = _names_key(path, cfg)
+@@ -136,6 +141,7 @@ def gateway_names() -> tuple[str, set[str]]:
+         return memo[2], set(memo[3])
+     failed: list[sqlite3.Error] = []
+     me, known = _read_gateway_names(path, cfg, failed)
++    known = _without_former(me, known)
+     # A file written within the timestamp granularity could change again under the same signature: not kept.
+     # Nor is an answer from a hub.db read that failed (locked, mid-replace): the next caller reads again.
+     racy = time.time_ns() - _NAMES_RACY_NS
+@@ -151,12 +157,19 @@ def gateway_name() -> str:
+     (10 min), keyed on hub.db's identity (path, device, inode) and the mail config's signature, never on hub.db's
+     WAL or mtime: the hub writes those continuously, so a memo keyed on them would almost never be kept, and every
+     card in a task list asked again (an open + close of hub.db each, 70% of ``session_tasks`` CPU on the hub,
+-    2026-11-20). Gateways are never renamed in place; re-enrolling replaces hub.db (a new inode), which busts the
+-    memo, as does any change to the mail config. A miss reads only the hub.db ``meta`` row (a primary-key lookup)
+-    and the mail config, never the ``replica`` scan. ``gateway_names`` (the known set, which does change) keeps its
+-    short memo. So after an in-place ``meta.gateway`` change (never done on purpose) ``gateway_name()`` may lag
+-    ``gateway_names()[0]`` for up to 10 min; that is intended. An empty name is never kept: hermes-hub writes
+-    ``meta.gateway`` only after its first sync, and an empty answer must not stick for 10 min. [daveey]"""
++    the observation window). Re-enrolling replaces hub.db (a new inode), which busts the memo, as does any change to the mail
++    config. A miss reads only the hub.db ``meta`` row (a primary-key lookup) and the mail config, never the
++    ``replica`` scan. ``gateway_names`` (the known set, which does change) keeps its short memo.
++
++    A gateway CAN be renamed in place (``hermes-mail rename-self``: same key, same hub.db file). The rename
++    writes the mail config's ``gateway`` and hub.db ``meta.gateway``; hermes-hub also copies the config name
++    into ``meta.gateway`` on every sync, so the two agree except while a rename is being written. The config
++    write changes the memo key, and a name read while the two disagree is not kept (the next caller reads
++    again), so the new name is returned from the first call after the rename completes, with no restart. Only
++    a ``meta.gateway`` edit that leaves the mail config untouched (nothing supported does that, and the next
++    hermes-hub sync reverts it) can lag, for at most ``_NAME_MAX_AGE_S``. An empty name is never kept either:
++    hermes-hub writes ``meta.gateway`` only after its first sync, and an empty answer must not stick for
++    10 min. [daveey]"""
+     global _name_memo
+     path, cfg = _hub_db(), _mail_config()
+     memo, now = _names_memo, time.monotonic()
+@@ -168,14 +181,32 @@ def gateway_name() -> str:
+         return own[2]
+     failed: list[sqlite3.Error] = []
+     me = _read_gateway_names(path, cfg, failed, names=False)[0]
+-    # A failed hub.db read (locked, mid-replace), an empty name (hub not synced yet) or a mail config written
+-    # within the timestamp granularity is not kept: the next caller reads again.
++    # A failed hub.db read (locked, mid-replace), an empty name (hub not synced yet), a mail config written
++    # within the timestamp granularity, or a name the mail config does not agree with (a rename is half
++    # written) is not kept: the next caller reads again.
+     cfg_sig = key[-1]
+     racy = isinstance(cfg_sig, tuple) and cfg_sig[1] >= time.time_ns() - _NAMES_RACY_NS
+-    _name_memo = None if failed or racy or not me else (key, now, me)
++    renaming = _mail_gateway(cfg) not in ("", me)
++    _name_memo = None if failed or racy or renaming or not me else (key, now, me)
+     return me
+ 
+ 
++def _mail_gateway(cfg: Path) -> str:
++    """The gateway name the hermes-mail config carries; "" when it has none or cannot be read."""
++    try:
++        return str(json.loads(cfg.read_text(encoding="utf-8-sig")).get("gateway") or "")
++    except (OSError, ValueError, AttributeError):
++        return ""
++
++
++def _without_former(me: str, known: set[str]) -> set[str]:
++    """``known`` minus a renamed gateway's old names (never ``me``). No alias map drops nothing."""
++    if len(known) < 2:
++        return known
++    from hermes_cli import kanban_gateway_alias
++    return known - (kanban_gateway_alias.former(known) - {me})
++
++
+ def _name_key(path: Optional[Path], cfg: Path) -> tuple:
+     """Identity of ``gateway_name``'s inputs: hub.db's file identity (not its contents) and the mail config."""
+     ident = None
+@@ -211,10 +242,7 @@ def _read_gateway_names(path: Optional[Path], cfg: Path,
+             if failed is not None:
+                 failed.append(exc)
+     if not me:
+-        try:
+-            me = str(json.loads(cfg.read_text(encoding="utf-8-sig")).get("gateway") or "")
+-        except (OSError, ValueError, AttributeError):
+-            me = ""
++        me = _mail_gateway(cfg)
+     if me:
+         known.add(me)
+     return me, known
+@@ -234,6 +262,9 @@ def resolve(explicit: Optional[str] = None) -> Optional[Origin]:
+         raise OriginError("hub_not_installed",
+                           "this gateway has no hermes-hub client (no hub.db / hermes-mail config), so a card created "
+                           f"here can never show in {origin.ref}; install hermes-hub or create the cards on that gateway")
++    if origin.gateway not in known:  # a ref written before its gateway was renamed still names that gateway
++        from hermes_cli import kanban_gateway_alias
++        origin = Origin(kanban_gateway_alias.current(origin.gateway, known), origin.profile, origin.session)
+     if origin.gateway == me:
+         return None
+     if origin.gateway not in known:
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index 1aa228f734..64b22dee39 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -355,6 +355,7 @@ def _file_reason(why: str) -> bool:
+ _HOST_ALIASES = {
+     "macbook": "macbook", "mbp": "macbook", "laptop-1": "macbook", "test-key-gen": "macbook",
+     "mini": "mini", "daveey-mini": "mini", "mac-mini": "mini", "mini-1-1": "mini",
++    "mac-mini-2": "mini",  # the same machine's Board gateway name since its in-place rename from ``mini``
+     "hermes-hub": "hub",
+ }
+ # Bare "hub" is not a host here: it is also the BB hub (on the mini) and "for hub t_..." quotes a card. A host is a
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index a0a57b5f36..5203332081 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -141,6 +141,7 @@ def _unreachable_task(gateway, target, *, board, until, since, live_timeout) ->
+     time, not when the owner wrote the row, so it is not weighed against the registry's ``observed_at``. A live
+     owner read stands; a Board replica that is not fresh adds nothing."""
+     from hermes_cli.kanban_wait_replica import check
++    gateway = current_gateway(gateway)  # the registry partition is keyed by the owner's name today
+     rc, msg = check(gateway, target, board=board, until=until, since=since, live_timeout=live_timeout)
+     if rc == 0 or "(live owner" in msg:
+         return rc, msg
+@@ -148,6 +149,28 @@ def _unreachable_task(gateway, target, *, board, until, since, live_timeout) ->
+     return board_view if board_view is not None and board_view[0] == 0 else (rc, msg)
+ 
+ 
++def current_gateway(gateway: str) -> str:
++    """``gateway`` as this host's hub.db knows it today: a probe parked before an in-place rename still names
++    the old gateway (``--gateway mini``), and the owner's records now sit under the new name. Resolved from
++    ``kanban.placement.aliases`` and the local hub.db only (``kanban_gateway_alias.current``): no network, and
++    the name is unchanged until the new one has records here. Never raises."""
++    try:
++        from hermes_cli import kanban_gateway_alias
++        if kanban_gateway_alias.resolve(gateway) == str(gateway or "").strip().lower():
++            return gateway  # no alias names it: hub.db is not opened for the common case
++        from hermes_cli.kanban_origin import gateway_names
++        return kanban_gateway_alias.current(gateway, gateway_names()[1])
++    except (ImportError, OSError, sqlite3.Error, ValueError):
++        return gateway
++
++
++def _ssh_host(gateway: str) -> str:
++    """The ssh destination for ``gateway``. The name as typed stays the destination (ssh aliases are their own
++    namespace: host ``mini`` is still reachable as ``mini`` after its gateway became ``mac-mini-2``); the
++    built-in route of the gateway it names today is used when the typed name has none."""
++    return GATEWAY_SSH.get(gateway) or GATEWAY_SSH.get(current_gateway(gateway), gateway)
++
++
+ def _producer_suffix(board, target, *, source=None):
+     from hermes_cli.kanban_session_activity import _open_ro
+     from hermes_cli.kanban_awaiting import card_orphan_reason
+@@ -177,7 +200,7 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+     # ``since`` (--from) is applied here, on the reply, so an older remote never sees a flag it would reject.
+     if board:
+         inner += ["--board", board]
+-    host = GATEWAY_SSH.get(gateway, gateway)
++    host = _ssh_host(gateway)
+     remote = "export PATH=$HOME/.local/bin:$HOME/.hermes/bin:$PATH; " + shlex.join(inner)
+     try:
+         p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_TIMEOUT}", host, remote],
+diff --git a/tests/hermes_cli/test_kanban_gateway_rename.py b/tests/hermes_cli/test_kanban_gateway_rename.py
+new file mode 100644
+index 0000000000..ee8e8b84cd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gateway_rename.py
+@@ -0,0 +1,321 @@
++"""A Board gateway renamed in place (``mini`` -> ``mac-mini-2``): core follows the name. [daveey]
++
++One test per entry path (t_8b6fcf8c8f8c1703):
++* ``gateway_name()`` / ``gateway_names()`` pick the new name up with no process restart;
++* ``gateway_names()`` stops listing the old partition as a live gateway;
++* ``hermes kanban wait-check task <id> --gateway <former>`` and ``wait-comment --from-gateway <former>``
++  through the argparse entry;
++* an origin ref written before the rename;
++* the overlap host map.
++
++The alias source is ``kanban.placement.aliases`` (config on disk), never the network.
++"""
++import argparse
++import json
++import os
++import sqlite3
++import subprocess
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_comment_origin as kco
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_gateway_alias as alias
++from hermes_cli import kanban_origin as ko
++from hermes_cli import kanban_overlap
++from hermes_cli import kanban_wait_check as wait
++
++OLD, NEW, OTHER = "mini", "mac-mini-2", "hub"
++TID = "t_123456789abcdef0"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / ".hermes"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    (tmp_path / "hub-state").mkdir()
++    ko._names_memo = ko._name_memo = None
++    yield tmp_path
++    ko._names_memo = ko._name_memo = None
++
++
++def _old(path: Path) -> None:
++    """Age ``path`` past the racy-write window, so its memo is kept as it is in a long-running process."""
++    then = time.time() - 60
++    os.utime(path, (then, then))
++
++
++def hub_db(home, me: str, partitions=()) -> Path:
++    """This host's hub.db: ``meta.gateway`` = ``me`` and one live replica record per partition."""
++    path = home / "hub-state" / "hub.db"
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
++        db.execute("CREATE TABLE IF NOT EXISTS replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++        db.execute("INSERT OR REPLACE INTO meta VALUES('gateway', ?)", (me,))
++        db.execute("DELETE FROM replica")
++        db.executemany("INSERT INTO replica VALUES(?, 'gateway', ?, '{}', 1)", [(g, g) for g in partitions])
++    _old(path)
++    return path
++
++
++def mail_config(home, me: str) -> Path:
++    path = home / "mail.json"
++    path.write_text(json.dumps({"gateway": me, "url": "https://board.invalid"}), encoding="utf-8")
++    _old(path)
++    return path
++
++
++def aliases(home, table: dict) -> None:
++    (home / ".hermes" / "config.yaml").write_text(  # JSON is YAML
++        json.dumps({"kanban": {"placement": {"aliases": table}}}), encoding="utf-8")
++
++
++def rename_self(home, new: str) -> None:
++    """What ``hermes-mail rename-self --to <new>`` leaves: the mail config and hub.db ``meta.gateway`` both
++    carry the new name. Same hub.db file (inode), as an in-place rename keeps it."""
++    with sqlite3.connect(home / "hub-state" / "hub.db") as db:
++        db.execute("UPDATE meta SET v = ? WHERE k = 'gateway'", (new,))
++    mail_config(home, new)
++
++
++# --- name pickup ---------------------------------------------------------------------------------------------------
++
++def test_gateway_name_follows_an_in_place_rename_without_a_restart(home):
++    hub_db(home, OLD, [OLD, OTHER])
++    mail_config(home, OLD)
++    assert ko.gateway_name() == OLD
++    assert ko._name_memo is not None, "the settled name must be memoized, or this test proves nothing"
++    rename_self(home, NEW)
++    assert ko.gateway_name() == NEW          # same process, no memo reset, well inside the 10-minute memo
++    assert ko.gateway_names()[0] == NEW
++
++
++def test_a_half_written_rename_is_not_memoized(home):
++    """hub.db ``meta.gateway`` and the mail config disagree while ``rename-self`` is between its two writes:
++    the name read then is returned but not kept, so the settled name is seen on the next call."""
++    hub_db(home, OLD, [OLD])
++    mail_config(home, NEW)                   # config written first; meta.gateway still the old name
++    assert ko.gateway_name() == OLD
++    assert ko._name_memo is None
++    with sqlite3.connect(home / "hub-state" / "hub.db") as db:
++        db.execute("UPDATE meta SET v = ? WHERE k = 'gateway'", (NEW,))
++    assert ko.gateway_name() == NEW          # the mail config did not change again: only the no-memo rule helps
++    assert ko._name_memo is not None
++
++
++def test_a_settled_name_is_still_memoized(home, monkeypatch):
++    """The memo's purpose survives: a list render asks once per card and must not open hub.db each time."""
++    hub_db(home, OLD, [OLD])
++    mail_config(home, OLD)
++    assert ko.gateway_name() == OLD
++    opened = []
++    monkeypatch.setattr(ko, "_ro", lambda path: opened.append(path) or (_ for _ in ()).throw(AssertionError("opened")))
++    assert [ko.gateway_name() for _ in range(5)] == [OLD] * 5 and not opened
++
++
++# --- the old partition ---------------------------------------------------------------------------------------------
++
++def test_gateway_names_drops_the_renamed_gateways_old_partition(home):
++    """Another gateway's hub.db after the rename: rows of the old partition are still there (their tombstones
++    have not arrived), next to the new one. The old name is not a second live gateway."""
++    hub_db(home, OTHER, [OTHER, OLD, NEW])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    assert ko.gateway_names() == (OTHER, {OTHER, NEW})
++
++
++def test_gateway_names_keeps_the_old_name_until_the_new_one_has_records(home):
++    """The alias map is rolled out before the cutover: until the new name shows up here, ``mini`` is the
++    gateway and must stay addressable."""
++    hub_db(home, OTHER, [OTHER, OLD])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    assert ko.gateway_names() == (OTHER, {OTHER, OLD})
++
++
++def test_gateway_names_without_an_alias_map_is_unchanged(home):
++    hub_db(home, OTHER, [OTHER, OLD, NEW])
++    mail_config(home, OTHER)
++    assert ko.gateway_names() == (OTHER, {OTHER, OLD, NEW})
++
++
++def test_gateway_names_never_drops_this_gateways_own_name(home):
++    """A wrong map (this host aliased to another known gateway) must not make the host forget its own name."""
++    hub_db(home, OLD, [OLD, NEW])
++    mail_config(home, OLD)
++    aliases(home, {OLD: NEW})
++    assert ko.gateway_names() == (OLD, {OLD, NEW})
++
++
++def test_a_ref_written_before_the_rename_reaches_the_renamed_gateway(home):
++    hub_db(home, OTHER, [OTHER, OLD, NEW])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    got = ko.resolve(f"@session:default@{OLD}/20000101_000000_032d97")
++    assert got == ko.Origin(NEW, "default", "20000101_000000_032d97")
++
++
++def test_the_renamed_gateways_own_old_ref_is_local(home):
++    hub_db(home, NEW, [NEW, OTHER])
++    mail_config(home, NEW)
++    aliases(home, {OLD: NEW})
++    assert ko.resolve(f"@session:default@{OLD}/20000101_000000_032d97") is None
++
++
++# --- the alias map -------------------------------------------------------------------------------------------------
++
++def test_alias_chain_loop_and_case():
++    cfg = {"aliases": {"Mac-Mini": "MINI", "mini": "mac-mini-2", "a": "b", "b": "a", "same": "same", "": "x"}}
++    assert alias.resolve("mac-mini", cfg) == NEW and alias.resolve("MINI", cfg) == NEW
++    assert alias.resolve("worker-7", cfg) == "worker-7"
++    assert alias.resolve("a", cfg) == "a"                      # a loop resolves to nothing new
++    assert alias.aliases(cfg) == {"mac-mini": "mini", "mini": NEW, "a": "b", "b": "a"}
++    assert alias.aliases({"aliases": ["mini"]}) == {} and alias.aliases({}) == {}
++    assert alias.current("mini", {"Mac-Mini-2", "hub"}, cfg) == "Mac-Mini-2"
++    assert alias.current("mini", {"hub"}, cfg) == "mini"
++    assert alias.current("hub", {"hub", NEW}, cfg) == "hub"
++    assert alias.spellings(NEW, cfg) == [NEW, "mac-mini", "mini"]
++    assert alias.spellings("mini", cfg) == ["mini", NEW, "mac-mini"]
++    assert alias.spellings("worker-7", cfg) == ["worker-7"] and alias.spellings("", cfg) == []
++
++
++# --- wait-check ----------------------------------------------------------------------------------------------------
++
++def _cli(*argv: str) -> int:
++    from hermes_cli import kanban as kc
++    parser = argparse.ArgumentParser()
++    kc.build_parser(parser.add_subparsers(dest="cmd"))
++    return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++def registry(home, gw: str, status: str) -> None:
++    """The hermes-hub registry replica holds the card under gateway ``gw``, observed just now."""
++    scope = {"task_scopes": [{"board": "default", "profile": "default", "state": "ok", "observed_at": time.time()}]}
++    row = dict(id=TID, board="default", status=status, gateway=gw, profile="default", owner_profile="default",
++               wait_observation={"parked_agent": False, "orphan_reason": None})
++    with sqlite3.connect(home / "hub-state" / "hub.db") as db:
++        db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (gw, "gateway", gw, json.dumps(scope), 1))
++        db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (gw, "tasks", f"default/default/{TID}", json.dumps(row), 1))
++
++
++@pytest.fixture
++def no_ssh(monkeypatch):
++    """No route to the owner (the pool-worker case): the probe answers from this host's replicas."""
++    calls = []
++
++    def run(argv, **kwargs):
++        calls.append(argv)
++        return subprocess.CompletedProcess(argv, 255, "", "Permission denied (publickey).")
++
++    monkeypatch.setattr(wait.subprocess, "run", run)
++    return calls
++
++
++def test_wait_check_cli_with_a_former_gateway_name_reads_the_renamed_partition(home, no_ssh, capsys):
++    hub_db(home, OTHER, [OTHER])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    registry(home, NEW, "done")
++    rc = _cli("wait-check", "task", TID, "--gateway", OLD)
++    out = capsys.readouterr().out
++    assert rc == 0 and out.split()[:2] == [TID, "done"], out
++    assert [c[5] for c in no_ssh] == [OLD]   # the typed name is still the ssh destination
++
++
++def test_wait_check_cli_with_a_former_name_is_not_met_while_the_card_runs(home, no_ssh, capsys):
++    hub_db(home, OTHER, [OTHER])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    registry(home, NEW, "running")
++    assert _cli("wait-check", "task", TID, "--gateway", OLD) == 1
++    assert "running" in capsys.readouterr().out
++
++
++def test_wait_check_cli_keeps_the_old_name_before_the_rename(home, no_ssh, capsys):
++    """Map present, rename not done: the owner's records are still under ``mini`` and are read there."""
++    hub_db(home, OTHER, [OTHER])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW})
++    registry(home, OLD, "done")
++    assert _cli("wait-check", "task", TID, "--gateway", OLD) == 0
++    assert capsys.readouterr().out.split()[:2] == [TID, "done"]
++
++
++def test_wait_check_ssh_route_keeps_the_typed_host(home):
++    """ssh names are their own namespace: host ``mini`` stays reachable as ``mini``; a name with no built-in
++    route falls back to its current gateway's."""
++    hub_db(home, OTHER, [OTHER, NEW])
++    mail_config(home, OTHER)
++    aliases(home, {OLD: NEW, "the-hub": OTHER})
++    assert wait._ssh_host(OLD) == OLD
++    assert wait._ssh_host("the-hub") == wait.GATEWAY_SSH[OTHER]
++    assert wait._ssh_host("worker-7") == "worker-7"
++
++
++# --- wait-comment --------------------------------------------------------------------------------------------------
++
++@pytest.fixture
++def board(home):
++    hub_db(home, OTHER, [OTHER, NEW])
++    mail_config(home, OTHER)
++    kb.init_db()
++    return home
++
++
++@pytest.mark.parametrize("author,origin,flag,want", [
++    ("default", NEW, OLD, 0),                 # written after the rename, probe parked before it
++    ("default", OLD, NEW, 0),                 # written before the rename, probe written after it
++    (f"hub:gw:{OLD}", None, NEW, 0),          # the relay author form, old name
++    ("default", OTHER, OLD, 1),               # another gateway's comment still does not match
++    ("default", OTHER, NEW, 1),
++])
++def test_wait_comment_cli_matches_both_names_of_a_renamed_gateway(board, capsys, author, origin, flag, want):
++    aliases(board, {OLD: NEW})
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        kb.add_comment(conn, tid, author, "verification: fix live", origin_gateway=origin)
++    assert _cli("wait-comment", tid, "--after-id", "0", "--from-gateway", flag) == want
++    capsys.readouterr()
++
++
++def test_wait_comment_cli_without_the_alias_does_not_match_the_other_name(board, capsys):
++    """Control: the match above comes from the map, not from a substring (``x9`` / ``y7`` share none)."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        kb.add_comment(conn, tid, "default", "reply", origin_gateway="y7")
++    assert _cli("wait-comment", tid, "--after-id", "0", "--from-gateway", "x9") == 1
++    aliases(board, {"x9": "y7"})
++    assert _cli("wait-comment", tid, "--after-id", "0", "--from-gateway", "x9") == 0
++    capsys.readouterr()
++
++
++def test_wait_comment_from_card_and_gateway_matches_the_renamed_gateway(board):
++    aliases(board, {"x9": "y7"})
++    card = "t_0123456789abcdef"
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        kb.add_comment(conn, tid, f"y7/{card}", "reply")
++        assert kco.find_comment(conn, tid, from_card=card, from_gateway="x9") is not None
++        assert kco.find_comment(conn, tid, from_card=card, from_gateway="z3") is None
++
++
++# --- overlap host map ----------------------------------------------------------------------------------------------
++
++def test_overlap_host_map_knows_the_new_gateway_name_as_the_same_machine():
++    """Two cards naming the M6 by its old and its new gateway name target one machine."""
++    host = lambda title: kanban_overlap.target_identity(title)["host"]
++    assert host("restart the gateway on mac-mini-2") == host("restart the gateway on mini") == {"mini"}
++    for name in ("mini-1", "mac-mini", "mini-1-1"):   # the existing names still mean that machine
++        assert host(f"check {name}") == {"mini"}, name
++    assert host("check hermes-hub") == {"hub"} and host("check mbp") == {"macbook"}
++    assert host("tune the mini-batch size") == frozenset()
+diff --git a/tests/hermes_cli/test_kanban_sync_gateway_rename.py b/tests/hermes_cli/test_kanban_sync_gateway_rename.py
+new file mode 100644
+index 0000000000..0fd8ca1d3e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_gateway_rename.py
+@@ -0,0 +1,143 @@
++"""A Board gateway renamed in place: this gateway's own cards stay its own on the sync path. [daveey]
++
++The Board's rename op rewrites ``tasks.created_on`` from the old name to the new one and re-emits each row on
++the feed. The gateway then syncs under its new name while its live file still says ``created_on = <old>``
++(t_8b6fcf8c8f8c1703; plan review F10, re-review R7 e).
++
++* a normal pull adopts the re-emitted row onto the existing local row (``kanban_db_sync._upsert_task``), and
++  ``own_partition`` treats the card as own afterwards;
++* the first full round under the new name, run while every local row still carries the old name, queues and
++  sends nothing, deletes nothing, and leaves the live file agreeing with the Board.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++OLD, NEW, OTHER, BOARD = "mini", "mac-mini-2", "hub", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, OLD)
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _round(kanban_home, svc, gateway):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(gateway), gateway)
++
++
++def _settle(kanban_home, svc, gateway) -> None:
++    for _ in range(4):  # push, then pull the echo back into the replica; a settled board repeats cleanly
++        _round(kanban_home, svc, gateway)
++
++
++def _created_on(conn) -> dict:
++    return dict(conn.execute("SELECT id, created_on FROM tasks ORDER BY id").fetchall())
++
++
++def board_rename(svc, old: str, new: str, *, writer: str) -> list[str]:
++    """The Board's in-place rename of ``old``: every card it created is rewritten to ``created_on = new`` at a
++    new version and re-emitted on the feed (``writer`` = the change's origin_gateway)."""
++    b = svc.board(BOARD)
++    moved = [uid for uid, row in b["rows"]["tasks"].items() if row.get("created_on") == old]
++    for i, uid in enumerate(moved):
++        svc._put(b, "tasks", uid, {"created_on": new}, writer, None, f"9999999999999-{i:04d}-board")
++    return moved
++
++
++def _ops_sent(svc) -> int:
++    return sum(len(call[2]) for call in svc.calls if call[0] == "ops")
++
++
++@pytest.fixture
++def renamed(live, kanban_home, svc):
++    """Two own cards (one with a comment) and one of another gateway's, settled; then the Board renames us."""
++    own = [kb.create_task(live, title="own a", assignee="worker"), kb.create_task(live, title="own b", assignee="worker")]
++    kb.add_comment(live, own[0], "me", "a note")
++    other = kbc.connect(kanban_home / "other.db")
++    try:
++        ksc.ensure_identity(other, BOARD, OTHER)
++        foreign = kb.create_task(other, title="theirs", assignee="worker")
++        ksc.push(other, svc.hub(OTHER), BOARD, OTHER, primary=False)
++    finally:
++        other.close()
++    _settle(kanban_home, svc, OLD)
++    assert _created_on(live) == {own[0]: OLD, own[1]: OLD}
++    assert not ksc.status(live)["pending"]
++    return own, foreign
++
++
++@pytest.mark.parametrize("writer", [OTHER, NEW, OLD])
++def test_first_round_under_the_new_name_adopts_the_renamed_cards_and_sends_nothing(
++        renamed, live, kanban_home, svc, writer):
++    own, foreign = renamed
++    assert sorted(board_rename(svc, OLD, NEW, writer=writer)) == sorted(own)
++    head, sent = svc.board(BOARD)["seq"], _ops_sent(svc)
++
++    result = _round(kanban_home, svc, NEW)   # local rows still say created_on = mini when this round starts
++
++    assert _created_on(live) == {own[0]: NEW, own[1]: NEW}          # adopted in place, the foreign card not pulled in
++    assert _ops_sent(svc) == sent and svc.board(BOARD)["seq"] == head, "the rename round must not write to the Board"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state != 'acked'").fetchall()
++    assert not live.execute("SELECT 1 FROM kanban_sync_tombstones").fetchall()
++    assert kb.get_task(live, own[0]).title == "own a"
++    assert [c.body for c in kb.list_comments(live, own[0])] == ["a note"]
++    assert result.error is None and (result.push is None or result.push.rejected == 0), result
++    assert sync.sync_state(live)["gateway_id"] == NEW
++
++    _settle(kanban_home, svc, NEW)                                   # and it stays quiet
++    assert _ops_sent(svc) == sent and svc.board(BOARD)["seq"] == head
++    with kbc.connect(ksc.shadow_path(BOARD)) as shadow:
++        report = ksc.diff(live, shadow, NEW)
++    assert report["clean"] and report["checked"] == 2 and report["foreign_cards"] == 1, report
++    assert foreign not in _created_on(live)
++
++
++def test_a_normal_pull_adopts_the_re_emitted_row_and_own_partition_keeps_the_card(renamed, live, kanban_home, svc):
++    """F10, at the two functions it names: ``pull(partition=<new>)`` applies the re-emitted ``tasks`` row onto
++    the existing local row, and later changes to that card pass ``own_partition`` under the new name."""
++    own, foreign = renamed
++    board_rename(svc, OLD, NEW, writer=OTHER)
++    ksc.ensure_identity(live, BOARD, NEW)
++
++    res = ksc.pull(live, svc.hub(NEW), BOARD, observers=True, partition=NEW)
++
++    assert not res.more and _created_on(live) == {own[0]: NEW, own[1]: NEW}
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", own[0], {"title": "own a, edited on the Board"}, OTHER, None, "9999999999999-9000-board")
++    svc._put(b, "tasks", foreign, {"title": "theirs, edited"}, OTHER, None, "9999999999999-9001-board")
++    tail = [ksc.adapt(c) for c in b["changes"][-2:]]
++    assert [c.uid for c in ksc.own_partition(live, tail, NEW)] == [own[0]]
++    ksc.pull(live, svc.hub(NEW), BOARD, observers=True, partition=NEW)
++    assert kb.get_task(live, own[0]).title == "own a, edited on the Board" and foreign not in _created_on(live)
++
++
++def test_a_card_created_under_the_new_name_is_pushed_as_the_new_name(renamed, live, kanban_home, svc):
++    own, _foreign = renamed
++    board_rename(svc, OLD, NEW, writer=OTHER)
++    _settle(kanban_home, svc, NEW)
++    tid = kb.create_task(live, title="after the rename", assignee="worker")
++    _settle(kanban_home, svc, NEW)
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["created_on"] == NEW
++    assert _created_on(live) == {own[0]: NEW, own[1]: NEW, tid: NEW}
+-- 
+2.43.0
+

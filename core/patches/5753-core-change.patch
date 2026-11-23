@@ -1,0 +1,269 @@
+From 2f204cb41aaf399971e2fdb80dd094c8d1745dc1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:45:52 +0000
+Subject: [PATCH] [daveey] Ignore reader closes and coalesce annotation write
+ bursts
+
+Review R4 of f6427737c9: a process that only reads a board made the
+holder run a forced projection per reader session. SQLite opens -wal and
+-shm read-write even for mode=ro, and a default connection opens the main
+file read-write, so each reader close raised IN_CLOSE_WRITE on a watched
+name.
+
+- annotation_file_events: drop IN_CLOSE_WRITE from the watch mask. Every
+  write, truncate, create, rename and delete still raises an event.
+- annotation_event_loop: the first source event after a quiet period is
+  read at once; later ones within COALESCE_S (0.25 s) share one trailing
+  read, so a continuously written board costs at most about 4 projections
+  per second. The loop now tracks a pending source invalidation itself, so
+  a demand wake during the gap cannot downgrade it.
+
+Tests: test_foreign_reader_sessions_do_not_project (WAL mode=ro, WAL
+default, rollback default; real loop, FileEvents and projection, second
+process) is red 3/3 on f6427737c9 and green here; a later commit is still
+projected. test_write_burst_is_coalesced_and_last_write_is_read fails with
+COALESCE_S = 0 (40 refreshes for 40 writes). 183 test files importing the
+changed modules: 3317 passed, 0 failed, 1 skipped.
+
+Known limit: when no other process holds a WAL board open, a reader
+creates and deletes -wal/-shm, which still wakes the holder. Not measured
+live; the reviewer's passive count on a live board saw no such events.
+---
+ hermes_cli/annotation_event_loop.py           | 32 ++++++--
+ hermes_cli/annotation_file_events.py          |  5 +-
+ .../hermes_cli/test_annotation_event_loop.py  | 37 +++++++++
+ .../test_annotation_native_holder.py          | 79 +++++++++++++++++++
+ 4 files changed, 144 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/annotation_event_loop.py b/hermes_cli/annotation_event_loop.py
+index d3cdf4ff65..8fe2bc88b2 100644
+--- a/hermes_cli/annotation_event_loop.py
++++ b/hermes_cli/annotation_event_loop.py
+@@ -6,8 +6,13 @@ import time
+ 
+ log = logging.getLogger(__name__)
+ 
++# Minimum gap between reading refreshes. The first event after a quiet period is
++# answered at once; later ones inside the gap share one trailing refresh, so a
++# continuously written board costs a bounded number of projections per second.
++COALESCE_S = 0.25
+ 
+-def run(events, stop, lease, refresh, *, interval=2.0):
++
++def run(events, stop, lease, refresh, *, interval=2.0, coalesce=COALESCE_S):
+     """refresh installs coverage before reading and returns an absolute deadline.
+ 
+     A deadline is one-shot: refresh must consume it and return its successor or
+@@ -16,6 +21,8 @@ def run(events, stop, lease, refresh, *, interval=2.0):
+     Errors schedule a bounded recovery attempt without certifying old inputs.
+     """
+     dirty, owned = True, False
++    source = True  # a pending wake that invalidates inputs (not demand-only)
++    quiet = 0.0  # monotonic time before which no reading refresh may start
+     due = None
+     beat_at = time.monotonic()
+     while not stop.is_set():
+@@ -26,7 +33,7 @@ def run(events, stop, lease, refresh, *, interval=2.0):
+                 if held:
+                     lease.beat()
+                 if held and not owned:
+-                    events.control_only = False
++                    source = True
+                 dirty |= held and not owned
+                 owned = held
+             except Exception:  # health: allow BLE001 -- lease I/O failure must not retire the holder
+@@ -34,7 +41,11 @@ def run(events, stop, lease, refresh, *, interval=2.0):
+                 owned = False  # no source read until ownership is established again
+                 dirty = True
+             beat_at = now + interval
+-        if owned and (dirty or (due is not None and time.time() >= due)):
++        expired = due is not None and time.time() >= due
++        reads = source or expired
++        deferred = owned and (dirty or expired) and reads and time.monotonic() < quiet
++        if owned and (dirty or expired) and not deferred:
++            events.control_only = not source
+             try:
+                 due = refresh()
+                 # An expired provider deadline must not create a busy spin.
+@@ -43,15 +54,20 @@ def run(events, stop, lease, refresh, *, interval=2.0):
+             except Exception:  # health: allow BLE001 -- preserve holder after a failed source read
+                 log.warning('annotation event refresh failed', exc_info=True)
+                 due = time.time() + interval
+-            dirty = False
++            if reads:
++                quiet = time.monotonic() + coalesce
++            dirty = source = False
+         timeout = max(0.0, beat_at - time.monotonic())
+-        if owned and due is not None:
++        if deferred:
++            timeout = min(timeout, max(0.0, quiet - time.monotonic()))
++        elif owned and due is not None:
+             timeout = min(timeout, max(0.0, due - time.time()))
+         try:
+-            dirty |= events.wait(timeout)
++            changed = events.wait(timeout)
++            dirty |= changed
++            source |= changed and not getattr(events, 'control_only', False)
+         except OSError:
+             log.warning('annotation event wait failed', exc_info=True)
+             # Do not spin on a broken descriptor. The refresh reinstalls coverage.
+             stop.wait(interval)
+-            events.control_only = False
+-            dirty = True
++            dirty = source = True
+diff --git a/hermes_cli/annotation_file_events.py b/hermes_cli/annotation_file_events.py
+index 91278ddcda..b8dad1b7fc 100644
+--- a/hermes_cli/annotation_file_events.py
++++ b/hermes_cli/annotation_file_events.py
+@@ -11,7 +11,10 @@ import threading
+ from pathlib import Path
+ 
+ _HEADER = struct.Struct('iIII')
+-_CHANGE = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
++# No IN_CLOSE_WRITE: SQLite readers open -wal/-shm (and by default the main file)
++# read-write, so their close would wake the holder with nothing committed. Every
++# write, truncate, create, rename and delete still raises one of these.
++_CHANGE = 0x2 | 0x4 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
+ _LOST = 0x400 | 0x800 | 0x2000 | 0x8000
+ _OVERFLOW = 0x4000
+ 
+diff --git a/tests/hermes_cli/test_annotation_event_loop.py b/tests/hermes_cli/test_annotation_event_loop.py
+index 47a1eb5df2..65509bf39a 100644
+--- a/tests/hermes_cli/test_annotation_event_loop.py
++++ b/tests/hermes_cli/test_annotation_event_loop.py
+@@ -1,4 +1,5 @@
+ """Real native waits with independent lease maintenance."""
++import itertools
+ import resource
+ import threading
+ import time
+@@ -113,3 +114,39 @@ def test_one_shot_deadline_and_read_error_retry(tmp_path):
+             events.wake()
+             thread.join(2)
+         assert not thread.is_alive()
++
++
++def test_write_burst_is_coalesced_and_last_write_is_read(tmp_path):
++    """A steady writer gets a bounded refresh rate, and its final write is read."""
++    path = tmp_path / 'source'
++    path.write_text('0')
++    stop, ready = threading.Event(), threading.Event()
++    reads = []
++    with FileEvents() as events:
++        def refresh():
++            events.replace([path])
++            reads.append((time.monotonic(), path.read_text()))
++            ready.set()
++        lease = SimpleNamespace(held=lambda: True, beat=lambda: None)
++        thread = threading.Thread(target=run, args=(events, stop, lease, refresh))
++        thread.start()
++        try:
++            assert ready.wait(1)
++            stop.wait(.5)
++            first = len(reads)
++            began = time.monotonic()
++            for index in range(1, 41):  # 20 writes/s for 2 s
++                path.write_text(str(index))
++                stop.wait(.05)
++            assert reads[first][0] - began < .2, 'first write of a burst waited for the gap'
++            stop.wait(1)
++            burst = reads[first:]
++            assert len(burst) <= 12, f'{len(burst)} refreshes for a 2 s burst'
++            assert burst[-1][1] == '40'
++            gaps = [b[0] - a[0] for a, b in itertools.pairwise(burst)]
++            assert min(gaps) >= .24
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(2)
++        assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_annotation_native_holder.py b/tests/hermes_cli/test_annotation_native_holder.py
+index 817a0c8e77..a668ba7c16 100644
+--- a/tests/hermes_cli/test_annotation_native_holder.py
++++ b/tests/hermes_cli/test_annotation_native_holder.py
+@@ -698,3 +698,82 @@ def test_wal_commit_racing_its_notification_is_confirmed(tmp_path, monkeypatch):
+             conn.close()
+             ksa._reset_cache_for_tests()
+     assert not thread.is_alive()
++
++
++_READER = (
++    'import sqlite3, sys\n'
++    'for _ in range(12):\n'
++    '    conn = sqlite3.connect(sys.argv[1], uri=True)\n'
++    '    assert conn.execute("SELECT status FROM tasks").fetchall()\n'
++    '    conn.close()\n'
++)
++
++
++@pytest.mark.parametrize('wal,mode', [(True, '?mode=ro'), (True, ''), (False, '')])
++def test_foreign_reader_sessions_do_not_project(tmp_path, monkeypatch, wal, mode):
++    """Another process that opens, selects and closes commits nothing.
++
++    SQLite opens -wal/-shm (and, by default, the main file) read-write even to
++    read, so every reader close raises IN_CLOSE_WRITE on a watched name. Real
++    loop, real FileEvents, real projection: no read may follow, and a later
++    commit must still be projected.
++    """
++    import subprocess
++    import sys
++
++    scope = ('native-reader-test', 'default')
++    path = tmp_path / 'kanban.db'
++    conn = helpers._board(path, [('t1', 'running', 's1')])
++    if wal:
++        assert conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
++    conn.execute('SELECT * FROM tasks').fetchall()
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path])
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(ksa, '_replica_paths', list)
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(ksa, '_done_checks', {})
++    monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(path)], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    disk.touch_demand(scope)
++    ready, done, stop = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    refresh = ksa._refresh_annotation_locked
++
++    def record(scope):
++        result = refresh(scope)
++        calls.append(dict(result[0]))
++        ready.set()
++        if not result[0]:
++            done.set()
++        return result
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
++    settle = max(host.SETTLE_S) + .5
++    with FileEvents() as events:
++        thread = threading.Thread(target=run, args=(
++            events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
++            lambda: host._event_refresh(events)))
++        thread.start()
++        try:
++            assert ready.wait(5)
++            stop.wait(settle)
++            quiet = len(calls)
++            subprocess.run([sys.executable, '-c', _READER, f'file:{path}{mode}'], check=True, timeout=30)
++            stop.wait(settle)
++            assert len(calls) == quiet, f'{len(calls) - quiet} projections followed 12 reader sessions'
++            disk.touch_demand(scope)
++            conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++            assert done.wait(settle), 'commit after reader sessions was not projected'
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(5)
++            conn.close()
++            ksa._reset_cache_for_tests()
++    assert not thread.is_alive()
+-- 
+2.43.0
+

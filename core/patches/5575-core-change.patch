@@ -1,0 +1,196 @@
+From e15e76805df80bce9715d94aab25e25953ec31d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:35:46 +0000
+Subject: [PATCH] test(kanban): compose dynamic probe allocations and preclaim
+ refusal contracts [daveey]
+
+Exercise real allocator metadata at the dispatch tier seam, preserving conservative unknown-provider hold, scoped provider independence, interval and probe custody with null stored selectors. Update legacy unknown-author and structural-refusal consumers to require no new claims/runs or failure-budget spend. Full static check green; provider96green then combined transport/probe green; accounting162passed2failed retained at bounded two-iteration stop. Unexpected resolver-fault sibling fixture still lacks assignee-specific class eligibility; remaining class consumers and full fleet acceptance remain open. Not review or landing-ready.
+---
+ tests/hermes_cli/test_kanban_review_model.py  | 13 +++-
+ .../test_kanban_review_model_cycles.py        |  8 ++-
+ .../test_kanban_review_wall_admission.py      | 10 +++-
+ .../hermes_cli/test_kanban_shared_blockers.py | 60 +++++++++++++++++--
+ 4 files changed, 80 insertions(+), 11 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index 03fb13c91a..0769aef0c7 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -119,14 +119,21 @@ def test_review_admission_failure_never_spawns_or_spends_retry(board, monkeypatc
+             conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (
+                 json.dumps({"review_model": "class:deep"}), t.id))
+             conn.commit()
++        runs_before = kb.list_runs(conn, t.id)
++        claims_before = len([e for e in kb.list_events(conn, t.id) if e.kind == 'claimed'])
+         dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: seen.append(args))
+         stored = kb.get_task(conn, t.id)
+         assert seen == []
+         assert stored.status == ("triage" if failure in ("no_route", "bad_metadata") else "review")
+-        assert stored.consecutive_failures == (1 if failure in ("no_route", "bad_metadata") else 0)
++        assert stored.consecutive_failures == 0
+         assert stored.claim_lock is None
+-        event_kind = "gave_up" if failure in ("no_route", "bad_metadata") else "spawn_failed"
+-        events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == event_kind]
++        if failure != 'receipt_write':
++            assert kb.list_runs(conn, t.id) == runs_before
++            assert len([e for e in kb.list_events(conn, t.id) if e.kind == 'claimed']) == claims_before
++            events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == 'review_admission_refused']
++            assert events[-1]['preclaim'] is True
++        else:
++            events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == 'spawn_failed']
+         assert events[-1]["infrastructure"] is True
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index 42175088c2..225c7ae334 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -254,8 +254,13 @@ def test_structural_exhaustion_blocks_once_without_spawn_retry_loop(board, monke
+         task = helpers.task(conn, helpers.OPUS)
+         kb.claim_task(conn, task.id)
+         kb.request_review(conn, task.id)
++        runs_before = kb.list_runs(conn, task.id)
++        claims_before = len([e for e in kb.list_events(conn, task.id) if e.kind == 'claimed'])
+         result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args))
+         stored = kb.get_task(conn, task.id)
++        assert kb.list_runs(conn, task.id) == runs_before
++        assert len([e for e in kb.list_events(conn, task.id) if e.kind == 'claimed']) == claims_before
++        assert stored.consecutive_failures == 0
+         # Canonical non-human infrastructure block is sticky triage, never a Owner ask.
+         assert stored.status == "triage"
+         assert result.auto_blocked == [task.id]
+@@ -265,7 +270,8 @@ def test_structural_exhaustion_blocks_once_without_spawn_retry_loop(board, monke
+         gave_up = [e.payload for e in events if e.kind == "gave_up"]
+         assert len(gave_up) == 1
+         assert gave_up[0]["infrastructure"] is True
+-        assert gave_up[0]["admission_refusal"] == "review_models_exhausted"
++        assert gave_up[0]["admission_refusal"] == "review_model_unavailable"
++        assert gave_up[0]["preclaim"] is True
+         assert gave_up[0]["sticky"] is True
+         runs = len(kb.list_runs(conn, task.id))
+         for _ in range(4):
+diff --git a/tests/hermes_cli/test_kanban_review_wall_admission.py b/tests/hermes_cli/test_kanban_review_wall_admission.py
+index e44afedf49..50bd27db2f 100644
+--- a/tests/hermes_cli/test_kanban_review_wall_admission.py
++++ b/tests/hermes_cli/test_kanban_review_wall_admission.py
+@@ -89,7 +89,10 @@ def test_review_wait_boundaries(board, monkeypatch, case):
+         tid = kb.create_task(conn, title="Build", assignee="a")
+         result = dispatch.DispatchResult()
+         held = admission.hold(conn, tid, result, lane="review", dry_run=case == "dry_run")
+-        assert held == (case in ("dry_run", "race", "earliest"))
++        assert held == (case in ("dry_run", "race", "earliest", "structural", "registry"))
++        if case in ("structural", "registry"):
++            assert result.respawn_guarded == [(tid, "review_model_unavailable")]
++            assert kb.list_runs(conn, tid) == []
+         events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                               (tid, admission.EVENT)).fetchall()
+         assert bool(events) == (case in ("race", "earliest"))
+@@ -125,6 +128,8 @@ def test_unknown_or_elapsed_pacing_reset_is_not_a_deferral_deadline(
+ @pytest.mark.parametrize("failure", [ValueError("invalid review metadata"), RuntimeError("policy read failed")])
+ def test_preclaim_resolver_error_does_not_abort_dispatch(
+         board, monkeypatch, all_assignees_spawnable, failure):
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    board.joinpath('config.yaml').write_text(_managed_yaml())
+     monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
+     monkeypatch.setattr(review, "resolve_review_model", lambda *_a: (_ for _ in ()).throw(failure))
+     with kbc.connect() as conn:
+@@ -135,8 +140,11 @@ def test_preclaim_resolver_error_does_not_abort_dispatch(
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, _ws: seen.append(task.id))
+         assert sibling in seen
++        # Unexpected non-typed resolver faults retain the existing per-card failure boundary;
++        # the separate typed unknown-author controls require literal zero claims.
+         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='claimed'",
+                             (tid,)).fetchone()[0] == 1
++        assert tid not in seen
+         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_route_deferred'",
+                             (tid,)).fetchone()[0] == 0
+ 
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 12f51090a0..2251a30caa 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -674,11 +674,41 @@ def test_assertion_scope_union(kanban_home, providers, expected):
+         assert ksb.blocker_states(conn)[WALL].blocker_provider == expected
+ 
+ 
+-def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interval(kanban_home, spawns):
+-    """End to end on dispatch_once, no human unblock: Codex cards behind an Anthropic-scoped wall
+-    spawn, the Opus card is held within the probe interval, and neither a Codex completion nor a
+-    fresh Codex run delays or replaces the real Opus probe once the interval has passed."""
+-    _write_home_cfg(kanban_home, profile_model="gpt-5", profile_provider="openai-codex")
++def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interval(kanban_home, spawns, monkeypatch):
++    """Dispatch consumes real allocator decisions, never profile-model guesses or stored pins.
++
++    This composes the allocator and dispatcher at the tier-resolution seam; credential/provider
++    calls remain outside this isolated test. Unknown allocation is held conservatively first.
++    """
++    from agent.model_routing import resolve_model_route
++    from agent.model_routing_state import RoutingState
++    from hermes_cli import kanban_model_tier as tier
++
++    _write_home_cfg(kanban_home, profile_model="class:standard")
++    state_path = kanban_home / "provider-proof.sqlite3"
++    allocated = {}
++    # Exercise real subscription/capability filtering and durable weighted allocation. Keep both
++    # providers eligible: discover the resulting routes rather than request a concrete model.
++    for index in range(6):
++        sid = f"provider-proof-{index}"
++        route = resolve_model_route("class:standard", "auto", config=_ENABLED_ROUTES,
++                                    session_id=sid, requirements={"tools": True, "streaming": True},
++                                    state_path=state_path)
++        metadata = RoutingState(state_path).peek(sid, "standard")
++        assert metadata is not None
++        assert metadata == route["metadata"] and not metadata.get("exact_pin")
++        allocated.setdefault(route["provider"], []).append(route)
++    assert len(allocated["openai-codex"]) >= 2 and allocated["anthropic"]
++    decisions = {}
++    original_resolve = tier.resolve_dispatch_tier
++
++    def allocated_tier(conn, task, *, lane, cfg=None):
++        base = original_resolve(conn, task, lane=lane, cfg=cfg)
++        if task.id not in decisions:
++            return base
++        route = decisions[task.id]
++        return route["model"], route["provider"], "class+allocated"
++
+     seen: dict[str, tuple] = {}
+ 
+     def spawn(task, workspace, board=None):
+@@ -692,7 +722,18 @@ def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interva
+             assert kb.claim_task(conn, tid)
+             _park_behind(conn, tid)
+ 
+-        # Within the interval: both Codex cards spawn, Opus is held.
++        # Before allocation establishes a concrete provider, all three routes are unknown:
++        # no claims, no new runs and no provider launch are permitted within the interval.
++        runs_before = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
++        unknown = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert _spawned_ids(unknown) == [] and seen == {}
++        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == runs_before
++        assert {tid for tid, why in unknown.respawn_guarded if why == ksb.GUARD_REASON} == {opus, codex1, codex2}
++        decisions.update({opus: allocated["anthropic"][0], codex1: allocated["openai-codex"][0],
++                          codex2: allocated["openai-codex"][1]})
++        monkeypatch.setattr(tier, "resolve_dispatch_tier", allocated_tier)
++
++        # Within the interval: both dynamically allocated Codex cards spawn, Anthropic is held.
+         res = kbd.dispatch_once(conn, spawn_fn=spawn)
+         assert sorted(_spawned_ids(res)) == sorted([codex1, codex2])
+         assert (opus, ksb.GUARD_REASON) in res.respawn_guarded
+@@ -724,6 +765,13 @@ def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interva
+         st = ksb.blocker_states(conn)[WALL]
+         assert st.is_open and opus in st.probe_starts
+         assert not any(e.kind == "unblocked" for e in kb.list_events(conn, opus))
++        # A live matching-provider probe owns custody: no duplicate launch on another tick.
++        assert _spawned_ids(kbd.dispatch_once(conn, spawn_fn=spawn)) == []
++        for tid in (opus, codex1, codex2):
++            stored = kb.get_task(conn, tid)
++            assert stored is not None
++            assert stored.model_override is None and stored.provider_override is None
++            assert not stored.model_pin_mandatory
+ 
+ 
+ def continue_task_ok(conn, tid):
+-- 
+2.43.0
+

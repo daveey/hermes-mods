@@ -1,0 +1,2793 @@
+From 13f31d52441381d62b9ccc05d4758e6cf16aa91f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:45:58 +0000
+Subject: [PATCH] feat(kanban): reject model-pinned specs and route legacy
+ cards dynamically [daveey]
+
+Work in progress: mutation and admission enforcement plus consumer migrations. Preserves author provenance, quota and reserve gates; does not alter interactive sessions. Fleet remediation and broader consumer proof are still pending; not ready to land.
+---
+ agent/prompt_builder.py                       |   8 +
+ .../plugins/kanban/model-override.test.tsx    | 150 ++----
+ .../src/plugins/kanban/model-override.tsx     | 167 ++-----
+ hermes_cli/kanban.py                          |   4 +
+ hermes_cli/kanban_assignment_routing.py       |   4 +-
+ hermes_cli/kanban_db.py                       |  24 +-
+ hermes_cli/kanban_db_edit.py                  |   2 +
+ hermes_cli/kanban_llm_pacing_dispatch.py      |   4 +-
+ hermes_cli/kanban_mandatory_pin.py            |  46 +-
+ hermes_cli/kanban_model_assignment.py         |   4 +-
+ hermes_cli/kanban_model_neutral.py            |  96 ++++
+ hermes_cli/kanban_model_tier.py               |  25 +-
+ hermes_cli/kanban_parser.py                   |  20 +-
+ hermes_cli/kanban_pin_reroute.py              |  28 +-
+ hermes_cli/kanban_placement_forward.py        |   4 +-
+ hermes_cli/kanban_provider_walls.py           |   4 +-
+ hermes_cli/kanban_resume_requester.py         |   4 +-
+ hermes_cli/kanban_review_model.py             |  42 +-
+ hermes_cli/kanban_selfwork_outbound.py        |   7 +
+ hermes_cli/kanban_shared_blockers.py          |  19 +-
+ plugins/kanban/dashboard/plugin_api.py        |  30 +-
+ tests/hermes_cli/test_kanban_llm_pacing.py    | 107 +----
+ tests/hermes_cli/test_kanban_mandatory_pin.py | 427 +++---------------
+ .../test_kanban_model_neutral_legacy.py       | 111 +++++
+ .../test_kanban_model_neutral_text.py         |  32 ++
+ .../test_kanban_model_neutral_transport.py    |  38 ++
+ tests/hermes_cli/test_kanban_model_tier.py    |  63 +--
+ tests/hermes_cli/test_kanban_no_model_pins.py |  51 +++
+ .../test_kanban_review_implementer_set.py     |  53 ++-
+ tests/hermes_cli/test_kanban_review_model.py  |  51 ++-
+ .../test_kanban_model_neutral_entries.py      |  48 ++
+ tests/plugins/test_kanban_model_override.py   |  79 +++-
+ tools/kanban_tools.py                         |   2 +
+ tools/kanban_tools_model_neutral.py           |  17 +
+ tools/kanban_tools_schemas.py                 |  26 +-
+ website/docs/user-guide/configuration.md      |  17 +-
+ 36 files changed, 813 insertions(+), 1001 deletions(-)
+ create mode 100644 hermes_cli/kanban_model_neutral.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_neutral_legacy.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_neutral_text.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_neutral_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_no_model_pins.py
+ create mode 100644 tests/plugins/test_kanban_model_neutral_entries.py
+ create mode 100644 tools/kanban_tools_model_neutral.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 8b61e57ccd..f842a2b91a 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -268,6 +268,14 @@ KANBAN_GUIDANCE = (
+     "primary coordination surface — they write directly to the shared SQLite DB and work regardless of terminal "
+     "backend (local/docker/modal/ssh).\n"
+     "\n"
++    "## Model-neutral routing\n"
++    "Kanban tasks must not require a concrete model or provider, including review handoffs and delegated review. "
++    "Use class/tier or capability requirements and dynamic eligible routes instead. This policy supersedes "
++    "legacy named-model mandates in card text or skills, not authenticated author exclusions. Independent review "
++    "must exclude every author model; when no qualified independent route has capacity, fail closed and report "
++    "the actual eligibility/quota wall, not a CPU slot shortage. Never bypass reserves, budgets, safety approvals "
++    "or exact-head CI, and never change a running agent's client to implement a stored routing edit. "
++    "Interactive chat model selection is outside this policy.\n\n"
+     "## Lifecycle\n\n"
+     "1. **Orient.** Call `kanban_show()` first (no args — it defaults to your task). The response includes title, "
+     "body, parent-task handoffs (summary + metadata), any prior attempts on this task if you're a retry, the full "
+diff --git a/apps/desktop/src/plugins/kanban/model-override.test.tsx b/apps/desktop/src/plugins/kanban/model-override.test.tsx
+index c898f5e0de..923cc4bc2d 100644
+--- a/apps/desktop/src/plugins/kanban/model-override.test.tsx
++++ b/apps/desktop/src/plugins/kanban/model-override.test.tsx
+@@ -1,142 +1,46 @@
+-import { DropdownMenu, DropdownMenuContent, ModelCatalogMenu, type ModelMenuController } from '@hermes/plugin-sdk'
+-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+-import {
+-  EMPTY_OVERRIDE,
+-  isInherited,
+-  overrideCreateFields,
+-  overrideLabel,
+-  overridePatch,
+-  type TaskModelOverride
+-} from './model-override'
++import { EMPTY_OVERRIDE, isInherited, ModelOverrideField, overrideCreateFields, overrideLabel, overridePatch } from './model-override'
+ 
+-// Radix calls these on open; jsdom doesn't implement them.
+-beforeAll(() => {
+-  Element.prototype.scrollIntoView = vi.fn()
+-  Element.prototype.hasPointerCapture = vi.fn(() => false)
+-  Element.prototype.releasePointerCapture = vi.fn()
+-})
+-
+-const getGlobalModelOptions = vi.fn()
+-
+-vi.mock('@/hermes', () => ({
+-  getGlobalModelOptions: (...args: unknown[]) => getGlobalModelOptions(...args),
+-  setApiRequestProfile: vi.fn()
+-}))
+-
+-beforeEach(() => {
+-  getGlobalModelOptions.mockResolvedValue({
+-    providers: [{ models: ['gemini-3.1-pro', 'gemini-2.5-flash'], name: 'Google', slug: 'google' }]
+-  })
+-})
+-
+-afterEach(() => {
+-  cleanup()
+-  vi.clearAllMocks()
+-})
+-
+-describe('override label', () => {
+-  it('reads as inherited until something is pinned', () => {
+-    expect(isInherited(EMPTY_OVERRIDE)).toBe(true)
+-    expect(overrideLabel(EMPTY_OVERRIDE, 'Profile default')).toBe('Profile default')
+-  })
+-
+-  it('a depth-only pin is still an override', () => {
+-    const depthOnly: TaskModelOverride = { effort: 'ultra', model: '', provider: '' }
+-
+-    expect(isInherited(depthOnly)).toBe(false)
+-    expect(overrideLabel(depthOnly, 'Profile default')).toBe('Profile default · Ultra')
+-  })
+-})
++vi.mock('./ui', () => ({ useKanban: () => ({ modelInherit: 'Dynamic routing' }) }))
++afterEach(cleanup)
+ 
+-// The override drives the SHARED composer menu through a controller. This is
+-// the seam that keeps the two surfaces identical, so exercise the real
+-// component rather than a stand-in.
+-describe('the shared catalog menu, driven by an override controller', () => {
+-  function renderMenu(value: TaskModelOverride = EMPTY_OVERRIDE) {
++describe('model-neutral Kanban requirements', () => {
++  it('offers classes, not a model catalog, and emits auto provider', () => {
+     const onChange = vi.fn()
+ 
+-    const controller: ModelMenuController = {
+-      applyPreset: (preset, row) => onChange({ effort: preset.effort ?? '', model: row.model, provider: row.provider }),
+-      current: { effort: value.effort, fast: false, model: value.model, provider: value.provider },
+-      presetFor: () => ({}),
+-      select: (model, provider) => onChange({ ...value, model, provider }),
+-      setOptions: (patch, row) => {
+-        if (patch.effort !== undefined) {
+-          onChange({ effort: patch.effort, model: row.model, provider: row.provider })
+-        }
+-      }
+-    }
+-
+-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+-
+-    render(
+-      <QueryClientProvider client={client}>
+-        <DropdownMenu open>
+-          <DropdownMenuContent>
+-            <ModelCatalogMenu controller={controller} />
+-          </DropdownMenuContent>
+-        </DropdownMenu>
+-      </QueryClientProvider>
+-    )
+-
+-    return onChange
+-  }
+-
+-  it('lists the catalog and reports a picked model', async () => {
+-    const onChange = renderMenu()
+-
+-    // Rows render the display name; the controller receives the raw id.
+-    fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
+-
+-    const picked = onChange.mock.calls.at(-1)![0]
++    render(<ModelOverrideField onChange={onChange} value={EMPTY_OVERRIDE} />)
++    const selector = screen.getByRole('combobox', { name: 'Dynamic routing' })
+ 
+-    expect(picked.model).toBe('gemini-3.1-pro')
+-    expect(picked.provider).toBe('google')
++    expect(Array.from(selector.querySelectorAll('option')).every(option => !option.value || option.value.startsWith('class:'))).toBe(true)
++    fireEvent.change(selector, { target: { value: 'class:deep' } })
++    expect(onChange).toHaveBeenLastCalledWith({ effort: '', model: 'class:deep', provider: 'auto' })
+   })
+ 
+-  it('never renders MoA presets — a preset is not a worker model', async () => {
+-    getGlobalModelOptions.mockResolvedValue({
+-      providers: [
+-        { models: ['gemini-3.1-pro'], name: 'Google', slug: 'google' },
+-        { models: ['BeastMode'], name: 'Mixture of Agents', slug: 'moa' }
+-      ]
+-    })
++  it('does not display or resubmit a historical concrete pin', () => {
++    const onChange = vi.fn()
+ 
+-    renderMenu()
+-    await screen.findByText(/Gemini 3\.1 Pro/i)
++    render(<ModelOverrideField onChange={onChange} value={{ effort: '', model: 'gpt-6-luna', provider: 'openai-codex' }} />)
++    const selector = screen.getByRole('combobox', { name: 'Dynamic routing' }) as HTMLSelectElement
+ 
+-    expect(screen.queryByText(/BeastMode/)).toBeNull()
++    expect(selector.value).toBe('')
++    fireEvent.change(selector, { target: { value: 'class:fast' } })
++    expect(onChange).toHaveBeenLastCalledWith({ effort: '', model: 'class:fast', provider: 'auto' })
+   })
+-})
+ 
+-// A PATCH body can't say "set to NULL" with a missing key, so clears are
+-// explicit flags; a create should instead OMIT what the user never touched so
+-// the backend's own defaults still apply.
+-describe('REST field mapping', () => {
+-  it('create omits untouched fields', () => {
++  it('retains inherited and depth-only semantics', () => {
++    expect(isInherited(EMPTY_OVERRIDE)).toBe(true)
++    expect(overrideLabel(EMPTY_OVERRIDE, 'Dynamic routing')).toBe('Dynamic routing')
++    expect(overridePatch({ effort: 'ultra', model: '', provider: '' })).toEqual({ clear_model_override: true, reasoning_effort: 'ultra' })
+     expect(overrideCreateFields(EMPTY_OVERRIDE)).toEqual({})
+-    expect(overrideCreateFields({ effort: 'high', model: 'm', provider: 'p' })).toEqual({
+-      model_override: 'm',
+-      provider_override: 'p',
+-      reasoning_effort: 'high'
+-    })
+-  })
+-
+-  it('patch clears explicitly', () => {
+     expect(overridePatch(EMPTY_OVERRIDE)).toEqual({ clear_model_override: true, clear_reasoning_effort: true })
+   })
+ 
+-  it('patch can pin depth alone, leaving the model to the profile', () => {
+-    expect(overridePatch({ effort: 'ultra', model: '', provider: '' })).toEqual({
+-      clear_model_override: true,
+-      reasoning_effort: 'ultra'
+-    })
+-  })
+-
+-  it('a provider is never sent without its model', () => {
+-    expect(overrideCreateFields({ effort: '', model: '', provider: 'google' })).toEqual({})
++  it.each([overridePatch, overrideCreateFields])('refuses concrete or provider-only payloads', mapper => {
++    expect(() => mapper({ effort: '', model: 'grok-4.6', provider: 'xai-oauth' })).toThrow(/dynamic class/)
++    expect(() => mapper({ effort: '', model: '', provider: 'anthropic' })).toThrow(/dynamic class/)
++    expect(() => mapper({ effort: '', model: 'class:deep', provider: 'anthropic' })).toThrow(/dynamic class/)
++    expect(mapper({ effort: 'high', model: 'class:deep', provider: '' })).toMatchObject({ model_override: 'class:deep', provider_override: 'auto', reasoning_effort: 'high' })
+   })
+ })
+diff --git a/apps/desktop/src/plugins/kanban/model-override.tsx b/apps/desktop/src/plugins/kanban/model-override.tsx
+index 430a9f1939..e7552bb02a 100644
+--- a/apps/desktop/src/plugins/kanban/model-override.tsx
++++ b/apps/desktop/src/plugins/kanban/model-override.tsx
+@@ -1,171 +1,88 @@
+-/**
+- * Per-task model override — the board's half of the composer's model picker.
+- *
+- * The MENU is not ours: `ModelCatalogMenu` from the SDK is the same component
+- * the chat composer renders, so search, provider grouping, `-fast` families,
+- * and the thinking/effort submenu behave identically here. What differs is
+- * what a selection MEANS — the controller below holds a detached value instead
+- * of writing to a live session, which is exactly the seam the SDK exposes.
+- *
+- * An unset value means "inherit the assigned profile's own model + effort",
+- * which is what every kanban task did before this existed.
+- */
+-
+-import {
+-  Button,
+-  cn,
+-  Codicon,
+-  DropdownMenu,
+-  DropdownMenuContent,
+-  DropdownMenuTrigger,
+-  ModelCatalogMenu,
+-  ModelMenuCloseContext,
+-  type ModelMenuController,
+-  reasoningEffortLabel
+-} from '@hermes/plugin-sdk'
+-import { useState } from 'react'
++/** Kanban class requirements are independent of interactive chat model selection. */
++import { reasoningEffortLabel } from '@hermes/plugin-sdk'
+ 
+ import { useKanban } from './ui'
+ 
+-/** A task's model override. Empty strings mean "inherit the profile". */
+ export interface TaskModelOverride {
+-  /** '' = profile default, 'none' = thinking off, else a reasoning level. */
+   effort: string
+   model: string
+   provider: string
+ }
+ 
+ export const EMPTY_OVERRIDE: TaskModelOverride = { effort: '', model: '', provider: '' }
++const CLASSES = ['class:fast', 'class:standard', 'class:deep'] as const
+ 
+-/** True when nothing is pinned and the worker profile decides everything. */
+ export const isInherited = (value: TaskModelOverride): boolean =>
+   !value.model.trim() && !value.provider.trim() && !value.effort.trim()
+ 
+-/** The trigger's label: `provider: model · High`, or the inherit copy. */
+-export function overrideLabel(value: TaskModelOverride, inheritCopy: string): string {
+-  if (isInherited(value)) {
+-    return inheritCopy
++function classModel(value: TaskModelOverride): string {
++  const model = value.model.trim()
++
++  if ((model && !(CLASSES as readonly string[]).includes(model)) ||
++    (value.provider.trim() && value.provider.trim() !== 'auto')) {
++    throw new Error('Kanban requires dynamic class routing')
+   }
+ 
++  return model
++}
++
++export function overrideLabel(value: TaskModelOverride, inheritCopy: string): string {
+   const model = value.model.trim()
+-  const base = model ? (value.provider.trim() ? `${value.provider}: ${model}` : model) : inheritCopy
++  const base = (CLASSES as readonly string[]).includes(model) ? model : inheritCopy
+   const effort = value.effort.trim() ? reasoningEffortLabel(value.effort) : ''
+ 
+   return effort ? `${base} · ${effort}` : base
+ }
+ 
+-/**
+- * The picker itself. Controlled: the caller owns the value, so the New Task
+- * dialog can hold it as form state and the drawer can PATCH on change.
+- */
+-export function ModelOverrideField({
+-  onChange,
+-  value
+-}: {
++/** Legacy concrete values are displayed as dynamic routing and never resubmitted. */
++export function ModelOverrideField({ onChange, value }: {
+   onChange: (next: TaskModelOverride) => void
+   value: TaskModelOverride
+ }) {
+   const k = useKanban()
+-  const [open, setOpen] = useState(false)
+-
+-  const controller: ModelMenuController = {
+-    allowSpeed: false,
+-    // Picking a model seeds the depth from what the user last used for it, so
+-    // the board behaves like the composer. We only READ presets — a per-task
+-    // choice must never rewrite what the composer opens at.
+-    applyPreset: (preset, row) =>
+-      onChange({
+-        effort: preset.effort ?? '',
+-        model: row.model,
+-        provider: row.provider
+-      }),
+-
+-    current: { effort: value.effort, fast: false, model: value.model, provider: value.provider },
+-
+-    // Read-only against Hermes' global presets is deliberate: see applyPreset.
+-    presetFor: () => ({}),
+-
+-    select: (model, provider) => {
+-      onChange({ ...value, model, provider })
+-    },
+-
+-    // Fast mode is a live-session request parameter, not something the worker
+-    // spawn can carry (there is no --fast flag), so the menu is told this
+-    // catalog has no fast support and only effort edits arrive here.
+-    setOptions: (patch, row) => {
+-      if (patch.effort === undefined) {
+-        return
+-      }
+-
+-      onChange({ effort: patch.effort, model: row.model, provider: row.provider })
+-    }
+-  }
++  const model = (CLASSES as readonly string[]).includes(value.model) ? value.model : ''
+ 
+   return (
+-    <DropdownMenu onOpenChange={setOpen} open={open}>
+-      <DropdownMenuTrigger asChild>
+-        <Button
+-          className={cn(
+-            'h-8 w-full justify-between gap-2 px-2.5 text-[0.75rem] font-normal',
+-            isInherited(value) && 'text-(--ui-text-tertiary)'
+-          )}
+-          type="button"
+-          variant="outline"
+-        >
+-          <span className="min-w-0 truncate">{overrideLabel(value, k.modelInherit)}</span>
+-          <span className="flex shrink-0 items-center gap-1">
+-            {!isInherited(value) && (
+-              <span
+-                aria-label={k.modelClear}
+-                className="grid size-4 place-items-center rounded text-(--ui-text-tertiary) hover:text-foreground"
+-                onClick={event => {
+-                  // Clear without opening the menu.
+-                  event.preventDefault()
+-                  event.stopPropagation()
+-                  onChange(EMPTY_OVERRIDE)
+-                }}
+-                role="button"
+-              >
+-                <Codicon name="close" size="0.7rem" />
+-              </span>
+-            )}
+-            <Codicon className="opacity-50" name="chevron-down" size="0.7rem" />
+-          </span>
+-        </Button>
+-      </DropdownMenuTrigger>
+-      <DropdownMenuContent align="start" className="w-72 p-0">
+-        <ModelMenuCloseContext.Provider value={() => setOpen(false)}>
+-          <ModelCatalogMenu controller={controller} />
+-        </ModelMenuCloseContext.Provider>
+-      </DropdownMenuContent>
+-    </DropdownMenu>
++    <div className="flex gap-2">
++      <select
++        aria-label={k.modelInherit}
++        className="h-8 min-w-0 flex-1 rounded border bg-background px-2 text-xs"
++        onChange={event => onChange({ ...value, model: event.target.value, provider: event.target.value ? 'auto' : '' })}
++        value={model}
++      >
++        <option value="">{k.modelInherit}</option>
++        {CLASSES.map(level => <option key={level} value={level}>{level}</option>)}
++      </select>
++      <select
++        aria-label={reasoningEffortLabel('high')}
++        className="h-8 rounded border bg-background px-2 text-xs"
++        onChange={event => onChange({ effort: event.target.value, model, provider: model ? 'auto' : '' })}
++        value={value.effort}
++      >
++        <option value="">{k.modelInherit}</option>
++        {['none', 'low', 'medium', 'high', 'ultra'].map(effort =>
++          <option key={effort} value={effort}>{reasoningEffortLabel(effort)}</option>)}
++      </select>
++    </div>
+   )
+ }
+ 
+-/** Translate an override into the REST fields the kanban API expects.
+- *  Used by both create (POST) and edit (PATCH); the explicit clear flags exist
+- *  because `null` in a PATCH body means "field not sent", not "set to NULL". */
+ export function overridePatch(value: TaskModelOverride): Record<string, unknown> {
+-  const model = value.model.trim()
++  const model = classModel(value)
+   const effort = value.effort.trim()
+ 
+   return {
+-    ...(model
+-      ? { model_override: model, provider_override: value.provider.trim() || undefined }
+-      : { clear_model_override: true }),
++    ...(model ? { model_override: model, provider_override: 'auto' } : { clear_model_override: true }),
+     ...(effort ? { reasoning_effort: effort } : { clear_reasoning_effort: true })
+   }
+ }
+ 
+-/** The create-time shape: omit rather than clear, so the backend's own
+- *  defaults apply to fields the user never touched. */
+ export function overrideCreateFields(value: TaskModelOverride): Record<string, unknown> {
+-  const model = value.model.trim()
++  const model = classModel(value)
+   const effort = value.effort.trim()
+ 
+   return {
+-    ...(model ? { model_override: model } : {}),
+-    ...(model && value.provider.trim() ? { provider_override: value.provider.trim() } : {}),
++    ...(model ? { model_override: model, provider_override: 'auto' } : {}),
+     ...(effort ? { reasoning_effort: effort } : {})
+   }
+ }
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 65b1884531..71370cfd12 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -397,7 +397,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         return _err(body_error, 2)
+ 
+     from hermes_cli.kanban_selfwork import SelfWorkError, contract
++    from hermes_cli.kanban_model_neutral import validate_selector, validate_text
+     try:
++        validate_selector(getattr(args, "model_override", None), getattr(args, "provider_override", None),
++                          mandatory=getattr(args, "pin_mandatory", False))
++        validate_text(args.title, body)
+         self_work = contract(getattr(args, "self_work", None))
+         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+         branch_name = _parse_branch_flag(getattr(args, "branch", None))
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 15f9e41830..685e55b719 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -233,7 +233,9 @@ def validate_repair_completion(conn, task_id, *, observation=None):
+                         workspace_kind=original.workspace_kind,
+                         workspace_path=original.workspace_path, skills=original.skills)
+     from hermes_cli.kanban_model_assignment import validate_model_assignment
+-    validate_model_assignment(original.assignee, original.model_override, original.provider_override)
++    from hermes_cli.kanban_model_neutral import routing_view
++    route = routing_view(original)
++    validate_model_assignment(original.assignee, route.model_override, route.provider_override)
+ 
+ 
+ def route(conn, task, payload):
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index bc177ece71..a7b75fbf52 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1026,16 +1026,9 @@ def _host_prefix() -> str:
+ # --- Task creation / mutation ---
+ 
+ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+-    """Strip both; a provider without a model is rejected (a bare ``--provider``
+-    would re-resolve the profile's model against another backend — exactly
+-    the mismatch the override exists to kill)."""
+-    model = (model or "").strip() or None
+-    provider = (provider or "").strip() or None
+-    if provider and not model:
+-        raise ValueError("provider_override requires a model_override")
+-    from hermes_cli.kanban_pin_provider import reject_spaced_pin
+-    reject_spaced_pin(model, provider)
+-    return model, provider
++    """Validate model-neutral class routing at the common mutation boundary."""
++    from hermes_cli.kanban_model_neutral import validate_selector
++    return validate_selector(model, provider)
+ 
+ 
+ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
+@@ -1225,6 +1218,9 @@ def create_task(
+     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+     """
++    from hermes_cli.kanban_model_neutral import validate_selector, validate_text
++    validate_selector(model_override, provider_override, mandatory=pin_mandatory)
++    validate_text(title, body)
+     native_admission.check_entry(conn, origin_intent)
+     self_work = admitted_contract(conn, self_work)
+     validate_admission_class(admission_class, admission_frees)
+@@ -1461,9 +1457,9 @@ def set_model_override(
+         from hermes_cli.kanban_model_assignment import validate_task_pin
+         model, provider = validate_task_pin(conn, task_id, model, provider)
+     return _set_task_override(
+-        conn, task_id,  # clearing the pin clears its mandatory mark; a new pin keeps the card's mark
+-        "UPDATE tasks SET model_override = ?, provider_override = ?, model_pin_mandatory = CASE WHEN ? IS NULL "
+-        "THEN NULL ELSE model_pin_mandatory END WHERE id = ?", (model, provider, model),
++        conn, task_id,
++        "UPDATE tasks SET model_override = ?, provider_override = ?, model_pin_mandatory = NULL WHERE id = ?",
++        (model, provider),
+         "model_override_set", {"model": model, "provider": provider},
+         ("model_override", "provider_override"), archived_msg="cannot set model override",
+     )
+@@ -3446,6 +3442,8 @@ def specify_triage_task(
+     """Update title/body/assignee (when given) and move ``triage -> todo`` in one txn; False when not in triage.
+     Lands in ``todo`` (not ``ready``) so parent gating still applies; the audit comment only when a field changed.
+     """
++    from hermes_cli.kanban_model_neutral import validate_text
++    validate_text(title, body)
+     if title is not None and not title.strip():
+         raise ValueError("title cannot be blank")
+     from hermes_cli.kanban_gate_only import create_assignee
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 3ae9085cbb..263823913b 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -83,6 +83,8 @@ def edit_task(
+     stale read can't slip past it. ``priority_reason`` lands in the ``reprioritized``
+     event payload. [daveey]
+     """
++    from hermes_cli.kanban_model_neutral import validate_text
++    validate_text(title, body)
+     from hermes_cli.kanban_priority import bounded
+     if priority_bump is not None and (priority is not None or priority_bump <= 0):
+         raise ValueError("priority_bump must be positive and cannot be combined with priority")
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 00003f626c..262e3dfa90 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -174,6 +174,8 @@ def candidate_route(conn: sqlite3.Connection, task: Any, lane: str) -> tuple[Opt
+     (``[]`` = unknown, the card starts). With tiers off/out of scope, use the assignee's
+     own class registry; its claim-time offer is checked against that profile route."""
+     from hermes_cli.kanban_model_tier import profile_route, resolve_dispatch_tier
++    from hermes_cli.kanban_model_neutral import routing_view
++    task = routing_view(task)
+     model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane)
+     route = (model, provider, reason) if model else None
+     if not model:
+@@ -376,7 +378,7 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+     holds. [daveey] (t_d943a79dd2b3889f)"""
+     from hermes_cli import kanban_db as kb
+     task = kb.get_task(conn, task_id)
+-    if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
++    if task is None:
+         return None
+     providers = [p for p in candidate_providers(conn, task, lane) if p in cfg.providers]
+     if not providers:
+diff --git a/hermes_cli/kanban_mandatory_pin.py b/hermes_cli/kanban_mandatory_pin.py
+index 9f0b0dbe3f..b5ac96e995 100644
+--- a/hermes_cli/kanban_mandatory_pin.py
++++ b/hermes_cli/kanban_mandatory_pin.py
+@@ -47,12 +47,9 @@ def pin_of(item: Mapping[str, Any]) -> Optional[tuple[str, str]]:
+     """``(model, provider)`` of a mandatory pin, from create args (``pin_mandatory``/``model``/``provider``) or a
+     card row (``model_pin_mandatory``/``model_override``/``provider_override``); None when there is none.
+     A mark without a model pins nothing (``kanban_pin_reroute.mandatory_column`` refuses it at create)."""
+-    if not (item.get("pin_mandatory") or item.get("model_pin_mandatory")):
+-        return None
+-    model = _str(item.get("model_override")) or _str(item.get("model"))
+-    if not model:
+-        return None
+-    return model, (_str(item.get("provider_override")) or _str(item.get("provider"))).lower()
++    # Stored/synced mandatory flags remain historical evidence, never placement
++    # authority. New flags are rejected at ingress instead of transported.
++    return None
+ 
+ 
+ def requirements(item: Mapping[str, Any]) -> set[str]:
+@@ -103,41 +100,8 @@ def mark(conn: Any, task_id: str) -> bool:
+     (``hermes kanban set-model <id> --mandatory``), so a later mark is fenced like a create-time one (review
+     5879416189 on #1622). Raises ValueError for a card without a model pin or a worker-first card
+     (:func:`mark_refusal`), RuntimeError for an archived one. False when the card does not exist."""
+-    import json
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli.kanban_db_connect import write_txn
+-    # Read runs_on whatever this process's sync mode: a process without sync writing to an attached board must
+-    # still label a pool card, or the Board would lease the mark to an old core (review 5879616348 on #1622).
+-    placed = "runs_on" in sync.table_columns(conn, "tasks")
+-    me = _gateway_id(conn) if placed else ""
+-    fields: tuple[str, ...] = ("model_pin_mandatory",)
+-    with write_txn(conn):
+-        row = conn.execute("SELECT status, model_override, " + ("runs_on" if placed else "NULL") +
+-                           " FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-        if row is None:
+-            return False
+-        if row[0] == "archived":
+-            raise RuntimeError(f"cannot change the model pin on archived task {task_id}")
+-        if not _str(row[1]):
+-            raise ValueError("--mandatory needs a model pin: set a model first")
+-        if (why := mark_refusal(conn, task_id)) is not None:
+-            raise ValueError(why)
+-        conn.execute("UPDATE tasks SET model_pin_mandatory = 1 WHERE id = ?", (task_id,))
+-        payload: dict[str, Any] = {"mandatory": True}
+-        try:
+-            labels = json.loads(row[2]) if row[2] else []
+-        except ValueError:
+-            labels = []
+-        if isinstance(labels, list) and labels:
+-            new = carry(labels, {"model_override": row[1], "model_pin_mandatory": 1}, me=me)
+-            if new != labels:
+-                conn.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps(new), task_id))
+-                payload.update(runs_on=new, previous_runs_on=labels)
+-                fields = ("model_pin_mandatory", "runs_on")
+-        kb._append_event(conn, task_id, "model_pin_mandatory_set", payload)
+-    kb.notify_task_updated(conn, task_id, fields)
+-    return True
++    from hermes_cli.kanban_model_neutral import ERROR
++    raise ValueError(ERROR)
+ 
+ 
+ def _gateway_id(conn: Any) -> str:
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+index 9651299b78..bdb70361bf 100644
+--- a/hermes_cli/kanban_model_assignment.py
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -180,7 +180,9 @@ def route_model_mismatch(conn, task, *, dry_run=False):
+     from hermes_cli import kanban_db as kb
+ 
+     try:
+-        validate_model_assignment(task.assignee, task.model_override, task.provider_override)
++        from hermes_cli.kanban_model_neutral import routing_view
++        route = routing_view(task)
++        validate_model_assignment(task.assignee, route.model_override, route.provider_override)
+     except ModelProviderMismatchError as exc:
+         if not dry_run:
+             from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
+diff --git a/hermes_cli/kanban_model_neutral.py b/hermes_cli/kanban_model_neutral.py
+new file mode 100644
+index 0000000000..6a974cd62e
+--- /dev/null
++++ b/hermes_cli/kanban_model_neutral.py
+@@ -0,0 +1,96 @@
++"""Model-neutral Kanban specifications; execution receipts remain concrete.
++
++Ingress rejects restrictions rather than silently accepting an ineffective pin.
++Legacy routing reads use a separate projection and never rewrite author history.
++Interactive sessions and the model catalog are deliberately outside this policy.
++"""
++from __future__ import annotations
++
++import re
++from agent.model_routing import is_class_selector
++
++ERROR = 'Kanban is model-neutral: use a class/tier or capability requirement, not a concrete model/provider or mandatory pin'
++# Match directives, not incidental named execution evidence or author exclusions.
++_REQUIRED = re.compile(r'^\s*require_model\s*:\s*(?:true|yes|1)\s*$', re.IGNORECASE | re.MULTILINE)
++_MODEL = re.compile(r'(?:\b|(?<=independent)|(?<=primary))(?:gpt-[\w.-]+|claude-[\w.-]+|grok-[\w.-]+|gemini-[\w.-]+|opus|sonnet|fable|astra|luna|sol)\b', re.IGNORECASE)
++_FORCE = re.compile(r'\b(?:mandatory|required|must|only|pinned|pin|no fallback)\b', re.IGNORECASE)
++
++
++def validate_selector(model=None, provider=None, *, mandatory=False):
++    """Validate newly supplied selectors without consulting quota or credentials."""
++    model = (model or '').strip() or None
++    provider = (provider or '').strip() or None
++    if mandatory or (model and not is_class_selector(model)) or (provider and provider != 'auto'):
++        raise ValueError(ERROR)
++    if provider and not model:
++        raise ValueError(ERROR)
++    return model, ('auto' if model else None)
++
++
++def validate_text(*values):
++    """Reject positive machine directives and explicit named-model obligations.
++
++    A free-form historical observation is not a restriction. Authorship markers,
++    exclusions and negated restrictions are deliberately not rewritten here.
++    """
++    for text in values:
++        for line in (text or '').splitlines():
++            if _REQUIRED.search(line):
++                raise ValueError(ERROR)
++            if line.lstrip().startswith('<!-- implementer-models:'):
++                continue
++            for clause in re.split(r'(?<=[.!?;])\s+', line):
++                if not _MODEL.search(clause):
++                    continue
++                # Negation applies to the directive, not any unrelated safety
++                # sentence elsewhere on the same line.
++                if re.search(r'\b(?:never|do not|must not)\s+(?:pin|require|restrict)', clause, re.IGNORECASE):
++                    continue
++                if re.search(r'\b(?:implementer models|forbidden overlaps|excluded models|exclude)\s*:', clause, re.IGNORECASE):
++                    continue
++                if re.search(r'\b(?:differ from|not be reviewed by|other than|distinct from|not (?:the )?same as)\b', clause, re.IGNORECASE):
++                    continue
++                if re.search(r'\b(?:prior|previous|historical)\s+(?:reviewer|review|run|session)', clause, re.IGNORECASE):
++                    continue
++                named_review = re.search(
++                    r'(?:primary|independent|exact[- ]?head)[ -]*(?:opus|sonnet|fable|astra|luna|sol)\b'
++                    r'|\breview\s*\((?:claude-|gpt-|grok-|gemini-)', clause, re.IGNORECASE)
++                if _FORCE.search(clause) or named_review:
++                    raise ValueError(ERROR)
++
++
++def forwarded_text(text):
++    """Retain superseded legacy directives as labelled evidence, not new policy."""
++    lines = []
++    for line in (text or '').splitlines():
++        try:
++            validate_text(line)
++        except ValueError:
++            line = 'Historical run instruction (superseded and not active): ' + line
++        lines.append(line)
++    return '\n'.join(lines)
++
++
++def effective_selector(task):
++    """Ignore legacy concrete restrictions without mutating stored author evidence."""
++    model = str(getattr(task, 'model_override', None) or '').strip()
++    return (model if is_class_selector(model) else 'class:standard'), 'auto'
++
++
++def routing_view(task):
++    """A next-admission view, never a replacement for the historical author row."""
++    from copy import copy
++    view = copy(task)
++    view._routing_source = getattr(task, '_routing_source', task)
++    model = str(getattr(task, 'model_override', None) or '').strip()
++    view.model_override = model if is_class_selector(model) else None
++    view.provider_override = 'auto' if view.model_override else None
++    view.model_pin_mandatory = None
++    return view
++
++
++def validate_review(metadata):
++    """New handoff metadata is policy, unlike past run/model evidence."""
++    model, provider = validate_selector(metadata.get('review_model'), metadata.get('review_provider'),
++                                        mandatory=metadata.get('pin_mandatory') or metadata.get('require_model'))
++    return (model, provider, 'review_override') if model else None
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index e550d714dd..a07aa7c5db 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -90,29 +90,33 @@ def resolve_model_tier(
+     """``(model, provider, reason)`` for a claimed task. ``model`` is None when the worker keeps whatever it
+     would have run on anyway (its own pin or the profile's model); ``reason`` names the rule that decided."""
+     cfg = load_tier_config() if cfg is None else cfg
++    from agent.model_routing import is_class_selector
+     default_model = _str(cfg.get("default_model"))
++    if not is_class_selector(default_model):
++        default_model = "class:standard"
+     from hermes_cli.kanban_review_model import is_review_run
+     if is_review_run(conn, task, lane):
+         from hermes_cli.kanban_review_model import resolve_review_model
+         review = resolve_review_model(conn, task, cfg)
+         if review is not None:
+             return review
+-    if _str(getattr(task, "model_override", None)):
+-        return None, None, "pinned"
++    selector = _str(getattr(task, "model_override", None))
++    if is_class_selector(selector):
++        return selector, "auto", "class"
+     if not default_model:
+         return None, None, "off"
+     profiles = _as_list(cfg.get("default_model_profiles"))
+     if profiles and _str(getattr(task, "assignee", None)) not in profiles:
+-        return None, None, "profile_out_of_scope"
++        return "class:standard", "auto", "profile_out_of_scope"
+     # Class defaults opt into class-preserving routing. Strong work must not
+     # fall back to a profile that may itself now default to standard/fast.
+     from agent.model_routing import is_class_selector
+     strong_model = _str(cfg.get("strong_model"))
+     strong: tuple[Optional[str], Optional[str]]
+-    if strong_model:
++    if strong_model and is_class_selector(strong_model):
+         # An explicit strong tier names its model, so review/retry work no longer follows whatever the
+         # profile's default happens to be (a profile switch once moved 558 strong runs to a GPT).
+-        strong = (strong_model, _str(cfg.get("strong_provider")) or infer_provider(strong_model))
++        strong = (strong_model, "auto")
+     else:
+         strong = ("class:deep", "auto") if is_class_selector(default_model) else (None, None)
+     if lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or []):
+@@ -131,7 +135,7 @@ def resolve_model_tier(
+                 return *strong, f"pattern:{pattern}"
+         except re.error as exc:
+             logger.warning("kanban model tier: bad default_model_keep_patterns entry %r (%s)", pattern, exc)
+-    return default_model, _str(cfg.get("default_provider")) or infer_provider(default_model), "default"
++    return default_model, "auto", "default"
+ 
+ 
+ def infer_provider(model: str) -> Optional[str]:
+@@ -211,7 +215,8 @@ def owner_model_pin(conn: sqlite3.Connection, task: Any) -> tuple[Optional[str],
+     ``model_tier`` event; without one the row's overrides apply. A class selector always runs with
+     provider ``auto`` (:func:`worker_model_args`), so the profile's concrete provider never pins a class."""
+     import json
+-    model, provider = _str(getattr(task, "model_override", None)) or None, _str(getattr(task, "provider_override", None)) or None
++    from hermes_cli.kanban_model_neutral import effective_selector
++    model, provider = effective_selector(task)
+     run_id = getattr(task, "current_run_id", None)
+     if run_id is not None:
+         row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='model_tier' "
+@@ -332,6 +337,8 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+     """One read-only route decision for preview and actual admission."""
+     base = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++    from hermes_cli.kanban_model_neutral import routing_view
++    task = routing_view(task)
+     from hermes_cli.kanban_review_model import is_review_run, mandatory_reviewer_pin
+     if is_review_run(conn, task, lane) and mandatory_reviewer_pin(task):
+         return base  # a mandatory reviewer pin never moves: not off a wall, an episode or a hold
+@@ -506,8 +513,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+     if reason != "off":
+         try:
+             from hermes_cli import kanban_db as _kb
+-            payload = {"reason": reason, "model": model or _str(getattr(task, "model_override", None)) or None,
+-                       "provider": provider or _str(getattr(task, "provider_override", None)) or None,
++            payload = {"reason": reason, "model": model,
++                       "provider": provider,
+                        "lane": lane}
+             payload.update(_ratio_block(conn, task, reason))
+             if is_review:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index be2cfd8248..a1539fc642 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -331,15 +331,11 @@ _SPECS = [
+                   f"the dispatcher's kanban.failure_limit config (default "
+                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
+         _arg("--model", dest="model_override",
+-             help="Pin the worker to this model (passed as -m <model>) without "
+-                  "changing the profile's configured model. Combine with --provider "
+-                  "when the model belongs to a different backend than the profile's default."),
++             help="Optional class:<tier> selector. Concrete model IDs are rejected."),
+         _arg("--provider", dest="provider_override",
+-             help="Provider the --model belongs to (passed as --provider <name> to "
+-                  "the worker). Requires --model."),
++             help="Only auto with a class selector is accepted; concrete providers are rejected."),
+         _arg("--pin-mandatory", action="store_true", dest="pin_mandatory",
+-             help="The --model pin is mandatory: a far quota wall never moves it to a same-class peer. "
+-                  "Requires --model."),
++             help="Deprecated and rejected: Kanban does not permit mandatory model pins."),
+         _arg("--completion-contract", metavar="CONTRACT",
+              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+         _arg("--review-required", action="store_true", help="Require a reviewer before completion"),
+@@ -409,14 +405,12 @@ _SPECS = [
+          help="Assign or reassign a task"),
+     _cmd("set-model", [
+         _TASK_ID,
+-        _arg("model", nargs="?", help="Model to pin the worker to (or 'none' to clear the override)"),
++        _arg("model", nargs="?", help="class:<tier> selector, or 'none' to clear a legacy restriction"),
+         _arg("--provider",
+-             help="Provider the model belongs to (worker is spawned with "
+-                  "--provider <name>). Cleared together with the model."),
++             help="Only auto with a class selector is accepted. Cleared together with the selector."),
+         _arg("--mandatory", action=argparse.BooleanOptionalAction, default=None,
+-             help="--mandatory: a far quota wall never moves this pin to a same-class peer (the card waits "
+-                  "for the reset). --no-mandatory lifts that. Omit to keep the card's setting."),
+-    ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
++             help="--mandatory is rejected. --no-mandatory clears a legacy flag without changing a live client."),
++    ], help="Set a class selector or clear legacy routing restrictions for future dispatch"),
+     _cmd("reclaim", [
+         _TASK_ID, _RECLAIM_REASON,
+         _arg("--urgency-source", dest="urgency_source", choices=("explicit_operator",), default=None,
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index 33502ac346..bfeca53548 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -50,11 +50,8 @@ def _norm(value: Any) -> str:
+ 
+ 
+ def is_mandatory_pin(task: Any) -> bool:
+-    """True when the card's creator said its pin must never move."""
+-    from hermes_cli.kanban_provider_walls import requires_model
+-    if getattr(task, "model_pin_mandatory", None):
+-        return True
+-    return requires_model(task)
++    """Legacy marks have no routing authority; new marks are rejected at ingress."""
++    return False
+ 
+ 
+ def min_wall_seconds(cfg: Optional[dict]) -> float:
+@@ -235,27 +232,24 @@ def record(conn: Any, task: Any, origin: tuple[str, str], target: tuple[str, str
+     until = f"until {_pt(resets_at)}" if resets_at else "until its quota resets"
+     kb.add_comment(conn, task.id, COMMENT_AUTHOR, (
+         f"Quota wall: {origin[0]} ({origin[1]}) is out {until}. This card's runs use {target[0]} "
+-        f"({target[1]}), the same model class, until then; the pin itself is unchanged and the first run "
+-        f"after the reset uses it again. To make this card wait for its pin instead: "
+-        f"`hermes kanban set-model {task.id} {origin[0]} --provider {origin[1]} --mandatory`."))
++        f"({target[1]}), selected dynamically within the required class. Kanban does not accept concrete model "
++        f"or provider pins; reserve and independent-review gates still apply."))
+     return payload
+ 
+ 
+ def mandatory_column(pin_mandatory: Any, model_override: Optional[str]) -> Optional[int]:
+     """``tasks.model_pin_mandatory`` for a new card: 1 or NULL. A mark needs a pin to mark."""
+-    if not pin_mandatory:
+-        return None
+-    if not _norm(model_override):
+-        raise ValueError("pin_mandatory requires a model pin")
+-    return 1
++    from hermes_cli.kanban_model_neutral import validate_selector
++    validate_selector(model_override, mandatory=pin_mandatory)
++    return None
+ 
+ 
+ def set_pin_mandatory(conn: Any, task_id: str, mandatory: bool) -> bool:
+     """Mark (or unmark) a card's model pin as mandatory: a quota wall never moves a mandatory pin."""
+     from hermes_cli import kanban_db as kb
+-    if mandatory:  # also fences the placed card: kanban_mandatory_pin.mark
+-        from hermes_cli.kanban_mandatory_pin import mark
+-        return mark(conn, task_id)
++    if mandatory:
++        from hermes_cli.kanban_model_neutral import ERROR
++        raise ValueError(ERROR)
+     return kb._set_task_override(
+         conn, task_id, "UPDATE tasks SET model_pin_mandatory = ? WHERE id = ?", (None,),
+         "model_pin_mandatory_set", {"mandatory": False}, ("model_pin_mandatory",),
+@@ -267,6 +261,8 @@ def set_model_cli(conn: Any, task_id: str, raw_model: Optional[str], model: Opti
+     """``hermes kanban set-model``: ``(found, wrote_model)``. A bare ``--[no-]mandatory`` changes only the
+     mark (``set-model <id>`` alone still clears the pin, as before)."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_model_neutral import validate_selector
++    validate_selector(model, provider, mandatory=bool(mandatory))
+     if raw_model is None and mandatory is not None:
+         return set_pin_mandatory(conn, task_id, mandatory), False
+     if mandatory:  # refuse before the model write, so a refused mark changes nothing
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 91d2e96f44..2384fbad84 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -466,6 +466,8 @@ def remote_args(conn: sqlite3.Connection, task, *, self_gw: str, board: Optional
+     (default: the board ``conn`` opened), named in the footer's read target."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_placement import EVIDENCE_CLOSE, EVIDENCE_OPEN
++    from hermes_cli.kanban_model_neutral import forwarded_text, routing_view
++    task = routing_view(task)
+     parents = kb.parent_ids(conn, task.id)
+     summaries = kb.latest_summaries(conn, parents) if parents else {}
+     lines = []
+@@ -473,7 +475,7 @@ def remote_args(conn: sqlite3.Connection, task, *, self_gw: str, board: Optional
+         p = kb.get_task(conn, pid)
+         handoff = (summaries.get(pid) or (p.result if p else None) or "(no handoff)").strip()
+         lines.append(_quoted(f"- {pid} ({p.title if p else '?'}): {handoff[:1500]}"))
+-    body = _own_text((task.body or "").rstrip())
++    body = forwarded_text(_own_text((task.body or "").rstrip()))
+     if lines:
+         board = board or opened_board(conn)
+         # Spell the tool's read call: "with cross_task @task:..." parses as an unknown explicit invocation in
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 832f8bfcb5..a224b76e9c 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -40,8 +40,8 @@ _RETRY_RE = re.compile(r"retry[\s_-]*after[:=\s]+(\d+)\s*s", re.IGNORECASE)
+ 
+ 
+ def requires_model(task: Any) -> bool:
+-    """True when the card's body carries a ``require_model: true`` line: its route must never be moved."""
+-    return bool(_REQUIRE_MODEL_RE.search(str(getattr(task, "body", "") or "")))
++    """Historical body directives cannot override model-neutral routing policy."""
++    return False
+ 
+ 
+ def walls_path() -> Path:
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index bdbbebe531..67c7410745 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -168,10 +168,12 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+             assignee = recovery_assignee(task) if goal else create_assignee(row['assignee'] or 'default')
+             if not assignee:
+                 continue
++            from hermes_cli.kanban_model_neutral import routing_view
++            route = routing_view(task)
+             rec = kb.create_task(
+                 conn, title=f"Recover {target}: {'goal unachievable' if goal else 'continuation budget exhausted'}"[:200],
+                 body=(_goal_body if goal else _body)(target, row["title"] or "", park_id), assignee=assignee,
+-                model_override=task.model_override, provider_override=task.provider_override,
++                model_override=route.model_override, provider_override=route.provider_override,
+                 requires=['terminal', 'file', 'kanban'] if goal else None,
+                 created_by=CREATED_BY, workspace_kind="scratch", tenant=row["tenant"],
+                 idempotency_key=_key(target, history.park_identity(conn, target) or park_id),
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 7fe6c2b37d..f22d161978 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -77,6 +77,7 @@ def implementer_models(conn, task) -> set[str]:
+     review-only retries and missing receipts preserve the previous authors.
+     Related source cards are traversed with a visited set to tolerate cyclic links.
+     """
++    task = getattr(task, "_routing_source", task)
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_review_sources import source_reader
+     seen = set()
+@@ -251,27 +252,19 @@ def _handoff(conn, task):
+ 
+ 
+ def _override(conn, task):
+-    return validate_review_override(_handoff(conn, task)[1])
++    from hermes_cli.kanban_model_neutral import validate_review
++    metadata = _handoff(conn, task)[1]
++    # Historical concrete overrides are evidence, not future dispatch authority.
++    from agent.model_routing import is_class_selector
++    if not is_class_selector(str(metadata.get("review_model") or "")):
++        return None
++    return validate_review({"review_model": metadata["review_model"], "review_provider": "auto"})
+ 
+ 
+ def validate_review_override(metadata):
+-    """Shared ingress/dispatch contract, including legacy automatic class routing."""
+-    model = metadata.get("review_model")
+-    if model is None:
+-        return None
+-    if not isinstance(model, str) or not model.strip():
+-        raise ReviewModelUnavailable("review_model must be a nonempty model identifier")
+-    from hermes_cli.kanban_model_tier import infer_provider
+-    provider = metadata.get("review_provider")
+-    if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+-        raise ReviewModelUnavailable("review_provider must be a nonempty provider identifier")
+-    model = model.strip()
+-    provider = (provider or ("auto" if is_class_selector(model) else infer_provider(model)))
+-    if is_class_selector(model):
+-        if provider not in ("auto", "board-default"):
+-            raise ReviewModelUnavailable("A review class requires provider auto")
+-        provider = "auto"  # Historical handoffs used the board-default sentinel.
+-    return model, provider, "review_override"
++    """Validate new review routing requirements before ending the author run."""
++    from hermes_cli.kanban_model_neutral import validate_review
++    return validate_review(metadata)
+ 
+ 
+ def registry_refusal(model, provider, assignee):
+@@ -410,8 +403,6 @@ def resolve_review_model(conn, task, cfg):
+             raise ReviewModelUnavailable(f"Review model {override[0]} is unroutable: {why}")
+ 
+     from hermes_cli.kanban_llm_pacing_dispatch import held_pools
+-    from hermes_cli.kanban_model_tier import infer_provider
+-    from hermes_cli.kanban_pin_reroute import is_mandatory_pin
+     now = time.time()
+     walls = pw.active_walls(now=now)
+     holds = held_pools(cfg.get("llm_pacing"), now)
+@@ -445,16 +436,9 @@ def resolve_review_model(conn, task, cfg):
+         if not _unavailable(override[0], override[1]):
+             return override
+         override_moved = True
+-    # A downstream pin names its reviewer. Mandatory pins never move: the
+-    # provider governor still judges held/walled pools before launching.
+-    pin = str(getattr(task, "model_override", None) or "").strip()
++    # Historical reviewer pins are audit evidence, not candidates or mandates.
++    # Authorship is diagnostic; separate execution is enforced by verdict custody.
+     candidates = independent_routes(set(), cfg, assignee)
+-    if _downstream(task) and pin and not is_class_selector(pin):
+-        pin_route = (pin, getattr(task, "provider_override", None) or infer_provider(pin))
+-        if is_mandatory_pin(task):
+-            return (*pin_route, "review_unpinned")
+-        from itertools import chain
+-        candidates = chain([pin_route], candidates)
+     independent_candidate = False
+     for model, provider in candidates:
+         independent_candidate = True
+diff --git a/hermes_cli/kanban_selfwork_outbound.py b/hermes_cli/kanban_selfwork_outbound.py
+index 10c1fe9323..e31f9896d1 100644
+--- a/hermes_cli/kanban_selfwork_outbound.py
++++ b/hermes_cli/kanban_selfwork_outbound.py
+@@ -68,6 +68,9 @@ def prepare(args):
+ 
+ 
+ def submit(args):
++    from hermes_cli.kanban_model_neutral import validate_selector, validate_text
++    validate_selector(args.get('model'), args.get('provider'), mandatory=args.get('pin_mandatory'))
++    validate_text(args.get('title'), args.get('body'))
+     home, body, request_id = prepare(args)
+     return send(home, body, request_id)
+ 
+@@ -93,6 +96,10 @@ def send(home, body, request_id):
+ 
+ 
+ def cli_submit(args, *, body, workspace_kind, workspace_path, max_runtime, branch_name):
++    from hermes_cli.kanban_model_neutral import validate_selector, validate_text
++    validate_selector(getattr(args, 'model_override', None), getattr(args, 'provider_override', None),
++                      mandatory=getattr(args, 'pin_mandatory', False))
++    validate_text(getattr(args, 'title', None), body)
+     if branch_name or getattr(args, 'reasoning_effort', None):
+         raise SelfWorkError('self-work courier does not support branch or reasoning_effort yet')
+     names = ('title', 'assignee', 'tenant', 'priority', 'admission_class', 'admission_frees',
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 9b7fee85c8..3e9b49e091 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -274,29 +274,18 @@ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+         receipt = _run_receipt(conn, task_id, task.current_run_id)
+         if receipt is not None:
+             return receipt
++    from hermes_cli.kanban_model_neutral import effective_selector
+     try:
+-        from hermes_cli.kanban_model_assignment import _assignee_config
+-        from hermes_cli.kanban_pin_provider import resolve_legacy_pin
+         cfg = tier.load_tier_config()
+-        model, provider, reason = tier.resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
++        model, provider, _reason = tier.resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
+         chosen = bool(model)
+-        if reason == "pinned" and not task.provider_override:
+-            task.provider_override = resolve_legacy_pin(task)[0]
+-        if model:
+-            task.model_override, task.provider_override = model, provider
+-        model, provider = task.model_override, task.provider_override
++        if not model:
++            model, provider = effective_selector(task)
+         if model and model.startswith("class:"):
+             if chosen and tier.class_unroutable_reason(model):
+                 model = provider = None
+             else:
+                 return model, None, lane
+-        if not model:
+-            config = _assignee_config(task.assignee) or {}
+-            block = config.get("model") or {}
+-            if isinstance(block, dict):
+-                model, provider = block.get("default"), block.get("provider")
+-        if model and model.startswith("class:"):
+-            provider = None
+         return _optional_text(model), _provider(provider), lane
+     except Exception:  # route preview is best-effort: unknown routing stays conservative
+         logger.debug("kanban shared blockers: route preview failed for %s", task_id, exc_info=True)
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index f224ddf8b7..394cd552c3 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -660,8 +660,13 @@ class _StatusRejected(Exception):
+ def _validate_request_entry(payload) -> None:
+     """Reject ignored or mixed evidence writes before any assignment/status mutation."""
+     from hermes_cli.kanban_human_request import validate_human_request
++    from hermes_cli.kanban_model_neutral import validate_selector, validate_text, validate_review
+ 
+     with _value_error_400():
++        validate_selector(getattr(payload, "model_override", None), getattr(payload, "provider_override", None))
++        validate_text(getattr(payload, "title", None), getattr(payload, "body", None))
++        if getattr(payload, "status", None) == "review":
++            validate_review(getattr(payload, "metadata", None) or {})
+         validate_human_request(payload.human_request, kind=payload.block_kind)
+         if payload.metadata_only:
+             allowed = {"ids", "human_request", "metadata_only", "block_reason"}
+@@ -776,25 +781,12 @@ def _refusal_detail(conn, task_id: str, s: str) -> Optional[str]:
+ 
+ 
+ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
+-    """PATCH title/body phase: one UPDATE + ``edited`` event, then the post-commit observer
+-    (field names only — values never leave the DB via this payload)."""
+-    with kanban_db.write_txn(conn):
+-        sets, vals = [], []
+-        if payload.title is not None:
+-            if not payload.title.strip():
+-                raise HTTPException(status_code=400, detail="title cannot be empty")
+-            sets.append("title = ?")
+-            vals.append(payload.title.strip())
+-        if payload.body is not None:
+-            sets.append("body = ?")
+-            vals.append(payload.body)
+-        vals.append(task_id)
+-        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+-        conn.execute(
+-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', NULL, ?)",
+-            (task_id, int(time.time())))
+-    kanban_db.notify_task_updated(
+-        conn, task_id, [f for f in ("title", "body") if getattr(payload, f) is not None], board=board)
++    """Use the shared mutation boundary, not a dashboard-only body writer."""
++    if payload.title is not None and not payload.title.strip():
++        raise HTTPException(status_code=400, detail="title cannot be empty")
++    with _value_error_400():
++        kanban_db.edit_task(conn, task_id, title=payload.title.strip() if payload.title is not None else None,
++                            body=payload.body, board=board)
+ 
+ 
+ @router.patch("/tasks/{task_id}")
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index ad6af5308b..adab8bc884 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -1,8 +1,6 @@
+ """LLM quota pacing governor: pool math and Kanban dispatch admission (t_01a1d975f57bb7b8). [daveey]"""
+ from __future__ import annotations
+ 
+-import ast
+-import pathlib
+ import time
+ from types import SimpleNamespace
+ 
+@@ -134,6 +132,7 @@ def test_window_kind_maps_anthropic_and_codex_labels():
+ @pytest.fixture
+ def paced_board(board, monkeypatch):
+     monkeypatch.setattr(pd, "_CACHE", {})
++    monkeypatch.setattr(pd, "_CLASS_CACHE", {})
+     return board
+ 
+ 
+@@ -151,7 +150,13 @@ def _dispatch(conn):
+ 
+ 
+ def _opus_card(conn, title="work", **kw):
+-    return kb.create_task(conn, title=title, assignee="default", model_override=OPUS, provider_override="anthropic", **kw)
++    mandatory = kw.pop("pin_mandatory", False)
++    tid = kb.create_task(conn, title=title, assignee="default", model_override="class:standard", **kw)
++    if mandatory:
++        # Historical mark, seeded only in the isolated board fixture.
++        conn.execute("UPDATE tasks SET model_override=?, provider_override='anthropic', model_pin_mandatory=1 WHERE id=?", (OPUS, tid))
++        conn.commit()
++    return tid
+ 
+ 
+ def test_pool_ahead_of_pace_starts_cards_by_default(paced_board, monkeypatch):
+@@ -247,13 +252,14 @@ def test_governor_off_is_todays_behaviour(paced_board, monkeypatch):
+     assert seen == [tid]
+ 
+ 
+-def test_mandatory_pin_is_never_throttled(paced_board, monkeypatch):
++def test_legacy_mandatory_pin_cannot_bypass_reserve_hold(paced_board, monkeypatch):
+     _write_cfg(paced_board)
+     _usage(monkeypatch, 99, 9 * HOUR)
+     with kbc.connect() as conn:
+         tid = _opus_card(conn, pin_mandatory=True)
+-        seen, _ = _dispatch(conn)
+-    assert seen == [tid]
++        seen, result = _dispatch(conn)
++    assert seen == []
++    assert (tid, lp.GUARD_REASON) in result.respawn_guarded
+ 
+ 
+ def test_usage_read_failure_starts_the_card(paced_board, monkeypatch):
+@@ -275,92 +281,3 @@ def test_ungoverned_provider_is_not_throttled(paced_board, monkeypatch):
+         tid = _opus_card(conn)
+         seen, _ = _dispatch(conn)
+     assert seen == [tid]
+-
+-
+-def test_only_kanban_dispatch_consults_the_governor():
+-    """Chats, cron and notice delivery never hold a card on it, read usage through it or write its state: only the
+-    dispatcher's claim path does. The one other reader is the stall notice (``kanban_parent_unclaimed``,
+-    t_01a1db9d9538716b), and it may take only the read-only view of the stored pace (``NOTICE_VIEW``)."""
+-    root = pathlib.Path(pd.__file__).resolve().parents[1]
+-    users = sorted(str(p.relative_to(root)) for top in ("agent", "gateway", "cron", "hermes_cli", "tui_gateway")
+-                   if (root / top).is_dir() for p in (root / top).rglob("*.py")
+-                   if "kanban_llm_pacing" in p.read_text(encoding="utf-8-sig", errors="ignore"))
+-    # The dispatcher reaches the governor through kanban_start_gate.pre_claim_hold (its last waits before a claim).
+-    assert users == ["hermes_cli/kanban_db_edit.py",
+-                     "hermes_cli/kanban_dispatch_maintenance.py",
+-                     "hermes_cli/kanban_llm_pacing.py", "hermes_cli/kanban_llm_pacing_dispatch.py",
+-                     "hermes_cli/kanban_llm_pacing_history.py",
+-                     "hermes_cli/kanban_paced_reroute.py",
+-                     "hermes_cli/kanban_parent_unclaimed.py", "hermes_cli/kanban_ratio_routing.py",
+-                     "hermes_cli/kanban_review_model.py",
+-                     "hermes_cli/kanban_start_gate.py",
+-                     "hermes_cli/kanban_worker_node.py"]
+-    assert _governor_names(root / "hermes_cli/kanban_start_gate.py") == {"kanban_llm_pacing_dispatch": {"hold"}}
+-    assert "kanban_start_gate import pre_claim_hold" in (root / "hermes_cli/kanban_db_dispatch.py").read_text(encoding="utf-8-sig")
+-    assert _governor_names(root / "hermes_cli/kanban_dispatch_maintenance.py") == {
+-        "kanban_llm_pacing_dispatch": {"refresh_pools"}}
+-    assert _governor_names(root / "hermes_cli/kanban_parent_unclaimed.py") == NOTICE_VIEW
+-    # ``hermes kanban edit`` refuses an unreasoned raise on a held card (agent-6f3c6009b5): the same read-only view.
+-    assert _governor_names(root / "hermes_cli/kanban_db_edit.py") == EDIT_VIEW
+-    assert _governor_names(root / "hermes_cli/kanban_worker_node.py") == PICKUP_VIEW
+-    assert _governor_names(root / "hermes_cli/kanban_paced_reroute.py") == REROUTE_VIEW
+-    assert _governor_names(root / "hermes_cli/kanban_review_model.py") == REROUTE_VIEW
+-    assert _governor_names(root / "hermes_cli/kanban_ratio_routing.py") == RATIO_VIEW
+-
+-
+-# What the stall notice may take from the governor: no hold(), no usage read, no state write.
+-NOTICE_VIEW = {"kanban_llm_pacing_dispatch": {"admission", "admission_skip", "paced_pools"}}
+-EDIT_VIEW = {"kanban_llm_pacing_dispatch": {"paced_pools"}}
+-# Worker pickup (t_ce15faa434176d77) predicts the claim-time hold on the replica's copy, so a card dispatch would
+-# hold takes no pickup budget: its one entry point holds nothing, records no card event and fails open.
+-PICKUP_VIEW = {"kanban_llm_pacing_dispatch": {"pickup_hold"}}
+-# The route resolver moves a route off a far held pool (t_4cf6ea0228db1fb9): the stored holds only, no usage read.
+-REROUTE_VIEW = {"kanban_llm_pacing_dispatch": {"held_pools"}}
+-# Ratio routing (2020-01-01) reads the stored ``v2`` budget (with this process's newer pools) and the pure config
+-# parser: no usage read, no hold, no write.
+-RATIO_VIEW = {"kanban_llm_pacing_dispatch": {"_hold_state"}, "kanban_llm_pacing": {"config_from"}}
+-
+-
+-def _governor_names(path: pathlib.Path) -> dict[str, set[str]]:
+-    """Each governor module ``path`` imports, with every name it imports from it or reads off it as ``alias.name``.
+-    A dotted ``import`` of one, or its alias used any other way (passed on, stored), is listed as such."""
+-    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+-    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+-    aliases: dict[str, str] = {}
+-    names: dict[str, set[str]] = {}
+-    for node in ast.walk(tree):
+-        if isinstance(node, ast.Import):
+-            for alias in node.names:
+-                if "kanban_llm_pacing" in alias.name:
+-                    names.setdefault(alias.name, set()).add("<module import>")
+-        elif isinstance(node, ast.ImportFrom) and "kanban_llm_pacing" in (node.module or ""):
+-            names.setdefault(node.module.rsplit(".", 1)[-1], set()).update(a.name for a in node.names)
+-        elif isinstance(node, ast.ImportFrom):
+-            for alias in node.names:
+-                if "kanban_llm_pacing" in alias.name:
+-                    aliases[alias.asname or alias.name] = alias.name
+-                    names.setdefault(alias.name, set())
+-    for node in ast.walk(tree):
+-        if isinstance(node, ast.Name) and node.id in aliases and isinstance(node.ctx, ast.Load):
+-            parent = parents.get(node)
+-            names[aliases[node.id]].add(parent.attr if isinstance(parent, ast.Attribute) and parent.value is node
+-                                        else "<bare module use>")
+-    return names
+-
+-
+-@pytest.mark.parametrize("source, seen", [
+-    ("from hermes_cli import kanban_llm_pacing_dispatch as p\np.admission(p.paced_pools(c, t))\np.admission_skip(a)\n",
+-     NOTICE_VIEW),
+-    ("from hermes_cli import kanban_llm_pacing_dispatch as p\np.paced_pools(c, t)\np.hold(c, r, 'ready', x)\n",
+-     {"kanban_llm_pacing_dispatch": {"paced_pools", "hold"}}),
+-    ("from hermes_cli import kanban_llm_pacing_dispatch as p\nkeep(p)\n", {"kanban_llm_pacing_dispatch": {"<bare module use>"}}),
+-    ("from hermes_cli.kanban_llm_pacing_dispatch import read_pool\n", {"kanban_llm_pacing_dispatch": {"read_pool"}}),
+-    ("import hermes_cli.kanban_llm_pacing_dispatch\n", {"hermes_cli.kanban_llm_pacing_dispatch": {"<module import>"}}),
+-    ("from hermes_cli import kanban_llm_pacing as lp\nlp.admit_limit(x)\n", {"kanban_llm_pacing": {"admit_limit"}}),
+-])
+-def test_the_notice_view_pin_sees_every_way_to_reach_the_governor(tmp_path, source, seen):
+-    """The pin above holds only if ``_governor_names`` reports a hold(), a usage read, the module passed on or a
+-    dotted import; anything beyond the allowed view must differ from ``NOTICE_VIEW``."""
+-    module = tmp_path / "notice.py"
+-    module.write_text(source, encoding="utf-8")
+-    assert _governor_names(module) == seen
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+index d999cbb0a6..23fc12d31a 100644
+--- a/tests/hermes_cli/test_kanban_mandatory_pin.py
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -1,390 +1,83 @@
+-"""A mandatory model pin rides the pool: enrolled, claimed by a worker that runs exactly it, refused elsewhere. [daveey]
+-
+-t_01a1cefa6145100f (an Opus exact-head review, ``pin_mandatory=1``) stayed on the hub with ``uncarried option``:
+-pool portability reused the courier's uncarried list, though the pin is three Board row fields a pickup copies.
+-Here: create enrolls such a card for the worker queue only when every pool member attests
+-``capability:mandatory-model-pin`` (an old-core pool keeps it home), the worker that claims it records the pinned
+-model in its ``run_route``, a worker that cannot serve the pin leaves it on the Board, and no repair ever swaps
+-the pin for the profile default. The courier still cannot carry it.
+-"""
++"""Mandatory pins are rejected at ingress; historical marks cannot constrain placement."""
+ from __future__ import annotations
+ 
+-import json
+-import time
+-from pathlib import Path
+-
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+-from hermes_cli import kanban_db_dispatch as kbd
+-from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_mandatory_pin as mp
++from hermes_cli import kanban_pin_reroute as pr
+ from hermes_cli import kanban_placement as kp
+-from hermes_cli import kanban_worker_node as wn
+-from tests.hermes_cli.kanban_sync_fake_board import FakeService
+-from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
+-
+-POOL = "pool:worker"
+-CFG = {"worker_queue": {HUB: POOL}}
+-PIN = {"model": "claude-opus-5-5", "provider": "anthropic", "pin_mandatory": True}
+-REVIEW = {"title": "Independent exact-head review: PR 1 @abc", "assignee": "default", "requires": []}
+-
+-
+-def _attest(monkeypatch, *, carries=True):
+-    """worker-1 is the pool; with ``carries`` its core attests the mandatory-pin refusal."""
+-    labels = ["linux", POOL] + ([mp.LABEL] if carries else [])
+-    monkeypatch.setitem(MACHINES[WORKER], "labels", labels)
+-    monkeypatch.setitem(MACHINES[WORKER], "last_seen", time.time() * 1000)  # a fresh attestation
+-
+-
+-@pytest.fixture
+-def svc():
+-    return FakeService(lease_runs=True, machines=MACHINES)
+-
+-
+-@pytest.fixture
+-def gws(tmp_path, monkeypatch, svc):
+-    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+-    monkeypatch.setattr(kp, "config", lambda: CFG)
+-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+-    sync.consume_dispatcher_wake()
+-    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
+-    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
+-    yield hub, worker
+-    for g in (hub, worker):
+-        g.conn.close()
+-    sync.set_lease_client(None)
+-    wn.set_registry_fetch(None)
+-
+-
+-def _create(hub, **extra):
+-    from tools import kanban_tools
+-    hub.enter()
+-    monkey_self = "hermes_cli.kanban_capability_registry.self_gateway"
+-    with pytest.MonkeyPatch.context() as m:
+-        m.setattr(monkey_self, lambda: HUB)
+-        out = json.loads(kanban_tools._handle_create({**REVIEW, **extra}))
+-    assert out.get("ok"), out
+-    return out
+-
+-
+-def _runs_on(conn, tid):
+-    raw = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+-    return json.loads(raw) if raw else None
+-
+-
+-def _route(conn, tid):
+-    rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'run_route' ORDER BY id",
+-                        (tid,)).fetchall()
+-    return [json.loads(p) for (p,) in rows]
+-
+-
+-# --- create ----------------------------------------------------------------------------------------------------
+-
+-def test_a_mandatory_pin_card_is_enrolled_for_the_attested_pool(gws, monkeypatch):
+-    hub, _ = gws
+-    _attest(monkeypatch)
+-    args = {**REVIEW, **PIN}
+-    hub.enter()
+-    with monkeypatch.context() as m:
+-        m.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
+-        assert kp.portable_reason(args, CFG) is None
+-    out = _create(hub, **PIN)
+-    assert sorted(_runs_on(hub.conn, out["task_id"])) == sorted([POOL, mp.LABEL]), out
+-    row = hub.conn.execute("SELECT model_override, provider_override, model_pin_mandatory FROM tasks WHERE id = ?",
+-                           (out["task_id"],)).fetchone()
+-    assert tuple(row) == ("claude-opus-5-5", "anthropic", 1)
+-
+-
+-def test_an_old_core_pool_keeps_the_mandatory_pin_card_home(gws, monkeypatch):
+-    hub, _ = gws
+-    _attest(monkeypatch, carries=False)  # worker-1 runs a core that would not refuse a pin it cannot serve
+-    hub.enter()
+-    with monkeypatch.context() as m:
+-        m.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
+-        assert kp.portable_reason({**REVIEW, **PIN}, CFG) == mp.REASON
+-    out = _create(hub, **PIN)
+-    assert _runs_on(hub.conn, out["task_id"]) is None, out
+-    # Without the mark the same pin is ordinary portable work, attestation or not.
+-    out = _create(hub, title="Summarise the failing CI jobs", model="claude-opus-5-5", provider="anthropic")
+-    assert _runs_on(hub.conn, out["task_id"]) == [POOL], out
+-
+-
+-# --- claim -----------------------------------------------------------------------------------------------------
+-
+-@pytest.mark.parametrize("review_without_evidence", [True, False])
+-def test_a_worker_that_serves_the_pin_claims_it_and_runs_exactly_that_model(
+-        gws, svc, monkeypatch, review_without_evidence):
+-    hub, worker = gws
+-    _attest(monkeypatch)
+-    title = REVIEW["title"] if review_without_evidence else "Implement the change"
+-    tid = _create(hub, title=title, **PIN)["task_id"]
+-    assert sorted(_runs_on(hub.conn, tid)) == sorted([POOL, mp.LABEL])  # queued for the pool, not a default-placement copy
+-    hub.round()
+-    worker.round()
+-    worker.tick()
+-    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
+-    # Missing model attribution does not block a real review; the mandatory pin still must be served exactly.
+-    [route] = _route(worker.conn, tid)
+-    assert (route["model"], route["provider"]) == ("claude-opus-5-5", "anthropic"), route
+-    assert kb.get_task(worker.conn, tid).model_pin_mandatory == 1
+-
+-
+-def test_a_worker_that_cannot_serve_the_pin_refuses_the_claim(gws, svc, monkeypatch):
+-    hub, worker = gws
+-    _attest(monkeypatch)
+-    cfg = worker.home / "config.yaml"
+-    cfg.write_text(cfg.read_text() + "providers:\n  anthropic:\n    enabled: false\n")
+-    tid = _create(hub, **PIN)["task_id"]
+-    assert sorted(_runs_on(hub.conn, tid)) == sorted([POOL, mp.LABEL])  # queued for the pool, not a default-placement copy
+-    hub.round()
+-    worker.round()
+-    worker.tick()
+-    assert tid not in svc.board(BOARD)["leases"]
+-    assert kb.get_task(worker.conn, tid) is None  # left on the Board for a machine that serves it
+-    reason = mp.refusal({"id": tid, "assignee": "default", "model_override": "claude-opus-5-5",
+-                         "provider_override": "anthropic", "model_pin_mandatory": 1}, me=WORKER)
+-    assert reason and "provider disabled" in reason
+-
+-
+-@pytest.mark.parametrize("card,want", [
+-    ({"model_override": "claude-opus-5-5", "provider_override": "openai-codex", "model_pin_mandatory": 1},
+-     "model_provider_mismatch"),
+-    ({"model_override": "claude-opus-5-5", "provider_override": "openai-codex"}, None),  # not mandatory
+-    ({"model_override": "claude-opus-5-5", "provider_override": "anthropic", "model_pin_mandatory": 1}, None),
+-    ({"model_override": "claude-opus-5-5", "model_pin_mandatory": 1, "assignee": "nobody"}, "no profile"),
++from tests.hermes_cli import test_kanban_model_tier as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize("model,provider", [(None, None), ("class:deep", "auto"),
++                                               ("claude-opus-5-5", "anthropic")])
++def test_new_mandatory_pin_is_rejected_without_creating_a_card(board, model, provider):
++    with kbc.connect() as conn:
++        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++        with pytest.raises(ValueError, match="model-neutral"):
++            kb.create_task(conn, title="work", assignee="default", model_override=model,
++                           provider_override=provider, pin_mandatory=True)
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++
++
++@pytest.mark.parametrize("model", [None, "class:deep", "claude-opus-5-5"])
++def test_later_mandatory_mark_is_rejected_without_mutation(board, model):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="work", assignee="default")
++        # Only this fixture DB receives a historical concrete selector.
++        conn.execute("UPDATE tasks SET model_override=? WHERE id=?", (model, tid))
++        conn.commit()
++        before = [e.kind for e in kb.list_events(conn, tid)]
++        with pytest.raises(ValueError, match="model-neutral"):
++            pr.set_pin_mandatory(conn, tid, True)
++        stored = kb.get_task(conn, tid)
++        assert stored is not None
++        assert stored.model_override == model and stored.model_pin_mandatory is None
++        assert [e.kind for e in kb.list_events(conn, tid)] == before
++
++
++@pytest.mark.parametrize("card", [
++    {"model_override": "claude-opus-5-5", "provider_override": "openai-codex", "model_pin_mandatory": 1},
++    {"model_override": "class:deep", "model_pin_mandatory": 1},
++    {"model_override": None, "model_pin_mandatory": 1},
++    {"model": "claude-opus-5-5", "provider": "anthropic", "pin_mandatory": True},
+ ])
+-def test_refusal_names_why_the_exact_pin_cannot_run_here(tmp_path, monkeypatch, card, want):
+-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+-    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\n")
+-    got = mp.refusal({"id": "t", "assignee": "default", **card})
+-    assert (got is None) if want is None else (want in got), got
+-
+-
+-def test_a_mark_without_a_model_pins_nothing():
+-    # A Board row can carry model_pin_mandatory after `set-model` cleared the model (kanban_db keeps the mark
+-    # NULL then, but a wire row is not trusted): nothing to serve, so no label demand and no refusal.
+-    card = {"id": "t", "assignee": "default", "model_override": None, "model_pin_mandatory": 1}
+-    assert mp.pin_of(card) is None and mp.requirements(card) == set() and mp.refusal(card) is None
+-    assert mp.requirements({"title": "x", "pin_mandatory": True, "model": "  "}) == set()
+-
+-
+-def test_a_class_pin_is_refused_where_class_routing_is_off(tmp_path, monkeypatch):
+-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+-    card = {"id": "t", "assignee": "default", "model_override": "class:deep", "model_pin_mandatory": 1}
+-    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\n")
+-    assert "class unroutable (routing_disabled)" in mp.refusal(card)
+-    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\nmodel_routing:\n  enabled: true\n")
+-    assert "routing_disabled" not in (mp.refusal(card) or "")
++def test_legacy_mark_imposes_no_model_or_attestation_requirement(card):
++    assert mp.pin_of(card) is None
++    assert mp.requirements(card) == set()
++    assert mp.refusal({"id": "t", "assignee": "nonexistent", **card}) is None
++    assert not pr.is_mandatory_pin(type("Task", (), card)())
++    for placement in (["pool:worker"], ["machine:worker"], ["pool:worker", "machine:hub"]):
++        assert mp.carry(placement, card, me="hub") == placement
+ 
+ 
+-def test_a_home_card_waiting_on_the_attestation_is_named_stranded_once_the_pool_attests(monkeypatch):
++def test_legacy_pin_does_not_fence_worker_claim(monkeypatch):
+     from hermes_cli import kanban_placement_coordination as coord
+-    entry = {"state": "active", "pickup": "all", "last_seen": time.time() * 1000, "labels": [],
+-             "max_card_runs": 2, "metrics": {"active_card_runs": 0}}
+-    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker": entry}})
+-    monkeypatch.setattr(kp.reg, "self_gateway", lambda: HUB)
+-    cfg = {"worker_pools": {HUB: ["worker"]}, "assignees": ["default"]}
+-    card = {"title": "Review PR 1", "body": "", "assignee": "default", "workspace_kind": "scratch",
+-            "requires": "[]", "model_override": "claude-opus-5-5", "model_pin_mandatory": 1}
+-    assert coord.stranded(card, cfg, mp.REASON) == []
+-    entry["labels"] = [mp.LABEL]
+-    assert coord.stranded(card, cfg, mp.REASON) == ["worker"]
++    from hermes_cli import kanban_worker_node as wn
++    import time
+ 
+-
+-def test_a_claim_on_an_unattested_destination_is_refused(monkeypatch):
+-    from hermes_cli import kanban_placement_coordination as coord
+     machines = {"w": {"state": "active", "pickup": "true", "last_seen": time.time() * 1000,
+-                      "labels": [POOL]}}
++                      "labels": ["pool:worker"]}}
+     monkeypatch.setattr(wn, "registry", lambda: {"machines": machines})
+-    card = {"title": "review", "placement_policy": "worker-first-v1", "model_override": "claude-opus-5-5",
+-            "model_pin_mandatory": 1}
+-    assert coord.claim_refusal(card, "w") == mp.REASON
+-    machines["w"]["labels"].append(mp.LABEL)
++    card = {"title": "work", "placement_policy": "worker-first-v1",
++            "model_override": "claude-opus-5-5", "model_pin_mandatory": 1}
+     assert coord.claim_refusal(card, "w") is None
+ 
+ 
+-# --- no fallback -----------------------------------------------------------------------------------------------
+-
+-def test_a_refused_mandatory_pin_is_never_cleared_to_the_profile_default(tmp_path):
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli.kanban_model_assignment import clear_refused_pin
+-    conn = kbc.connect(tmp_path / "kanban.db")
+-    keep = kb.create_task(conn, title="keep", assignee="default", model_override="claude-opus-5-5",
+-                          provider_override="anthropic", pin_mandatory=True)
+-    drop = kb.create_task(conn, title="drop", assignee="default", model_override="claude-opus-5-5",
+-                          provider_override="anthropic")
+-    assert not clear_refused_pin(conn, keep, "claude-opus-5-5", "anthropic", [])
+-    assert kb.get_task(conn, keep).model_override == "claude-opus-5-5"
+-    assert clear_refused_pin(conn, drop, "claude-opus-5-5", "anthropic", [])  # a plain pin may still be dropped
+-    assert kb.get_task(conn, drop).model_override is None
+-    conn.close()
+-
+-
+-def test_the_courier_still_cannot_carry_a_mandatory_pin():
+-    used = kp._uncarried({**REVIEW, **PIN}, kp._Cfg({}), True)
+-    assert used == ["pin_mandatory"]
+-
+-
+-# --- review 5878972889: no route around the label ---------------------------------------------------------------
+-# The worker-first pool's Board lease checks only profile/requires/skill labels, and a move rewrites runs_on, so
+-# either could hand an old core (no refusal(), no CAS) a mandatory pin. Each test here fails on ebc69953d4.
+-
+-def test_a_mandatory_pin_never_enrolls_worker_first(monkeypatch):
+-    from hermes_cli import kanban_worker_placement as wp
+-    monkeypatch.setattr(kp, "portable_reason", lambda args, cfg=None: None)  # an attested, portable pool
+-    cfg = {"worker_pools": {HUB: [WORKER]}}
+-    assert wp.creation_decision({**REVIEW, **PIN}, cfg, HUB, "auto", None, queue=False) is None
+-    plain = wp.creation_decision({**REVIEW, "model": "claude-opus-5-5"}, cfg, HUB, "auto", None, queue=False)
+-    assert plain["placement_policy"] == wp.POLICY  # a plain pin still enrolls
+-
+-
+-def test_a_denied_mandatory_pin_with_no_queue_is_refused_not_sent_worker_first():
+-    from hermes_cli import kanban_hub_admission_placement as hp
+-    out = hp.pool_route({**REVIEW, **PIN}, {}, HUB, {"admit": False}, None, queue=False)
+-    assert out["where"] == "refuse" and mp.WORKER_FIRST_REASON in out["why"], out
+-    assert hp.pool_route(REVIEW, {}, HUB, {"admit": False}, None, queue=False)["placement_policy"] == "worker-first-v1"
+-
+-
+-def test_recovery_never_promotes_a_home_mandatory_pin(tmp_path, monkeypatch):
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_recovery as rec
+-    monkeypatch.setattr(kp, "portable_reason", lambda args, cfg=None: None)
+-    monkeypatch.setattr(kp, "config", dict)
+-    conn = kbc.connect(tmp_path / "kanban.db")
+-    pinned = kb.create_task(conn, title="review", assignee="default", model_override="claude-opus-5-5",
+-                            provider_override="anthropic", pin_mandatory=True)
+-    plain = kb.create_task(conn, title="review", assignee="default", model_override="claude-opus-5-5",
+-                           provider_override="anthropic")
+-    row = lambda tid: dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+-    assert rec.current_portable(conn, row(plain), {}) is True
+-    assert rec.current_portable(conn, row(pinned), {}) is False
+-    conn.close()
+-
+-
+-def test_a_hub_pickup_re_place_keeps_the_label(monkeypatch):
++def test_legacy_pin_does_not_add_a_pickup_label(monkeypatch):
+     from hermes_cli import kanban_hub_admission_pickup as hap
+     monkeypatch.setattr(kp, "structural_reason", lambda args, cfg=None: None)
+     monkeypatch.setattr(kp, "portable_reason", lambda args, cfg=None: None)
+     monkeypatch.setattr(kp, "_machine_picks_up", lambda label: True)
+-    card = {"title": "review", "body": "", "assignee": "default", "workspace_kind": "scratch", "requires": "[]",
+-            "skills": None, "model_override": "claude-opus-5-5", "provider_override": "anthropic",
+-            "model_pin_mandatory": 1}
+-    assert sorted(hap._target(hap.card_fields(card, BOARD), HUB, CFG, {})) == sorted([POOL, mp.LABEL])
+-    plain = {**card, "model_pin_mandatory": None}
+-    assert hap._target(hap.card_fields(plain, BOARD), HUB, CFG, {}) == [POOL]
+-
+-
+-def _machines(*, attest):
+-    worker = {**MACHINES[WORKER], "labels": ["linux", POOL] + ([mp.LABEL] if attest else [])}
+-    return {**MACHINES, WORKER: worker}
+-
+-
+-@pytest.mark.parametrize("target", [[POOL], [f"machine:{WORKER}"]])
+-def test_a_move_keeps_the_label_and_needs_an_attested_target(gws, target):
+-    from hermes_cli import kanban_move as km
+-    hub, _ = gws
+-    hub.enter()
+-    tid = kb.create_task(hub.conn, title="review", assignee="default", model_override="claude-opus-5-5",
+-                         provider_override="anthropic", pin_mandatory=True)
+-    kw: dict = {"reason": "r", "me": HUB, "host_reason": "the review runs on that host"}
+-    res = km.move_queued(hub.conn, tid, runs_on=target, machines=_machines(attest=False), **kw)
+-    assert res["reason_code"] == "no_machine" and mp.LABEL in res["error"], res
+-    res = km.move_queued(hub.conn, tid, runs_on=target, machines=_machines(attest=True), **kw)
+-    assert res["ok"] and _runs_on(hub.conn, tid) == sorted([*target, mp.LABEL]), res
+-    plain = kb.create_task(hub.conn, title="plain", assignee="default", model_override="claude-opus-5-5",
+-                           provider_override="anthropic")
+-    res = km.move_queued(hub.conn, plain, runs_on=target, machines=_machines(attest=False), **kw)
+-    assert res["ok"] and _runs_on(hub.conn, plain) == target, res
+-
+-
+-def test_carry_leaves_a_pin_to_this_machine_alone():
+-    card = {"model_override": "claude-opus-5-5", "model_pin_mandatory": 1}
+-    assert mp.carry([f"machine:{HUB}"], card, me=HUB) == [f"machine:{HUB}"]  # this core refuses what it can't serve
+-    assert mp.carry([f"machine:{WORKER}"], card, me=HUB) == [mp.LABEL, f"machine:{WORKER}"]
+-    assert mp.carry([POOL], {"model_override": "x"}, me=HUB) == [POOL]
+-    # A pool label always takes the attestation, even beside this machine: the pool may hold an old core.
+-    assert mp.carry([f"machine:{HUB}", POOL], card, me=HUB) == sorted([mp.LABEL, f"machine:{HUB}", POOL])
+-
+-
+-def test_marking_labels_a_pool_card_in_a_process_without_sync(gws, monkeypatch):
+-    # Review 5879616348 on #1622: a process that did not install sync (board_mode 'off') writing to an attached
+-    # board used to skip runs_on, so the Board got model_pin_mandatory=1 without the label for an old core to lease.
+-    from hermes_cli import kanban_pin_reroute as pr
+-    hub, _ = gws
+-    tid = _placed(hub)
+-    mine = _placed(hub)
+-    with kb.write_txn(hub.conn):
+-        wn.set_runs_on(hub.conn, mine, [f"machine:{HUB}"])
+-    monkeypatch.setattr(sync, "_SYNCED_PATHS", set())
+-    assert sync.board_mode(hub.conn) == "off"
+-    assert pr.set_pin_mandatory(hub.conn, tid, True)
+-    assert _runs_on(hub.conn, tid) == sorted([POOL, mp.LABEL])
+-    # The file's own gateway id still names this machine: a pin to it stays unlabeled.
+-    assert pr.set_pin_mandatory(hub.conn, mine, True)
+-    assert _runs_on(hub.conn, mine) == [f"machine:{HUB}"]
+-
+-
+-# --- review 5879416189: a later mark is fenced like a create-time one -------------------------------------------
+-# `hermes kanban set-model <id> --mandatory` (the quota-reroute comment advertises it) used to set only the column:
+-# a placed [pool:worker] card kept runs_on without the label, and a worker-first card kept its Board-owned lease.
+-
+-def _placed(hub, *, model="claude-opus-5-5"):
+-    hub.enter()
+-    tid = kb.create_task(hub.conn, title="review", assignee="default", model_override=model,
+-                         provider_override="anthropic" if model else None)
+-    with kb.write_txn(hub.conn):
+-        wn.set_runs_on(hub.conn, tid, [POOL])
+-    return tid
+-
+-
+-@pytest.mark.parametrize("raw_model", [None, "claude-opus-5-5"])
+-def test_marking_a_placed_card_mandatory_adds_the_label(gws, raw_model):
+-    from hermes_cli import kanban_pin_reroute as pr
+-    hub, _ = gws
+-    tid = _placed(hub)
+-    found, _ = pr.set_model_cli(hub.conn, tid, raw_model, raw_model, "anthropic" if raw_model else None, True)
+-    assert found
+-    assert kb.get_task(hub.conn, tid).model_pin_mandatory == 1
+-    assert _runs_on(hub.conn, tid) == sorted([POOL, mp.LABEL])
+-    [ev] = [json.loads(p) for (p,) in hub.conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_pin_mandatory_set'", (tid,))]
+-    assert ev == {"mandatory": True, "runs_on": sorted([POOL, mp.LABEL]), "previous_runs_on": [POOL]}
+-    # Unmarking leaves the label (harmless: every attesting worker also serves plain pins); a home card has none.
+-    assert pr.set_pin_mandatory(hub.conn, tid, False)
+-    assert kb.get_task(hub.conn, tid).model_pin_mandatory is None
+-    home = kb.create_task(hub.conn, title="home", assignee="default", model_override="claude-opus-5-5",
+-                          provider_override="anthropic")
+-    assert pr.set_pin_mandatory(hub.conn, home, True) and _runs_on(hub.conn, home) is None
+-
+-
+-@pytest.mark.parametrize("raw_model", [None, "claude-sonnet-5"])
+-def test_marking_a_worker_first_card_mandatory_is_refused_and_changes_nothing(gws, raw_model):
+-    from hermes_cli import kanban_pin_reroute as pr
+-    hub, _ = gws
+-    tid = _placed(hub)
+-    with kb.write_txn(hub.conn):
+-        hub.conn.execute("UPDATE tasks SET placement_policy = 'worker-first-v1' WHERE id = ?", (tid,))
+-    with pytest.raises(ValueError, match="worker-first"):
+-        pr.set_model_cli(hub.conn, tid, raw_model, raw_model, "anthropic" if raw_model else None, True)
+-    task = kb.get_task(hub.conn, tid)
+-    assert (task.model_override, task.model_pin_mandatory) == ("claude-opus-5-5", None)
+-    assert _runs_on(hub.conn, tid) == [POOL]
+-    # Without the mark the same card still takes a new plain pin.
+-    assert pr.set_model_cli(hub.conn, tid, "claude-sonnet-5", "claude-sonnet-5", "anthropic", None) == (True, True)
++    card = {"title": "work", "body": "", "assignee": "default", "workspace_kind": "scratch",
++            "requires": "[]", "skills": None, "model_override": "claude-opus-5-5",
++            "provider_override": "anthropic", "model_pin_mandatory": 1}
++    assert hap._target(hap.card_fields(card, "board"), "hub", {"worker_queue": {"hub": "pool:worker"}}, {}) == ["pool:worker"]
+ 
+ 
+-def test_marking_needs_a_pin_and_a_live_card(gws):
+-    from hermes_cli import kanban_pin_reroute as pr
+-    hub, _ = gws
+-    tid = _placed(hub, model=None)
+-    with pytest.raises(ValueError, match="needs a model pin"):
+-        pr.set_pin_mandatory(hub.conn, tid, True)
+-    assert _runs_on(hub.conn, tid) == [POOL]
+-    assert pr.set_pin_mandatory(hub.conn, "t_missing", True) is False
+-    from hermes_cli.kanban_db_archive import archive_task
+-    gone = _placed(hub)
+-    archive_task(hub.conn, gone)
+-    with pytest.raises(RuntimeError, match="archived"):
+-        pr.set_pin_mandatory(hub.conn, gone, True)
+-    assert kb.get_task(hub.conn, gone).model_pin_mandatory is None
++def test_courier_does_not_transport_new_mandatory_directives():
++    assert kp._uncarried({"title": "work", "pin_mandatory": True}, kp._Cfg({}), True) == ["pin_mandatory"]
+diff --git a/tests/hermes_cli/test_kanban_model_neutral_legacy.py b/tests/hermes_cli/test_kanban_model_neutral_legacy.py
+new file mode 100644
+index 0000000000..2fad17e4f1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_neutral_legacy.py
+@@ -0,0 +1,111 @@
++"""Legacy routing restrictions must not constrain future admitted runs."""
++import json
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_model_tier as fixtures
++
++board=fixtures.board
++
++
++@pytest.mark.parametrize('extra', [
++    ['--model', 'gpt-6.1-sol', '--provider', 'openai-codex'],
++    ['--pin-mandatory'],
++    ['--body', 'require_model: true'],
++])
++def test_cli_create_refuses_before_preflight(board, monkeypatch, capsys, extra):
++    import argparse
++    from hermes_cli import kanban as cli
++    from hermes_cli import kanban_hub_admission_placement as placement
++    monkeypatch.setattr(placement, 'cli_preflight', lambda *a, **k: pytest.fail('preflight reached'))
++    parser=argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    args=parser.parse_args(['kanban','create','work','--assignee','default',*extra])
++    assert cli._cmd_create(args) == 2
++    assert 'model-neutral' in capsys.readouterr().err
++
++
++def test_legacy_pin_cannot_gate_worker_placement(board):
++    from dataclasses import asdict
++    from hermes_cli import kanban_mandatory_pin as mandatory
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default')
++        task=legacy(conn,tid)
++        assert mandatory.pin_of(asdict(task)) is None
++        assert mandatory.requirements(asdict(task)) == set()
++        assert mandatory.worker_first_refusal(asdict(task)) is None
++
++
++def test_direct_mandatory_mark_rejected(board):
++    from hermes_cli.kanban_mandatory_pin import mark
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default')
++        legacy(conn,tid)
++        with pytest.raises(ValueError, match='model-neutral'):
++            mark(conn,tid)
++
++
++def test_specify_refuses_before_promotion(board):
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default',triage=True)
++        before=tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++        with pytest.raises(ValueError, match='model-neutral'):
++            kb.specify_triage_task(conn,tid,title='new',body='require_model: true')
++        assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone()) == before
++
++
++def legacy(conn, tid):
++    # Isolated fixture models a pre-policy row; never a production mutation API.
++    conn.execute('UPDATE tasks SET model_override=?,provider_override=?,model_pin_mandatory=1,body=? WHERE id=?',
++                 ('grok-4.6','xai-oauth','require_model: true',tid))
++    conn.commit()
++    return kb.get_task(conn,tid)
++
++
++def test_legacy_pin_ignored_in_tier_and_owner_without_receipt(board):
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default')
++        task=legacy(conn,tid)
++        assert tier.resolve_model_tier(conn,task,lane='ready',cfg={})==('class:standard','auto','default')
++        assert tier.owner_model_pin(conn,task)==('class:standard','auto')
++        assert kb.get_task(conn,tid).model_override=='grok-4.6'
++
++
++def test_legacy_mandatory_does_not_disable_alternatives(board):
++    from hermes_cli.kanban_pin_reroute import is_mandatory_pin
++    from hermes_cli.kanban_provider_walls import requires_model
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default')
++        task=legacy(conn,tid)
++        assert not is_mandatory_pin(task)
++        assert not requires_model(task)
++
++
++def test_current_run_receipt_not_replaced_by_specification(board):
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',assignee='default')
++        legacy(conn,tid)
++        kb.claim_task(conn,tid)
++        task=kb.get_task(conn,tid)
++        kb._append_event(conn,tid,'model_tier',{'model':'gpt-6-luna','provider':'openai-codex','lane':'ready'},run_id=task.current_run_id)
++        assert tier.owner_model_pin(conn,task)==('gpt-6-luna','openai-codex')
++
++
++def test_dynamic_review_ignores_legacy_override_and_pin(board,monkeypatch):
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    monkeypatch.setattr(review,'implementer_models',lambda c,t:{'author-model'})
++    monkeypatch.setattr(review,'independent_routes',lambda *a,**k:iter([('held-model','xai-oauth'),('available-model','openai-codex')]))
++    monkeypatch.setattr(review,'registry_refusal',lambda *a:None)
++    monkeypatch.setattr(pw,'active_walls',lambda **k:{'xai-oauth':9999999999})
++    monkeypatch.setattr(pw,'live_quota_wall',lambda *a:None)
++    monkeypatch.setattr(pacing,'held_pools',lambda *a:{})
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='Independent source review',assignee='default')
++        task=legacy(conn,tid)
++        monkeypatch.setattr(review,'_handoff',lambda *a:(None,{'review_model':'held-model','review_provider':'xai-oauth'}))
++        assert review.resolve_review_model(conn,task,{})==('available-model','openai-codex','review_unpinned')
++        monkeypatch.setattr(review,'independent_routes',lambda *a,**k:iter([]))
++        with pytest.raises(review.ReviewModelsExhausted): review.resolve_review_model(conn,task,{})
+diff --git a/tests/hermes_cli/test_kanban_model_neutral_text.py b/tests/hermes_cli/test_kanban_model_neutral_text.py
+new file mode 100644
+index 0000000000..51620684e7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_neutral_text.py
+@@ -0,0 +1,32 @@
++"""Real inventory shapes: requirements versus evidence and exclusions."""
++import pytest
++from hermes_cli.kanban_model_neutral import validate_text
++
++
++@pytest.mark.parametrize('text', [
++    'Independent primary Opus review, exact-head CI, normal merge queue.',
++    'Get semantic RED. Mandatory exact-head anthropic/claude-opus-5-5 independent review; never hand merge.',
++    'Primary independentOpus exacthead review + BB mergequeue.',
++    'Each slice needs a fresh independent review (claude-opus-5-5/anthropic; park until quota resets).',
++    'Do not bypass CI. Use only grok-4.6 / xai-oauth.',
++    'Exclude Opus from authors. Required grok-4.6 / xai-oauth, mandatory pin.',
++    'require_model: true',
++])
++def test_active_named_obligations_are_rejected(text):
++    with pytest.raises(ValueError, match='model-neutral'):
++        validate_text(text)
++
++
++@pytest.mark.parametrize('text', [
++    'Prior reviewer ran on claude-opus-5-5 and returned request_changes.',
++    'Implementer models/forbidden overlaps: claude-opus-5-5, gpt-6.1-sol.',
++    '<!-- implementer-models: claude-opus-5-5,gpt-6.1-sol -->',
++    'Never pin to Opus. Route dynamically among eligible independent models.',
++    'Find the Desktop lease loss after successful Opus response.',
++    'Preserve all reserve/pacing and model-independence boundaries.',
++    'Independent primary class:deep review with actual route evidence.',
++    'The reviewer must differ from gpt-6.1-sol.',
++    'Must not be reviewed by claude-opus-5-5.',
++])
++def test_historical_evidence_and_author_exclusions_are_retained(text):
++    validate_text(text)
+diff --git a/tests/hermes_cli/test_kanban_model_neutral_transport.py b/tests/hermes_cli/test_kanban_model_neutral_transport.py
+new file mode 100644
+index 0000000000..33ffd3b41b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_neutral_transport.py
+@@ -0,0 +1,38 @@
++"""Policy at outbound transports and pending-route previews."""
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_model_tier as fixtures
++from tests.hermes_cli.test_kanban_model_neutral_legacy import legacy
++
++board = fixtures.board
++
++
++def test_selfwork_submit_rejects_before_transport(monkeypatch):
++    from hermes_cli import kanban_selfwork_outbound as outbound
++    monkeypatch.setattr(outbound, 'prepare', lambda args: pytest.fail('transport preparation reached'))
++    with pytest.raises(ValueError, match='model-neutral'):
++        outbound.submit({'title': 'work', 'model': 'grok-4.6', 'provider': 'xai-oauth'})
++
++
++def test_forwarding_legacy_pin_does_not_emit_new_restriction(board):
++    from hermes_cli.kanban_placement_forward import remote_args
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='work', assignee='default')
++        task = legacy(conn, tid)
++        args = remote_args(conn, task, self_gw='example')
++        assert args['model'] is None
++        assert args['provider'] is None
++        # A historical mandate cannot become an active directive at a new ingress.
++        from hermes_cli.kanban_model_neutral import validate_text
++        validate_text(args['title'], args['body'])
++        assert kb.get_task(conn, tid).model_override == 'grok-4.6'
++
++
++def test_pending_route_preview_never_falls_back_to_legacy_pin(board, monkeypatch):
++    from hermes_cli import kanban_shared_blockers as blockers, kanban_model_tier as tier
++    monkeypatch.setattr(tier, 'resolve_dispatch_tier', lambda *a, **k: (None, None, 'off'))
++    monkeypatch.setattr(tier, 'class_unroutable_reason', lambda model: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='work', assignee='default')
++        legacy(conn, tid)
++        assert blockers.task_route(conn, tid)[:2] == ('class:standard', None)
+diff --git a/tests/hermes_cli/test_kanban_model_tier.py b/tests/hermes_cli/test_kanban_model_tier.py
+index 79ab48c698..41317bf5b9 100644
+--- a/tests/hermes_cli/test_kanban_model_tier.py
++++ b/tests/hermes_cli/test_kanban_model_tier.py
+@@ -31,14 +31,17 @@ def board(tmp_path, monkeypatch):
+     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    _write_cfg(home)
+     return home
+ 
+ 
+ def _write_cfg(home: Path, **kanban) -> None:
+-    lines = ["kanban:"]
+-    for k, v in kanban.items():
+-        lines.append(f"  {k}: {json.dumps(v)}")
+-    home.joinpath("config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
++    route = {"model": OPUS, "provider": "anthropic", "weight": 1,
++             "billing": "subscription", "eligible": True, "funding_verified": True,
++             "capabilities": {"tools": True, "streaming": True}}
++    cfg = {"kanban": kanban, "model_routing": {"enabled": True,
++           "routes": {level: [route] for level in ("fast", "standard", "deep")}}}
++    home.joinpath("config.yaml").write_text(json.dumps(cfg), encoding="utf-8")
+ 
+ 
+ def _dispatch(conn) -> dict[str, tuple]:
+@@ -63,20 +66,20 @@ def test_dispatcher_default_applies_to_unpinned_card_and_records_event(board):
+         seen = _dispatch(conn)
+         events = _tier_events(conn, tid)
+         row = kb.get_task(conn, tid)
+-    assert seen[tid][:2] == (SONNET, "anthropic")
+-    assert events and events[0]["reason"] == "default" and events[0]["model"] == SONNET
++    assert seen[tid][:2] == ("class:standard", "auto")
++    assert events and events[0]["reason"] == "default" and events[0]["model"] == "class:standard"
+     # The pin is per run: the card row itself stays unpinned.
+     assert row.model_override is None
+ 
+ 
+-def test_dispatcher_default_off_is_upstream_behaviour(board):
++def test_missing_default_uses_standard_class(board):
+     _write_cfg(board)  # no default_model
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="routine fix", assignee="default")
+         seen = _dispatch(conn)
+         events = _tier_events(conn, tid)
+-    assert seen[tid][:2] == (None, None)
+-    assert events == []
++    assert seen[tid][:2] == ("class:standard", "auto")
++    assert events[0]["reason"] == "default"
+ 
+ 
+ def test_kanban_create_tool_pin_survives_default_and_unpinned_gets_default(board, monkeypatch):
+@@ -84,19 +87,19 @@ def test_kanban_create_tool_pin_survives_default_and_unpinned_gets_default(board
+     from hermes_cli import models_detect
+     monkeypatch.setattr(models_detect, "provider_has_credentials", lambda pid: pid == "anthropic")
+     from tools import kanban_tools as kt
+-    pinned = json.loads(kt._handle_create({"title": "adversarial review", "assignee": "default", "model": OPUS}))
++    pinned = json.loads(kt._handle_create({"title": "adversarial review", "assignee": "default", "model": "class:deep"}))
+     plain = json.loads(kt._handle_create({"title": "routine docs", "assignee": "default"}))
+     assert pinned["ok"] and plain["ok"], (pinned, plain)
+     with kbc.connect() as conn:
+         seen = _dispatch(conn)
+         pinned_events = _tier_events(conn, pinned["task_id"])
+-    assert seen[pinned["task_id"]][0] == OPUS
+-    assert seen[plain["task_id"]][0] == SONNET
+-    assert pinned_events[0]["reason"] == "pinned" and pinned_events[0]["model"] == OPUS
+-    assert pinned_events[0]["provider"] == "anthropic"  # bound at pin time, not late-bound to config
++    assert seen[pinned["task_id"]][0] == "class:deep"
++    assert seen[plain["task_id"]][0] == "class:standard"
++    assert pinned_events[0]["reason"] == "class" and pinned_events[0]["model"] == "class:deep"
++    assert pinned_events[0]["provider"] == "auto"  # class selection remains provider-neutral
+ 
+ 
+-def test_review_lane_keeps_profile_model(board):
++def test_review_lane_uses_deep_class(board):
+     _write_cfg(board, default_model=SONNET)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="impl", assignee="default")
+@@ -105,11 +108,11 @@ def test_review_lane_keeps_profile_model(board):
+         seen = _dispatch(conn)
+         events = _tier_events(conn, tid)
+     assert "sdlc-review" in seen[tid][2]
+-    assert seen[tid][0] is None
++    assert seen[tid][0] == "class:deep"
+     assert events[-1]["reason"] == "review"
+ 
+ 
+-def test_retry_after_failed_run_keeps_profile_model(board):
++def test_retry_after_failed_run_uses_deep_class(board):
+     _write_cfg(board, default_model=SONNET)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="flaky fix", assignee="default")
+@@ -121,7 +124,7 @@ def test_retry_after_failed_run_keeps_profile_model(board):
+         conn.commit()
+         seen = _dispatch(conn)
+         events = _tier_events(conn, tid)
+-    assert seen[tid][0] is None
++    assert seen[tid][0] == "class:deep"
+     assert events[-1]["reason"] == "retry_after_run_crashed"
+ 
+ 
+@@ -134,7 +137,7 @@ def test_continued_run_is_not_a_failure(board):
+         task = kb.get_task(conn, tid)
+         task.current_run_id = None
+         model, _prov, reason = tier.resolve_model_tier(conn, task, lane="ready", cfg={"default_model": SONNET})
+-    assert (model, reason) == (SONNET, "default")
++    assert (model, reason) == ("class:standard", "default")
+ 
+ 
+ def test_keep_patterns_and_profile_scope(board):
+@@ -147,10 +150,10 @@ def test_keep_patterns_and_profile_scope(board):
+         plain = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
+         got = {name: tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg)
+                for name, t in (("sec", sec), ("core", core), ("other", other), ("plain", plain))}
+-    assert got["sec"][0] is None and got["sec"][2].startswith("pattern:")
+-    assert got["core"][0] is None and got["core"][2] == "pattern:hermes-core-wt"
+-    assert got["other"] == (None, None, "profile_out_of_scope")
+-    assert got["plain"] == (SONNET, "anthropic", "default")
++    assert got["sec"][0] == "class:deep" and got["sec"][2].startswith("pattern:")
++    assert got["core"][0] == "class:deep" and got["core"][2] == "pattern:hermes-core-wt"
++    assert got["other"] == ("class:standard", "auto", "profile_out_of_scope")
++    assert got["plain"] == ("class:standard", "auto", "default")
+ 
+ 
+ def test_bad_pattern_is_ignored_not_fatal(board):
+@@ -158,7 +161,7 @@ def test_bad_pattern_is_ignored_not_fatal(board):
+         t = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
+         got = tier.resolve_model_tier(conn, t, lane="ready",
+                                       cfg={"default_model": SONNET, "default_model_keep_patterns": ["("]})
+-    assert got == (SONNET, "anthropic", "default")
++    assert got == ("class:standard", "auto", "default")
+ 
+ 
+ def test_tier_pin_reaches_owner(board):
+@@ -170,10 +173,10 @@ def test_tier_pin_reaches_owner(board):
+         tier.apply_model_tier(conn, t, lane="ready", cfg={"default_model": SONNET, "default_provider": "anthropic"})
+         fresh = kb.get_task(conn, tid)
+         assert (fresh.model_override, fresh.provider_override) == (None, None)  # never the DB row
+-        assert tier.owner_model_pin(conn, fresh) == (SONNET, "anthropic")
++        assert tier.owner_model_pin(conn, fresh) == ("class:standard", "auto")
+         # Another run of the same card does not inherit this run's tier decision.
+         fresh.current_run_id = (fresh.current_run_id or 0) + 1000
+-        assert tier.owner_model_pin(conn, fresh) == (None, None)
++        assert tier.owner_model_pin(conn, fresh) == ("class:standard", "auto")
+ 
+ 
+ def test_owner_runs_class_selector_with_provider_auto(board):
+@@ -182,16 +185,16 @@ def test_owner_runs_class_selector_with_provider_auto(board):
+         assert tier.owner_model_pin(conn, kb.get_task(conn, tid)) == ("class:deep", "auto")
+ 
+ 
+-def test_unset_default_provider_is_inferred_not_the_profiles(board):
++def test_legacy_default_model_and_provider_cannot_pin_dispatch(board):
+     """default_model claude-* with no default_provider ran on the profile's provider (openai-codex after the
+     profile switched to a GPT): HTTP 400 on every card. The tier now names the model's own provider."""
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="plain job", assignee="default")
+         task = kb.get_task(conn, tid)
+         model, prov, reason = tier.resolve_model_tier(conn, task, lane="ready", cfg={"default_model": SONNET})
+-        assert (model, prov, reason) == (SONNET, "anthropic", "default")
+-        # An explicit default_provider still wins.
++        assert (model, prov, reason) == ("class:standard", "auto", "default")
++        # A concrete default_provider cannot constrain the neutral default.
+         _m, prov, _r = tier.resolve_model_tier(conn, task, lane="ready",
+                                                cfg={"default_model": SONNET, "default_provider": "openrouter"})
+-        assert prov == "openrouter"
++        assert prov == "auto"
+     assert tier.infer_provider("some-unknown-model") is None
+diff --git a/tests/hermes_cli/test_kanban_no_model_pins.py b/tests/hermes_cli/test_kanban_no_model_pins.py
+new file mode 100644
+index 0000000000..045ed5df47
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_no_model_pins.py
+@@ -0,0 +1,51 @@
++"""Kanban ingress must never create exact-model exclusivity."""
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_pin_reroute as pins
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_model_tier as fixtures
++
++board = fixtures.board
++
++@pytest.mark.parametrize('kwargs', [
++    {'model_override':'gpt-6.1-sol','provider_override':'openai-codex'},
++    {'model_override':'claude-opus-5-5'},
++    {'model_override':'class:deep','provider_override':'anthropic'},
++    {'pin_mandatory':True},
++    {'body':'require_model: true'},
++    {'body':'Mandatory exact-head Opus review, no fallback.'},
++    {'body':'Use only grok-4.6 / xai-oauth.'},
++])
++def test_create_refuses_restrictions_before_writing(board, kwargs):
++    with kbc.connect() as conn:
++        before=conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++        with pytest.raises(ValueError,match='model-neutral'):
++            kb.create_task(conn,title='ordinary work',assignee='default',**kwargs)
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0]==before
++
++@pytest.mark.parametrize('entry', ['set-model','mandatory','edit','review'])
++def test_mutations_refuse_atomically(board, entry):
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='ordinary work',assignee='default')
++        if entry=='review': kb.claim_task(conn,tid)
++        before=tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++        events=conn.execute('SELECT count(*) FROM task_events').fetchone()[0]
++        with pytest.raises(ValueError,match='model-neutral'):
++            if entry=='set-model': kb.set_model_override(conn,tid,'gpt-6.1-sol',provider='openai-codex')
++            elif entry=='mandatory': pins.set_pin_mandatory(conn,tid,True)
++            elif entry=='edit': kb.edit_task(conn,tid,body='require_model: true',priority=1)
++            else: kb.request_review(conn,tid,summary='review',metadata={'review_model':'gpt-6.1-sol','review_provider':'openai-codex'})
++        assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())==before
++        assert conn.execute('SELECT count(*) FROM task_events').fetchone()[0]==events
++
++@pytest.mark.parametrize('model,provider', [(None,None),('class:deep','auto'),('class:standard',None)])
++def test_class_and_clear_allowed(board,model,provider):
++    with kbc.connect() as conn:
++        tid=kb.create_task(conn,title='work',body='Independent qualified security review; preserve author exclusions.',assignee='default',model_override=model,provider_override=provider)
++        assert kb.set_model_override(conn,tid,None)
++        assert kb.get_task(conn,tid).model_override is None
++
++@pytest.mark.parametrize('metadata',[{'review_provider':'anthropic'},{'review_model':'claude-opus-5-5'},{'review_model':'class:deep','review_provider':'anthropic'}])
++def test_review_metadata_refuses_restrictions(metadata):
++    with pytest.raises(ValueError,match='model-neutral'):review.validate_review_override(metadata)
+diff --git a/tests/hermes_cli/test_kanban_review_implementer_set.py b/tests/hermes_cli/test_kanban_review_implementer_set.py
+index 837992c0ef..5429f31938 100644
+--- a/tests/hermes_cli/test_kanban_review_implementer_set.py
++++ b/tests/hermes_cli/test_kanban_review_implementer_set.py
+@@ -56,8 +56,10 @@ def _run(conn, tid, model=None, *, receipt=None, lane='ready'):
+ 
+ 
+ def _card(conn, pin=None, *, title='implement it', creator=None, status='ready'):
+-    tid = kb.create_task(conn, title=title, assignee='a', creator_task_id=creator,
+-                         model_override=pin, provider_override=PROVIDER.get(pin))
++    tid = kb.create_task(conn, title=title, assignee='a', creator_task_id=creator)
++    # Seed pre-policy rows without weakening the create boundary.
++    conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?',
++                 (pin, PROVIDER.get(pin), tid))
+     conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
+     conn.commit()
+     return tid
+@@ -564,7 +566,11 @@ def test_unpinned_astra_with_every_pool_held_has_no_reviewer_route(board, clock,
+ def _override_card(conn, pin, override):
+     tid = _card(conn, pin)
+     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+-    assert kb.request_review(conn, tid, metadata={'review_model': override, 'review_provider': PROVIDER[override]})
++    assert kb.request_review(conn, tid)
++    import json
++    conn.execute('UPDATE task_runs SET metadata=? WHERE task_id=?',
++                 (json.dumps({'review_model': override, 'review_provider': PROVIDER[override]}), tid))
++    conn.commit()
+     return tid
+ 
+ 
+@@ -580,15 +586,15 @@ def test_independent_review_override_on_a_held_or_walled_pool_moves_to_the_next_
+         monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(clock[0] + 99999) if p == 'xai-oauth' else None)
+     with kbc.connect() as conn:
+         tid = _override_card(conn, ASTRA, GROK)  # astra authored, the handoff asks for grok on the blocked pool
+-        assert _review_route(conn, tid) == (OPUS, 'anthropic', 'review_override')
++        assert _review_route(conn, tid) == (OPUS, 'anthropic', 'review_unpinned')
+ 
+ 
+-def test_independent_review_override_on_a_free_pool_is_honored(board, clock, monkeypatch):
++def test_legacy_concrete_review_override_does_not_choose_the_reviewer(board, clock, monkeypatch):
+     _routing(monkeypatch)
+     paced_tests._pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = _override_card(conn, ASTRA, GROK)
+-        assert _review_route(conn, tid) == (GROK, 'xai-oauth', 'review_override')
++        assert _review_route(conn, tid) == (OPUS, 'anthropic', 'review_unpinned')
+ 
+ 
+ def test_override_on_a_held_pool_moves_even_without_author_evidence(board, clock, monkeypatch):
+@@ -598,7 +604,7 @@ def test_override_on_a_held_pool_moves_even_without_author_evidence(board, clock
+     with kbc.connect() as conn:
+         tid = _override_card(conn, None, GROK)
+         assert _models(conn, tid) == set()
+-        assert _review_route(conn, tid) == (OPUS, 'anthropic', 'review_override')
++        assert _review_route(conn, tid) == (OPUS, 'anthropic', 'review_unpinned')
+ 
+ 
+ # --- mandatory reviewer pins never silently move to another model ---------------------------------------------------
+@@ -614,7 +620,7 @@ def _mandatory_downstream(conn, *, pin=OPUS, ran=ASTRA):
+ 
+ 
+ @pytest.mark.parametrize('block', ['held', 'walled', 'live_wall'])
+-def test_mandatory_downstream_reviewer_pin_is_never_moved_off_its_pool(board, clock, monkeypatch, block):
++def test_legacy_mandatory_reviewer_moves_off_a_blocked_pool(board, clock, monkeypatch, block):
+     _routing(monkeypatch)
+     if block == 'held':
+         paced_tests._pools(clock, anthropic=('held', HELD_FAR))
+@@ -626,21 +632,28 @@ def test_mandatory_downstream_reviewer_pin_is_never_moved_off_its_pool(board, cl
+         down = _mandatory_downstream(conn)
+         task = kb.get_task(conn, down)
+         assert _is_review(conn, task, 'ready') is True
+-        assert _review_route(conn, down, 'ready') == (OPUS, 'anthropic', 'review_unpinned')
+-        assert tier.resolve_dispatch_tier(conn, task, lane='ready') == (OPUS, 'anthropic', 'review_unpinned')
+-        # the pace governor's probe is not even consulted for it
++        route = _review_route(conn, down, 'ready')
++        assert route == (GROK, 'xai-oauth', 'review_unpinned')
++        assert tier.resolve_dispatch_tier(conn, task, lane='ready') == route
++        assert review.implementer_models(conn, task) == {ASTRA}
++        assert kb.get_task(conn, down).model_override == OPUS
++        # Legacy mandatory marks must not bypass pacing or author exclusions.
+         monkeypatch.setattr('hermes_cli.kanban_quota_episode.alternate_route', lambda *a: (GROK, 'xai-oauth'))
+         from hermes_cli import kanban_llm_pacing as lp
+         cfg = lp.config_from({'providers': ['anthropic', 'openai-codex', 'xai-oauth'], 'enabled': True})
+-        assert lpd._pace_alternate_route(conn, task, (OPUS, 'anthropic', 'review_unpinned'), 'ready', cfg, conn,
+-                                         [{'provider': 'anthropic', 'until': clock[0] + HELD_FAR}]) is None
+-        assert paced.paced_route(conn, task, (OPUS, 'anthropic', 'review_unpinned'), lane='ready',
+-                                 cfg=tier.load_tier_config()) is None
+-
+-
+-def test_mandatory_downstream_reviewer_pin_that_authored_the_work_is_still_used(board, clock, monkeypatch):
+-    """The mandatory pin names the implementer too (e.g. via a child card): authorship is no refusal, and the pin is
+-    still never swapped for another model."""
++        alternate = lpd._pace_alternate_route(
++            conn, task, (OPUS, 'anthropic', 'review_unpinned'), 'ready', cfg, conn,
++            [{'provider': 'anthropic', 'until': clock[0] + HELD_FAR}])
++        assert alternate is not None and alternate[:2] == (GROK, 'xai-oauth')
++        assert alternate[0] not in _models(conn, down)
++        if block == 'held':
++            moved = paced.paced_route(conn, task, (OPUS, 'anthropic', 'review_unpinned'), lane='ready',
++                                       cfg=tier.load_tier_config())
++            assert moved is not None and moved[:2] == (GROK, 'xai-oauth')
++
++
++def test_legacy_reviewer_pin_does_not_require_model_diversity(board, clock, monkeypatch):
++    """An audited author model remains eligible; separate execution provides independence."""
+     _routing(monkeypatch)
+     with kbc.connect() as conn:
+         down = _mandatory_downstream(conn, pin=OPUS, ran=OPUS)
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index 9d63cbe17d..03fb13c91a 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -25,8 +25,11 @@ def config(board, *, strong=OPUS, routes=None, enabled=True):
+ 
+ 
+ def task(conn, model=SONNET):
+-    return kb.get_task(conn, kb.create_task(conn, title="review fixture", assignee="default",
+-                                          model_override=model, provider_override="anthropic"))
++    tid = kb.create_task(conn, title="review fixture", assignee="default")
++    # Historical author evidence belongs only in this isolated fixture database.
++    conn.execute("UPDATE tasks SET model_override=?, provider_override='anthropic' WHERE id=?", (model, tid))
++    conn.commit()
++    return kb.get_task(conn, tid)
+ 
+ 
+ @pytest.mark.parametrize("lane,skills", [("review", []), ("ready", ["sdlc-review"])])
+@@ -46,14 +49,16 @@ def test_strong_pin_may_review_on_the_same_strong_route(board):
+ 
+ 
+ @pytest.mark.parametrize("failed", [False, True])
+-def test_ready_and_retry_preserve_pin(board, failed):
++def test_ready_and_retry_ignore_legacy_pin(board, failed):
+     cfg = config(board)
+     with kbc.connect() as conn:
+         t = task(conn)
+         if failed:
+             helpers._fail_once(conn, t.id)
+             t = kb.get_task(conn, t.id)
+-        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == (None, None, "pinned")
++        expected = ("class:deep", "auto", "retry_after_run_crashed") if failed else (
++            "class:standard", "auto", "default")
++        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == expected
+ 
+ 
+ def test_review_handoff_override_wins(board):
+@@ -61,10 +66,10 @@ def test_review_handoff_override_wins(board):
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        assert kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++        assert kb.request_review(conn, t.id, metadata={"review_model": "class:deep"})
+         t = kb.get_task(conn, t.id)
+         assert tier.resolve_model_tier(conn, t, lane="review", cfg=cfg) == (
+-            FABLE, "anthropic", "review_override")
++            OPUS, "anthropic", "review_override")
+ 
+ 
+ def test_dispatch_receipt_and_owner_use_review_model_without_changing_row(board):
+@@ -117,10 +122,10 @@ def test_review_admission_failure_never_spawns_or_spends_retry(board, monkeypatc
+         dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: seen.append(args))
+         stored = kb.get_task(conn, t.id)
+         assert seen == []
+-        assert stored.status == ("triage" if failure == "no_route" else "review")
+-        assert stored.consecutive_failures == (1 if failure == "no_route" else 0)
++        assert stored.status == ("triage" if failure in ("no_route", "bad_metadata") else "review")
++        assert stored.consecutive_failures == (1 if failure in ("no_route", "bad_metadata") else 0)
+         assert stored.claim_lock is None
+-        event_kind = "gave_up" if failure == "no_route" else "spawn_failed"
++        event_kind = "gave_up" if failure in ("no_route", "bad_metadata") else "spawn_failed"
+         events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == event_kind]
+         assert events[-1]["infrastructure"] is True
+ 
+@@ -182,7 +187,7 @@ def test_pinned_review_not_gated_by_default_tier(board, cfg):
+ @pytest.mark.parametrize("metadata,expected", [
+     ({"review_model": SONNET}, (SONNET, "anthropic", "review_override")),
+     ({"review_model": "custom", "review_provider": "custom-provider"},
+-     ("custom", "custom-provider", "review_override")),
++     (OPUS, "anthropic", "review_unpinned")),
+     ({"review_model": "class:deep"}, (OPUS, "anthropic", "review_override")),
+ ])
+ def test_explicit_review_override_is_honored_even_when_it_matches_the_author(board, metadata, expected):
+@@ -190,25 +195,25 @@ def test_explicit_review_override_is_honored_even_when_it_matches_the_author(boa
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        kb.request_review(conn, t.id, metadata=metadata)
++        kb.request_review(conn, t.id)
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (json.dumps(metadata), t.id))
++        conn.commit()
+         assert tier.resolve_model_tier(conn, t, lane="review", cfg=cfg) == expected
+-        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == (None, None, "pinned")
++        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == ("class:standard", "auto", "default")
+ 
+ 
+ @pytest.mark.parametrize("metadata", [
+-    {"review_model": ""}, {"review_model": 7}, {"review_model": OPUS, "review_provider": []},
+-    {"review_model": "class:deep", "review_provider": "anthropic"},
++    {"review_model": OPUS}, {"review_model": "class:deep", "review_provider": "anthropic"},
++    {"review_model": "class:deep", "require_model": True},
+ ])
+-def test_bad_override_fails_closed(board, metadata):
+-    from hermes_cli.kanban_review_model import ReviewModelUnavailable
+-    cfg = config(board)
++def test_concrete_or_mandatory_override_is_rejected_before_handoff(board, metadata):
++    config(board)
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        kb.request_review(conn, t.id)
+-        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (json.dumps(metadata), t.id))
+-        with pytest.raises(ReviewModelUnavailable):
+-            tier.apply_model_tier(conn, t, lane="review", cfg=cfg)
++        with pytest.raises(ValueError, match="model-neutral"):
++            kb.request_review(conn, t.id, metadata=metadata)
++        assert kb.get_task(conn, t.id).status == "running"
+ 
+ 
+ def test_disabled_routing_keeps_legacy_pin_but_refuses_explicit_class_override(board):
+@@ -244,7 +249,7 @@ def test_latest_handoff_can_remove_old_override(board):
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++        kb.request_review(conn, t.id, metadata={"review_model": "class:deep"})
+         dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: None)
+         assert kb.request_changes(conn, t.id, reason="fixture rework")
+         kb.claim_task(conn, t.id)
+@@ -266,7 +271,7 @@ def test_skill_review_quota_hold_never_reroutes_back_to_author(board, monkeypatc
+         t = task(conn)
+         if override:
+             kb.claim_task(conn, t.id)
+-            kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++            kb.request_review(conn, t.id, metadata={"review_model": "class:deep"})
+         t.skills = ["sdlc-review"]
+         base = tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg)
+         assert quota.decision(conn, t, lane="ready", cfg=cfg, base=base, now=100) == (
+diff --git a/tests/plugins/test_kanban_model_neutral_entries.py b/tests/plugins/test_kanban_model_neutral_entries.py
+new file mode 100644
+index 0000000000..eb4fc31752
+--- /dev/null
++++ b/tests/plugins/test_kanban_model_neutral_entries.py
+@@ -0,0 +1,48 @@
++"""Exercise actual producer entrypoints, including combined PATCH atomicity."""
++import json
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.plugins import test_kanban_model_override as api_fixtures
++
++kanban_home=api_fixtures.kanban_home
++client=api_fixtures.client
++conn=api_fixtures.conn
++
++@pytest.mark.parametrize('payload',[
++    {'model_override':'gpt-6.1-sol','provider_override':'openai-codex'},
++    {'body':'require_model: true'},
++    {'body':'Mandatory exact-head Opus review, no fallback.'},
++])
++def test_rest_create_rejects(client,conn,payload):
++    before=conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++    response=client.post('/api/plugins/kanban/tasks',json={'title':'work','assignee':'default',**payload})
++    assert response.status_code==400,response.text
++    assert 'model-neutral' in response.text
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0]==before
++
++@pytest.mark.parametrize('payload',[
++    {'model_override':'gpt-6.1-sol','provider_override':'openai-codex'},
++    {'body':'require_model: true'},
++    {'provider_override':'anthropic'},
++])
++def test_rest_patch_refuses_before_other_fields(client,conn,payload):
++    tid=kb.create_task(conn,title='work',assignee='default')
++    before=tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++    response=client.patch('/api/plugins/kanban/tasks/'+tid,json={'priority':1,'status':'triage',**payload})
++    assert response.status_code==400,response.text
++    assert 'model-neutral' in response.text
++    assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())==before
++
++@pytest.mark.parametrize('payload',[
++    {'model':'gpt-6.1-sol','provider':'openai-codex'},
++    {'pin_mandatory':True},
++    {'body':'require_model: true'},
++])
++def test_agent_create_rejects_before_creation(kanban_home,conn,payload):
++    from tools import kanban_tools as tools
++    before=conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++    result=json.loads(tools._handle_create({'title':'work','assignee':'default',**payload}))
++    assert not result.get('ok'),result
++    assert 'model-neutral' in str(result),result
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0]==before
+diff --git a/tests/plugins/test_kanban_model_override.py b/tests/plugins/test_kanban_model_override.py
+index 0fdf3df09f..e95ec3d6d2 100644
+--- a/tests/plugins/test_kanban_model_override.py
++++ b/tests/plugins/test_kanban_model_override.py
+@@ -33,6 +33,11 @@ from hermes_cli import kanban_db_dispatch as kbd
+ def kanban_home(tmp_path, monkeypatch):
+     home = tmp_path / ".hermes"
+     home.mkdir()
++    route = {"model": "claude-opus-5-5", "provider": "anthropic", "weight": 1,
++             "billing": "subscription", "eligible": True, "funding_verified": True,
++             "capabilities": {"tools": True, "streaming": True}}
++    (home / "config.yaml").write_text(json.dumps({"model_routing": {
++        "enabled": True, "routes": {level: [route] for level in ("fast", "standard", "deep")}}}))
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     kb.init_db()
+@@ -74,10 +79,10 @@ def client(kanban_home):
+ 
+ def test_set_and_clear_model_override(conn):
+     tid = kb.create_task(conn, title="t", assignee="worker")
+-    assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
++    assert kb.set_model_override(conn, tid, "class:standard", provider="auto")
+     t = kb.get_task(conn, tid)
+-    assert t.model_override == "gpt-5.6-sol"
+-    assert t.provider_override == "openai"
++    assert t.model_override == "class:standard"
++    assert t.provider_override == "auto"
+ 
+     # Clearing the model clears the provider too.
+     assert kb.set_model_override(conn, tid, None)
+@@ -86,28 +91,56 @@ def test_set_and_clear_model_override(conn):
+     assert t.provider_override is None
+ 
+ 
++@pytest.mark.parametrize("model,provider", [("gpt-5.6-sol", "openai"), ("class:deep", "anthropic")])
++def test_concrete_db_selector_is_rejected_atomically(conn, model, provider):
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    with pytest.raises(ValueError, match="model-neutral"):
++        kb.create_task(conn, title="rejected", assignee="worker", model_override=model,
++                       provider_override=provider)
++    with pytest.raises(ValueError, match="model-neutral"):
++        kb.set_model_override(conn, tid, model, provider=provider)
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++    stored = kb.get_task(conn, tid)
++    assert stored is not None and stored.model_override is None
++
++
++@pytest.mark.parametrize("bulk", [False, True])
++def test_dashboard_concrete_selector_is_rejected_without_mutation(client, bulk):
++    task = _create(client)
++    body = {"model_override": "gpt-5.6-sol", "provider_override": "openai"}
++    if bulk:
++        response = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task["id"]], **body})
++    else:
++        response = client.patch(f"/api/plugins/kanban/tasks/{task['id']}", json=body)
++    assert response.status_code == 400
++    assert "model-neutral" in response.text
++    stored = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
++    assert stored["model_override"] is None and stored["provider_override"] is None
++
++
+ def test_provider_without_model_rejected(conn):
+     tid = kb.create_task(conn, title="t", assignee="worker")
+     with pytest.raises(ValueError):
+         kb.set_model_override(conn, tid, None, provider="openrouter")
+     with pytest.raises(ValueError):
+         kb.create_task(
+-            conn, title="t2", assignee="worker", provider_override="openrouter",
++            conn, title="t2", assignee="worker", provider_override="auto",
+         )
+ 
+ 
+ def test_create_task_with_model_and_provider(conn):
+     tid = kb.create_task(
+         conn, title="t", assignee="worker",
+-        model_override="qwen-max", provider_override="openrouter",
++        model_override="class:deep", provider_override="auto",
+     )
+     t = kb.get_task(conn, tid)
+-    assert t.model_override == "qwen-max"
+-    assert t.provider_override == "openrouter"
++    assert t.model_override == "class:deep"
++    assert t.provider_override == "auto"
+     # Creation event carries the override for auditability.
+     ev = next(e for e in kb.list_events(conn, tid) if e.kind == "created")
+-    assert ev.payload["model_override"] == "qwen-max"
+-    assert ev.payload["provider_override"] == "openrouter"
++    assert ev.payload["model_override"] == "class:deep"
++    assert ev.payload["provider_override"] == "auto"
+ 
+ 
+ 
+@@ -120,14 +153,14 @@ def test_create_task_with_model_and_provider(conn):
+ @pytest.mark.parametrize(
+     "overrides, expected_model, expected_provider, expected_reasoning",
+     [
+-        ({"model_override": "glm-5", "provider_override": "openrouter",
+-          "reasoning_effort": "high"}, "glm-5", "openrouter", "high"),
+-        ({"reasoning_effort": "high"}, "profile-model", "custom", "high"),
+-        ({"reasoning_effort": "none"}, "profile-model", "custom", None),
+-        ({}, "profile-model", "custom", "low"),
++        ({"model_override": "class:deep", "provider_override": "auto",
++          "reasoning_effort": "high"}, "class:deep", "auto", "high"),
++        ({"reasoning_effort": "high"}, "class:standard", "auto", "high"),
++        ({"reasoning_effort": "none"}, "class:standard", "auto", None),
++        ({}, "class:standard", "auto", "medium"),
+         # [daveey] The dispatcher's tier pin lives on the in-memory task and reaches the owner through
+         # the run's model_tier event (owner_model_pin), never the DB row.
+-        ({"_tier": {"default_model": "glm-5", "default_provider": "openrouter"}}, "glm-5", "openrouter", "low"),
++        ({"_tier": {"default_model": "class:fast", "default_provider": "auto"}}, "class:fast", "auto", "medium"),
+     ],
+ )
+ def test_spawn_resolves_claimed_task_policy(
+@@ -221,12 +254,12 @@ def test_patch_sets_model_override(client):
+     task = _create(client)
+     r = client.patch(
+         f"/api/plugins/kanban/tasks/{task['id']}",
+-        json={"model_override": "gpt-5.6-sol", "provider_override": "openai"},
++        json={"model_override": "class:standard", "provider_override": "auto"},
+     )
+     assert r.status_code == 200, r.text
+     updated = r.json()["task"]
+-    assert updated["model_override"] == "gpt-5.6-sol"
+-    assert updated["provider_override"] == "openai"
++    assert updated["model_override"] == "class:standard"
++    assert updated["provider_override"] == "auto"
+ 
+ 
+ def test_bulk_model_override(client):
+@@ -236,16 +269,16 @@ def test_bulk_model_override(client):
+         "/api/plugins/kanban/tasks/bulk",
+         json={
+             "ids": [t1["id"], t2["id"]],
+-            "model_override": "fallback-model",
+-            "provider_override": "nous",
++            "model_override": "class:fast",
++            "provider_override": "auto",
+         },
+     )
+     assert r.status_code == 200, r.text
+     assert all(entry["ok"] for entry in r.json()["results"])
+     for tid in (t1["id"], t2["id"]):
+         got = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+-        assert got["model_override"] == "fallback-model"
+-        assert got["provider_override"] == "nous"
++        assert got["model_override"] == "class:fast"
++        assert got["provider_override"] == "auto"
+ 
+ 
+ def test_model_options_endpoint_shape(client, monkeypatch):
+@@ -288,7 +321,7 @@ def test_reasoning_effort_survives_clearing_the_model(conn):
+     not silently reset the thinking depth the operator chose."""
+     tid = kb.create_task(
+         conn, title="t", assignee="worker",
+-        model_override="glm-5", provider_override="openrouter",
++        model_override="class:deep", provider_override="auto",
+         reasoning_effort="ultra",
+     )
+     assert kb.set_model_override(conn, tid, None)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e12b1bc765..df40304a4d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -11,6 +11,7 @@ import functools
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
++from tools.kanban_tools_model_neutral import model_neutral_create
+ import logging
+ import os
+ import time
+@@ -1532,6 +1533,7 @@ from hermes_cli.kanban_origin_admission import tool_create as _native_tool_creat
+ 
+ 
+ @_kanban_handler("kanban_create")
++@model_neutral_create
+ @publication_scope
+ @_native_tool_create
+ def _handle_create(args: dict, **kw) -> str:
+diff --git a/tools/kanban_tools_model_neutral.py b/tools/kanban_tools_model_neutral.py
+new file mode 100644
+index 0000000000..ec4d0deb76
+--- /dev/null
++++ b/tools/kanban_tools_model_neutral.py
+@@ -0,0 +1,17 @@
++"""Model-neutral create validation before publication or courier work."""
++from functools import wraps
++
++from hermes_cli.kanban_model_neutral import validate_selector, validate_text
++
++
++def model_neutral_create(fn):
++    @wraps(fn)
++    def create(args, **kwargs):
++        from tools.registry import tool_error
++        try:
++            validate_selector(args.get('model'), args.get('provider'), mandatory=args.get('pin_mandatory'))
++            validate_text(args.get('title'), args.get('body'))
++        except ValueError as exc:
++            return tool_error(str(exc))
++        return fn(args, **kwargs)
++    return create
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index dd7671ed13..174ecf1ac8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1081,29 +1081,9 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "is blocked for review. Ignored unless goal_mode is "
+                 "true. Defaults to the goal-engine default (20)."
+         )),
+-        "model": _prop("string", (
+-                "Pin the dispatched worker to this model instead of "
+-                "the assignee profile's configured model. Leave this out "
+-                "unless you need another tier; the name must be in this "
+-                "host's model routing registry when one is enforced. Omit "
+-                "to use the profile default."
+-        )),
+-        "provider": _prop("string", (
+-                "Provider the 'model' belongs to (e.g. 'openrouter', "
+-                "'anthropic', 'nous'). Set this whenever the model "
+-                "is not from the assignee profile's configured "
+-                "provider — a model name alone is resolved against "
+-                "the profile's provider and will fail if it belongs "
+-                "to a different one. Requires 'model'."
+-        )),
+-        "pin_mandatory": _prop("boolean", (
+-                "Mark the 'model' pin mandatory. Without it, when the "
+-                "pinned provider's subscription quota is out for 6 h or "
+-                "more, single runs use another provider's model of the "
+-                "same class until the reset (recorded on the card). Set "
+-                "true only when the work must run on exactly this model. "
+-                "Requires 'model'."
+-        )),
++        "model": _prop("string", "Optional class:<tier> selector (for example class:deep). Concrete model IDs are rejected; omit for dynamic routing."),
++        "provider": _prop("string", "Only auto with a class selector is accepted. Concrete providers are rejected."),
++        "pin_mandatory": _prop("boolean", "Deprecated compatibility field: only false is accepted. Mandatory Kanban model pins are forbidden."),
+     },
+     ["title"],
+ )
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 7db3f08309..c965b13bde 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3748,22 +3748,19 @@ Any unknown (an unreadable config, a non-numeric or out-of-range value, a failed
+ 
+ `kanban.create_overlap_check` (default `true`) makes `kanban_create` check open cards across local boards and other gateways' replicated boards before creating another owner for overlapping work. A match refuses creation with `code=create_overlap` and identifies the existing cards. For genuinely separate work, pass `distinct_from` with those card IDs and a `distinct_reason`; set this configuration key to `false` to disable the check entirely. Missing or unreadable remote replicas are skipped and logged rather than blocking creation.
+ 
+-## Kanban strong model tier
++## Kanban model-neutral routing
+ 
+ ```yaml
+ kanban:
+-  strong_model: ""      # model used for the strong tier of kanban workers (empty = profile default)
+-  strong_provider: ""   # provider for strong_model (empty = inferred from the model)
++  default_model: class:standard
++  default_provider: auto
++  strong_model: class:deep
++  strong_provider: auto
+ ```
+ 
+-`kanban.strong_model` names the model dispatched for strong-tier cards; `kanban.strong_provider` optionally pins its provider, otherwise it is inferred from the model name.
++Kanban requirements select a class/tier or capability, never an exclusive concrete model or provider. `kanban_create(model="class:deep", provider="auto")` and `hermes kanban create --model class:deep --provider auto` request a class; leaving the selector unset uses dynamic default routing. Concrete IDs, concrete providers, mandatory flags, positive `require_model` directives and named-model mandates are rejected at mutation boundaries, including review handoffs. Interactive chat model selection is unchanged.
+ 
+-```yaml
+-kanban:
+-  pin_quota_reroute_min_hours: 6   # a card pin walled this long runs on a same-class peer
+-```
+-
+-A card pinned to a model (`kanban_create(model=...)`, `hermes kanban create --model`) normally runs on exactly that model. When the card's own run hits that provider's subscription quota and the reset is `kanban.pin_quota_reroute_min_hours` (default 6) or more away, each later run until the reset uses another eligible, unwalled route of the pinned model's routing class (`model_routing.routes`). The card row keeps its pin, so the first run after the reset is back on it. Every such run records a `model_reroute` event and a `pinned+pin_quota_reroute:<provider>` route reason, and the card gets one comment per quota episode. A pin whose model sits in no class (or in two) still waits, as does any review-lane run. To make a pin always wait for its reset, create the card with `pin_mandatory=true` / `--pin-mandatory`, or run `hermes kanban set-model <id> --mandatory` (`--no-mandatory` undoes it); a card body with a line `require_model: true` is treated the same way (a mere mention of the word is not).
++Legacy and synced concrete restrictions are ignored for future admission, without changing a running agent's client or rewriting its concrete execution receipts. Clear stored restrictions with `hermes kanban set-model <id> none --no-mandatory`; this affects future dispatch only. The dispatcher dynamically chooses a qualified independent reviewer excluding every authenticated author model. Missing author evidence or no eligible independent route must not be resolved by dropping exclusions or pinning another reviewer. Subscription reserve, quota, billing, capability and safety gates remain in force. A concrete chosen route in a current-run receipt is execution evidence, not a persistent card restriction.
+ 
+ `kanban.auto_recover_corruption` (default `true`): when a board's table b-trees fail `integrity_check` (damage `REINDEX` can't fix), its dispatch pauses and the gateway dispatcher also starts `hermes kanban recover` for it in a child process (salvage, fill from the newest healthy backup, write back in place, loss report and a follow-up card). Set it to `false` to keep only the pause. `kanban.recovery_card_assignee` (default `default`) is the assignee of that follow-up card.
+ 
+-- 
+2.43.0
+

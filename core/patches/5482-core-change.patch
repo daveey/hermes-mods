@@ -1,0 +1,358 @@
+From aa5d1dc92394078129e877a29233bb1939543919 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:26:50 +0000
+Subject: [PATCH] [daveey] Reuse request-local evidence in lanes flow
+ projections
+
+Measured projection repeated ordered history reads and JSON decoding across PR prefetch, card classification and dependency blockers. Share one request-scoped Evidence and leave the legacy differential path intact; no cross-request classifier caching or policy changes.
+
+Proof: original9regressions failed; batched fixture preserves40000heartbeat events without autocommit fsync overhead. Expanded legacy/blocker controls and all8flow consumer files plus isolated Sources prototype passed169tests. Plugin shared-context/snapshot test failed2reads vs1 before consumer wiring, then lanes+unfiltered repo-guards green. Full scripts/check ran21checks; only stale-base unrelated sidebar/dispatch health ratchets failed; rebase before ship.
+---
+ hermes_cli/kanban_lanes_flow.py               |  36 ++--
+ hermes_cli/kanban_lanes_flow_evidence.py      |  68 ++++++++
+ .../test_kanban_lanes_flow_projection.py      | 158 ++++++++++++++++++
+ 3 files changed, 250 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_lanes_flow_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_lanes_flow_projection.py
+
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index c0e1b13491..9def684c92 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -11,6 +11,7 @@ import time
+ from typing import Any, Optional
+ 
+ from hermes_cli import kanban_lanes as lanes
++from hermes_cli.kanban_lanes_flow_evidence import Evidence
+ 
+ WINDOWS = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400}
+ STEPS = ("intake", "waiting", "ready", "running", "review", "ci", "merge", "deploy", "test", "done")
+@@ -200,7 +201,7 @@ def _pr_snapshot(task, events, awaiting, reader=None) -> Optional[dict]:
+         snap.update(merged=True, deployed=False)
+     # Deployment has no provider-independent API. Accept explicit task-event observations only;
+     # never turn a merge receipt or elapsed time into proof of live installation.
+-    for event in events:
++    for event in events if url else ():
+         meta = _payload(dict(event)).get("metadata")
+         observed = meta.get("flow_pr") if isinstance(meta, dict) else None
+         if isinstance(observed, dict) and url and observed.get("url") == url:
+@@ -256,8 +257,8 @@ def _awaiting(task, events=()) -> Optional[dict]:
+     return None
+ 
+ 
+-def _card_from_row(conn, task, now: float, reader=None, pol=None) -> dict:
+-    events = _events(conn, task["id"])
++def _card_from_row(conn, task, now: float, reader=None, pol=None, *, evidence=None) -> dict:
++    events = _events(conn, task["id"]) if evidence is None else evidence.events(task["id"])
+     awaited = _awaiting(task, events)
+     held = conn.execute(f"SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}", (task["id"],)).fetchone() is not None
+     gate_reason = _gate_reason(events) if held else None
+@@ -272,7 +273,8 @@ def _card_from_row(conn, task, now: float, reader=None, pol=None) -> dict:
+     return {
+         "id": task["id"], "title": task["title"], "status": task["status"],
+         "block_kind": task["block_kind"], "human_request": human if human else None,
+-        "parents_open": _parents_open(conn, task["id"]), "events": event_dicts,
++        "parents_open": (_parents_open(conn, task["id"]) if evidence is None
++                         else bool(evidence.parents(task["id"]))), "events": event_dicts,
+         "awaiting": awaited, "pr": pr, "created_by": task["created_by"],
+         "session_id": task["session_id"] if "session_id" in task.keys() else None,
+         "project_id": task["project_id"] if "project_id" in task.keys() else None,
+@@ -282,15 +284,25 @@ def _card_from_row(conn, task, now: float, reader=None, pol=None) -> dict:
+     }
+ 
+ 
+-def _pr_urls(conn, rows) -> list:
++def _pr_urls(conn, rows, *, evidence=None) -> list:
+     out = []
+     for task in rows:
++        if evidence is not None:
++            out.append(evidence.pr_url(task))
++            continue
+         events = _events(conn, task["id"])
+-        out.append((_pr_snapshot(task, events, _awaiting(task, events)) or {}).get("url"))
++        url = _pr_url(task, events)
++        awaited = _awaiting(task, events)
++        if not url and isinstance(awaited, dict):
++            ref = awaited.get("ref")
++            if isinstance(ref, str) and ref.startswith("https://github.com/") and "/pull/" in ref:
++                url = ref
++        out.append(url)
+     return out
+ 
+ 
+-def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None, reader=None) -> dict:
++def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None, reader=None,
++             evidence=None) -> dict:
+     """Cards still open, plus per-lane window throughput and today's cap usage.
+ 
+     Dashboards may inject a nonblocking published PR reader (prefetch/get). The CLI
+@@ -304,15 +316,15 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+         pol = lanes.parse({"lanes": {"other": {}}})
+     window_s = WINDOWS[window]
+     usage = lanes.usage(conn, pol, window_s=window_s, now=now)
+-    rows = conn.execute(
+-        f"SELECT * FROM tasks WHERE status IN {_OPEN} ORDER BY created_at, id").fetchall()
++    evidence = Evidence(conn) if evidence is None else evidence
++    rows = evidence.rows
+     if reader is None:
+         from hermes_cli.kanban_lanes_flow_pr import Reader
+         reader = Reader()
+-    reader.prefetch(_pr_urls(conn, rows))
++    reader.prefetch(_pr_urls(conn, rows, evidence=evidence))
+     cards = []
+     for row in rows:
+-        card = _card_from_row(conn, row, now, reader, pol)
++        card = _card_from_row(conn, row, now, reader, pol, evidence=evidence)
+         step = classify_step(card)
+         reason = classify_reason(card, step)
+         source = classify_source(card)
+@@ -323,7 +335,7 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+                       "lane": pol.lane_of(card["tenant"]), "step": step, "reason": reason,
+                       "source": source, "age_h": card["age_h"], "pr": pr})
+         if reason == "dep":
+-            blockers = _blockers(conn, card["id"])
++            blockers = evidence.blockers(card["id"])
+             cards[-1].update(blockers=blockers, blocker=blockers[0] if blockers else None)
+     out_lanes = {}
+     for name, spec in pol.lanes.items():
+diff --git a/hermes_cli/kanban_lanes_flow_evidence.py b/hermes_cli/kanban_lanes_flow_evidence.py
+new file mode 100644
+index 0000000000..2fe5ae0a6e
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_flow_evidence.py
+@@ -0,0 +1,68 @@
++"""Request-local evidence shared by lanes flow consumers. [daveey]
++
++Never retain this object across requests: row/event changes must be visible on the
++next projection. PR provider observations have a separate bounded lifecycle.
++"""
++from __future__ import annotations
++
++
++class Evidence:
++    """Read each card's ordered history and parent state at most once per view."""
++
++    def __init__(self, conn):
++        from hermes_cli import kanban_lanes_flow as flow
++
++        self.conn = conn
++        self.rows = conn.execute(
++            f"SELECT * FROM tasks WHERE status IN {flow._OPEN} ORDER BY created_at, id").fetchall()
++        self._rows = {row["id"]: row for row in self.rows}
++        self._events = {}
++        self._parents = {}
++        self._urls = {}
++
++    def row(self, task_id):
++        if task_id not in self._rows:
++            self._rows[task_id] = self.conn.execute(
++                "SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        return self._rows[task_id]
++
++    def events(self, task_id):
++        from hermes_cli import kanban_lanes_flow as flow
++
++        if task_id not in self._events:
++            events = self.conn.execute(
++                "SELECT id, kind, payload FROM task_events WHERE task_id=? ORDER BY id",
++                (task_id,)).fetchall()
++            self._events[task_id] = [
++                {"id": event["id"], "kind": event["kind"], "payload": flow._payload(dict(event))}
++                for event in events]
++        return self._events[task_id]
++
++    def parents(self, task_id):
++        from hermes_cli import kanban_db as kb
++
++        if task_id not in self._parents:
++            self._parents[task_id] = kb.unsatisfied_parents(self.conn, task_id)
++        return self._parents[task_id]
++
++    def pr_url(self, task):
++        from hermes_cli import kanban_lanes_flow as flow
++
++        task_id = task["id"]
++        if task_id not in self._urls:
++            events = self.events(task_id)
++            url = flow._pr_url(task, events)
++            awaited = flow._awaiting(task, events)
++            if not url and isinstance(awaited, dict):
++                ref = awaited.get("ref")
++                if isinstance(ref, str) and ref.startswith("https://github.com/") and "/pull/" in ref:
++                    url = ref
++            self._urls[task_id] = url
++        return self._urls[task_id]
++
++    def blockers(self, task_id):
++        out = []
++        for parent_id, _status in self.parents(task_id):
++            parent = self.row(parent_id)
++            out.append({"id": parent_id, "pr": self.pr_url(parent) if parent is not None else None})
++        return out
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_projection.py b/tests/hermes_cli/test_kanban_lanes_flow_projection.py
+new file mode 100644
+index 0000000000..3d66f952b9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_flow_projection.py
+@@ -0,0 +1,158 @@
++"""Projection work scales with unique cards, not repeated history consumers."""
++import json
++from collections import Counter
++
++import pytest
++
++from hermes_cli import kanban_lanes_flow as flow
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++URL = "https://github.com/example/repo/pull/1"
++
++
++class Published:
++    def prefetch(self, urls):
++        pass
++
++    def get(self, url):
++        return {}
++
++
++def test_huge_histories_read_and_decode_once(conn, configured, monkeypatch):
++    ids = [f"projection-{i}" for i in range(100)]
++    # Core connections are autocommit: batch fixture setup, not 40,000 fsyncs.
++    conn.execute("BEGIN")
++    conn.executemany("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES (?,?,'ready',100,'myapp')",
++                     ((tid, tid) for tid in ids))
++    # Old publication forces a full backward scan through later harmless churn.
++    for tid in ids:
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                     (tid, "commented", json.dumps({"metadata": {"pr": URL}}), 100))
++    conn.executemany("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                     ((tid, "heartbeat", '{"projection_noise":true}', 101) for tid in ids for _ in range(400)))
++    # Shared parents would otherwise reread their histories for every child.
++    conn.executemany("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)",
++                     ((ids[i % 20], tid) for i, tid in enumerate(ids[20:])))
++    conn.commit()
++    queries = []
++    decoded = Counter()
++    loads = flow.json.loads
++
++    def count_loads(raw, *args, **kwargs):
++        if raw == '{"projection_noise":true}':
++            decoded["noise"] += 1
++        return loads(raw, *args, **kwargs)
++
++    monkeypatch.setattr(flow.json, "loads", count_loads)
++    conn.set_trace_callback(queries.append)
++    try:
++        result = flow.snapshot(conn, reader=Published(), now=1000)
++    finally:
++        conn.set_trace_callback(None)
++    assert len(result["cards"]) == len(ids)
++    assert {c["pr"] for c in result["cards"]} == {URL}
++    histories = [q for q in queries if "FROM task_events WHERE task_id=" in q and "ORDER BY id" in q]
++    assert len(histories) <= len(ids), len(histories)
++    assert decoded["noise"] <= 400 * len(ids), decoded
++
++
++@pytest.mark.parametrize("status,events", [
++    ("ready", [("commented", "not-json"), ("commented", "[]")]),
++    ("ready", [("commented", "null"), ("commented", "42"), ("commented", '{"metadata":[]}')]),
++    ("ready", [("dispatch_skipped", '{"reason":"quota"}')]),
++    ("review", [("commented", json.dumps({"metadata": {"pr": URL, "flow_pr": {
++        "url": URL, "merged": True, "deployed": True, "verified": True}}}))]),
++    ("scheduled", [("scheduled", json.dumps({"awaiting": {"kind": "ci", "ref": URL}}))]),
++    ("scheduled", [("scheduled", json.dumps({"awaiting": {"kind": "deploy", "ref": URL}}))]),
++    ("ready", [("review_requested", "{}"), ("review_reopened", "{}")]),
++    ("review", [("commented", json.dumps({"metadata": {"pr": URL}})),
++                ("commented", json.dumps({"metadata": {"pr": URL + "2"}}))]),
++    ("triage", [("created", json.dumps({"creator_task_id": "creator"})),
++                ("lane_gated", json.dumps({"reason": "limit:cards_per_day"}))]),
++])
++def test_shared_evidence_preserves_legacy_card_semantics(conn, configured, status, events):
++    conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant,created_by,block_kind) "
++                 "VALUES ('c','c',?,100,'myapp','user',?)",
++                 (status, flow.lanes.GATE_KIND if status == 'triage' else None))
++    for kind, payload in events:
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('c',?,?,100)",
++                     (kind, payload))
++    conn.commit()
++    row = conn.execute("SELECT * FROM tasks WHERE id='c'").fetchone()
++    pol = flow.lanes.safe_policy()
++    legacy = flow._card_from_row(conn, row, 1000, Published(), pol)
++    evidence = flow.Evidence(conn)
++    shared = flow._card_from_row(conn, row, 1000, Published(), pol, evidence=evidence)
++    # Decoding is an internal representation change, not a classifier change.
++    for card in (legacy, shared):
++        card['events'] = [{'kind': e['kind'], 'payload': flow._payload(e)} for e in card['events']]
++    assert shared == legacy
++    assert flow.classify_step(shared) == flow.classify_step(legacy)
++    assert flow.classify_reason(shared, flow.classify_step(shared)) == flow.classify_reason(legacy, flow.classify_step(legacy))
++    assert flow.classify_source(shared) == flow.classify_source(legacy)
++
++
++def test_evidence_shared_between_context_and_snapshot_and_not_between_requests(conn, configured, monkeypatch):
++    conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES ('c','c','ready',100,'myapp')")
++    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('c','commented',?,100)",
++                 (json.dumps({'metadata': {'pr': URL}}),))
++    conn.commit()
++    queries = []
++    conn.set_trace_callback(queries.append)
++    try:
++        evidence = flow.Evidence(conn)
++        row = evidence.rows[0]
++        assert evidence.pr_url(row) == URL
++        result = flow.snapshot(conn, reader=Published(), now=1000, evidence=evidence)
++    finally:
++        conn.set_trace_callback(None)
++    assert result['cards'][0]['pr'] == URL
++    histories = [q for q in queries if 'FROM task_events WHERE task_id=' in q and 'ORDER BY id' in q]
++    assert len(histories) == 1
++    conn.execute("UPDATE tasks SET status='archived' WHERE id='c'")
++    conn.commit()
++    assert flow.snapshot(conn, reader=Published(), now=1000)['cards'] == []
++
++
++def test_shared_parent_history_and_parent_state_loaded_once(conn, configured, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    for tid, status in [('parent', 'ready'), ('c1', 'todo'), ('c2', 'todo')]:
++        conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES (?,?,?,100,'myapp')",
++                     (tid, tid, status))
++    conn.executemany("INSERT INTO task_links(parent_id,child_id) VALUES ('parent',?)", [('c1',), ('c2',)])
++    conn.commit()
++    calls = Counter()
++    original = kb.unsatisfied_parents
++
++    def counted(db, tid):
++        calls[tid] += 1
++        return original(db, tid)
++
++    monkeypatch.setattr(kb, 'unsatisfied_parents', counted)
++    result = flow.snapshot(conn, reader=Published(), now=1000)
++    children = [c for c in result['cards'] if c['id'].startswith('c')]
++    assert [c['blockers'] for c in children] == [[{'id': 'parent', 'pr': None}]] * 2
++    assert max(calls.values()) == 1
++
++
++@pytest.mark.parametrize('kind', ['missing', 'triage', 'awaiting', 'contract', 'remote'])
++def test_shared_blockers_match_legacy_oracle(conn, configured, kind):
++    conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES('child','child','todo',100,'myapp')")
++    if kind not in ('missing', 'remote'):
++        conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES('parent','parent',?,100,'myapp')",
++                     ('scheduled' if kind == 'awaiting' else 'triage',))
++    if kind == 'awaiting':
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('parent','scheduled',?,100)",
++                     (json.dumps({'awaiting': {'kind': 'ci', 'ref': URL}}),))
++    if kind == 'contract':
++        conn.execute("UPDATE tasks SET completion_contract=? WHERE id='parent'", (json.dumps({'pr': URL}),))
++    if kind == 'remote':
++        conn.execute('CREATE TABLE kanban_sync_remote_parents(parent_id TEXT PRIMARY KEY,status TEXT)')
++        conn.execute("INSERT INTO kanban_sync_remote_parents VALUES('parent','ready')")
++    conn.execute("INSERT INTO task_links(parent_id,child_id) VALUES('parent','child')")
++    evidence = flow.Evidence(conn)
++    assert evidence.blockers('child') == flow._blockers(conn, 'child')
++    assert bool(evidence.parents('child')) == flow._parents_open(conn, 'child')
+-- 
+2.43.0
+

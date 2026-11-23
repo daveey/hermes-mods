@@ -1,0 +1,162 @@
+From f8d15d50e8c0a758c6c4da36898bc1fe01d2f0c5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:25:48 +0000
+Subject: [PATCH] fix(gateway): retain managed worker fixture and relay
+ compatibility [daveey]
+
+---
+ gateway/session_managed_worker.py             |  7 ++++---
+ gateway/session_worker_credentials.py         |  4 +++-
+ .../fixtures/managed_worker_witness.py        | 19 +++++++++++++++++++
+ .../test_managed_worker_least_privilege.py    | 15 +++++++++++++++
+ tests/gateway/test_mcp_reload_new_server.py   |  7 ++++++-
+ .../test_unified_gateway_native_live.py       |  4 +++-
+ tests/hermes_cli/test_safe_mode.py            |  4 +++-
+ 7 files changed, 53 insertions(+), 7 deletions(-)
+ create mode 100644 tests/gateway/fixtures/managed_worker_witness.py
+
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index c6a83ec3d7..638c7b8712 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -465,12 +465,13 @@ def _worker_env(authority):
+     from gateway.session_worker_credentials import EXEC_ENV
+     from tools.environments.local import build_subprocess_env
+     home = Path(str(authority.profile_id))
+-    if not home.is_absolute():
+-        raise RuntimeStoreError('invalid_profile_home')
+     env = build_subprocess_env(base={k: v for k, v in os.environ.items() if k in EXEC_ENV}, scrub_secrets=True)
+     from gateway.session_context import _VAR_MAP
+     env = {k: v for k, v in env.items() if k in EXEC_ENV or k in _VAR_MAP}
+-    env['HERMES_HOME'] = str(home)
++    # Logical profile IDs used by embedded owners have no filesystem secret scope.
++    # Keep their startup allowlist, never fall back to Popen's inherited environment.
++    if home.is_absolute():
++        env['HERMES_HOME'] = str(home)
+     from hermes_constants import apply_subprocess_home_env
+     apply_subprocess_home_env(env)
+     return env
+diff --git a/gateway/session_worker_credentials.py b/gateway/session_worker_credentials.py
+index 3a32d7789a..4247aad4ad 100644
+--- a/gateway/session_worker_credentials.py
++++ b/gateway/session_worker_credentials.py
+@@ -11,7 +11,7 @@ EXEC_ENV = frozenset({
+     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+     'TMPDIR', 'TMP', 'TEMP', 'SYSTEMROOT', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT',
+     'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+-    'HERMES_REAL_HOME', 'HERMES_MANAGED_HOME',
++    'HERMES_REAL_HOME', 'HERMES_MANAGED_HOME', 'HERMES_NEMO_RELAY_PLUGINS_TOML',
+ })
+ 
+ 
+@@ -21,6 +21,8 @@ def _profile_values(authority, policy):
+     from tools.environments.local import _is_routed_home
+     from tui_gateway.launch_profile_policy import launch_secret_scope
+     home = Path(str(authority.profile_id))
++    if not home.is_absolute():
++        return {}
+     values = {} if _is_routed_home(home) else launch_secret_scope(home)
+     if not policy.ignore_user_config:
+         values = {**values, **build_profile_secret_scope(home)}
+diff --git a/tests/gateway/fixtures/managed_worker_witness.py b/tests/gateway/fixtures/managed_worker_witness.py
+new file mode 100644
+index 0000000000..393b335ac4
+--- /dev/null
++++ b/tests/gateway/fixtures/managed_worker_witness.py
+@@ -0,0 +1,19 @@
++"""Fixture-only explicit audit injection; production workers never inherit PYTHONPATH."""
++from pathlib import Path
++
++
++def install(site):
++    from gateway import capsule_contract
++    original = capsule_contract.worker_command
++    root = str(Path(__file__).resolve().parents[3])
++
++    def witnessed(policy):
++        command = original(policy)
++        # Keep worker flags and the original command tail for the audit identity.
++        # Load only this test's witness explicitly, without changing the exec env.
++        code = ("import runpy,sys; "
++                f"sys.path.insert(0, {root!r}); runpy.run_path({str(site)!r}); "
++                "sys.argv=sys.argv[2:]; runpy.run_module('agent.managed_worker', run_name='__main__')")
++        return [command[0], '-c', code, *command[1:]]
++
++    capsule_contract.worker_command = witnessed
+diff --git a/tests/gateway/test_managed_worker_least_privilege.py b/tests/gateway/test_managed_worker_least_privilege.py
+index b2df86b079..7e82e5bb84 100644
+--- a/tests/gateway/test_managed_worker_least_privilege.py
++++ b/tests/gateway/test_managed_worker_least_privilege.py
+@@ -27,6 +27,21 @@ def test_exec_environment_is_allowlisted_without_profile_secrets(tmp_path, monke
+     assert env['HERMES_HOME'] == str(home)
+ 
+ 
++def test_logical_profile_keeps_allowlist_without_filesystem_secret_scope(monkeypatch):
++    from gateway.session_managed_worker import _worker_env
++    from gateway.session_worker_credentials import _profile_values
++    sentinel = 'synthetic-logical-owner-secret'
++    monkeypatch.setenv('UNKNOWN_OWNER_CREDENTIAL', sentinel)
++    monkeypatch.setenv('PYTHONPATH', sentinel)
++    monkeypatch.setenv('HERMES_NEMO_RELAY_PLUGINS_TOML', '/synthetic/relay.toml')
++    authority = SimpleNamespace(profile_id='owned')
++    env = _worker_env(authority)
++    assert isinstance(env, dict) and sentinel not in json.dumps(env)
++    assert 'HERMES_HOME' not in env
++    assert env['HERMES_NEMO_RELAY_PLUGINS_TOML'] == '/synthetic/relay.toml'
++    assert _profile_values(authority, SimpleNamespace(ignore_user_config=False)) == {}
++
++
+ def test_bootstrap_contains_no_bound_api_key(tmp_path, monkeypatch):
+     from gateway.session_managed_worker import _bootstrap
+     _, args = assignment(tmp_path, monkeypatch)
+diff --git a/tests/gateway/test_mcp_reload_new_server.py b/tests/gateway/test_mcp_reload_new_server.py
+index d0f7849a4f..cd99103ad1 100644
+--- a/tests/gateway/test_mcp_reload_new_server.py
++++ b/tests/gateway/test_mcp_reload_new_server.py
+@@ -50,7 +50,12 @@ def _worker_frame(authority, sid, monkeypatch):
+     policy = policy_for_source(authority.runner, authority.sessions[sid].source)
+     scope = {'profile_id': authority.profile_id, 'session_id': sid, 'execution_id': 'x', 'generation': 1,
+              'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+-    return smw._bootstrap(authority, SessionRef(authority.profile_id, sid), {'payload': {'text': 'hi'}}, policy, scope)
++    frame = smw._bootstrap(authority, SessionRef(authority.profile_id, sid), {'payload': {'text': 'hi'}}, policy, scope)
++    # Bootstrap carries placeholders; discovery sees secrets only after the adopted
++    # execution resolves its private material. RPC authorization is covered separately.
++    from gateway.session_worker_credentials import hydrate_credentials, resolve_credentials
++    assert 'sekret' not in json.dumps(frame)
++    return hydrate_credentials(frame, lambda method, **params: resolve_credentials(authority, params))
+ 
+ 
+ def _worker_servers(frame, monkeypatch):
+diff --git a/tests/gateway/test_unified_gateway_native_live.py b/tests/gateway/test_unified_gateway_native_live.py
+index 50445fe442..6115f68b40 100644
+--- a/tests/gateway/test_unified_gateway_native_live.py
++++ b/tests/gateway/test_unified_gateway_native_live.py
+@@ -284,7 +284,9 @@ def harness(tmp_path, peer):
+         "    if type(obj) is dict and obj.get('type') == 'error' and 'reason' in obj:\n"
+         "        record('worker_error', reason=obj.get('reason'), traceback=traceback.format_exc())\n"
+         "    return _dumps(obj, *a, **kw)\n"
+-        "_json.dumps = _dumps_witness\n", encoding='utf-8')
++        "_json.dumps = _dumps_witness\n"
++        "from tests.gateway.fixtures.managed_worker_witness import install\n"
++        "install(__file__)\n", encoding='utf-8')
+     env = {k: os.environ[k] for k in _CHILD_ENV_KEYS if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONUNBUFFERED='1', PYTHONFAULTHANDLER='1',
+                PYTHONPATH=os.pathsep.join([str(site), str(ROOT)]),
+diff --git a/tests/hermes_cli/test_safe_mode.py b/tests/hermes_cli/test_safe_mode.py
+index 0bb1d4643b..1807764a23 100644
+--- a/tests/hermes_cli/test_safe_mode.py
++++ b/tests/hermes_cli/test_safe_mode.py
+@@ -150,7 +150,9 @@ def test_canonical_safe_launch_is_frozen_policy_executed_in_isolated_worker(tmp_
+         "        record('open', path=path, mode=str(args[1]), **fields)\n"
+         "    finally:\n"
+         "        _busy.on = False\n"
+-        "sys.addaudithook(witness)\n", encoding='utf-8')
++        "sys.addaudithook(witness)\n"
++        "from tests.gateway.fixtures.managed_worker_witness import install\n"
++        "install(__file__)\n", encoding='utf-8')
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), TERM='xterm',
+                PYTHONPATH=os.pathsep.join([str(site), str(root)]), OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+-- 
+2.43.0
+

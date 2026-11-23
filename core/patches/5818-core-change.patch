@@ -1,0 +1,1047 @@
+From fe50155d5558f9f68e6aaf92c9244285841135e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:49:19 +0000
+Subject: [PATCH] feat(kanban): authority-bound scope renewal for scope-stopped
+ holds
+
+A card stopped by kanban_retain(reason='scope_stopped') could never run
+again. Add `hermes kanban renew-scope <task> --episode <uid>
+--mandate-comment <id> --reason <text>`: a human operator, the card's
+owning chat (unreleased created link; shepherd/touch never qualify) or
+its creator task renews one stop on a mandate comment it wrote after the
+stop. The scope_renewed event freezes the scope evidence it covers;
+execution fencing ignores exactly that evidence. Safety restrictions are
+never renewable. Renewal does not promote and does not move the spend
+window (restricted_floor keeps the historical accounting floor); a
+promotion recorded after the renewal releases the card. On a synced
+board the canonical Board decides (renew_scope op, hermes-hub #207).
+
+Card: t_7ed22668a47f201b
+---
+ gateway/kanban_watchers_notifier.py           |   2 +-
+ hermes_cli/kanban.py                          |   1 +
+ hermes_cli/kanban_db_context.py               |   7 +
+ hermes_cli/kanban_parser.py                   |   9 +
+ hermes_cli/kanban_scope_renewal.py            | 261 +++++++++++++++++
+ hermes_cli/kanban_scope_renewal_cli.py        | 159 ++++++++++
+ hermes_cli/kanban_spend_budget.py             |   4 +-
+ hermes_cli/kanban_spend_decision.py           |  40 ++-
+ tests/hermes_cli/test_kanban_scope_renewal.py | 271 ++++++++++++++++++
+ .../test_kanban_scope_renewal_synced.py       | 117 ++++++++
+ website/docs/user-guide/features/kanban.md    |   2 +
+ 11 files changed, 865 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_scope_renewal.py
+ create mode 100644 hermes_cli/kanban_scope_renewal_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_scope_renewal.py
+ create mode 100644 tests/hermes_cli/test_kanban_scope_renewal_synced.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index ca9a1a85fa..c1a7e03f2c 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -674,7 +674,7 @@ def _fmt_resolved_check_drop(ev, n) -> tuple:
+ 
+ def _fmt_spend_budget(ev, n):
+     from hermes_cli.kanban_spend_decision import notice
+-    body = notice(ev.payload or {})
++    body = notice({**(ev.payload or {}), "task_id": getattr(n, "task_id", None)})
+     return f"⏸ {n.head} {body}", body, None
+ 
+ 
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 0b75455e62..5a26ac906e 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1842,6 +1842,7 @@ _HANDLERS = {
+     "complete": _cmd_complete, "edit": _cmd_edit, "reopen": _cmd_reopen, "block": _cmd_block,
+     **dict.fromkeys(("contain", "resume-contained"), lambda a: importlib.import_module("hermes_cli.kanban_containment_cli").command(a)),
+     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
++    "renew-scope": lambda a: importlib.import_module("hermes_cli.kanban_scope_renewal_cli").command(a),
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "resume": _cmd_resume, "quota-release": _cmd_quota_release,
+     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "source-release": _cmd_source_release,
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 13f7b5e68a..0ba2e83da7 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -278,6 +278,13 @@ def _ctx_comments(lines: list[str], conn: sqlite3.Connection, task_id: str, now:
+     attacker-influenceable body (defense-in-depth). A comment whose ``commented`` event
+     says an agent wrote it (``writer_kind='agent'``) is tagged ``(agent chat)``: David and
+     his agents share one profile, so the author alone can't tell them apart. [daveey]"""
++    from hermes_cli.kanban_scope_renewal import mandate as _scope_mandate
++    renewed = _scope_mandate(conn, task_id)
++    if renewed:  # in full: this comment is the scope the run was released for, not thread history
++        lines += ["## Scope renewal mandate",
++                  f"An earlier run stopped this card's scope. It was renewed ({renewed['authority_kind']}, comment "
++                  f"{renewed['mandate_comment_id']}) for exactly the scope below; stop again if the work needs more.",
++                  renewed["body"], ""]
+     shown, omitted_note = _ctx_tail(_kb.list_comments(conn, task_id), _CTX_MAX_COMMENTS, "comment")
+     if not shown:
+         return
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 272c81d87a..2e59b89ca4 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -646,6 +646,15 @@ _SPECS = [
+         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
+         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+     ], help="Manually move one or more todo/blocked/triage tasks to ready (recovery path)"),
++    _cmd("renew-scope", [
++        _TASK_ID,
++        _arg("--episode", required=True, help="Uid of the scope stop (spend_budget_triaged event) being renewed"),
++        _arg("--mandate-comment", required=True, type=int,
++             help="Id of your comment on the card, written after the stop, that states the renewed scope"),
++        _arg("--reason", required=True, help="Why the scope is renewed (audit trail)"),
++        _json_flag(),
++    ], help="Renew a scope-stopped card's scope (human operator, owning chat or creator task; never a safety "
++            "stop). Does not promote: run `hermes kanban promote` afterwards"),
+     _cmd("spend-budget", [
+         _TASK_ID,
+         _arg("--runs", type=_nonnegative_int, help="This card's spending-run limit (0 = no limit)"),
+diff --git a/hermes_cli/kanban_scope_renewal.py b/hermes_cli/kanban_scope_renewal.py
+new file mode 100644
+index 0000000000..f2a6ff2f73
+--- /dev/null
++++ b/hermes_cli/kanban_scope_renewal.py
+@@ -0,0 +1,261 @@
++"""Authority-bound renewal of ONE scope-stopped episode. [daveey]
++
++A worker's ``kanban_retain(reason='scope_stopped')`` restricts its card: no promotion, comment, timer or review
++releases it (``kanban_spend_decision``). ``scope_renewed`` is the one release of that restriction, and only of it:
++
++* it names one stop episode (the ``spend_budget_triaged`` uid) and one mandate comment, written after the stop by
++  the same authority that renews: a human operator, the card's owning chat (an unreleased ``created`` chat link;
++  ``shepherd``/``touch`` observers never qualify) or the card's creator task. Runs of the stopped card never renew;
++* it freezes the exact scope evidence it covers (``covered_restriction_uids``). Execution readers ignore covered
++  evidence only; evidence added later, a new stop, and every safety restriction stay restrictive;
++* it does not promote, claim or touch spend: the card stays in triage under its pending decision until a
++  ``hermes kanban promote`` recorded AFTER the renewal, and ``kanban_spend_budget`` keeps the historical floor
++  (``kanban_spend_decision.restricted_floor``), so a renew-then-promote cycle cannot open a fresh window.
++
++A mandate edited after the renewal no longer matches its frozen digest: the renewal stops covering (restricted
++again) and a fresh mandate plus a new renewal is the recovery.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++from dataclasses import dataclass
++from typing import Any, Optional
++
++EVENT = "scope_renewed"
++STOP, RESTRICT = "spend_budget_triaged", "decision_hold_restricted"
++MAX_MANDATE = 8000  # the operator courier's comment bound: one limit on every path
++MAX_REASON = 2000
++ROUTE = ("record the renewed scope as a comment on the card, then "
++         "`hermes kanban renew-scope {task} --episode <stop uid> --mandate-comment <comment id> --reason <text>` "
++         "(a human operator, the card's owning chat or its creator task), then a separate "
++         "`hermes kanban promote {task} <what changed>`")
++
++
++class RenewalRefused(ValueError):
++    def __init__(self, code: str, message: str):
++        super().__init__(message)
++        self.code = code
++
++
++@dataclass(frozen=True)
++class Actor:
++    """Who renews, as the comment classifier sees them. ``authority``: human | chat | creator_task."""
++    kind: str
++    session: Optional[str]
++    authority: str
++    ref: Optional[str] = None
++    gateway: str = ""
++    profile: str = "default"
++
++
++def key(event: dict) -> str:
++    return event.get("uid") or str(event["id"])
++
++
++def _payload(raw: Any) -> dict:
++    if isinstance(raw, dict):
++        return raw
++    try:
++        data = json.loads(raw or "{}")
++    except (TypeError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def digest(body: str) -> str:
++    return hashlib.sha256(body.encode("utf-8")).hexdigest()
++
++
++def _columns(conn: sqlite3.Connection, table: str) -> set:
++    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def comment_ref(row: dict) -> str:
++    """Portable identity of a comment: its sync uid, else the local id on a board that never synced."""
++    return row.get("uid") or str(row["id"])
++
++
++def _comment(conn: sqlite3.Connection, task_id: str, ref: str) -> Optional[dict]:
++    if not ref:
++        return None
++    if "uid" in _columns(conn, "task_comments"):
++        row = conn.execute("SELECT * FROM task_comments WHERE task_id=? AND uid=?", (task_id, ref)).fetchone()
++        if row is not None:
++            return dict(row)
++    if ref.isascii() and ref.isdecimal():
++        row = conn.execute("SELECT * FROM task_comments WHERE task_id=? AND id=?", (task_id, int(ref))).fetchone()
++        if row is not None and comment_ref(dict(row)) == ref:
++            return dict(row)
++    return None
++
++
++def renewals(conn: sqlite3.Connection, task_id: str) -> list[dict]:
++    """Renewals whose frozen mandate is still the comment on the card; each with a parsed ``payload``."""
++    out = []
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind=?", (task_id, EVENT)):
++        event = dict(row)
++        p = _payload(event["payload"])
++        uids = p.get("covered_restriction_uids")
++        if p.get("version") != 1 or not p.get("episode") or not isinstance(uids, list):
++            continue
++        mandate = _comment(conn, task_id, str(p.get("mandate_comment_uid") or ""))
++        if mandate is None or digest(mandate["body"]) != p.get("mandate_body_sha256"):
++            continue
++        out.append({**event, "payload": p})
++    return out
++
++
++def covered(conn: sqlite3.Connection, task_id: str) -> frozenset:
++    """Keys of scope evidence a valid renewal froze. Callers never apply it to safety evidence."""
++    return frozenset(str(uid) for r in renewals(conn, task_id) for uid in r["payload"]["covered_restriction_uids"])
++
++
++def reopened(conn: sqlite3.Connection, task_id: str, ordinary: list[dict]) -> Optional[dict]:
++    """The renewed stop that still waits for its own decision.
++
++    A renewal re-opens its stop at the renewal's position: only a promotion or archive recorded after it is that
++    decision. Without this, a promotion older than the scope annotation would release the card at renewal.
++    ``ordinary``: stop/promotion/archive events, newest first.
++    """
++    from hermes_cli.kanban_sync_divergence import _event_order
++    renewed = sorted(renewals(conn, task_id), key=_event_order, reverse=True)
++    if not renewed:
++        return None
++    decided = next((e for e in ordinary if e["kind"] != STOP), None)
++    for renewal in renewed:
++        if decided is not None and _event_order(decided) > _event_order(renewal):
++            return None
++        stop = next((e for e in ordinary if e["kind"] == STOP and key(e) == renewal["payload"]["episode"]), None)
++        if stop is not None:
++            return stop
++    return None
++
++
++def scope_evidence(conn: sqlite3.Connection, task_id: str, episode: str) -> list[dict]:
++    """Scope-cause stop/annotation rows and confirmed scope receipts bound to ``episode``. Never safety."""
++    from hermes_cli.kanban_spend_decision import receipt_restrictions
++    out = []
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?)", (task_id, STOP, RESTRICT)):
++        event = dict(row)
++        p = _payload(event["payload"])
++        if p.get("cause") == "scope_stopped" and (key(event) if event["kind"] == STOP else p.get("episode")) == episode:
++            out.append(event)
++    for event in receipt_restrictions(conn, task_id):
++        p = _payload(event["payload"])
++        if p.get("superseded_by_safety_stop") is not True and p.get("episode_uid") == episode:
++            out.append(event)
++    return out
++
++
++def _mandate_event(conn: sqlite3.Connection, task_id: str, comment: dict) -> Optional[dict]:
++    """The one ``commented`` event bound to this comment (uid on synced boards, local id otherwise)."""
++    found = []
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (task_id,)):
++        event = dict(row)
++        p = _payload(event["payload"])
++        bound = (p.get("comment_uid") == comment["uid"] if comment.get("uid")
++                 else p.get("comment_uid") is None and p.get("comment_id") == comment["id"])
++        if bound:
++            found.append({**event, "payload": p})
++    return found[0] if len(found) == 1 else None
++
++
++def _creator_sessions(conn: sqlite3.Connection, creator: str) -> set:
++    return {str(s) for (raw,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='owner_admitted'", (creator,))
++        if (s := _payload(raw).get("session_id"))}
++
++
++def _writer_refusal(conn: sqlite3.Connection, actor: Actor, event: dict) -> Optional[str]:
++    """None when the mandate was written by the renewing authority, on what the ``commented`` event records."""
++    p = event["payload"]
++    if actor.authority == "human":
++        if p.get("writer_kind") != "human":
++            return "a human operator renews on a mandate comment a human wrote"
++        if actor.gateway and event.get("origin_gateway") and event["origin_gateway"] != actor.gateway:
++            return f"the mandate comment was written on {event['origin_gateway']}, not this gateway"
++        return None
++    if p.get("writer_kind") != "agent":
++        return "the mandate comment was not written by the renewing agent"
++    if actor.authority == "creator_task":
++        if p.get("writer_task") == actor.ref or p.get("writer_session") in _creator_sessions(conn, str(actor.ref)):
++            return None
++        return f"the mandate comment was not written by creator task {actor.ref}"
++    if p.get("writer_task") or not actor.session or p.get("writer_session") != actor.session:
++        return "the mandate comment was not written by this owning chat"
++    return None
++
++
++def prepare(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str,
++            actor: Actor) -> dict:
++    """The ``scope_renewed`` payload, or :class:`RenewalRefused`. Call inside the write transaction that appends it."""
++    from hermes_cli import kanban_spend_decision as ksd
++    from hermes_cli.kanban_refusal_receipt import restricted as safety_restricted
++    from hermes_cli.kanban_sync_divergence import _event_order
++    reason = (reason or "").strip()
++    if not reason or len(reason) > MAX_REASON:
++        raise RenewalRefused("invalid_reason", f"--reason is required (at most {MAX_REASON} characters)")
++    task = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if task is None:
++        raise RenewalRefused("no_such_task", f"no such task {task_id}")
++    if safety_restricted(conn, task_id):
++        raise RenewalRefused("safety_restricted", ksd.execution_refusal(conn, task_id) or "safety restriction retained")
++    if task[0] != "triage" or task[2]:
++        raise RenewalRefused("not_stopped", f"{task_id} is {task[0]}, not held in triage by a scope stop")
++    stop = ksd.pending_episode(conn, task_id)
++    current = key(stop) if stop else None
++    if stop is None or stop["kind"] != STOP or current != episode:
++        raise RenewalRefused("episode_mismatch", f"episode {episode} is not {task_id}'s current stop ({current}); "
++                             "reread the card")
++    done = covered(conn, task_id)
++    evidence = [e for e in scope_evidence(conn, task_id, episode) if key(e) not in done]
++    if not evidence:
++        raise RenewalRefused("not_scope_stopped", f"stop {episode} on {task_id} carries no unrenewed scope restriction")
++    comment = conn.execute("SELECT * FROM task_comments WHERE task_id=? AND id=?", (task_id, int(comment_id))).fetchone()
++    body = (comment["body"] or "").strip() if comment is not None else ""
++    if not body:
++        raise RenewalRefused("mandate_missing", f"comment {comment_id} is not a non-empty comment on {task_id}")
++    if len(body) > MAX_MANDATE:
++        raise RenewalRefused("mandate_too_long", f"the mandate comment exceeds {MAX_MANDATE} characters; "
++                             "write a shorter one")
++    comment = dict(comment)
++    written = _mandate_event(conn, task_id, comment)
++    if written is None:
++        raise RenewalRefused("mandate_unattributable", f"comment {comment_id} has no single writer record; "
++                             "write a fresh mandate comment")
++    if why := _writer_refusal(conn, actor, written):
++        raise RenewalRefused("mandate_authority", why)
++    if any(_event_order(e) >= _event_order(written) for e in evidence):
++        raise RenewalRefused("mandate_stale", f"comment {comment_id} predates the scope stop it would renew; "
++                             "write the mandate after the stop")
++    return {"version": 1, "episode": episode, "mandate_comment_uid": comment_ref(comment),
++            "mandate_comment_id": comment["id"], "mandate_event_uid": key(written),
++            "mandate_body_sha256": digest(comment["body"]),
++            "covered_restriction_uids": sorted(key(e) for e in evidence),
++            "actor_kind": actor.kind, "actor_session": actor.session, "actor_gateway": actor.gateway,
++            "actor_profile": actor.profile, "authority_kind": actor.authority, "authority_ref": actor.ref,
++            "reason": reason}
++
++
++def renew_local(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str,
++                actor: Actor) -> dict:
++    """Validate and append in one write transaction on a board with no canonical Board. Status is untouched."""
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        payload = prepare(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
++        kb._append_event(conn, task_id, EVENT, payload)
++    return payload
++
++
++def mandate(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """The newest effective renewal's mandate for the next run's context, or None while restricted."""
++    from hermes_cli import kanban_spend_decision as ksd
++    from hermes_cli.kanban_sync_divergence import _event_order
++    valid = renewals(conn, task_id)
++    if not valid or ksd.execution_restricted(conn, task_id):
++        return None
++    renewal = max(valid, key=_event_order)
++    comment = _comment(conn, task_id, str(renewal["payload"]["mandate_comment_uid"]))
++    return {**renewal["payload"], "body": comment["body"], "mandate_comment_id": comment["id"]} if comment else None
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+new file mode 100644
+index 0000000000..fdda71993e
+--- /dev/null
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -0,0 +1,159 @@
++"""``hermes kanban renew-scope``: who is asking, and where the renewal is decided. [daveey]
++
++The caller is identified exactly as ``hermes kanban comment`` identifies a comment's writer
++(``kanban_comment_writer.cli_comment_writer``); no flag names a role or session. On a synced board the canonical
++Board decides and writes the ``scope_renewed`` event (one ``renew_scope`` op, so a card whose home is another
++gateway needs no courier); a board that never synced validates and appends in one local transaction.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import re
++import sqlite3
++from typing import Mapping, Optional
++
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli.kanban_scope_renewal import Actor, RenewalRefused
++
++_TASK_MARKERS = ("HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_TASK")
++_MARKED = re.compile(r"\d+:[A-Z][A-Z0-9_]*")  # an agent-marker ancestor; not a runner, a guess or a handle
++
++
++def _sessions(conn: sqlite3.Connection, task_id: str) -> set:
++    return renewal._creator_sessions(conn, task_id)
++
++
++def owning_link(conn: sqlite3.Connection, task_id: str, *, gateway: str, profile: str, session: str) -> Optional[dict]:
++    """This chat's unreleased ``created`` link (or the legacy owning subscription ``_chat_links`` projects).
++
++    ``shepherd``/``touch`` rows are observer subscriptions any chat can add to any card: never authority.
++    """
++    from hermes_cli.kanban_creator_chats import _chat_links
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        return _owning_sub(conn, task_id, session)
++    for link in _chat_links(conn, task_id):
++        if (link.get("kind", "created") == "created" and link["chat_session"] == session
++                and link["chat_gateway"] == gateway and (link.get("chat_profile") or "default") == profile):
++            return link
++    return None
++
++
++def _owning_sub(conn: sqlite3.Connection, task_id: str, session: str) -> Optional[dict]:
++    """A board that never synced has no chat links: the chat whose subscription was stamped at creation owns."""
++    from hermes_cli.kanban_db_notify import OBSERVER_SUB_REASONS
++    for row in conn.execute("SELECT chat_id, delivery_metadata FROM kanban_notify_subs WHERE task_id=? AND chat_id=?",
++                            (task_id, session)):
++        try:
++            reason = json.loads(row[1] or "{}").get("reason")
++        except (TypeError, ValueError, AttributeError):
++            continue
++        if reason and reason not in OBSERVER_SUB_REASONS:
++            return {"chat_session": session}
++    return None
++
++
++def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, env: Mapping[str, str],
++                  gateway: str, profile: str) -> Actor:
++    """The renewing authority, or :class:`RenewalRefused`. The stopped card's own runs are refused first."""
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    kind, session, evidence = writer
++    if kind == "human":
++        return Actor("human", None, "human", None, gateway, profile)
++    marked = {str(env.get(name) or "").strip() for name in _TASK_MARKERS} - {""}
++    if task_id in marked or (session and session in _sessions(conn, task_id)):
++        raise RenewalRefused("own_run", f"a run of {task_id} cannot renew its own stopped scope")
++    if kind != "agent" or not session or not _MARKED.fullmatch(str(evidence)):
++        raise RenewalRefused("identity_unavailable", "the caller's identity is missing or ambiguous "
++                             f"({evidence}); renew from the owning chat, the creator task or a human terminal")
++    if len(marked) > 1:
++        raise RenewalRefused("identity_unavailable", "the caller carries two different task identities")
++    creator = _creator_task_id(conn, task_id)
++    if marked:
++        own = next(iter(marked))
++        row = conn.execute("SELECT status FROM tasks WHERE id=?", (own,)).fetchone()
++        if own != creator or row is None or row[0] != "running" or session not in _sessions(conn, own):
++            raise RenewalRefused("not_scope_authority", f"task {own} is not {task_id}'s running creator task")
++        return Actor("agent", session, "creator_task", own, gateway, profile)
++    if owning_link(conn, task_id, gateway=gateway, profile=profile, session=session) is None:
++        raise RenewalRefused("not_scope_authority", f"this session is not {task_id}'s owning chat (an unreleased "
++                             "created chat link); shepherd/touch subscriptions and unrelated agents cannot renew")
++    return Actor("agent", session, "chat", f"@session:{profile}@{gateway}/{session}", gateway, profile)
++
++
++def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict, mode: str) -> dict:
++    """Ask the canonical Board to revalidate and write the event; project its exact row into this replica."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    hub = client.Hub(client.load_identity())
++    try:
++        capability = hub.decision_retain_capability(board)
++        if not isinstance(capability, dict) or capability.get("scope_renewal") != 1:
++            raise RenewalRefused("board_unsupported", "the Board does not support scope renewal v1 yet; "
++                                 "nothing was changed. Retry after the Board deployment")
++        if mode == "primary":
++            client.push(conn, hub, board, hub.ident.gateway, primary=True)  # the mandate comment must be canonical
++        body = conn.execute("SELECT body FROM task_comments WHERE id=?", (payload["mandate_comment_id"],)).fetchone()[0]
++        event_uid = sync.uuid7()
++        audit = {k: payload[k] for k in ("actor_kind", "actor_session", "actor_profile", "authority_kind",
++                                         "authority_ref", "reason")}
++        wire = {"client_op_id": event_uid, "op": "renew_scope", "task": task_id, "event_uid": event_uid,
++                "episode": payload["episode"], "mandate_comment_uid": payload["mandate_comment_uid"],
++                "mandate_body": body, "payload": {"version": 1, **audit}}
++        results = hub.ops(board, [wire]).get("results", [])
++        if len(results) != 1 or results[0].get("client_op_id") != event_uid or results[0].get("status") != "applied":
++            reply = results[0] if len(results) == 1 else {}
++            raise RenewalRefused(str(reply.get("reason") or "board_rejected"),
++                                 f"the Board refused the renewal: {reply.get('reason') or 'no reply'}"
++                                 f"{': ' + str(reply['detail']) if reply.get('detail') else ''}")
++        proof = hub.row_evidence(board, "task_events", event_uid)
++        row = proof.get("row") if proof.get("state") == "live" else None
++        if not isinstance(row, dict) or row.get("kind") != renewal.EVENT or row.get("task_id") != task_id:
++            raise RenewalRefused("board_unconfirmed", "the Board applied the renewal but its event could not be "
++                                 "read back; rerun `hermes kanban show` after the next sync")
++        sync.apply_remote_changes(conn, [client._row_change("task_events", row)],
++                                  new_cursor=sync.sync_state(conn)["cursor"], board=board)
++        return json.loads(row["payload"])
++    finally:
++        hub.close()
++
++
++def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str,
++          board: Optional[str] = None, writer: Optional[tuple] = None,
++          env: Optional[Mapping[str, str]] = None) -> dict:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_comment_writer import cli_comment_writer
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.profiles import get_active_profile_name
++    env = os.environ if env is None else env
++    actor = resolve_actor(conn, task_id, writer=writer or cli_comment_writer(env=env), env=env,
++                          gateway=gateway_names()[0], profile=get_active_profile_name() or "default")
++    mode = sync.board_mode(conn)
++    if mode == "off" and not sync.sync_state(conn):
++        return renewal.renew_local(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
++    if mode == "off":
++        raise RenewalRefused("board_unavailable", "this board is synced but sync is not active in this process")
++    payload = renewal.prepare(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
++    return _canonical(conn, board or sync.sync_state(conn)["board_id"], task_id, payload, mode)
++
++
++def command(args: argparse.Namespace) -> int:
++    from hermes_cli import kanban_db as kb
++    try:
++        with kb.connect_closing() as conn:
++            payload = renew(conn, args.task_id, episode=args.episode, comment_id=args.mandate_comment,
++                            reason=args.reason)
++    except RenewalRefused as exc:
++        if getattr(args, "json", False):
++            print(json.dumps({"ok": False, "error": exc.code, "message": str(exc)}))
++        else:
++            print(f"renew-scope refused ({exc.code}): {exc}")
++        return 1
++    if getattr(args, "json", False):
++        print(json.dumps({"ok": True, "task_id": args.task_id, **payload}))
++    else:
++        print(f"Scope renewed on {args.task_id} for stop {payload['episode']} (mandate comment "
++              f"{payload['mandate_comment_uid']}). The card is still in triage: "
++              f"`hermes kanban promote {args.task_id} <what changed>` releases it.")
++    return 0
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index f623e81efc..af36af6d95 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -182,8 +182,8 @@ def usage_fields(agent) -> dict:
+ 
+ 
+ def _window_start(conn: sqlite3.Connection, task_id: str, cut: int) -> int:
+-    from hermes_cli.kanban_spend_decision import restricted_since
+-    restriction = restricted_since(conn, task_id)
++    from hermes_cli.kanban_spend_decision import restricted_floor
++    restriction = restricted_floor(conn, task_id)
+     if restriction is not None:
+         cut = min(cut, restriction)  # cap reset authority only; spend() still counts later run usage
+     marks = ",".join("?" for _ in RESET_OUTCOMES)
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 2aa01c3924..82f877486f 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -51,12 +51,17 @@ def pending_episode(conn, task_id: str):
+         "('spend_budget_triaged','decision_hold_restricted','decision_retained','promoted_manual','archived')", (task_id,))]
+     events.sort(key=_event_order, reverse=True)
+     receipts = {e['id'] for e in receipt_restrictions(conn, task_id)}
++    from hermes_cli import kanban_scope_renewal as renewal
++    renewed = renewal.covered(conn, task_id)  # scope evidence only; safety is never skipped
+     for event in events:
+         try:
+             payload = json.loads(event['payload'] or '{}')
+         except (TypeError, ValueError):
+             continue
+-
++        if (renewal.key(event) in renewed and isinstance(payload, dict) and (
++                payload.get('superseded_by_safety_stop') is not True if event['id'] in receipts
++                else payload.get('cause') == 'scope_stopped')):
++            continue
+         if event['id'] in receipts:
+             return next((e for e in events if e['kind'] == EVENT and (e.get('uid') or str(e['id'])) == payload.get('episode_uid')), event)
+         if (isinstance(payload, dict) and payload.get('cause') in {'safety_refusal', 'scope_stopped'}
+@@ -65,7 +70,9 @@ def pending_episode(conn, task_id: str):
+                          and (e.get('uid') or str(e['id'])) == payload.get('episode')),
+                         event) if event['kind'] != EVENT else event
+     ordinary = [e for e in events if e['kind'] not in ('decision_hold_restricted', 'decision_retained')]
+-    return ordinary[0] if ordinary and ordinary[0]['kind'] == EVENT else None
++    if ordinary and ordinary[0]['kind'] == EVENT:
++        return ordinary[0]
++    return renewal.reopened(conn, task_id, ordinary) if renewed else None
+ 
+ 
+ def pending(conn, task_id: str) -> bool:
+@@ -78,7 +85,26 @@ def execution_restricted(conn, task_id: str) -> bool:
+ 
+ 
+ def restricted_since(conn, task_id: str) -> int | None:
+-    """One monotone restriction predicate for release fencing and accounting."""
++    """Execution fencing: the earliest restriction a scope renewal does not cover. Safety is never covered."""
++    import json
++    from hermes_cli import kanban_scope_renewal as renewal
++    renewed = renewal.covered(conn, task_id)
++    if not renewed:
++        return restricted_floor(conn, task_id)
++    times = [e['created_at'] or 0 for e in receipt_restrictions(conn, task_id)
++             if renewal.key(e) not in renewed or json.loads(e['payload']).get('superseded_by_safety_stop') is True]
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN "
++                            "('spend_budget_triaged','decision_hold_restricted') AND json_valid(payload) "
++                            "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.cause') END "
++                            "IN ('safety_refusal','scope_stopped')", (task_id,)):
++        event = dict(row)
++        if json.loads(event['payload'])['cause'] == 'safety_refusal' or renewal.key(event) not in renewed:
++            times.append(event['created_at'] or 0)
++    return min(times) if times else None
++
++
++def restricted_floor(conn, task_id: str) -> int | None:
++    """Monotone historical floor for spend accounting: a scope renewal never moves it."""
+     row = conn.execute("SELECT MIN(COALESCE(created_at,0)) FROM task_events WHERE task_id=? AND kind IN "
+                         "('spend_budget_triaged','decision_hold_restricted') AND json_valid(payload) "
+                         "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.cause') END "
+@@ -122,7 +148,9 @@ def execution_refusal(conn, task_id: str) -> str | None:
+     if restricted(conn, task_id):
+         return 'Provider safety restriction retained; no supported execution release. A budget decision is not clearance. Owning supervisor must resolve the scope/authority boundary without rerunning refused work.'
+     if execution_restricted(conn, task_id):
+-        return 'Scope stopped; no supported execution release. Owning supervisor must resolve the scope/authority boundary.'
++        from hermes_cli.kanban_scope_renewal import ROUTE
++        return ('Scope stopped; promotion, comments, timers and review do not release it. To renew the scope: '
++                + ROUTE.format(task=task_id) + '.')
+     return None
+ 
+ 
+@@ -138,7 +166,9 @@ def unblock_refusal(conn, task_id: str) -> str | None:
+ 
+ def notice(payload: dict) -> str:
+     if payload.get('cause') == 'scope_stopped':
+-        return 'Scope stopped without execution authority. Record the administrative decision only; no generic promotion, comment, timer or review releases it.'
++        from hermes_cli.kanban_scope_renewal import ROUTE
++        return ('Scope stopped without execution authority. No generic promotion, comment, timer or review releases it. '
++                'Only an explicit scope renewal does: ' + ROUTE.format(task=payload.get('task_id') or '<task>') + '.')
+     if payload.get('cause') == 'safety_refusal':
+         return ('Provider safety refusal retained. There is no supported execution release; '
+                 'ordinary promotion, review, comments and timers are not clearance. '
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal.py b/tests/hermes_cli/test_kanban_scope_renewal.py
+new file mode 100644
+index 0000000000..b70f099fd3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scope_renewal.py
+@@ -0,0 +1,271 @@
++"""Scope renewal: one authority-bound release of one scope stop. Safety stays closed; spend is untouched."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_scope_renewal_cli as cli
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli.kanban_origin import gateway_names
++from hermes_cli.kanban_scope_renewal import RenewalRefused
++from gateway.session_context import scoped_current_session_id
++from tests.hermes_cli import test_kanban_containment_actor as support
++
++board = support.board
++ARGS = dict(summary='Incomplete; no execution authority', reason='scope_stopped',
++            next_step='Owning supervisor records scope decision', release_condition='Supported explicit authority',
++            evidence=['synthetic stopped-scope fixture'])
++CHAT = '20000101_000000_82dc14'  # a synthetic origin chat: an agent writer with no run
++AGENT = ('agent', CHAT, '4242:HERMES_SESSION_ID')
++HUMAN = ('human', None, 'clean-ancestry')
++
++
++def stopped(board, monkeypatch):
++    """A card its own run scope-stopped, with every worker marker cleared afterwards."""
++    from hermes_cli import kanban_retain as retain
++    tid, _, session = support.bind(board, monkeypatch)
++    with scoped_current_session_id(session):
++        result = retain.retain(board, board='default', **ARGS)
++    for name in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_SESSION_ID'):
++        monkeypatch.delenv(name, raising=False)
++    return tid, session, result['episode_uid']
++
++
++def link(board, tid, *, session=CHAT, kind='created', released=0, profile='default', gateway=None):
++    board.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT NOT NULL, "
++                  "chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, kind TEXT NOT NULL, "
++                  "released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
++    board.execute("INSERT INTO task_chat_links (task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                  "VALUES (?,?,?,?,?,?,1)", (tid, gateway or gateway_names()[0], profile, session, kind, released))
++    board.commit()
++
++
++def mandate(board, tid, *, session=CHAT, kind='agent', body='Renewed scope: one correction round on the open PR.'):
++    return kb.add_comment(board, tid, 'default', body, writer_kind=kind, writer_session=session if kind == 'agent' else None)
++
++
++def renew(board, tid, episode, comment, *, writer=AGENT, env=None, reason='origin chat authorized the round'):
++    return cli.renew(board, tid, episode=episode, comment_id=comment, reason=reason, writer=writer, env=env or {})
++
++
++def refused(board, tid, episode, comment, code, **kw):
++    with pytest.raises(RenewalRefused) as caught:
++        renew(board, tid, episode, comment, **kw)
++    assert caught.value.code == code
++    assert not board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++    assert decision.execution_restricted(board, tid)
++
++
++def test_a_owning_chat_renews_then_separate_promote_releases(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)
++    payload = renew(board, tid, episode, comment)
++    assert {k: payload[k] for k in ('episode', 'actor_kind', 'actor_session', 'reason', 'authority_kind')} == {
++        'episode': episode, 'actor_kind': 'agent', 'actor_session': CHAT,
++        'reason': 'origin chat authorized the round', 'authority_kind': 'chat'}
++    assert payload['mandate_comment_uid'] == renewal.comment_ref(
++        dict(board.execute('SELECT * FROM task_comments WHERE id=?', (comment,)).fetchone()))
++    # Renewal is not promotion: still triage, still a pending decision, no execution restriction.
++    assert kb.get_task(board, tid).status == 'triage'
++    assert decision.pending(board, tid) and not decision.execution_restricted(board, tid)
++    promoted, refusal = kb.promote_task(board, tid, actor='fixture', reason='renewed scope')
++    assert promoted is True, refusal
++    assert kb.get_task(board, tid).status != 'triage' and not decision.pending(board, tid)
++    context = kb.build_worker_context(board, tid)
++    assert '## Scope renewal mandate' in context and 'one correction round on the open PR' in context
++
++
++def test_a_real_origin_chat_shape_null_profile_link_counts_as_default(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid, profile=None)
++    link(board, tid, kind='shepherd', released=1)
++    comment = mandate(board, tid)
++    refused(board, tid, episode, comment, 'not_scope_authority', writer=('agent', 'another-session', '1:HERMES_SESSION_ID'))
++    written = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='commented' "
++                                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
++    assert written['writer_kind'] == 'agent' and written['writer_session'] == CHAT and 'writer_task' not in written
++    assert renew(board, tid, episode, comment)['authority_ref'] == f'@session:default@{gateway_names()[0]}/{CHAT}'
++
++
++def test_a_human_and_creator_task_renew_on_their_own_mandates(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    agent_note, human_note = mandate(board, tid), mandate(board, tid, kind='human')
++    refused(board, tid, episode, agent_note, 'mandate_authority', writer=HUMAN)
++    assert renew(board, tid, episode, human_note, writer=HUMAN)['authority_kind'] == 'human'
++
++
++def test_a_creator_task_renews_only_while_it_runs(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    creator = kb.create_task(board, title='creator', assignee='default')
++    board.execute("UPDATE task_events SET payload=json_set(COALESCE(payload,'{}'),'$.creator_task_id',?) "
++                  "WHERE task_id=? AND kind='created'", (creator, tid))
++    kb._append_event(board, creator, 'owner_admitted', {'session_id': 'local-creator'})
++    board.commit()
++    comment = mandate(board, tid, session='local-creator')
++    env, writer = {'HERMES_KANBAN_WORKER_TASK': creator}, ('agent', 'local-creator', '7:HERMES_KANBAN_WORKER_TASK')
++    refused(board, tid, episode, comment, 'not_scope_authority', writer=writer, env=env)  # creator is not running
++    board.execute("UPDATE tasks SET status='running' WHERE id=?", (creator,))
++    board.commit()
++    refused(board, tid, episode, comment, 'not_scope_authority', writer=('agent', 'local-other', '7:X'), env=env)
++    assert renew(board, tid, episode, comment, writer=writer, env=env)['authority_ref'] == creator
++
++
++def test_b_safety_restriction_is_never_renewable(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal', 'episode': episode})
++    board.commit()
++    refused(board, tid, episode, mandate(board, tid), 'safety_restricted')
++
++
++def test_b_safety_after_renewal_restricts_and_is_not_covered(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    renew(board, tid, episode, mandate(board, tid))
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal', 'episode': episode})
++    board.commit()
++    assert decision.execution_restricted(board, tid)
++    assert kb.promote_task(board, tid, actor='fixture', reason='x')[0] is False
++    assert 'safety' in decision.unblock_refusal(board, tid).lower()
++
++
++def test_c_stopped_cards_own_run_is_refused(board, monkeypatch):
++    tid, session, episode = stopped(board, monkeypatch)
++    link(board, tid, session=session)  # even an owning link does not let the card's own run renew
++    comment = mandate(board, tid, session=session)
++    refused(board, tid, episode, comment, 'own_run', writer=('agent', session, '9:HERMES_SESSION_ID'))
++    refused(board, tid, episode, comment, 'own_run', env={'HERMES_KANBAN_WORKER_TASK': tid})
++    refused(board, tid, episode, comment, 'own_run', env={'HERMES_KANBAN_TASK': tid})
++
++
++@pytest.mark.parametrize('writer', [AGENT, ('agent', None, '4242:HERMES_AGENT'), ('agent', CHAT, 'inconclusive:pid 1'),
++                                    ('agent', CHAT, 'runner:systemd:x.service'), ('agent', CHAT, '5:runner:cron'),
++                                    ('agent', CHAT, 'author_handle')])
++def test_d_unlinked_or_ambiguous_agent_is_refused(board, monkeypatch, writer):
++    tid, _, episode = stopped(board, monkeypatch)
++    if writer is not AGENT:
++        link(board, tid)
++    code = 'not_scope_authority' if writer is AGENT else 'identity_unavailable'
++    refused(board, tid, episode, mandate(board, tid), code, writer=writer)
++
++
++def test_d2_shepherd_touch_and_released_links_are_not_owners(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    comment = mandate(board, tid)
++    link(board, tid, kind='shepherd')
++    link(board, tid, kind='touch')
++    link(board, tid, kind='created', released=1)
++    link(board, tid, kind='created', gateway='another-gateway')
++    link(board, tid, kind='created', profile='other-profile')
++    refused(board, tid, episode, comment, 'not_scope_authority')
++    refused(board, tid, episode, comment, 'not_scope_authority')
++
++
++@pytest.mark.parametrize('reason,owner', [('shepherd', False), ('touch', False), (None, False), ('create', True)])
++def test_d2_unsynced_board_only_a_creation_stamped_subscription_owns(board, monkeypatch, reason, owner):
++    tid, _, episode = stopped(board, monkeypatch)
++    comment = mandate(board, tid)
++    from hermes_cli.kanban_db_notify import add_notify_sub
++    add_notify_sub(board, task_id=tid, platform='tui', chat_id=CHAT,
++                      delivery_metadata={'reason': reason} if reason else None)
++    if owner:
++        assert renew(board, tid, episode, comment)['authority_kind'] == 'chat'
++    else:
++        refused(board, tid, episode, comment, 'not_scope_authority')
++
++
++def test_e_comment_and_generic_promote_alone_leave_the_card_restricted(board, monkeypatch):
++    tid, _, _ = stopped(board, monkeypatch)
++    link(board, tid)
++    mandate(board, tid)
++    kb._append_event(board, tid, 'promoted_manual', {})
++    kb._append_event(board, tid, 'review_requested', {})
++    board.commit()
++    assert decision.execution_restricted(board, tid) and decision.pending(board, tid)
++    promoted, refusal = kb.promote_task(board, tid, actor='fixture', reason='generic promotion')
++    assert promoted is False and 'renew-scope' in refusal
++
++
++def test_f_wrong_stale_or_unmandated_requests_are_refused(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)
++    refused(board, tid, 'not-the-episode', comment, 'episode_mismatch')
++    refused(board, tid, episode, 999999, 'mandate_missing')
++    refused(board, tid, episode, mandate(board, tid, session='someone-else'), 'mandate_authority')
++    refused(board, tid, episode, mandate(board, tid, body='x' * 8001), 'mandate_too_long')
++    refused(board, tid, episode, comment, 'invalid_reason', reason=' ')
++    other = kb.create_task(board, title='other', assignee='default')
++    refused(board, tid, episode, mandate(board, other), 'mandate_missing')
++    # A mandate older than the newest covered restriction is stale.
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'scope_stopped', 'episode': episode})
++    board.commit()
++    refused(board, tid, episode, comment, 'mandate_stale')
++    renew(board, tid, episode, mandate(board, tid))
++    with pytest.raises(RenewalRefused) as replay:  # the episode is renewed; nothing is left to cover
++        renew(board, tid, episode, mandate(board, tid))
++    assert replay.value.code == 'not_scope_stopped'
++
++
++def test_f_edited_mandate_stops_covering(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)
++    renew(board, tid, episode, comment)
++    board.execute("UPDATE task_comments SET body='Do everything' WHERE id=?", (comment,))
++    board.commit()
++    assert decision.execution_restricted(board, tid)
++    assert kb.promote_task(board, tid, actor='fixture', reason='x')[0] is False
++
++
++@pytest.mark.parametrize('kind', ['spend_budget_triaged', 'decision_hold_restricted'])
++def test_g_new_scope_stop_after_renewal_restricts_again(board, monkeypatch, kind):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    renew(board, tid, episode, mandate(board, tid))
++    kb._append_event(board, tid, kind, {'cause': 'scope_stopped', 'episode': episode})
++    board.commit()
++    assert decision.execution_restricted(board, tid) and decision.pending(board, tid)
++    assert kb.promote_task(board, tid, actor='fixture', reason='x')[0] is False
++
++
++def test_g_promotion_older_than_the_scope_annotation_does_not_release_a_renewed_stop(board, monkeypatch):
++    tid, _, _ = support.bind(board, monkeypatch)
++    board.execute("UPDATE tasks SET status='triage',claim_lock=NULL WHERE id=?", (tid,))
++    kb._append_event(board, tid, 'spend_budget_triaged', {'reason': 'budget'})
++    episode = renewal.key(decision.pending_episode(board, tid))
++    kb._append_event(board, tid, 'promoted_manual', {})
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'scope_stopped', 'episode': episode})
++    board.commit()
++    link(board, tid)
++    renew(board, tid, episode, mandate(board, tid), env={})
++    assert decision.pending(board, tid), 'the old promotion must not decide the renewed stop'
++    kb._append_event(board, tid, 'promoted_manual', {})
++    assert not decision.pending(board, tid)
++
++
++def test_h_notice_and_unblock_text_name_the_route_only_for_scope_stops(board, monkeypatch):
++    tid, _, _ = stopped(board, monkeypatch)
++    text = decision.unblock_refusal(board, tid)
++    assert f'hermes kanban renew-scope {tid} --episode' in text and f'hermes kanban promote {tid}' in text
++    notice = decision.notice({'cause': 'scope_stopped', 'task_id': tid})
++    assert f'hermes kanban renew-scope {tid} --episode' in notice and 'owning chat' in notice
++    safety = decision.notice({'cause': 'safety_refusal', 'task_id': tid})
++    assert 'renew-scope' not in safety
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal'})
++    assert 'renew-scope' not in decision.unblock_refusal(board, tid)
++
++
++def test_i_renewal_leaves_the_spend_window_runs_and_tokens_unchanged(board, monkeypatch):
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)
++    since, spent = budget._window_start(board, tid, 2999999999), budget.spend(board, tid)
++    floor = decision.restricted_floor(board, tid)
++    renew(board, tid, episode, comment)
++    assert budget._window_start(board, tid, 2999999999) == since
++    assert budget.spend(board, tid) == spent
++    assert decision.restricted_floor(board, tid) == floor and decision.restricted_since(board, tid) is None
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_synced.py b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+new file mode 100644
+index 0000000000..61deed4db8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+@@ -0,0 +1,117 @@
++"""Synced boards: the canonical Board decides a scope renewal; this gateway only asks and projects its event."""
++import hashlib
++import json
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_scope_renewal_cli as cli
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli.kanban_origin import gateway_names
++from hermes_cli.kanban_scope_renewal import RenewalRefused
++from tests.hermes_cli import test_kanban_failure_transport as support
++
++live = support.live
++CHAT = '20000101_000000_82dc14'
++AGENT = ('agent', CHAT, '4242:HERMES_SESSION_ID')
++
++
++class Hub:
++    def __init__(self, capability, reply=None):
++        self.capability, self.reply, self.sent = capability, reply, []
++        self.ident = SimpleNamespace(gateway='fixture')
++
++    def decision_retain_capability(self, board):
++        return self.capability
++
++    def ops(self, board, ops):
++        self.sent += ops
++        if self.reply:
++            return {'results': [{'client_op_id': ops[0]['client_op_id'], **self.reply}]}
++        return {'results': [{'client_op_id': ops[0]['client_op_id'], 'status': 'applied'}]}
++
++    def row_evidence(self, board, table, uid):
++        wire = self.sent[-1]
++        payload = {'version': 1, 'episode': wire['episode'], 'mandate_comment_uid': wire['mandate_comment_uid'],
++                   'mandate_body_sha256': hashlib.sha256(wire['mandate_body'].encode()).hexdigest(),
++                   'covered_restriction_uids': [wire['episode']], 'actor_gateway': 'fixture', **wire['payload']}
++        now = int(time.time())
++        return {'board': board, 'table': table, 'uid': uid, 'state': 'live', 'row': {
++            'uid': uid, 'task_id': wire['task'], 'run_uid': None, 'kind': 'scope_renewed', 'payload': json.dumps(payload),
++            'created_at': now, 'version': 1, 'hlc': f'{now * 1000:013d}-0000-server', 'origin_gateway': 'fixture',
++            'updated_at': now * 1000, 'deleted_at': None}}
++
++    def close(self):
++        pass
++
++
++def stopped(live, monkeypatch, hub):
++    from hermes_cli import kanban_sync_client as client
++    tid, _ = support._running(live)
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status='triage',claim_lock=NULL,claim_expires=NULL WHERE id=?", (tid,))
++        kb._append_event(live, tid, 'spend_budget_triaged', {'cause': 'scope_stopped', 'reason': 'out of scope'})
++        live.execute("INSERT INTO task_chat_links (task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                     "VALUES (?,?,NULL,?,'created',0,1)", (tid, gateway_names()[0], CHAT))
++    comment = kb.add_comment(live, tid, 'default', 'Renewed scope: one correction round.', writer_kind='agent',
++                             writer_session=CHAT)
++    monkeypatch.setattr(client, 'Hub', lambda identity: hub)
++    monkeypatch.setattr(client, 'load_identity', lambda: None)
++    monkeypatch.setattr(client, 'push', lambda *a, **k: None)
++    for name in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK'):
++        monkeypatch.delenv(name, raising=False)
++    return tid, renewal.key(decision.pending_episode(live, tid)), comment
++
++
++def renew(live, tid, episode, comment):
++    return cli.renew(live, tid, episode=episode, comment_id=comment, reason='authorized', writer=AGENT, env={})
++
++
++def test_board_applies_and_the_exact_event_is_projected(live, monkeypatch):
++    hub = Hub({'decision_retain': 1, 'scope_renewal': 1})
++    tid, episode, comment = stopped(live, monkeypatch, hub)
++    assert sync.board_mode(live) != 'off'
++    before = live.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0]
++    payload = renew(live, tid, episode, comment)
++    wire, = hub.sent
++    uid = live.execute('SELECT uid FROM task_comments WHERE id=?', (comment,)).fetchone()[0]
++    assert wire == {'client_op_id': wire['event_uid'], 'op': 'renew_scope', 'task': tid, 'event_uid': wire['event_uid'],
++                    'episode': episode, 'mandate_comment_uid': uid, 'mandate_body': 'Renewed scope: one correction round.',
++                    'payload': {'version': 1, 'actor_kind': 'agent', 'actor_session': CHAT, 'actor_profile': 'default',
++                                'authority_kind': 'chat',
++                                'authority_ref': f'@session:default@{gateway_names()[0]}/{CHAT}', 'reason': 'authorized'}}
++    assert payload['covered_restriction_uids'] == [episode]
++    row = live.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchall()
++    assert [r[0] for r in row] == [wire['event_uid']]
++    # The Board's event came in as a remote row: nothing new waits in this gateway's outbox.
++    assert live.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == before
++    assert not decision.execution_restricted(live, tid) and decision.pending(live, tid)
++    assert kb.get_task(live, tid).status == 'triage'
++
++
++@pytest.mark.parametrize('capability,reply,code', [
++    ({'decision_retain': 1}, None, 'board_unsupported'),
++    ({'decision_retain': 1, 'scope_renewal': 1}, {'status': 'rejected', 'reason': 'not_scope_authority'}, 'not_scope_authority'),
++    ({'decision_retain': 1, 'scope_renewal': 1}, {'status': 'deferred'}, 'board_rejected'),
++])
++def test_unsupported_or_refusing_board_changes_nothing(live, monkeypatch, capability, reply, code):
++    hub = Hub(capability, reply)
++    tid, episode, comment = stopped(live, monkeypatch, hub)
++    with pytest.raises(RenewalRefused) as caught:
++        renew(live, tid, episode, comment)
++    assert caught.value.code == code
++    assert bool(hub.sent) is (reply is not None)
++    assert not live.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++    assert decision.execution_restricted(live, tid)
++
++
++def test_local_validation_refuses_before_any_board_request(live, monkeypatch):
++    hub = Hub({'decision_retain': 1, 'scope_renewal': 1})
++    tid, _, comment = stopped(live, monkeypatch, hub)
++    with pytest.raises(RenewalRefused):
++        renew(live, tid, 'not-the-episode', comment)
++    assert not hub.sent
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index c6a9ced00d..c58ae23b4a 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1550,6 +1550,8 @@ hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body
+         [--priority N]
+         [--review-required on|off]                     # 'off' is operator-only (see below)
+ hermes kanban promote <id>...                          # move todo/blocked/triage tasks to ready (recovery)
++hermes kanban renew-scope <id> --episode <stop uid> --mandate-comment <comment id> --reason <text>
++                                                       # renew a scope-stopped card's scope (then promote it)
+ hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+ hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
+ hermes kanban link <parent_id> <child_id>
+-- 
+2.43.0
+

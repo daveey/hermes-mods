@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 5437 by `repair_hostname_escapes_5437.py` (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 5836 by `repair_hostname_escapes_5836.py` (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-5437 patches, one entry per non-merge source commit through `a61ed2bc32bef9f4cb2bf8fde409093776fb7505`.
+5836 patches, one entry per non-merge source commit through `33774b3fc6826f1bd028a60b5c31963caa99da8c`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -39,6 +39,151 @@ The 4353–5011 append adds two source-derived bridges before entries 4353 and 4
 
 
 The 5040–5406 append retains 51 bridges and three ancestry-only markers. Its one feature-branch merge is tree-identical to the automatic merge, so no new bridge is required. Snapshot policy: [mirror-policy-5406.json](mirror-policy-5406.json); replay plan: [mirror-replay-5406.json](mirror-replay-5406.json); acceptance evidence: [mirror-5406-verification.md](mirror-5406-verification.md).
+
+The 5438–5836 append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Policy: [mirror-policy-5836.json](mirror-policy-5836.json); replay plan: [mirror-replay-5836.json](mirror-replay-5836.json); verification receipt: [mirror-5836-verification.md](mirror-5836-verification.md). All previously published patch and bridge bytes remain unchanged.
+
+## Mirror 5438–5836
+
+Frozen source `33774b3fc6826f1bd028a60b5c31963caa99da8c`. Feature tests below describe source coverage, not execution in this mirror pass.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Always-on rollover: replace an unresponsive backend](mirror-5836-a-always-on-unresponsive-roll.md) | 5438–5443 | Roll, demote and hard-stop backends that run but stop answering health |
+| [Kanban dispatcher candidate-refusal receipts](mirror-5836-a-kanban-candidate-refusal-receipts.md) | 5444–5446 | Bounded per-pass receipts of refused pickup candidates |
+| [Startup resume retries and update-marker deferral](mirror-5836-a-resume-and-update-marker-defer.md) | 5447, 5451–5454 | Resume ordinary interrupted turns; silent deferral behind proven updater owners |
+| [Background reviews yield to core updates](mirror-5836-a-background-review-update-interrupt.md) | 5455–5457 | Interrupt and carry background reviews across an update |
+| [Kanban reader contention bounds and private fallback](mirror-5836-a-kanban-reader-contention-bounds.md) | 5448–5449, 5472–5474, 5479–5481 | Bounded lock waits and private read-only fallback for shared readers |
+| [Desktop sidebar search and card colour squares](mirror-5836-a-desktop-sidebar-search-and-card-squares.md) | 5450, 5520 | Title-first server search, failure alert, card-colour squares |
+| [Retire reviewer model-diversity gates](mirror-5836-a-review-model-diversity-retirement.md) | 5458–5460 | Same-model review permitted; keep custody, CI and pin controls |
+| [Kanban continue tool carries source artifacts](mirror-5836-a-kanban-continue-source-artifacts.md) | 5461 | `artifacts` accepted by the continue tool |
+| [Turn lease recovery, retarget and custody](mirror-5836-a-turn-lease-recovery-and-custody.md) | 5462–5463, 5487, 5537 | Self-orphan release retry, contended admission key, refresh custody events |
+| [Quota-wall class failover](mirror-5836-a-quota-wall-class-failover.md) | 5464 | Fail over within class at any wall length |
+| [Dashboard thread lanes](mirror-5836-a-dashboard-thread-lanes.md) | 5465–5468 | Per-route thread budgets keep status responsive |
+| [Kanban sync outbox skip and phantom retirement](mirror-5836-a-kanban-sync-outbox-and-phantom-retirement.md) | 5469–5471, 5475, 5488 | Empty-outbox skip, repair windows, phantom run retirement |
+| [Kanban CI/deploy wait episode age](mirror-5836-a-kanban-wait-episode-age.md) | 5476–5478 | Durable wait-episode age on card details |
+| [Kanban lanes projection](mirror-5836-a-kanban-lanes-projection.md) | 5482–5483, 5490, 5521–5522 | Shared evidence, fresh sources, single spend scan |
+| [Async delegation owner-claimed adoption](mirror-5836-a-delegation-owned-adoption.md) | 5484 | `adopt_unit` seam |
+| [Backup and backfill test fixtures](mirror-5836-a-backup-and-backfill-test-fixtures.md) | 5485–5486, 5509, 5519 | Test-only fixture stabilization |
+| [Plugin ctx.dispose_path](mirror-5836-a-plugin-dispose-path.md) | 5489, 5499 | Guarded one-shot and empty-only path disposal for plugins |
+| [Kanban capsule contract v2](mirror-5836-a-kanban-capsule-contract-v2.md) | 5491–5493 | Cross-revision capsule contract and bounded identify |
+| [Kanban unclaimable ready cards](mirror-5836-a-kanban-unclaimable-ready.md) | 5494–5498 | Refuse and sweep cards no machine can claim |
+| [Receipt-only native session tickets](mirror-5836-a-receipt-only-session-tickets.md) | 5500–5501 | Least-privilege prompt-receipt tickets |
+| [Kanban links check diagnostics](mirror-5836-a-kanban-links-diagnostics.md) | 5502–5504 | Reason/source attribution counters |
+| [Kanban connect integrity and creation-key race](mirror-5836-a-kanban-connect-integrity-and-creation-race.md) | 5505–5508 | Integrity probe off the init lock; keyed-create replay serialization |
+| [Kanban sync first-send envelopes and frozen replay](mirror-5836-a-kanban-sync-first-send-envelopes.md) | 5510–5518 | Durable first-send envelopes, refusal retirement, parent ordering |
+| [Desktop sidebar project grouping](mirror-5836-a-desktop-sidebar-project-grouping.md) | 5523–5525 | Presentation grouping across gateways |
+| [Worker session-context read RPC](mirror-5836-a-worker-session-context-read-rpc.md) | 5526–5529 | `worker.sessionContext` without write receipts |
+| [Kanban dashboard history reuse](mirror-5836-a-kanban-dashboard-history-reuse.md) | 5530–5531 | Retain event histories across task-only changes |
+| [Kanban idle green PR release](mirror-5836-a-kanban-idle-green-pr-release.md) | 5532–5533 | Release idle green PR owners; bound holds |
+| [Session source-policy config reuse](mirror-5836-a-session-source-policy-reuse.md) | 5534–5536 | One config snapshot per classification |
+| [Deterministic contended turn-lease regressions](mirror-5836-b-contended-lease-regressions.md) | 5538 | Deterministic contended turn-lease regressions |
+| [Execution-bound managed-worker credentials](mirror-5836-b-adopted-worker-credentials.md) | 5539–5542 | Execution-bound managed-worker credentials |
+| [Isolated cleanup process-census fixtures](mirror-5836-b-cleanup-census-isolation.md) | 5543–5546 | Isolated cleanup process-census fixtures |
+| [Ready-entry age registry and refusal observations](mirror-5836-b-ready-entry-clocks.md) | 5547 | Ready-entry age registry and refusal observations |
+| [Bounded lane-source metadata reads](mirror-5836-b-lanes-source-metadata.md) | 5548 | Bounded lane-source metadata reads |
+| [Separate session circles and linked-card squares](mirror-5836-b-sidebar-card-markers.md) | 5549 | Separate session circles and linked-card squares |
+| [Exclude internal and temporary automatic workspaces](mirror-5836-b-workspace-auto-grouping.md) | 5550–5551 | Exclude internal and temporary automatic workspaces |
+| [HTTP profile-scan admission test synchronization](mirror-5836-b-http-scan-quiescence.md) | 5552 | HTTP profile-scan admission test synchronization |
+| [Creator grouping for blocked cards without visible chats](mirror-5836-b-blocked-card-creators.md) | 5553 | Creator grouping for blocked cards without visible chats |
+| [Separate session circles and linked-card squares](mirror-5836-b-sidebar-card-markers.md) | 5554–5555 | Separate session circles and linked-card squares |
+| [Terminal non-success archive of contained tasks](mirror-5836-b-containment-terminal-archive.md) | 5556–5563 | Terminal non-success archive of contained tasks |
+| [Subscription-specific notification revisions](mirror-5836-b-notification-revisions.md) | 5564–5565 | Subscription-specific notification revisions |
+| [Model-neutral Kanban ingress and legacy routing](mirror-5836-b-model-neutral-ingress.md) | 5566–5568 | Model-neutral Kanban ingress and legacy routing |
+| [Class-aware quota holds and profile routing](mirror-5836-b-class-wall-routing.md) | 5569–5571 | Class-aware quota holds and profile routing |
+| [Review-owned preclaim refusal and accounting](mirror-5836-b-review-preclaim-custody.md) | 5572–5577 | Review-owned preclaim refusal and accounting |
+| [Name-scoped public Kanban validation API](mirror-5836-b-plugin-validation-api.md) | 5578 | Name-scoped public Kanban validation API |
+| [Review-owned preclaim refusal and accounting](mirror-5836-b-review-preclaim-custody.md) | 5579 | Review-owned preclaim refusal and accounting |
+| [Class-aware quota holds and profile routing](mirror-5836-b-class-wall-routing.md) | 5580 | Class-aware quota holds and profile routing |
+| [Model-neutral Kanban ingress and legacy routing](mirror-5836-b-model-neutral-ingress.md) | 5581 | Model-neutral Kanban ingress and legacy routing |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5582–5583 | Consumer fixtures for dynamic class admission |
+| [Model-neutral Kanban ingress and legacy routing](mirror-5836-b-model-neutral-ingress.md) | 5584–5585 | Model-neutral Kanban ingress and legacy routing |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5586 | Consumer fixtures for dynamic class admission |
+| [Class-aware quota holds and profile routing](mirror-5836-b-class-wall-routing.md) | 5587 | Class-aware quota holds and profile routing |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5588–5594 | Consumer fixtures for dynamic class admission |
+| [Model-neutral refusal and recovery guidance](mirror-5836-b-neutral-routing-notices.md) | 5595 | Model-neutral refusal and recovery guidance |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5596–5601 | Consumer fixtures for dynamic class admission |
+| [Model-neutral refusal and recovery guidance](mirror-5836-b-neutral-routing-notices.md) | 5602 | Model-neutral refusal and recovery guidance |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5603–5606 | Consumer fixtures for dynamic class admission |
+| [Model-neutral refusal and recovery guidance](mirror-5836-b-neutral-routing-notices.md) | 5607 | Model-neutral refusal and recovery guidance |
+| [Consumer fixtures for dynamic class admission](mirror-5836-b-dynamic-route-fixtures.md) | 5608–5612 | Consumer fixtures for dynamic class admission |
+| [Independent review by separate execution](mirror-5836-b-review-execution-independence.md) | 5613–5614 | Independent review by separate execution |
+| [Lossless historical evidence in recovery and forwarding](mirror-5836-b-historical-recovery-evidence.md) | 5615–5616 | Lossless historical evidence in recovery and forwarding |
+| [Class-aware quota holds and profile routing](mirror-5836-b-class-wall-routing.md) | 5617 | Class-aware quota holds and profile routing |
+| [Lossless historical evidence in recovery and forwarding](mirror-5836-b-historical-recovery-evidence.md) | 5618–5620 | Lossless historical evidence in recovery and forwarding |
+| [Catalog-aware rendered mandate validation](mirror-5836-b-catalog-text-validation.md) | 5621–5623 | Catalog-aware rendered mandate validation |
+| [Per-card eligibility faults and pickup preflight](mirror-5836-b-eligibility-fault-boundaries.md) | 5624–5626 | Per-card eligibility faults and pickup preflight |
+| [Class-aware quota holds and profile routing](mirror-5836-b-class-wall-routing.md) | 5627 | Class-aware quota holds and profile routing |
+| [Ready-entry age registry and refusal observations](mirror-5836-b-ready-entry-clocks.md) | 5628 | Ready-entry age registry and refusal observations |
+| [Per-card eligibility faults and pickup preflight](mirror-5836-b-eligibility-fault-boundaries.md) | 5629 | Per-card eligibility faults and pickup preflight |
+| [Catalog-aware rendered mandate validation](mirror-5836-b-catalog-text-validation.md) | 5630–5631 | Catalog-aware rendered mandate validation |
+| [Per-card eligibility faults and pickup preflight](mirror-5836-b-eligibility-fault-boundaries.md) | 5632 | Per-card eligibility faults and pickup preflight |
+| [Overlapped catalog fetch and automatic heartbeats](mirror-5836-b-worker-io-overlap.md) | 5633–5636 | Overlapped catalog fetch and automatic heartbeats |
+| [Persistent fairness observation IDs and writer clocks](mirror-5836-b-fairness-observation-provenance.md) | 5637 | Persistent fairness observation IDs and writer clocks |
+| [Kanban fairness journal: reject overflowing clock bounds](mirror-5836-c-fairness-clock-bounds.md) | 5638–5640 | fairness journal clock-bound validation and test coverage |
+| [Test-harness hardening: bash-keyed replay memo, holder readiness, relative-home isolation, immutable race runner](mirror-5836-c-ci-test-flake-isolation.md) | 5641–5643, 5664 | test and CI harness fixes (no production behavior) |
+| [Kanban: provider content refusals stop automatic retries](mirror-5836-c-provider-refusal-no-retry.md) | 5644–5649 | refusal classification in failure accounting and notices |
+| [Kanban: durable refusal stop before reclaim retry](mirror-5836-c-refusal-stop-receipts.md) | 5655–5657 | durable stop receipts for attributable refusals |
+| [Desktop: linked running cards merge into the session status dot](mirror-5836-c-desktop-session-dot-linked-cards.md) | 5650–5651 | session dot and sidebar card squares |
+| [Kanban: retire stored model restrictions in owner dispatch](mirror-5836-c-kanban-model-restriction-retirement.md) | 5652–5654 | dispatcher-owned retirement of legacy stored model selectors |
+| [Desktop: sessions.filter plugin contribution area](mirror-5836-c-desktop-sessions-filter-area.md) | 5658–5661 | plugin-provided session-list filters |
+| [Kanban: adopt local decision ownership from an interactive chat](mirror-5836-c-kanban-origin-local-adoption.md) | 5662–5663 | origin-adopt --local |
+| [Managed workers: tool credentials require explicit opt-in](mirror-5836-c-managed-worker-tool-credential-opt-in.md) | 5665–5666, 5726 | worker tool_environment credential staging and nightly lifecycle probes |
+| [Kanban: fenced transaction for remote card answers](mirror-5836-c-kanban-card-answer-transaction.md) | 5667–5678, 5717 | exact-ask card answers with proof, runtime and courier transport |
+| [Kanban: kanban_retain with first-wins transport custody](mirror-5836-c-kanban-retain-tool.md) | 5679–5683 | retain tool, receipts, rejection handling |
+| [Workers: negative quota memo, receipt coalescing, boot-time recovery deferral](mirror-5836-c-codex-quota-negative-memo-and-boot-deferral.md) | 5684–5686, 5691, 5730–5731 | startup latency for managed Codex workers |
+| [TUI notifications: retained board observers and gone-board release](mirror-5836-c-notification-retained-observers.md) | 5687–5690 | notification signature reads |
+| [Desktop: unsent session drafts above Recents](mirror-5836-c-desktop-unsent-draft-rows.md) | 5692–5699 | sidebar draft rows and placement |
+| [Desktop: archive preflight survives reconnects](mirror-5836-c-desktop-archive-preflight-reconnect.md) | 5700–5704 | archive safety preflight transport handling |
+| [Kanban: PR acceptance falls back to REST on GraphQL exhaustion](mirror-5836-c-kanban-pr-acceptance-rest-fallback.md) | 5705 | pull-request acceptance evidence |
+| [Plugin code attestation bound to boot-pinned review records](mirror-5836-c-plugin-review-record-attestation.md) | 5706, 5716 | review-record based plugin attestation |
+| [Kanban: origin chat comments routed to their bound owner](mirror-5836-c-kanban-origin-comment-courier.md) | 5707–5710 | kanban_comment for replica-only targets |
+| [Kanban sync and dashboard read-cost reductions](mirror-5836-c-sync-and-board-read-cost.md) | 5711, 5714, 5724, 5735 | batched reads and reused watchers |
+| [Metrics: open and abandoned intervals in loop accounting](mirror-5836-c-loop-accounting-open-intervals.md) | 5712–5713, 5715 | thread accounting snapshots |
+| [Goal session activity: source-signature caching](mirror-5836-c-goal-session-activity-cache.md) | 5718–5719 | goal activity reads |
+| [TUI ownership: defer update/unidentified lease owners without takeover](mirror-5836-c-turn-ownership-transient-lease.md) | 5720–5723, 5725 | session ownership custody refusals and retry notes |
+| [Kanban sync: retain pending capture ambiguity without certifying history](mirror-5836-c-kanban-replay-capture-ambiguity.md) | 5727–5729 | replay capture storage |
+| [Kanban: frozen diagnostic actionability transport](mirror-5836-c-kanban-actionability-transport.md) | 5732–5734 | administrative diagnostic commands over sync |
+| [Canonical session status envelope (backend reducer)](mirror-5836-c-canonical-session-status-envelope.md) | 5736–5737 | single revisioned session status |
+| [One canonical session status across Desktop surfaces](mirror-5836-d-canonical-session-status.md) | 5738–5742 | One canonical session status across Desktop surfaces |
+| [Shared strict-link rebuilds and targeted publication lookup](mirror-5836-d-linked-card-read-sharing.md) | 5743 | Shared strict-link rebuilds and targeted publication lookup |
+| [Cause-specific spend holds and atomic decision acknowledgement](mirror-5836-d-spend-decision-fences.md) | 5744–5745 | Cause-specific spend holds and atomic decision acknowledgement |
+| [Explicit bounded allocator opt-in for the canonical test runner](mirror-5836-d-allocator-test-opt-in.md) | 5746 | Explicit bounded allocator opt-in for the canonical test runner |
+| [Dormant monotone Board writer admission](mirror-5836-d-dormant-writer-admission.md) | 5747–5748 | Dormant monotone Board writer admission |
+| [Native annotation refresh and part-specific invalidation](mirror-5836-d-annotation-native-refresh.md) | 5749 | Native annotation refresh and part-specific invalidation |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5750 | Isolated source fixtures and stable timing assertions |
+| [Native annotation refresh and part-specific invalidation](mirror-5836-d-annotation-native-refresh.md) | 5751–5754 | Native annotation refresh and part-specific invalidation |
+| [Logical-class-only delegation from managed Kanban lineage](mirror-5836-d-delegation-class-policy.md) | 5755–5757 | Logical-class-only delegation from managed Kanban lineage |
+| [Lifecycle guard effective script-visit scope](mirror-5836-d-effective-script-scope.md) | 5758–5759 | Lifecycle guard effective script-visit scope |
+| [Nonblocking SessionDB finalizer reader cleanup](mirror-5836-d-finalizer-reader-close.md) | 5760–5763 | Nonblocking SessionDB finalizer reader cleanup |
+| [Delta reads on the primary SSH scope](mirror-5836-d-primary-ssh-deltas.md) | 5764 | Delta reads on the primary SSH scope |
+| [Checkpoint pruning off the housekeeping thread](mirror-5836-d-checkpoint-prune-worker.md) | 5765 | Checkpoint pruning off the housekeeping thread |
+| [Native annotation refresh and part-specific invalidation](mirror-5836-d-annotation-native-refresh.md) | 5766–5770 | Native annotation refresh and part-specific invalidation |
+| [Conservative BoardWatch checkpoint retention and CPU attribution](mirror-5836-d-checkpoint-reader-proof.md) | 5771–5777 | Conservative BoardWatch checkpoint retention and CPU attribution |
+| [Exact gateway aliases and partition-preserving rename resolution](mirror-5836-d-gateway-rename-resolution.md) | 5778–5780 | Exact gateway aliases and partition-preserving rename resolution |
+| [Durable client upgrade recovery across renderer reloads](mirror-5836-d-durable-client-upgrade.md) | 5781–5783 | Durable client upgrade recovery across renderer reloads |
+| [Tenant-bearing producer cards through worker-pool placement](mirror-5836-d-pool-tenant-carry.md) | 5784–5785 | Tenant-bearing producer cards through worker-pool placement |
+| [One canonical session status across Desktop surfaces](mirror-5836-d-canonical-session-status.md) | 5786–5789 | One canonical session status across Desktop surfaces |
+| [Separate exact retain refusal audits from replica drift](mirror-5836-d-retain-rejection-audit.md) | 5790–5791 | Separate exact retain refusal audits from replica drift |
+| [Native annotation refresh and part-specific invalidation](mirror-5836-d-annotation-native-refresh.md) | 5792 | Native annotation refresh and part-specific invalidation |
+| [Reviewed static pending-custody mutation inventory](mirror-5836-d-capture-site-inventory.md) | 5793–5800 | Reviewed static pending-custody mutation inventory |
+| [Queued archive preflight with renderer custody](mirror-5836-d-archive-reconnect-custody.md) | 5801–5804 | Queued archive preflight with renderer custody |
+| [Authenticated foreign self-work creator intake](mirror-5836-d-foreign-selfwork-creators.md) | 5805 | Authenticated foreign self-work creator intake |
+| [Native annotation refresh and part-specific invalidation](mirror-5836-d-annotation-native-refresh.md) | 5806 | Native annotation refresh and part-specific invalidation |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5807 | Isolated source fixtures and stable timing assertions |
+| [Once-per-episode escalation for stranded parked cards](mirror-5836-d-stranded-park-escalation.md) | 5808–5812 | Once-per-episode escalation for stranded parked cards |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5813 | Isolated source fixtures and stable timing assertions |
+| [Non-releasing canonical classification CAS](mirror-5836-d-classification-cas.md) | 5814–5815 | Non-releasing canonical classification CAS |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5816 | Isolated source fixtures and stable timing assertions |
+| [Conservative BoardWatch checkpoint retention and CPU attribution](mirror-5836-d-checkpoint-reader-proof.md) | 5817 | Conservative BoardWatch checkpoint retention and CPU attribution |
+| [Authority-bound renewal of a scope-stopped episode](mirror-5836-d-scope-renewal.md) | 5818–5824 | Authority-bound renewal of a scope-stopped episode |
+| [Bounded annotation refresh floor and shared notice probes](mirror-5836-d-refresh-sharing-windows.md) | 5825 | Bounded annotation refresh floor and shared notice probes |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5826 | Isolated source fixtures and stable timing assertions |
+| [Shared strict-link rebuilds and targeted publication lookup](mirror-5836-d-linked-card-read-sharing.md) | 5827–5828 | Shared strict-link rebuilds and targeted publication lookup |
+| [Isolated source fixtures and stable timing assertions](mirror-5836-d-isolated-source-fixtures.md) | 5829 | Isolated source fixtures and stable timing assertions |
+| [One canonical session status across Desktop surfaces](mirror-5836-d-canonical-session-status.md) | 5830–5831 | One canonical session status across Desktop surfaces |
+| [Shared strict-link rebuilds and targeted publication lookup](mirror-5836-d-linked-card-read-sharing.md) | 5832 | Shared strict-link rebuilds and targeted publication lookup |
+| [Cause-specific spend holds and atomic decision acknowledgement](mirror-5836-d-spend-decision-fences.md) | 5833 | Cause-specific spend holds and atomic decision acknowledgement |
+| [Canonical listed-card acquisition on caller-owned snapshots](mirror-5836-d-canonical-session-acquisition.md) | 5834–5836 | Canonical listed-card acquisition on caller-owned snapshots |
 
 ## Mirror 5407–5437
 
@@ -4245,16 +4390,16 @@ The 5407–5437 append retains 51 bridges and three ancestry-only markers and ad
 
 ## Applying
 
-For the current **5437-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5437.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **5836-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5836.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip a61ed2bc32bef9f4cb2bf8fde409093776fb7505 \
+  --source-tip 33774b3fc6826f1bd028a60b5c31963caa99da8c \
   --base ea405e49a5e281558b3eeb3a13af66c6116cd0f2 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5437.json" \
-  --replay-plan "$MODS/core/mirror-replay-5437.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5836.json" \
+  --replay-plan "$MODS/core/mirror-replay-5836.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -4416,12 +4561,12 @@ git commit -m 'Explicit upstream integration bridge before 4353'
 git am -3 --empty=keep "${patches[@]:4352:145}"
 git apply --index --3way "$MODS/core/bridges/mirror-5011-before-4498.diff"
 git commit -m 'Explicit redaction resolution bridge before 4498'
-git am -3 --empty=keep "${patches[@]:4497:940}"
+git am -3 --empty=keep "${patches[@]:4497:1339}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_5437.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_5836.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_5437.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_5836.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

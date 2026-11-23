@@ -1,0 +1,224 @@
+From 84b7a2c9901be9c88a9eb314a205b33fd9a035a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 07:44:34 +0000
+Subject: [PATCH] fix(desktop): share archive preflight deadline across
+ sequential reads [daveey]
+
+Five-whys continuation for PR4013 review6011021833:
+1. Reconnect exhaustion could show Archive anyway because the preflight watchdog
+   returned unknown while a transport read was still pending.
+2. A successful ancestry read spent 1000ms, but the next task read still received
+   the original 5000ms remaining budget; 250ms grace only protected the first read.
+3. Each request derived its timeout from the attempt's input rather than an
+   absolute deadline shared by ancestry, tasks and the one legacy timeout retry.
+4. Tests exercised a single timed-out read, not sequential success then timeout
+   on the ninth/final reconnect attempt. The hung-read test even expected override.
+5. Safety uncertainty and transport exhaustion shared the watchdog's resolved
+   unknown path, allowing a safety dialog to conceal exhausted connectivity.
+
+Calculate remaining time before every send/retry and reject late successful
+results too. Retry-mode watchdog exhaustion is a reconnect error, not permission
+to override; legacy nontransport unknown confirmation remains unchanged. Late
+ancestry cannot issue another request after settlement/deadline.
+
+Proof: three regression tests fail on1c5a1b30 (including real archivePreflight
+restoration/no-dialog); late successful task result fails on intermediate fix.
+Final GREEN530 tests/43 action modules; TypeScript and ESLint pass; scripts/check
+all21 pass. Fresh exact-head CI/review required. Passive laptop-1 acceptance
+remains unproven; no launch or fault injection.
+---
+ .../archive-deadline.test.ts                  | 95 +++++++++++++++++++
+ .../confirm-linked-archive.test.ts            | 13 +--
+ .../refresh-archive-tasks.ts                  | 31 ++++--
+ 3 files changed, 127 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-deadline.test.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-deadline.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-deadline.test.ts
+new file mode 100644
+index 0000000000..38edc3251d
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-deadline.test.ts
+@@ -0,0 +1,95 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import type { HermesApiRequest } from '@/global'
++import type { SessionInfo } from '@/hermes'
++import { en } from '@/i18n/en'
++import { $confirmRequest, settleConfirm } from '@/store/confirm'
++import { clearNotifications } from '@/store/notifications'
++
++import { archivePreflight } from './archive-soft-hide'
++import { refreshArchiveTasks } from './refresh-archive-tasks'
++
++const row = { id: 'deadline', connection_id: 'owner', profile: 'work', kanban_unknown: true } as SessionInfo
++
++beforeEach(() => {
++  vi.useFakeTimers()
++  sessionStorage.clear()
++  clearNotifications()
++})
++afterEach(() => {
++  settleConfirm(false)
++  clearNotifications()
++  vi.unstubAllGlobals()
++  vi.useRealTimers()
++})
++
++it('deducts successful ancestry time before the task request timeout', async () => {
++  const api = vi.fn(({ path, timeoutMs }: HermesApiRequest) => new Promise((resolve, reject) => {
++    if (path === '/api/sessions/deadline') {
++      setTimeout(() => resolve({ id: row.id }), 1_000)
++    } else {
++      setTimeout(() => reject(new Error('Timed out connecting to Hermes backend')), (timeoutMs ?? 0) + 1)
++    }
++  }))
++
++  vi.stubGlobal('hermesDesktop', { api })
++
++  const outcome = refreshArchiveTasks(row.id, row, 'work', { retryTransport: true, budgetMs: 5_000 })
++    .then(() => 'resolved', () => 'rejected')
++
++  await vi.advanceTimersByTimeAsync(6_000)
++  expect(await outcome).toBe('rejected')
++  expect(api.mock.calls[1][0].timeoutMs).toBe(4_000)
++})
++
++it('rejects the reconnect deadline even if a transport read never settles', async () => {
++  const api = vi.fn(() => new Promise(() => {}))
++  vi.stubGlobal('hermesDesktop', { api })
++
++  const outcome = refreshArchiveTasks(row.id, row, 'work', { retryTransport: true, budgetMs: 125 })
++    .then(() => 'resolved', () => 'rejected')
++
++  await vi.advanceTimersByTimeAsync(375)
++  expect(await outcome).toBe('rejected')
++})
++
++it('does not accept a task result arriving after the shared deadline', async () => {
++  const api = vi.fn(({ path }: HermesApiRequest) => {
++    if (path === '/api/sessions/deadline') {return Promise.resolve({ id: row.id })}
++
++    return new Promise(resolve => setTimeout(() => resolve({ tasks: [] }), 5_001))
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++
++  const outcome = refreshArchiveTasks(row.id, row, 'work', { retryTransport: true, budgetMs: 5_000 })
++    .then(() => 'resolved', () => 'rejected')
++
++  await vi.advanceTimersByTimeAsync(5_250)
++  expect(await outcome).toBe('rejected')
++})
++
++it('restores rather than offering Archive anyway when sequential reads exhaust the final reconnect attempt', async () => {
++  let attempts = 0
++
++  const api = vi.fn(({ path, timeoutMs }: HermesApiRequest) => {
++    if (path === '/api/sessions/deadline') {
++      if (++attempts < 9) {return Promise.reject(new Error('socket hang up'))}
++
++      return new Promise(resolve => setTimeout(() => resolve({ id: row.id }), 1_000))
++    }
++
++    return new Promise((_resolve, reject) => setTimeout(() => reject(new Error('Timed out connecting to Hermes backend')), (timeoutMs ?? 0) + 1))
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  const hidden = { end: vi.fn(), hid: true, ids: [row.id], restore: vi.fn() }
++  const outcome = archivePreflight(row.id, row, true, hidden, en.desktop)
++  await vi.advanceTimersByTimeAsync(61_000)
++  const confirmation = $confirmRequest.get()
++  settleConfirm(false)
++  expect(await outcome).toBe(false)
++  expect(confirmation).toBeNull()
++  expect(hidden.restore).toHaveBeenCalledOnce()
++  expect(api.mock.calls.some(([request]) => request.method === 'PATCH')).toBe(false)
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+index b49d2f6113..44e32e3f31 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+@@ -63,15 +63,16 @@ it('walks compressed ancestors and preserves linked-task confirmation', async ()
+   await expect(pending).resolves.toBe(false)
+ })
+ 
+-it('bounds a hung task read instead of hanging archive', async () => {
++it('bounds a hung task read with reconnect exhaustion, not an override dialog', async () => {
+   vi.useFakeTimers()
+   vi.stubGlobal('hermesDesktop', { api: () => new Promise(() => {}) })
++
+   const pending = confirmLinkedArchive('tip', { id: 'tip', connection_id: 'owner' } as SessionInfo, 'work', en.desktop)
+-  await vi.advanceTimersByTimeAsync(14_000)
+-  expect($confirmRequest.get()?.details).toEqual([{ label: 'Kanban tasks', value: en.desktop.archiveLinkedTasksUnknown }])
+-  expect($confirmRequest.get()?.description).not.toMatch(/still has work linked/)
+-  settleConfirm(false)
+-  await expect(pending).resolves.toBe(false)
++    .then(() => 'resolved', error => String(error))
++
++  await vi.advanceTimersByTimeAsync(70_000)
++  expect($confirmRequest.get()).toBeNull()
++  expect(await pending).toMatch(/archive preflight deadline/)
+ })
+ 
+ it.each([undefined, 'remote-owner'])('refreshes expired empty observations on the row owner %s', async connectionId => {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index 887436e38f..786b7bf5a2 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -56,15 +56,29 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+   let timer: ReturnType<typeof setTimeout> | undefined
+   let stage = 'start'
+ 
++  const deadline = Date.now() + Math.min(OVERALL_BUDGET_MS, options?.budgetMs ?? OVERALL_BUDGET_MS)
++  const deadlineError = () => new Error(`Timed out connecting to Hermes backend: archive preflight deadline (${stage})`)
++
++  const send = async <T>(path: string): Promise<T> => {
++    const remaining = deadline - Date.now()
++
++    if (settled || remaining <= 0) {throw deadlineError()}
++    const result = await hermesApiAs<T>(owner, { path, timeoutMs: Math.min(READ_TIMEOUT_MS, remaining) })
++
++    if (settled || Date.now() >= deadline) {throw deadlineError()}
++
++    return result
++  }
++
+   const request = async <T>(path: string): Promise<T> => {
+     try {
+-      return await hermesApiAs<T>(owner, { path, timeoutMs: Math.min(READ_TIMEOUT_MS, options?.budgetMs ?? READ_TIMEOUT_MS) })
++      return await send<T>(path)
+     } catch (error) {
+       if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
+ 
+       if (!isTimeout(error)) {throw error}
+ 
+-      return hermesApiAs<T>(owner, { path, timeoutMs: READ_TIMEOUT_MS })
++      return send<T>(path)
+     }
+   }
+ 
+@@ -114,12 +128,17 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+   }
+ 
+   try {
+-    return await Promise.race([read(), new Promise<SessionInfo>(resolve => {
+-      // The overall timer trails the capped per-request timeout, so a transport rejection of the last
+-      // attempt wins the race and is queued/restored instead of becoming an override dialog.
++    return await Promise.race([read(), new Promise<SessionInfo>((resolve, reject) => {
++      // Per-request timeouts share an absolute deadline. The grace lets their transport error win;
++      // if the bridge never settles, the watchdog must reject retry mode, never offer an override.
+       const limit = Math.min(OVERALL_BUDGET_MS, options?.budgetMs === undefined ? OVERALL_BUDGET_MS : options.budgetMs + TIMER_GRACE_MS)
+ 
+-      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${limit}ms (${stage})`)), limit)
++      timer = setTimeout(() => {
++        const result = unknownBecause(`no answer within ${limit}ms (${stage})`)
++
++        if (options?.retryTransport) {reject(deadlineError())}
++        else {resolve(result)}
++      }, limit)
+     })])
+   } catch (error) {
+     if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
+-- 
+2.43.0
+

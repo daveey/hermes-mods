@@ -1,0 +1,818 @@
+From 012e9cab62ce2e17679f36dcb4dd737d01fe4b08 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:52:34 +0000
+Subject: [PATCH] perf(kanban-sync): keep BoardWatch readers across WAL
+ checkpoints; split the wait step's CPU live
+
+The Mac sync loop's wait step cost 2.67 ms/round (run52), unchanged by #4023. Every WAL
+checkpoint moved a board's main-file mtime and BoardWatch reopened its reader (about 3 ms of
+schema parsing per board each time).
+
+- kanban_sync_wal_evidence: read the wal-index header from <db>-shm with a lock-safe pread and
+  prove a checkpoint ran (nBackfill advanced, or the log restarted past outstanding frames).
+- BoardWatch keeps the reader only for the same inode, no smaller, with that proof; it then
+  drops the page cache (PRAGMA shrink_memory) and its answers, so a restore in the same interval
+  is read as a new connection would read it. Every other change reopens as before.
+- sync.wait/{boundary,event_wait,outbox_probe,reader_open}, sync.reader_open.step/<step>,
+  sync.reader_open.reason/<why> and sync.reader_keep/checkpoint: always on, recorded as subsets
+  (outer=False), so neither the step list nor sync.cpu.total/loop changes.
+
+Card: t_20097f02b6abaa50
+---
+ hermes_cli/kanban_sync_board_watch.py         |  55 ++++-
+ hermes_cli/kanban_sync_client.py              |  26 +-
+ hermes_cli/kanban_sync_cpu.py                 |  71 +++++-
+ hermes_cli/kanban_sync_timing.py              |   3 +-
+ hermes_cli/kanban_sync_wal_evidence.py        |  67 +++++
+ hermes_cli/sqlite_safe_read.py                |   9 +-
+ .../test_kanban_sync_checkpoint_keep.py       | 232 ++++++++++++++++++
+ .../test_kanban_sync_empty_outbox.py          |   9 +-
+ .../hermes_cli/test_kanban_sync_idle_round.py |  13 +-
+ .../hermes_cli/test_kanban_sync_wait_split.py | 137 +++++++++++
+ 10 files changed, 593 insertions(+), 29 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_wal_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_wait_split.py
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 05b92eb415..ab1a44dbc5 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -4,10 +4,13 @@ from __future__ import annotations
+ import os
+ import sqlite3
+ import threading
++import time
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++from hermes_cli import kanban_sync_cpu as _sync_cpu
++from hermes_cli import kanban_sync_wal_evidence as _wal_evidence
+ 
+ 
+ def path_gone(path: str) -> bool:
+@@ -40,7 +43,7 @@ class BoardWatch:
+ 
+     def __init__(self) -> None:
+         self._lock = threading.Lock()
+-        self._conns: dict[str, tuple[tuple[int, int, int, int], sqlite3.Connection, int]] = {}
++        self._conns: dict[str, tuple] = {}  # path -> (file identity, reader, generation, wal state)
+         self._gen = 0
+         self._answers: dict[str, dict[str, tuple[Any, Any]]] = {}  # path -> tag -> (data_version, answer)
+ 
+@@ -62,9 +65,12 @@ class BoardWatch:
+         ent = self._conns.get(key)
+         if ent is not None and ent[0] == identity:
+             return ent[1], ent[2]
++        if ent is not None and self._kept_over_checkpoint(key, ent, identity):
++            return ent[1], ent[2]
+         self._drop(key)
+         if len(self._conns) >= self.MAX:
+             self._drop(next(iter(self._conns)))
++        began = time.thread_time()
+         conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
+                                          check_same_thread=False)
+         # Pager freshness is not a repair-input generation: checkpoints change
+@@ -72,13 +78,52 @@ class BoardWatch:
+         # answers; keep the generation so ordinary checkpoints respect repair
+         # windows. Replacement, reset and failed-read recovery get a new one.
+         if ent is not None and ent[0][:2] == identity[:2]:
+-            gen = ent[2]
++            gen, reason = ent[2], "changed"
+         else:
+             self._gen += 1
+-            gen = self._gen
+-        self._conns[key] = (identity, conn, gen)
++            gen, reason = self._gen, "first" if ent is None else "replaced"
++        # The checkpoint baseline is read after the stat it is stored with: whatever moves the
++        # file between the two leaves the next comparison without proof, so it reopens.
++        real = os.path.realpath(key)  # SQLite names the sidecars by the resolved path
++        self._conns[key] = (identity, conn, gen, _wal_evidence.read(real), None, real)
++        _sync_cpu.note_reader_open(time.thread_time() - began, reason)
+         return conn, gen
+ 
++    def _kept_over_checkpoint(self, key: str, ent: tuple, identity: tuple[int, int, int, int]) -> bool:
++        """Keep the reader when SQLite's wal-index proves the main file moved in a checkpoint.
++
++        A checkpoint leaves the database content alone and a WAL reader is built to outlive it;
++        reopening only re-parsed the schema (about 3 ms per board each time, a laptop during an observation).
++        Kept only for the same inode, no smaller, with proof from ``kanban_sync_wal_evidence``;
++        a raw copy or restore shows none and takes the reopen path above. The proof says a
++        checkpoint ran, not that nothing else wrote the file, so the kept reader also gives up
++        its page cache and its answers, as a new one would: only its parsed schema survives,
++        and SQLite checks that against the file's schema cookie on the next read."""
++        if ent[0][:2] != identity[:2] or identity[3] < ent[0][3]:
++            return False
++        began = time.thread_time()
++        now = _wal_evidence.read(ent[5])
++        if not _wal_evidence.checkpointed(ent[3], now):
++            return False
++        try:
++            ent[1].execute("PRAGMA shrink_memory")
++        except sqlite3.Error:
++            return False
++        self._answers.pop(key, None)
++        self._conns[key] = (identity, ent[1], ent[2], now, ent[4], ent[5])
++        _sync_cpu.note_reader_keep(time.thread_time() - began)
++        return True
++
++    def _rebaseline(self, key: str, version: Any) -> None:
++        """Move the checkpoint baseline up to the commits this reader has now seen.
++
++        A fully backfilled baseline cannot prove the next checkpoint once the log has restarted
++        twice; one taken after each new commit still has that commit's frames outstanding. Only
++        after ``_conn`` accepted the file as it is, so the baseline still follows its stat."""
++        ent = self._conns.get(key)
++        if ent is not None and ent[4] != version:
++            self._conns[key] = (*ent[:3], _wal_evidence.read(ent[5]), version, ent[5])
++
+     def _drop(self, key: str) -> None:
+         self._answers.pop(key, None)
+         ent = self._conns.pop(key, None)
+@@ -110,6 +155,8 @@ class BoardWatch:
+                     return None
+                 conn, gen = got
+                 version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
++                if unchanged_ok:
++                    self._rebaseline(key, version)
+                 cached = self._answers.get(key, {}).get(tag)
+                 if unchanged_ok and cached is not None and cached[0] == version:
+                     return gen, cached[1]
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 30f3fcd7ad..265d0fb0ac 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1456,15 +1456,23 @@ def wait_for_work(wake: threading.Event, paths: Iterable[Path], period: float,
+     period ran out. Returns which, so a local write is pushed within ``tick`` and a remote one pulled at once."""
+     paths = list(paths)
+     deadline = time.monotonic() + period
+-    while keep_running():
+-        if wake.wait(timeout=max(0.0, min(tick, deadline - time.monotonic()))):
+-            wake.clear()
+-            return "remote"
+-        if outbox_pending(paths):
+-            return "local"
+-        if time.monotonic() >= deadline:
+-            return "period"
+-    return "stopped"
++    split = sync_cpu.WaitSplit()  # sync.wait/*: where this step's CPU goes, live
++    try:
++        while keep_running():
++            fired = wake.wait(timeout=max(0.0, min(tick, deadline - time.monotonic())))
++            split.mark("event_wait")
++            if fired:
++                wake.clear()
++                return "remote"
++            pending = outbox_pending(paths)
++            split.mark("outbox_probe")
++            if pending:
++                return "local"
++            if time.monotonic() >= deadline:
++                return "period"
++        return "stopped"
++    finally:
++        split.publish()
+ 
+ 
+ @connection_scope()
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index 10946132b4..a690915a29 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -22,9 +22,74 @@ _local = threading.local()
+ 
+ def step(fn, *args, **kwargs):
+     """Name a completed loop step; nested scopes book only their residual CPU."""
+-    if not loop_accounting.scopes_enabled():
+-        return fn(*args, **kwargs)
+-    return loop_accounting.scoped_call("sync.step", fn)(*args, **kwargs)
++    outer = getattr(_local, "step", None)
++    _local.step = getattr(fn, "__name__", "other")  # which step a kept-reader open is booked under
++    try:
++        if not loop_accounting.scopes_enabled():
++            return fn(*args, **kwargs)
++        return loop_accounting.scoped_call("sync.step", fn)(*args, **kwargs)
++    finally:
++        _local.step = outer
++
++
++def note_reader_open(cpu, reason):
++    """Book one BoardWatch reader open under the loop step that triggered it, on any thread.
++
++    Subsets of the enclosing step or board service, never added to the thread's accounted CPU:
++    ``sync.reader_open.step/<step>`` says where the CPU went, ``sync.reader_open.reason/<reason>``
++    why (``first``: no reader yet; ``replaced``: another file; ``changed``: the same file moved
++    with no checkpoint proof). ``WaitSplit`` subtracts the running total from its outbox probe."""
++    _local.opened = getattr(_local, "opened", 0.0) + cpu
++    where = getattr(_local, "step", None) or ("board" if getattr(_local, "frames", ()) else "other")
++    loop_accounting.record(f"sync.reader_open.step/{where}", cpu_s=cpu, outer=False)
++    loop_accounting.record(f"sync.reader_open.reason/{reason}", cpu_s=cpu, outer=False)
++
++
++def note_reader_keep(cpu):
++    """A reader kept across a proven checkpoint (the CPU is the proof's own cost)."""
++    loop_accounting.record("sync.reader_keep/checkpoint", cpu_s=cpu, outer=False)
++
++
++WAIT_PARTS = ("event_wait", "outbox_probe", "reader_open")  # sync.wait/boundary: TimingDiag.wait
++
++
++def wait_boundary(fn):
++    """Run the wait step's config check and flush as ``sync.wait/boundary``."""
++    start = time.thread_time()
++    try:
++        return fn()
++    finally:
++        loop_accounting.record("sync.wait/boundary", cpu_s=time.thread_time() - start, outer=False)
++
++
++class WaitSplit:
++    """Thread-CPU partition of one wait for work: ``sync.wait/<part>`` for each of ``WAIT_PARTS``.
++
++    Marks are chained (the end of one part starts the next), so with the boundary the parts
++    leave out only the step's own bookkeeping. They are subsets of ``sync.step/...wait``:
++    published with ``outer=False``, they change neither that step nor ``sync.cpu.total/loop``."""
++
++    __slots__ = ("_last", "_opened", "parts", "ticks")
++
++    def __init__(self):
++        self.parts = dict.fromkeys(WAIT_PARTS, 0.0)
++        self.ticks = 0
++        self._opened = getattr(_local, "opened", 0.0)
++        self._last = time.thread_time()
++
++    def mark(self, part):
++        now = time.thread_time()
++        opened = getattr(_local, "opened", 0.0)
++        opens = min(now - self._last, opened - self._opened)
++        self.parts[part] += now - self._last - opens
++        self.parts["reader_open"] += opens
++        self.ticks += part == "event_wait"
++        self._last, self._opened = now, opened
++
++    def publish(self):
++        for part, cpu in self.parts.items():
++            loop_accounting.record(f"sync.wait/{part}", cpu_s=cpu, outer=False,
++                                   rows=self.ticks if part == "event_wait" else 0)
+ 
+ 
+ @contextmanager
+diff --git a/hermes_cli/kanban_sync_timing.py b/hermes_cli/kanban_sync_timing.py
+index f51a57b3e0..136f50a443 100644
+--- a/hermes_cli/kanban_sync_timing.py
++++ b/hermes_cli/kanban_sync_timing.py
+@@ -557,7 +557,8 @@ class TimingDiag:
+ 
+     def wait(self, fn: Callable[..., Any], *args: Any) -> Any:
+         """The loop's wait for work. Its start is the loop's safe boundary: config check and flush first."""
+-        self.boundary()
++        from hermes_cli.kanban_sync_cpu import wait_boundary
++        wait_boundary(self.boundary)
+         cap = self.capture
+         if cap is None:
+             return fn(*args)
+diff --git a/hermes_cli/kanban_sync_wal_evidence.py b/hermes_cli/kanban_sync_wal_evidence.py
+new file mode 100644
+index 0000000000..82dce5c0f2
+--- /dev/null
++++ b/hermes_cli/kanban_sync_wal_evidence.py
+@@ -0,0 +1,67 @@
++"""SQLite's own proof that a board's main file moved because of a WAL checkpoint. [daveey]
++
++A kept read-only connection survives a checkpoint by design: the wal-index tells it which pages
++to read from where. It does not survive a raw overwrite of the main file, which bypasses the WAL
++and leaves its page cache describing bytes that are gone. Both change the main file's mtime, so
++``BoardWatch`` used to reopen on either (about 3 ms of schema parsing per board per checkpoint on
++a laptop gateway during an observation). This module reads the wal-index header from ``<db>-shm`` and
++answers one question: did a checkpoint run between two observations?
++
++Layout (SQLite ``wal.c``, native byte order): two copies of the 48-byte ``WalIndexHdr``
++(``isInit`` at 12, ``mxFrame`` at 16, ``aSalt`` at 32..40), then ``WalCkptInfo`` whose first
++word, at offset 96, is ``nBackfill``: the number of WAL frames already copied into the main file.
++
++Only a lock-safe ``pread`` touches the file: a plain open/close of ``-shm`` in a process that
++holds connections cancels their POSIX locks (see :mod:`hermes_cli.sqlite_safe_read`).
++"""
++from __future__ import annotations
++
++import os
++import struct
++from pathlib import Path
++from typing import NamedTuple, Optional
++
++from hermes_cli.sqlite_safe_read import pread_lock_safe_stat
++
++_HDR = 48
++_LEN = 136  # two header copies + WalCkptInfo
++_WORD = struct.Struct("=I")
++
++
++class WalState(NamedTuple):
++    shm: tuple[int, int]  # (st_dev, st_ino) of the -shm that was read
++    salts: bytes  # aSalt[0..1]: one WAL generation; rewritten when the log restarts
++    max_frame: int  # mxFrame: last valid frame of this generation
++    backfilled: int  # nBackfill: frames of this generation already in the main file
++
++
++def read(db_path: Path | str) -> Optional[WalState]:
++    """The board's wal-index state, or None when it cannot be read with certainty (no ``-shm``:
++    a rollback-journal database; a torn or uninitialised header; a platform without ``pread``).
++    *db_path* must be the path SQLite opened (symlinks resolved): it names the sidecar by that."""
++    if not hasattr(os, "pread"):
++        return None
++    got = pread_lock_safe_stat(os.fspath(db_path) + "-shm", 0, _LEN)
++    if got is None or len(got[0]) != _LEN:
++        return None
++    raw, st = got
++    first = raw[:_HDR]
++    # A writer updates the copies one after the other: unequal copies are a header in motion.
++    if first != raw[_HDR:2 * _HDR] or first[12] != 1:
++        return None
++    return WalState((st.st_dev, st.st_ino), first[32:40], _WORD.unpack_from(first, 16)[0],
++                    _WORD.unpack_from(raw, 96)[0])
++
++
++def checkpointed(before: Optional[WalState], after: Optional[WalState]) -> bool:
++    """True only when *after* proves a checkpoint copied frames into the main file since *before*.
++
++    Same WAL generation: ``nBackfill`` advanced. A later generation: the log restarts only once
++    every frame is backfilled, so frames outstanding at *before* were checkpointed after it, and
++    any frame backfilled in the new generation was too. A restart from a fully backfilled baseline
++    into a generation with nothing backfilled proves nothing. Anything unreadable is doubt."""
++    if before is None or after is None or before.shm != after.shm:
++        return False
++    if before.salts == after.salts:
++        return after.backfilled > before.backfilled
++    return before.backfilled < before.max_frame or after.backfilled > 0
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index b3cbd6fb14..64c96acd44 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -503,11 +503,18 @@ def _pread_fd(path: Path | str) -> Optional[tuple[int, os.stat_result]]:
+ 
+ def pread_lock_safe(path: Path | str, offset: int, length: int) -> Optional[bytes]:
+     """``length`` bytes at ``offset`` of *path* without ever closing a descriptor on it."""
++    got = pread_lock_safe_stat(path, offset, length)
++    return None if got is None else got[0]
++
++
++def pread_lock_safe_stat(path: Path | str, offset: int, length: int) -> Optional[tuple[bytes, os.stat_result]]:
++    """:func:`pread_lock_safe` plus the ``fstat`` of the descriptor the bytes came from, so the
++    two always describe the same file even when the path is replaced during the call."""
+     entry = _pread_fd(path)
+     if entry is None:
+         return None
+     try:
+-        return os.pread(entry[0], length, offset)
++        return os.pread(entry[0], length, offset), os.fstat(entry[0])
+     except OSError:
+         return None
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py b/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
+new file mode 100644
+index 0000000000..3f28b2fed4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_checkpoint_keep.py
+@@ -0,0 +1,232 @@
++"""BoardWatch keeps its reader across a WAL checkpoint and reopens on every other main-file change. [daveey]"""
++import os
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_sync_wal_evidence as evidence
++from hermes_cli import loop_accounting
++from hermes_cli.kanban_sync_board_watch import BoardWatch
++from hermes_cli.kanban_sync_wal_evidence import WalState
++
++VALUE = "SELECT v FROM t"
++PAD = "x" * 10000  # more than a page: every checkpoint of it grows or rewrites the main file
++
++
++@pytest.fixture
++def board(tmp_path):
++    path = tmp_path / "board.db"
++    writer = sqlite3.connect(path, isolation_level=None)
++    writer.execute("PRAGMA journal_mode=WAL")
++    writer.execute("PRAGMA wal_autocheckpoint=0")  # every checkpoint here is one the test asked for
++    writer.execute("CREATE TABLE t (v TEXT)")
++    writer.execute("CREATE TABLE u (v TEXT)")
++    writer.execute("CREATE TABLE pad (v TEXT)")
++    writer.execute("INSERT INTO t VALUES ('a')")
++    watch = BoardWatch()
++    loop_accounting.reset()
++    yield path, writer, watch
++    watch.reset()
++    writer.close()
++    loop_accounting.reset()
++
++
++def _reader(watch, path):
++    return watch._conns[str(path)][1]
++
++
++def _runs(name):
++    return loop_accounting.counters().get(name, {}).get("runs", 0)
++
++
++def _checkpoint(writer, mode):
++    busy, _log, _done = writer.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
++    assert busy == 0
++
++
++def _rewrite(path, image):
++    """A raw restore: other bytes in the same inode, behind SQLite's back."""
++    before = os.stat(path)
++    with open(path, "r+b") as handle:
++        handle.write(image)
++        handle.truncate()
++    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
++    assert os.stat(path).st_ino == before.st_ino
++
++
++@pytest.mark.parametrize("mode", ["PASSIVE", "RESTART", "TRUNCATE"])
++def test_checkpoint_keeps_reader_and_sees_later_commit(board, mode):
++    path, writer, watch = board
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("a",)
++    kept = _reader(watch, path)
++    for value in ("b", "c"):  # twice: the kept reader's new baseline must prove the next checkpoint too
++        before = os.stat(path)
++        writer.execute("INSERT INTO pad VALUES (?)", (PAD,))
++        writer.execute("UPDATE t SET v = ?", (value,))
++        _checkpoint(writer, mode)
++        after = os.stat(path)
++        assert (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size)
++        assert watch.query(path, VALUE, unchanged_ok=True) == (gen, (value,))
++        assert _reader(watch, path) is kept
++        writer.execute("UPDATE t SET v = ?", (value + "+",))  # committed after the checkpoint, WAL only
++        assert watch.query(path, VALUE, unchanged_ok=True) == (gen, (value + "+",))
++        assert _reader(watch, path) is kept
++    assert _runs("sync.reader_keep/checkpoint") == 2
++    assert _runs("sync.reader_open.reason/first") == 1
++    assert _runs("sync.reader_open.reason/changed") == 0
++
++
++def _two_images(writer, path):
++    """The main file holding 'a', then advanced to 'b' with the WAL emptied; returns the 'a' image."""
++    _checkpoint(writer, "TRUNCATE")
++    image = path.read_bytes()
++    writer.execute("UPDATE t SET v = 'b'")
++    _checkpoint(writer, "TRUNCATE")
++    assert len(path.read_bytes()) == len(image)
++    return image
++
++
++def test_same_inode_raw_restore_reopens(board):
++    path, writer, watch = board
++    image = _two_images(writer, path)
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("b",)
++    old = _reader(watch, path)
++    state = evidence.read(path)
++    assert state is not None  # the sidecars are there: nothing but missing proof forces the reopen
++    _rewrite(path, image)
++    assert evidence.read(path) == state
++    assert watch.query(path, VALUE, unchanged_ok=True) == (gen, ("a",))
++    assert _reader(watch, path) is not old
++    with pytest.raises(sqlite3.ProgrammingError):
++        old.execute("SELECT 1")
++    assert _runs("sync.reader_open.reason/changed") == 1
++    assert _runs("sync.reader_keep/checkpoint") == 0
++
++
++def test_restore_with_checkpoint_in_same_interval_matches_fresh_reader(board):
++    """Proof of a checkpoint is not proof that nothing else wrote the file: the kept reader must
++    answer as a new connection would, from the bytes now on disk."""
++    path, writer, watch = board
++    image = _two_images(writer, path)
++    writer.execute("INSERT INTO u VALUES ('pending')")  # frames the next checkpoint will backfill
++    assert watch.query(path, VALUE)[1] == ("b",)  # t's page is now in the kept reader's cache
++    kept = _reader(watch, path)
++    _rewrite(path, image)
++    _checkpoint(writer, "PASSIVE")
++    fresh = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
++    try:
++        expected = fresh.execute(VALUE).fetchone()
++    finally:
++        fresh.close()
++    assert expected == ("a",)
++    assert watch.query(path, VALUE)[1] == expected
++    assert _reader(watch, path) is kept  # the proof held, so this exercised the kept path
++    assert _runs("sync.reader_keep/checkpoint") == 1
++
++
++def test_wal_restart_with_backfilled_baseline_is_not_proof(board):
++    path, writer, watch = board
++    _checkpoint(writer, "PASSIVE")
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("a",)
++    old = _reader(watch, path)
++    base = evidence.read(path)
++    assert base is not None and base.backfilled == base.max_frame > 0
++    _rewrite(path, path.read_bytes())  # a raw rewrite; the next commit restarts the log, no checkpoint
++    writer.execute("UPDATE t SET v = 'b'")
++    now = evidence.read(path)
++    assert now is not None and now.salts != base.salts
++    assert watch.query(path, VALUE, unchanged_ok=True) == (gen, ("b",))
++    assert _reader(watch, path) is not old
++    assert _runs("sync.reader_open.reason/changed") == 1
++
++
++def test_shrunken_file_reopens_even_with_checkpoint_proof(board):
++    path, writer, watch = board
++    writer.execute("INSERT INTO pad VALUES (?)", (PAD * 20,))
++    _checkpoint(writer, "PASSIVE")
++    writer.execute("UPDATE t SET v = 'b'")  # restarts the log: the baseline below has frames outstanding
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("b",)
++    old = _reader(watch, path)
++    base, size = evidence.read(path), os.stat(path).st_size
++    writer.execute("DELETE FROM pad")
++    writer.execute("VACUUM")
++    _checkpoint(writer, "PASSIVE")
++    assert os.stat(path).st_size < size
++    assert evidence.checkpointed(base, evidence.read(path))
++    assert watch.query(path, VALUE, unchanged_ok=True) == (gen, ("b",))
++    assert _reader(watch, path) is not old
++    assert _runs("sync.reader_open.reason/changed") == 1
++
++
++def test_replaced_inode_reopens_with_new_generation(board):
++    path, writer, watch = board
++    _checkpoint(writer, "TRUNCATE")
++    gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("a",)
++    old = _reader(watch, path)
++    copy = path.with_name("copy.db")
++    copy.write_bytes(path.read_bytes())
++    edit = sqlite3.connect(copy)
++    edit.execute("UPDATE t SET v = 'replaced'")
++    edit.commit()
++    edit.close()
++    inode = os.stat(path).st_ino
++    os.replace(copy, path)
++    assert os.stat(path).st_ino != inode
++    new_gen, row = watch.query(path, VALUE, unchanged_ok=True)
++    assert row == ("replaced",) and new_gen != gen
++    assert _reader(watch, path) is not old
++    assert _runs("sync.reader_open.reason/replaced") == 1
++    assert _runs("sync.reader_keep/checkpoint") == 0
++
++
++def test_rollback_journal_board_has_no_proof(tmp_path):
++    path = tmp_path / "plain.db"
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE t (v TEXT)")
++    conn.commit()
++    conn.close()
++    assert evidence.read(path) is None
++
++
++def test_header_in_motion_is_not_read(board):
++    path, _writer, _watch = board
++    good = evidence.read(path)
++    assert good is not None and good.max_frame > 0 and good.backfilled == 0
++    shm = path.with_name(path.name + "-shm").read_bytes()
++    torn = tmp_path_copy(path, shm[:48] + bytes(48) + shm[96:])
++    assert evidence.read(torn) is None
++    unset = tmp_path_copy(path, bytes(12) + b"\0" + shm[13:48] + bytes(12) + b"\0" + shm[61:])
++    assert evidence.read(unset) is None
++    assert evidence.read(tmp_path_copy(path, shm[:100])) is None
++
++
++def tmp_path_copy(path, shm):
++    """A stand-in board path whose -shm holds *shm* (never the live board's own sidecar)."""
++    fake = path.with_name(f"fake-{len(shm)}-{shm[60]}.db")
++    fake.with_name(fake.name + "-shm").write_bytes(shm)
++    return fake
++
++
++STATE = WalState(shm=(1, 2), salts=b"saltsalt", max_frame=8, backfilled=3)
++
++
++@pytest.mark.parametrize("before, after, proven", [
++    (STATE, STATE._replace(backfilled=8), True),
++    (STATE, STATE._replace(max_frame=12, backfilled=4), True),
++    (STATE, STATE, False),
++    (STATE, STATE._replace(max_frame=12), False),  # commits alone
++    (STATE._replace(backfilled=8), STATE._replace(backfilled=3), False),
++    (STATE, STATE._replace(salts=b"newsalts", max_frame=1, backfilled=0), True),
++    (STATE._replace(backfilled=8), STATE._replace(salts=b"newsalts", max_frame=1, backfilled=0), False),
++    (STATE._replace(max_frame=0, backfilled=0), STATE._replace(salts=b"newsalts", max_frame=0, backfilled=0), False),
++    (STATE, STATE._replace(shm=(1, 3), backfilled=8), False),
++    (None, STATE, False),
++    (STATE, None, False),
++])
++def test_checkpoint_proof(before, after, proven):
++    assert evidence.checkpointed(before, after) is proven
+diff --git a/tests/hermes_cli/test_kanban_sync_empty_outbox.py b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+index d61fe4d78a..73dd4b129f 100644
+--- a/tests/hermes_cli/test_kanban_sync_empty_outbox.py
++++ b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+@@ -27,7 +27,7 @@ def board(tmp_path, monkeypatch):
+     client.reset_board_watch()
+ 
+ 
+-def test_checkpoint_refreshes_answers_without_rearming_repair_generation(board):
++def test_checkpoint_keeps_reader_and_answers_without_rearming_repair_generation(board):
+     path, conn = board
+     sql = "SELECT 1 FROM kanban_sync_outbox WHERE state='pending' LIMIT 1"
+     first = client._WATCH.query(path, sql, unchanged_ok=True)
+@@ -37,9 +37,10 @@ def test_checkpoint_refreshes_answers_without_rearming_repair_generation(board):
+     assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+     current = client._WATCH.query(path, sql, unchanged_ok=True)
+     assert current == (first[0], (1,))
+-    assert client._WATCH._conns[os.path.realpath(path)][1] is not old
+-    with pytest.raises(sqlite3.ProgrammingError):
+-        old.execute("SELECT 1")
++    # SQLite's wal-index proves the main file moved in a checkpoint: the reader is kept (no
++    # schema re-parse) and still answers from the checkpointed content.
++    assert client._WATCH._conns[os.path.realpath(path)][1] is old
++    assert old.execute("SELECT 1").fetchone() == (1,)
+ 
+ 
+ def test_empty_sample_does_not_reopen_schema(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_sync_idle_round.py b/tests/hermes_cli/test_kanban_sync_idle_round.py
+index 6d6850efba..e4434b1da0 100644
+--- a/tests/hermes_cli/test_kanban_sync_idle_round.py
++++ b/tests/hermes_cli/test_kanban_sync_idle_round.py
+@@ -207,9 +207,8 @@ def test_write_during_repair_is_not_cached_as_already_repaired(live, svc, kanban
+ 
+ 
+ def test_outbox_poll_keeps_one_connection_per_board_and_sees_new_work(live, kanban_home, monkeypatch):
+-    # Keep this a WAL-commit reuse test, not an auto-checkpoint page-count lottery.
+-    # Schema growth can put task capture across the default 1000-page threshold;
+-    # a main-file checkpoint correctly makes BoardWatch reopen its pager.
++    # Keep the commit-reuse half free of the auto-checkpoint page-count lottery: the one
++    # checkpoint below is explicit.
+     live.execute("PRAGMA wal_autocheckpoint=0")
+     path = kanban_home / "kanban.db"
+     with kbc.write_txn(live):
+@@ -223,15 +222,15 @@ def test_outbox_poll_keeps_one_connection_per_board_and_sees_new_work(live, kanb
+     kb.create_task(live, title="new local work", assignee="worker")  # captured into the outbox by trigger
+     assert ksc.outbox_pending([path]) is True
+     assert len(opened) == 1
+-    # Checkpoint is different from a WAL-only commit: reopening the main-file
+-    # pager must preserve visibility, then return to kept-connection polling.
++    # A checkpoint moves the main file; the wal-index proves it was one, so the kept
++    # reader stays and still sees the work.
+     checkpoint = tuple(live.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+     assert checkpoint[0] == 0
+     assert ksc.outbox_pending([path]) is True
+-    assert len(opened) == 2
++    assert len(opened) == 1
+     for _ in range(20):
+         assert ksc.outbox_pending([path]) is True
+-    assert len(opened) == 2
++    assert len(opened) == 1
+ 
+ 
+ def test_outbox_poll_reopens_a_replaced_board_file(live, kanban_home):
+diff --git a/tests/hermes_cli/test_kanban_sync_wait_split.py b/tests/hermes_cli/test_kanban_sync_wait_split.py
+new file mode 100644
+index 0000000000..ebed1b37fb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_wait_split.py
+@@ -0,0 +1,137 @@
++"""The wait step's live CPU split: sync.wait/* partitions sync.step/...wait and adds nothing. [daveey]"""
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_cpu as cpu
++from hermes_cli import kanban_sync_timing as timing
++from hermes_cli import loop_accounting
++from hermes_cli.kanban_sync_board_watch import BoardWatch
++
++STEP = "sync.step/hermes_cli.kanban_sync_timing.wait"
++PARTS = ("boundary", "event_wait", "outbox_probe", "reader_open")
++TICKS = 3
++
++
++class _Wake:
++    """An event whose wait costs CPU and never fires."""
++
++    def __init__(self, spend):
++        self._spend = spend
++
++    def wait(self, timeout=None):
++        self._spend(0.004)
++        return False
++
++    def clear(self):
++        pass
++
++
++def _spin(seconds):
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++def _run_wait(monkeypatch, spend, *, split=True):
++    """One loop round whose wait step runs TICKS ticks; the first probe opens a reader."""
++    loop_accounting.reset()
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: True)
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(timing._DIAG, "boundary", lambda: spend(0.002))
++    if not split:
++        monkeypatch.setattr(cpu.WaitSplit, "publish", lambda self: None)
++        monkeypatch.setattr(cpu, "wait_boundary", lambda fn: fn())
++        monkeypatch.setattr(cpu, "note_reader_open", lambda cpu_s, reason: None)
++    left = [TICKS]
++
++    def probe(paths):
++        if left[0] == TICKS:
++            spend(0.003)
++            cpu.note_reader_open(0.003, "changed")  # what BoardWatch does after a reopen
++        spend(0.001)
++        left[0] -= 1
++        return False
++
++    monkeypatch.setattr(client, "outbox_pending", probe)
++    with cpu.iterations(lambda: True) as rounds:
++        next(rounds)
++        cpu.step(timing.wait, client.wait_for_work, _Wake(spend), [], 60.0, lambda: left[0] > 0)
++    stats = loop_accounting.counters()
++    accounted = sum(loop_accounting._copy_accounted().values())
++    loop_accounting.reset()
++    return stats, accounted
++
++
++def _non_board(stats):
++    return stats["sync.cpu.total/loop"]["cpu_s"] - sum(
++        v["cpu_s"] for k, v in stats.items() if k.startswith("sync.board/"))
++
++
++@pytest.fixture
++def fake_clock(monkeypatch):
++    now = [100.0]
++    monkeypatch.setattr(time, "thread_time", lambda: now[0])
++    monkeypatch.setattr(loop_accounting, "_thread_time", lambda: now[0])
++    return lambda seconds: now.__setitem__(0, now[0] + seconds)
++
++
++def test_wait_split_sums_to_step_and_adds_nothing(monkeypatch, fake_clock):
++    stats, accounted = _run_wait(monkeypatch, fake_clock)
++    parts = {p: stats[f"sync.wait/{p}"]["cpu_s"] for p in PARTS}
++    assert parts == pytest.approx({"boundary": 0.002, "event_wait": 0.004 * TICKS,
++                                   "outbox_probe": 0.001 * TICKS, "reader_open": 0.003})
++    assert stats["sync.wait/event_wait"]["rows"] == TICKS
++    step = stats[STEP]["cpu_s"]
++    assert step > 0 and abs(sum(parts.values()) - step) <= 0.02 * step
++    assert stats["sync.reader_open.step/wait"]["cpu_s"] == pytest.approx(0.003)
++    assert stats["sync.reader_open.reason/changed"]["runs"] == 1
++    assert not [k for k in stats if k.startswith("sync.step/") and k != STEP]
++
++    plain, plain_accounted = _run_wait(monkeypatch, fake_clock, split=False)
++    assert not [k for k in plain if k.startswith(("sync.wait/", "sync.reader_"))]
++    assert stats[STEP]["cpu_s"] == pytest.approx(plain[STEP]["cpu_s"])
++    assert _non_board(stats) == pytest.approx(_non_board(plain))
++    assert accounted == pytest.approx(plain_accounted)
++    shared = [k for k in plain if k.startswith("sync.")]
++    assert {k: stats[k]["cpu_s"] for k in shared} == pytest.approx({k: plain[k]["cpu_s"] for k in shared})
++
++
++def test_wait_split_sums_to_step_on_the_real_clock(monkeypatch):
++    """Real thread CPU: what the marks leave out (the step's own bookkeeping) stays under 2%."""
++    stats, _ = _run_wait(monkeypatch, lambda seconds: _spin(seconds * 5))
++    step = stats[STEP]["cpu_s"]
++    total = sum(stats[f"sync.wait/{p}"]["cpu_s"] for p in PARTS)
++    assert step > 0.08 and total <= step and step - total <= 0.02 * step
++
++
++def test_reader_opens_are_booked_under_the_step_that_triggered_them(tmp_path, monkeypatch):
++    loop_accounting.reset()
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    path = tmp_path / "board.db"
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE t (v)")
++    conn.commit()
++    conn.close()
++    watch = BoardWatch()
++
++    def select():
++        return watch.query(path, "SELECT count(*) FROM t")
++
++    try:
++        assert cpu.step(select) is not None
++        watch.reset()
++        with cpu.service("default"):
++            assert select() is not None
++        watch.reset()
++        assert select() is not None
++    finally:
++        watch.reset()
++    stats = loop_accounting.counters()
++    assert {k: v["runs"] for k, v in stats.items() if k.startswith("sync.reader_open.")} == {
++        "sync.reader_open.step/select": 1, "sync.reader_open.step/board": 1,
++        "sync.reader_open.step/other": 1, "sync.reader_open.reason/first": 3}
++    loop_accounting.reset()
+-- 
+2.43.0
+

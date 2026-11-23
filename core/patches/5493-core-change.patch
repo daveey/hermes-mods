@@ -1,0 +1,265 @@
+From 5031229245f8fa8a12cd5bf2688b422a904b2663 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:39:30 +0000
+Subject: [PATCH] fix(capsule): bound advisory identify and keep preflight off
+ loop [daveey]
+
+Address independent PR3953 review: command preflight runs off-loop; identify waits at most 0.5s for one context-bound verifier without caching late positives. Strict owner and child permissions remain uncached. Same-revision legacy path applies to submitter admission only.
+
+Behavioral RED: both launch shapes fail event-loop preflight assertion and real socket identify loses default-timeout answer. GREEN: 203 tests across 14 consumers; scripts/check all21 OK.
+---
+ docs/designs/kanban-capsule-contract-v2.md    | 16 ++-
+ gateway/capsule_contract.py                   | 36 ++++++-
+ gateway/session_managed_worker.py             |  3 +-
+ tests/gateway/test_capsule_identify_budget.py | 97 +++++++++++++++++++
+ tests/gateway/test_capsule_worker_launch.py   | 15 ++-
+ 5 files changed, 159 insertions(+), 8 deletions(-)
+ create mode 100644 tests/gateway/test_capsule_identify_budget.py
+
+diff --git a/docs/designs/kanban-capsule-contract-v2.md b/docs/designs/kanban-capsule-contract-v2.md
+index a1507e18e8..1b99528fb6 100644
+--- a/docs/designs/kanban-capsule-contract-v2.md
++++ b/docs/designs/kanban-capsule-contract-v2.md
+@@ -7,8 +7,11 @@ permission grant, a full loaded-code digest or a sandbox against same-uid attack
+ ## Admission and launch
+ 
+ The submitter still requires a known full commit identity and transport-v1. A
+-same-revision owner retains the legacy path. Different revisions additionally
+-require v2. No caller chooses a child core or interpreter.
++same-revision owner retains the legacy **submitter admission** path. Different
++revisions additionally require v2. Every capsule-required launch, same-revision
++included, must pass strict owner/child identity checks; dirty/untracked core or
++any unfiltered ledger unknown (including external plugins) refuses that launch.
++No caller chooses a child core or interpreter.
+ 
+ The ready descriptor names the implemented ABI. Every control-socket identify
+ filters v2 against the bootstrap-installed integrity ledger and strict disk
+@@ -29,9 +32,12 @@ checkpoint recovery, before construction, before ready and before turns. An
+ installed FD with lost expectation fails closed. Startup failures revoke binding
+ and close session/RPC resources; consumed rendezvous cannot be reused.
+ 
+-These checks are uncached. A measured clean disk scan alone is not a bound on
+-whole identify latency or ledger inventory. Unsupported bootstrap routes do not
+-perform the strict capsule boot scan.
++These checks are uncached. Advisory identify waits at most 0.5 seconds for a
++single-flight verifier; overrun or an already-running check withdraws v2 only,
++with no reuse of late positive results. Launch and child verification remain
++strict, synchronous and uncached. A measured clean disk scan alone is not a
++bound on ledger inventory. Unsupported bootstrap routes do not perform the
++strict capsule boot scan.
+ 
+ ## Frozen ABI and evidence limits
+ 
+diff --git a/gateway/capsule_contract.py b/gateway/capsule_contract.py
+index e3dbf154fc..8c45b08424 100644
+--- a/gateway/capsule_contract.py
++++ b/gateway/capsule_contract.py
+@@ -1,4 +1,5 @@
+ """Strict, dynamically checked availability of the cross-revision capsule ABI."""
++import threading
+ from pathlib import Path
+ 
+ from hermes_cli.kanban_capsule_owner import CONTRACT_CAPABILITY
+@@ -32,6 +33,39 @@ def _verified_sha(*, worker=False):
+         return None
+ 
+ 
++# Advisory only: one in-flight verifier, no cached positives. A slow filesystem
++# must withdraw v2 rather than consume the control client's entire timeout.
++_IDENTIFY_VERIFY_BUDGET_S = 0.5
++_advisory_lock = threading.Lock()
++
++
++def _advisory_sha():
++    if not _advisory_lock.acquire(blocking=False):
++        return None
++    done = threading.Event()
++    result: list[str | None] = [None]
++
++    def verify():
++        try:
++            result[0] = _verified_sha()
++        except Exception:
++            # This advisory must never take legacy identify down with it.
++            import logging
++            logging.getLogger(__name__).exception('Capsule identify verification failed')
++            result[0] = None
++        finally:
++            _advisory_lock.release()
++            done.set()
++
++    try:
++        from agent.memory_provider import spawn_context_thread
++        spawn_context_thread(verify, name='capsule-identify', daemon=True).start()
++    except RuntimeError:
++        _advisory_lock.release()
++        return None
++    return result[0] if done.wait(_IDENTIFY_VERIFY_BUDGET_S) else None
++
++
+ def available_capabilities(capabilities, *, advertised_sha=None):
+     """Withdraw v2 on unknown/dirty/skewed code; never manufacture an advertisement.
+ 
+@@ -40,7 +74,7 @@ def available_capabilities(capabilities, *, advertised_sha=None):
+     """
+     result = list(capabilities)
+     if CONTRACT_CAPABILITY in result:
+-        sha = _verified_sha()
++        sha = _advisory_sha()
+         if sha is None or advertised_sha != sha:
+             result = [cap for cap in result if cap != CONTRACT_CAPABILITY]
+     return result
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index d57be9ecab..c1e71e7242 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -652,8 +652,9 @@ async def _spawn_registered_worker(authority, ref, row, policy=None):
+         log_path = worker_log_path(authority.profile_id)
+         from gateway.session_kanban_scope import placing_spawn
+         from gateway.capsule_contract import worker_command
++        command = await asyncio.to_thread(worker_command, policy)
+         process = await acquire_process(placing_spawn(lambda *a, **kw: subprocess.Popen(*a, **kw), policy),
+-            worker_command(policy),
++            command,
+             cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+             stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+     except asyncio.CancelledError:
+diff --git a/tests/gateway/test_capsule_identify_budget.py b/tests/gateway/test_capsule_identify_budget.py
+new file mode 100644
+index 0000000000..e89f5f8f9d
+--- /dev/null
++++ b/tests/gateway/test_capsule_identify_budget.py
+@@ -0,0 +1,97 @@
++"""Slow advisory verification must not hide the control socket's v1 answer."""
++import asyncio
++import threading
++import time
++from types import SimpleNamespace
++
++from gateway.runtime_bootstrap import TicketStore
++
++
++def test_slow_identity_withdraws_only_v2_and_never_reuses_late_positive(tmp_path, monkeypatch):
++    from gateway import capsule_contract as contract
++    from gateway.control_socket import identify_gateway
++    from gateway.run_bootstrap import _start_gateway_start_control_socket
++    from hermes_cli.kanban_capsule_owner import CAPABILITY, CONTRACT_CAPABILITY
++
++    home = tmp_path / 'home'
++    home.mkdir(mode=0o700)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    def slow_identity():
++        calls.append(1)
++        entered.set()
++        assert release.wait(5)
++        finished.set()
++        return 'a' * 40
++    monkeypatch.setattr(contract, '_verified_sha', slow_identity)
++    monkeypatch.setattr('gateway.control_socket.build_identify_payload', lambda: {'code_sha': 'a' * 40})
++    descriptor = {'instance_id': 'fixture', 'runtime_protocol': 1, 'authority_epoch': 'epoch',
++                  'state': 'ready', 'capabilities': [CAPABILITY, CONTRACT_CAPABILITY]}
++    runner = SimpleNamespace(session_runtime_descriptor=descriptor, _draining=False,
++                             session_ticket_store=TicketStore('fixture', frozenset({str(home)})),
++                             config=SimpleNamespace(multiplex_profiles=False))
++
++    async def scenario():
++        server = await _start_gateway_start_control_socket(runner)
++        assert server is not None
++        try:
++            started = time.monotonic()
++            answer = await asyncio.to_thread(identify_gateway, home)
++            assert answer is not None, 'slow v2 check lost the entire default-timeout identify answer'
++            assert time.monotonic() - started < 1.5
++            assert entered.is_set()
++            assert answer['capabilities'] == [CAPABILITY]
++            # A hung verifier must not accumulate threads on subsequent requests.
++            for _ in range(3):
++                answer = await asyncio.to_thread(identify_gateway, home)
++                assert answer is not None
++                assert answer['capabilities'] == [CAPABILITY]
++            assert len(calls) == 1
++        finally:
++            release.set()
++            assert await asyncio.to_thread(finished.wait, 5)
++            await server.stop()
++    asyncio.run(scenario())
++    assert contract._advisory_lock.acquire(timeout=5)
++    contract._advisory_lock.release()
++    # Even a late success is never a cached positive on a later identify.
++    monkeypatch.setattr(contract, '_verified_sha', lambda: None)
++    assert contract.available_capabilities([CAPABILITY, CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CAPABILITY]
++    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++    assert contract.available_capabilities([CAPABILITY, CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CAPABILITY, CONTRACT_CAPABILITY]
++    assert descriptor['capabilities'] == [CAPABILITY, CONTRACT_CAPABILITY]
++
++
++def test_advisory_preserves_context_and_recovers_from_exception(monkeypatch, caplog):
++    import contextvars
++    from gateway import capsule_contract as contract
++    from hermes_cli.kanban_capsule_owner import CONTRACT_CAPABILITY
++    marker = contextvars.ContextVar('capsule-budget-fixture', default='unset')
++    token = marker.set('profile-scope')
++    seen = []
++    def verify():
++        seen.append(marker.get())
++        raise LookupError('fixture unexpected inventory error')
++    try:
++        monkeypatch.setattr(contract, '_verified_sha', verify)
++        assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
++        assert seen == ['profile-scope']
++        assert 'Capsule identify verification failed' in caplog.text
++        monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++        assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
++    finally:
++        marker.reset(token)
++
++
++def test_advisory_thread_start_failure_withdraws_and_releases_slot(monkeypatch):
++    from gateway import capsule_contract as contract
++    from hermes_cli.kanban_capsule_owner import CONTRACT_CAPABILITY
++    class RefusedThread:
++        def start(self):
++            raise RuntimeError('fixture thread start refused')
++    with monkeypatch.context() as scoped:
++        scoped.setattr('agent.memory_provider.spawn_context_thread', lambda *a, **k: RefusedThread())
++        assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
++    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++    assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
+diff --git a/tests/gateway/test_capsule_worker_launch.py b/tests/gateway/test_capsule_worker_launch.py
+index 22efc7fd43..3c0100b16e 100644
+--- a/tests/gateway/test_capsule_worker_launch.py
++++ b/tests/gateway/test_capsule_worker_launch.py
+@@ -14,7 +14,19 @@ async def test_registered_worker_launch_shape(monkeypatch, required):
+     authority = SimpleNamespace(profile_id='fixture', _managed_spawning={})
+     monkeypatch.setattr(managed, '_mark_spawning', lambda *a: authority._managed_spawning)
+     monkeypatch.setattr(managed, '_worker_env', lambda a: {'HERMES_HOME': '/fixture/profile'})
+-    monkeypatch.setattr('gateway.session_kanban_capsule.check_capsule_transport', lambda policy: required)
++    import asyncio
++    import threading
++    calls = []
++    def preflight(policy):
++        calls.append(threading.current_thread() is threading.main_thread())
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            pass
++        else:
++            pytest.fail('capsule preflight ran on the event loop')
++        return required
++    monkeypatch.setattr('gateway.session_kanban_capsule.check_capsule_transport', preflight)
+     monkeypatch.setattr('gateway.session_managed_worker_log.worker_log_path', lambda profile: None)
+     seen = []
+     class StopBeforeSpawn(Exception):
+@@ -27,6 +39,7 @@ async def test_registered_worker_launch_shape(monkeypatch, required):
+         await managed._spawn_registered_worker(authority, SimpleNamespace(session_id='s'),
+                                                {'generation': 1}, object())
+     [(argv, kwargs)] = seen
++    assert calls == [False]
+     root = Path(managed.__file__).resolve().parents[1]
+     if required:
+         from hermes_cli._launch_template import render
+-- 
+2.43.0
+

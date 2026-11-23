@@ -1,0 +1,143 @@
+From a72cb8957d2af551152c1e0e56478c062e6ae5a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:42:21 +0000
+Subject: [PATCH] fix(metrics): mark incomplete open accounting boundaries
+ invalid [daveey]
+
+Keep raw native failure telemetry, but never infer an open interval from tick-only or missing CPU, and never subtract a negative pending term from completed accounting. Publish open_accounting_complete for collectors to reject. The phase2 collector now requires this proof while retaining all existing negative-residual and performance gates.
+
+Proof: 26 consumer files471 passed0failed13skipped; final focused15 pass; eight exact-anchor mutants killed by named tests; full scripts/check21 pass. Collector omission is RED then7 synthetic controls GREEN. Native Linux clock/failure/close serialization exercised; no Mac CPU window and no publication acceptance claim. This remains phase2 WIP pending report/wait cuts and canonical review/CI after the permitted publication date.
+---
+ hermes_cli/loop_accounting.py                 |  9 ++++++-
+ hermes_cli/loop_accounting_open.py            | 14 +++++++++--
+ .../test_loop_accounting_open_boundary.py     | 25 +++++++++++++++++++
+ .../test_loop_accounting_open_native.py       | 15 +++++++++++
+ 4 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 128f79ac74..654934d534 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -519,12 +519,15 @@ def _thread_cpu_locked() -> list[dict[str, Any]]:
+         if got is None:
+             continue
+         comm, user, system = got
++        precise = True
+         try:
+             cpu = time.clock_gettime((~tid << 3) | 6)  # Linux numeric TID CPUCLOCK_SCHED, not a pthread pointer
+         except (OSError, ValueError):
+             cpu = user + system
++            precise = False
+         out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(cpu, 6),
+                     "cpu_stat_s": round(user + system, 3),
++                    "cpu_sample_precise": precise,
+                     "user_s": round(user, 3), "system_s": round(system, 3),
+                     "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
+     if not tids and sys.platform == "darwin":
+@@ -556,7 +559,10 @@ def snapshot() -> dict[str, Any]:
+ 
+     Thread totals include the unbooked part of the oldest open interval (its
+     nested completed work is subtracted). ``open_accounting`` names that part;
+-    completed loop counters are unchanged. Callback hooks remain best-effort.
++    completed loop counters are unchanged. ``open_accounting_complete`` is false
++    if an open interval lacks a precise native reading or its pending CPU would
++    be negative; consumers must reject that boundary, not infer savings from it.
++    Callback hooks remain best-effort.
+     Linux cpu_s uses the numeric-TID high-resolution clock; cpu_stat_s retains
+     the tick-granular user/system sum. Diagnostic metadata is read afterwards.
+     """
+@@ -609,6 +615,7 @@ def _snapshot_locked() -> dict[str, Any]:
+             "unaccounted_live_cpu_s": round(max(0.0, live - accounted_live), 3) if procfs else None,
+         },
+         "threads": threads,
++        "open_accounting_complete": _open_intervals.complete(threads),
+         "residual": _residual(threads, process_cpu, accounted_total, procfs),
+         "loops": counters(),
+     }
+diff --git a/hermes_cli/loop_accounting_open.py b/hermes_cli/loop_accounting_open.py
+index fb2defd72d..e251e6a750 100644
+--- a/hermes_cli/loop_accounting_open.py
++++ b/hermes_cli/loop_accounting_open.py
+@@ -43,11 +43,21 @@ class OpenIntervals:
+ 
+     def apply(self, row: dict[str, Any]) -> None:
+         entries = self.by_tid.get(row["tid"])
+-        if not entries or row["cpu_s"] is None:
++        if not entries:
+             return
+         # Context managers are nested on one native thread. The oldest interval
+         # covers the union; subtract closed inner intervals, never count them twice.
+         name, cpu0, acc0 = next(iter(entries.values()))
++        row["open_accounting"] = {"name": name, "cpu_s": None, "depth": len(entries), "available": False}
++        if row["cpu_s"] is None or not row.get("cpu_sample_precise", True):
++            return
+         pending = row["cpu_s"] - cpu0 - (row["accounted_cpu_s"] - acc0)
+-        row["open_accounting"] = {"name": name, "cpu_s": round(pending, 6), "depth": len(entries)}
++        row["open_accounting"]["cpu_s"] = round(pending, 6)
++        if pending < 0:
++            return  # inconsistent sample, not permission to reduce completed accounting
++        row["open_accounting"]["available"] = True
+         row["accounted_cpu_s"] = round(row["accounted_cpu_s"] + pending, 6)
++
++    def complete(self, rows: list[dict[str, Any]]) -> bool:
++        sampled = {row["tid"] for row in rows if row.get("open_accounting", {}).get("available")}
++        return self.by_tid.keys() <= sampled
+diff --git a/tests/hermes_cli/test_loop_accounting_open_boundary.py b/tests/hermes_cli/test_loop_accounting_open_boundary.py
+index 4c6305c1d5..650eaa8b83 100644
+--- a/tests/hermes_cli/test_loop_accounting_open_boundary.py
++++ b/tests/hermes_cli/test_loop_accounting_open_boundary.py
+@@ -116,3 +116,28 @@ def test_child_open_scope_uses_child_clock_and_discards_foreign_threads(cpu_cloc
+         assert inside["process"]["accounted_cpu_s"] == pytest.approx(0.01)
+     assert la.counters()["inherited"]["cpu_s"] == pytest.approx(0.01)
+     assert not la._open_intervals.by_tid
++
++
++@pytest.mark.parametrize("sample", ["missing", "imprecise", "overbooked"])
++def test_incomplete_open_boundary_is_explicit_and_does_not_erase_booked_cpu(cpu_clock, monkeypatch, sample):
++    with la.scope("thread/incomplete"):
++        cpu_clock[0] = 1.08
++        if sample == "missing":
++            monkeypatch.setattr(la, "_darwin_thread_cpu", list)
++        elif sample == "imprecise":
++            monkeypatch.setattr(la, "_thread_cpu_locked", lambda: [{
++                "tid": la._native_id(), "name": "pool_0", "cpu_s": 1.08,
++                "accounted_cpu_s": 0.0, "cpu_sample_precise": False,
++            }])
++        else:
++            la.record("invalid.caller", cpu_s=0.2)
++        snap = la.snapshot()
++        assert snap["open_accounting_complete"] is False
++        if sample == "overbooked":
++            assert snap["process"]["accounted_cpu_s"] == pytest.approx(0.2)
++
++
++def test_complete_open_boundary_is_explicit(cpu_clock):
++    with la.scope("thread/complete"):
++        cpu_clock[0] = 1.08
++        assert la.snapshot()["open_accounting_complete"] is True
+diff --git a/tests/hermes_cli/test_loop_accounting_open_native.py b/tests/hermes_cli/test_loop_accounting_open_native.py
+index 846cd3474e..dfa2cdc3a2 100644
+--- a/tests/hermes_cli/test_loop_accounting_open_native.py
++++ b/tests/hermes_cli/test_loop_accounting_open_native.py
+@@ -86,3 +86,18 @@ def test_native_sampling_serializes_scope_close(monkeypatch):
+         thread.join(10)
+     assert closed.is_set()
+     assert not thread.is_alive()
++
++
++@pytest.mark.platforms("linux")
++def test_failed_precise_clock_keeps_raw_stats_but_invalidates_open_boundary(monkeypatch):
++    def unavailable(_clock):
++        raise OSError("synthetic native-clock failure")
++
++    monkeypatch.setattr(la.time, "clock_gettime", unavailable)
++    with la.scope("thread/no_native_clock"):
++        snap = la.snapshot()
++        assert snap["open_accounting_complete"] is False
++        row = next(t for t in snap["threads"] if t["tid"] == threading.get_native_id())
++        assert row["cpu_sample_precise"] is False
++        assert row["cpu_s"] == row["cpu_stat_s"]
++        assert row["open_accounting"]["available"] is False
+-- 
+2.43.0
+

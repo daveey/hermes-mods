@@ -1,0 +1,181 @@
+From 5ff464d7a3526f95479e0125669af63bea9f9d6f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:48:35 +0000
+Subject: [PATCH] [daveey] Record remote Other answers without releasing card
+ holds
+
+---
+ hermes_cli/kanban_card_answer.py              | 25 ++++++++++--
+ hermes_cli/kanban_card_answer_proof.py        |  2 +
+ hermes_cli/kanban_card_answer_source.py       | 10 ++++-
+ .../test_kanban_card_answer_other.py          | 38 +++++++++++++++++++
+ 4 files changed, 70 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_other.py
+
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index 3f3635601d..606fd4b469 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -59,6 +59,8 @@ def snapshot(conn, task: str) -> dict | None:
+ def validate_provenance(value: dict, task: str) -> None:
+     """Shape fence for the private comment hook; the adapter establishes truth."""
+     fields = {"ownerGateway", "ownerProfile", "board", "task", "generation", "choice", "operationId", "originGateway"}
++    if isinstance(value, dict) and value.get('mode') == 'comment':
++        fields.add('mode')
+     if (not isinstance(value, dict) or set(value) != fields or value.get("task") != task
+             or any(not isinstance(value[k], str) or not value[k] for k in fields)
+             or len(value["generation"]) != 64):
+@@ -81,6 +83,7 @@ def _valid_receipt(conn, task, request, fingerprint, kind, receipt) -> bool:
+             or not isinstance(origin, str) or not origin or receipt["fingerprint"] != fingerprint
+             or receipt["destination"] != "kanban_ask" or receipt["executionStarted"] is not False
+             or receipt["decisionProvenance"] != "recorded_desktop_operation"
++            or (request.get('mode') == 'comment') != (kind == 'card_answer_recorded')
+             or (kind == "archived" and request["choice"] != "archive")):
+         return False
+     provenance = {**request, "originGateway": origin}
+@@ -110,7 +113,7 @@ def _valid_receipt(conn, task, request, fingerprint, kind, receipt) -> bool:
+ def _receipt(conn, request, fingerprint):
+     task, operation_id = request["task"], request["operationId"]
+     for row in conn.execute(
+-        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived') ORDER BY id DESC",
++        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived','card_answer_recorded') ORDER BY id DESC",
+         (task,),
+     ):
+         payload = _payload(row[1])
+@@ -148,6 +151,8 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+     The transition API owns its transaction and post-commit archive cleanup.
+     """
+     fields = {"ownerGateway", "ownerProfile", "board", "task", "generation", "choice", "operationId"}
++    if isinstance(request, dict) and request.get('mode') == 'comment':
++        fields.add('mode')
+     if not isinstance(request, dict) or set(request) != fields:
+         raise AnswerRefused("invalid_answer")
+     if any(not isinstance(request[k], str) or not request[k] for k in fields):
+@@ -176,9 +181,12 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+         {"label": "Unblock", "value": "unblock"}, {"label": "Archive", "value": "archive"},
+     ]
+     choices = [ch for ch in options if isinstance(ch, dict) and ch.get("value") == request["choice"]]
+-    if len(choices) != 1:
++    informational = request.get('mode') == 'comment'
++    if informational:
++        choices = [dict(label='Other (user-relayed comment; does not resume)', value=request['choice'])]
++    elif len(choices) != 1:
+         raise AnswerRefused("unknown_choice")
+-    archive = not current["ask"].get("choices") and request["choice"] == "archive"
++    archive = not informational and not current["ask"].get("choices") and request["choice"] == "archive"
+     receipt = {**request, "originGateway": origin, "fingerprint": fingerprint,
+                "destination": "kanban_ask", "executionStarted": False,
+                "decisionProvenance": "recorded_desktop_operation"}
+@@ -190,7 +198,7 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+         from hermes_cli.kanban_containment_guard import pending as containment_pending
+         if containment_pending(c, request['task']):
+             return "containment_hold"
+-        if not archive and pending(c, request["task"]):
++        if not archive and not informational and pending(c, request["task"]):
+             return "spend_decision_pending"
+         if _receipt(c, request, fingerprint):
+             return "already_recorded"
+@@ -201,6 +209,15 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+     from hermes_cli.kanban_reason_comment import RecordedDecisionComment
+     provenance = {**request, "originGateway": origin}
+     comment = RecordedDecisionComment("user-steps", note, provenance)
++    if informational:
++        with kb.write_txn(conn):
++            error = fence(conn)
++            if error:
++                raise AnswerRefused(error)
++            kb.add_comment(conn, request['task'], comment.author, comment.body,
++                           writer_kind='agent', recorded_decision=provenance)
++            kb._append_event(conn, request['task'], 'card_answer_recorded', {FIELD: receipt})
++        return _receipt(conn, request, fingerprint)
+     transition(conn, request["task"], precondition=fence, comment=comment,
+                event_extra={FIELD: receipt})
+     recorded = _receipt(conn, request, fingerprint)
+diff --git a/hermes_cli/kanban_card_answer_proof.py b/hermes_cli/kanban_card_answer_proof.py
+index a02983064d..4adbacd2ab 100644
+--- a/hermes_cli/kanban_card_answer_proof.py
++++ b/hermes_cli/kanban_card_answer_proof.py
+@@ -17,6 +17,8 @@ def verify(answer: dict, *, request_id: str, proof_id: str, owner_gateway: str,
+     original = read_request(request_id)
+     proof = read_request(proof_id)
+     fields = {"ownerGateway", "ownerProfile", "board", "task", "generation", "choice", "operationId"}
++    if isinstance(answer, dict) and answer.get('mode') == 'comment':
++        fields.add('mode')
+     if (not isinstance(answer, dict) or set(answer) != fields
+             or any(not isinstance(v, str) or not v for v in answer.values())):
+         raise AnswerRefused("source_request_invalid")
+diff --git a/hermes_cli/kanban_card_answer_source.py b/hermes_cli/kanban_card_answer_source.py
+index 0d59d05ea2..758cee564f 100644
+--- a/hermes_cli/kanban_card_answer_source.py
++++ b/hermes_cli/kanban_card_answer_source.py
+@@ -59,7 +59,7 @@ def _recorded(path: Path, *, source: dict, owner_gateway: str, request_id: str,
+             raise AnswerRefused('source_binding_missing')
+         frozen = json.loads(bound['request'])
+         remote = json.loads(bound['snapshot']).get('remote')
+-        target = {k: v for k, v in answer.items() if k not in ('choice', 'operationId')}
++        target = {k: v for k, v in answer.items() if k not in ('choice', 'operationId', 'mode')}
+         if (not isinstance(remote, dict) or type(remote.get('version')) is not int or remote['version'] != 1
+                 or remote.get('target') != target or target['ownerGateway'] != owner_gateway
+                 or bound['board'] != target['board'] or bound['task'] != target['task']):
+@@ -70,6 +70,14 @@ def _recorded(path: Path, *, source: dict, owner_gateway: str, request_id: str,
+             raise AnswerRefused('source_revision_mismatch')
+         choices = [ch for ch in frozen['choices'] if ch['id'] == decision.get('choiceId')]
+         values = remote.get('choiceValues')
++        if answer.get('mode') == 'comment':
++            if (decision.get('choiceId') != 'answer-text'
++                    or op.get('provenance') != dict(type='kanban_other', version=1)
++                    or intent.get('effect') != 'answer' or intent.get('revisionText') != answer['choice']
++                    or decision.get('revisionText') != answer['choice']
++                    or intent.get('executionAuthorized') is not False or intent.get('permissionGrants') != []):
++                raise AnswerRefused('source_comment_mismatch')
++            return dict(answer=answer, source=source, requestId=request_id, gateway=source['gateway'], recorded=True)
+         if (len(choices) != 1 or choices[0].get('effect') != 'answer'
+                 or not isinstance(values, dict) or values.get(decision.get('choiceId')) != answer['choice']
+                 or intent.get('effect') != 'answer' or intent.get('revisionText') != choices[0]['label']
+diff --git a/tests/hermes_cli/test_kanban_card_answer_other.py b/tests/hermes_cli/test_kanban_card_answer_other.py
+new file mode 100644
+index 0000000000..693c71d4be
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_other.py
+@@ -0,0 +1,38 @@
++"""Record-only courier answers never imply a card transition."""
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect_closing
++from tests.hermes_cli.test_kanban_card_answer import apply, comments, setup_answer
++from tests.hermes_cli import test_kanban_awaiting as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('text', ['plan-a', 'archive', 'Different instructions'])
++def test_informational_answer_is_atomic_idempotent_and_keeps_human_ask(kanban_home, text):
++    with connect_closing(kanban_home / 'kanban.db') as conn:
++        answer = dict(setup_answer(conn), mode='comment', choice=text)
++        original = kb.get_task(conn, answer['task'])
++        receipt = apply(conn, answer)
++        assert receipt == apply(conn, answer)
++        current = kb.get_task(conn, answer['task'])
++        assert current.status == original.status == 'blocked'
++        assert current.human_request == original.human_request
++        assert len(comments(conn, answer['task'])) == 1
++        assert receipt['mode'] == 'comment' and receipt['choice'] == text
++        assert not any(e.kind in ('unblocked', 'archived') for e in kb.list_events(conn, answer['task']))
++        assert sum(e.kind == 'card_answer_recorded' for e in kb.list_events(conn, answer['task'])) == 1
++        with pytest.raises(ca.AnswerRefused, match='operation_conflict'):
++            apply(conn, {k: v for k, v in answer.items() if k != 'mode'})
++
++
++def test_informational_answer_refuses_changed_generation_without_comment(kanban_home):
++    with connect_closing(kanban_home / 'kanban.db') as conn:
++        answer = dict(setup_answer(conn), mode='comment', choice='free text')
++        kb._append_event(conn, answer['task'], 'blocked', {'reason': 'fresh ask'})
++        conn.commit()
++        with pytest.raises(ca.AnswerRefused, match='stale_ask'):
++            apply(conn, answer)
++        assert comments(conn, answer['task']) == []
+-- 
+2.43.0
+

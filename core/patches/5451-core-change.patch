@@ -1,0 +1,399 @@
+From 63e1b0f910158654033bce9b555c57b3e88cc2f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:14:23 +0000
+Subject: [PATCH] [daveey] defer automatic turns behind proven updating marker
+ owners
+
+Five whys:
+1. An automatic turn can display an ownership card while a core update is
+   still holding the paused turn's live writer.
+2. Admission returns SESSION_NOT_OWNED for this temporary custody too.
+3. The automatic-turn publication gate previously distinguished the gateway
+   ledger, but not positively proven updating marker owners.
+4. Registry refusals discarded the holder's recorded process incarnation,
+   leaving consumers unable to distinguish that case from a foreign writer.
+5. Coverage asserted exclusion and card throttling, not update-bound silent
+   deferral with install, incarnation and kernel-custody controls.
+
+Carry registry PID/birth without changing lease acquisition or release.
+Classify a labelled copy only when the recorded holder matches a paused
+marker, the verified same-install spawn ledger, a live updater incarnation,
+and real POSIX checkout kernel-lock contention. Automatic submissions keep
+existing retry/backoff but do not emit a takeover card for that case.
+Typed, foreign, unknown, stale and non-updating cases retain the card.
+
+Historical limit: earlier logs identify marker writer PIDs, not their recorded
+birth/install provenance. They cannot be retroactively certified. Durable
+PID-only lease holders and unprovable/Windows lock observations retain the
+existing fail-closed behavior; this does not reclaim or release any lease.
+
+Proof before commit:
+- Vertical canonical RED/GREEN slices for classifier, registry PID/birth,
+  automatic card suppression, producer wiring and foreign warning cause.
+- Real separate-process writer + marker + registry + spawn ledger + update
+  lock integration, retry/recovery, and fail-closed matrix pass canonically.
+- scripts/check --base origin/main: all 21 checks pass.
+- Wider consumers and mutation verification follow on this frozen revision;
+  independent exact-head review and required CI remain landing gates.
+---
+ hermes_cli/active_sessions.py                 |   9 +-
+ tests/tui_gateway/test_update_marker_defer.py | 226 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |   4 +
+ tui_gateway/session_lifecycle.py              |   3 +-
+ tui_gateway/update_marker_owner.py            |  58 +++++
+ 5 files changed, 298 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_marker_defer.py
+ create mode 100644 tui_gateway/update_marker_owner.py
+
+diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
+index f9da27a6fc..77baee42b7 100644
+--- a/hermes_cli/active_sessions.py
++++ b/hermes_cli/active_sessions.py
+@@ -675,11 +675,18 @@ def try_acquire_active_session(
+                     entries[index] = entry
+                     _write_entries(state_path, entries)
+                     return lease, None
+-                return refuse(
++                _, refusal = refuse(
+                     session_already_owned_message(key, existing), SESSION_NOT_OWNED,
+                     "Refused active session %s: already held by pid=%s surface=%s",
+                     key, existing.get("pid"), existing.get("surface"),
+                 )
++                # Carry the recorded incarnation, never a newly observed birth for a bare PID.
++                refusal.holder_pid = existing.get("pid")
++                refusal.holder_start_time = existing.get("process_start_time")
++                if (refusal.holder_start_time is not None
++                        and _pid_liveness(refusal.holder_pid, refusal.holder_start_time) is True):
++                    refusal.ownership_cause = "lease_foreign"
++                return None, refusal
+ 
+         # Capacity second, and only when an operator asked for one.
+         if max_sessions is not None and len(entries) >= max_sessions:
+diff --git a/tests/tui_gateway/test_update_marker_defer.py b/tests/tui_gateway/test_update_marker_defer.py
+new file mode 100644
+index 0000000000..3bd9582fc3
+--- /dev/null
++++ b/tests/tui_gateway/test_update_marker_defer.py
+@@ -0,0 +1,226 @@
++"""Only incarnation-bound same-install update custody suppresses an automatic card."""
++import itertools
++import os
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import active_sessions, process_identity, update_lock
++from tests.tui_gateway import test_automatic_ledger_defer as ledger_tests
++from tui_gateway import server, turn_marker, update_marker_owner
++
++admission = ledger_tests.admission
++
++
++@pytest.fixture
++def custody(tmp_path, monkeypatch):
++    if os.name != "posix":
++        pytest.skip("positive checkout contention proof is POSIX-only")
++    home, install = tmp_path / "home", tmp_path / "install"
++    install.mkdir()
++    monkeypatch.setattr(process_identity, "_ledger_path", lambda: tmp_path / "spawn-ledger.json")
++    assert process_identity.register_self("serve", project_root=install)
++    pid, birth = os.getpid(), active_sessions._own_start_time()
++    assert birth is not None
++    assert turn_marker.record_turn_start(home, "chat", "pending")
++    assert turn_marker.mark_turn_paused(home, "chat", "core_update_pause")
++    refusal = active_sessions.ActiveSessionRefusal("owned", active_sessions.SESSION_NOT_OWNED)
++    refusal.holder_pid, refusal.holder_start_time = pid, birth
++    refusal.ownership_cause = "lease_foreign"
++    lock = update_lock.UpdateLock(path=home / update_lock.MARKER_NAME, install_root=install)
++    assert lock.acquire()
++    try:
++        yield SimpleNamespace(home=home, install=install, refusal=refusal, lock=lock,
++                              classify=lambda: update_marker_owner.classify_refusal(
++                                  home, "chat", refusal, install_root=install))
++    finally:
++        lock.release()
++
++
++def test_proven_marker_refusal_is_classified(custody):
++    result = custody.classify()
++    assert result.ownership_cause == "update_marker"
++    assert result.holder_pid == os.getpid()
++    assert result is not custody.refusal
++    assert custody.refusal.ownership_cause == "lease_foreign"
++
++
++def test_registry_producer_classifies_proven_update(custody, monkeypatch):
++    original = update_marker_owner.classify_refusal
++    monkeypatch.setattr(update_marker_owner, "classify_refusal",
++                        lambda h, k, r: original(h, k, r, install_root=custody.install))
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda s: None)
++    monkeypatch.setattr(server, "_durable_owner_refusal", lambda s: None)
++    # Real registry refusal, not a pre-labelled mock: two live records in this process.
++    lease, refused = active_sessions.try_acquire_active_session(
++        session_id="chat", surface="desktop", registry_home=custody.home, config={},
++        metadata={"live_session_id": "first"})
++    assert refused is None
++    try:
++        monkeypatch.setattr(server, "_load_cfg", dict)
++        session = {"session_key": "chat", "profile_home": custody.home, "source": "desktop"}
++        actual = server._ensure_active_session_slot("second", session, allow_takeover=False)
++        assert actual.ownership_cause == "update_marker"
++    finally:
++        lease.release()
++
++
++def test_automatic_update_marker_refusal_defers(admission, caplog):
++    admission.session["_synthesized_turn"] = True
++    admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ownership_cause="update_marker", holder_pid=123)
++    with caplog.at_level("INFO"):
++        assert ledger_tests._admit(admission) is None
++    assert admission.errors == []
++    assert admission.starts == []
++    assert admission.session["_turn_owner_refusal"] == "SESSION_NOT_OWNED"
++    assert "update marker writer pid 123" in caplog.text
++
++
++def test_update_deferral_retries_and_recovers(custody, admission, monkeypatch):
++    admission.refusal = custody.classify()
++    def submit(*args, **kwargs):
++        return ledger_tests._admit(admission) is not None
++    monkeypatch.setattr(server, "_run_prompt_submit", submit)
++    for _ in range(3):
++        assert not server._notif_run_submit("rid", "live", admission.session, "notice")
++        assert server._notif_owner_refused(admission.session)
++        admission.now = admission.session["_notif_owner_refused_until"]
++    assert admission.errors == []
++    admission.refusal = None
++    assert server._notif_run_submit("rid", "live", admission.session, "notice")
++    assert not server._notif_owner_refused(admission.session)
++
++
++@pytest.mark.parametrize("synthesized,reason,cause", itertools.product(
++    [True, False], ["SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE"],
++    ["update_marker", "lease_foreign", "unknown", None]))
++def test_other_refusals_keep_their_card(admission, synthesized, reason, cause):
++    if synthesized and reason == "SESSION_NOT_OWNED" and cause == "update_marker":
++        return  # the sole positive shape, independently exercised above
++    admission.session["_synthesized_turn"] = synthesized
++    admission.refusal = SimpleNamespace(reason=reason, ownership_cause=cause, holder_pid=123)
++    assert ledger_tests._admit(admission) is None
++    assert len(admission.errors) == 1
++
++
++@pytest.mark.parametrize("defect", ["no_marker", "not_paused", "different_writer", "stale_writer",
++                                    "missing_birth", "foreign_install", "no_ledger", "stale_ledger",
++                                    "no_update", "no_checkout_lock", "stale_updater", "legacy_updater",
++                                    "unreadable_lock", "unknown_writer", "marker_changed"])
++def test_unproven_marker_never_relabels(custody, monkeypatch, defect):
++    marker = turn_marker.read_turn_marker(custody.home, "chat")
++    path = custody.home / update_lock.MARKER_NAME
++
++    def stale_ledger():
++        from utils import atomic_json_write
++        rows = process_identity._read_ledger(process_identity._ledger_path())
++        rows[0]["create_time"] += 1
++        atomic_json_write(process_identity._ledger_path(), rows)
++
++    def update_birth(birth):
++        lines = path.read_text().splitlines()[:2]
++        path.write_text("\n".join(lines + ([] if birth is None else [f"ct:{birth:.3f}"])) + "\n")
++
++    def denied(*args, **kwargs):
++        raise PermissionError("fixture lock unreadable")
++
++    reads = iter([marker, {**marker, "prompt": "successor"}])
++    actions = {
++        "no_marker": lambda: turn_marker.clear_turn_marker(custody.home, "chat"),
++        "not_paused": lambda: turn_marker.record_turn_start(custody.home, "chat", "not paused"),
++        "different_writer": lambda: setattr(custody.refusal, "holder_pid", os.getpid() + 1),
++        "stale_writer": lambda: setattr(custody.refusal, "holder_start_time", active_sessions._own_start_time() + 1),
++        "missing_birth": lambda: delattr(custody.refusal, "holder_start_time"),
++        "foreign_install": lambda: process_identity.register_self("serve", project_root=custody.install / "foreign"),
++        "no_ledger": lambda: process_identity._ledger_path().unlink(),
++        "stale_ledger": stale_ledger,
++        "no_update": path.unlink,
++        "no_checkout_lock": update_lock._release_checkout,
++        "stale_updater": lambda: update_birth(active_sessions._own_start_time() + 10),
++        "legacy_updater": lambda: update_birth(None),
++        "unreadable_lock": lambda: monkeypatch.setattr(update_marker_owner.os, "open", denied),
++        "unknown_writer": lambda: monkeypatch.setattr(update_marker_owner, "marker_writer_state", lambda _: "unknown"),
++        "marker_changed": lambda: monkeypatch.setattr(update_marker_owner, "read_turn_marker", lambda *a: next(reads)),
++    }
++    actions[defect]()
++    assert custody.classify() is custody.refusal
++    assert custody.refusal.ownership_cause == "lease_foreign"
++
++
++_CHILD_WRITER = """
++import sys
++from pathlib import Path
++from hermes_cli import active_sessions, process_identity, update_lock
++from tui_gateway import turn_marker
++home, install, ledger, ready = map(Path, sys.argv[1:])
++process_identity._ledger_path = lambda: ledger
++assert process_identity.register_self("serve", project_root=install)
++lease, refused = active_sessions.try_acquire_active_session(
++    session_id="chat", surface="desktop", registry_home=home, config={},
++    metadata={"live_session_id": "child"})
++assert refused is None
++assert turn_marker.record_turn_start(home, "chat", "pending")
++assert turn_marker.mark_turn_paused(home, "chat", "core_update_pause")
++lock = update_lock.UpdateLock(path=home / update_lock.MARKER_NAME, install_root=install)
++assert lock.acquire()
++try:
++    ready.write_text("ready")
++    sys.stdin.read()
++finally:
++    lock.release()
++    lease.release()
++"""
++
++
++def test_real_other_process_marker_update_defers(tmp_path, monkeypatch, admission):
++    from tests.waiting import wait_until
++    if os.name != "posix":
++        pytest.skip("POSIX kernel contention proof")
++    home, install = tmp_path / "home", tmp_path / "install"
++    install.mkdir()
++    ledger, ready = tmp_path / "ledger.json", tmp_path / "ready"
++    monkeypatch.setattr(process_identity, "_ledger_path", lambda: ledger)
++    proc = subprocess.Popen([sys.executable, "-c", _CHILD_WRITER, str(home), str(install), str(ledger), str(ready)],
++                            cwd=Path.cwd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, text=True, encoding="utf-8")
++    try:
++        wait_until(lambda: ready.exists() or proc.poll() is not None, what="child writer ready")
++        assert proc.poll() is None, proc.communicate(timeout=10)
++        _, refusal = active_sessions.try_acquire_active_session(
++            session_id="chat", surface="desktop", registry_home=home, config={},
++            metadata={"live_session_id": "parent"})
++        assert refusal.holder_pid == proc.pid
++        classified = update_marker_owner.classify_refusal(home, "chat", refusal, install_root=install)
++        assert classified.ownership_cause == "update_marker"
++        admission.refusal = classified
++        admission.session["_synthesized_turn"] = True
++        assert ledger_tests._admit(admission) is None
++        assert admission.errors == []
++        out, err = proc.communicate(timeout=10)
++        assert proc.returncode == 0, (out, err)
++        # Same historical marker after owner exit is NOT current update provenance.
++        assert update_marker_owner.classify_refusal(home, "chat", refusal, install_root=install) is refusal
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++        proc.communicate(timeout=10)
++
++
++def test_registry_refusal_carries_original_holder_birth(tmp_path):
++    first, refusal = active_sessions.try_acquire_active_session(
++        session_id="marker-chat", surface="desktop", registry_home=tmp_path, config={},
++        metadata={"live_session_id": "first"})
++    assert refusal is None
++    try:
++        second, refusal = active_sessions.try_acquire_active_session(
++            session_id="marker-chat", surface="desktop", registry_home=tmp_path, config={},
++            metadata={"live_session_id": "second"})
++        assert second is None
++        assert refusal.holder_pid == os.getpid()
++        assert refusal.holder_start_time == active_sessions._own_start_time()
++        assert refusal.ownership_cause == "lease_foreign"
++    finally:
++        first.release()
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 24a1124865..0e8bba4435 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -177,6 +177,10 @@ def _admit_prompt_turn(
+                 getattr(ownership_refusal, "ledger_status", None) in owner_forward.FORWARDABLE_LEDGER_STATES):
+             logger.info("automatic turn for %s deferred: gateway queue holds %s work",
+                         session.get("session_key") or sid, ownership_refusal.ledger_status)
++        elif (session.get("_synthesized_turn") and reason == "SESSION_NOT_OWNED"
++              and getattr(ownership_refusal, "ownership_cause", None) == "update_marker"):
++            logger.info("automatic turn for %s deferred: update marker writer pid %s is still updating",
++                        session.get("session_key") or sid, ownership_refusal.holder_pid)
+         elif report_ownership_refusal:
+             # [daveey] retire_marker=False: this submit wrote no marker; the one on disk is a live turn's.
+             _emit_terminal_turn_error(
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 1f480ec062..50e74c60fd 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -229,7 +229,8 @@ def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool
+     if (allow_takeover and getattr(limit_message, "reason", None) == SESSION_NOT_OWNED
+             and _take_over_detached_runtime_lease(sid, session, key, idle_only=takeover_idle_only)):
+         return None
+-    return limit_message
++    from tui_gateway.update_marker_owner import classify_refusal
++    return classify_refusal(_session_home(session), key, limit_message)
+ 
+ 
+ # Whether an id has a non-terminal ledger row (existence only: ``LIMIT 1`` returns an arbitrary row, so a status is
+diff --git a/tui_gateway/update_marker_owner.py b/tui_gateway/update_marker_owner.py
+new file mode 100644
+index 0000000000..196060d666
+--- /dev/null
++++ b/tui_gateway/update_marker_owner.py
+@@ -0,0 +1,58 @@
++"""Positive update custody for a refusal; never admission or lease takeover authority."""
++import os
++from pathlib import Path
++
++from hermes_cli import active_sessions, process_identity, update_lock
++from tui_gateway.turn_marker import finite_deadline, marker_writer_state, read_turn_marker
++
++
++def classify_refusal(home, key, refusal, *, install_root=None):
++    """Return a labelled copy only for a live paused writer of this updating install.
++
++    Missing birth, ledger or kernel evidence retains the original actionable refusal.
++    A durable lease's PID-only holder string is deliberately insufficient.
++    """
++    if getattr(refusal, "reason", None) != active_sessions.SESSION_NOT_OWNED:
++        return refusal
++    pid = getattr(refusal, "holder_pid", None)
++    birth = finite_deadline(getattr(refusal, "holder_start_time", None))
++    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or birth is None:
++        return refusal
++    from hermes_cli._startup_fast import project_root_str
++    root = Path(install_root) if install_root is not None else Path(project_root_str())
++    try:
++        marker = read_turn_marker(home, key)
++        if (not marker or marker.get("reason") != "core_update_pause"
++                or marker.get("writer_pid") != pid or marker.get("writer_start_time") != birth
++                or marker_writer_state(marker) != "alive"):
++            return refusal
++        rows = process_identity.ledger_entries(project_root=root, verified_only=True)
++        if not any(row.get("pid") == pid and row.get("create_time") == birth
++                   and row.get("install") == process_identity.install_id(root) for row in rows):
++            return refusal
++        from hermes_constants import get_default_hermes_root
++        update = update_lock._read_marker(get_default_hermes_root(home=Path(home)) / update_lock.MARKER_NAME)
++        if (update is None or update.started_at is None or update.create_time is None
++                or update_lock.incarnation_live(update.pid, update.create_time) is not True):
++            return refusal
++        # Positive lock contention, not checkout_lock_held's conservative "unreadable = held".
++        # Windows' lock failure cannot distinguish access failure here; retain its card.
++        if os.name != "posix":
++            return refusal
++        fd = os.open(update_lock.checkout_lock_path(root), os.O_RDONLY)
++        try:
++            held = not update_lock._try_shared_lock(fd)
++        finally:
++            os.close(fd)
++        if not held:
++            return refusal
++        # Revalidate the writer after the update probes (no stale PID classification).
++        if marker_writer_state(marker) != "alive" or read_turn_marker(home, key) != marker:
++            return refusal
++    except (OSError, ValueError, TypeError):
++        return refusal
++    result = active_sessions.ActiveSessionRefusal(str(refusal), refusal.reason)
++    result.ownership_cause = "update_marker"
++    result.holder_pid = pid
++    result.holder_start_time = birth
++    return result
+-- 
+2.43.0
+

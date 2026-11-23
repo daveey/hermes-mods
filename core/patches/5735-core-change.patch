@@ -1,0 +1,460 @@
+From bcb622bb15e47689d2f566dc61bb8c15341022b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 11:17:06 +0000
+Subject: [PATCH] perf(kanban): batch exact history reads on short-lived
+ snapshots [daveey]
+
+Task-only P2 invalidations with unchanged event count/max executed one exact
+history SELECT per displayed task. Batch only those ambiguous comparisons;
+retain count/max shortcuts, ordered storage-type/column parity and overlays.
+Keep the existing observer only as a commit clock; close the guarded row
+snapshot before projection, also on errors. No whole-payload cache or polling.
+
+Proof:
+- RED title-only edit: six per-task history SELECTs; GREEN one IN query.
+- Real default shadow board copy, 189 displayed cards, migrated offline to
+  install P2 triggers. Old/new serialized payload bytes match with fixed clock.
+  Stable title-change SQL statements 242 -> 54; event reads 188 -> 1.
+  Seven-request sequential-arm CPU medians 272.15ms -> 294.92ms (thread CPU).
+  This bounds query/connection lifetime; it is not a demonstrated CPU speedup.
+  Cold 624.85ms -> 731.93ms; unchanged 10.34ms -> 12.12ms; no live serve signals.
+- 570 consumer tests pass across 36 files, plus 23 final focused tests.
+- Reader-lifetime RED on original board_rows; success, failure/retry, unchanged
+  and interleaved-clock/read commit regressions covered.
+- Full scripts/check --base origin/main passes.
+
+Hermes-Card: t_83775cfa619d2208
+---
+ .../kanban/dashboard/board_event_history.py   |  54 +++++++++
+ plugins/kanban/dashboard/board_read.py        |  28 ++---
+ plugins/kanban/dashboard/board_rows.py        |  44 ++++---
+ .../test_kanban_board_reader_lifetime.py      |  80 +++++++++++++
+ tests/plugins/test_kanban_event_batch.py      | 108 ++++++++++++++++++
+ .../test_kanban_materialization_reuse.py      |   4 +
+ 6 files changed, 276 insertions(+), 42 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/board_event_history.py
+ create mode 100644 tests/plugins/test_kanban_board_reader_lifetime.py
+ create mode 100644 tests/plugins/test_kanban_event_batch.py
+
+diff --git a/plugins/kanban/dashboard/board_event_history.py b/plugins/kanban/dashboard/board_event_history.py
+new file mode 100644
+index 0000000000..94e00cc232
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_event_history.py
+@@ -0,0 +1,54 @@
++"""Exact, storage-type-preserving history comparison in the caller's snapshot."""
++from __future__ import annotations
++
++import marshal
++from itertools import groupby
++from operator import itemgetter
++from types import MappingProxyType
++
++
++def _raw(history):
++    return tuple(tuple(row.values()) if isinstance(row, MappingProxyType) else tuple(row) for row in history)
++
++
++def same_histories(conn, histories: dict) -> dict[str, bool]:
++    """One SQL read for all ambiguous P2 invalidations; no history reductions.
++
++    Keep the caller's snapshot: opening another connection here could compare
++    against a newer commit than its task rows and event marks. Close the cursor
++    before Python comparisons; the caller ends its snapshot before projection.
++    """
++    if not histories:
++        return {}
++    cur = conn.cursor()
++    cur.row_factory = None
++    try:
++        rows = cur.execute(
++            f"SELECT * FROM task_events WHERE task_id IN ({','.join('?' for _ in histories)})",
++            tuple(histories)).fetchall()
++        keys = tuple(d[0] for d in cur.description)
++    finally:
++        cur.close()
++    matches = {tid: not history for tid, history in histories.items()}
++    # idx_events_task is (task_id, created_at), not (task_id, id). Avoid
++    # SQLite's wide-row temporary B-tree; order detached tuples in Python.
++    rows.sort(key=itemgetter(keys.index('task_id'), keys.index('id')))
++    for tid, group in groupby(rows, itemgetter(keys.index('task_id'))):
++        history = histories[tid]
++        matches[tid] = (not history or tuple(history[0].keys()) == keys) and (
++            marshal.dumps(tuple(group), 2) == marshal.dumps(_raw(history), 2))
++    return matches
++
++
++def same_events(conn, tid, history) -> bool:
++    """Scalar compatibility helper, also the pre-batch parity oracle."""
++    cur = conn.cursor()
++    cur.row_factory = None
++    try:
++        rows = cur.execute('SELECT * FROM task_events WHERE task_id = ? ORDER BY id', (tid,)).fetchall()
++        keys = tuple(d[0] for d in cur.description)
++        if history and tuple(history[0].keys()) != keys:
++            return False
++        return marshal.dumps(tuple(rows), 2) == marshal.dumps(_raw(history), 2)
++    finally:
++        cur.close()
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 6f5037d236..9529264f86 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -4,7 +4,6 @@ commit (clock, config, profiles on disk, hub replica) and runs on every refresh.
+ 
+ from __future__ import annotations
+ 
+-import marshal
+ import sqlite3
+ import time
+ from dataclasses import asdict
+@@ -16,6 +15,7 @@ from hermes_cli import kanban_diagnostics as kd
+ from hermes_cli import kanban_workflow
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics
+ from plugins.kanban.dashboard.board_run_history import retained_runs
++from plugins.kanban.dashboard.board_event_history import same_histories as _same_event_histories
+ 
+ # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
+ # one workflow definition. A status missing here gets mis-bucketed into ``todo``.
+@@ -209,23 +209,9 @@ def _diag_memo(rows, events_by_task, runs_by_task, marks, unmarked=None) -> dict
+ 
+ 
+ def _same_events(conn, tid, history) -> bool:
+-    """Exact same-snapshot comparison for task-wide P2 false positives.
+-
+-    Count/max cannot certify same-ID edits. Compare every ordered scalar, including
+-    column names and storage types, before retaining immutable history reductions.
+-    This still scans SQL history; it avoids rebuilding/reducing it and the broad
+-    diagnostic loader's duplicate run/graph reads on task/comment/link edits.
+-    """
+-    cur = conn.cursor()
+-    cur.row_factory = None
+-    try:
+-        rows = cur.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)).fetchall()
+-        keys = tuple(d[0] for d in cur.description)
+-        if history and tuple(history[0].keys()) != keys:
+-            return False
+-        return marshal.dumps(tuple(rows), 2) == marshal.dumps(_raw(history), 2)
+-    finally:
+-        cur.close()
++    """Scalar compatibility seam for existing callers and pre-batch parity tests."""
++    from plugins.kanban.dashboard.board_event_history import same_events
++    return same_events(conn, tid, history)
+ 
+ 
+ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *,
+@@ -247,6 +233,10 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     else:
+         marks = _event_marks(conn, ids)
+     runs = retained_runs(conn, ids, prev, event_changed, _rows_by_task)
++    same_events = _same_event_histories(conn, {
++        tid: prev[tid][3] for tid in ids if trusted and tid in event_changed
++        and tid in prev and prev[tid][2] == marks.get(tid, _NO_EVENTS)
++    })
+ 
+     def moved(r, tid) -> bool:
+         old = prev.get(tid)
+@@ -259,7 +249,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+                 # the exact comparison for same-ID edits and replacements.
+                 if old[2] != marks.get(tid, _NO_EVENTS):
+                     return True
+-                return not _same_events(conn, tid, old[3])
++                return not same_events[tid]
+             if len(old) > 5 and old[5] is not None:
+                 return old[5] != unmarked.get(tid)
+             return old[2] is None or old[2] != marks.get(tid, _NO_EVENTS)
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index e7fc122651..6cf231e9e0 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -266,10 +266,11 @@ def content_version(path: str) -> Optional[tuple]:
+ 
+ 
+ def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> dict:
+-    """Read cursor, delta and volatile overlay in ONE snapshot on the guarded observer.
++    """Read cursor, delta and volatile overlay in ONE short-lived guarded snapshot.
+ 
+     Serialize a board's refreshes through its observer lock, so concurrent readers cannot
+-    publish an older result over a newer cursor. No transaction survives a call.
++    publish an older result over a newer cursor. Only the commit-clock observer survives;
++    the row reader closes before projection, including on a failed build.
+     """
+     from hermes_cli import kanban_task_change
+ 
+@@ -285,29 +286,26 @@ def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> d
+             hit = _entries.get(cache_key)
+         if not current:
+             return fallback()
+-        conn = obs.conn
+-        factory = conn.row_factory
+-        conn.row_factory = sqlite3.Row
+-        try:
+-            conn.execute("BEGIN")
+-            # Sample while holding this observer's refresh lock and snapshot. A
+-            # version captured by version() before the lock can predate another
+-            # refresh. This key includes bookkeeping commits, unlike P2.
+-            commit_key = (obs.gen, *obs.ident,
+-                          conn.execute("PRAGMA schema_version").fetchone()[0],
+-                          conn.execute("PRAGMA data_version").fetchone()[0])
+-            if hit is not None and len(hit) > 2 and hit[0] is not None and hit[2] == commit_key:
+-                from hermes_cli import loop_accounting
+-                with loop_accounting.pass_("kanban.board.rows", skipped=True):
+-                    rows = hit[1]
+-                cursor = hit[0]
+-            else:
++        # Retain only the observer's commit clock, not a history-reader connection.
++        # Sample before opening the snapshot: a later commit invalidates next read.
++        commit_key = (obs.gen, *obs.ident,
++                      obs.conn.execute("PRAGMA schema_version").fetchone()[0],
++                      obs.conn.execute("PRAGMA data_version").fetchone()[0])
++        if hit is not None and len(hit) > 2 and hit[0] is not None and hit[2] == commit_key:
++            from hermes_cli import loop_accounting
++            with loop_accounting.pass_("kanban.board.rows", skipped=True):
++                rows = hit[1]
++            cursor = hit[0]
++        else:
++            from hermes_cli.kanban_generation import open_ro
++            conn = open_ro(Path(path))
++            conn.row_factory = sqlite3.Row
++            try:
++                conn.execute("BEGIN")
+                 changed, cursor = kanban_task_change.changed_since(conn, hit[0] if hit else None)
+                 rows = build(conn, hit[1] if hit else None, changed)
+-        finally:
+-            if conn.in_transaction:
+-                conn.rollback()
+-            conn.row_factory = factory
++            finally:
++                conn.close()  # even on build/read failure; before Python projection/rules
+         with _lock:
+             if _observers.get(str(path)) is obs:
+                 _entries[cache_key] = (cursor, rows, commit_key)
+diff --git a/tests/plugins/test_kanban_board_reader_lifetime.py b/tests/plugins/test_kanban_board_reader_lifetime.py
+new file mode 100644
+index 0000000000..c93816547d
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_reader_lifetime.py
+@@ -0,0 +1,80 @@
++"""The incremental observer must not retain history-reader snapshots."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_generation
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize('fail', [False, True])
++def test_reader_closed_before_projection_and_after_failure(board, monkeypatch, fail):
++    helpers._seed()
++    readers = []
++    original_open = kanban_generation.open_ro
++
++    def open_reader(*args, **kwargs):
++        conn = original_open(*args, **kwargs)
++        if kwargs.get('check_same_thread') is not False:  # retained commit observer is separate
++            readers.append(conn)
++        return conn
++
++    monkeypatch.setattr(kanban_generation, 'open_ro', open_reader)
++    original_materialize = board_read.materialize
++    original_project = board_read.project
++
++    def assert_closed():
++        assert readers
++        for conn in readers:
++            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++                conn.execute('SELECT 1')
++
++    def project(*args):
++        assert_closed()
++        return original_project(*args)
++
++    monkeypatch.setattr(board_read, 'project', project)
++    if fail:
++        def error(*args, **kwargs):
++            raise sqlite3.OperationalError('injected materialization failure')
++        monkeypatch.setattr(board_read, 'materialize', error)
++        with pytest.raises(sqlite3.OperationalError, match='injected'):
++            helpers._read(board)
++        assert_closed()
++        monkeypatch.setattr(board_read, 'materialize', original_materialize)
++    first = helpers._stable(helpers._read(board))
++    count = len(readers)
++    assert first == helpers._stable(helpers._read(board))
++    assert len(readers) == count, 'unchanged commit reuses rows without opening a reader'
++
++
++def test_commit_between_clock_sample_and_reader_open_is_not_lost(board, monkeypatch):
++    ids, _ = helpers._seed()
++    helpers._read(board)
++    conn = kbc.connect()
++    conn.execute("UPDATE tasks SET title = 'first' WHERE id = ?", (ids[0],))
++    conn.commit()
++    conn.close()
++    original_open = kanban_generation.open_ro
++    opened = []
++
++    def interleaved_open(*args, **kwargs):
++        if kwargs.get('check_same_thread') is not False:
++            if not opened:
++                writer = kbc.connect()
++                writer.execute("UPDATE tasks SET title = 'second' WHERE id = ?", (ids[0],))
++                writer.commit()
++                writer.close()
++            opened.append(True)
++        return original_open(*args, **kwargs)
++
++    monkeypatch.setattr(kanban_generation, 'open_ro', interleaved_open)
++    first = helpers._stable(helpers._read(board))
++    second = helpers._stable(helpers._read(board))
++    assert first == second
++    assert len(opened) == 2, 'the interleaved commit must invalidate the older sampled key'
++    assert any(t['title'] == 'second' for c in second['columns'] for t in c['tasks'])
+diff --git a/tests/plugins/test_kanban_event_batch.py b/tests/plugins/test_kanban_event_batch.py
+new file mode 100644
+index 0000000000..915b954db0
+--- /dev/null
++++ b/tests/plugins/test_kanban_event_batch.py
+@@ -0,0 +1,108 @@
++"""Exact-history checks use one query, with the old scalar implementation as oracle."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read, board_rows
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++def test_title_edits_batch_exact_history_reads(board, monkeypatch):
++    ids, _ = helpers._seed()
++    statements = []
++    from hermes_cli import kanban_generation
++    original = kanban_generation.open_ro
++
++    def observe(*args, **kwargs):
++        conn = original(*args, **kwargs)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(kanban_generation, 'open_ro', observe)
++    helpers._read(board)
++    conn = kbc.connect()
++    try:
++        conn.execute("UPDATE tasks SET title = title || ' edited'")
++        conn.commit()
++    finally:
++        conn.close()
++    statements.clear()
++    helpers._read(board)
++    scans = [s for s in statements if s.startswith('SELECT * FROM task_events WHERE')]
++    assert len(scans) == 1, scans
++    assert ' IN (' in scans[0]
++    assert len(ids) > 1
++
++
++@pytest.mark.parametrize('mutation', ['title', 'event', 'heartbeat', 'none'])
++def test_payload_bytes_match_scalar_oracle(board, monkeypatch, mutation):
++    ids, _ = helpers._seed()
++    helpers._read(board)
++    conn = kbc.connect()
++    try:
++        if mutation == 'title':
++            conn.execute("UPDATE tasks SET title = title || ' edited'")
++        elif mutation == 'event':
++            conn.execute("UPDATE task_events SET payload = '{}' WHERE task_id = ?", (ids[0],))
++        elif mutation == 'heartbeat':
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (ids[0],))
++        conn.commit()
++    finally:
++        conn.close()
++    # Save and restore the exact pre-refresh retained rows so both implementations
++    # see the same cursor and snapshot, rather than comparing two warm cache hits.
++    entries = board_rows._entries.copy()
++    new = json.dumps(helpers._stable(helpers._read(board)))
++    board_rows._entries.clear()
++    board_rows._entries.update(entries)
++
++    def scalar(conn, histories):
++        return {tid: board_read._same_events(conn, tid, history) for tid, history in histories.items()}
++
++    monkeypatch.setattr(board_read, '_same_event_histories', scalar)
++    old = json.dumps(helpers._stable(helpers._read(board)))
++    assert new == old
++
++
++def test_batch_empty_and_sql_error_close_cursor():
++    class Cursor:
++        row_factory = sqlite3.Row
++        closed = False
++
++        def execute(self, *_):
++            raise sqlite3.OperationalError('injected read failure')
++
++        def close(self):
++            self.closed = True
++
++    class Connection:
++        def __init__(self):
++            self.cur = Cursor()
++
++        def cursor(self):
++            return self.cur
++
++    conn = Connection()
++    assert board_read._same_event_histories(conn, {}) == {}
++    with pytest.raises(sqlite3.OperationalError, match='injected'):
++        board_read._same_event_histories(conn, {'t': ()})
++    assert conn.cur.closed
++
++
++def test_batch_orders_interleaved_history_by_id_not_creation_time():
++    with sqlite3.connect(':memory:') as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute('CREATE TABLE task_events (id INTEGER PRIMARY KEY, payload, task_id TEXT, created_at)')
++        conn.execute('CREATE INDEX events_task ON task_events(task_id, created_at)')
++        conn.executemany('INSERT INTO task_events VALUES (?, ?, ?, ?)', [
++            (4, 'late', 'b', 1), (1, 1, 'a', 9), (3, 1.0, 'a', 0), (2, None, 'b', 8)])
++        histories = board_read._rows_by_task(conn, 'task_events', ['b', 'a', 'missing'])
++        assert board_read._same_event_histories(conn, histories) == {
++            tid: board_read._same_events(conn, tid, h) for tid, h in histories.items()}
++        assert all(board_read._same_event_histories(conn, histories).values())
++        conn.execute("UPDATE task_events SET payload = x'31' WHERE id = 3")
++        assert board_read._same_event_histories(conn, histories) == {'b': True, 'a': False, 'missing': True}
+diff --git a/tests/plugins/test_kanban_materialization_reuse.py b/tests/plugins/test_kanban_materialization_reuse.py
+index 2aafcb3e47..13d75232dc 100644
+--- a/tests/plugins/test_kanban_materialization_reuse.py
++++ b/tests/plugins/test_kanban_materialization_reuse.py
+@@ -73,8 +73,10 @@ def test_exact_history_comparison_rejects_mutations(mutation):
+         conn.execute("INSERT INTO task_events VALUES (1, 't', 'created', 1)")
+         history = board_read._rows_by_task(conn, 'task_events', ['t'])['t']
+         assert board_read._same_events(conn, 't', history)
++        assert board_read._same_event_histories(conn, {'t': history}) == {'t': True}
+         conn.execute(mutation)
+         assert not board_read._same_events(conn, 't', history)
++        assert board_read._same_event_histories(conn, {'t': history}) == {'t': False}
+         assert conn.row_factory is sqlite3.Row
+ 
+ 
+@@ -83,8 +85,10 @@ def test_exact_empty_history_and_independent_task():
+         conn.row_factory = sqlite3.Row
+         conn.execute('CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, payload)')
+         assert board_read._same_events(conn, 't', ())
++        assert board_read._same_event_histories(conn, {'t': (), 'other': ()}) == {'t': True, 'other': True}
+         conn.execute("INSERT INTO task_events VALUES (1, 'other', 'x')")
+         assert board_read._same_events(conn, 't', ())
++        assert board_read._same_event_histories(conn, {'t': (), 'other': ()}) == {'t': True, 'other': False}
+         conn.execute("INSERT INTO task_events VALUES (2, 't', 'x')")
+         assert not board_read._same_events(conn, 't', ())
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,521 @@
+From ad3b1eba4b714cd0e80c39d44d33239a52e225d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:16:26 +0000
+Subject: [PATCH] [daveey] Forward explicit bounded allocator opt-in through
+ test runner
+
+Problem: whole-file offline tests exhausted a 3 GiB address-space limit while RSS stayed below the cgroup limit; component and clean-base controls both failed.
+Why: retained maps showed large glibc arena reservations. An explicit MALLOC_ARENA_MAX=2 paired control passed 19/19 on each tree with sharply reduced reserved address space.
+Why the control was unavailable: the canonical runner's env -i discarded the allocator setting. Existing tests did not exercise this opt-in across actual activation/reexec and final pytest children.
+
+Forward only an explicitly supplied canonical decimal 1..1024. Keep absent behavior unchanged and reject invalid values before Python/setup/test children. No general environment passthrough, global default, cap changes or runtime changes.
+
+Proof: real-shell RED 1 passed/3 failed before forwarding; GREEN 35 passed/0 failed with explicit/current/missing/stale activation and stale-refresh refusal. Full scripts/check: 21 checks OK. Source hashes and raw logs independently rechecked before publication. Prior whole-file failures remain retained, not erased by conditional controls.
+
+Coverage limits: Linux resource receipts only; offline fixture provisioning is not locked-install proof. Failed-refresh case is successful setup leaving stale stamps, not nonzero setup exit. Invalid input executes explicit/missing paths; other paths share the early guard. Final child isolation covers three synthetic sentinels, not comprehensive intermediate-process isolation. Prepublication independent source assessment is not exact-head ship approval.
+
+Separate harness-only delivery; no machine-component, parser or fleet remediation bundled. Original no-model-pin goal and remaining consumer ledger stay open.
+---
+ scripts/run_tests.sh                          |  13 +
+ tests/pm/run_tests_harness_support.py         | 256 ++++++++++++++++++
+ tests/scripts/test_run_tests_allocator_env.py | 194 +++++++++++++
+ 3 files changed, 463 insertions(+)
+ create mode 100644 tests/pm/run_tests_harness_support.py
+ create mode 100644 tests/scripts/test_run_tests_allocator_env.py
+
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index f186fc20fc..de0c94050f 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -37,6 +37,18 @@ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ 
++# Explicit allocator opt-in for address-space-bounded tests. No default is
++# imposed. Validate before launching any Python/test child; a small decimal
++# bound avoids shell arithmetic overflow and libc-specific extreme values.
++ALLOCATOR_ENV=()
++if [ "${MALLOC_ARENA_MAX+x}" = x ]; then
++  if [[ ! "$MALLOC_ARENA_MAX" =~ ^[1-9][0-9]{0,3}$ ]] || (( MALLOC_ARENA_MAX > 1024 )); then
++    echo "error: MALLOC_ARENA_MAX must be a canonical decimal integer from 1 to 1024" >&2
++    exit 2
++  fi
++  ALLOCATOR_ENV+=("MALLOC_ARENA_MAX=$MALLOC_ARENA_MAX")
++fi
++
+ # ── Locate python ───────────────────────────────────────────────────────────
+ # The suite runs under the checkout's isolated test environment (pm.testenv),
+ # and only there: unless the inherited environment is current for this
+@@ -233,6 +245,7 @@ exec env -i \
+   HOME="$HOME" \
+   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
+   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
++  ${ALLOCATOR_ENV[@]+"${ALLOCATOR_ENV[@]}"} \
+   TZ=UTC \
+   LANG=C.UTF-8 \
+   LC_ALL=C.UTF-8 \
+diff --git a/tests/pm/run_tests_harness_support.py b/tests/pm/run_tests_harness_support.py
+new file mode 100644
+index 0000000000..7d27393637
+--- /dev/null
++++ b/tests/pm/run_tests_harness_support.py
+@@ -0,0 +1,256 @@
++"""An offline checkout that runs the REAL ``scripts/run_tests.sh`` chain.
++
++``tests.pm.activation_support.isolated_checkout`` supplies the real PM package
++and activation scripts. This module adds what the test runner needs on top:
++the runner scripts and the one ``hermes_cli`` module they import, a git index
++(so the runner's bytecode warm-up compiles tracked files and not ``sys.path``),
++and an *offline provisioner* standing in for ``setup-hermes.sh``.
++
++The provisioner is a fixture, not proof of a locked install. It publishes what
++activation reads and nothing it would have to download: PM facts naming a
++committed venv, a ``pm.testenv`` selection (``active.json`` ``gen-<32 hex>`` with
++``pyvenv.cfg`` and an interpreter that direct-execs ``sys.executable``), and the
++real ``record_activation_inputs`` stamps. Everything downstream is the real
++code: ``run_tests.sh`` -> ``run-in-hermes-env`` -> ``_activation.sh`` ->
++``python -m pm.environments`` -> the ``env -i`` runner -> a pytest child.
++"""
++
++from __future__ import annotations
++
++import json
++import shlex
++import shutil
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++from tests.pm.activation_support import (
++    REPO_ROOT,
++    bash,
++    bash_env,
++    fake_store,
++    isolated_checkout,
++    posix,
++    spawnable_python,
++)
++
++RUNNER_FILES = (
++    "scripts/run_tests.sh",
++    "scripts/run-in-hermes-env",
++    "scripts/run_tests_parallel.py",
++    "scripts/run_tests_parallel_rss.py",
++    "scripts/run_tests_host_slots.py",
++    "scripts/run_tests_launch.py",
++    "scripts/run_tests_fork_child.py",
++    "scripts/worker_test_budget.py",
++    "scripts/ci/list_os_marked_tests.py",
++    # worker_enabled() is called by the runner's -j parser and the slot code.
++    "hermes_cli/worker_compute_capacity.py",
++    "hermes_cli/config_backend.py",
++    "utils.py",
++    "hermes_yaml.py",
++    "hermes_constants_scratch.py",
++    "hermes_constants_scratch_stuck.py",
++)
++
++GENERATION = "gen-" + "0123456789abcdef" * 2
++# Names the harness must never hand a child, and the canary's synthetic secrets.
++SECRETS = {
++    "OPENAI_API_KEY": "sk-synthetic-openai-harness94",
++    "ANTHROPIC_API_KEY": "sk-ant-synthetic-harness94",
++    "HERMES_TEST_SECRET_SENTINEL": "synthetic-sentinel-harness94",
++}
++# Inherited activation / interpreter / runner state a fixture run must not see.
++SANITIZED = (
++    "__HERMES_ACTIVATED", "__HERMES_TEST_PYTHON", "__HERMES_TESTS_REEXEC", "HERMES_PYTHON",
++    "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "BASH_ENV", "ENV", "PYTHONSTARTUP",
++    "MALLOC_ARENA_MAX", "UV_PYTHON_INSTALL_DIR", "HERMES_TEST_POLICY_ROOT",
++    "HERMES_TEST_SLOT_HELD", "HERMES_TEST_SLOT_RECEIPT", "HERMES_TEST_SLOT_CONFIG",
++    "HERMES_TEST_SLOT_MAX_AGE", "HERMES_TEST_XDIST_MAX", "PYTEST_ADDOPTS", "PYTEST_PLUGINS",
++    "PYTEST_CURRENT_TEST", "HERMES_TEST_WORKERS", "HERMES_TEST_PATHS", "HERMES_TEST_SLICE",
++    "HERMES_TEST_FLAKY_REPORT", "HERMES_TEST_FILE_TIMEOUT", "HERMES_TEST_REQUIRE_EXTRAS",
++)
++
++PROVISIONER = textwrap.dedent('''\
++    """Offline stand-in for setup-hermes.sh --runtime-only --test-environment."""
++    import json, os, pathlib, stat, sys
++
++    root = pathlib.Path(__file__).resolve().parent
++    sys.path.insert(0, str(root))
++    from pm.environments import (
++        activation_input_mtimes, activation_inputs_dir, record_activation_inputs,
++        runtime_facts_path, site_packages,
++    )
++    from pm.testenv import testenv_root
++
++    config = json.loads((root / "provision.json").read_text(encoding="utf-8"))
++    with (root / "setup-calls.jsonl").open("a", encoding="utf-8") as stream:
++        stream.write(json.dumps({"argv": sys.argv[1:], "malloc": os.environ.get("MALLOC_ARENA_MAX")}) + "\\n")
++    assert sys.argv[1:] == ["--runtime-only", "--test-environment"], sys.argv
++
++    facts = runtime_facts_path(root)
++    selected = facts.parent / "environments" / "app" / "venv"
++    site_packages(selected).mkdir(parents=True, exist_ok=True)
++    (selected / "pyvenv.cfg").write_text("home = fixture\\n", encoding="utf-8")
++    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(selected)}}}), encoding="utf-8")
++
++    generation = testenv_root(root) / config["generation"] / "venv"
++    interpreter = generation / "bin" / "python"
++    interpreter.parent.mkdir(parents=True, exist_ok=True)
++    (generation / "pyvenv.cfg").write_text("home = fixture\\n", encoding="utf-8")
++    interpreter.write_text("#!/bin/sh\\nexec " + config["quoted_python"] + ' "$@"\\n', encoding="utf-8")
++    interpreter.chmod(interpreter.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
++    (testenv_root(root) / "active.json").write_text(
++        json.dumps({"generation": config["generation"]}), encoding="utf-8")
++
++    mtimes = {name: value + config["stamp_skew_ns"] for name, value in activation_input_mtimes(root).items()}
++    record_activation_inputs(activation_inputs_dir(root), mtimes, root, test_environment=True)
++''')
++
++
++def runner_checkout(tmp_path: Path, *, stamp_skew_ns: int = 0) -> tuple[Path, dict, Path]:
++    """Return ``(checkout, env, store)``: a checkout, its sanitised environment, its store."""
++    store, _entry = fake_store(tmp_path)
++    root = isolated_checkout(tmp_path)
++    for relative in RUNNER_FILES:
++        target = root / relative
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(REPO_ROOT / relative, target)
++    # pm/lock.json is the one activation input the checkout carries.
++    assert (root / "pm" / "lock.json").is_file()
++
++    python = spawnable_python()
++    bootstrap = root / ".venv" / "bin" / "python"
++    bootstrap.parent.mkdir(parents=True)
++    log = tmp_path / "bootstrap-calls.log"
++    bootstrap.write_text(
++        f"#!/bin/sh\necho \"$$ $*\" >> {shlex.quote(str(log))}\nexec {shlex.quote(str(python))} \"$@\"\n",
++        encoding="utf-8")
++    bootstrap.chmod(0o755)
++
++    (root / "provision.py").write_text(PROVISIONER, encoding="utf-8")
++    set_provisioning(root, stamp_skew_ns=stamp_skew_ns)
++    (root / "setup-hermes.sh").write_text(
++        'test "$#" = 2 && test "$1" = --runtime-only && test "$2" = --test-environment || exit 2\n'
++        f"cd {shlex.quote(str(root))} || exit 3\n"
++        f"exec {shlex.quote(str(python))} provision.py \"$@\"\n", encoding="utf-8")
++
++    env = sanitized_env(tmp_path, store)
++    # Tracked files give the runner's `git ls-files` warm-up something finite to compile.
++    git = shutil.which("git") or "git"
++    subprocess.run([git, "init", "-q"], cwd=root, env=env, check=True, capture_output=True, timeout=60)
++    subprocess.run([git, "add", "-A"], cwd=root, env=env, check=True, capture_output=True, timeout=60)
++    return root, env, store
++
++
++def set_provisioning(root: Path, *, stamp_skew_ns: int) -> None:
++    """``stamp_skew_ns`` != 0 makes every sync record stamps that never match the inputs."""
++    (root / "provision.json").write_text(json.dumps({
++        "generation": GENERATION,
++        "quoted_python": shlex.quote(sys.executable),
++        "stamp_skew_ns": stamp_skew_ns,
++    }), encoding="utf-8")
++
++
++def sanitized_env(tmp_path: Path, store: Path) -> dict:
++    env = bash_env(store)
++    for key in SANITIZED:
++        env.pop(key, None)
++    for key in [k for k in env if k.startswith(("HERMES_E2E_", "HERMES_TEST_SSH_", "HERMES_TEST_DOCKER"))]:
++        env.pop(key)
++    slots = tmp_path / "host-slots"
++    env.update(
++        SECRETS,
++        HERMES_PM_ACCOUNT_SEED="0",           # never borrow the account's tool store
++        HERMES_RUNTIME_DIR=posix(store),      # an explicit store also disables borrowing
++        HERMES_TEST_FILE_RETRIES="0",
++        HERMES_TEST_FORKSERVER="0",
++        HERMES_TEST_HOST_SLOTS="2",
++        HERMES_TEST_SLOT_DIR=posix(slots),    # private: never wait on the outer run's slots
++    )
++    return env
++
++
++def explicit_python(tmp_path: Path) -> Path:
++    """An explicit ``HERMES_PYTHON`` that has pytest and records every launch."""
++    wrapper = tmp_path / "explicit-python"
++    log = tmp_path / "explicit-python-calls.log"
++    wrapper.write_text(
++        f"#!/bin/sh\necho \"$$ $*\" >> {shlex.quote(str(log))}\nexec {shlex.quote(sys.executable)} \"$@\"\n",
++        encoding="utf-8")
++    wrapper.chmod(0o755)
++    return wrapper
++
++
++def provision(root: Path, env: dict) -> None:
++    """Run the offline setup once, as a prior activation would have."""
++    run = subprocess.run([bash(), str(root / "setup-hermes.sh"), "--runtime-only", "--test-environment"],
++                         cwd=root, env=env, capture_output=True, text=True, timeout=120, check=False)
++    assert run.returncode == 0, run.stdout + run.stderr
++
++
++def composed_env(root: Path, env: dict) -> dict:
++    """The environment ``activate`` would give a shell: PM's own ``python -m pm.environments`` output."""
++    python = root / ".venv" / "bin" / "python"
++    run = subprocess.run([str(python), "-m", "pm.environments", "--format", "json"],
++                         cwd=root, env={**env, "PYTHONPATH": str(root)}, capture_output=True, text=True,
++                         timeout=120, check=False)
++    assert run.returncode == 0, run.stdout + run.stderr
++    composed = json.loads(run.stdout)
++    assert composed["__HERMES_ACTIVATED"] and composed["__HERMES_TEST_PYTHON"], composed
++    return composed
++
++
++def count_lines(path: Path) -> int:
++    return len(path.read_text(encoding="utf-8").splitlines()) if path.exists() else 0
++
++
++# Source of the child-side observation, shared so the test measures itself the same way.
++OBSERVE = textwrap.dedent('''\
++    def observe():
++        import os, resource, sys
++        from pathlib import Path
++        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8").strip()
++        limit = None
++        for line in cgroup.splitlines():
++            if line.startswith("0::"):
++                target = Path("/sys/fs/cgroup") / line[3:].lstrip("/") / "memory.max"
++                limit = target.read_text(encoding="utf-8").strip() if target.is_file() else None
++        return {"rlimit_as": list(resource.getrlimit(resource.RLIMIT_AS)), "cgroup_memory_max": limit,
++                "executable": sys.executable}
++''')
++
++
++def write_canary(directory: Path, observed: Path) -> Path:
++    """A test file OUTSIDE the repository, so no repo conftest touches it. It appends what its own
++    process saw to ``observed`` (a path embedded in the source), one JSON line per execution."""
++    directory.mkdir(parents=True, exist_ok=True)
++    observed.parent.mkdir(parents=True, exist_ok=True)
++    case = directory / "test_allocator_canary.py"
++    case.write_text(
++        "import json, os\nfrom pathlib import Path\n\n"
++        + OBSERVE
++        + "\n\ndef test_observe_child_environment():\n"
++        f"    record = {{'env': dict(os.environ), **observe()}}\n"
++        f"    with Path({str(observed)!r}).open('a', encoding='utf-8') as stream:\n"
++        "        stream.write(json.dumps(record) + '\\n')\n",
++        encoding="utf-8")
++    return case
++
++
++def observed_records(observed: Path) -> list[dict]:
++    if not observed.exists():
++        return []
++    return [json.loads(line) for line in observed.read_text(encoding="utf-8").splitlines()]
++
++
++def own_observation() -> dict:
++    scope: dict = {}
++    exec(OBSERVE, scope)  # the same source the canary runs
++    return scope["observe"]()
++
++
++def runner_command(root: Path, case: Path) -> list[str]:
++    return [bash(), str(root / "scripts" / "run_tests.sh"), "-j", "1", str(case)]
++
+diff --git a/tests/scripts/test_run_tests_allocator_env.py b/tests/scripts/test_run_tests_allocator_env.py
+new file mode 100644
+index 0000000000..b6d9191a67
+--- /dev/null
++++ b/tests/scripts/test_run_tests_allocator_env.py
+@@ -0,0 +1,194 @@
++"""``scripts/run_tests.sh`` forwards an explicit ``MALLOC_ARENA_MAX`` opt-in, and nothing else.
++
++Regression for the allocator opt-in (address-space-bounded tests need a small arena count): an
++exported ``MALLOC_ARENA_MAX`` must reach the pytest child exactly, an unset one must stay unset,
++and a malformed one must be refused with status 2 BEFORE any interpreter, setup or test child
++starts. The hermetic ``env -i`` must keep dropping credentials either way.
++
++The chain under test is the real one, in an offline checkout copy (tests/pm/run_tests_harness_support.py):
++``run_tests.sh`` -> ``run-in-hermes-env`` -> ``_activation.sh`` -> ``python -m pm.environments`` ->
++``env -i`` runner -> pytest child. Only provisioning is a fixture; it proves nothing about a
++locked install. A canary file outside the repository (so no repo conftest applies) records what
++its own process saw.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from tests.pm.run_tests_harness_support import (
++    SECRETS,
++    composed_env,
++    count_lines,
++    explicit_python,
++    observed_records,
++    own_observation,
++    provision,
++    runner_checkout,
++    runner_command,
++    write_canary,
++)
++
++pytestmark = pytest.mark.platforms("linux")  # resource receipts use /proc and cgroup v2
++
++MESSAGE = "MALLOC_ARENA_MAX must be a canonical decimal integer from 1 to 1024"
++VALID = [None, "2", "1", "1024"]
++INVALID = {
++    "empty": "",
++    "zero": "0",
++    "negative": "-2",
++    "whitespace": " ",
++    "leading-zero": "02",
++    "over-limit": "1025",
++    "overflow": "9" * 40,
++    "command-substitution": "$(touch {marker})",
++    "list-injection": "1; touch {marker}",
++    "env-injection": "1 HERMES_TEST_SECRET_SENTINEL=leaked",
++    "newline": "1\n",
++}
++ROOT_SKEW_NS = 7 * 10**9
++
++
++@pytest.fixture(autouse=True)
++def _host_policy_is_not_worker_mode():
++    """The runner reads the ACCOUNT's worker policy (not HOME-relative); worker mode ignores the
++    private slot directory this fixture relies on."""
++    from hermes_cli.worker_compute_capacity import worker_enabled
++
++    if worker_enabled():
++        pytest.skip("host worker_resources policy is enabled: the runner would ignore the fixture slot dir")
++
++
++class Chain:
++    """One offline checkout plus how to drive its runner."""
++
++    def __init__(self, tmp_path: Path, *, stamp_skew_ns: int = 0) -> None:
++        self.tmp = tmp_path
++        self.root, self.env, self.store = runner_checkout(tmp_path, stamp_skew_ns=stamp_skew_ns)
++        self.observed = tmp_path / "observed" / "child.jsonl"
++        self.case = write_canary(tmp_path / "canary", self.observed)
++        self.marker = tmp_path / "injected"
++        self.setup_calls = self.root / "setup-calls.jsonl"
++        self.bootstrap_log = tmp_path / "bootstrap-calls.log"
++        self.explicit_log = tmp_path / "explicit-python-calls.log"
++
++    def run(self, malloc: str | None, env: dict | None = None) -> subprocess.CompletedProcess:
++        env = dict(self.env if env is None else env)
++        env.pop("MALLOC_ARENA_MAX", None)
++        if malloc is not None:
++            env["MALLOC_ARENA_MAX"] = malloc.format(marker=self.marker)
++        return subprocess.run(runner_command(self.root, self.case), cwd=self.tmp, env=env,
++                              capture_output=True, text=True, timeout=300, check=False)
++
++    def explicit_env(self) -> dict:
++        return {**self.env, "HERMES_PYTHON": str(explicit_python(self.tmp))}
++
++    def current_env(self) -> dict:
++        """A caller already activated: PM's real composed environment for this checkout."""
++        provision(self.root, self.env)
++        self.setup_calls.unlink()
++        env = {**self.env, **composed_env(self.root, self.env)}
++        self.bootstrap_log.unlink(missing_ok=True)  # composing used the bootstrap; the run must not
++        return env
++
++
++def _assert_child(chain: Chain, run: subprocess.CompletedProcess, malloc: str | None) -> dict:
++    report = run.stdout + run.stderr
++    assert run.returncode == 0, report
++    (record,) = observed_records(chain.observed)  # retries are off: exactly one execution
++    env = record["env"]
++    if malloc is None:
++        assert "MALLOC_ARENA_MAX" not in env, env
++    else:
++        assert env.get("MALLOC_ARENA_MAX") == malloc, env.get("MALLOC_ARENA_MAX")
++    for name in SECRETS:
++        assert name not in env, f"{name} leaked into the hermetic child"
++    assert not chain.marker.exists()
++    # The run is serial and keeps the memory limits it inherited.
++    assert record["rlimit_as"] == own_observation()["rlimit_as"]
++    assert record["cgroup_memory_max"] == own_observation()["cgroup_memory_max"]
++    assert Path(record["executable"]).resolve() == Path(sys.executable).resolve()
++    # The private slot directory, not the host's, took the (single) file's slot.
++    slots = {path.name for path in (chain.tmp / "host-slots").iterdir()}
++    assert slots and slots <= {"0.lock", "1.lock"}, slots
++    assert env.get("HERMES_TEST_SLOT_HELD") == "1"
++    return record
++
++
++@pytest.mark.parametrize("malloc", VALID, ids=lambda v: "absent" if v is None else v)
++def test_explicit_hermes_python_forwards_the_allocator_opt_in(tmp_path, malloc):
++    chain = Chain(tmp_path)
++    run = chain.run(malloc, chain.explicit_env())
++    _assert_child(chain, run, malloc)
++    assert "not activated — using HERMES_PYTHON" in run.stdout
++    assert count_lines(chain.setup_calls) == 0
++    assert count_lines(chain.bootstrap_log) == 0
++    assert count_lines(chain.explicit_log) >= 1  # the explicit interpreter did the work
++
++
++@pytest.mark.parametrize("malloc", VALID, ids=lambda v: "absent" if v is None else v)
++def test_current_activation_runs_without_setup(tmp_path, malloc):
++    chain = Chain(tmp_path)
++    run = chain.run(malloc, chain.current_env())
++    _assert_child(chain, run, malloc)
++    assert "re-running under run-in-hermes-env" not in run.stderr
++    assert count_lines(chain.setup_calls) == 0
++    assert count_lines(chain.bootstrap_log) == 0
++
++
++@pytest.mark.parametrize("malloc", [None, "1024"], ids=["absent", "1024"])
++def test_missing_activation_reexecs_once_through_setup(tmp_path, malloc):
++    chain = Chain(tmp_path)
++    run = chain.run(malloc)
++    _assert_child(chain, run, malloc)
++    assert run.stderr.count("re-running under run-in-hermes-env") == 1, run.stderr
++    assert count_lines(chain.setup_calls) == 1
++
++
++@pytest.mark.parametrize("skew_ns", [ROOT_SKEW_NS, -ROOT_SKEW_NS], ids=["input-newer", "input-older"])
++def test_stale_activation_resyncs_once_and_restamps(tmp_path, skew_ns):
++    chain = Chain(tmp_path)
++    env = chain.current_env()
++    lock = chain.root / "pm" / "lock.json"
++    moved = lock.stat().st_mtime_ns + skew_ns
++    os.utime(lock, ns=(moved, moved))
++    run = chain.run("2", env)
++    _assert_child(chain, run, "2")
++    assert run.stderr.count("re-running under run-in-hermes-env") == 1, run.stderr
++    assert count_lines(chain.setup_calls) == 1
++    stamp = Path(env["__HERMES_ACTIVATED"]).parent / "inputs" / "pm" / "lock.json"
++    assert stamp.stat().st_mtime_ns == lock.stat().st_mtime_ns == moved
++
++
++def test_refresh_that_leaves_the_environment_stale_is_refused(tmp_path):
++    """Setup stamps a mtime the input does not have: the re-exec must stop, not loop or run tests."""
++    chain = Chain(tmp_path, stamp_skew_ns=10**9)
++    run = chain.run("2")
++    report = run.stdout + run.stderr
++    assert run.returncode == 1, report
++    assert "run-in-hermes-env did not produce a current environment" in run.stderr, report
++    assert count_lines(chain.setup_calls) == 1
++    assert observed_records(chain.observed) == []
++
++
++@pytest.mark.parametrize("name", INVALID)
++@pytest.mark.parametrize("mode", ["missing-activation", "explicit-python"])
++def test_invalid_allocator_value_is_refused_before_any_child(tmp_path, mode, name):
++    chain = Chain(tmp_path)
++    env = chain.explicit_env() if mode == "explicit-python" else None
++    run = chain.run(INVALID[name], env)
++    report = run.stdout + run.stderr
++    assert run.returncode == 2, report
++    assert MESSAGE in run.stderr, report
++    assert "▶" not in run.stdout, report  # no stage of the runner started
++    assert count_lines(chain.setup_calls) == 0, "setup ran"
++    assert count_lines(chain.bootstrap_log) == 0, "the bootstrap interpreter ran"
++    assert count_lines(chain.explicit_log) == 0, "HERMES_PYTHON ran"
++    assert observed_records(chain.observed) == [], "a test child ran"
++    assert not chain.marker.exists(), "the value was evaluated by a shell"
++    assert "leaked" not in report
+-- 
+2.43.0
+

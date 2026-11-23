@@ -1,0 +1,107 @@
+From d91656ba577b14dd3bac6040ef580a1136a94dc0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:35:22 +0000
+Subject: [PATCH] test(web): wait for transient cache peeks before pool
+ assertion [daveey]
+
+Problem: profile scan HTTP admission intermittently observed one shared
+AnyIO token after a successful status response (/api/sessions-limit).
+
+Why: every sessions request does a short shared-pool cache peek before
+sessions-lane admission. Completing status does not join those peeks;
+fifty loop yields do not establish that they have all released tokens.
+The assertion confused transient probes with the blocked expensive scan.
+
+Wait for pool quiescence while the scan release event is still unset,
+then retain zero shared tokens and exactly one sessions-lane admission.
+Keep the real synchronous status request and its existing response bound,
+cache-hit/other-profile independence, twelve responses and validation.
+
+Add a controlled schedule holding the real limit=12 peek through status
+JSON validation and releasing it on the next loop turn. The original
+assertion fails 1 == 0; the corrected scenario passes. Historical CI did
+not record borrower stacks, so this is causal reproduction, not proof
+of which borrower was present in the reported run.
+
+Detection gap: the original test assumed loop yields drained unrelated
+workers; the new regression forces the previously untested ordering.
+
+Proof (HERMES_TEST_FILE_RETRIES=0): baseline 5 passed, exact id 1 passed;
+controlled RED 1 failed at original line 94, GREEN whole file 6 passed;
+related five-file sweep 51 passed. Default-pool lane mutant fails the
+quiescence wait; per-limit admission mutant fails in_use 2 == 1.
+Full scripts/check: 21 checks passed using literal PM test interpreter.
+
+Hermes-Card: t_7f71fcc2ce72028b
+---
+ .../test_profile_scan_http_admission.py       | 47 ++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_profile_scan_http_admission.py b/tests/hermes_cli/test_profile_scan_http_admission.py
+index fdff546a18..1abc92a873 100644
+--- a/tests/hermes_cli/test_profile_scan_http_admission.py
++++ b/tests/hermes_cli/test_profile_scan_http_admission.py
+@@ -89,7 +89,10 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+                 response = await asyncio.wait_for(client.get('/api/status'), 0.5)
+                 assert response.status_code == 200
+                 assert response.json() == {'ok': True}
+-                # Scans run on the sessions thread lane (web_thread_lanes): none of the shared pool. [daveey]
++                # Cache peeks for other /api/sessions requests use the shared pool
++                # before lane admission; status completion does not drain them.
++                # A scan wrongly using that pool cannot drain while release is unset.
++                await async_wait_until(lambda: limiter.borrowed_tokens == 0, timeout=3)
+                 from hermes_cli import web_thread_lanes
+                 assert limiter.borrowed_tokens == 0
+                 assert web_thread_lanes.stats()["sessions"]["in_use"] == 1
+@@ -116,6 +119,48 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+         sessions.SESSION_LIST_CACHE.clear()
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_peek_can_outlive_status_response(monkeypatch, tmp_path):
++    """A completed status response is not a barrier for other requests' peeks."""
++    import httpx
++    from hermes_cli.web_routers import sessions
++    from tests.waiting import async_wait_until
++
++    peek_entered = threading.Event()
++    release_peek = threading.Event()
++    original_peek = sessions._peek_sessions_encoded
++    original_get = httpx.AsyncClient.get
++    original_json = httpx.Response.json
++
++    def delayed_peek(arguments):
++        if arguments['limit'] == 12:
++            peek_entered.set()
++            assert release_peek.wait(5)
++        return original_peek(arguments)
++
++    async def get(client, url, *args, **kwargs):
++        if url == '/api/status':
++            await async_wait_until(peek_entered.is_set, timeout=3)
++        return await original_get(client, url, *args, **kwargs)
++
++    def response_json(response, *args, **kwargs):
++        value = original_json(response, *args, **kwargs)
++        if response.request.url.path == '/api/status':
++            # Keep the real shared token through JSON validation. Release on the
++            # next loop turn, not before the original instantaneous assertion.
++            asyncio.get_running_loop().call_soon(release_peek.set)
++        return value
++
++    monkeypatch.setattr(sessions, '_peek_sessions_encoded', delayed_peek)
++    monkeypatch.setattr(httpx.AsyncClient, 'get', get)
++    monkeypatch.setattr(httpx.Response, 'json', response_json)
++    try:
++        await test_profile_scan_burst_keeps_status_responsive(
++            monkeypatch, tmp_path, '/api/sessions', 'limit')
++    finally:
++        release_peek.set()
++
++
+ def test_session_list_peek_requires_fresh_matching_stamp():
+     from hermes_cli.session_list_flight import SingleFlightCache, copy_session_list
+     now = [0.0]
+-- 
+2.43.0
+

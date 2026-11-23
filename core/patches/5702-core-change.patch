@@ -1,0 +1,300 @@
+From 04a4e47560d6856d76a2dddc16cac7b3416b360c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 06:14:06 +0000
+Subject: [PATCH] fix(desktop): preserve archive fallback scope and release ACK
+ promptly [daveey]
+
+Follow up independent review of PR4013 at f61509f5cd8505c75fd67c9f2a81e4e80aa61536 before landing.
+
+Why did the ownerless archive target default instead of active work? Owner capture pinned primary before profile resolution, and a swallowed resolution transport error yielded undefined; the later pinned write defaulted it. Why was it missed? The prior regression covered successful resolution to work, not unlisted/unresolved fallback. Capture the invocation profile before awaiting resolution; use it only after existing ambiguous-listed refusal, and carry the same profile through safety checks and PATCH. Explicit row profiles still win.
+
+Why could a successful archive look pending for another six seconds? Authoritative diagnostic GET was awaited before onArchived and hidden.end. Why not caught? ACK/verification tests resolved the read immediately. Detach the diagnostic with handled rejection; it cannot restore or resend a committed write. Pending-read regression checks success before rejecting the read.
+
+Why did five review mutations survive? Tests covered positive replay but omitted settled queue cleanup, ownerless primary switches, remaining deadline cap, late settled success and wrong-id archived verification. Add direct negative assertions for all five; all mutants now killed.
+
+Proof on worker-a1, disposable deps tree at exact reviewed source: final new regressions RED (2 failures,40 pass); corrected source GREEN229 tests across seven modules including actual useSessionActions callers; TypeScript noEmit and ESLint pass; scripts/check21 pass. Mutants baseline15 pass,5/5 killed. Independent precommit read-only review approves current four-file diff. Fresh published-head CI and independent review still required. laptop-1 passive acceptance remains UNPROVEN; no launch/fault injection performed.
+---
+ .../use-session-actions/archive-commit.ts     |   3 +-
+ .../archive-linked-confirm.test.tsx           |  23 +++
+ .../archive-reconnect.test.ts                 | 148 +++++++++++++++++-
+ .../use-session-actions/archive-soft-hide.ts  |  11 +-
+ 4 files changed, 179 insertions(+), 6 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+index f6dba6f1a0..09950efd22 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+@@ -44,9 +44,10 @@ export async function commitArchive(commit: ArchiveCommit): Promise<boolean> {
+     // A write ACK alone is not archived=true evidence. Use the same pinned
+     // owner and the real IPC read path. Failed verification never replays a
+     // committed mutation or pretends its optimistic DOM is backend truth.
++    // Diagnostic-only: don't hold success/optimistic-hide release behind a slow GET.
+     if (commit.trace) {
+       const scope = owner && typeof owner === 'object' ? owner : { profile: owner }
+-      await Promise.resolve().then(() => hermesApiAs<{ id: string; archived?: boolean | number }>({ connectionId: scope.connectionId ?? null, profile: scope.profile ?? null },
++      void Promise.resolve().then(() => hermesApiAs<{ id: string; archived?: boolean | number }>({ connectionId: scope.connectionId ?? null, profile: scope.profile ?? null },
+         { path: `/api/sessions/${encodeURIComponent(storedSessionId)}`, timeoutMs: 6_000 }))
+         .then(row => commit.trace?.(row.id === storedSessionId && (row.archived === true || row.archived === 1)
+           ? 'committed' : 'verification-pending:not-archived'))
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index 846795a939..ef61282fff 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -6,6 +6,7 @@ import type { MutableRefObject } from 'react'
+ import { useEffect } from 'react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++import { setApiRequestProfile as setRequestProfile } from '@/api/client'
+ import { getSession, type SessionInfo, setSessionArchived } from '@/hermes'
+ import { registerArchiveGuard, resetArchiveGuardsForTests } from '@/store/archive-guards'
+ import { $confirmRequest, settleConfirm } from '@/store/confirm'
+@@ -557,6 +558,28 @@ describe('archive preflight follows the remote owner when Recents lacks it', ()
+     expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, { connectionId: 'local', profile: 'default' }, expect.any(Function))
+   })
+ 
++  it('pins the invocation active profile for an unlisted unresolved ownerless chat in safety reads and PATCH', async () => {
++    setRequestProfile('work')
++    vi.mocked(getSession).mockRejectedValue(new Error('socket hang up'))
++
++    let release: (value: unknown) => void = () => {}
++    api.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
++      .mockImplementation(async ({ path }) => path.includes('session-kanban-tasks') ? { tasks: [] } : { id: 'unlisted', archived: true })
++    const handle = await mountHarness()
++    let done: Promise<void> | undefined
++    act(() => { done = handle.archiveSession('unlisted') })
++    await waitFor(() => expect(api).toHaveBeenCalled())
++    setRequestProfile('other')
++    await act(async () => { release({ id: 'unlisted' }); await done })
++    expect(api.mock.calls.map(([request]) => [request.connectionId, request.profile])).toEqual([
++      ['local', 'work'], ['local', 'work'], ['local', undefined], ['local', 'work']
++    ])
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local', profile: 'work' }))
++    expect(setSessionArchived).toHaveBeenCalledWith('unlisted', true, { connectionId: 'local', profile: 'work' }, expect.any(Function))
++    setRequestProfile(null)
++    vi.mocked(getSession).mockReset()
++  })
++
+   it('writes to the resolved nondefault profile, not default, for an ownerless/profileless row', async () => {
+     const selectedRow = remoteRow({ connection_id: undefined, profile: undefined, kanban_observed_at: Date.now() / 1000 })
+     setSessions([selectedRow])
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+index 0db07d2e6b..fd7f1a1152 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+@@ -11,7 +11,8 @@ import { $notifications, clearNotifications, readableError } from '@/store/notif
+ import { commitArchive } from './archive-commit'
+ import { archivePreflight } from './archive-soft-hide'
+ import { confirmLinkedArchive } from './confirm-linked-archive'
+-import { reportDroppedArchiveQueues } from './reconnect-archive-preflight'
++import { reconnectArchivePreflight, reportDroppedArchiveQueues } from './reconnect-archive-preflight'
++import { refreshArchiveTasks } from './refresh-archive-tasks'
+ 
+ const row = { id: 'archive-proof', connection_id: 'owner', profile: 'work', kanban_unknown: true } as SessionInfo
+ const hidden = () => ({ end: vi.fn(), hid: true, ids: [row.id], restore: vi.fn() })
+@@ -96,6 +97,8 @@ it.each(['direct', 'preflight reconnect', 'snapshot reconnect', 'PATCH reconnect
+ 
+   if (mode === 'preflight reconnect') {
+     expect(events.slice(1, 4)).toEqual(['preflight=waiting-reconnect', 'queued', 'preflight=ok'])
++    expect($notifications.get().some(n => n.message === en.desktop.archiveQueued)).toBe(false)
++    expect(Object.keys(sessionStorage)).toHaveLength(0)
+   }
+ 
+   if (mode === 'PATCH reconnect') {
+@@ -174,7 +177,7 @@ it('drops reload markers with a visible note, without replay, once; active remou
+   await result
+ })
+ 
+-it.each(['read-failed', 'not-archived'])('does not fabricate committed evidence from an ACK and %s verification', async failure => {
++it.each(['read-failed', 'not-archived', 'wrong-id'])('does not fabricate committed evidence from an ACK and %s verification', async failure => {
+   const logLine = vi.fn()
+   vi.stubGlobal('hermesDesktop', { logLine, api: async ({ path, method }: HermesApiRequest) => {
+     if (path.includes('mutation-snapshot')) {return { exists: true, runtime_revision: 0, runtime_generation: 1 }}
+@@ -182,11 +185,150 @@ it.each(['read-failed', 'not-archived'])('does not fabricate committed evidence
+     if (method === 'PATCH') {return { ok: true }}
+ 
+     if (failure === 'not-archived') {return { id: 'verify-only', archived: false }}
++
++    if (failure === 'wrong-id') {return { id: 'another-session', archived: true }}
+     throw new Error('socket hang up')
+   } })
+   const trace = startArchiveTrace('verify-only')
+   expect(await commitArchive({ storedSessionId: 'verify-only', owner: { connectionId: 'owner', profile: 'work' },
+     hidden: hidden(), rehide: hidden, copy: en.desktop, onArchived: vi.fn(), retryLabel: 'Retry', trace })).toBe(true)
+-  expect(logLine.mock.calls.flat().join('\n')).toContain(`verification-pending:${failure}`)
++  // Verification is diagnostic and may finish after the archive ACK has returned.
++  await vi.advanceTimersByTimeAsync(0)
++  expect(logLine.mock.calls.flat().join('\n')).toContain(`verification-pending:${failure === 'wrong-id' ? 'not-archived' : failure}`)
++  expect(logLine.mock.calls.flat().join('\n')).not.toContain(' committed')
++})
++
++it('limits a preflight read to the reconnect window remaining budget', async () => {
++  let resolveRead!: (value: { id: string }) => void
++  const api = vi.fn((_request: HermesApiRequest) => new Promise<{ id: string }>(resolve => {resolveRead = resolve}))
++  vi.stubGlobal('hermesDesktop', { api })
++  const stages: string[] = []
++  const trace = Object.assign((stage: string) => stages.push(stage), { attemptId: 'remaining-budget' })
++  let result: SessionInfo | undefined
++  let finished = false
++
++  const pending = refreshArchiveTasks(row.id, row, 'work', { budgetMs: 125, trace }).then(value => {
++    result = value
++    finished = true
++  })
++
++  expect(api).toHaveBeenCalledWith(expect.objectContaining({
++    path: `/api/sessions/${row.id}`, timeoutMs: 125, connectionId: 'owner', profile: 'work'
++  }))
++  await vi.advanceTimersByTimeAsync(124)
++  expect(finished).toBe(false)
++  await vi.advanceTimersByTimeAsync(1)
++  // Capture the deadline outcome before allowing the read to finish, so a
++  // missing budget cap fails without leaving a never-settling test behind.
++  const finishedAtDeadline = finished
++  const resultAtDeadline = result
++  resolveRead({ id: 'mismatched-cleanup-row' })
++  await pending
++  expect(finishedAtDeadline).toBe(true)
++  expect(resultAtDeadline).toMatchObject({ id: row.id, kanban_unknown: true })
++  expect(stages).toHaveLength(1)
++  expect(stages[0]).toMatch(/^preflight=unknown:no answer within/)
++})
++
++it('keeps a timed-out preflight unknown when its successful task read arrives late', async () => {
++  let resolveTasks!: (value: { tasks: [] }) => void
++
++  const api = vi.fn(async ({ path }: HermesApiRequest) => {
++    if (path === `/api/sessions/${row.id}`) {return { id: row.id }}
++
++    return new Promise<{ tasks: [] }>(resolve => {resolveTasks = resolve})
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  const stages: string[] = []
++  const trace = Object.assign((stage: string) => stages.push(stage), { attemptId: 'late-success' })
++  const pending = refreshArchiveTasks(row.id, row, 'work', { trace })
++  await vi.advanceTimersByTimeAsync(0)
++  expect(api).toHaveBeenCalledTimes(2)
++  expect(api.mock.calls[1][0].path).toBe('/api/session-kanban-tasks?ids=archive-proof')
++  await vi.advanceTimersByTimeAsync(14_000)
++  const result = await pending
++  expect(result).toMatchObject({ id: row.id, kanban_unknown: true })
++  expect(stages).toHaveLength(1)
++  expect(stages[0]).toMatch(/^preflight=unknown:no answer within/)
++  const deadlineStages = [...stages]
++  resolveTasks({ tasks: [] })
++  await vi.advanceTimersByTimeAsync(0)
++  expect(stages).toEqual(deadlineStages)
++  expect(stages).not.toContain('preflight=ok')
++  expect(result?.kanban_unknown).toBe(true)
++})
++
++it('pins an ownerless preflight to the initial primary across reconnect and a registry switch', async () => {
++  $connectionsRegistry.set({ version: 1, primary: 'initial-primary', connections: [], secureTokenStorage: true })
++  let disconnected = true
++
++  const api = vi.fn(async ({ path }: HermesApiRequest) => {
++    if (disconnected) {disconnected = false; throw new Error('socket hang up')}
++
++    if (path === `/api/sessions/${row.id}`) {return { id: row.id }}
++
++    return { tasks: [] }
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  const pending = reconnectArchivePreflight(row.id, { ...row, connection_id: undefined }, 'work', en.desktop)
++  await vi.advanceTimersByTimeAsync(0)
++  expect(api).toHaveBeenCalledOnce()
++  expect($notifications.get().some(n => n.message === en.desktop.archiveQueued)).toBe(true)
++  $connectionsRegistry.set({ version: 1, primary: 'replacement-primary', connections: [], secureTokenStorage: true })
++  await vi.advanceTimersByTimeAsync(1_000)
++  expect(await pending).toMatchObject({ connection_id: 'initial-primary', kanban_unknown: false })
++  expect(api.mock.calls.map(([request]) => [request.connectionId, request.profile])).toEqual([
++    ['initial-primary', 'work'], ['initial-primary', 'work'], ['initial-primary', 'work']
++  ])
++  expect($notifications.get().some(n => n.message === en.desktop.archiveQueued)).toBe(false)
++  expect(Object.keys(sessionStorage)).toHaveLength(0)
++})
++
++it('finishes the ACK while diagnostic verification is pending, and never restores or resends on its rejection', async () => {
++  let rejectVerification!: (error: Error) => void
++  const verification = new Promise<never>((_resolve, reject) => {rejectVerification = reject})
++  const logLine = vi.fn()
++
++  const api = vi.fn(async ({ path, method }: HermesApiRequest) => {
++    if (path.includes('mutation-snapshot')) {return { exists: true, runtime_revision: 0, runtime_generation: 1 }}
++
++    if (method === 'PATCH') {return { ok: true }}
++
++    expect(path).toBe('/api/sessions/pending-verification')
++
++    return verification
++  })
++
++  vi.stubGlobal('hermesDesktop', { api, logLine })
++  const hiddenRow = hidden()
++  const onArchived = vi.fn()
++  let outcome: boolean | undefined
++
++  const pending = commitArchive({ storedSessionId: 'pending-verification', owner: { connectionId: 'owner', profile: 'work' },
++    hidden: hiddenRow, rehide: hidden, copy: en.desktop, onArchived, retryLabel: 'Retry', trace: startArchiveTrace('pending-verification') })
++    .then(value => {outcome = value})
++
++  await vi.advanceTimersByTimeAsync(0)
++  expect(api.mock.calls.filter(([request]) => request.path === '/api/sessions/pending-verification' && !request.method)).toHaveLength(1)
++
++  const beforeDiagnosticFailure = { outcome, ended: hiddenRow.end.mock.calls.length,
++    archived: onArchived.mock.calls.length, restored: hiddenRow.restore.mock.calls.length }
++
++  expect(logLine.mock.calls.flat().join('\n')).not.toContain(' committed')
++  rejectVerification(new Error('socket hang up'))
++  await vi.advanceTimersByTimeAsync(70_000)
++  await pending
++  expect(beforeDiagnosticFailure).toEqual({ outcome: true, ended: 1, archived: 1, restored: 0 })
++  expect(outcome).toBe(true)
++  expect(hiddenRow.end).toHaveBeenCalledOnce()
++  expect(onArchived).toHaveBeenCalledOnce()
++  expect(hiddenRow.restore).not.toHaveBeenCalled()
++  expect(api.mock.calls.filter(([request]) => request.method === 'PATCH')).toHaveLength(1)
++  expect(api).toHaveBeenCalledTimes(3)
++  expect(api.mock.calls.every(([request]) => request.connectionId === 'owner' && request.profile === 'work')).toBe(true)
++  expect(logLine.mock.calls.flat().join('\n')).toContain('verification-pending:read-failed')
+   expect(logLine.mock.calls.flat().join('\n')).not.toContain(' committed')
++  expect($notifications.get().some(n => n.kind === 'error')).toBe(false)
+ })
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+index d877854232..00ba8e0d60 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+@@ -1,3 +1,4 @@
++import { getApiRequestProfile } from '@/api/client'
+ import type { SessionInfo } from '@/hermes'
+ import type { Translations } from '@/i18n/types'
+ import type { ArchiveTrace } from '@/lib/archive-trace'
+@@ -110,16 +111,22 @@ export async function archivePreflight(
+   options?: { skipLinkedConfirm?: boolean },
+   trace?: ArchiveTrace
+ ): Promise<false | string | undefined> {
++  // Preserve the invocation's implicit profile even if resolution/reconnect
++  // yields after the window switches profiles. Resolve before using fallback;
++  // an ambiguous listed row must still refuse rather than borrow this value.
++  const fallbackProfile = getApiRequestProfile() || 'default'
+   const stampedProfile = archived?.profile?.trim()
+-  const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
++  const resolvedProfile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+ 
+-  if (listed && !stampedProfile && !profile?.trim() && $profiles.get().filter(item => item.name.trim()).length > 1) {
++  if (listed && !stampedProfile && !resolvedProfile?.trim() && $profiles.get().filter(item => item.name.trim()).length > 1) {
+     hidden.restore()
+     notifyError(new Error('Session ownership could not be resolved'), copy.archiveFailed)
+ 
+     return false
+   }
+ 
++  const profile = resolvedProfile || fallbackProfile
++
+   try {
+     if (!(await confirmLinkedArchive(storedSessionId, archived, profile, copy, options?.skipLinkedConfirm, trace))) {
+       trace?.('failed:confirmation-cancelled')
+-- 
+2.43.0
+

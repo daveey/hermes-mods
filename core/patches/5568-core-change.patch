@@ -1,0 +1,128 @@
+From aa162cdecbd96d81f22c799e6605510794e3bdc8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:50:46 +0000
+Subject: [PATCH] fix(kanban): preserve model-neutral admission and
+ unknown-author refusal [daveey]
+
+Origin receipt serialization captured validator function imports through locals; use an explicit wire-field allowlist. Same-card review previously fell through to a class with no concrete author; fail closed exactly as downstream review does. Legacy selectors also blocked quota alternates, and class pacing consulted the dispatcher registry rather than the assignee registry. Preserve original routing source and all pool gates.
+
+Proof: pre-fix courier and missing-author regression failures reproduced; both consumers now 45 passed. Six saved quota/pacing consumers exercised twice, remaining failures retained for bounded follow-up; this commit is publication, not readiness or landing. Full scripts/check passes.
+---
+ hermes_cli/kanban_lane_classifier.py     | 11 +++++++++--
+ hermes_cli/kanban_llm_pacing_dispatch.py | 15 ++++++++++-----
+ hermes_cli/kanban_quota_episode.py       |  7 +++++--
+ hermes_cli/kanban_review_model.py        |  2 +-
+ 4 files changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_lane_classifier.py b/hermes_cli/kanban_lane_classifier.py
+index 820021527c..7478e61fd8 100644
+--- a/hermes_cli/kanban_lane_classifier.py
++++ b/hermes_cli/kanban_lane_classifier.py
+@@ -37,8 +37,15 @@ def create_origin(conn, intent, options):
+     from hermes_cli.kanban_lanes import prepare_classification
+     from hermes_cli.kanban_origin_creation import create_with_origin
+ 
+-    options = {key: value for key, value in options.items()
+-               if key not in ("conn", "origin_intent", "creation_receipt", "create_origin")}
++    # Explicit wire fields: locals() also contains implementation imports. Never
++    # forward those into the origin receipt or recursive create_task invocation.
++    fields = """title body assignee created_by workspace_kind workspace_path branch_name tenant priority
++        parents triage idempotency_key max_runtime_seconds skills max_retries model_override provider_override
++        reasoning_effort pin_mandatory goal_mode goal_max_turns initial_status session_id board project_id
++        project_source_task_id creator_task_id completion_contract review_required validate_workspace validate_skills
++        human_request chat_origin native_origin requires lint_blocked runs_on require_declaration placement_policy
++        placement_checked insert_guard placement_audit admission_class admission_frees self_work""".split()
++    options = {key: options[key] for key in fields if key in options}
+     options["parents"] = tuple(options["parents"])
+     result = prepare_classification(conn, options["parents"], options["initial_status"],
+                                     options["triage"], options["tenant"], options)
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 262e3dfa90..51fb6fe648 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -186,17 +186,20 @@ def candidate_route(conn: sqlite3.Connection, task: Any, lane: str) -> tuple[Opt
+     pinned_provider = getattr(task, "provider_override", None)
+     if pinned_provider and str(pinned_provider).strip().lower() != "auto" and reason == "pinned":
+         return route, [str(pinned_provider).strip().lower()]
+-    if route is None and model:
++    if model:
+         from agent.model_routing import eligible_routes, is_class_selector
+         from agent.model_routing_agent import class_requirements
++        from hermes_cli.config import is_provider_enabled
+         from hermes_cli.kanban_model_assignment import _assignee_config
+         if is_class_selector(model):
+             config = _assignee_config(task.assignee) or {}
+             policy = config.get("model_routing") or {}
+-            providers = sorted({str(r["provider"]).strip().lower() for r in
+-                                eligible_routes(policy, model.removeprefix("class:"), class_requirements(config))}) \
+-                if policy.get("enabled") else []
+-            return route, providers
++            providers = config.get("providers") or {}
++            def allowed(route):
++                return is_provider_enabled(providers.get(route["provider"], {}))
++            candidates = eligible_routes(policy, model.removeprefix("class:"), class_requirements(config),
++                                         eligible=allowed) if policy.get("enabled") else []
++            return route, sorted({str(r["provider"]).strip().lower() for r in candidates})
+     return route, _route_providers(model, provider)
+ 
+ 
+@@ -377,9 +380,11 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+     it (:func:`_verdicts`), :func:`_pace_alternate` moves it to a pool of its class with room that serves here, or it
+     holds. [daveey] (t_d943a79dd2b3889f)"""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_model_neutral import routing_view
+     task = kb.get_task(conn, task_id)
+     if task is None:
+         return None
++    task = routing_view(task)
+     providers = [p for p in candidate_providers(conn, task, lane) if p in cfg.providers]
+     if not providers:
+         return None
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 357a20b089..dfcd6a5d15 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -184,6 +184,8 @@ def _strong_fallback(task, base, walls, cfg, now):
+     from copy import copy
+     from hermes_cli.kanban_model_tier import load_tier_config
+     from hermes_cli.kanban_provider_walls import retier_for_walls
++    from hermes_cli.kanban_model_neutral import routing_view
++    task = routing_view(task)
+     if task.model_override or task.provider_override or base[2] != 'default' or not base[0]:
+         return None
+     probe = copy(task)
+@@ -246,8 +248,7 @@ def alternate_route(conn, task, walls, base, now):
+     from hermes_cli.kanban_provider_walls import active_walls, live_pool_serving
+     model, _provider, reason = base
+     strong = _strong_class(base)
+-    if (task.model_override or task.provider_override
+-            or (reason not in {'default', 'off', 'profile_out_of_scope'} and not strong) or not walls):
++    if ((reason not in {'default', 'off', 'profile_out_of_scope', 'class'} and not strong) or not walls):
+         return None
+     config = _assignee_config(task.assignee) or {}
+     policy = config.get('model_routing') or {}
+@@ -334,6 +335,8 @@ def _served_here(conn, task, wall, now):
+ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+     """Return (guard reason, alternate route); never writes or allocates quota."""
+     from hermes_cli.kanban_model_tier import resolve_model_tier
++    from hermes_cli.kanban_model_neutral import routing_view
++    task = routing_view(task)
+     state = episode(conn, task.id)
+     now = time.time() if now is None else now
+     if not state:
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index f22d161978..5028280552 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -401,7 +401,7 @@ def resolve_review_model(conn, task, cfg):
+         why = class_unroutable_reason(override[0], _assignee_config(assignee) or {})
+         if why:
+             raise ReviewModelUnavailable(f"Review model {override[0]} is unroutable: {why}")
+-
++    # Model attribution is audit-only; distinct execution is enforced by verdict custody.
+     from hermes_cli.kanban_llm_pacing_dispatch import held_pools
+     now = time.time()
+     walls = pw.active_walls(now=now)
+-- 
+2.43.0
+

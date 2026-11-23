@@ -1,0 +1,211 @@
+From efa8965dab633e8a6adfe0d70501e6d0ce969b1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:18:44 +0000
+Subject: [PATCH] [daveey] kanban delegation: refuse the named auth headers and
+ query keys on caller/tier overrides
+
+Review of PR #4048 at 1b4afbaf3293 (t_59ae72a4aa530f45, point N1) found the request-override guard this PR
+adds incomplete: for a Kanban-origin delegation it refused `extra_headers` Authorization / x-api-key /
+api-key / host, but admitted x-goog-api-key, Cookie, Proxy-Authorization and OpenAI-Organization, and
+`extra_query` key / api-key. The module docstring and the refusal text said credential overrides are not
+accepted, which was wider than the code.
+
+Why it happened: the header list was written from the two providers in the first tests, and the query
+container was only checked against the routing-key set.
+
+Fix (agent/kanban_delegation_policy.py):
+- `_AUTH_HEADERS` gains x-goog-api-key, cookie, proxy-authorization, openai-organization (matched
+  case-insensitively, as before).
+- New `_AUTH_QUERY` = key, api-key, checked on `extra_query` only (case-insensitive). `api_key` there was
+  already refused as a routing key.
+- Docstring and refusal text now describe a finite enumerated list. This is not a general credential
+  detector: a header or query name outside the list is still admitted.
+- Unchanged: existing refusals, the B1 source-based rule for the allocated route's own `extra_body`, the
+  interactive (non-Kanban) path. A custom route's own `custom_providers[].extra_headers` go to the client's
+  default headers, not into delegation overrides, and are not refused.
+
+Behaviour change: an operator `delegation.request_overrides` or tier overlay that sets one of these names is
+now refused for delegations started by a Kanban worker.
+
+Tests, RED on 35ff1456f7fe (44 failed: every case below except the controls), GREEN here. Values are
+placeholders.
+- tests/tools/test_kanban_delegation_no_pin.py: each name, with a mixed-case variant, through the
+  `delegate_task` facade; refused before any effect.
+- tests/tools/test_kanban_delegation_component79.py:
+  - caller overlay through real `_routes_for`: refused, nothing constructed.
+  - tier overlay through real `_routes_for` + `_build_children` + `AIAgent`, on a custom route whose own
+    `extra_headers` set the same names with the same value: child built, refused before launch, closed.
+  - controls, green before and after: that route with no tier overlay builds and its headers are not in the
+    child's request_overrides; a tier overlay with an unlisted header and query key builds unchanged.
+  - unit, `check_built_child`: each name in the final mapping refuses.
+
+Not covered: auth-bearing names outside the list; auxiliary, MoA, curator, side-question, plugin and external
+delegation paths; `register_root` against a live worker process; macOS/Windows.
+
+Card: t_b76fc0ced1eeacb2
+---
+ agent/kanban_delegation_policy.py             | 16 +++--
+ .../test_kanban_delegation_component79.py     | 62 ++++++++++++++++++-
+ tests/tools/test_kanban_delegation_no_pin.py  |  7 +++
+ 3 files changed, 80 insertions(+), 5 deletions(-)
+
+diff --git a/agent/kanban_delegation_policy.py b/agent/kanban_delegation_policy.py
+index fd0e0bcd27..6638bbb172 100644
+--- a/agent/kanban_delegation_policy.py
++++ b/agent/kanban_delegation_policy.py
+@@ -1,7 +1,10 @@
+ """Restriction-only classification of Kanban-native delegation lineage.
+ 
+ A managed Kanban worker (and every descendant it builds) may start NEW delegated work only on a logical
+-model class, never on a concrete model/provider pin, endpoint, credential or transport override.  This module
++model class, never on a concrete model/provider pin, endpoint or transport override, and never with one of the
++finite destination/auth names below in a request override (``_AUTH_HEADERS``, ``_AUTH_QUERY``).  That list is an
++enumerated refusal, not a general credential detector; credentials the allocator resolves for the selected route
++are not delegation overrides and are untouched.  This module
+ holds the pure logical checks and a process-local weak identity map from live agent objects to a restriction
+ token.  Nothing here grants authority: ``WorkerCustody.validated`` (creator rights, live lease) is untouched,
+ and the token is never serialized, read from the environment, or accepted from a request field.
+@@ -41,7 +44,9 @@ _ENTRIES: dict[int, tuple[weakref.ref, _Token]] = {}
+ _TRANSPORT_KEYS = ("base_url", "api_key", "api_mode", "command", "args", "acp_command", "acp_args")
+ _ROUTING_KEYS = frozenset({"model", "provider", *_TRANSPORT_KEYS, "models", "route", "fallbacks"})
+ _WIRE_CONTAINERS = ("extra_body", "extra_query")
+-_AUTH_HEADERS = frozenset({"authorization", "x-api-key", "api-key", "host"})
++_AUTH_HEADERS = frozenset({"authorization", "x-api-key", "api-key", "host", "x-goog-api-key", "cookie",
++                           "proxy-authorization", "openai-organization"})  # matched case-insensitively
++_AUTH_QUERY = frozenset({"key", "api-key"})  # extra_query only; api_key is already a routing key
+ _KEPT_TUNING = ("request_overrides", "reasoning_effort", "service_tier", "label")
+ 
+ 
+@@ -133,7 +138,7 @@ def _refuse(index: Optional[int], what: str) -> RestrictionError:
+     return RestrictionError(
+         f"{_where(index)}{what}. New delegations from a Kanban worker take a model class "
+         f"(class:{'|class:'.join(sorted(CLASSES))}) with provider auto; concrete models, providers, endpoints, "
+-        f"credentials and routing overrides are not accepted.")
++        f"routing overrides and the listed destination/auth headers and query keys are not accepted.")
+ 
+ 
+ def class_for_selectors(source: Mapping[str, Any], parent: Any, index: Optional[int] = None) -> str:
+@@ -154,7 +159,8 @@ def class_for_selectors(source: Mapping[str, Any], parent: Any, index: Optional[
+ 
+ 
+ def check_request_overrides(overrides: Any, index: Optional[int] = None) -> None:
+-    """Refuse routing keys at the top level and in the SDK merge containers; other tuning is untouched."""
++    """Refuse routing keys at the top level and in the SDK merge containers, and the listed auth names in
++    ``extra_headers`` / ``extra_query``; other tuning is untouched."""
+     if overrides is None:
+         return
+     if not isinstance(overrides, Mapping):
+@@ -171,6 +177,8 @@ def check_request_overrides(overrides: Any, index: Optional[int] = None) -> None
+         for key in inner:
+             if str(key).lower() in _ROUTING_KEYS:
+                 raise _refuse(index, f"request_overrides.{name}.{key} is a routing override")
++            if name == "extra_query" and str(key).lower() in _AUTH_QUERY:
++                raise _refuse(index, f"request_overrides.{name}.{key} is a destination/auth override")
+     headers = overrides.get("extra_headers")
+     if headers is not None:
+         if not isinstance(headers, Mapping):
+diff --git a/tests/tools/test_kanban_delegation_component79.py b/tests/tools/test_kanban_delegation_component79.py
+index df8bc59ac8..bd117d1bfe 100644
+--- a/tests/tools/test_kanban_delegation_component79.py
++++ b/tests/tools/test_kanban_delegation_component79.py
+@@ -202,7 +202,7 @@ RELAY_URL = "http://127.0.0.1:9/v1"
+ ROUTE_BODY = {"provider": {"order": ["x"], "allow_fallbacks": False}, "models": ["relay-model"], "route": "fallback"}
+ 
+ 
+-def _real_children(native, monkeypatch, *, route_body=None, tier=None):
++def _real_children(native, monkeypatch, *, route_body=None, tier=None, route_headers=None):
+     """Real ``_routes_for`` + ``_build_children`` + ``AIAgent``; ``route_body`` None = native subscription route."""
+     from pathlib import Path
+     from hermes_cli.config import atomic_config_write, load_config_readonly
+@@ -227,6 +227,8 @@ def _real_children(native, monkeypatch, *, route_body=None, tier=None):
+         cfg["model_routing"]["allow_metered"] = True
+         cfg["custom_providers"] = [{"name": "relay", "base_url": RELAY_URL, "api_key": "k", "model": "relay-model",
+                                     "extra_body": deepcopy(route_body)}]
++        if route_headers:
++            cfg["custom_providers"][0]["extra_headers"] = dict(route_headers)
+     cfg["model"] = {"context_length": 100000}
+     atomic_config_write(home / "config.yaml", cfg)
+     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
+@@ -327,3 +329,61 @@ def test_built_child_check_refuses_tier_routing_keys_before_reading_the_route():
+     child = _built({"extra_body": deepcopy(ROUTE_BODY)})
+     with pytest.raises(policy.RestrictionError):
+         policy.check_built_child(child, {"extra_body": {"provider": ROUTE_BODY["provider"]}})
++
++
++# ── finite destination/auth names on the caller/tier override surface (placeholder values only) ──
++
++AUTH_NAMES = [("extra_headers", name) for name in (
++    "x-goog-api-key", "X-Goog-Api-Key", "Cookie", "COOKIE", "Proxy-Authorization", "proxy-AUTHORIZATION",
++    "OpenAI-Organization", "openai-organization")] + [("extra_query", "key"), ("extra_query", "api-key"),
++                                                      ("extra_query", "Api-Key")]
++AUTH_IDS = [f"{c}.{n}" for c, n in AUTH_NAMES]
++ROUTE_HEADERS = {"x-goog-api-key": "placeholder", "Cookie": "placeholder", "Proxy-Authorization": "placeholder",
++                 "OpenAI-Organization": "placeholder"}
++
++
++@pytest.mark.parametrize("container,name", AUTH_NAMES, ids=AUTH_IDS)
++def test_auth_names_refused_for_caller_before_construction(native, monkeypatch, container, name):
++    import tools.delegate_tool as dt
++    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", lambda **kw: pytest.fail("constructed"))
++    routes, error = dt._routes_for([{"goal": "neutral analysis", "model": "class:deep"}],
++                                   {"request_overrides": {container: {name: "placeholder"}}}, None, native)
++    assert routes == [] and error and "destination/auth override" in error
++
++
++@pytest.mark.parametrize("container,name", AUTH_NAMES, ids=AUTH_IDS)
++def test_real_build_children_refuses_tier_auth_names_even_when_the_route_sets_the_same_header(
++        native, monkeypatch, container, name):
++    """Same-key collision: the allocated route's own ``extra_headers`` carry the name with the same value."""
++    children, error, closed = _real_children(native, monkeypatch, route_body={"service_tier": "flex"},
++                                             route_headers=ROUTE_HEADERS, tier={container: {name: "placeholder"}})
++    assert children == [] and error and "destination/auth override" in error
++    assert len(closed) == 1 and closed[0].provider == "custom:relay"  # built, refused before launch, closed
++
++
++@pytest.mark.parametrize("tier", [None, {"extra_headers": {"x-trace-id": "t"}, "extra_query": {"trace": "t"}}],
++                         ids=["route-headers-only", "harmless-tier"])
++def test_real_build_children_keeps_the_allocated_routes_own_auth_headers(native, monkeypatch, tier):
++    """Allocator-owned route headers live on the client, not in delegation overrides, and are not refused."""
++    children, error, closed = _real_children(native, monkeypatch, route_body={"service_tier": "flex"},
++                                             route_headers=ROUTE_HEADERS, tier=tier)
++    try:
++        assert not error, error
++        child, = children
++        assert closed == [] and child.provider == "custom:relay"
++        if tier is None:
++            assert child.request_overrides.get("extra_body") == {"service_tier": "flex"}
++        else:  # harmless tier tuning passes through untouched
++            assert child.request_overrides["extra_headers"] == tier["extra_headers"]
++            assert child.request_overrides["extra_query"] == tier["extra_query"]
++        for name in ROUTE_HEADERS:
++            assert name not in (child.request_overrides.get("extra_headers") or {})
++    finally:
++        for child in children:
++            child.release_clients()
++
++
++@pytest.mark.parametrize("container,name", AUTH_NAMES, ids=AUTH_IDS)
++def test_built_child_check_refuses_auth_names_in_the_final_mapping(container, name):
++    with pytest.raises(policy.RestrictionError, match="destination/auth override"):
++        policy.check_built_child(_built({"extra_body": deepcopy(ROUTE_BODY), container: {name: "placeholder"}}))
+diff --git a/tests/tools/test_kanban_delegation_no_pin.py b/tests/tools/test_kanban_delegation_no_pin.py
+index 7e1764ab44..fe5547ce12 100644
+--- a/tests/tools/test_kanban_delegation_no_pin.py
++++ b/tests/tools/test_kanban_delegation_no_pin.py
+@@ -180,6 +180,13 @@ OVERRIDES = [
+     {"extra_headers": {"Authorization": "Bearer x"}}, {"extra_headers": {"x-API-Key": "x"}},
+     {"extra_headers": {"API-KEY": "x"}}, {"extra_headers": {"HOST": "evil"}},
+     {"extra_body": "str"}, {"extra_headers": ["a"]},
++    # finite destination/auth names; values are placeholders, never real secrets
++    {"extra_headers": {"x-goog-api-key": "placeholder"}}, {"extra_headers": {"X-Goog-Api-Key": "placeholder"}},
++    {"extra_headers": {"Cookie": "placeholder"}}, {"extra_headers": {"COOKIE": "placeholder"}},
++    {"extra_headers": {"Proxy-Authorization": "placeholder"}}, {"extra_headers": {"proxy-AUTHORIZATION": "placeholder"}},
++    {"extra_headers": {"OpenAI-Organization": "placeholder"}}, {"extra_headers": {"openai-organization": "placeholder"}},
++    {"extra_query": {"key": "placeholder"}}, {"extra_query": {"api-key": "placeholder"}},
++    {"extra_query": {"API-Key": "placeholder"}},
+ ]
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,464 @@
+From d6356be93625a60f2849f5109fe539afc4da0f92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:13:44 +0000
+Subject: [PATCH] fix(kanban): retire stored model restrictions in owner
+ dispatch [daveey]
+
+Dispatcher-owned bounded rotation clears legacy stored selectors and mandatory flags via exact-value CAS, with audit and standard sync field clocks. Refused body lines become reversible historical JSON evidence through supported body editing. Live run, claim and session custody remain untouched.
+
+Proof: new retirement regressions RED before implementation; 24 focused tests GREEN including real dispatch_once and field-HLC/SQLite replica readback with in-memory Board transport. scripts/check --base origin/main passed. Full Kanban consumer suite running; canonical publication, independent exact-head review and required CI still pending.
+---
+ hermes_cli/kanban_db_edit.py                  |  24 +++
+ hermes_cli/kanban_dispatch_owner.py           |   3 +
+ hermes_cli/kanban_model_retirement.py         |  99 ++++++++++
+ .../test_kanban_model_retirement.py           | 184 ++++++++++++++++++
+ .../test_kanban_model_retirement_sync.py      |  70 +++++++
+ 5 files changed, 380 insertions(+)
+ create mode 100644 hermes_cli/kanban_model_retirement.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_retirement.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_retirement_sync.py
+
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 263823913b..4b1104b26f 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -8,6 +8,25 @@ import json
+ import sqlite3
+ from typing import Optional
+ 
++_UNSET = object()
++
++
++def _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only):
++    """Recheck maintenance custody and body CAS under edit_task's write transaction."""
++    if home_open_only:
++        from hermes_cli.kanban_wake_check import foreign_copy
++        if status in ('done', 'archived') or foreign_copy(conn, task_id):
++            return False
++    if expected_body is not _UNSET:
++        stored = conn.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
++        return stored['body'] == expected_body
++    return True
++
++
++def _append_edit_comment(conn, task_id, audit_comment):
++    if audit_comment is not None:
++        _kb.add_comment(conn, task_id, *audit_comment)
++
+ 
+ class PriorityLowerRefused(ValueError):
+     """An edit would lower a card's priority without a reason (``require_lower_reason``). [daveey]"""
+@@ -73,6 +92,8 @@ def edit_task(
+     priority_reason: Optional[str] = None, require_lower_reason: bool = False,
+     priority_bump: Optional[int] = None,
+     admission_class: Optional[str] = None, admission_frees: Optional[str] = None,
++    expected_body: object = _UNSET, home_open_only: bool = False,
++    audit_comment: Optional[tuple[str, str]] = None,
+ ) -> bool:
+     """Edit task fields, optionally backfilling a completed task's result.
+ 
+@@ -98,6 +119,8 @@ def edit_task(
+         status = _kb._task_status(conn, task_id)
+         if status is None or (result is not None and status != "done"):
+             return False
++        if not _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only):
++            return False
+         previous_priority = conn.execute("SELECT priority FROM tasks WHERE id=?", (task_id,)).fetchone()[0] or 0
+         if priority_bump is not None:
+             priority = bounded(previous_priority + priority_bump)
+@@ -176,6 +199,7 @@ def edit_task(
+                 },
+                 run_id=run_id,
+             )
++        _append_edit_comment(conn, task_id, audit_comment)
+     _kb.notify_task_updated(conn, task_id, changed_fields, board=board)
+     return True
+ 
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 96438d5ef4..1b97c281f0 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -141,6 +141,9 @@ def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
+             return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+         if owner is not None and dispatcher_id != owner:
+             return DispatchResult(skipped_owned=True, dispatch_owner=owner)
++        if not dry_run:
++            from hermes_cli.kanban_model_retirement import sweep as retire_model_policy
++            retire_model_policy(conn)
+         from hermes_cli import kanban_ratio_routing as ratio
+         try:
+             ratio.begin_tick(conn)  # ratio routing re-reads this board's start counts once per tick
+diff --git a/hermes_cli/kanban_model_retirement.py b/hermes_cli/kanban_model_retirement.py
+new file mode 100644
+index 0000000000..b58e596caa
+--- /dev/null
++++ b/hermes_cli/kanban_model_retirement.py
+@@ -0,0 +1,99 @@
++"""Dispatcher-owned retirement of stored pre-model-neutral specifications.
++
++Only task policy columns change. Execution receipts, leases and live clients are
++not policy, and are deliberately never read or rewritten by this maintenance.
++Ordinary UPDATEs use the same sync capture/field-HLC path as set-model and edit.
++"""
++from __future__ import annotations
++
++import json
++
++from agent.model_routing import is_class_selector
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_model_neutral import validate_text
++from hermes_cli.kanban_wake_check import foreign_copy, own_gateway
++
++FIELDS = ('model_override', 'provider_override', 'model_pin_mandatory')
++REASON = 'model_policy_no_pins'
++AUTHOR = 'kanban-dispatcher'
++PREFIX = 'Historical run instruction (superseded and not active): '
++_scan_cursor: dict[str, str] = {}
++
++
++def retire_selectors(conn, row):
++    """CAS the exact stored selector triple, leaving concurrent supported edits intact."""
++    old = tuple(row[field] for field in FIELDS)
++    model, provider, _mandatory = old
++    new = (model if model and is_class_selector(model) else None,
++           provider if provider == 'auto' else None, None)
++    if old == new:
++        return False
++    with kb.write_txn(conn):
++        if foreign_copy(conn, row['id']):
++            return False
++        cur = conn.execute(
++            "UPDATE tasks SET model_override=?,provider_override=?,model_pin_mandatory=? "
++            "WHERE id=? AND model_override IS ? AND provider_override IS ? AND model_pin_mandatory IS ? "
++            "AND status IN ('todo','triage','ready','scheduled','blocked','running','review')",
++            (*new, row['id'], *old))
++        if cur.rowcount != 1:
++            return False
++        kb._append_event(conn, row['id'], 'model_override_cleared',
++                         {'reason': REASON, 'previous': dict(zip(FIELDS, old)), 'current': dict(zip(FIELDS, new))})
++        kb.add_comment(conn, row['id'], AUTHOR,
++                       'Stored model/provider restrictions and mandatory-pin state retired '
++                       '(model_policy_no_pins). Class/capability routing remains active; '
++                       'any already-started run and its execution history are unchanged.')
++    kb.notify_task_updated(conn, row['id'], FIELDS)
++    return True
++
++
++def retired_body(body):
++    """Quote refused lines only, retaining original line terminators and all other bytes."""
++    out = []
++    for line in (body or '').splitlines(keepends=True):
++        text = line.rstrip('\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029')
++        ending = line[len(text):]
++        try:
++            validate_text(text)
++        except ValueError:
++            text = PREFIX + json.dumps(text, ensure_ascii=False)
++        out.append(text + ending)
++    return ''.join(out)
++
++
++def retire_body(conn, row):
++    """Use supported body editing, including its audit and post-commit observer."""
++    from hermes_cli.kanban_db_edit import edit_task
++    body = retired_body(row['body'])
++    if body == (row['body'] or ''):
++        return False
++    return edit_task(conn, row['id'], body=body, expected_body=row['body'], home_open_only=True,
++                     audit_comment=(AUTHOR, 'Superseded model/provider mandates were retained as JSON historical '
++                                    'evidence (model_policy_no_pins); all other body text is unchanged.'))
++
++
++def sweep(conn, *, limit=64):
++    """Bounded rotating owner-only scan; one broken card never starves siblings."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    key = str(_main_db_file(conn))
++    own = own_gateway(conn)
++    owner_sql = ' AND (created_on IS NULL OR created_on=?)' if own else ''
++    rows = conn.execute(
++        "SELECT id,body,model_override,provider_override,model_pin_mandatory FROM tasks "
++        "WHERE status IN ('todo','triage','ready','scheduled','blocked','running','review')" + owner_sql
++        + ' ORDER BY (id <= ?), id LIMIT ?',
++        (*((own,) if own else ()), _scan_cursor.get(key, ''), max(0, min(limit, 256)))).fetchall()
++    changed = 0
++    for row in rows:
++        _scan_cursor[key] = row['id']
++        repaired = False
++        for repair in (retire_selectors, retire_body):
++            try:
++                repaired = bool(repair(conn, row)) or repaired
++            except Exception:  # health: allow BLE001 -- per-card maintenance fault containment; retry next rotation
++                kb._log.exception('kanban: model policy retirement failed for %s (%s)', row['id'], repair.__name__)
++        changed += repaired
++    if len(_scan_cursor) > 1024:
++        del _scan_cursor[next(iter(_scan_cursor))]
++    return changed
+diff --git a/tests/hermes_cli/test_kanban_model_retirement.py b/tests/hermes_cli/test_kanban_model_retirement.py
+new file mode 100644
+index 0000000000..500a594198
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_retirement.py
+@@ -0,0 +1,184 @@
++"""Owner-side stored policy retirement, without touching execution custody."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kd
++from tests.hermes_cli import test_kanban_model_tier as fixtures
++
++board = fixtures.board
++PREFIX = 'Historical run instruction (superseded and not active): '
++
++
++def seed(conn, *, status='blocked', model='grok-4.6', provider='xai-oauth', mandatory=1, body='scope'):
++    tid = kb.create_task(conn, title='ordinary work', body='scope', assignee='default')
++    conn.execute('UPDATE tasks SET status=?,model_override=?,provider_override=?,model_pin_mandatory=?,body=? WHERE id=?',
++                 (status, model, provider, mandatory, body, tid))
++    return tid
++
++
++def sweep(conn, **kwargs):
++    from hermes_cli.kanban_model_retirement import sweep as retire
++    return retire(conn, **kwargs)
++
++
++@pytest.mark.parametrize('status', ['todo', 'triage', 'ready', 'scheduled', 'blocked', 'running', 'review'])
++def test_open_selector_retired_and_only_policy_changes(board, status, monkeypatch):
++    with kbc.connect() as conn:
++        tid = seed(conn, status=status)
++        before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        runs = list(conn.execute('SELECT * FROM task_runs'))
++        notices = []
++        monkeypatch.setattr(kb, 'notify_task_updated', lambda c, t, f, **k: notices.append((t, tuple(f))))
++        assert sweep(conn) == 1
++        after = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        for field in ('model_override', 'provider_override', 'model_pin_mandatory'):
++            assert after.pop(field) is None
++            before.pop(field)
++        # The activity cursor is allowed to advance for a policy edit.
++        for field in ('updated_at',):
++            before.pop(field, None)
++            after.pop(field, None)
++        assert after == before
++        assert list(conn.execute('SELECT * FROM task_runs')) == runs
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='model_override_cleared'", (tid,)).fetchone()
++        assert json.loads(event[0])['reason'] == 'model_policy_no_pins'
++        assert conn.execute("SELECT author FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0] == 'kanban-dispatcher'
++        assert notices == [(tid, ('model_override', 'provider_override', 'model_pin_mandatory'))]
++        counts = [conn.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in ('task_events', 'task_comments')]
++        assert sweep(conn) == 0
++        assert counts == [conn.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in ('task_events', 'task_comments')]
++
++
++@pytest.mark.parametrize('model,provider,mandatory,expected', [
++    ('class:deep', 'auto', None, ('class:deep', 'auto', None)),
++    ('class:deep', 'anthropic', 1, ('class:deep', None, None)),
++    (None, 'auto', None, (None, 'auto', None)),
++    ('auto', 'auto', 0, (None, 'auto', None)),
++    (None, None, 1, (None, None, None)),
++])
++def test_class_auto_and_mandatory(board, model, provider, mandatory, expected):
++    with kbc.connect() as conn:
++        tid = seed(conn, model=model, provider=provider, mandatory=mandatory)
++        sweep(conn)
++        row = conn.execute('SELECT model_override,provider_override,model_pin_mandatory FROM tasks WHERE id=?', (tid,)).fetchone()
++        assert tuple(row) == expected
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_terminal_unchanged(board, status):
++    with kbc.connect() as conn:
++        tid = seed(conn, status=status, body='require_model: true')
++        before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        assert sweep(conn) == 0
++        assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == before
++
++
++def test_body_exact_line_roundtrip_and_supported_edit(board, monkeypatch):
++    from hermes_cli import kanban_db_edit as edits
++    with kbc.connect() as conn:
++        body = 'scope  \r\n  require_model: true\r\n\nexclude: claude-opus-5-5\nUse only grok-4.6.\rtrailing no newline'
++        tid = seed(conn, body=body)
++        calls = []
++        original = edits.edit_task
++        def observed(*args, **kwargs):
++            calls.append(kwargs)
++            return original(*args, **kwargs)
++        monkeypatch.setattr(edits, 'edit_task', observed)
++        assert sweep(conn) == 1
++        expected = ('scope  \r\n' + PREFIX + json.dumps('  require_model: true') + '\r\n\n'
++                    + 'exclude: claude-opus-5-5\n' + PREFIX + json.dumps('Use only grok-4.6.') + '\rtrailing no newline')
++        assert kb.get_task(conn, tid).body == expected
++        assert len(calls) == 1
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='edited'", (tid,)).fetchone()[0] == 1
++        assert sweep(conn) == 0
++
++
++def test_cas_concurrent_set_model_wins(board):
++    from hermes_cli.kanban_model_retirement import retire_selectors
++    with kbc.connect() as conn:
++        tid = seed(conn)
++        snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        kb.set_model_override(conn, tid, 'class:deep', 'auto')
++        assert not retire_selectors(conn, snapshot)
++        assert kb.get_task(conn, tid).model_override == 'class:deep'
++
++
++def test_per_card_fault_and_bounded_rotation(board, monkeypatch):
++    from hermes_cli import kanban_model_retirement as retirement
++    with kbc.connect() as conn:
++        bad = seed(conn)
++        good = seed(conn)
++        original = retirement.retire_selectors
++        def faulty(c, row):
++            if row['id'] == bad:
++                raise RuntimeError('one malformed legacy card')
++            return original(c, row)
++        monkeypatch.setattr(retirement, 'retire_selectors', faulty)
++        for _ in range(2):
++            sweep(conn, limit=1)
++        assert kb.get_task(conn, good).model_override is None
++        assert kb.get_task(conn, bad).model_override == 'grok-4.6'
++
++
++def test_real_dispatch_once_retires_even_without_spawn_budget(board):
++    with kbc.connect() as conn:
++        tid = seed(conn)
++        kd.dispatch_once(conn, max_spawn=0, reconcile_orphans=False)
++        assert kb.get_task(conn, tid).model_override is None
++        assert kb.get_task(conn, tid).model_pin_mandatory is None
++
++
++def test_running_claim_run_and_session_are_untouched(board):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='live work', assignee='default')
++        assert kb.claim_task(conn, tid)
++        conn.execute("UPDATE tasks SET model_override='grok-4.6',provider_override='xai-oauth',model_pin_mandatory=1,session_id='live-session' WHERE id=?", (tid,))
++        before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        run = dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (before['current_run_id'],)).fetchone())
++        sweep(conn)
++        after = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        for key in ('claim_lock', 'claim_expires', 'current_run_id', 'session_id', 'status', 'worker_pid'):
++            assert after[key] == before[key]
++        assert dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (before['current_run_id'],)).fetchone()) == run
++
++
++def test_body_cas_and_terminal_races(board):
++    from hermes_cli.kanban_model_retirement import retire_body, retire_selectors
++    with kbc.connect() as conn:
++        tid = seed(conn, body='require_model: true')
++        snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        kb.edit_task(conn, tid, body='new user scope')
++        assert not retire_body(conn, snapshot)
++        assert kb.get_task(conn, tid).body == 'new user scope'
++        conn.execute("UPDATE tasks SET body=?,status='done' WHERE id=?", (snapshot['body'], tid))
++        assert not retire_body(conn, snapshot)
++        assert not retire_selectors(conn, snapshot)
++        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
++        assert not retire_body(conn, snapshot)
++        assert not retire_selectors(conn, snapshot)
++
++
++def test_audit_failure_rolls_back_and_body_failure_keeps_siblings(board, monkeypatch):
++    with kbc.connect() as conn:
++        tid = seed(conn, body='require_model: true')
++        good = seed(conn, body='require_model: true')
++        original = kb.add_comment
++        def refuse(c, task, *args):
++            if task == tid:
++                raise RuntimeError('failed audit')
++            return original(c, task, *args)
++        monkeypatch.setattr(kb, 'add_comment', refuse)
++        assert sweep(conn) == 1
++        assert kb.get_task(conn, tid).body == 'require_model: true'
++        assert kb.get_task(conn, tid).model_override == 'grok-4.6'
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind IN ('edited','model_override_cleared')", (tid,)).fetchone()[0] == 0
++        assert kb.get_task(conn, good).model_override is None
++        assert kb.get_task(conn, good).body.startswith(PREFIX)
++
++
++def test_dry_dispatch_does_not_retire(board):
++    with kbc.connect() as conn:
++        tid = seed(conn)
++        kd.dispatch_once(conn, dry_run=True, max_spawn=0, reconcile_orphans=False)
++        assert kb.get_task(conn, tid).model_override == 'grok-4.6'
+diff --git a/tests/hermes_cli/test_kanban_model_retirement_sync.py b/tests/hermes_cli/test_kanban_model_retirement_sync.py
+new file mode 100644
+index 0000000000..abbcd2d8ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_retirement_sync.py
+@@ -0,0 +1,70 @@
++"""Real capture/outbox/HLC/sync/replica round trip with the in-memory Board transport."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_model_retirement as retirement
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    svc = FakeService()
++    path = home / 'kanban.db'
++    with kbc.connect(path) as conn:
++        client.ensure_identity(conn, 'default', 'owner')
++        sync.set_mode(conn, 'primary')
++        yield conn, path, svc
++
++
++def roundtrip(path, svc):
++    result = client.sync_board('default', path, svc.hub('owner'), 'owner')
++    assert result.error is None
++    assert result.push is None or result.push.rejected == 0
++
++
++def test_policy_field_clocks_and_replica_readback(live):
++    conn, path, svc = live
++    tid = kb.create_task(conn, title='ordinary work', body='scope', assignee='default')
++    conn.execute("UPDATE tasks SET model_override='grok-4.6',provider_override='xai-oauth',model_pin_mandatory=1,body='scope\r\nrequire_model: true\r\n' WHERE id=?", (tid,))
++    roundtrip(path, svc)
++    roundtrip(path, svc)
++    before = dict(svc.board('default')['rows']['tasks'][tid]['field_hlc'])
++    assert retirement.sweep(conn) == 1
++    roundtrip(path, svc)
++    roundtrip(path, svc)
++    stored = svc.board('default')['rows']['tasks'][tid]
++    for key in retirement.FIELDS:
++        assert stored[key] is None
++        assert stored['field_hlc'][key] > before[key]
++    assert stored['field_hlc']['body'] > before['body']
++    # Read the actual shadow SQLite replica, not just the fake transport reply.
++    with kbc.connect(client.shadow_path('default')) as replica:
++        row = replica.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++        assert all(row[key] is None for key in retirement.FIELDS)
++        assert row['body'] == 'scope\r\n' + retirement.PREFIX + json.dumps('require_model: true') + '\r\n'
++        assert replica.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='model_override_cleared'", (tid,)).fetchone()[0] == 1
++        assert replica.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND author='kanban-dispatcher'", (tid,)).fetchone()[0] == 2
++    head = svc.board('default')['seq']
++    assert retirement.sweep(conn) == 0
++    roundtrip(path, svc)
++    assert svc.board('default')['seq'] == head
++
++
++def test_foreign_copy_and_changed_ownership_are_not_repaired(live):
++    conn, _path, _svc = live
++    tid = kb.create_task(conn, title='ordinary work', assignee='default')
++    conn.execute("UPDATE tasks SET model_override='grok-4.6',provider_override='xai-oauth',model_pin_mandatory=1,body='require_model: true' WHERE id=?", (tid,))
++    snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    # Simulate a foreign retained executor copy, including ownership changing after selection.
++    conn.execute('UPDATE tasks SET created_on=? WHERE id=?', ('other-gateway', tid))
++    before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    assert retirement.sweep(conn) == 0
++    assert not retirement.retire_selectors(conn, snapshot)
++    assert not retirement.retire_body(conn, snapshot)
++    assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == before
+-- 
+2.43.0
+

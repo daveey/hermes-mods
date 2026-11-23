@@ -1,0 +1,178 @@
+From 7cf4b672595233f36d7fa98f196c242277cef181 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 10:43:20 +0000
+Subject: [PATCH] fix(workers): retain inline quota recovery when fast
+ selection fails [daveey]
+
+A failed boot killed its recovery daemon and marked recovery attempted despite skipping it. Deferral was also provider-agnostic. Retry ordinary inline selection for a typed Codex wall before one completion recovery; preserve Anthropic recovery and leave non-quota errors unmarked. Tests previously substituted None/RuntimeError for the real typed wall and joined recovery manually, hiding process lifetime. Five new regressions fail on previous head, including short-lived process persistence; 157 consumer files pass 1564 tests, 13 skipped, full 21 checks green. Initial wider unchanged-pool sweep timed out with an OAuth cadence failure; not claimed green. No receipt/RPC fences changed.
+---
+ agent/codex_boot_recovery.py                  | 15 +++-
+ agent/managed_worker.py                       | 23 +++--
+ .../test_codex_boot_recovery_fallback.py      | 83 +++++++++++++++++++
+ 3 files changed, 111 insertions(+), 10 deletions(-)
+ create mode 100644 tests/agent/test_codex_boot_recovery_fallback.py
+
+diff --git a/agent/codex_boot_recovery.py b/agent/codex_boot_recovery.py
+index 80d65e15c3..8805981455 100644
+--- a/agent/codex_boot_recovery.py
++++ b/agent/codex_boot_recovery.py
+@@ -1,8 +1,9 @@
+ """Keep exhausted Codex recovery off managed Kanban construction's critical path.
+ 
+-A boot never promotes an exhausted row from missing evidence. Recovery runs on a
+-separately loaded pool after construction, using the ordinary generation-aware
+-persistence path; no shared positive evidence or live agent pool is mutated.
++A boot never promotes an exhausted row from missing evidence. With a usable peer,
++recovery runs on a separately loaded pool after construction. If selection raises
++a typed Codex quota wall, construction restores ordinary inline recovery before
++failing; daemon lifetime is never the only recovery path for an empty pool.
+ """
+ from __future__ import annotations
+ 
+@@ -24,6 +25,14 @@ def defer_recovery() -> bool:
+     return True
+ 
+ 
++def resume_inline_recovery() -> None:
++    """No usable credential: do not rely on a daemon surviving failed boot."""
++    pending = _pending.get()
++    if pending is not None:
++        pending.clear()
++    _pending.set(None)
++
++
+ def recovery_deferred() -> bool:
+     return bool(_pending.get())
+ 
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 025cf8a442..e1110cb027 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -470,19 +470,28 @@ def _construct_agent(frame, factory, policy, **kwargs):
+     """Agent construction resolves the provider credentials; a Kanban attempt that fails here
+     still books the one-shot exit mapping (quota wall 75, re-login 78) before the crash."""
+     from gateway.session_worker_construct import worker_route
+-    from hermes_cli.kanban_quota_recovery import recover_exception
+-    from agent.codex_boot_recovery import construction_scope, recovery_deferred
++    from hermes_cli.kanban_quota_recovery import quota_exception, recover_exception
++    from agent.codex_boot_recovery import construction_scope, recovery_deferred, resume_inline_recovery
+     kanban = json.loads(frame['policy'].get('kanban_json') or 'null') is not None
++    probed = False
+     with construction_scope(kanban):
+-        for attempt in range(2):
++        for _ in range(3):  # fast selection, ordinary selection, one completion-proof retry
+             try:
+                 return factory(**{**kwargs, **worker_route(policy, kwargs)})
+             except Exception as exc:
+-                if kanban:
+-                    healed = attempt == 0 and not recovery_deferred() and recover_exception(exc)
+-                    exc._kanban_quota_probe_attempted = True
+-                    if healed:
++                wall = quota_exception(exc)
++                if kanban and wall is not None:
++                    if wall.provider == 'openai-codex' and recovery_deferred():
++                        resume_inline_recovery()
+                         continue
++                    if not probed:
++                        probed = True
++                        healed = recover_exception(exc)
++                        exc._kanban_quota_probe_attempted = True
++                        if healed:
++                            continue
++                    else:
++                        exc._kanban_quota_probe_attempted = True
+                 from gateway.session_kanban import record_start_failure
+                 record_start_failure(frame, exc)
+                 raise
+diff --git a/tests/agent/test_codex_boot_recovery_fallback.py b/tests/agent/test_codex_boot_recovery_fallback.py
+new file mode 100644
+index 0000000000..2d6ca633c8
+--- /dev/null
++++ b/tests/agent/test_codex_boot_recovery_fallback.py
+@@ -0,0 +1,83 @@
++"""A failed fast selection must retain inline, provider-scoped recovery."""
++import time
++
++import pytest
++
++from agent import codex_boot_recovery as boot
++from agent.credential_pool import load_pool
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from hermes_cli import auth_codex
++from tests.agent.test_codex_boot_recovery import construct, setup_pool as pool_fixture
++from tests.hermes_cli.test_auth_codex_quota_probe import _StubClient, _StubResponse
++
++
++@pytest.fixture
++def setup_pool(tmp_path, monkeypatch):
++    return pool_fixture.__wrapped__(tmp_path, monkeypatch)
++
++
++def test_sole_exhausted_account_recovers_before_worker_exit(setup_pool, monkeypatch):
++    calls = []
++    monkeypatch.setattr(auth_codex, '_codex_http_client', lambda **kw: _StubClient(
++        calls, _StubResponse(200, {'rate_limit': {'primary_window': {
++            'used_percent': 0, 'reset_at': time.time() + 86400 * 30}}})))
++    def factory(**kw):
++        selected = load_pool('openai-codex').select()
++        if selected is None:
++            raise SubscriptionQuotaUnavailable('openai-codex', 'fixture', time.time() + 3600)
++        return selected
++    selected = construct(factory)
++    assert selected.last_status == 'ok'
++    assert len(calls) == 1
++    assert load_pool('openai-codex').select().id == selected.id
++
++
++@pytest.mark.parametrize('provider', ['anthropic', 'openai-codex'])
++def test_typed_wall_retains_completion_recovery(setup_pool, monkeypatch, provider):
++    monkeypatch.setattr(boot, '_start', lambda ctx: None)
++    calls = []
++    wall = SubscriptionQuotaUnavailable(provider, 'fixture', time.time() + 3600)
++    def recovery(exc):
++        calls.append(exc)
++        return False
++    monkeypatch.setattr('hermes_cli.kanban_quota_recovery.recover_exception', recovery)
++    def factory(**kw):
++        boot.defer_recovery()
++        raise wall
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        construct(factory)
++    assert calls == [wall]
++    assert wall._kanban_quota_probe_attempted is True
++
++
++def test_recovery_survives_short_lived_process(tmp_path):
++    import subprocess
++    import sys
++    code = '''
++from pathlib import Path
++import sys
++import pytest
++from tests.agent.test_codex_boot_recovery_fallback import (
++    setup_pool, test_sole_exhausted_account_recovers_before_worker_exit,
++)
++with pytest.MonkeyPatch.context() as patch:
++    fixture = setup_pool.__wrapped__(Path(sys.argv[1]), patch)
++    test_sole_exhausted_account_recovers_before_worker_exit(fixture, patch)
++'''
++    result = subprocess.run([sys.executable, '-c', code, str(tmp_path)],
++                            capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    import json
++    row = json.loads((tmp_path / 'home' / 'auth.json').read_text())
++    assert row['credential_pool']['openai-codex'][0]['last_status'] == 'ok'
++
++
++def test_nonquota_failure_is_not_marked_as_probed(setup_pool, monkeypatch):
++    monkeypatch.setattr(boot, '_start', lambda ctx: None)
++    error = RuntimeError('construction error')
++    def factory(**kw):
++        boot.defer_recovery()
++        raise error
++    with pytest.raises(RuntimeError):
++        construct(factory)
++    assert not getattr(error, '_kanban_quota_probe_attempted', False)
+-- 
+2.43.0
+

@@ -1,0 +1,154 @@
+From 7125349844376935d8c04e1c05176bfc2b0bb78e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:44:29 +0000
+Subject: [PATCH] test(lease): tie contended-admission tests to the observed
+ busy report; cover an unreadable claim
+
+---
+ .../test_contended_admission_retarget.py      | 72 +++++++++++++++----
+ 1 file changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/tests/agent/test_contended_admission_retarget.py b/tests/agent/test_contended_admission_retarget.py
+index 07d02dc3e1..44cb8dc2e2 100644
+--- a/tests/agent/test_contended_admission_retarget.py
++++ b/tests/agent/test_contended_admission_retarget.py
+@@ -72,20 +72,39 @@ def compressed(tmp_path):
+ 
+ 
+ class busy_writer:
+-    """Hold the store's write lock past the acquire's write patience, then commit."""
++    """Hold the store's write lock until the admission's acquire has reported the busy store, then
++    commit. Tied to that report, not to a sleep, so a slow runner cannot admit uncontended and pass
++    without reaching the reload; ``contended`` is asserted by every test that depends on it."""
+ 
+-    def __init__(self, path, hold=1.5):
++    def __init__(self, path, monkeypatch):
+         self.conn = sqlite3.connect(path, timeout=0.1, check_same_thread=False)
+         self.conn.isolation_level = None
+-        self.timer = threading.Timer(hold, lambda: self.conn.execute("COMMIT"))
++        self.contended = threading.Event()
++        self.held = False
++        real = SessionDB.acquire_session_turn_lease
++
++        def acquire(db, session_id, holder, *, on_contended=None, **kwargs):
++            def reported():
++                self.contended.set()
++                self.commit()
++                if on_contended is not None:
++                    on_contended()
++            return real(db, session_id, holder, on_contended=reported, **kwargs)
++
++        monkeypatch.setattr(SessionDB, "acquire_session_turn_lease", acquire)
++
++    def commit(self):
++        if self.held:
++            self.held = False
++            self.conn.execute("COMMIT")
+ 
+     def __enter__(self):
+         self.conn.execute("BEGIN IMMEDIATE")
+-        self.timer.start()
++        self.held = True
+         return self
+ 
+     def __exit__(self, *_exc):
+-        self.timer.join()
++        self.commit()
+         self.conn.close()
+ 
+ 
+@@ -140,13 +159,14 @@ def test_uncontended_admission_keeps_id_and_persists(plain):
+     assert lease_rows(path) == []
+ 
+ 
+-def test_contended_admission_stays_on_the_claimed_key(plain):
++def test_contended_admission_stays_on_the_claimed_key(plain, monkeypatch):
+     """Was: SessionTurnLeaseLostError (missing lease row) on the admitted owner's first flush."""
+     db, path = plain
+     agent = Agent(db, "root")
+     context = {"platform": "desktop", "session_id": "root"}
+-    with busy_writer(path):
++    with busy_writer(path, monkeypatch) as writer:
+         admission = admit(agent, "root", context)
++    assert writer.contended.is_set()
+     lease = admission.lease
+     try:
+         assert lease_rows(path) == [("root", lease.holder)]
+@@ -166,13 +186,14 @@ def test_contended_admission_stays_on_the_claimed_key(plain):
+         flush(db, "root", lease.holder, "after release")
+ 
+ 
+-def test_contended_admission_follows_a_compression_child(compressed):
++def test_contended_admission_follows_a_compression_child(compressed, monkeypatch):
+     """Same lease key: the redirect to the continuation still happens and the owner persists there."""
+     db, path = compressed
+     agent = Agent(db, "root")
+     context = {"platform": "desktop", "session_id": "root"}
+-    with busy_writer(path):
++    with busy_writer(path, monkeypatch) as writer:
+         admission = admit(agent, "root", context)
++    assert writer.contended.is_set()
+     lease = admission.lease
+     try:
+         assert lease_rows(path) == [("root", lease.holder)]
+@@ -187,11 +208,12 @@ def test_contended_admission_follows_a_compression_child(compressed):
+         flush(db, "child", lease.holder, "after release")
+ 
+ 
+-def test_non_owners_still_refuse(plain):
++def test_non_owners_still_refuse(plain, monkeypatch):
+     db, path = plain
+     first = Agent(db, "root")
+-    with busy_writer(path):
++    with busy_writer(path, monkeypatch) as writer:
+         old = admit(first, "root").lease
++    assert writer.contended.is_set()
+     old.release()
+     with pytest.raises(SessionTurnLeaseLostError):  # released
+         flush(db, "root", old.holder, "released")
+@@ -209,6 +231,31 @@ def test_non_owners_still_refuse(plain):
+     assert contents(path, "root") == ["first", "successor"]
+ 
+ 
++def test_unreadable_claim_ends_the_turn_and_releases(plain, monkeypatch):
++    """A store that refuses the claim read for the resume target (the scoped worker store answers
++    ``permission_denied`` for any id but its own) ends the turn at admission: the admitted row is
++    released, the agent is not moved, nothing is written. Modelled on ``SessionDB`` with that one
++    refusal; ``RuntimeSessionStore`` itself is not exercised here."""
++    db, path = plain
++    real = SessionDB.session_turn_lease_expires_at
++
++    def scoped(self, session_id, holder):
++        if session_id != "root":
++            raise PermissionError("permission_denied")
++        return real(self, session_id, holder)
++
++    monkeypatch.setattr(SessionDB, "session_turn_lease_expires_at", scoped)
++    agent = Agent(db, "root")
++    context = {"platform": "desktop", "session_id": "root"}
++    with busy_writer(path, monkeypatch) as writer:
++        with pytest.raises(PermissionError, match="permission_denied"):
++            admit(agent, "root", context)
++    assert writer.contended.is_set()
++    assert (agent.session_id, context["session_id"]) == ("root", "root")
++    assert lease_rows(path) == []
++    assert contents(path, "root") == ["first"] and contents(path, "child") == ["newer"]
++
++
+ def test_managed_turn_persists_after_contended_admission(plain, monkeypatch):
+     """Through ``AIAgent.run_conversation``: admission, the loop's guarded flush, release."""
+     db, path = plain
+@@ -233,8 +280,9 @@ def test_managed_turn_persists_after_contended_admission(plain, monkeypatch):
+ 
+     monkeypatch.setattr("agent.conversation_loop.run_conversation", loop)
+     monkeypatch.setattr("agent.relay_cwd.resolve_relay_scope_cwds", lambda *_a, **_k: ("", ""))
+-    with busy_writer(path):
++    with busy_writer(path, monkeypatch) as writer:
+         result = AIAgent.run_conversation(agent, "new message", conversation_history=[])
++    assert writer.contended.is_set()  # the reload ran: without the fix this turn moved to "child"
+     assert result["final_response"] == "ok"
+     assert seen["session_id"] == "root" and seen["written"] == 1
+     assert seen["rows"] == [("root", seen["holder"])]
+-- 
+2.43.0
+

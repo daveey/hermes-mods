@@ -1,0 +1,199 @@
+From 67b383b4d0e6b0e6fa289c64479a452da9394c7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:30:29 +0000
+Subject: [PATCH] test(kanban): harden retirement custody and CAS proofs
+ [daveey]
+
+Fail closed on identity-incomplete synced stores; use keyset ranges instead of sorting a computed cursor key. Cover each selector CAS atom, a second-connection set-model at the transaction boundary, committed notification readback, all supported line separators and missing synced identity.
+
+Proof: 42 focused tests pass. Exact-anchor mutation baseline passes; 16 guard mutations killed, covering all selector CAS atoms, terminal/home/body custody, class/auto preservation, mandatory state, missing identity, dry dispatch, rotation and body evidence. Canonical review and required CI remain mandatory.
+---
+ hermes_cli/kanban_db_edit.py                  |  8 ++-
+ hermes_cli/kanban_model_retirement.py         | 21 +++++--
+ .../test_kanban_model_retirement.py           | 57 +++++++++++++++++++
+ .../test_kanban_model_retirement_sync.py      | 13 +++++
+ website/docs/user-guide/configuration.md      |  2 +-
+ 5 files changed, 93 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 4b1104b26f..04e21a43b1 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -14,8 +14,8 @@ _UNSET = object()
+ def _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only):
+     """Recheck maintenance custody and body CAS under edit_task's write transaction."""
+     if home_open_only:
+-        from hermes_cli.kanban_wake_check import foreign_copy
+-        if status in ('done', 'archived') or foreign_copy(conn, task_id):
++        from hermes_cli.kanban_model_retirement import owns_policy
++        if status in ('done', 'archived') or not owns_policy(conn, task_id):
+             return False
+     if expected_body is not _UNSET:
+         stored = conn.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
+@@ -102,7 +102,9 @@ def edit_task(
+     ``priority_reason`` is given, and :class:`PriorityRaisePacedRefused` when it is above the stored
+     value of a ready card the LLM pacing governor holds; the check runs inside the write transaction, so a
+     stale read can't slip past it. ``priority_reason`` lands in the ``reprioritized``
+-    event payload. [daveey]
++    event payload. Maintenance callers can supply ``expected_body`` for an
++    exact stored-body CAS, ``home_open_only`` to recheck nonterminal home custody,
++    and ``audit_comment`` to append an explanation in the same transaction. [daveey]
+     """
+     from hermes_cli.kanban_model_neutral import validate_text
+     validate_text(title, body)
+diff --git a/hermes_cli/kanban_model_retirement.py b/hermes_cli/kanban_model_retirement.py
+index b58e596caa..37608bd5f7 100644
+--- a/hermes_cli/kanban_model_retirement.py
++++ b/hermes_cli/kanban_model_retirement.py
+@@ -20,6 +20,14 @@ PREFIX = 'Historical run instruction (superseded and not active): '
+ _scan_cursor: dict[str, str] = {}
+ 
+ 
++def owns_policy(conn, task_id):
++    """Legacy unsynced files are local; identity-incomplete synced files fail closed."""
++    if own_gateway(conn) is None and conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone():
++        return False
++    return not foreign_copy(conn, task_id)
++
++
+ def retire_selectors(conn, row):
+     """CAS the exact stored selector triple, leaving concurrent supported edits intact."""
+     old = tuple(row[field] for field in FIELDS)
+@@ -29,7 +37,7 @@ def retire_selectors(conn, row):
+     if old == new:
+         return False
+     with kb.write_txn(conn):
+-        if foreign_copy(conn, row['id']):
++        if not owns_policy(conn, row['id']):
+             return False
+         cur = conn.execute(
+             "UPDATE tasks SET model_override=?,provider_override=?,model_pin_mandatory=? "
+@@ -79,11 +87,16 @@ def sweep(conn, *, limit=64):
+     key = str(_main_db_file(conn))
+     own = own_gateway(conn)
+     owner_sql = ' AND (created_on IS NULL OR created_on=?)' if own else ''
+-    rows = conn.execute(
++    query = (
+         "SELECT id,body,model_override,provider_override,model_pin_mandatory FROM tasks "
+         "WHERE status IN ('todo','triage','ready','scheduled','blocked','running','review')" + owner_sql
+-        + ' ORDER BY (id <= ?), id LIMIT ?',
+-        (*((own,) if own else ()), _scan_cursor.get(key, ''), max(0, min(limit, 256)))).fetchall()
++        + ' AND id {} ? ORDER BY id LIMIT ?')
++    size = max(0, min(limit, 256))
++    cursor = _scan_cursor.get(key, '')
++    params = (own,) if own else ()
++    rows = conn.execute(query.format('>'), (*params, cursor, size)).fetchall()
++    if len(rows) < size:
++        rows += conn.execute(query.format('<='), (*params, cursor, size - len(rows))).fetchall()
+     changed = 0
+     for row in rows:
+         _scan_cursor[key] = row['id']
+diff --git a/tests/hermes_cli/test_kanban_model_retirement.py b/tests/hermes_cli/test_kanban_model_retirement.py
+index 500a594198..777250971f 100644
+--- a/tests/hermes_cli/test_kanban_model_retirement.py
++++ b/tests/hermes_cli/test_kanban_model_retirement.py
+@@ -94,6 +94,63 @@ def test_body_exact_line_roundtrip_and_supported_edit(board, monkeypatch):
+         assert sweep(conn) == 0
+ 
+ 
++@pytest.mark.parametrize('field,new', [('model_override', 'different-model'), ('provider_override', 'auto'), ('model_pin_mandatory', None)])
++def test_each_exact_selector_cas_atom(board, field, new):
++    from hermes_cli.kanban_model_retirement import retire_selectors
++    with kbc.connect() as conn:
++        tid = seed(conn)
++        snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        conn.execute(f'UPDATE tasks SET {field}=? WHERE id=?', (new, tid))
++        assert not retire_selectors(conn, snapshot)
++        assert conn.execute(f'SELECT {field} FROM tasks WHERE id=?', (tid,)).fetchone()[0] == new
++
++
++def test_second_connection_wins_at_transaction_boundary(board, monkeypatch):
++    from contextlib import contextmanager
++    from hermes_cli.kanban_model_retirement import retire_selectors
++    with kbc.connect() as conn, kbc.connect() as other:
++        tid = seed(conn)
++        snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        original = kb.write_txn
++        injected = []
++        @contextmanager
++        def race(c, **kwargs):
++            if c is conn and not injected:
++                injected.append(True)
++                kb.set_model_override(other, tid, 'class:deep', 'auto')
++            with original(c, **kwargs):
++                yield
++        monkeypatch.setattr(kb, 'write_txn', race)
++        assert not retire_selectors(conn, snapshot)
++        assert injected
++        assert kb.get_task(conn, tid).model_override == 'class:deep'
++
++
++def test_notify_observes_committed_row_and_audit(board, monkeypatch):
++    import sqlite3
++    with kbc.connect() as conn:
++        tid = seed(conn, body='require_model: true')
++        seen = []
++        def observe(c, task, fields, **kwargs):
++            assert task == tid
++            assert not c.in_transaction
++            with sqlite3.connect('file:' + str(kbc._main_db_file(c)) + '?mode=ro', uri=True) as reader:
++                assert reader.execute('SELECT model_override FROM tasks WHERE id=?', (task,)).fetchone()[0] is None
++                assert reader.execute('SELECT COUNT(*) FROM task_comments WHERE task_id=?', (task,)).fetchone()[0] >= 1
++            seen.append(tuple(fields))
++        monkeypatch.setattr(kb, 'notify_task_updated', observe)
++        assert sweep(conn) == 1
++        assert len(seen) == 2
++
++
++@pytest.mark.parametrize('ending', ['\n', '\r\n', '\r', '\v', '\f', '\x1c', '\x1d', '\x1e', '\x85', '\u2028', '\u2029', ''])
++def test_all_body_line_endings_and_preexisting_evidence(ending):
++    from hermes_cli.kanban_model_retirement import retired_body
++    accepted = PREFIX + json.dumps('Use only grok-4.6.') + '\nuntouched λ  \n'
++    source = accepted + 'Use only grok-4.6. λ  ' + ending
++    assert retired_body(source) == accepted + PREFIX + json.dumps('Use only grok-4.6. λ  ', ensure_ascii=False) + ending
++
++
+ def test_cas_concurrent_set_model_wins(board):
+     from hermes_cli.kanban_model_retirement import retire_selectors
+     with kbc.connect() as conn:
+diff --git a/tests/hermes_cli/test_kanban_model_retirement_sync.py b/tests/hermes_cli/test_kanban_model_retirement_sync.py
+index abbcd2d8ff..bf2a5a7e81 100644
+--- a/tests/hermes_cli/test_kanban_model_retirement_sync.py
++++ b/tests/hermes_cli/test_kanban_model_retirement_sync.py
+@@ -56,6 +56,19 @@ def test_policy_field_clocks_and_replica_readback(live):
+     assert svc.board('default')['seq'] == head
+ 
+ 
++def test_synced_missing_identity_fails_closed(live):
++    conn, _path, _svc = live
++    tid = kb.create_task(conn, title='ordinary work', assignee='default')
++    conn.execute("UPDATE tasks SET model_override='grok-4.6',body='require_model: true' WHERE id=?", (tid,))
++    snapshot = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    conn.execute('DELETE FROM kanban_sync_state')
++    assert retirement.sweep(conn) == 0
++    assert not retirement.retire_selectors(conn, snapshot)
++    assert not retirement.retire_body(conn, snapshot)
++    assert kb.get_task(conn, tid).model_override == 'grok-4.6'
++    assert kb.get_task(conn, tid).body == 'require_model: true'
++
++
+ def test_foreign_copy_and_changed_ownership_are_not_repaired(live):
+     conn, _path, _svc = live
+     tid = kb.create_task(conn, title='ordinary work', assignee='default')
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 5f2062ae5e..56f5884c6c 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3760,7 +3760,7 @@ kanban:
+ 
+ Kanban requirements select a class/tier or capability, never an exclusive concrete model or provider. `kanban_create(model="class:deep", provider="auto")` and `hermes kanban create --model class:deep --provider auto` request a class; leaving the selector unset uses dynamic default routing. Concrete IDs, concrete providers, mandatory flags, positive `require_model` directives and named-model mandates are rejected at mutation boundaries, including review handoffs. Interactive chat model selection is unchanged.
+ 
+-Legacy and synced concrete restrictions are ignored for future admission, without changing a running agent's client or rewriting its concrete execution receipts. Clear stored restrictions with `hermes kanban set-model <id> none --no-mandatory`; this affects future dispatch only. The dispatcher dynamically chooses a qualified reviewer in a genuinely separate execution/session with authenticated exact-head approval custody. Model attribution is audit history, not an exclusion: the same model may perform an independent review in a separate execution. No eligible route or missing execution/approval custody must fail closed, not be worked around by pinning a reviewer. Subscription reserve, quota, billing, capability and safety gates remain in force. A concrete chosen route in a current-run receipt is execution evidence, not a persistent card restriction.
++Legacy and synced concrete restrictions are ignored for future admission, without changing a running agent's client or rewriting its concrete execution receipts. Each non-dry dispatcher tick also retires stored restrictions on up to 64 open cards belonging to that gateway (including running and review cards), rotating through the board. Class selectors and `auto` providers remain; concrete selectors/providers and mandatory-pin flags are cleared with an audit event and dispatcher comment. Done/archived cards and foreign executor copies are not edited. Refused body lines alone become `Historical run instruction (superseded and not active): <JSON string>` evidence, preserving every other byte and the original line endings. The ordinary field-level sync path propagates these edits to replicas. Concurrent supported edits win the retirement compare-and-swap. Operators can also clear stored restrictions with `hermes kanban set-model <id> none --no-mandatory`; worker shells remain write-fenced. These edits affect future dispatch only. The dispatcher dynamically chooses a qualified reviewer in a genuinely separate execution/session with authenticated exact-head approval custody. Model attribution is audit history, not an exclusion: the same model may perform an independent review in a separate execution. No eligible route or missing execution/approval custody must fail closed, not be worked around by pinning a reviewer. Subscription reserve, quota, billing, capability and safety gates remain in force. A concrete chosen route in a current-run receipt is execution evidence, not a persistent card restriction.
+ 
+ `kanban.pin_quota_reroute_min_hours` (default `6`) remains a legacy compatibility setting for the old concrete-pin reroute helper's wall threshold. Model-neutral admission ignores legacy concrete pins before route selection, so this threshold does not delay or restrict dynamic class selection and cannot restore mandatory model routing. Do not set a concrete task selector to use this compatibility helper.
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,204 @@
+From 93e128d2b9f3c7d16e460caad7efe2f31625dd1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:31:28 +0000
+Subject: [PATCH] [daveey] Separate audited ended-run retain refusals from
+ replica drift
+
+A definitively rejected retain intent cannot be applied retention. Keep outbox and immutable custody unchanged while allowing converged replicas to be clean only when exact frozen request identity/digest and both closed original runs prove the rejection. Missing or conflicting custody and any ordinary row drift remain fail closed. RED: 15 passed, integration clean assertion failed on base. GREEN: sync and retain suites plus full scripts/check.
+---
+ hermes_cli/kanban_sync_client.py              |  13 ++-
+ hermes_cli/kanban_sync_retain_drift.py        |  40 +++++++
+ .../test_kanban_sync_retain_drift.py          | 101 ++++++++++++++++++
+ 3 files changed, 150 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_retain_drift.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_retain_drift.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 265d0fb0ac..9a607408fc 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1823,7 +1823,8 @@ def _child_uids(conn: sqlite3.Connection, table: str, task_ids: set[str],
+ 
+ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, Any]:
+     """This gateway's live cards against the shadow copy of the service. Rows with an unanswered local edit are
+-    reported as pending, not as differences; rejected outbox rows are differences until fixed."""
++    reported as pending, not as differences. Exact audited retain refusals for ended runs remain
++    visible command audits, not replica mutations; all other rejected writes remain differences."""
+     pending_tasks = {r[0] for r in live.execute(
+         "SELECT DISTINCT CASE WHEN table_name = 'tasks' THEN row_uid ELSE json_extract(fields, '$.task_id') END "
+         "FROM kanban_sync_outbox WHERE state = 'pending'")}
+@@ -1853,11 +1854,15 @@ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) ->
+         n = len(lv ^ sh)
+         if n:
+             children[table] = n
+-    rejected = live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()[0]
+-    clean = not (missing or extra or fields or children or rejected)
++    from hermes_cli.kanban_sync_retain_drift import audited_rejection
++    rejected_rows = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE state = 'rejected'")]
++    audits = [r['op_id'] for r in rejected_rows if audited_rejection(live, shadow, r)]
++    rejected = len(rejected_rows)
++    clean = not (missing or extra or fields or children or rejected - len(audits))
+     return {"clean": clean, "checked": len(checked), "pending": len(pending_tasks & set(live_tasks)),
+             "missing_in_shadow": missing, "extra_in_shadow": extra, "field_mismatch": fields,
+-            "child_mismatch": children, "rejected_ops": rejected, "foreign_cards": foreign}
++            "child_mismatch": children, "rejected_ops": rejected, "foreign_cards": foreign,
++            "audited_retain_rejections": audits}
+ 
+ 
+ def repair_missing_children(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> None:
+diff --git a/hermes_cli/kanban_sync_retain_drift.py b/hermes_cli/kanban_sync_retain_drift.py
+new file mode 100644
+index 0000000000..304a8ef3a6
+--- /dev/null
++++ b/hermes_cli/kanban_sync_retain_drift.py
+@@ -0,0 +1,40 @@
++"""Read-only separation of rejected retain audit from replica drift. [daveey]
++
++No transport retirement, retention confirmation, or custody/fence change occurs.
++The original run must be closed on both copies; ordinary row diff still gates clean.
++"""
++from __future__ import annotations
++
++import hashlib
++import sqlite3
++
++
++def audited_rejection(live: sqlite3.Connection, shadow: sqlite3.Connection, op: dict) -> bool:
++    """Fail closed unless immutable custody attests this definitive rejection."""
++    from hermes_cli.kanban_retain_transport import canonical, command, frozen_wire
++
++    if (op.get('op') != 'retain' or op.get('table_name') != 'tasks'
++            or op.get('state') != 'rejected' or op.get('last_error') != 'missing_decision_episode'):
++        return False
++    try:
++        wire = frozen_wire(op)
++        owned = command(live, wire.get('run_uid'))
++        text = canonical(wire)
++        if (not owned or owned.get('operation_kind') != 'retain'
++                or owned.get('delivery_state') != 'rejected' or owned.get('canonical_receipt_json') is not None
++                or owned.get('op_id') != op['op_id'] or owned.get('request_uid') != op['op_id']
++                or owned.get('task_id') != op['row_uid'] or owned.get('event_uid') != wire.get('event_uid')
++                or not owned.get('event_uid') or owned.get('request_json') != text
++                or owned.get('request_sha256') != hashlib.sha256(text.encode('utf-8')).hexdigest()):
++            return False
++        for conn in (live, shadow):
++            run = conn.execute('SELECT id,task_id,ended_at FROM task_runs WHERE uid=?',
++                               (wire['run_uid'],)).fetchone()
++            task = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (op['row_uid'],)).fetchone()
++            if (run is None or run['task_id'] != op['row_uid'] or run['ended_at'] is None
++                    or task is None or task['current_run_id'] == run['id']):
++                return False
++        return True
++    except (ValueError, TypeError, KeyError, sqlite3.Error):
++        # Legacy schema, malformed custody, or unavailable proof is not settlement.
++        return False
+diff --git a/tests/hermes_cli/test_kanban_sync_retain_drift.py b/tests/hermes_cli/test_kanban_sync_retain_drift.py
+new file mode 100644
+index 0000000000..ab422af7f8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_retain_drift.py
+@@ -0,0 +1,101 @@
++"""Rejected intent is not an applied retain or a replica mutation. [daveey]"""
++import hashlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_sync_retain_drift as drift
++
++
++@pytest.fixture
++def stores():
++    live, shadow = (sqlite3.connect(':memory:') for _ in range(2))
++    for conn in (live, shadow):
++        conn.row_factory = sqlite3.Row
++        conn.executescript('''
++            CREATE TABLE tasks(id TEXT, current_run_id INTEGER);
++            CREATE TABLE task_runs(id INTEGER, uid TEXT, task_id TEXT, ended_at INTEGER);
++            INSERT INTO tasks VALUES ('t_card', NULL);
++            INSERT INTO task_runs VALUES (1, 'run', 't_card', 123);
++        ''')
++    live.execute('''CREATE TABLE kanban_failure_commands(
++        run_uid TEXT, task_id TEXT, op_id TEXT, operation_kind TEXT,
++        request_uid TEXT, event_uid TEXT, request_json TEXT, request_sha256 TEXT,
++        delivery_state TEXT, canonical_receipt_json TEXT)''')
++    wire = dict(op='retain', client_op_id='op', task='t_card', run_uid='run', event_uid='event')
++    text = json.dumps(wire, sort_keys=True, separators=(',', ':'))
++    live.execute('INSERT INTO kanban_failure_commands VALUES (?,?,?,?,?,?,?,?,?,?)',
++                 ('run', 't_card', 'op', 'retain', 'op', 'event', text,
++                  hashlib.sha256(text.encode()).hexdigest(), 'rejected', None))
++    op = dict(op_id='op', row_uid='t_card', table_name='tasks', op='retain',
++              state='rejected', last_error='missing_decision_episode', fields=text)
++    yield live, shadow, op
++    live.close()
++    shadow.close()
++
++
++def test_exact_rejection_is_diagnostic_only(stores):
++    live, shadow, op = stores
++    before = list(live.iterdump())
++    assert drift.audited_rejection(live, shadow, op)
++    assert list(live.iterdump()) == before
++
++
++@pytest.mark.parametrize('change', [
++    'unknown', 'receipt', 'digest', 'wire', 'request', 'event', 'task',
++    'live_run', 'shadow_run', 'active', 'shadow_active', 'reason', 'operation', 'missing_custody',
++])
++def test_incomplete_or_conflicting_proof_fails_closed(stores, change):
++    live, shadow, op = stores
++    sql_changes = {
++        'unknown': (live, "UPDATE kanban_failure_commands SET delivery_state='unknown'"),
++        'receipt': (live, "UPDATE kanban_failure_commands SET canonical_receipt_json='{}'"),
++        'digest': (live, "UPDATE kanban_failure_commands SET request_sha256='bad'"),
++        'request': (live, "UPDATE kanban_failure_commands SET request_uid='other'"),
++        'event': (live, "UPDATE kanban_failure_commands SET event_uid='other'"),
++        'task': (live, "UPDATE kanban_failure_commands SET task_id='other'"),
++        'live_run': (live, 'UPDATE task_runs SET ended_at=NULL'),
++        'shadow_run': (shadow, 'UPDATE task_runs SET ended_at=NULL'),
++        'active': (live, 'UPDATE tasks SET current_run_id=1'),
++        'shadow_active': (shadow, 'UPDATE tasks SET current_run_id=1'),
++        'missing_custody': (live, 'DROP TABLE kanban_failure_commands'),
++    }
++    op_changes = {'wire': {'fields': op['fields'].replace('event', 'other')},
++                  'reason': {'last_error': 'storage_error'}, 'operation': {'op': 'release'}}
++    if change in sql_changes:
++        conn, sql = sql_changes[change]
++        conn.execute(sql)
++    else:
++        op.update(op_changes[change])
++    assert not drift.audited_rejection(live, shadow, op)
++
++
++def test_diff_preserves_audits_and_real_drift(stores):
++    from hermes_cli.kanban_sync_client import diff
++
++    live, shadow, op = stores
++    for conn in (live, shadow):
++        conn.executescript('''
++            ALTER TABLE tasks ADD COLUMN sync_version INTEGER;
++            ALTER TABLE tasks ADD COLUMN created_on TEXT;
++            ALTER TABLE tasks ADD COLUMN title TEXT DEFAULT 'same';
++            CREATE TABLE task_links(parent_id TEXT, child_id TEXT);
++            CREATE TABLE task_comments(task_id TEXT, uid TEXT);
++            CREATE TABLE task_chat_links(task_id TEXT, uid TEXT, chat_gateway TEXT);
++        ''')
++    live.execute('''CREATE TABLE kanban_sync_outbox(op_id TEXT, row_uid TEXT, table_name TEXT,
++                    op TEXT, state TEXT, last_error TEXT, fields TEXT)''')
++    live.execute('INSERT INTO kanban_sync_outbox VALUES (?,?,?,?,?,?,?)',
++                 tuple(op[k] for k in ('op_id', 'row_uid', 'table_name', 'op', 'state', 'last_error', 'fields')))
++    before = list(live.iterdump())
++    report = diff(live, shadow, 'macbook')
++    assert report['clean'], report
++    assert report['rejected_ops'] == 1
++    assert report['audited_retain_rejections'] == ['op']
++    assert list(live.iterdump()) == before
++    shadow.execute("UPDATE tasks SET title='different'")
++    assert not diff(live, shadow, 'macbook')['clean']
++    shadow.execute("UPDATE tasks SET title='same'")
++    live.execute("INSERT INTO kanban_sync_outbox VALUES ('other','t_card','tasks','upsert','rejected','conflict','{}')")
++    assert not diff(live, shadow, 'macbook')['clean']
+-- 
+2.43.0
+

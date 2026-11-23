@@ -1,0 +1,130 @@
+From d271b8e111ddfe7a0624589ecde7f8725c3b4839 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:35:32 +0000
+Subject: [PATCH] [daveey] Record effective script scan scope before recursive
+ traversal
+
+---
+ cron/lifecycle_guard.py                       |  8 ++++-
+ cron/lifecycle_guard_nested_shells.py         | 18 +++++++++++
+ .../test_lifecycle_guard_effective_scope.py   | 32 +++++++++++++++++++
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_effective_scope.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index d756f6cb39..665a38893b 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1674,6 +1674,7 @@ def _contains_unsafe_gateway_action(
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+     source: Optional[str] = None, covered_quote_scope: Optional[tuple] = None,
+     variable_source: bool = True, preserve_cwd: bool = False,
++    visit_identity: Optional[tuple[Path, Optional[str]]] = None,
+ ) -> bool:
+     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
+@@ -1685,6 +1686,9 @@ def _contains_unsafe_gateway_action(
+     if _direct_lifecycle_scan(command, mask_heredocs=budget.mask_heredocs):
+         return True
+     budget.note_aliases(command)
++    from cron.lifecycle_guard_nested_shells import mark_effective_visit
++
++    mark_effective_visit(command, visited, budget, visit_identity, executed=executed)
+     if (refused := _walk_refusal(budget, command, depth, executed)) is not None:
+         return refused
+ 
+@@ -1692,6 +1696,7 @@ def _contains_unsafe_gateway_action(
+         text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
+         nested: bool = False, covered_quotes: Optional[tuple] = None, variable_source: bool = True,
+         preserve_source_cwd: bool = preserve_cwd,
++        visit_identity: Optional[tuple[Path, Optional[str]]] = None,
+     ) -> bool:
+         if python_source:
+             return _python_source_is_unsafe(text, budget)
+@@ -1700,7 +1705,7 @@ def _contains_unsafe_gateway_action(
+                 text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
+                 read_remote_script=read_remote_script, executed=executed, source=source,
+                 covered_quote_scope=covered_quotes, variable_source=variable_source,
+-                preserve_cwd=preserve_source_cwd,
++                preserve_cwd=preserve_source_cwd, visit_identity=visit_identity,
+             )
+ 
+     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+@@ -1786,6 +1791,7 @@ def _contains_unsafe_gateway_action(
+         if any(recurse(
+             script_text, script_working_directory(resolved, cwd, preserve_cwd), candidate_executed,
+             f"`{script_path}`", python_source, nested=nested,
++            visit_identity=(resolved, str(cwd or Path.cwd()) if preserve_cwd else None),
+         ) for nested, _key in scopes):
+             return True
+     return False
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 6d8468f3b6..55447cda57 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -85,6 +85,24 @@ def unvisited_scopes(
+     return [(flag, key) for key, flag in keys.items() if key not in visited]
+ 
+ 
++def mark_effective_visit(command, visited, budget, identity, *, executed):
++    """Register the scope established at a charged script's entry, not its caller's old scope.
++
++    Alias discovery has already run; pre-discover integer declarations before walking any
++    payload so this key describes coverage of the whole script. Later recursive discoveries
++    still require another visit under their genuinely stronger scope.
++    """
++    from cron.lifecycle_guard_arith_words import may_set_integer_attributes
++
++    if identity is None:
++        return
++    budget.integer_context = budget.integer_context or may_set_integer_attributes(
++        command, aliases_defined=budget.aliases_defined)
++    scopes = unvisited_scopes(visited, budget, identity[0], python_source=False,
++                              nested=False, executed=executed, working_directory=identity[1])
++    visited.update(itertools.chain.from_iterable((key, key[:2]) for _nested, key in scopes))
++
++
+ def collect_nested_shell_inputs(
+     command: str, walk_command: str, *, cwd: Optional[str], budget: _LifecycleScanBudget,
+     session_payloads: Sequence[str] = (),
+diff --git a/tests/cron/test_lifecycle_guard_effective_scope.py b/tests/cron/test_lifecycle_guard_effective_scope.py
+new file mode 100644
+index 0000000000..a6f7e42849
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_effective_scope.py
+@@ -0,0 +1,32 @@
++"""Referenced scripts must be keyed by the scope actually used to scan them."""
++import pytest
++
++from cron import lifecycle_guard as guard
++
++
++@pytest.mark.parametrize('declaration', ["alias ll='ls -l'", 'declare -i count',
++                                         "alias ll='ls -l'\ndeclare -i count"])
++@pytest.mark.parametrize('wrapper', ['if [ "$(nice)" -lt 10 ]; then true; fi\n',
++                                     'echo "$(true)"; ', 'true; '])
++def test_substitution_wrapper_does_not_charge_script_twice(tmp_path, monkeypatch, declaration, wrapper):
++    script = tmp_path / 'helper.sh'
++    script.write_text(declaration + '\n' + '# padding\n' * 10)
++    monkeypatch.setattr(guard, '_MAX_LIFECYCLE_SCAN_LINES', 24)
++    command = f'{wrapper}{script} eta'
++    assert guard.scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++def test_effective_visit_retains_distinct_execution_and_later_context(tmp_path):
++    from cron.lifecycle_guard_nested_shells import mark_effective_visit, unvisited_scopes
++
++    budget = guard._LifecycleScanBudget()
++    path = tmp_path / 'helper.sh'
++    visited = set()
++    mark_effective_visit(':', visited, budget, (path, None), executed=False)
++    assert unvisited_scopes(visited, budget, path, python_source=False, nested=False, executed=True)
++    mark_effective_visit(':', visited, budget, (path, None), executed=True)
++    assert not unvisited_scopes(visited, budget, path, python_source=False, nested=False)
++    budget.integer_context = True
++    assert unvisited_scopes(visited, budget, path, python_source=False, nested=False)
++    budget.alias_names = None
++    assert unvisited_scopes(visited, budget, path, python_source=False, nested=False)
+-- 
+2.43.0
+

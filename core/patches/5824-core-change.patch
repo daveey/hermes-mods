@@ -1,0 +1,212 @@
+From 66cb6c5dde90cdea28fdefd63d9834b6d748e5e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:07:41 +0000
+Subject: [PATCH] [daveey] Pin surviving scope-renewal clauses with separating
+ cases
+
+Add named tests for mandate references, writer provenance, late arrivals,
+context body rendering, explicit board/profile selection and refusal messages.
+
+Proof: canonical new clause suite passes (22 cases). Full original450 sweep
+completed:403 killed,46 survived,1 ambiguous anchor. Targeted survivor
+reruns and anchor repair follow before publication; no source change.
+---
+ .../test_kanban_scope_renewal_clauses.py      | 186 ++++++++++++++++++
+ 1 file changed, 186 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_scope_renewal_clauses.py
+
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_clauses.py b/tests/hermes_cli/test_kanban_scope_renewal_clauses.py
+new file mode 100644
+index 0000000000..d4516ea20d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scope_renewal_clauses.py
+@@ -0,0 +1,186 @@
++"""Separating cases for the complete renewal clause sweep, not only review probes."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_scope_renewal_cli as cli
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_scope_renewal as local
++from tests.hermes_cli import test_kanban_scope_renewal_synced as synced
++
++board = local.board
++live = synced.live
++
++
++def renewed(board, monkeypatch):
++    tid, _, episode = local.stopped(board, monkeypatch)
++    local.link(board, tid)
++    cid = local.mandate(board, tid)
++    payload = local.renew(board, tid, episode, cid)
++    return tid, episode, cid, payload
++
++
++def test_context_includes_the_exact_renewed_scope_not_only_the_original_comment(board, monkeypatch):
++    tid, _, _, _ = renewed(board, monkeypatch)
++    text = kb.build_worker_context(board, tid)
++    section = text.split('## Scope renewal mandate', 1)[1].split('\n## ', 1)[0]
++    body = renewal.mandate(board, tid)['body']
++    assert body in section
++
++
++def test_non_ascii_decimal_reference_is_rejected_before_sqlite_integer_conversion(board, monkeypatch):
++    tid, _, _, _ = renewed(board, monkeypatch)
++    assert renewal._comment(board, tid, '١' * 20) is None
++
++
++def test_empty_reference_never_matches_an_empty_uid_comment(live, monkeypatch):
++    hub = synced.Hub({'scope_renewal': 1})
++    tid, _, cid = synced.stopped(live, monkeypatch, hub)
++    with kb.write_txn(live):
++        live.execute('UPDATE task_comments SET uid=? WHERE id=?', ('', cid))
++    assert renewal._comment(live, tid, '') is None
++
++
++def test_falsy_numeric_mandate_ref_never_matches_comment_zero(board, monkeypatch):
++    tid, _, cid, payload = renewed(board, monkeypatch)
++    with kb.write_txn(board):
++        board.execute('UPDATE task_comments SET id=0 WHERE id=?', (cid,))
++        payload['mandate_comment_uid'] = 0
++        board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='scope_renewed'", (json.dumps(payload), tid))
++    assert renewal.renewals(board, tid) == []
++
++
++def test_uidless_mandate_never_uses_a_writer_record_bound_to_a_foreign_uid(board, monkeypatch):
++    tid, _, episode = local.stopped(board, monkeypatch)
++    cid = local.mandate(board, tid, kind='human')
++    with kb.write_txn(board):
++        row = board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='commented'", (tid,)).fetchone()
++        payload = json.loads(row['payload'])
++        payload['comment_uid'] = 'foreign-comment'
++        board.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
++    local.refused(board, tid, episode, cid, 'mandate_unattributable', writer=local.HUMAN)
++
++
++@pytest.mark.parametrize('actor_gateway,event_gateway', [('gateway-a', None), ('', 'gateway-b')])
++def test_human_gateway_comparison_requires_both_gateway_identities(board, monkeypatch, actor_gateway, event_gateway):
++    tid, _, episode = local.stopped(board, monkeypatch)
++    cid = local.mandate(board, tid, kind='human')
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET origin_gateway=? WHERE task_id=? AND kind='commented'", (event_gateway, tid))
++    result = renewal.renew_local(board, tid, episode=episode, comment_id=cid, reason='ok',
++                                 actor=renewal.Actor('human', None, 'human', gateway=actor_gateway))
++    assert result['episode'] == episode
++
++
++def test_late_arriving_stop_is_not_a_promotion_of_a_renewed_stop(board, monkeypatch):
++    tid, episode, _, _ = renewed(board, monkeypatch)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'spend_budget_triaged', {'reason': 'ordinary budget'})
++    ordinary = [dict(r) for r in board.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN "
++                                              "('spend_budget_triaged','promoted_manual','archived')", (tid,))]
++    assert renewal.key(renewal.reopened(board, tid, ordinary)) == episode
++
++
++def test_missing_newer_stop_does_not_hide_an_older_renewed_stop(board, monkeypatch):
++    tid, episode, _, payload = renewed(board, monkeypatch)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'scope_renewed', {**payload, 'episode': 'not-local-yet'})
++    ordinary = [dict(r) for r in board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (tid,))]
++    assert renewal.key(renewal.reopened(board, tid, ordinary)) == episode
++
++
++def test_mandate_disappearing_between_validation_and_context_is_absent(board, monkeypatch):
++    tid, _, cid, _ = renewed(board, monkeypatch)
++    def deleted(conn, task_id):
++        with kb.write_txn(conn):
++            conn.execute('DELETE FROM task_comments WHERE id=?', (cid,))
++        return False
++    monkeypatch.setattr(decision, 'execution_restricted', deleted)
++    assert renewal.mandate(board, tid) is None
++
++
++def test_raw_dictionary_payload_is_preserved():
++    payload = {'cause': 'scope_stopped'}
++    assert renewal._payload(payload) == payload
++
++
++@pytest.mark.parametrize('profile', ['special-profile', None])
++def test_renew_records_active_profile_and_default_fallback(board, monkeypatch, profile):
++    from hermes_cli import profiles
++    tid, _, episode = local.stopped(board, monkeypatch)
++    cid = local.mandate(board, tid, kind='human')
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: profile)
++    result = local.renew(board, tid, episode, cid, writer=local.HUMAN)
++    assert result['actor_profile'] == (profile or 'default')
++
++
++@pytest.mark.parametrize('explicit', [None, 'explicit-board'])
++def test_canonical_request_uses_explicit_board_or_stored_board(live, monkeypatch, explicit):
++    from hermes_cli import kanban_db_sync as sync
++    hub = synced.Hub({'scope_renewal': 1})
++    tid, episode, cid = synced.stopped(live, monkeypatch, hub)
++    seen = []
++    original = hub.ops
++    def ops(board_name, operations):
++        seen.append(board_name)
++        return original(board_name, operations)
++    monkeypatch.setattr(hub, 'ops', ops)
++    cli.renew(live, tid, episode=episode, comment_id=cid, reason='ok', board=explicit,
++              writer=synced.AGENT, env={}, ancestry=[{'HERMES_SESSION_ID': synced.CHAT}])
++    assert seen == [explicit or sync.sync_state(live)['board_id']]
++
++
++@pytest.mark.parametrize('reply,message', [
++    ({'status': 'rejected', 'reason': 'denied', 'detail': 'issuer differs'}, 'the Board refused the renewal: denied: issuer differs'),
++    ({'status': 'deferred'}, 'the Board refused the renewal: no reply'),
++])
++def test_board_refusal_preserves_reason_and_detail(live, monkeypatch, reply, message):
++    hub = synced.Hub({'scope_renewal': 1}, reply)
++    tid, episode, cid = synced.stopped(live, monkeypatch, hub)
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        synced.renew(live, tid, episode, cid)
++    assert str(caught.value) == message
++
++
++def test_sessionless_agent_cannot_use_a_sessionless_owner_link(board, monkeypatch):
++    tid, _, _ = local.stopped(board, monkeypatch)
++    local.link(board, tid, session='')
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        cli.resolve_actor(board, tid, writer=('agent', '', '1:HERMES_AGENT'),
++                          environs=[], gateway='', profile='default')
++    assert caught.value.code == 'identity_unavailable'
++
++
++def test_claimed_stopped_run_session_is_refused_before_ancestry_mismatch(board, monkeypatch):
++    tid, session, _ = local.stopped(board, monkeypatch)
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        cli.resolve_actor(board, tid, writer=('agent', session, '1:HERMES_AGENT'),
++                          environs=[{'HERMES_SESSION_ID': 'other'}], gateway='', profile='default')
++    assert caught.value.code == 'own_run'
++
++
++def test_subscription_for_someone_else_cannot_authorize_this_chat(board, monkeypatch):
++    tid, _, _ = local.stopped(board, monkeypatch)
++    from hermes_cli.kanban_db_notify import add_notify_sub
++    add_notify_sub(board, task_id=tid, platform='tui', chat_id='other',
++                   delivery_metadata={'reason': 'create'})
++    assert cli._owning_sub(board, tid, local.CHAT) is None
++
++
++def test_parser_rejects_nonnumeric_mandate_before_dispatch(board, monkeypatch):
++    tid, _, episode = local.stopped(board, monkeypatch)
++    with pytest.raises(SystemExit) as caught:
++        local.argv(tid, '--episode', episode, '--mandate-comment', 'not-a-number', '--reason', 'ok')
++    assert caught.value.code == 2
++
++
++def test_safety_refusal_retains_its_specific_message(board, monkeypatch):
++    tid, _, episode = local.stopped(board, monkeypatch)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal', 'episode': episode})
++    cid = local.mandate(board, tid, kind='human')
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        local.renew(board, tid, episode, cid, writer=local.HUMAN)
++    assert str(caught.value) == decision.execution_refusal(board, tid)
+-- 
+2.43.0
+

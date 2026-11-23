@@ -1,0 +1,798 @@
+From 67add62f2c4973ecd413623d52487e1dc7551d6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:09:20 +0000
+Subject: [PATCH] [daveey] Read only the annotation parts whose inputs moved;
+ cache board stamps
+
+t_28eb8d66d577eab3. On the hub (serving process, current core) the
+kanban-annotation thread ran at 51% CPU and 17,021 voluntary cs/s, and
+/api/profiles/sessions had p95 1.7-2.1 s.
+
+Annotation holder. _event_refresh set force_read for the whole scope on
+every wake, so each wake recomputed the counts, reprojected the remote
+links and re-ran every done check on every recent done card. The hub's
+watched files are written about 5 times a second (measured: board WALs
+0.3-0.4/s each over 7 boards, kanban.db 1/s, the sync shadow 0.75/s,
+state.db 0.35/s), mostly bookkeeping no reader selects, so with the
+0.25 s coalescing gap the full read ran about 4 times a second.
+
+kanban_annotation_parts takes one key per part before the read and the
+holder forces only the parts whose key moved since their last forced
+read:
+- counts: board and shadow content revisions, origin ledger, plain inputs
+- links: board content revisions, origin ledger, plain inputs
+- attention: board content revisions, files the done checks declared
+Plain inputs (state.db, hub db, config, mutation cue) use
+kanban_annotation_watch.signature. Every part is still forced when a
+provider deadline came due, a board has no content revision and its stat
+is not settled, a done check declared no watch paths, a key is unreadable,
+the previous read failed, or the scope has no holder read yet. The counts
+are also re-read once their last read is STRICT_REFRESH_AGE_S old, so the
+published read_at stays adoptable. force_read.scope alone keeps meaning
+"every part". Waiting sources are not gated: they run on every refresh
+and own their input memo.
+
+Sessions route. stamp_boards opened every board through the lock guard on
+every request (58% of the route's samples, 10% more in the close). It now
+keeps each board's contribution under the board file's change signature,
+read once per request before any open; an unchanged board is not opened.
+A board with a scheduled parked card (the only cards with an external
+state, which also moves with the clock) keeps the 5 s bound
+session_external already had.
+
+Not changed: _project_remote_links (shared with the feed thread,
+t_3d9583999ea5284c), the waiting sources and done checks themselves
+(hermes-mods), payload shapes.
+
+Tests: test_kanban_annotation_parts (a write to one source rereads only
+the parts that read it; a bookkeeping write rereads none; every gated
+refresh equals a cold full read; a due deadline, an undeclared check and
+a failed read force everything; 40 writes through the real loop are a
+bounded number of reads with the last write shown) and four new cases in
+test_kanban_external_activity (an unchanged board is not opened over 20
+requests, a write is seen on the next request, cached answer byte-equal
+to an uncached one). Forcing every part again fails 5 of the 6 parts
+tests; never storing the board contribution fails 3 of the 4 route tests.
+120 adjacent test files: 1742 passed, 0 failed, 15 skipped.
+
+Not measured live yet: the hub numbers are taken after deploy.
+---
+ hermes_cli/kanban_annotation_host.py          |  24 +-
+ hermes_cli/kanban_annotation_parts.py         | 124 +++++++++
+ hermes_cli/kanban_external_activity.py        |  95 +++++--
+ hermes_cli/kanban_session_activity.py         |   2 +-
+ .../kanban_session_activity_attention.py      |   2 +-
+ .../kanban_session_activity_revalidate.py     |  11 +-
+ .../test_kanban_annotation_parts.py           | 240 ++++++++++++++++++
+ .../test_kanban_external_activity.py          | 114 +++++++++
+ 8 files changed, 588 insertions(+), 24 deletions(-)
+ create mode 100644 hermes_cli/kanban_annotation_parts.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_parts.py
+
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 28d7676737..f56d99e84a 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -46,6 +46,7 @@ from typing import Any
+ 
+ from hermes_cli import kanban_annotation_disk as _disk
+ from hermes_cli import kanban_annotation_mutation as _mutation
++from hermes_cli import kanban_annotation_parts as _parts
+ 
+ log = logging.getLogger("hermes_cli.kanban_session_activity")
+ 
+@@ -697,11 +698,26 @@ def _event_refresh(events) -> float | None:
+             # Preserve those until consumed; replacing the list needs per-cache
+             # deadline ownership, not just a successful outer projection.
+             confirmations = _settle_deadlines.get(scope, ())
+-            _holder_ctx.deadlines = [t for t in _clock_deadlines.get(scope, ())
+-                                     if t > time.time() and t not in confirmations]
++            started = time.time()
++            pending = [t for t in _clock_deadlines.get(scope, ()) if t not in confirmations]
++            _holder_ctx.deadlines = [t for t in pending if t > started]
++            # [daveey] Force only the parts whose own inputs moved (kanban_annotation_parts). A provider deadline
++            # that came due is a wall-time transition no key sees: it forces them all. A settle confirmation is
++            # not one: it re-takes the keys, which is what shows a commit the first read was too early for. The
++            # counts are also read once their last read is ``STRICT_REFRESH_AGE_S`` old, so the published
++            # ``read_at`` is renewed before exact adopters drop the copy at ``_COUNTS_MAX_AGE_S``.
++            forced, part_keys = _parts.plan(
++                scope, clock=len(_holder_ctx.deadlines) != len(pending),
++                renew=time.monotonic() - _ksa._cache_read_at >= STRICT_REFRESH_AGE_S)
+             _ksa._revalidate.force_read.scope = scope
++            _ksa._revalidate.force_read.parts = forced
+             try:
+-                _ksa._refresh_annotation_locked(scope)
++                try:
++                    _ksa._refresh_annotation_locked(scope)
++                except BaseException:
++                    _parts.failed(scope)
++                    raise
++                _parts.done(scope, part_keys)
+                 _, due = waiting_events(time.time())
+                 note_deadline(due)
+                 now = time.time()
+@@ -719,6 +735,7 @@ def _event_refresh(events) -> float | None:
+                 _holder_ctx.deadlines = None
+                 _holder_ctx.active = False
+                 _ksa._revalidate.force_read.scope = None
++                _ksa._revalidate.force_read.parts = None
+                 _ksa._annotate_refresh_lock.release()
+         try:
+             due = ctx.run(refresh_scope)
+@@ -926,4 +943,5 @@ def reset() -> None:
+     _gates.clear()
+     _seen.clear()
+     _paths_memo.clear()
++    _parts.reset()
+     _pin_set.scope = None
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+new file mode 100644
+index 0000000000..dd4d129c2b
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -0,0 +1,124 @@
++"""Which parts of the annotation an event refresh must really read. [daveey]
++
++The event-driven holder (``kanban_annotation_host._event_refresh``) forced every inner cache on every wake: the
++counts, the remote-links projection and every done-check verdict were recomputed whenever any watched file was
++written. The hub's sources are written about five times a second, mostly bookkeeping no reader selects (dispatch
++stamps, heartbeats, sync clocks), so the full read ran back to back: 51% of a core and 17,000 context switches a
++second in the ``kanban-annotation`` thread (t_28eb8d66d577eab3).
++
++A wake says only that some watched file moved. Before the read, the holder takes one key per part over exactly the
++inputs that part reads, and forces a part only when its key differs from the one its last forced read answered:
++
++- ``counts``: the boards' and sync shadows' content revisions, the origin ledger, and the plain inputs below;
++- ``links``: the boards' content revisions, the origin ledger and the plain inputs;
++- ``attention``: the boards' content revisions and the files the done checks declared.
++
++Plain inputs are everything else the holder watches for the scope (state.db, the hub database, config files, the
++mutation cue), keyed by ``kanban_annotation_watch.signature`` (stat, header change counter, WAL-index header). A
++part that is not forced is served by its own cache under that cache's ordinary freshness rules, exactly as a
++request poll is.
++
++Every part is forced when no key can vouch for the inputs: a provider clock deadline came due (wall-time verdicts
++move without any write), a board has no content revision and its file stat is not settled, a done check declared no
++watch paths, a key could not be read, or the scope has no completed holder read yet. Waiting sources are not gated
++here: they are called on every refresh and own their input memo.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import time
++
++log = logging.getLogger(__name__)
++
++COUNTS, LINKS, ATTENTION = "counts", "links", "attention"
++ALL = frozenset({COUNTS, LINKS, ATTENTION})
++_MAX_SCOPES = 64
++
++# Per scope, the part keys the last completed holder read answered. Holder thread only.
++_seen: dict[tuple[str, ...], dict[str, object]] = {}
++
++
++def _signature(scope: tuple[str, ...], paths) -> str:
++    """Change signal of ``paths``: SQLite-aware for files (sidecars and header counters), stat for the rest."""
++    from hermes_cli import kanban_annotation_watch as watch
++
++    paths = sorted({str(p) for p in paths})
++    plain = [p for p in paths if os.path.isdir(p)]
++    return watch.signature(scope, [p for p in paths if p not in plain], plain)
++
++
++def _plain_key(scope: tuple[str, ...]) -> str:
++    """Every watched input of ``scope`` that no content revision covers."""
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_session_activity as ksa
++
++    dbs, files = host._watch_paths(scope)
++    discovery, _dirs = host._discovery_paths()
++    keyed = {str(p) for p in ksa._board_db_paths()} | {str(p) for p in ksa._replica_paths()}
++    return _signature(scope, {*dbs, *files, *(str(p) for p in discovery)} - keyed)
++
++
++def _done_key(scope: tuple[str, ...]) -> object:
++    """The done checks' declared files; unequal to everything while any check is undeclared."""
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_session_activity as ksa
++
++    paths: set[str] = set()
++    for name, fn in sorted(ksa._done_checks.items()):
++        declared = host._done_event_sources.get(name)
++        if declared is None or declared[0] is not fn:
++            return object()
++        paths.update(str(p) for p in declared[1]())
++    return (tuple(sorted(ksa._done_checks)), _signature(scope, paths))
++
++
++def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
++    """One key per part, read now in ``scope``'s context; None when the inputs cannot be vouched for."""
++    from hermes_cli import kanban_session_activity as ksa
++
++    wall = time.time()
++    local = ksa._activity_fingerprint(include_shadows=False)
++    shadows = ksa._shadow_fingerprint()
++    if not ksa._revalidate.revalidatable(local + shadows, wall):
++        return None
++    ledger = ksa._origin_ledger_fingerprint()
++    plain = _plain_key(scope)
++    return {COUNTS: (local, shadows, ledger, plain), LINKS: (local, ledger, plain),
++            ATTENTION: (local, _done_key(scope))}
++
++
++def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
++    """``(parts to force, keys)`` for a holder read of ``scope`` starting now. ``clock``: a provider deadline came
++    due. ``renew``: the cached counts are old enough that the published copy needs a new read time. Pass ``keys``
++    to :func:`done` once the read succeeded. Taken before the read, so a write racing it moves the next plan's
++    key."""
++    try:
++        now = keys(scope)
++    except Exception:  # health: allow BLE001 -- an unreadable key is a change: every part reads
++        log.debug("kanban annotation part keys unavailable", exc_info=True)
++        now = None
++    before = _seen.get(scope)
++    if clock or now is None or before is None:
++        return ALL, now
++    moved = {part for part in ALL if before.get(part) != now[part]}
++    return frozenset(moved | {COUNTS} if renew else moved), now
++
++
++def done(scope: tuple[str, ...], now: dict[str, object] | None) -> None:
++    """The read planned with ``now`` completed: its forced parts answered those keys."""
++    _seen.pop(scope, None)
++    if now is not None:
++        while len(_seen) >= _MAX_SCOPES:
++            del _seen[next(iter(_seen))]
++        _seen[scope] = now
++
++
++def failed(scope: tuple[str, ...]) -> None:
++    """A holder read of ``scope`` raised: nothing is vouched for."""
++    _seen.pop(scope, None)
++
++
++def reset() -> None:
++    _seen.clear()
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+index e916979b16..0b79e02a4b 100644
+--- a/hermes_cli/kanban_external_activity.py
++++ b/hermes_cli/kanban_external_activity.py
+@@ -101,26 +101,84 @@ def stamp_rows(rows: list[dict[str, Any]], by_session: dict[str, dict[str, Any]]
+             row.pop("kanban_external_cards", None)
+ 
+ 
+-def stamp_boards(rows: list[dict[str, Any]], board_paths, open_ro, parked_pairs, row_ids) -> list[dict[str, Any]]:
+-    """Read every local board's parked (session, task) pairs and stamp ``rows``; returns ``rows``. Never raises:
+-    the session list must render without the external fields."""
++# [daveey] Per board, what one read of it contributed: ``path -> (signature, clocked, read wall time, by-session
++# map)``. The session list used to open every board through the lock guard on every request (58% of the route's
++# samples on the hub, t_28eb8d66d577eab3). ``signature`` is the board file's cheap change signal, taken once per
++# request before any read; an unchanged one proves no commit since, so the stored contribution is the answer and
++# the board is not opened. ``clocked``: the board has a scheduled parked card, whose derived state also moves with
++# the reader's clock; such a contribution keeps the ``_TTL_S`` bound ``session_external`` already gave it.
++_boards: dict[str, tuple[str, bool, float, dict]] = {}
++
++
++def board_signature(path) -> Optional[str]:
++    """Moves on every commit to ``path`` (stat, header change counter, WAL-index header); None = unknown."""
++    try:
++        from hermes_cli import kanban_annotation_watch as watch
++        return watch.signature(("external",), [str(path)], [])
++    except (OSError, ValueError, ImportError):
++        logger.debug("kanban external board signature unavailable for %s", path, exc_info=True)
++        return None
++
++
++def _clocked(conn: sqlite3.Connection, pairs) -> bool:
++    """True when any parked card is ``scheduled`` (only those can carry an external state), or when unknown."""
++    ids = sorted({str(t) for _s, t in pairs})
++    try:
++        for i in range(0, len(ids), 500):
++            chunk = ids[i:i + 500]
++            if conn.execute("SELECT 1 FROM tasks WHERE status = 'scheduled' AND id IN "
++                            f"({','.join('?' for _ in chunk)}) LIMIT 1", chunk).fetchone():
++                return True
++    except sqlite3.Error:
++        return True
++    return False
++
++
++def _board_external(path, open_ro, parked_pairs, signature, wall: float) -> dict[str, dict[str, Any]]:
++    """One board's ``session_external`` map: the stored one while the board is unchanged, else a read of it."""
++    key = str(path)
++    sig = signature(path) if signature is not None else None
++    if sig is not None:
++        with _lock:
++            hit = _boards.get(key)
++        if hit is not None and hit[0] == sig and (not hit[1] or 0 <= wall - hit[2] < _TTL_S):
++            return hit[3]
++    try:
++        conn = open_ro(path)
++    except sqlite3.Error:
++        return {}
++    try:
++        pairs = parked_pairs(conn)
++        found = session_external(conn, pairs, key=key) if pairs else {}
++        clocked = bool(pairs) and _clocked(conn, pairs)
++    except sqlite3.Error:
++        logger.debug("kanban external read failed for %s", path, exc_info=True)
++        return {}
++    finally:
++        conn.close()
++    if sig is not None:  # taken before the read: a commit racing it moves the next request's signature
++        with _lock:
++            _boards[key] = (sig, clocked, wall, found)
++    return found
++
++
++def stamp_boards(rows: list[dict[str, Any]], board_paths, open_ro, parked_pairs, row_ids, *,
++                 signature=board_signature) -> list[dict[str, Any]]:
++    """Stamp ``rows`` from every local board's parked (session, task) pairs; returns ``rows``. A board whose
++    ``signature`` has not moved since its last read is not opened. Never raises: the session list must render
++    without the external fields."""
+     by_session: dict[str, dict[str, Any]] = {}
+     try:
+-        for path in board_paths():
+-            try:
+-                conn = open_ro(path)
+-            except sqlite3.Error:
+-                continue
+-            try:
+-                pairs = parked_pairs(conn)
+-                for sid, slot in (session_external(conn, pairs, key=str(path)) if pairs else {}).items():
+-                    mine = by_session.setdefault(sid, {"counts": [0, 0, 0], "cards": []})
+-                    mine["counts"] = [a + b for a, b in zip(mine["counts"], slot["counts"])]
+-                    mine["cards"] += slot["cards"]
+-            except sqlite3.Error:
+-                logger.debug("kanban external read failed for %s", path, exc_info=True)
+-            finally:
+-                conn.close()
++        wall = time.time()
++        paths = list(board_paths())
++        for path in paths:
++            for sid, slot in _board_external(path, open_ro, parked_pairs, signature, wall).items():
++                mine = by_session.setdefault(sid, {"counts": [0, 0, 0], "cards": []})
++                mine["counts"] = [a + b for a, b in zip(mine["counts"], slot["counts"])]
++                mine["cards"] += slot["cards"]
++        with _lock:
++            for gone in set(_boards) - {str(p) for p in paths}:
++                del _boards[gone]
+         stamp_rows(rows, by_session, row_ids)
+     except (sqlite3.Error, OSError, ImportError, KeyError, TypeError, ValueError, AttributeError):
+         logger.debug("kanban external stamping failed", exc_info=True)
+@@ -130,3 +188,4 @@ def stamp_boards(rows: list[dict[str, Any]], board_paths, open_ro, parked_pairs,
+ def reset_for_tests() -> None:
+     with _lock:
+         _memo.clear()
++        _boards.clear()
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ed161bac98..cd0a23d62f 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -954,7 +954,7 @@ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
+     with diag.source("links_display" if stale_ok else "links_strict"):
+         # Native source/clock invalidation must cross the inner TTL cache too:
+         # state/config inputs and wall-time verdicts can move without this key.
+-        if getattr(_revalidate.force_read, 'scope', None) == scope:
++        if _revalidate.forced(scope, 'links'):
+             with _links_lock:
+                 fingerprint = diag.timed("fingerprint", _links_fingerprint)
+                 return _publish_links(scope, fingerprint)
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index 6b3c9aa2fa..493e095a0c 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -137,7 +137,7 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     scope = activity._origin_scope()
+     mono = activity.time.monotonic()
+     wall = activity.time.time() if now is None else now
+-    forced = getattr(activity._revalidate.force_read, 'scope', None) == scope
++    forced = activity._revalidate.forced(scope, 'attention')
+     hit = None if forced else activity._attention.get(scope, mono, wall=wall)
+     if hit is not None:
+         activity._host_copy.note_deadline(activity._attention.deadline(scope))
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index 9a7bc69f5d..2065a6edaf 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -27,9 +27,18 @@ STAT_SETTLED_S = 2.0
+ inputs_pin = threading.local()
+ # [daveey] ``force_read.scope``: this thread's next counts read of that scope really reads (the annotation holder
+ # renewing an aging host copy, ``kanban_annotation_host._holder_refresh``).
++# ``force_read.parts``: the parts that read applies to (``kanban_annotation_parts``); unset or None = every part.
+ force_read = threading.local()
+ 
+ 
++def forced(scope: tuple[str, ...], part: str) -> bool:
++    """True when this thread's read of ``scope`` must really read ``part`` (bypassing that part's cache)."""
++    if getattr(force_read, "scope", None) != scope:
++        return False
++    parts = getattr(force_read, "parts", None)
++    return parts is None or part in parts
++
++
+ def revalidatable(fingerprint: tuple, wall: float) -> bool:
+     """True when ``fingerprint`` (taken at wall time ``wall``) proves no write since: every board is keyed by its
+     content revision, or by a file stat last modified more than ``STAT_SETTLED_S`` before ``wall``. A stat key can
+@@ -82,7 +91,7 @@ def counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool
+     cache = _ksa._cache
+     if cache is None or _ksa._cache_scope != scope or fingerprint != _ksa._cache_fingerprint:
+         return False
+-    if getattr(force_read, "scope", None) == scope:
++    if forced(scope, "counts"):
+         return False
+     if now < cache[0]:
+         return True
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+new file mode 100644
+index 0000000000..f8506f4d56
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -0,0 +1,240 @@
++"""An event refresh reads only the annotation parts whose own inputs moved. [daveey]
++
++t_28eb8d66d577eab3: the event-driven holder forced the counts, the links projection and every done-check verdict on
++every wake. The hub's watched files are written about five times a second, mostly bookkeeping, so the full read ran
++back to back (51% CPU in the ``kanban-annotation`` thread).
++"""
++from __future__ import annotations
++
++import contextvars
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.annotation_event_loop import run
++from hermes_cli.annotation_file_events import FileEvents
++from tests.hermes_cli import test_kanban_annotation_host as helpers
++
++SCOPE = ('annotation-parts-test', 'default')
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    """One board, one plain input (state.db's stand-in) and a done check with one declared file."""
++    board = tmp_path / 'kanban.db'
++    conn = helpers._board(board, [('t1', 'running', 's1')])
++    plain, declared = tmp_path / 'state.db', tmp_path / 'done-check.json'
++    plain.write_text('0')
++    declared.write_text('0')
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: SCOPE)
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [board])
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(ksa, '_replica_paths', list)
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(board), str(plain)], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    monkeypatch.setattr(host, 'SETTLE_S', ())
++    seen = SimpleNamespace(counts=0, links=0, checks=0, flagged=True, conn=conn, board=board, plain=plain,
++                           declared=declared, deadline=None)
++    recompute = ksa._recompute_all_counts
++
++    def counting(*a, **kw):
++        seen.counts += 1
++        return recompute(*a, **kw)
++
++    def project():
++        seen.links += 1
++        return []
++
++    def check(card):
++        seen.checks += 1
++        return seen.flagged
++    monkeypatch.setattr(ksa, '_recompute_all_counts', counting)
++    monkeypatch.setattr(ksa, '_project_remote_links', project)
++    monkeypatch.setattr(ksa, '_done_checks', {'fixture': check})
++    monkeypatch.setattr(host, '_done_event_sources', {'fixture': (check, lambda: [declared], lambda: seen.deadline)})
++    monkeypatch.setattr(ksa._recent_done, 'memoized', lambda path, since, *a: [
++        ('s1', {'id': 'd1', 'completed_at': time.time() - 60, 'title': 'done', 'summary': 'ok'})])
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(host, '_known', {SCOPE: contextvars.copy_context()})
++    disk.touch_demand(SCOPE)
++    yield seen
++    conn.close()
++    ksa._reset_cache_for_tests()
++
++
++def _refresh(source=True):
++    return host._event_refresh(SimpleNamespace(replace=lambda *a, **kw: None, control_only=not source))
++
++
++def _reads(seen):
++    return seen.counts, seen.links, seen.checks
++
++
++def _published():
++    return ksa._last_annotation[SCOPE]
++
++
++def _full_read():
++    """What a process with no caches reads now: the answer every gated refresh must equal."""
++    saved, known = dict(parts._seen), dict(host._known)
++    ksa._reset_cache_for_tests()  # also forgets the holder's scopes and part keys: put those back
++    host._known.update(known)
++    ksa._annotate_refresh_lock.acquire()
++    try:
++        return ksa._refresh_annotation_locked(SCOPE)
++    finally:
++        ksa._annotate_refresh_lock.release()
++        parts._seen.update(saved)
++
++
++def test_a_write_to_one_source_rereads_only_the_parts_that_read_it(world):
++    _refresh()
++    assert _reads(world) == (1, 1, 1), 'the first read of a scope reads every part'
++    first = _published()
++    assert first[0] == {'s1': 1} and first[10] == {'s1': 1}
++
++    _refresh()
++    assert _reads(world) == (1, 1, 1), 'a wake with no input moved read a part'
++    assert _published() == first
++
++    # bookkeeping no reader selects: the board file moves, its content revision does not
++    world.conn.execute('CREATE TABLE IF NOT EXISTS kanban_dispatch_stamp (at REAL)')
++    _refresh()
++    before = _reads(world)
++    world.conn.execute('INSERT INTO kanban_dispatch_stamp VALUES (1.0)')
++    _refresh()
++    assert _reads(world) == before, 'a bookkeeping write reread a part'
++
++    # the plain input (state.db, config): counts and links read it, the done checks do not
++    world.plain.write_text('moved')
++    _refresh()
++    assert _reads(world) == (before[0] + 1, before[1] + 1, before[2])
++
++    # a file only the done checks declared: neither the counts nor the links read it
++    world.flagged = False
++    world.declared.write_text('moved')
++    _refresh()
++    assert _reads(world) == (before[0] + 1, before[1] + 1, before[2] + 1)
++    assert _published()[10] == {}, 'the done check verdict was not re-evaluated'
++
++    # board content: every part reads the boards
++    world.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't1'")
++    _refresh()
++    assert _reads(world) == (before[0] + 2, before[1] + 2, before[2] + 2)
++    assert _published()[0] == {}
++
++
++def _undated(value):
++    """``value`` without the wall times a read stamps on its execution evidence (they date the read itself)."""
++    if isinstance(value, dict):
++        return {k: _undated(v) for k, v in value.items() if k not in ('observed_at', 'valid_until')}
++    if isinstance(value, (tuple, list)):
++        return tuple(_undated(v) for v in value)
++    return value
++
++
++def test_every_gated_refresh_publishes_what_a_cold_full_read_would(world):
++    steps = [
++        lambda: None,
++        lambda: world.plain.write_text('one'),
++        lambda: world.declared.write_text('one'),
++        lambda: world.conn.execute("INSERT INTO tasks VALUES ('t2', 'running', 's2')"),
++        lambda: setattr(world, 'flagged', False) or world.declared.write_text('two'),
++        lambda: world.conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = 't2'"),
++        lambda: world.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't1'"),
++        lambda: None,
++    ]
++    for step in steps:
++        step()
++        _refresh()
++        gated = _published()
++        assert _undated(gated) == _undated(_full_read())
++        _refresh()  # the cold read above refilled the caches; the gate still answers for the same keys
++        assert _undated(_published()) == _undated(gated)
++
++
++def test_a_due_provider_deadline_rereads_every_part_without_any_write(world, monkeypatch):
++    _refresh()
++    assert _reads(world) == (1, 1, 1)
++    host._clock_deadlines[SCOPE] = [time.time() - 1]  # a wall-time verdict no key sees
++    _refresh(source=False)
++    assert _reads(world) == (2, 2, 2)
++    _refresh()
++    assert _reads(world) == (2, 2, 2)
++
++
++def test_an_undeclared_done_check_or_a_failed_read_is_never_vouched_for(world, monkeypatch):
++    _refresh()
++    monkeypatch.setattr(host, '_done_event_sources', {})
++    _refresh()
++    _refresh()
++    assert world.checks == 3, 'a done check with no declared inputs was served from its cache'
++    assert world.counts == 1
++
++    def boom(scope):
++        raise RuntimeError('read failed')
++    real = ksa._refresh_annotation_locked
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', boom)
++    _refresh()
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', real)
++    host._clock_deadlines.pop(SCOPE, None)  # the failed scope's retry deadline; the gate itself is under test
++    _refresh()
++    assert world.counts == 2, 'a read after a failed one reused parts nothing vouches for'
++
++
++def test_an_old_counts_read_is_renewed_so_the_published_read_time_stays_adoptable(world, monkeypatch):
++    _refresh()
++    assert _reads(world) == (1, 1, 1)
++    monkeypatch.setattr(host, 'STRICT_REFRESH_AGE_S', 0.0)
++    _refresh()
++    assert _reads(world) == (2, 1, 1)
++
++
++def test_a_burst_of_board_writes_is_a_bounded_number_of_reads_and_the_last_write_shows(world, monkeypatch):
++    monkeypatch.setattr(host, 'SETTLE_S', (0.25, host.HOLDER_INTERVAL_S))
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(world.board), str(world.plain)], []))
++    stop = threading.Event()
++    with FileEvents() as events:
++        thread = threading.Thread(
++            target=lambda: run(events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
++                               lambda: host._event_refresh(events)), name='kanban-annotation-holder')
++        thread.start()
++        try:
++            deadline = time.monotonic() + 5
++            while world.counts < 1 and time.monotonic() < deadline:
++                time.sleep(0.01)
++            stop.wait(max(host.SETTLE_S) + 0.5)  # the ownership read's confirmations
++            base = _reads(world)
++            writes = 40
++            started = time.monotonic()
++            for n in range(writes):
++                world.conn.execute("INSERT INTO tasks VALUES (?, 'running', 's1')", (f'burst-{n}',))
++                time.sleep(0.01)  # health: allow HX013 -- the spacing of the burst is the input under test
++            burst = time.monotonic() - started
++            deadline = time.monotonic() + 5
++            while ksa._last_annotation[SCOPE][0] != {'s1': writes + 1} and time.monotonic() < deadline:
++                time.sleep(0.01)
++            assert ksa._last_annotation[SCOPE][0] == {'s1': writes + 1}, 'the last write of the burst is not shown'
++            stop.wait(max(host.SETTLE_S) + 0.5)  # the trailing confirmations
++            reads = world.counts - base[0]
++            # one read at once, one per coalescing gap while the burst lasts, one trailing
++            assert reads <= 2 + burst / 0.25 + 1, (reads, burst)
++            assert reads < writes / 4
++            quiet = _reads(world)
++            stop.wait(1.0)
++            assert _reads(world) == quiet, 'a settled burst kept reading'
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(5)
++    assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_kanban_external_activity.py b/tests/hermes_cli/test_kanban_external_activity.py
+index d84e8a7c3c..eae28ac4a6 100644
+--- a/tests/hermes_cli/test_kanban_external_activity.py
++++ b/tests/hermes_cli/test_kanban_external_activity.py
+@@ -100,3 +100,117 @@ def test_non_external_waits_keep_todays_wait_info(kanban_home):
+         tid = park(conn, kind="clock", ref="soak", wake_check=None, clock_only=True)
+         info = _local_wait_info(conn, [tid])[tid]
+         assert "external" not in info and info["wait_state"] in ("waiting", "stalled")
++
++
++# --- the session list opens a board only when it moved (t_28eb8d66d577eab3) ---------------------------------------
++
++def _counting(monkeypatch, conn):
++    """Point the stamp at ``conn``'s board with the real readers; returns (stamp, opens)."""
++    path = Path(str(kbc._main_db_file(conn)))
++    opens: list[Path] = []
++    real_open = ksa._open_ro
++
++    def open_ro(p):
++        opens.append(Path(p))
++        return real_open(p)
++
++    def stamp(rows):
++        return kea.stamp_boards(rows, lambda: [path], open_ro, ksa._parked_pairs, ksa._identity.row_ids)
++    return stamp, opens
++
++
++def _fresh_stamp(conn, rows):
++    """What the pre-cache code answered: every board opened and read."""
++    kea.reset_for_tests()
++    path = Path(str(kbc._main_db_file(conn)))
++    return kea.stamp_boards(rows, lambda: [path], ksa._open_ro, ksa._parked_pairs, ksa._identity.row_ids,
++                            signature=None)
++
++
++def _session_card(conn, sid, **kw):
++    tid = kb.create_task(conn, title=f"card of {sid}", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='blocked', session_id=? WHERE id=?", (sid, tid))
++    return tid
++
++
++def test_an_unchanged_board_is_not_opened_again_and_a_write_to_it_is_seen_at_once(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        _session_card(conn, "s1")  # parked, but nothing scheduled: no external state, no clock input
++        stamp, opens = _counting(monkeypatch, conn)
++        first = stamp([{"id": "s1"}])
++        assert len(opens) == 1
++        for _ in range(20):
++            assert stamp([{"id": "s1"}]) == first
++        assert len(opens) == 1, "an unchanged board must not be opened per request"
++        assert first == _fresh_stamp(conn, [{"id": "s1"}])
++        kea.reset_for_tests()
++        stamp([{"id": "s1"}])
++        before = len(opens)
++        _session_card(conn, "s1")  # any commit to the board moves its signature
++        stamp([{"id": "s1"}])
++        assert len(opens) == before + 1
++        stamp([{"id": "s1"}])
++        assert len(opens) == before + 1
++
++
++def test_a_cached_board_answers_byte_identically_and_a_new_external_card_shows_on_the_next_request(
++        kanban_home, gh, clock, monkeypatch):
++    import json
++    with kbc.connect_closing() as conn:
++        a = park(conn, 8001)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='s1' WHERE id=?", (a,))
++        tick(conn, gh, clock, 0)
++        stamp, opens = _counting(monkeypatch, conn)
++        rows = lambda: [{"id": "s1", "kanban_parked": 1}, {"id": "s2"}]
++        cold = json.dumps(stamp(rows()), sort_keys=True)
++        warm = json.dumps(stamp(rows()), sort_keys=True)
++        assert len(opens) == 1 and warm == cold
++        assert cold == json.dumps(_fresh_stamp(conn, rows()), sort_keys=True)
++        assert json.loads(cold)[0]["kanban_external"] == 1
++        # a second external card lands: the very next request shows it (no TTL wait)
++        kea.reset_for_tests()
++        stamp(rows())
++        b = park(conn, 8002)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='s1' WHERE id=?", (b,))
++        tick(conn, gh, clock, 0)
++        with kea._lock:
++            kea._memo.clear()  # session_external's own 5 s memo predates this change; not under test
++        got = stamp(rows())
++        assert got[0]["kanban_external"] == 2
++        assert json.dumps(got, sort_keys=True) == json.dumps(_fresh_stamp(conn, rows()), sort_keys=True)
++
++
++def test_a_board_with_a_scheduled_card_is_reread_after_the_ttl_because_its_state_moves_with_the_clock(
++        kanban_home, gh, clock, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = park(conn, 8101)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='s1' WHERE id=?", (a,))
++        tick(conn, gh, clock, 0)
++        stamp, opens = _counting(monkeypatch, conn)
++        wall = [time.time()]
++        monkeypatch.setattr(kea.time, "time", lambda: wall[0])
++        stamp([{"id": "s1"}])
++        stamp([{"id": "s1"}])
++        assert len(opens) == 1
++        wall[0] += kea._TTL_S + 0.1
++        stamp([{"id": "s1"}])
++        assert len(opens) == 2
++
++
++def test_an_unknown_signature_reads_the_board_every_time(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        _session_card(conn, "s1")
++        path = Path(str(kbc._main_db_file(conn)))
++        opens = []
++
++        def open_ro(p):
++            opens.append(p)
++            return ksa._open_ro(p)
++        for _ in range(3):
++            kea.stamp_boards([{"id": "s1"}], lambda: [path], open_ro, ksa._parked_pairs, ksa._identity.row_ids,
++                             signature=lambda p: None)
++        assert len(opens) == 3 and not kea._boards
+-- 
+2.43.0
+

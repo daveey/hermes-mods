@@ -1,0 +1,148 @@
+From c2f0ccddc3e607378a19c78d8e9b4ff967d6223d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:21:56 +0000
+Subject: [PATCH] fix(kanban): refresh class wall registry per allocation
+ [daveey]
+
+Problem: combined class wall consumers reused a module-captured assignee config closure after the registry changed. Why: helper imported the config reader by value at initialization; isolated tests could not expose stale selection. Read the reader per call; a sequential two-registry test reproduces first-provider leakage before the change and passes afterward.
+
+Proof: canonical retries-disabled class controls 76 passed; combined 12-file class/pacing/B verification 277 passed, 11 failures retained, not ready to land. Correct historical dedupe seed, explicit class provider representation, destination pacing and ordinary paced receipt assertions without changing author or quota gates. Full scripts/check green. Original fleet remediation and review/deployment acceptance remains open.
+---
+ hermes_cli/kanban_class_walls.py              |  2 +-
+ .../test_kanban_class_wall_admission.py       | 25 +++++++++++++++++++
+ .../hermes_cli/test_kanban_pacing_recovery.py |  4 ++-
+ tests/hermes_cli/test_kanban_pin_reroute.py   | 10 +++++---
+ .../test_kanban_review_paced_reroute.py       |  4 +--
+ 5 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_class_walls.py b/hermes_cli/kanban_class_walls.py
+index 0ac8526602..88291f296d 100644
+--- a/hermes_cli/kanban_class_walls.py
++++ b/hermes_cli/kanban_class_walls.py
+@@ -5,7 +5,6 @@ Concrete choices are per-run allocations, never stored task restrictions.
+ from agent.model_routing import eligible_routes, is_class_selector, validate_policy
+ from agent.model_routing_agent import class_requirements
+ from hermes_cli.config import is_provider_enabled
+-from hermes_cli.kanban_model_assignment import _assignee_config
+ 
+ 
+ def class_wall_routes(task, model, *, now, extra_walls=None):
+@@ -15,6 +14,7 @@ def class_wall_routes(task, model, *, now, extra_walls=None):
+     No quota is allocated and no credential/reserve gate is bypassed.
+     """
+     from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_model_assignment import _assignee_config
+     if not is_class_selector(model):
+         return [], {}
+     config = _assignee_config(task.assignee) or {}
+diff --git a/tests/hermes_cli/test_kanban_class_wall_admission.py b/tests/hermes_cli/test_kanban_class_wall_admission.py
+index eb744bbab8..9f5de0642d 100644
+--- a/tests/hermes_cli/test_kanban_class_wall_admission.py
++++ b/tests/hermes_cli/test_kanban_class_wall_admission.py
+@@ -1,4 +1,6 @@
+ """Class selectors must not hide known provider walls at actual dispatch."""
++from types import SimpleNamespace
++
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+@@ -10,6 +12,29 @@ from tests.hermes_cli.test_kanban_quota_episode import board as board, routing
+ from tests.hermes_cli.test_kanban_quota_episode_walls import _class_routes, _clock
+ 
+ 
++def test_class_wall_lookup_observes_sequential_assignee_registries(monkeypatch):
++    """A long-lived dispatcher must read the current registry on every call."""
++    from importlib import reload
++
++    from hermes_cli import kanban_class_walls as probe
++    from hermes_cli import kanban_model_assignment as assignment
++
++    first = {}
++    _class_routes(first, standard=[('openai-codex', 'gpt-6-astra')])
++    monkeypatch.setattr(assignment, '_assignee_config', lambda who: first)
++    reload(probe)  # first registry is present when the module is initialized
++    monkeypatch.setattr(walls, 'active_walls', lambda **kw: {})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *args: None)
++    task = SimpleNamespace(assignee='a')
++    for provider, model in [('openai-codex', 'gpt-6-astra'), ('anthropic', 'claude-opus-5-5')]:
++        config = {}
++        _class_routes(config, standard=[(provider, model)])
++        monkeypatch.setattr(assignment, '_assignee_config', lambda who, current=config: current)
++        routes, blocked = probe.class_wall_routes(task, 'class:standard', now=1_800_000_000)
++        assert [(r['provider'], r['model']) for r in routes] == [(provider, model)]
++        assert blocked == {}
++
++
+ @pytest.mark.parametrize('evidence', ['file', 'live'])
+ @pytest.mark.parametrize('all_blocked', [False, True])
+ def test_actual_class_admission_avoids_known_walls(board, monkeypatch, all_assignees_spawnable,
+diff --git a/tests/hermes_cli/test_kanban_pacing_recovery.py b/tests/hermes_cli/test_kanban_pacing_recovery.py
+index 23f9faa8b7..5ed1df37bd 100644
+--- a/tests/hermes_cli/test_kanban_pacing_recovery.py
++++ b/tests/hermes_cli/test_kanban_pacing_recovery.py
+@@ -46,7 +46,9 @@ def test_far_wall_reroutes_before_pacing_and_destination_limits_claims(
+         seen = []
+         result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(
+             (task.id, task.model_override, task.provider_override)))
+-        assert consulted and set(consulted) == {'anthropic', 'openai-codex'}  # a class card judges every pool of its class
++        # The wall pass has already concretely selected anthropic. Pacing must judge
++        # that destination (including HELD), not spend a new claim on the known-walled source.
++        assert consulted and set(consulted) == {'anthropic'}
+         if destination == lp.HELD:
+             assert seen == []
+             assert len(result.llm_paced) == 2
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+index 689583eabf..49d044f529 100644
+--- a/tests/hermes_cli/test_kanban_pin_reroute.py
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -125,17 +125,18 @@ def test_historical_reroute_records_distinct_runs_and_one_comment(board, monkeyp
+     _deep(monkeypatch)
+     with kbc.connect() as conn:
+         tid = _pinned_card(conn)
+-        kb._append_event(conn, tid, 'model_reroute', {'walled_provider': PIN[1],
+-                         'resets_at': clock[0] + 55 * 3600, 'episode_id': 213})
++        kb._append_event(conn, tid, 'quota_episode', {'provider': PIN[1],
++                         'until': clock[0] + 55 * 3600, 'episode_id': 213})
+         conn.commit()
+         for _ in range(2):
+             task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert task is not None
+             with kb.write_txn(conn):
+                 event = pr.record(conn, task, PIN, PEER)
+             assert event['run_id'] == task.current_run_id
+             assert event['resets_at'] == clock[0] + 55 * 3600
+             kb.reclaim_task(conn, tid, reason='test')
+-        recorded = _events(conn, tid, 'model_reroute')[1:]
++        recorded = _events(conn, tid, 'model_reroute')
+         assert len(recorded) == 2 and len({event['run_id'] for event in recorded}) == 2
+         assert len(_comments(conn, tid)) == 1
+         assert 'selected dynamically' in _comments(conn, tid)[0]
+@@ -186,7 +187,8 @@ def test_preview_matches_admission_and_preserves_concrete_row(board, monkeypatch
+         before = conn.total_changes
+         preview = task_route(conn, tid)
+         assert conn.total_changes == before
+-        assert _tick(conn) == [preview[:2]] == [('class:standard', 'auto')]
++        assert preview[:2] == ('class:standard', None)  # preview has no concrete provider yet
++        assert _tick(conn) == [(preview[0], preview[1] or 'auto')] == [('class:standard', 'auto')]
+         stored = kb.get_task(conn, tid)
+         assert (stored.model_override, stored.provider_override) == PIN
+         assert stored.model_pin_mandatory == 1
+diff --git a/tests/hermes_cli/test_kanban_review_paced_reroute.py b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+index c22dbab647..57ac70314d 100644
+--- a/tests/hermes_cli/test_kanban_review_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+@@ -257,9 +257,9 @@ def test_only_review_receipts_carry_the_paced_block(board, clock, monkeypatch, a
+     paced_tests._pools(clock, openai_codex=('held', HELD_FAR))
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='default card', assignee='a')
+-        assert pin_tests._tick(conn) == [('class:standard', 'auto')]
++        assert pin_tests._tick(conn) == [PEER]
+         tier_event = pin_tests._events(conn, tid, 'model_tier')[-1]
+-    assert tier_event['reason'] == 'default' and 'paced' not in tier_event
++    assert tier_event['reason'] == 'default+paced:openai-codex' and 'paced' not in tier_event
+ 
+ 
+ @pytest.mark.parametrize('reason', ['review_unpinned', 'review_override', 'default', 'pinned+pin_quota_reroute'])
+-- 
+2.43.0
+

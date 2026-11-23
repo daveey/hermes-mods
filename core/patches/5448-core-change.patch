@@ -1,0 +1,141 @@
+From 0ba587fd84af23a43ebffbc9916c1bec53f1525e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:06:17 +0000
+Subject: [PATCH] fix(kanban): bound Python locks in speculative session-task
+ reads [daveey]
+
+Session task requests took 17.508 seconds live with 808 sampled AnyIO stacks queued at content_key probe_lock. SQLite zero-budget reads still waited indefinitely on Python probe and shared-reader locks. Make contended speculative keys unknown and include reader-lock admission in the existing busy budget. No timeout increase or completion authority change. Parent RED: both held-lock tests fail; fix GREEN: 64 focused tests and all 21 checks.
+---
+ hermes_cli/kanban_activity_revision.py        |  9 +++-
+ hermes_cli/kanban_reader_lifecycle.py         | 12 ++++++
+ hermes_cli/kanban_session_activity.py         |  5 ++-
+ .../test_kanban_content_key_busy_budget.py    | 41 +++++++++++++++++++
+ 4 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index a60ebd7f64..b69e446e1a 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -291,8 +291,15 @@ def probe_lock(path: Path):
+ 
+ 
+ def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+-    with probe_lock(path):
++    lock = probe_lock(path)
++    if not lock.acquire(blocking=False):
++        # Speculative keys must never queue behind another probe. Unknown keys
++        # are deliberately unequal, so they cannot certify a cached answer.
++        return ("stat", file_stat(path), object())
++    try:
+         return _content_key(path, tables, open_ro)
++    finally:
++        lock.release()
+ 
+ 
+ def _content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index 6ca561b28d..598398d2be 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -1,4 +1,5 @@
+ """Prepare cached board readers without holding a global lock across SQLite I/O."""
++import contextlib
+ import os
+ import sqlite3
+ import threading
+@@ -6,6 +7,17 @@ import threading
+ from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access, retry_open
+ 
+ 
++@contextlib.contextmanager
++def borrow_lock(lock, budget):
++    """Python coordination is part of the reader budget, not an unbounded prelude."""
++    if not lock.acquire(timeout=max(0.0, budget)):
++        raise sqlite3.OperationalError("database is locked: cached reader is borrowed")
++    try:
++        yield
++    finally:
++        lock.release()
++
++
+ def cached_entry(path, busy_budget=0.5):
+     return retry_open(lambda remaining: _cached_entry_once(path, remaining), busy_budget)
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index a04b92091c..5b820e6d22 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -463,11 +463,12 @@ def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Conne
+     replaced (new inode: a rebuilt replica), after any sqlite error, or when its ``-shm`` generation is gone (the
+     connection is stranded on a deleted WAL index and would fail with ``disk I/O error`` or read stale rows until
+     restart; kanban-759104eb56). Raises ``sqlite3.OperationalError`` when the file is missing, like ``_open_ro``."""
+-    from hermes_cli.kanban_reader_lifecycle import cached_entry
++    from hermes_cli.kanban_reader_lifecycle import borrow_lock, cached_entry
+ 
++    started = time.monotonic()
+     key, entry = cached_entry(path, busy_budget)
+     conn, _ident, lock, _shm = entry
+-    with lock:  # bodies read every result they start: an unfinished cursor would pin a WAL snapshot
++    with borrow_lock(lock, busy_budget - (time.monotonic() - started)):
+         with _RO_CACHE_LOCK:
+             if _RO_CACHE.get(key) is not entry:
+                 from hermes_cli.kanban_generation import DeletedWalGenerationError
+diff --git a/tests/hermes_cli/test_kanban_content_key_busy_budget.py b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+index 59fe425dcb..c7877885a5 100644
+--- a/tests/hermes_cli/test_kanban_content_key_busy_budget.py
++++ b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+@@ -5,6 +5,8 @@ make each key read wait out the reader's busy budget before the real read waits
+ """
+ 
+ import sqlite3
++import threading
++from concurrent.futures import ThreadPoolExecutor
+ 
+ import pytest
+ 
+@@ -93,3 +95,42 @@ def test_cached_reader_budget_restored_after_non_sqlite_error(busy_board):
+     with activity.cached_ro(board) as again:
+         assert again is conn  # still cached: only sqlite errors evict
+         assert again.execute("PRAGMA busy_timeout").fetchone()[0] == 500
++
++
++def _during_hold(lock, call):
++    """Release only after observing completion; old unbounded waits fail, not hang."""
++    finished = threading.Event()
++
++    def run():
++        try:
++            return call()
++        finally:
++            finished.set()
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with lock:
++            future = pool.submit(run)
++            returned_while_held = finished.wait(1)
++        result = future.result(timeout=5)
++    assert returned_while_held, "advisory read waited for another reader's Python lock"
++    return result
++
++
++def test_content_key_does_not_queue_behind_probe_lock(busy_board):
++    board, _ = busy_board
++    first = _during_hold(activity._revision.probe_lock(board), lambda: activity._board_content_key(board))
++    second = _during_hold(activity._revision.probe_lock(board), lambda: activity._board_content_key(board))
++    assert first[0] == second[0] == "stat"
++    assert first != second  # contended probes cannot certify unchanged content
++    assert activity._board_content_key(board)  # retry after contention still works
++
++
++def test_zero_budget_content_key_does_not_queue_behind_borrowed_reader(busy_board):
++    board, _ = busy_board
++    with activity.cached_ro(board):
++        pass
++    lock = activity._RO_CACHE[str(board)][2]
++    key = _during_hold(lock, lambda: activity._board_content_key(board))
++    assert key[0] == "stat"
++    with activity.cached_ro(board) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM marker").fetchone()[0] == 0
+-- 
+2.43.0
+

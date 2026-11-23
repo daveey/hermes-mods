@@ -1,0 +1,154 @@
+From 9cf2f7e671ade10c7e785028d50d8131eed0fbf2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:01:11 +0000
+Subject: [PATCH] [daveey] retain exact dashboard histories across task-only
+ changes
+
+Task-wide P2 marks currently discard immutable event histories even when only task content, runs, comments or neighbours changed. Compare the ordered typed SQLite scalars before reusing history reductions. Keep fresh task/run/graph/wake reads and reload changed events, including same-ID edits.
+
+Proof: baseline-compatible RED on title-only reload. 29 consumer files: 525 tests green; added schema-rename control green separately. scripts/check --base origin/main green. Captured hub-board A/B: parent-equivalent 72.48ms, candidate 52.86ms, parent-repeat 65.85ms per content-edit GET (30 samples each), cold payload parity in all three. These fixture timings are not live CPU acceptance; 1.97% is only a theoretical zero-materialization floor.
+---
+ plugins/kanban/dashboard/board_read.py        | 23 ++++++-
+ tests/plugins/test_kanban_board_history.py    |  4 +-
+ .../test_kanban_materialization_reuse.py      | 65 +++++++++++++++++++
+ 3 files changed, 90 insertions(+), 2 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_materialization_reuse.py
+
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 76d5f7faa7..9447940a59 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -4,6 +4,7 @@ commit (clock, config, profiles on disk, hub replica) and runs on every refresh.
+ 
+ from __future__ import annotations
+ 
++import marshal
+ import sqlite3
+ import time
+ from dataclasses import asdict
+@@ -207,6 +208,26 @@ def _diag_memo(rows, events_by_task, runs_by_task, marks, unmarked=None) -> dict
+                       None if unmarked is None else unmarked.get(r["id"])) for r in rows}
+ 
+ 
++def _same_events(conn, tid, history) -> bool:
++    """Exact same-snapshot comparison for task-wide P2 false positives.
++
++    Count/max cannot certify same-ID edits. Compare every ordered scalar, including
++    column names and storage types, before retaining immutable history reductions.
++    This still scans SQL history; it avoids rebuilding/reducing it and the broad
++    diagnostic loader's duplicate run/graph reads on task/comment/link edits.
++    """
++    cur = conn.cursor()
++    cur.row_factory = None
++    try:
++        rows = cur.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)).fetchall()
++        keys = tuple(d[0] for d in cur.description)
++        if history and tuple(history[0].keys()) != keys:
++            return False
++        return marshal.dumps(tuple(rows), 2) == marshal.dumps(_raw(history), 2)
++    finally:
++        cur.close()
++
++
+ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *,
+                              graphs=None, event_changed=None) -> tuple:
+     """Retain event histories independently of task/run bookkeeping. ``event_changed``
+@@ -232,7 +253,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+             return True
+         if trusted:
+             if tid in event_changed:
+-                return True
++                return not _same_events(conn, tid, old[3])
+             if len(old) > 5 and old[5] is not None:
+                 return old[5] != unmarked.get(tid)
+             return old[2] is None or old[2] != marks.get(tid, _NO_EVENTS)
+diff --git a/tests/plugins/test_kanban_board_history.py b/tests/plugins/test_kanban_board_history.py
+index d02aee74f4..537878e8d5 100644
+--- a/tests/plugins/test_kanban_board_history.py
++++ b/tests/plugins/test_kanban_board_history.py
+@@ -123,8 +123,10 @@ def test_history_mutations_match_cold_projection(board, monkeypatch, mutation):
+         warm = helpers._stable(helpers._read(board))
+         warm_loaded = list(loaded)
+         assert warm == helpers._cold(board)
+-        if mutation == "heartbeat":
++        if mutation in {"heartbeat", "run_update"}:
+             assert not [v for v in warm_loaded if v[0] == "task_events"]
++            if mutation == "run_update":
++                assert any(table == "task_runs" and tid in touched for table, touched in warm_loaded)
+         else:
+             assert any(table == "task_events" and tid in touched for table, touched in warm_loaded)
+         assert kb.get_task(conn, tid) is not None
+diff --git a/tests/plugins/test_kanban_materialization_reuse.py b/tests/plugins/test_kanban_materialization_reuse.py
+new file mode 100644
+index 0000000000..e239e1ea5d
+--- /dev/null
++++ b/tests/plugins/test_kanban_materialization_reuse.py
+@@ -0,0 +1,65 @@
++"""Task-wide invalidations must not discard identical diagnostic histories."""
++import sqlite3
++
++import pytest
++
++from plugins.kanban.dashboard import board_read, board_rows
++from tests.plugins import test_kanban_board_incremental as helpers
++from hermes_cli import kanban_db_connect as kbc
++
++board = helpers.board
++
++
++def test_content_only_edit_retains_history_and_visible_payload(board, monkeypatch):
++    ids, _run = helpers._seed()
++    helpers._read(board)
++    loads = []
++    original = board._diagnostic_inputs
++    monkeypatch.setattr(board, '_diagnostic_inputs',
++                        lambda c, task_ids=None: loads.append(task_ids) or original(c, task_ids))
++    conn = kbc.connect()
++    try:
++        conn.execute('UPDATE tasks SET title = ? WHERE id = ?', ('new title', ids[0]))
++        conn.commit()
++    finally:
++        conn.close()
++    warm = helpers._stable(helpers._read(board))
++    assert loads == [], 'task-only changes must retain identical event histories and reductions'
++    board_rows.clear()
++    assert warm == helpers._stable(helpers._read(board))
++    assert any(t['title'] == 'new title' for col in warm['columns'] for t in col['tasks'])
++
++
++@pytest.mark.parametrize('mutation', [
++    "UPDATE task_events SET payload = 1.0 WHERE id = 1",
++    "UPDATE task_events SET payload = NULL WHERE id = 1",
++    "UPDATE task_events SET payload = x'31' WHERE id = 1",
++    "UPDATE task_events SET payload = '1' WHERE id = 1",
++    "DELETE FROM task_events WHERE id = 1",
++    "INSERT INTO task_events VALUES (0, 't', 'heartbeat', 1)",
++    "INSERT OR REPLACE INTO task_events VALUES (1, 't', 'edited', 1)",
++    "ALTER TABLE task_events ADD COLUMN extra TEXT",
++    "ALTER TABLE task_events RENAME COLUMN payload TO renamed",
++])
++def test_exact_history_comparison_rejects_mutations(mutation):
++    with sqlite3.connect(':memory:') as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute('CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload)')
++        conn.execute("INSERT INTO task_events VALUES (1, 't', 'created', 1)")
++        history = board_read._rows_by_task(conn, 'task_events', ['t'])['t']
++        assert board_read._same_events(conn, 't', history)
++        conn.execute(mutation)
++        assert not board_read._same_events(conn, 't', history)
++        assert conn.row_factory is sqlite3.Row
++
++
++def test_exact_empty_history_and_independent_task():
++    with sqlite3.connect(':memory:') as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute('CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, payload)')
++        assert board_read._same_events(conn, 't', ())
++        conn.execute("INSERT INTO task_events VALUES (1, 'other', 'x')")
++        assert board_read._same_events(conn, 't', ())
++        conn.execute("INSERT INTO task_events VALUES (2, 't', 'x')")
++        assert not board_read._same_events(conn, 't', ())
++
+-- 
+2.43.0
+

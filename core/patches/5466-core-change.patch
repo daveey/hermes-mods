@@ -1,0 +1,390 @@
+From 886b64ffc6983f8fc8f53291000176c7365d0909 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:20:24 +0000
+Subject: [PATCH] fix(dashboard): lane slots never leak and stay held until the
+ thread returns [daveey]
+
+Review of #3936:
+- _admit: a cancellation landing right after the gate handed the slot over
+  left it held forever (two /api/status active-count timeouts filled the probe
+  lane). Acquisition is now recorded as soon as acquire returns, and any
+  exception releases a slot already taken. The disconnect poll never
+  overrides an acquisition.
+- run_in_lane: a caller cancelled while its thread ran (e.g. /api/status's
+  0.75 s wait_for) freed the slot while the read kept running, so a lane did
+  not bound its threads. The slot and counters are now released by the
+  thread when it returns; work cancelled before a thread picked it up never
+  starts.
+- New kanban lane (4) for /api/session-kanban-tasks: polled per sidebar row
+  and slow when a board is busy, it no longer shares the session lists'
+  threads.
+- configure() swaps the lane table in one assignment.
+- Docs: request= only where the body is already read; coalesced callers wait
+  on coalesced_read's own admission first.
+
+Tests: a cancel 0-5 loop turns after the hand-off leaves nothing borrowed
+(failed on the previous head); a caller cancelled mid-run keeps its slot
+until the thread returns (failed on the previous head); an exception from the
+work releases the slot; a disconnect racing the hand-off leaves nothing
+borrowed (guards the invariant; the old leak depended on task order and did
+not reproduce here). The load test now also requires the slow kanban reads to
+leave the sessions lane empty.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/web_routers/sessions.py            |   5 +-
+ hermes_cli/web_thread_lanes.py                | 136 +++++++++++++-----
+ .../test_dashboard_thread_starvation.py       |   6 +-
+ tests/hermes_cli/test_web_thread_lanes.py     |  93 +++++++++++-
+ 4 files changed, 195 insertions(+), 45 deletions(-)
+
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index a8d0c643e0..31b5194a88 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -208,8 +208,9 @@ def _session_kanban_tasks_read(ids: str):
+ 
+ @list_router.get("/api/session-kanban-tasks")
+ async def get_session_kanban_tasks(request: Request, ids: str = Query(..., max_length=4000)):
+-    # Reads every board's linked cards: on the sessions lane, so a slow board never holds the shared pool. [daveey]
+-    return await run_in_lane("sessions", _session_kanban_tasks_read, ids, request=request)
++    # Reads every board's linked cards: the kanban lane, so a slow board holds neither the shared pool nor the
++    # threads of the session lists. [daveey]
++    return await run_in_lane("kanban", _session_kanban_tasks_read, ids, request=request)
+ 
+ 
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+diff --git a/hermes_cli/web_thread_lanes.py b/hermes_cli/web_thread_lanes.py
+index 6588c59466..48204ff9ce 100644
+--- a/hermes_cli/web_thread_lanes.py
++++ b/hermes_cli/web_thread_lanes.py
+@@ -9,22 +9,28 @@ A lane is a group of routes with its own thread budget:
+ 
+ * ``control`` -- the thread work of ``/api/status`` and Desktop's small control reads. Never a kanban or
+   ``state.db`` read: those may wait on a lock, and this lane must stay free.
+-* ``sessions`` -- session lists, project trees, linked kanban cards.
++* ``sessions`` -- session lists and project trees.
++* ``kanban`` -- linked-card reads across every board (``/api/session-kanban-tasks``): polled per sidebar row and
++  slow when a board is busy, so they never take the session lists' threads.
+ * ``probe`` -- the short, bounded ``state.db`` reads inside ``/api/status`` (storage probe, active-session
+   count, FTS rebuild status), with a short deadline: they must not wait behind session lists, and a busy
+   probe lane only marks those fields unknown/degraded instead of holding the status answer.
+ * ``feed`` -- plugin catch-up reads (``session-panel`` ``/changes``, ``user-steps``).
+ 
+-A full lane holds only its own threads, never the shared pool. A caller waits at most
+-``queue_deadline_s`` (below Desktop's 30 s timeout) for one of them; then, or as soon as its client has
+-disconnected, it gets ``503`` with ``Retry-After`` and the work never starts, so a retry is always safe.
+-Work that already started runs to the end: a Python thread cannot be interrupted safely.
++A full lane holds only its own threads, never the shared pool. A caller waits at most ``queue_deadline_s``
++(below Desktop's 30 s timeout) for one of them; then, or as soon as its client has disconnected (callers that
++pass ``request=``), it gets ``503`` with ``Retry-After`` and the work never starts, so a retry is always safe.
++Work that already started runs to the end (a Python thread cannot be interrupted safely) and keeps its lane
++slot until its thread returns, even when the caller was cancelled meanwhile: a lane never runs more threads
++than its size. A ``coalesced_read`` caller first waits on that wrapper's own admission (no deadline there),
++then on the lane.
+ 
+ Sizes and the deadline come from ``dashboard.thread_lanes`` in config.yaml, read once at app start-up
+ (``configure()`` in a worker thread); until then the built-in defaults apply.
+ """
+ from __future__ import annotations
+ 
++import asyncio
+ import functools
+ import logging
+ import threading
+@@ -38,7 +44,7 @@ from fastapi import HTTPException
+ 
+ _log = logging.getLogger(__name__)
+ 
+-DEFAULT_SIZES = {"control": 4, "sessions": 8, "feed": 6, "probe": 2}
++DEFAULT_SIZES = {"control": 4, "sessions": 8, "kanban": 4, "feed": 6, "probe": 2}
+ QUEUE_DEADLINE_S = 25.0      # below Desktop's 30 s request timeout: a waiter it gave up on never runs
+ RETRY_AFTER_S = 2
+ DISCONNECT_POLL_S = 1.0
+@@ -128,13 +134,14 @@ def _read_config() -> tuple[dict[str, int], float]:
+ 
+ 
+ def configure(sizes: Optional[dict[str, int]] = None, queue_deadline_s: Optional[float] = None) -> None:
+-    """Set the lanes (``None``: read config.yaml). Resets every counter; for start-up and tests."""
+-    global _deadline_s
++    """Set the lanes (``None``: read config.yaml). Resets every counter; for start-up and tests. The new
++    table replaces the old one in one assignment, so a concurrent lookup never sees it half-built."""
++    global _deadline_s, _lanes
+     read_sizes, read_deadline = _read_config() if sizes is None or queue_deadline_s is None else ({}, 0.0)
+     sizes = dict(sizes) if sizes is not None else read_sizes
++    table = {name: _Lane(name, size) for name, size in sizes.items()}
+     with _config_lock:
+-        _lanes.clear()
+-        _lanes.update({name: _Lane(name, size) for name, size in sizes.items()})
++        _lanes = table
+         _deadline_s = float(queue_deadline_s) if queue_deadline_s is not None else read_deadline
+ 
+ 
+@@ -158,38 +165,51 @@ def queue_deadline_s() -> float:
+ 
+ 
+ async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, request: Any) -> str:
+-    """'ok' once ``token`` holds a gate slot; else 'deadline' or 'disconnected' (and nothing is held).
+-    CapacityLimiter.acquire_on_behalf_of releases what it took when it is cancelled, so no outcome leaks."""
+-    outcome = "deadline"
+-    with anyio.move_on_after(deadline):
+-        async with anyio.create_task_group() as tg:
+-            async def take() -> None:
+-                nonlocal outcome
+-                await gate.acquire_on_behalf_of(token)
+-                outcome = "ok"
+-                tg.cancel_scope.cancel()
+-
+-            async def watch() -> None:
+-                nonlocal outcome
+-                while True:
+-                    await anyio.sleep(DISCONNECT_POLL_S)
+-                    if await request.is_disconnected():
+-                        outcome = "disconnected"
+-                        tg.cancel_scope.cancel()
+-                        return
++    """'ok' with ``token`` holding one gate slot; else 'deadline' or 'disconnected' with nothing held.
+ 
+-            tg.start_soon(take)
+-            if request is not None:
+-                tg.start_soon(watch)
+-    return outcome
++    The caller's own cancellation can land at any point, including right after the slot was handed over:
++    any exception releases a slot already taken before it propagates. A disconnect noticed after the slot
++    was taken is ignored (the call runs; nothing leaks)."""
++    acquired = False
++    gone = False
++    try:
++        with anyio.move_on_after(deadline):
++            if request is None:
++                await gate.acquire_on_behalf_of(token)
++                acquired = True
++            else:
++                async with anyio.create_task_group() as tg:
++                    async def watch() -> None:
++                        nonlocal gone
++                        while not acquired:
++                            await anyio.sleep(DISCONNECT_POLL_S)
++                            if acquired:
++                                return
++                            if await request.is_disconnected() and not acquired:
++                                gone = True
++                                tg.cancel_scope.cancel()
++                                return
++
++                    tg.start_soon(watch)
++                    await gate.acquire_on_behalf_of(token)
++                    acquired = True
++                    tg.cancel_scope.cancel()
++    except BaseException:
++        if acquired:
++            gate.release_on_behalf_of(token)
++        raise
++    if acquired:
++        return "ok"
++    return "disconnected" if gone else "deadline"
+ 
+ 
+ async def run_in_lane(lane: str, fn: Callable[..., Any], *args: Any, request: Any = None,
+                       deadline: Optional[float] = None, **kwargs: Any) -> Any:
+     """``run_in_threadpool`` on a lane: wait at most the queue deadline (or a shorter ``deadline`` for this
+     call) for one of the lane's threads, then run ``fn(*args, **kwargs)`` there. Raises :class:`LaneBusy`
+-    (503) without running ``fn`` when no thread freed up in time, or when ``request`` (optional)
+-    disconnected while waiting."""
++    (503) without running ``fn`` when no thread freed up in time, or when ``request`` disconnected while
++    waiting. Pass ``request`` only where the body is already read (GET, or a parsed body parameter):
++    ``Request.is_disconnected()`` drops body chunks it receives."""
+     entry = _lane(lane)
+     limit = queue_deadline_s() if deadline is None else min(float(deadline), queue_deadline_s())
+     gate, runner = entry.limiters()
+@@ -207,13 +227,51 @@ async def run_in_lane(lane: str, fn: Callable[..., Any], *args: Any, request: An
+         if outcome == "deadline" and entry._should_log_reject():
+             _log.warning("thread lane %s full: refused a call after %.1fs (%s)", lane, waited, entry.stats())
+         raise LaneBusy(lane, outcome, waited)
+-    entry._add(in_use=1)
+-    try:
+-        return await _to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=runner)
+-    finally:
++
++    # The slot is released when the work is over, not when the caller stops waiting: a cancelled caller
++    # (e.g. /api/status's own timeout) leaves its thread running, and that thread still counts.
++    loop = asyncio.get_running_loop()
++    state_lock = threading.Lock()
++    state = {"entered": False, "skipped": False, "done": False}
++
++    def finish() -> None:
++        with state_lock:
++            if state["done"]:
++                return
++            state["done"] = True
+         entry._add(in_use=-1, served=1)
+         gate.release_on_behalf_of(token)
+ 
++    def call() -> Any:
++        with state_lock:
++            if state["skipped"]:  # the caller was cancelled before this thread picked the work up
++                return None
++            state["entered"] = True
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            try:
++                loop.call_soon_threadsafe(finish)
++            except RuntimeError:  # the loop is closed: nothing is left to release
++                pass
++
++    functools.update_wrapper(call, getattr(fn, "func", fn))  # loop accounting names the thread after fn
++    entry._add(in_use=1)
++    try:
++        result = await _to_thread.run_sync(call, limiter=runner)
++    except BaseException as exc:
++        with state_lock:
++            entered = state["entered"]
++            if not entered:
++                state["skipped"] = True
++        # Not started (now never will) or already finished (fn raised): release now. Started and the caller
++        # was cancelled: the thread releases when it returns.
++        if not entered or not isinstance(exc, (asyncio.CancelledError, anyio.get_cancelled_exc_class())):
++            finish()
++        raise
++    finish()
++    return result
++
+ 
+ def lane_runner(lane: str) -> Callable[[Callable[[], Any]], Any]:
+     """A ``coalesced_read(thread_runner=...)`` that runs the shared read on ``lane``."""
+diff --git a/tests/hermes_cli/test_dashboard_thread_starvation.py b/tests/hermes_cli/test_dashboard_thread_starvation.py
+index fdbea09a1d..98443e9b3e 100644
+--- a/tests/hermes_cli/test_dashboard_thread_starvation.py
++++ b/tests/hermes_cli/test_dashboard_thread_starvation.py
+@@ -86,8 +86,10 @@ async def test_status_and_health_answer_while_slow_reads_fill_the_shared_pool_an
+             assert health.status_code == 200
+             report = health.json()["thread_lanes"]
+             assert len(in_other) == SHARED_POOL  # the other routes kept the shared pool full throughout
+-            assert report["sessions"]["in_use"] == lanes.DEFAULT_SIZES["sessions"]
+-            assert report["sessions"]["waiting"] > 0
++            assert report["kanban"]["in_use"] == lanes.DEFAULT_SIZES["kanban"]
++            assert report["kanban"]["waiting"] > 0
++            # The slow kanban reads never took the session lists' threads.
++            assert report["sessions"]["in_use"] == 0
+             # The slow reads never touched the control lane's budget.
+             assert report["control"]["in_use"] == 0 and report["control"]["rejected"] == 0
+     finally:
+diff --git a/tests/hermes_cli/test_web_thread_lanes.py b/tests/hermes_cli/test_web_thread_lanes.py
+index f69aab9c79..ab8e7fd1a3 100644
+--- a/tests/hermes_cli/test_web_thread_lanes.py
++++ b/tests/hermes_cli/test_web_thread_lanes.py
+@@ -18,7 +18,7 @@ TIMEOUT = 5.0
+ 
+ @pytest.fixture(autouse=True)
+ def _lanes():
+-    lanes.configure({"control": 2, "sessions": 1, "feed": 1, "probe": 1}, queue_deadline_s=5.0)
++    lanes.configure({"control": 2, "sessions": 1, "kanban": 1, "feed": 1, "probe": 1}, queue_deadline_s=5.0)
+     yield
+     lanes.configure(dict(lanes.DEFAULT_SIZES), lanes.QUEUE_DEADLINE_S)
+ 
+@@ -55,7 +55,7 @@ async def test_a_full_lane_makes_the_next_caller_wait_then_runs_it():
+ 
+ @pytest.mark.asyncio
+ async def test_a_waiter_past_the_deadline_gets_503_and_never_runs():
+-    lanes.configure({"control": 1, "sessions": 1, "feed": 1, "probe": 1}, queue_deadline_s=0.2)
++    lanes.configure({"control": 1, "sessions": 1, "kanban": 1, "feed": 1, "probe": 1}, queue_deadline_s=0.2)
+     work, started, release = _blocker()
+     holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
+     await _until(started.is_set)
+@@ -181,3 +181,92 @@ def test_an_unconfigured_process_uses_the_defaults_without_reading_config(monkey
+ async def test_unknown_lane_is_a_programming_error():
+     with pytest.raises(KeyError):
+         await lanes.run_in_lane("nope", lambda: None)
++
++
++def _borrowed(lane):
++    gate, _runner = lanes._lane(lane).limiters()
++    return gate.statistics().borrowed_tokens
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("turns", range(6))
++async def test_a_cancel_right_after_the_hand_off_never_leaks_the_slot(turns):
++    # Review of #3936: a cancellation landing just after the gate handed the slot to a waiter left it held
++    # forever (the probe lane filled after two /api/status timeouts).
++    work, started, release = _blocker()
++    holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
++    await _until(started.is_set)
++    waiter = asyncio.create_task(lanes.run_in_lane("sessions", lambda: "late"))
++    await _until(lambda: lanes.stats()["sessions"]["waiting"] == 1)
++    release.set()
++    await holder  # its slot is now handed to the waiter
++    for _ in range(turns):
++        await asyncio.sleep(0)
++    waiter.cancel()
++    try:
++        await waiter
++    except asyncio.CancelledError:
++        pass
++    await _until(lambda: lanes.stats()["sessions"]["in_use"] == 0)
++    assert _borrowed("sessions") == 0
++    assert await asyncio.wait_for(lanes.run_in_lane("sessions", lambda: "next"), 2) == "next"
++
++
++class _GoneWhen:
++    """Disconnected once ``gone()`` is true; answers without yielding, as uvicorn does once it knows."""
++
++    def __init__(self, gone):
++        self.gone = gone
++
++    async def is_disconnected(self):
++        return self.gone()
++
++
++@pytest.mark.asyncio
++async def test_a_disconnect_seen_with_the_hand_off_never_leaks_the_slot(monkeypatch):
++    # Review of #3936: when the slot was handed over in the same loop turn the disconnect poll woke, the poll
++    # overwrote the acquisition with 'disconnected' and the slot was never released. The client reads as gone
++    # from the hand-off on (the gate has dequeued the waiter); repeated so both orderings come up.
++    monkeypatch.setattr(lanes, "DISCONNECT_POLL_S", 0)
++    gate, _runner = lanes._lane("sessions").limiters()
++    for _ in range(20):
++        work, started, release = _blocker()
++        holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
++        await _until(started.is_set)
++        handed = _GoneWhen(lambda: gate.statistics().tasks_waiting == 0)
++        waiter = asyncio.create_task(lanes.run_in_lane("sessions", lambda: "ran", request=handed))
++        await _until(lambda: gate.statistics().tasks_waiting == 1)
++        release.set()
++        await holder
++        try:
++            await asyncio.wait_for(waiter, 2)
++        except lanes.LaneBusy as busy:
++            assert busy.detail["reason"] == "disconnected"
++        await _until(lambda: lanes.stats()["sessions"]["in_use"] == 0)
++        assert _borrowed("sessions") == 0
++
++
++@pytest.mark.asyncio
++async def test_a_caller_cancelled_while_its_thread_runs_keeps_the_slot_until_the_thread_returns():
++    # Review of #3936: /api/status's own 0.75 s timeout cancelled the caller and freed the slot while the
++    # state.db read kept running, so the probe lane did not bound its threads.
++    work, started, release = _blocker()
++    with pytest.raises(asyncio.TimeoutError):
++        await asyncio.wait_for(lanes.run_in_lane("probe", work), 0.2)
++    assert started.is_set()
++    assert lanes.stats()["probe"]["in_use"] == 1 and _borrowed("probe") == 1
++    with pytest.raises(lanes.LaneBusy):  # the lane is still full: its one thread is still busy
++        await lanes.run_in_lane("probe", lambda: None, deadline=0.1)
++    release.set()
++    await _until(lambda: lanes.stats()["probe"]["in_use"] == 0)
++    assert _borrowed("probe") == 0 and lanes.stats()["probe"]["served"] == 1
++    assert await asyncio.wait_for(lanes.run_in_lane("probe", lambda: "free"), 2) == "free"
++
++
++@pytest.mark.asyncio
++async def test_an_exception_from_the_work_releases_the_slot():
++    def boom():
++        raise ValueError("read failed")
++    with pytest.raises(ValueError):
++        await lanes.run_in_lane("sessions", boom)
++    assert lanes.stats()["sessions"]["in_use"] == 0 and _borrowed("sessions") == 0
+-- 
+2.43.0
+

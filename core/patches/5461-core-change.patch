@@ -1,0 +1,253 @@
+From df35cbf3eba3e24da75d538d7f78267cc452f2e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:15:18 +0000
+Subject: [PATCH] [daveey] Carry selected source artifacts through the continue
+ tool
+
+Fixture B reached the registered continue tool with source_path and artifacts, but the schema rejected artifacts before the handler could attach. Merely adding the field would silently lose the selection: continue registered only source_path before publication. Reuse the bound source staging producer for selection before existing continuation preflight; reject malformed lists before attaching. Omission preserves selection and explicit empty clears it, without checkpoint metadata or chat delivery.
+
+Proof: registered handler RED 3 invalid_args; composed registry dispatch GREEN with initial/attached/published receipts and exact blob bytes; 46 source/continuation consumer files 703 passed; 4 targeted mutants killed; full scripts/check 21 checks pass. Independent bounded plan reviewed; final exact-head review and required CI remain required. Live fixture acceptance is not claimed.
+---
+ tests/tools/test_kanban_continue_artifacts.py | 116 ++++++++++++++++++
+ .../test_kanban_source_ending_initial.py      |   6 +-
+ tools/kanban_tools.py                         |   6 +-
+ tools/kanban_tools_schemas.py                 |   5 +
+ tools/kanban_tools_source.py                  |  11 ++
+ website/docs/user-guide/features/kanban.md    |  12 +-
+ 6 files changed, 146 insertions(+), 10 deletions(-)
+ create mode 100644 tests/tools/test_kanban_continue_artifacts.py
+
+diff --git a/tests/tools/test_kanban_continue_artifacts.py b/tests/tools/test_kanban_continue_artifacts.py
+new file mode 100644
+index 0000000000..0e99b959ff
+--- /dev/null
++++ b/tests/tools/test_kanban_continue_artifacts.py
+@@ -0,0 +1,116 @@
++"""Continue's registered tool carries portable selections, not chat deliverables."""
++import json
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_continuation as continuation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_source_artifacts as artifacts
++from hermes_cli import kanban_source_board as board
++from hermes_cli import kanban_source_registration as registration
++from tests.hermes_cli import test_kanban_source_registration as helpers
++from tests.tools.test_kanban_source_heartbeat import _bind
++from tools import kanban_tools as kt
++
++setup = helpers.setup
++
++
++def call(args):
++    entry = kt.registry.get_entry("kanban_continue")
++    assert entry is not None
++    return json.loads(entry.handler(args))
++
++
++def test_registered_schema_exposes_continue_selection_only():
++    props = kt.registry.get_schema("kanban_continue")["parameters"]["properties"]
++    assert props["artifacts"]["type"] == "array"
++    assert props["artifacts"]["items"] == {"type": "string"}
++    for name in ("move", "block", "schedule", "request_changes"):
++        assert "artifacts" not in kt.registry.get_schema(f"kanban_{name}")["parameters"]["properties"]
++
++
++@pytest.mark.parametrize("selection", [None, "report.txt", {}, [1]])
++def test_invalid_selection_refuses_before_initial_attach(selection, setup, monkeypatch):
++    conn, boundary, tid, source, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    out = call({"checkpoint": "resume", "source_path": str(source), "artifacts": selection})
++    assert "list of paths" in out["error"], out
++    assert kb.get_task(conn, tid).status == "running"
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach", "publish_source") == []
++    assert kb.list_attachments(conn, tid) == []
++
++
++@pytest.mark.parametrize("identity", ["foreign", "unbound", "stale", "operator"])
++def test_selection_requires_bound_worker(identity, setup, monkeypatch):
++    conn, boundary, tid, source, _, _, _ = setup
++    run = registration.register_initial(conn, tid, str(source))
++    _bind(monkeypatch, conn, tid, run.run_id, identity)
++    out = call({"task_id": tid, "checkpoint": "resume", "artifacts": []})
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    assert artifacts.selected(conn, tid, run.run_uid) is None
++    assert boundary.actions("publish_source") == []
++
++
++def test_selection_without_source_refuses(setup, monkeypatch):
++    conn, boundary, tid, _, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    out = call({"checkpoint": "resume", "artifacts": []})
++    assert "attached" in out["error"], out
++    assert kb.get_task(conn, tid).status == "running"
++    assert boundary.actions("source_attach", "publish_source") == []
++
++
++@pytest.mark.parametrize("selection", ["omitted", "empty", "replacement", "missing"])
++def test_continuation_selection_precedes_core_and_survives_refusal(selection, setup, monkeypatch):
++    conn, boundary, tid, source, scratch, _, _ = setup
++    run = registration.register_initial(conn, tid, str(source))
++    _bind(monkeypatch, conn, tid, run.run_id, "owner")
++    first, second = scratch / "first.txt", scratch / "second.txt"
++    first.write_bytes(b"first snapshot")
++    second.write_bytes(b"second snapshot")
++    old = artifacts.stage_for_run(conn, tid, [str(first)], board=kb.get_current_board(),
++                                  expected_run_id=run.run_id)
++    args = {"checkpoint": "resume", "metadata": {"marker": "checkpoint only"}}
++    if selection != "omitted":
++        args["artifacts"] = [] if selection == "empty" else [str(second if selection == "replacement" else scratch / "missing")]
++    observed = []
++
++    def refuse(*a, **kw):
++        chosen = artifacts.selected(conn, tid, run.run_uid)
++        observed.append(chosen)
++        assert kw["metadata"]["marker"] == "checkpoint only"
++        assert "artifacts" not in kw["metadata"], "selection is not chat delivery"
++        second.write_bytes(b"edited after staging")
++        return {"ok": False, "error": "controlled downstream refusal"}
++
++    core = Mock(side_effect=refuse)
++    monkeypatch.setattr(continuation, "continue_task", core)
++    out = call(args)
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    chosen = artifacts.selected(conn, tid, run.run_uid)
++    assert boundary.actions("publish_source") == []
++    if selection == "missing":
++        core.assert_not_called()
++        assert chosen == old
++        return
++    assert observed == [chosen]
++    if selection == "omitted":
++        assert chosen == old
++    elif selection == "empty":
++        assert chosen == []
++    else:
++        assert chosen and chosen != old
++        assert Path(artifacts._row(conn, tid, chosen[0])["stored_path"]).read_bytes() == b"second snapshot"
++        second.write_bytes(b"second snapshot")
++    count = len(kb.list_attachments(conn, tid))
++    again = call(args)
++    assert "error" in again
++    assert artifacts.selected(conn, tid, run.run_uid) == chosen
++    assert len(kb.list_attachments(conn, tid)) == count, "same bytes replay without duplicate attachment"
+diff --git a/tests/tools/test_kanban_source_ending_initial.py b/tests/tools/test_kanban_source_ending_initial.py
+index dded4de11e..c11934dd9e 100644
+--- a/tests/tools/test_kanban_source_ending_initial.py
++++ b/tests/tools/test_kanban_source_ending_initial.py
+@@ -31,7 +31,7 @@ ENDINGS = {
+     "schedule": ("_handle_schedule", {"reason": _PARK, "clock_only": True, "awaiting": {"kind": "clock", "why": "test window"}},
+                  "hermes_cli.kanban_db", "schedule_task", "scheduled", False),
+     "continue": ("_handle_continue", {"checkpoint": "done so far; resume later"},
+-                 "hermes_cli.kanban_continuation", "continue_task", "ready", False),
++                 "hermes_cli.kanban_continuation", "continue_task", "ready", True),
+     "move": ("_handle_move", {"runs_on": ["pool:worker"], "reason": "needs another machine",
+                               "checkpoint": "resume elsewhere"},
+              "hermes_cli.kanban_move", "move_task", "ready", False),
+@@ -41,7 +41,7 @@ ENDINGS = {
+ @pytest.mark.parametrize("ending", list(ENDINGS))
+ @pytest.mark.parametrize("prior_state", ["none", "attached", "published"])
+ def test_ending_registers_initial_source_before_ending_preflight(ending, prior_state, setup, tmp_path, monkeypatch):
+-    handler, base_args, core_mod, core_attr, landed, with_artifacts = ENDINGS[ending]
++    _handler, base_args, core_mod, core_attr, landed, with_artifacts = ENDINGS[ending]
+     conn, boundary, tid, source, scratch, _home, clone = setup
+     from hermes_cli import kanban_sync_client as client
+     client.ensure_identity(conn, "default", "worker")
+@@ -108,7 +108,7 @@ def test_ending_registers_initial_source_before_ending_preflight(ending, prior_s
+             if with_artifacts:
+                 stage_completion(conn, tid, {"artifacts": [str(report)]}, expected_run_id=run_id)
+             assert preflight.compute_receipt(conn, tid, prior)["state"] == "published"
+-    out = json.loads(getattr(kt, handler)(args))
++    out = json.loads(kt.registry.dispatch(f"kanban_{ending}", args))
+     heartbeat.assert_not_called()
+     assert out.get("ok") is True, out
+     assert kb.get_task(conn, tid).status == landed
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 34bac8c2a6..e12b1bc765 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1210,9 +1210,9 @@ def _handle_continue(args: dict, **kw) -> str:
+         wake = _wake_check_args(args, conn=conn, tid=tid)
+         awaiting, wake = _awaiting_arg(args, wake)
+         _park_guard(conn, tid, "continue", wake, resume_after=int(raw_after or 0))
+-        from tools.kanban_tools_source import register_for_ending
+-        register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
+-                            expected_run_id=_worker_run_id(tid))
++        from tools.kanban_tools_source import stage_continuation
++        stage_continuation(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                           expected_run_id=_worker_run_id(tid))
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+                             expected_run_id=_worker_run_id(tid), metadata=metadata, awaiting=awaiting,
+                             wake_check=wake[0], check_every=wake[1], clock_only=wake[2],
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index f519689fdb..da62c810c6 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -629,6 +629,11 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+     ),
+     {
+         **_ENDING_SOURCE_PATH,
++        "artifacts": {"type": "array", "items": {"type": "string"}, "description": (
++            "Optional absolute file paths to carry with this run's attached source (max 32). "
++            "Snapshots are staged before continuation publication; [] clears selection, omission preserves it. "
++            "Requires this task's bound worker and protocol-2 source. Not chat delivery."
++        )},
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "checkpoint": _prop("string", (
+             "Everything the next run needs to resume without re-deriving it: "
+diff --git a/tools/kanban_tools_source.py b/tools/kanban_tools_source.py
+index 6258fd59bd..5b3ee8c17f 100644
+--- a/tools/kanban_tools_source.py
++++ b/tools/kanban_tools_source.py
+@@ -57,6 +57,17 @@ def register_for_ending(conn, task_id, args, *, worker_task, expected_run_id):
+                      worker_task=worker_task, expected_run_id=expected_run_id)
+ 
+ 
++def stage_continuation(conn, task_id, args, *, worker_task, expected_run_id):
++    """Attach explicitly and select portable snapshots before continuation preflight."""
++    if "artifacts" in args and (not isinstance(args["artifacts"], list)
++                               or not all(isinstance(p, str) for p in args["artifacts"])):
++        raise ValueError("artifacts must be a list of paths")
++    bound = {"worker_task": worker_task, "expected_run_id": expected_run_id}
++    register_for_ending(conn, task_id, args, **bound)
++    if "artifacts" in args:
++        heartbeat_source(conn, task_id, {"artifacts": args["artifacts"]}, **bound)
++
++
+ def stage_completion(conn, task_id, metadata, *, expected_run_id):
+     """Called after worker ownership, foreign-card and completion gates.
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 113ffdb744..b13714d059 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -880,10 +880,14 @@ moves. As the worker:
+    or schedule; register with heartbeat first in that case. This does not add
+    CLI registration or a `source_path` argument to `kanban_request_changes`.
+ 4. Optionally carry up to 32 files that are not in Git with
+-   `kanban_heartbeat(artifacts=[...])` (or `artifacts` on the ending call). Each
+-   call replaces the selection with byte snapshots taken at that moment; `[]`
+-   clears it. Symlinks, special files and secret-looking names or bytes are
+-   refused.
++   `kanban_heartbeat(artifacts=[...])` or `kanban_continue(artifacts=[...])`.
++   Continue may also supply `source_path` for the first registration; attachment
++   and byte snapshots precede its source-publication preflight. Omitting
++   `artifacts` preserves the selection; `[]` clears it. Selection requires the
++   bound worker's protocol-2 source, and is not chat delivery or checkpoint
++   metadata. Completion and review also accept `artifacts` for delivery.
++   A refused continuation retains successfully staged snapshots for replay.
++   Symlinks, special files and secret-looking names or bytes are refused.
+ 
+ Endings then publish the branch exactly as for worktree cards, and the selected
+ artifacts are verified by digest when another machine picks the card up. Until
+-- 
+2.43.0
+

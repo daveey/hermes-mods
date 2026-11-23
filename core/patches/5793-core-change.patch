@@ -1,0 +1,233 @@
+From 92e74b5e1f636fe94117b09efb5a19976729bfd5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:52:41 +0000
+Subject: [PATCH] Audit every pending-custody mutation site before capture
+ certification
+
+Adds a static inventory of all outbox/parent-envelope insert, update and delete
+sites with a gate test that fails on any unaudited, stale or reclassified site.
+Certifies nothing, stamps nothing, activates nothing (spec section 8).
+---
+ hermes_cli/kanban_sync_capture_sites.py       |  93 +++++++++++++++
+ .../test_kanban_sync_capture_sites.py         | 109 ++++++++++++++++++
+ 2 files changed, 202 insertions(+)
+ create mode 100644 hermes_cli/kanban_sync_capture_sites.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_capture_sites.py
+
+diff --git a/hermes_cli/kanban_sync_capture_sites.py b/hermes_cli/kanban_sync_capture_sites.py
+new file mode 100644
+index 0000000000..f1398fed6c
+--- /dev/null
++++ b/hermes_cli/kanban_sync_capture_sites.py
+@@ -0,0 +1,93 @@
++"""Audited inventory of every pending-custody mutation site. [daveey]
++
++Post-collection replay fencing (POST-COLLECTION-DESIGN section 8) requires a COMPLETE
++insert/update/delete inventory of ``kanban_sync_outbox`` and
++``kanban_sync_parent_envelopes`` before any capture may be certified ``original``.
++This module is that inventory and nothing else: it stamps nothing, certifies nothing
++and activates nothing. Historical and new rows stay UNKNOWN until a later, separately
++reviewed slice stamps ORIGINAL_CANDIDATE sites after writer drain and complete
++exposure-principal provenance. A producer's name is never proof of originality, so even
++ORIGINAL_CANDIDATE only means "may be certified once the unresolved-predecessor and
++pre-I/O exposure conditions hold at that site".
++
++``tests/hermes_cli/test_kanban_sync_capture_sites.py`` scans the source and fails when a
++site appears, disappears or changes verb without an entry here.
++"""
++from __future__ import annotations
++
++# New, authorized intent with no recovery semantics: the only sites that may ever be stamped original.
++ORIGINAL_CANDIDATE = "original_candidate"
++# Re-emission / recovery / repair of possibly exposed work: stamp ambiguous, never original.
++RECOVERY_AMBIGUOUS = "recovery_ambiguous"
++# Re-derived synthetic parent or synthetic verdict: UNKNOWN provenance, never original.
++SYNTHETIC_UNKNOWN = "synthetic_unknown"
++# In-place op_id / created_at / payload rotation of an existing record: must taint sticky-ambiguous.
++IDENTITY_ROTATION = "identity_rotation"
++# Freezes the exact wire bytes/HLC of an existing record (an exposure indicator, not a certification).
++WIRE_FREEZE = "wire_freeze"
++# Attempt/error/state/status-origin bookkeeping; changes no identity tuple.
++STATE_ONLY = "state_only"
++# Removes pending custody (collection of provenance with its record).
++REMOVAL = "removal"
++# Installs the immutability / taint guards themselves.
++GUARD_INSTALL = "guard_install"
++
++DISPOSITIONS = frozenset({
++    ORIGINAL_CANDIDATE, RECOVERY_AMBIGUOUS, SYNTHETIC_UNKNOWN, IDENTITY_ROTATION,
++    WIRE_FREEZE, STATE_ONLY, REMOVAL, GUARD_INSTALL,
++})
++
++_O = "kanban_sync_outbox"
++_P = "kanban_sync_parent_envelopes"
++
++# (module file, enclosing top-level function, SQL verb, table) -> disposition
++SITES: dict[tuple[str, str, str, str], str] = {
++    # -- new intents ------------------------------------------------------------------------
++    ("kanban_db_sync.py", "_outbox_insert", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_db_sync.py", "_insert_trigger", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_retain_transport.py", "reserve", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_actionability_transport.py", "reserve", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_failure_release.py", "queue", "INSERT", _O): ORIGINAL_CANDIDATE,
++    # -- recovery / re-emission / repair ------------------------------------------------------
++    ("kanban_db_sync.py", "_queue_rows", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_client.py", "import_board", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_client.py", "repair_missing_children", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_client.py", "retire_lost_placeholder_links", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_compat.py", "enqueue_retry", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_compat.py", "_drop_virtual", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_divergence.py", "repair_divergence", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_omissions.py", "_queue_restore", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_reserved_key.py", "_queue_children", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    ("kanban_sync_reserved_key.py", "_write_receipt", "INSERT", _O): RECOVERY_AMBIGUOUS,
++    # -- synthetic parents / verdicts -----------------------------------------------------------
++    ("kanban_sync_compat.py", "rejected_parent", "INSERT", _O): SYNTHETIC_UNKNOWN,
++    ("kanban_sync_envelope.py", "parent", "INSERT", _P): SYNTHETIC_UNKNOWN,
++    # -- in-place rotation of an existing record --------------------------------------------------
++    ("kanban_containment_outbox.py", "strip_lifecycle", "UPDATE", _O): IDENTITY_ROTATION,
++    ("kanban_sync_client.py", "push", "UPDATE", _O): IDENTITY_ROTATION,
++    # -- exact-wire freeze --------------------------------------------------------------------------
++    ("kanban_sync_envelope.py", "outbound", "UPDATE", _O): WIRE_FREEZE,
++    # -- bookkeeping -------------------------------------------------------------------------------
++    ("kanban_actionability_transport.py", "eligible_pending", "UPDATE", _O): STATE_ONLY,
++    ("kanban_actionability_transport.py", "record_result", "UPDATE", _O): STATE_ONLY,
++    ("kanban_retain_transport.py", "record_result", "UPDATE", _O): STATE_ONLY,
++    ("kanban_sync_status_origin.py", "bind", "UPDATE", _O): STATE_ONLY,
++    # -- removal of pending custody --------------------------------------------------------------
++    ("kanban_actionability_transport.py", "confirm", "DELETE", _O): REMOVAL,
++    ("kanban_actionability_transport.py", "record_result", "DELETE", _O): REMOVAL,
++    ("kanban_containment_outbox.py", "strip_lifecycle", "DELETE", _O): REMOVAL,
++    ("kanban_db_sync.py", "_apply_one", "DELETE", _O): REMOVAL,
++    ("kanban_retain_safety.py", "recover", "DELETE", _O): REMOVAL,
++    ("kanban_retain_transport.py", "confirm", "DELETE", _O): REMOVAL,
++    ("kanban_retain_transport.py", "record_result", "DELETE", _O): REMOVAL,
++    ("kanban_sync_client.py", "import_board", "DELETE", _O): REMOVAL,
++    ("kanban_sync_client.py", "push", "DELETE", _O): REMOVAL,
++    ("kanban_sync_compat.py", "_drop_virtual", "DELETE", _O): REMOVAL,
++    ("kanban_sync_dependency_delete.py", "settle", "DELETE", _O): REMOVAL,
++    ("kanban_sync_envelope.py", "prune_parents", "DELETE", _P): REMOVAL,
++    ("kanban_sync_envelope.py", "retire_parent", "DELETE", _P): REMOVAL,
++    ("kanban_sync_rejections.py", "resolve_rejections", "DELETE", _O): REMOVAL,
++    # -- the guards themselves -------------------------------------------------------------------------
++    ("kanban_sync_capture_storage.py", "install", "UPDATE", _O): GUARD_INSTALL,
++    ("kanban_sync_capture_storage.py", "install", "UPDATE", _P): GUARD_INSTALL,
++}
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_sites.py b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+new file mode 100644
+index 0000000000..79e93da4ad
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+@@ -0,0 +1,109 @@
++"""Gate: every pending-custody mutation site is audited (POST-COLLECTION-DESIGN section 8). [daveey]
++
++Static scan only: a new, moved or re-verbed INSERT/UPDATE/DELETE/REPLACE against the outbox or parent-
++envelope table must be classified in ``kanban_sync_capture_sites.SITES`` before it can land. Nothing here
++certifies a capture or activates replay fencing.
++"""
++from __future__ import annotations
++
++import ast
++import pathlib
++import re
++
++from hermes_cli import kanban_sync_capture_sites as inv
++
++REPO = pathlib.Path(__file__).resolve().parents[2]
++SCAN_DIRS = ("hermes_cli", "gateway", "plugins", "tools", "agent", "cron", "acp_adapter")
++PAT = re.compile(
++    r"\b(INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+"
++    r"(kanban_sync_outbox|kanban_sync_parent_envelopes)\b", re.IGNORECASE)
++
++
++def _files():
++    for d in SCAN_DIRS:
++        base = REPO / d
++        if base.is_dir():
++            yield from sorted(base.rglob("*.py"))
++    yield from sorted(REPO.glob("*.py"))
++
++
++def _scan() -> dict[tuple[str, str, str, str], list[str]]:
++    found: dict[tuple[str, str, str, str], list[str]] = {}
++    for path in _files():
++        rel = path.relative_to(REPO)
++        if rel.parts[0] == "tests" or "__pycache__" in rel.parts:
++            continue
++        tree = ast.parse(path.read_text())
++
++        def visit(node, owner):
++            for child in ast.iter_child_nodes(node):
++                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and owner == "<module>":
++                    visit(child, child.name)
++                    continue
++                if isinstance(child, ast.Constant) and isinstance(child.value, str):
++                    text = " ".join(child.value.split())
++                    for m in PAT.finditer(text):
++                        verb = m.group(1).split()[0].upper()
++                        verb = "INSERT" if verb == "REPLACE" else verb
++                        found.setdefault((path.name, owner, verb, m.group(2).lower()), []).append(text[m.start():])
++                visit(child, owner)
++
++        visit(tree, "<module>")
++    return found
++
++
++def test_inventory_is_complete_in_both_directions():
++    found = set(_scan())
++    declared = set(inv.SITES)
++    assert found - declared == set(), f"unaudited pending-custody mutation sites: {sorted(found - declared)}"
++    assert declared - found == set(), f"stale inventory entries without a source site: {sorted(declared - found)}"
++
++
++def test_every_disposition_is_known():
++    assert set(inv.SITES.values()) <= inv.DISPOSITIONS
++
++
++def test_no_two_modules_share_a_filename_so_site_keys_are_unambiguous():
++    names = [p.name for p in _files() if p.relative_to(REPO).parts[0] != "tests"]
++    dup = {n for n in names if names.count(n) > 1}
++    scanned = {k[0] for k in _scan()}
++    assert not (dup & scanned), f"ambiguous module names carrying sites: {sorted(dup & scanned)}"
++
++
++def test_only_inserts_may_be_original_or_synthetic_candidates():
++    for (_, _, verb, _), disposition in inv.SITES.items():
++        if disposition in (inv.ORIGINAL_CANDIDATE, inv.RECOVERY_AMBIGUOUS, inv.SYNTHETIC_UNKNOWN):
++            assert verb == "INSERT"
++        if disposition == inv.REMOVAL:
++            assert verb == "DELETE"
++        if disposition in (inv.IDENTITY_ROTATION, inv.WIRE_FREEZE, inv.STATE_ONLY, inv.GUARD_INSTALL):
++            assert verb == "UPDATE"
++
++
++def test_in_place_identity_mutation_is_classified_as_rotation():
++    # Any UPDATE assigning op_id/created_at/fields/payload/wire may change an exposed identity: it must
++    # be IDENTITY_ROTATION (taint sticky ambiguous) or WIRE_FREEZE; never bookkeeping.
++    setter = re.compile(r"\bSET\b(.*?)(?:\bWHERE\b|$)", re.IGNORECASE)
++    identity = re.compile(
++        r"(?:^|,)\s*(op_id|created_at|fields|wire|wire_json|hlc|task_id|table_name|row_uid|op|base_version)\s*=", re.IGNORECASE)
++    for key, statements in _scan().items():
++        if key[2] != "UPDATE" or key[1] == "install":  # the guard installer only taints
++            continue
++        for text in statements:
++            assigned = setter.search(text)
++            assert assigned, (key, text)
++            if identity.search(assigned.group(1)):
++                assert inv.SITES[key] in (inv.IDENTITY_ROTATION, inv.WIRE_FREEZE), (key, text)
++
++
++def test_nothing_in_production_stamps_original_yet():
++    """The substrate and this inventory certify nothing: no production module may write 'original'."""
++    stamped = []
++    for path in _files():
++        rel = path.relative_to(REPO)
++        if rel.parts[0] == "tests" or path.name in ("kanban_sync_capture_sites.py",):
++            continue
++        text = path.read_text()
++        if re.search(r"identity_state\s*=\s*'original'|capture_protocol\s*=\s*'", text):
++            stamped.append(str(rel))
++    assert stamped == [], f"original stamping must wait for the audited capture slice: {stamped}"
+-- 
+2.43.0
+

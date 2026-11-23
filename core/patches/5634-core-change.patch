@@ -1,0 +1,300 @@
+From c995c2412dd05316ffee94031e356a3e0370cd70 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:00:17 +0000
+Subject: [PATCH] fix(worker): preserve steering, heartbeat scope and catalog
+ persistence [daveey]
+
+Address PR #3988 independent exact-head review: isolate automatic heartbeat admission failures from operator steering, retain the original delegate-only heartbeat gate including fenced descendant warnings, and resolve/persist the selected model on the prefetch request owner before normal context initialization. Keep all fenced writer and lifecycle paths unchanged.
+---
+ agent/activity_tracking.py                    |  4 +-
+ agent/agent_init.py                           |  5 +-
+ agent/model_metadata_codex_prefetch.py        | 13 +++-
+ tests/agent/test_codex_catalog_prefetch.py    | 14 +++-
+ tests/cron/test_cron_kanban_env_isolation.py  |  2 +-
+ .../tools/test_kanban_heartbeat_background.py | 76 ++++++++++++++++++-
+ tools/kanban_heartbeat_background.py          |  4 +-
+ tools/kanban_tools.py                         |  4 +-
+ 8 files changed, 107 insertions(+), 15 deletions(-)
+
+diff --git a/agent/activity_tracking.py b/agent/activity_tracking.py
+index 2702114683..1269e39eeb 100644
+--- a/agent/activity_tracking.py
++++ b/agent/activity_tracking.py
+@@ -77,9 +77,11 @@ class ActivityTrackingMixin:
+         if os.environ.get("HERMES_KANBAN_TASK"):
+             # Never let the bridge break the loop; this guard covers import-time failures.
+             with suppress(Exception):
+-                from tools.kanban_tools import inject_new_comments_from_env, inject_soft_deadline_from_env
+                 from tools.kanban_heartbeat_background import heartbeat_in_background
+                 heartbeat_in_background()
++            # Thread admission/resource failures must not suppress operator steering.
++            with suppress(Exception):
++                from tools.kanban_tools import inject_new_comments_from_env, inject_soft_deadline_from_env
+                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+                 inject_new_comments_from_env(self)
+                 # Near max_runtime: tell the worker to checkpoint via kanban_continue.
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 7770140e75..0129174fa1 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2112,7 +2112,7 @@ def init_agent(
+     check_model_matches_provider(agent)
+     _init_fallback_chain(agent, fallback_model)
+     from agent.model_metadata_codex_prefetch import prefetch_agent
+-    prefetch_agent(agent)
++    catalog_prefetch = prefetch_agent(agent)
+     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+     _init_session_state(
+         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+@@ -2139,6 +2139,9 @@ def init_agent(
+     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
+     _apply_agent_section(agent, _agent_cfg)
+     cs = _parse_compression_config(agent, _agent_cfg)
++    if catalog_prefetch is not None:
++        with suppress(Exception):  # failed optional overlap retries on the normal path
++            catalog_prefetch.result()
+     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
+         agent, _agent_cfg, base_url
+     )
+diff --git a/agent/model_metadata_codex_prefetch.py b/agent/model_metadata_codex_prefetch.py
+index 9fed9a7dbd..7e9320dd81 100644
+--- a/agent/model_metadata_codex_prefetch.py
++++ b/agent/model_metadata_codex_prefetch.py
+@@ -85,14 +85,19 @@ def resolve(token, base_url, fetch):
+                 del _inflight[key]
+ 
+ 
+-def prefetch(token, base_url):
++def prefetch(token, base_url, model=None):
+     """Start one daemon request with this caller's profile, TLS and secret scope."""
+     result = Future()
+ 
+     def run():
+-        from agent.model_metadata import _fetch_codex_oauth_context_lengths_with_source
++        from agent import model_metadata as mm
+         try:
+-            result.set_result(_fetch_codex_oauth_context_lengths_with_source(token, base_url))
++            # Use the ordinary resolver for agent boots so the fresh request's owner
++            # also performs its existing authoritative persistent-context write.
++            value = (mm.get_model_context_length(model, base_url=base_url, api_key=token,
++                                                provider='openai-codex') if model else
++                     mm._fetch_codex_oauth_context_lengths_with_source(token, base_url))
++            result.set_result(value)
+         except BaseException as exc:
+             logger.debug('catalog prefetch failed', exc_info=True)
+             result.set_exception(exc)
+@@ -115,7 +120,7 @@ def prefetch_agent(agent):
+         logger.debug('catalog prefetch configuration unavailable', exc_info=True)
+         return  # This is optional overlap, never a new startup failure.
+     try:
+-        return prefetch(agent.api_key, agent.base_url)
++        return prefetch(agent.api_key, agent.base_url, getattr(agent, 'model', None))
+     except (RuntimeError, OSError) as exc:
+         from hermes_cli.worker_drain_fence import DrainRefused
+         if isinstance(exc, DrainRefused):
+diff --git a/tests/agent/test_codex_catalog_prefetch.py b/tests/agent/test_codex_catalog_prefetch.py
+index 4eee602323..499168ee43 100644
+--- a/tests/agent/test_codex_catalog_prefetch.py
++++ b/tests/agent/test_codex_catalog_prefetch.py
+@@ -50,7 +50,7 @@ def test_agent_prefetch_uses_final_route_before_tools(monkeypatch):
+     calls = []
+     monkeypatch.setattr('hermes_cli.config.load_config_readonly', dict)
+     monkeypatch.setattr('agent.model_metadata_codex_prefetch.prefetch',
+-                        lambda token, base: calls.append((token, base)))
++                        lambda token, base, model=None: calls.append((token, base)))
+     prefetch_agent(agent)
+     assert calls == [(agent.api_key, agent.base_url)]
+     # Keep source-order coverage behavioral: the real constructor must reach tool
+@@ -64,6 +64,8 @@ def test_real_constructor_overlaps_catalog_with_tools(monkeypatch):
+ 
+     entered, release = threading.Event(), threading.Event()
+     calls = []
++    saved = []
++    monkeypatch.setattr(mm, 'save_context_length', lambda *args: saved.append(args))
+     monkeypatch.setattr(mm, '_codex_catalog_probe_allowed', lambda *_: True)
+     monkeypatch.setattr(mm, '_codex_oauth_context_cache', {})
+     monkeypatch.setattr(mm, '_codex_oauth_max_context_cache', {})
+@@ -76,12 +78,21 @@ def test_real_constructor_overlaps_catalog_with_tools(monkeypatch):
+         return SimpleNamespace(status_code=200, json=lambda: {'models': [
+             {'slug': 'gpt-5.5', 'context_window': 123456, 'max_context_window': 234567}]})
+ 
++    from agent import model_metadata_codex_prefetch as prefetch_module
++    original_prefetch = prefetch_module.prefetch_agent
++    futures = []
++    def track_prefetch(agent):
++        future = original_prefetch(agent)
++        futures.append(future)
++        return future
++    monkeypatch.setattr(prefetch_module, 'prefetch_agent', track_prefetch)
+     overlap = []
+     def tools(*args, **kwargs):
+         try:
+             overlap.append(entered.wait(5))
+         finally:
+             release.set()
++        futures[0].result(5)  # Force completed-prefetch, not just concurrent-join coverage.
+         return []
+ 
+     monkeypatch.setattr(mm.model_metadata_http, 'get', get)
+@@ -98,6 +109,7 @@ def test_real_constructor_overlaps_catalog_with_tools(monkeypatch):
+             assert agent.api_key == 'selected-account'
+             assert overlap == [True], 'tools did not overlap the live catalog request'
+             assert calls == ['Bearer selected-account']
++            assert saved == [('gpt-5.5', 'https://chatgpt.com/backend-api/codex', 123456)]
+         finally:
+             release.set()
+ 
+diff --git a/tests/cron/test_cron_kanban_env_isolation.py b/tests/cron/test_cron_kanban_env_isolation.py
+index 2d913e9985..f63aad600c 100644
+--- a/tests/cron/test_cron_kanban_env_isolation.py
++++ b/tests/cron/test_cron_kanban_env_isolation.py
+@@ -16,7 +16,7 @@ The isolation is a **ContextVar**, deliberately not an ``os.environ`` clear:
+ ``os.environ`` is process-global and shared with
+ 
+   * the worker's own claim heartbeat (``run_agent._touch_activity`` ->
+-    ``heartbeat_current_worker_from_env``), which would starve and let the
++    ``heartbeat_in_background`` -> ``heartbeat_current_worker_from_env``), which would starve and let the
+     dispatcher reclaim a task whose worker is still alive;
+   * the gateway's kanban watchers, which do their own board save/restore;
+   * concurrent cron jobs on the parallel pool, which take a *shared* read lock
+diff --git a/tests/tools/test_kanban_heartbeat_background.py b/tests/tools/test_kanban_heartbeat_background.py
+index 405177a37c..7cf72f3305 100644
+--- a/tests/tools/test_kanban_heartbeat_background.py
++++ b/tests/tools/test_kanban_heartbeat_background.py
+@@ -1,5 +1,6 @@
+ """Auto liveness I/O must not block the agent's first user message."""
+ import contextvars
++import pytest
+ import threading
+ 
+ 
+@@ -12,7 +13,7 @@ def test_auto_heartbeat_does_not_wait_and_keeps_run_context(monkeypatch):
+     token = scope.set(('profile', 'task', 'run', 'owner'))
+     calls = []
+     monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
+-    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: True)
++    monkeypatch.setattr(kt, '_is_delegated_child_context', lambda: False)
+     monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
+ 
+     def heartbeat():
+@@ -45,10 +46,10 @@ def test_delegates_and_rate_limited_activity_schedule_nothing(monkeypatch):
+     from tools import kanban_tools as kt
+     from tools.kanban_heartbeat_background import heartbeat_in_background
+     monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
+-    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: False)
++    monkeypatch.setattr(kt, '_is_delegated_child_context', lambda: True)
+     monkeypatch.setattr(kt, 'heartbeat_current_worker_from_env', lambda: (_ for _ in ()).throw(AssertionError('not owner')))
+     assert heartbeat_in_background() is None
+-    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: True)
++    monkeypatch.setattr(kt, '_is_delegated_child_context', lambda: False)
+     monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', time.monotonic())
+     assert heartbeat_in_background() is None
+     monkeypatch.delenv('HERMES_KANBAN_TASK')
+@@ -70,3 +71,72 @@ def test_activity_calls_background_bridge_and_keeps_operator_injection(monkeypat
+     ActivityTrackingMixin._touch_activity(agent, 'starting')
+     assert calls == ['background', 'comments', 'deadline', 'activity']
+     assert agent._last_activity_desc == 'starting'
++
++
++def test_background_cron_activity_retains_original_heartbeat_scope(monkeypatch):
++    from agent.delegation_context import non_dispatcher_owned_context
++    from tools import kanban_tools as kt
++    from tools.kanban_heartbeat_background import heartbeat_in_background
++    calls = []
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++    monkeypatch.setattr(kt, 'heartbeat_current_worker_from_env', lambda: calls.append('heartbeat'))
++    with non_dispatcher_owned_context():
++        worker = heartbeat_in_background()
++        assert worker is not None
++        worker.join(5)
++    assert calls == ['heartbeat']
++
++
++def test_background_activity_reports_fenced_descendant_once(monkeypatch, tmp_path, caplog):
++    from types import SimpleNamespace
++    from agent.activity_tracking import ActivityTrackingMixin
++    from tools import kanban_tools as kt
++    import tools.kanban_heartbeat_background as background
++    from tests.tools.test_delegate_kanban_isolation import _make_running_kanban_task
++    import logging
++    kb, tid, _, _ = _make_running_kanban_task(monkeypatch, tmp_path)
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        before = kb.get_task(conn, tid)
++        events = kb.list_events(conn, tid)
++        monkeypatch.setenv('HERMES_DELEGATED_CHILD_CONTEXT', str(tmp_path / '.hermes'))
++        monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++        monkeypatch.setattr(kt, '_auto_heartbeat_fence_warned', False)
++        monkeypatch.setattr(kt, 'inject_new_comments_from_env', lambda agent: None)
++        monkeypatch.setattr(kt, 'inject_soft_deadline_from_env', lambda agent: None)
++        agent = SimpleNamespace(_persist_session_activity_if_due=lambda: None)
++        with caplog.at_level(logging.WARNING, logger='tools.kanban_tools'):
++            for _ in range(2):
++                monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++                ActivityTrackingMixin._touch_activity(agent, 'starting')
++                worker = background._worker
++                assert worker is not None
++                worker.join(5)
++                assert not worker.is_alive()
++        warnings = [r for r in caplog.records if 'HERMES_DELEGATED_CHILD_CONTEXT' in r.getMessage()]
++        assert len(warnings) == 1
++        after = kb.get_task(conn, tid)
++        assert after.claim_expires == before.claim_expires
++        assert after.last_heartbeat_at == before.last_heartbeat_at
++        assert kb.list_events(conn, tid) == events
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('failure', ['resource', 'drain'])
++def test_activity_thread_start_failure_keeps_operator_injections(monkeypatch, failure):
++    from hermes_cli.worker_drain_fence import DrainRefused
++    from types import SimpleNamespace
++    from agent.activity_tracking import ActivityTrackingMixin
++    calls = []
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    def unavailable():
++        raise DrainRefused('draining') if failure == 'drain' else RuntimeError('cannot start thread')
++    monkeypatch.setattr('tools.kanban_heartbeat_background.heartbeat_in_background', unavailable)
++    monkeypatch.setattr('tools.kanban_tools.inject_new_comments_from_env', lambda agent: calls.append('comments'))
++    monkeypatch.setattr('tools.kanban_tools.inject_soft_deadline_from_env', lambda agent: calls.append('deadline'))
++    agent = SimpleNamespace(_persist_session_activity_if_due=lambda: calls.append('activity'))
++    ActivityTrackingMixin._touch_activity(agent, 'starting')
++    assert calls == ['comments', 'deadline', 'activity']
+diff --git a/tools/kanban_heartbeat_background.py b/tools/kanban_heartbeat_background.py
+index bf7be97c75..565866ef28 100644
+--- a/tools/kanban_heartbeat_background.py
++++ b/tools/kanban_heartbeat_background.py
+@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ def heartbeat_in_background():
+-    """Schedule at most one automatic heartbeat; return its thread for bounded teardown."""
++    """Schedule at most one automatic heartbeat; return the thread for observers."""
+     global _worker
+     from tools import kanban_tools as kt
+-    if not os.environ.get('HERMES_KANBAN_TASK') or not kt._is_dispatcher_owned_worker():
++    if not os.environ.get('HERMES_KANBAN_TASK') or kt._is_delegated_child_context():
+         return None
+     with _lock:
+         if _worker is not None and _worker.is_alive():
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index df40304a4d..ea3219eeaa 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -616,8 +616,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str, *, conn=None):
+ # — that tool stays available for workers that want to attach a note or pre-emptively extend a claim across
+ # a known-long op. Constraints: - Best-effort: never raise. The agent loop must not care if the bridge fails
+ # (board missing, DB locked, etc.). - Rate-limited to one DB write per 60s per-process; runtime activity can
+-# tick on every chunk/tool result and we don't need that resolution. - No-op outside dispatcher-spawned
+-# worker context (no ``HERMES_KANBAN_TASK``). - No durable note on these auto-heartbeats; that's reserved
++# tick on every chunk/tool result; heartbeat_in_background schedules this writer off the turn thread.
++# No-op without worker context (no ``HERMES_KANBAN_TASK``). No durable note; that's reserved
+ # for the explicit tool which carries a model-supplied note.
+ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
+ _auto_heartbeat_last_attempt: float = 0.0
+-- 
+2.43.0
+

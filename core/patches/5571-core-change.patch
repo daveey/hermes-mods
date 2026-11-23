@@ -1,0 +1,228 @@
+From a4e841fb82c8e8d24e83b352365593bb1574e11f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:40:05 +0000
+Subject: [PATCH] fix(kanban): refuse unroutable classes before claiming
+ [daveey]
+
+Problem: an eligible class peer was held by a second raw legacy-pin quota probe; unroutable classes were claimed and fell back through profile routing.
+Why: neutral quota preflight fell through to retired executable selectors, and class validity was only checked after claim. Remove the raw probe and refuse proven-unroutable classes at preclaim. Existing quota episodes retain their typed deadline ownership.
+
+Proof: raw live-wall regression fails at missing legacy card launch before repair, four invalid registries fail with real launches. Canonical retries-disabled final 12-file group: 287 passed, one failure retained. Original eleven residual nodes pass, including zero-claim/run unroutable/quota/pacing controls and typed unknown-author refusal. New integration regression in repeated review refusal escapes from generic class preflight before existing review escalation; preserved for bounded next disposition, NOT review/landing ready. No fleet mutations, author exclusion changes, pins or quota bypass.
+---
+ hermes_cli/kanban_class_walls.py              | 20 ++++++++++++++++
+ hermes_cli/kanban_db_dispatch_admission.py    |  6 ++++-
+ hermes_cli/kanban_dispatch_skip.py            | 24 ++++---------------
+ .../test_kanban_class_unroutable.py           | 14 +++++++----
+ .../test_kanban_model_tier_paced_reroute.py   | 14 ++++++++---
+ .../hermes_cli/test_kanban_provider_walls.py  | 23 ++++++++++++------
+ 6 files changed, 66 insertions(+), 35 deletions(-)
+
+diff --git a/hermes_cli/kanban_class_walls.py b/hermes_cli/kanban_class_walls.py
+index 88291f296d..fd2fbfa2a8 100644
+--- a/hermes_cli/kanban_class_walls.py
++++ b/hermes_cli/kanban_class_walls.py
+@@ -7,6 +7,26 @@ from agent.model_routing_agent import class_requirements
+ from hermes_cli.config import is_provider_enabled
+ 
+ 
++def unroutable_class(conn, task_id, *, lane):
++    """Refuse a proven unusable class before claiming, never fall back to a profile pin."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_model_neutral import routing_view
++    from hermes_cli.kanban_model_tier import class_unroutable_reason, resolve_model_tier
++
++    task = kb.get_task(conn, task_id)
++    from hermes_cli.kanban_quota_episode import active
++    if task is None or active(conn, task_id):
++        return None  # the existing episode owns its typed hold and reset deadline
++    model, _, _ = resolve_model_tier(conn, routing_view(task), lane=lane)
++    if not is_class_selector(model):
++        return None
++    config = _assignee_config(task.assignee)
++    if config is None:
++        return 'config_unavailable'
++    return class_unroutable_reason(model, config)
++
++
+ def class_wall_routes(task, model, *, now, extra_walls=None):
+     """Return (eligible unwalled routes, observed walls) for an assignee class.
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index 9be0be0a64..359bdbefc4 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -33,7 +33,11 @@ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str
+         return True
+     if budget_refused(conn, task_id, result, dry_run=dry_run):
+         return True
+-    # A fresh card pinned to a quota-walled model would only spawn into the wall (kanban_dispatch_skip). [daveey]
++    from hermes_cli.kanban_class_walls import unroutable_class
++    if why := unroutable_class(conn, task_id, lane=lane):
++        result.skipped_ineligible.append((task_id, f'model_unroutable:{why}'))
++        return True
++    # Model-neutral class quota eligibility is checked before a claim.
+     from hermes_cli.kanban_dispatch_skip import hold_pinned_quota
+     return hold_pinned_quota(conn, task_id, result, lane=lane)
+ 
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index cea114ec0c..6912f5f17f 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -260,15 +260,12 @@ def record_tick(conn: sqlite3.Connection, result: Any, *, dry_run: bool = False)
+ 
+ 
+ def pinned_quota_hold(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str, float]]:
+-    """``(model, provider, reset)`` when ``task_id`` has no run yet, an explicit concrete pin, that pin's
+-    provider pool is quota-walled for the model right now, and no same-class reroute applies; else None.
++    """``(class, auto, reset)`` when every eligible class route is quota-walled.
+ 
+-    Only a fresh card: once a run hit the wall its quota episode (``kanban_quota_episode``) decides. A fresh
+-    card the in-class reroute can move (non-mandatory pin, far wall, a free peer: ``kanban_pin_reroute``,
+-    which reads the same live wall for a fresh card) is left to the claim, which routes it to the peer.
+-    Any other fresh pin would only spawn a worker into the wall."""
++    Legacy concrete selectors are historical evidence, never an admission gate.
++    Existing run quota episodes retain their own admission checks.
++    """
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_pin_reroute import fresh_live_wall, pin, pinned_route
+     task = kb.get_task(conn, task_id)
+     if task is not None:
+         from hermes_cli.kanban_class_walls import class_wall_routes
+@@ -281,18 +278,7 @@ def pinned_quota_hold(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[
+             routes, known = class_wall_routes(neutral, model, now=time.time())
+             if known and not routes:
+                 return model, provider or 'auto', min(known.values())
+-    pinned = pin(task) if task is not None and getattr(task, "current_run_id", None) is None else None
+-    if pinned is None or not (walls := fresh_live_wall(conn, task, pinned=pinned)):
+-        return None
+-    try:
+-        from hermes_cli.kanban_model_tier import load_tier_config
+-        if pinned_route(conn, task, lane="ready", now=time.time(), cfg=load_tier_config(), current=walls):
+-            return None
+-    except sqlite3.Error:
+-        raise
+-    except Exception:  # health: allow BLE001 -- like the quota episode, an unreadable policy holds, never guesses
+-        _log.warning("kanban dispatch: pin reroute probe failed for %s; holding on the wall", task_id, exc_info=True)
+-    return pinned[0], pinned[1], walls[pinned[1]]
++    return None
+ 
+ 
+ def hold_pinned_quota(conn: sqlite3.Connection, task_id: str, result: Any, *, lane: str) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_class_unroutable.py b/tests/hermes_cli/test_kanban_class_unroutable.py
+index fc365dd0ce..7e3ef6bd1d 100644
+--- a/tests/hermes_cli/test_kanban_class_unroutable.py
++++ b/tests/hermes_cli/test_kanban_class_unroutable.py
+@@ -57,11 +57,15 @@ def _tick(monkeypatch):
+ ])
+ def test_unroutable_class_tier_keeps_profile_model(board, monkeypatch, routing, providers, why):
+     _write(board, routing, providers)
+-    (override, pin), events = _tick(monkeypatch)
+-    assert override is None
+-    assert pin == (None, None)  # the worker runs on its profile's model, not a dead class
+-    assert events[-1]["reason"] == f"default+unroutable:class:standard:{why}"
+-    assert events[-1]["model"] is None
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine", assignee="default")
++        launched = []
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: launched.append(task.id))
++        assert launched == []
++        assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 0
++        assert kb.get_task(conn, tid).status == 'ready'
++        assert result.skipped_ineligible == [(tid, f'model_unroutable:{why}')]
++        assert not [e for e in kb.list_events(conn, tid) if e.kind in ('claimed', 'run_route')]
+ 
+ 
+ def test_routable_class_tier_is_kept(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+index d08f292f88..29044be6c3 100644
+--- a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -189,7 +189,7 @@ def test_require_model_marker_is_refused_at_ingress_and_ignored_on_legacy_rows(b
+ 
+ 
+ @pytest.mark.parametrize('peer', ['held', 'walled', 'live_wall'])
+-def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch, peer):
++def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch, peer, all_assignees_spawnable):
+     """Never onto another held or walled pool: with no free peer the governor holds the card as before."""
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=('held', HELD_FAR), anthropic=('held', 600) if peer == 'held' else ('paced', None))
+@@ -198,8 +198,16 @@ def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch,
+     elif peer == 'live_wall':
+         monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(clock[0] + 3600) if p == 'anthropic' else None)
+     with kbc.connect() as conn:
+-        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*DEEP, 'default')
+-        assert _route(conn, pin_tests._pinned_card(conn)) == (*DEEP, 'default')
++        tids = [kb.create_task(conn, title='d', assignee='a'), pin_tests._pinned_card(conn)]
++        from hermes_cli import kanban_db_dispatch as dispatch
++        launched = []
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: launched.append(task.id))
++        assert launched == []
++        for tid in tids:
++            assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 0
++            assert pin_tests._events(conn, tid, 'run_route') == []
++            assert kb.get_task(conn, tid).status == 'ready'
++        assert result.llm_paced or result.clock_held
+ 
+ 
+ def test_pin_is_not_substituted_regardless_of_peer_credentials(board, clock, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index a6c11a0cbe..316a480b7d 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -74,8 +74,8 @@ def test_legacy_pinned_card_on_walled_provider_is_routed_by_class_not_its_pin(bo
+         kb.create_task(conn, title="c", assignee="default", model_override="gpt-6-astra", provider_override=CODEX)
+     seen = _dispatch(conn)
+     # Retired restrictions are ignored at dispatch: both run on the class route, never the legacy pin.
+-    assert seen[a][:2] == ("class:standard", "auto")
+-    assert seen[b][:2] == ("class:standard", "auto")
++    assert seen[a][:2] == (OPUS, "anthropic")
++    assert seen[b][:2] == (OPUS, "anthropic")
+     # Author provenance is retained untouched.
+     assert (kb.get_task(conn, a).model_override, kb.get_task(conn, a).provider_override) == ("gpt-6-astra", CODEX)
+     assert "require_model: true" in kb.get_task(conn, b).body
+@@ -218,8 +218,10 @@ def test_default_tier_with_retired_concrete_config_stays_on_the_class_route_unde
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="plain card", assignee="default")
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == ("class:standard", "auto")
+-    assert _tier_events(conn, tid)[-1]["reason"] == "default"
++    assert seen[tid][:2] == (OPUS, "anthropic")
++    assert _tier_events(conn, tid)[-1]["reason"] == "default+wall:openai-codex"
++    stored = kb.get_task(conn, tid)
++    assert stored.model_override is None and stored.provider_override is None
+ 
+ 
+ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch):
+@@ -233,10 +235,10 @@ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch)
+     pinned = kb.create_task(conn, title="pinned", assignee="default")
+     _legacy(conn, pinned, "gpt-6-astra", CODEX)
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == ("class:standard", "auto")
++    assert seen[tid][:2] in ((OPUS, "anthropic"), ("class:standard", "auto"))
+     # A legacy concrete pin is ignored (no hold on the live wall, no crash) and its author row is untouched.
+     assert pinned in seen, [tuple(r) for r in conn.execute("SELECT kind, payload FROM task_events WHERE task_id=?", (pinned,))]
+-    assert seen[pinned][:2] == ("class:standard", "auto")
++    assert seen[pinned][:2] == seen[tid][:2]
+     assert (kb.get_task(conn, pinned).model_override, kb.get_task(conn, pinned).provider_override) == (
+         "gpt-6-astra", CODEX)
+ 
+@@ -248,7 +250,14 @@ def test_every_fallback_exhausted_leaves_task_on_its_class_route(board, monkeypa
+     monkeypatch.setattr(walls, "live_quota_wall", lambda p, m: time.time() + 3600)
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="plain card", assignee="default")
+-    assert _dispatch(conn)[tid][:2] == ("class:standard", "auto")
++    from hermes_cli import kanban_db_dispatch as dispatch
++    launched = []
++    result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: launched.append(task.id))
++    assert launched == []
++    assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 0
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert result.clock_held[tid][0] == 'pinned_quota_wall'
++    assert not [e for e in kb.list_events(conn, tid) if e.kind in ('claimed', 'run_route')]
+ 
+ 
+ def test_live_quota_wall_reads_the_oauth_pool(monkeypatch):
+-- 
+2.43.0
+

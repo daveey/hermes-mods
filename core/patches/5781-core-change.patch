@@ -1,0 +1,362 @@
+From 627d6914e730307d1de9d6e65a1bc702e42e1e67 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:11:26 +0000
+Subject: [PATCH] [daveey] Retain client upgrade recovery across deferred
+ bundle swaps
+
+Why: checkout/backend updates and Desktop bundle installation run on separate clocks. Existing skew and lag mitigation preserves idle and turn gates, but a refused legacy edit only produced a transient reminder whose update action could target a remote backend.
+
+Keep one client-install-wide acknowledgement bit and a coalesced persistent recovery notice. Rehydrate after reload; explicitly open client Updates on click. Do not replay edits, apply updates, restart busy sessions or alter archive intent.
+
+Proof: 3 baseline notification failures; 9 recovery tests green; 8/8 notification mutants killed. Real POSIX mac_swap copy and install failures retain advanced Git code and the complete old bundle with warnings. Existing legacy HTTP refusal and seven-boundary interrupted-swap tests pass. 82 consumer files: 81 pass, one fixture teardown needed explicit dismissal; affected file rerun green. TypeScript and scripts/check pass. External state skew/defer composition: 4 pass; bundle-lag suite passes. Native signed Mac installation not claimed; the earlier incident cause remains undetermined.
+---
+ .../archive-reconnect.test.ts                 |   4 +-
+ .../src/store/client-upgrade-recovery.test.ts | 100 ++++++++++++++++++
+ .../src/store/client-upgrade-recovery.ts      |  33 ++++++
+ apps/desktop/src/store/notifications.ts       |  10 ++
+ .../test_post_commit_bundle_failure.py        |  78 ++++++++++++++
+ .../developer-guide/macos-bundle-updates.md   |  42 ++++++++
+ 6 files changed, 266 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/store/client-upgrade-recovery.test.ts
+ create mode 100644 apps/desktop/src/store/client-upgrade-recovery.ts
+ create mode 100644 tests/scripts/desktop_update/test_post_commit_bundle_failure.py
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+index 96ba4320fb..60d5a135f4 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+@@ -6,7 +6,7 @@ import { en } from '@/i18n/en'
+ import { startArchiveTrace } from '@/lib/archive-trace'
+ import { $confirmRequest, settleConfirm } from '@/store/confirm'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+-import { $notifications, clearNotifications, readableError } from '@/store/notifications'
++import { $notifications, clearNotifications, dismissNotification, readableError } from '@/store/notifications'
+ 
+ import { commitArchive } from './archive-commit'
+ import { archivePreflight } from './archive-soft-hide'
+@@ -25,6 +25,8 @@ beforeEach(() => {
+ })
+ afterEach(() => {
+   settleConfirm(false)
++  // Upgrade-required recovery deliberately survives ordinary clearing; acknowledge fixture notices.
++  for (const notice of $notifications.get()) {dismissNotification(notice.id)}
+   clearNotifications()
+   $connectionsRegistry.set(null)
+   vi.unstubAllGlobals()
+diff --git a/apps/desktop/src/store/client-upgrade-recovery.test.ts b/apps/desktop/src/store/client-upgrade-recovery.test.ts
+new file mode 100644
+index 0000000000..3489b55c41
+--- /dev/null
++++ b/apps/desktop/src/store/client-upgrade-recovery.test.ts
+@@ -0,0 +1,100 @@
++import { afterEach, beforeEach, expect, test, vi } from 'vitest'
++
++const { openUpdatesWindow, cloud } = vi.hoisted(() => ({ openUpdatesWindow: vi.fn(), cloud: { served: false } }))
++vi.mock('@/store/updates', () => ({ openUpdatesWindow }))
++vi.mock('@/lib/hermes-cloud-host', () => ({ servedByHermesCloud: () => cloud.served }))
++
++const refusal = new Error('409: {"detail":"client_upgrade_required: this app is out of sync (different versions) with the Hermes backend; update the app to edit sessions"}')
++
++beforeEach(() => {
++  localStorage.clear()
++  vi.resetModules()
++  openUpdatesWindow.mockClear()
++  cloud.served = false
++})
++afterEach(() => vi.restoreAllMocks())
++
++test('an actual client upgrade refusal survives unrelated notification clearing and renderer reload', async () => {
++  const first = await import('./notifications')
++  first.notifyError(refusal, 'Edit failed')
++  first.clearNotifications()
++  expect(first.$notifications.get()).toHaveLength(1)
++  expect(first.$notifications.get()[0]).toMatchObject({ persistent: true, kind: 'error' })
++  vi.resetModules()
++  const reloaded = await import('./notifications')
++  expect(reloaded.$notifications.get()).toHaveLength(1)
++  expect(reloaded.$notifications.get()[0].message).toBe(first.$notifications.get()[0].message)
++  expect(JSON.stringify(localStorage)).not.toContain('Edit failed')
++})
++
++test('client recovery opens the client updater, never the active remote backend, without applying it', async () => {
++  const n = await import('./notifications')
++  n.notifyError(refusal, 'Edit failed')
++  n.$notifications.get()[0].action?.onClick()
++  await vi.waitFor(() => expect(openUpdatesWindow).toHaveBeenCalledWith('client'))
++})
++
++test('explicit dismissal acknowledges the durable note, but another refusal restores it', async () => {
++  const n = await import('./notifications')
++  const id = n.notifyError(refusal, 'Edit failed')
++  n.dismissNotification(id)
++  vi.resetModules()
++  const reloaded = await import('./notifications')
++  expect(reloaded.$notifications.get()).toEqual([])
++  reloaded.notifyError(refusal, 'Edit failed again')
++  expect(reloaded.$notifications.get()).toHaveLength(1)
++})
++
++test('repeat refusals coalesce even when callers supply different toast IDs', async () => {
++  const n = await import('./notifications')
++  n.notifyError(refusal, 'Edit failed', { id: 'first' })
++  n.notifyError(refusal, 'Edit failed', { id: 'second' })
++  expect(n.$notifications.get()).toHaveLength(1)
++})
++
++test('reload alone restores the note and opening Updates does not acknowledge compatibility', async () => {
++  const n = await import('./notifications')
++  n.notifyError(refusal, 'Edit failed')
++  n.$notifications.get()[0].action?.onClick()
++  await vi.waitFor(() => expect(openUpdatesWindow).toHaveBeenCalledWith('client'))
++  vi.resetModules()
++  const reloaded = await import('./notifications')
++  expect(reloaded.$notifications.get()).toHaveLength(1)
++  expect(reloaded.$notifications.get()[0]).toMatchObject({ persistent: true, kind: 'error' })
++})
++
++test('Cloud offers reload instead of a native update', async () => {
++  cloud.served = true
++  const n = await import('./notifications')
++  n.notifyError(refusal, 'Edit failed')
++  expect(n.$notifications.get()[0].action?.label).not.toBe('Update Hermes')
++  expect(n.$notifications.get()[0].action?.label).toMatch(/reload/i)
++  expect(openUpdatesWindow).not.toHaveBeenCalled()
++})
++
++test('unavailable localStorage does not hide the in-window recovery', async () => {
++  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('denied') })
++  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota') })
++  const n = await import('./notifications')
++  n.notifyError(refusal, 'Edit failed')
++  n.clearNotifications()
++  expect(n.$notifications.get()).toHaveLength(1)
++})
++
++test('bare legacy refusal codes also retain recovery, without depending on the wording suffix', async () => {
++  const n = await import('./notifications')
++  n.notifyError(new Error('409: client_upgrade_required'), 'Edit failed')
++  n.clearNotifications()
++  expect(n.$notifications.get()).toHaveLength(1)
++  expect(n.$notifications.get()[0].message).toMatch(/different versions/i)
++})
++
++test('ordinary errors and generic protocol skew keep their existing transient policy', async () => {
++  const n = await import('./notifications')
++  n.notifyError(new Error('out of sync (different versions)'), 'RPC failed')
++  n.notifyError(new Error('network timeout'), 'Edit failed')
++  n.clearNotifications()
++  expect(n.$notifications.get()).toEqual([])
++  vi.resetModules()
++  expect((await import('./notifications')).$notifications.get()).toEqual([])
++})
+diff --git a/apps/desktop/src/store/client-upgrade-recovery.ts b/apps/desktop/src/store/client-upgrade-recovery.ts
+new file mode 100644
+index 0000000000..da77b96fd0
+--- /dev/null
++++ b/apps/desktop/src/store/client-upgrade-recovery.ts
+@@ -0,0 +1,33 @@
++import { translateNow } from '@/i18n'
++import { servedByHermesCloud } from '@/lib/hermes-cloud-host'
++import { persistString, storedString } from '@/lib/storage'
++
++import type { NotificationInput } from './notifications'
++
++// Client-install-wide recovery note, not a queued edit or a claim about the active gateway.
++// Store only an acknowledgement bit: no session IDs, error text or remote credentials.
++const KEY = 'hermes:client-install:upgrade-required-note'
++
++export function hasClientUpgradeNote(): boolean {
++  return storedString(KEY) === '1'
++}
++
++export function clientUpgradeNote(): NotificationInput {
++  persistString(KEY, '1')
++
++  return {
++    id: 'client-upgrade-required',
++    kind: 'error',
++    persistent: true,
++    message: translateNow('notifications.errors.rpcOutOfSync'),
++    action: servedByHermesCloud()
++      ? { label: translateNow('commandCenter.reloadWindow'), onClick: () => window.location.reload() }
++      : {
++          label: translateNow('notifications.updateHermes'),
++          onClick: () => void import('@/store/updates').then(({ openUpdatesWindow }) => openUpdatesWindow('client'))
++        },
++    // Only an explicit acknowledgement removes the reminder. Opening Updates or an
++    // unrelated successful request is not proof the refused edit is now compatible.
++    onDismiss: () => persistString(KEY, null)
++  }
++}
+diff --git a/apps/desktop/src/store/notifications.ts b/apps/desktop/src/store/notifications.ts
+index 6a7016e397..f1615f12f5 100644
+--- a/apps/desktop/src/store/notifications.ts
++++ b/apps/desktop/src/store/notifications.ts
+@@ -5,6 +5,7 @@ import { errorDiagnostic, errorField } from '@/lib/error-diagnostic'
+ import { isOutOfSyncRpcParams } from '@/lib/gateway-rpc'
+ import { servedByHermesCloud } from '@/lib/hermes-cloud-host'
+ import { isTimeoutError } from '@/lib/with-timeout'
++import { clientUpgradeNote, hasClientUpgradeNote } from '@/store/client-upgrade-recovery'
+ import { type ErrorToastCategory, recordFriction } from '@/store/desktop-metrics'
+ import { requestBackendRestart, requestRoute } from '@/store/recovery-requests'
+ 
+@@ -402,6 +403,10 @@ export function notifyError(
+   const readable = readableError(error, fallback)
+   logErrorToDesktopLog(error, fallback)
+ 
++  if (/\bclient_upgrade_required\b/.test(errorDiagnostic(error, fallback).text)) {
++    return showNotification(clientUpgradeNote(), 'rpc_out_of_sync')
++  }
++
+   const category: ErrorToastCategory =
+     readable.category === 'unclassified' && isTimeoutError(error) ? 'timeout' : readable.category
+ 
+@@ -446,3 +451,8 @@ export function clearNotifications() {
+     item.onDismiss?.()
+   }
+ }
++
++// Rehydrate a refused client's recovery affordance, not the refused mutation itself.
++if (hasClientUpgradeNote()) {
++  showNotification(clientUpgradeNote(), null)
++}
+diff --git a/tests/scripts/desktop_update/test_post_commit_bundle_failure.py b/tests/scripts/desktop_update/test_post_commit_bundle_failure.py
+new file mode 100644
+index 0000000000..328eb5b8a3
+--- /dev/null
++++ b/tests/scripts/desktop_update/test_post_commit_bundle_failure.py
+@@ -0,0 +1,78 @@
++"""Post-commit bundle failures keep old client bytes, not old backend code.
++
++Exercise the real POSIX mac_swap function on disposable directories (no macOS
++launch or signing claim). Its copy/rename seams deliberately fail; the actual
++shell recovery and rollback run. An old client must retain update recovery.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import shlex
++import subprocess
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[3]
++
++
++def _git(root: Path, *args: str) -> str:
++    return subprocess.run(
++        ['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', *args],
++        cwd=root, check=True, capture_output=True, text=True,
++    ).stdout.strip()
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('failure', ['copy', 'install'])
++def test_post_commit_swap_failure_keeps_advanced_code_and_old_complete_bundle(tmp_path: Path, failure: str):
++    core = tmp_path / 'core'
++    core.mkdir()
++    _git(core, 'init', '-q')
++    backend = core / 'contract'
++    backend.write_text('legacy')
++    _git(core, 'add', 'contract')
++    _git(core, 'commit', '-qm', 'old contract')
++    old = _git(core, 'rev-parse', 'HEAD')
++    backend.write_text('fenced session-edit contract')
++    _git(core, 'commit', '-qam', 'new contract')
++    advanced = _git(core, 'rev-parse', 'HEAD')
++    target = tmp_path / 'Applications/Hermes.app'
++    rebuilt = core / 'apps/desktop/release/mac-arm64/Hermes.app'
++    for app, commit in ((target, old), (rebuilt, advanced)):
++        app.mkdir(parents=True)
++        (app / 'install-stamp.json').write_text(json.dumps({'commit': commit}))
++        (app / 'payload').write_text(commit)
++
++    # Load the production shell functions, not a Python reimplementation of the swap.
++    source = (ROOT / 'scripts/desktop-update/posix.sh').read_text()
++    functions = source[source.index('mac_bundle_recover()'):source.index('deliver_outcome()')]
++    harness = tmp_path / 'swap.sh'
++    harness.write_text(
++        'set -eu\n' + functions + '\n'
++        + f'INSTALL_ROOT={shlex.quote(str(core))}\nRELAUNCH_TARGET={shlex.quote(str(target))}\n'
++        + 'FINAL_CODE=0 APP_REBUILD_FAILED=0 DONE_NOTE=""\n'
++        + 'log() { printf "%s\\n" "$*"; }\npublish_stage() { :; }\n'
++        + 'add_warning() { printf "warning:%s:%s\\n" "$1" "$2"; }\n'
++        + ('MAC_DITTO=/usr/bin/false\n' if failure == 'copy' else
++           'copy_bundle() { cp -R "$1" "$2"; }\nMAC_DITTO=copy_bundle\n'
++           'mv() { if [ "$1" = "$RELAUNCH_TARGET.new" ]; then return 1; fi; command mv "$@"; }\n')
++        + 'mac_swap\nprintf "code:%s\\nnote:%s\\n" "$FINAL_CODE" "$DONE_NOTE"\n'
++    )
++    result = subprocess.run(
++        ['/bin/bash', str(harness)], cwd=tmp_path,
++        env={**os.environ, 'HOME': str(tmp_path), 'TMPDIR': str(tmp_path)},
++        capture_output=True, text=True, check=False, timeout=20,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert 'warning:app-swap:' in result.stdout
++    assert 'code:0' in result.stdout
++    assert 'Run the update again.' in result.stdout
++    assert ('previous app was kept' if failure == 'copy' else 'previous app was restored') in result.stdout
++    assert _git(core, 'rev-parse', 'HEAD') == advanced != old
++    assert backend.read_text() == 'fenced session-edit contract'
++    assert json.loads((target / 'install-stamp.json').read_text())['commit'] == old
++    assert (target / 'payload').read_text() == old
++    assert not target.with_suffix('.app.old').exists()
++    assert not target.with_suffix('.app.new').exists()
+diff --git a/website/docs/developer-guide/macos-bundle-updates.md b/website/docs/developer-guide/macos-bundle-updates.md
+index e4a64bd6ec..35fcfabb80 100644
+--- a/website/docs/developer-guide/macos-bundle-updates.md
++++ b/website/docs/developer-guide/macos-bundle-updates.md
+@@ -79,6 +79,48 @@ into memory and crashes downloading one that size
+ ([electron/electron#55089](https://github.com/electron/electron/issues/55089)).
+ The Darwin publish job waits for the arm64 build and its smoke, and serializes channel writes.
+ 
++## Checkout updater: backend/client skew
++
++Checkout-managed updates are not atomic backend-and-client updates. The backend
++checkout can advance while Desktop remains open and its bundle swap is deferred.
++The POSIX handoff's `mac_swap` stages and rolls back **the bundle**, not the
++already committed backend code. Copy/install failure keeps or restores the old
++app and reports an `app-swap` follow-up warning; it does not undo the code update.
++Matching current install stamps therefore do not establish update atomicity.
++
++A legacy client without session mutation identity receives HTTP 409
++`client_upgrade_required`. The backend must not accept an unfenced edit to hide
++the mismatch. Desktop retains a client-install-wide update reminder for that
++refusal, including across ordinary notification clearing and renderer/app
++relaunch (when localStorage is available). It stores only an acknowledgement bit,
++not the failed edit, session identity or error text. The action opens **client**
++Updates, even while viewing a remote backend; a Cloud-served webapp offers reload.
++Nothing applies or restarts automatically. Explicit dismissal acknowledges the
++note; a later refusal restores it. Opening Updates alone does not establish
++compatibility or clear the reminder. After updating, retry the refused edit;
++this recovery does not replay it automatically.
++
++External `hermes-sync` safeguards are complementary: `desktop_contract_skew`
++recognizes changed session-contract files or a recent upgrade refusal, but still
++waits for the user to be away and for Desktop turns to finish before swapping.
++`desktop_bundle_lag` records lag in `deploy-check.json` and escalates overdue swaps.
++Those safeguards do not guarantee compatibility during the deferred interval.
++Do not bypass their drain/idle gates or force a busy app restart.
++
++Regression coverage:
++
++- `tests/hermes_cli/test_session_mutation_legacy_client.py` exercises real HTTP
++  refusal and verifies legacy archive/rename/delete do not change session state.
++- `tests/scripts/desktop_update/test_post_commit_bundle_failure.py` executes the
++  production shell swap functions on disposable old/new bundles after a real Git
++  contract commit. Copy failure and install-rename failure retain the advanced
++  code and complete old bundle, with an actionable warning.
++- `apps/desktop/src/store/client-upgrade-recovery.test.ts` exercises persistence,
++  reload, explicit acknowledgement, coalescing and client update targeting.
++
++These are controlled mechanism proofs, not a signed macOS installation test and
++not evidence for the cause of an earlier incident whose logs are unavailable.
++
+ ## Verification limits
+ 
+ Helper tests exercise the strategy, native-event ordering, feed validation,
+-- 
+2.43.0
+

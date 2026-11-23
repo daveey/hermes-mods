@@ -1,0 +1,175 @@
+From 055b4ebbd046fb903be634dc3d1283448f762e8f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:09:11 +0000
+Subject: [PATCH] perf(sync): avoid repeated board-watch path walks [daveey]
+
+Preserve requested absolute spelling and fresh target identity rather than resolving every parent twice per read. Keep symlink/.. semantics, restore fences, data_version and bounded alias readers.
+
+Proof: RED two failures (four redundant realpath calls; retained old alias). GREEN four consumer suites 31 tests, expanded two suites 14 tests. Four exact-anchor mutants killed after retaining timed-out attempts. Full scripts/check passes. Worker-only diagnostic outbox probe 0.543 to 0.075ms including test guard overhead; not Mac acceptance. Phase2 WIP: report cut and snapshot-boundary correction still owed; no PR before the agreed publication window.
+---
+ hermes_cli/kanban_sync_board_watch.py         |  10 +-
+ .../test_kanban_sync_watch_paths.py           | 117 ++++++++++++++++++
+ 2 files changed, 124 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_watch_paths.py
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index f0b942eeac..487ca38f0e 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -45,7 +45,11 @@ class BoardWatch:
+         self._answers: dict[str, tuple[int, str, Any]] = {}
+ 
+     def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
+-        key = os.path.realpath(path)
++        # Keep the requested spelling (including symlink/.. semantics). stat
++        # follows the current target on every read; inode changes reopen it.
++        # Aliases may own separate readers, bounded by MAX, instead of walking
++        # every path component twice per unchanged query with realpath.
++        key = str(Path(path).absolute())
+         try:
+             st = os.stat(key)
+         except OSError:
+@@ -92,7 +96,7 @@ class BoardWatch:
+                 if got is None:
+                     return None
+                 conn, gen = got
+-                key = os.path.realpath(path)
++                key = str(Path(path).absolute())
+                 version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
+                 cached = self._answers.get(key)
+                 if unchanged_ok and cached is not None and cached[:2] == (version, sql):
+@@ -104,7 +108,7 @@ class BoardWatch:
+                     self._answers[key] = (version, sql, answer)
+                 return gen, answer
+             except sqlite3.Error:
+-                self._drop(os.path.realpath(path))
++                self._drop(str(Path(path).absolute()))
+                 return None
+ 
+     def release_gone(self) -> int:
+diff --git a/tests/hermes_cli/test_kanban_sync_watch_paths.py b/tests/hermes_cli/test_kanban_sync_watch_paths.py
+new file mode 100644
+index 0000000000..8be9eb7df0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_watch_paths.py
+@@ -0,0 +1,117 @@
++"""Kept-reader lookup does not repeatedly resolve every path component."""
++import os
++import sqlite3
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++from hermes_cli import kanban_sync_board_watch as watch_module
++
++SQL = 'SELECT value FROM probe'
++
++
++def make_board(path, value):
++    conn = sqlite3.connect(path)
++    conn.execute('CREATE TABLE probe(value INTEGER)')
++    conn.execute('INSERT INTO probe VALUES (?)', (value,))
++    conn.commit()
++    conn.close()
++    return path
++
++
++def test_warm_queries_do_not_walk_path_components(tmp_path, monkeypatch):
++    path = make_board(tmp_path / 'board.db', 1)
++    watch = watch_module.BoardWatch()
++    try:
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (1,)
++        realpath = Mock(wraps=os.path.realpath)
++        # Replace only this module's os reference, not the process-wide guard.
++        monkeypatch.setattr(watch_module, 'os', SimpleNamespace(
++            stat=os.stat, path=SimpleNamespace(realpath=realpath)))
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (1,)
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (1,)
++        assert realpath.call_count == 0
++    finally:
++        watch.reset()
++
++
++def test_directory_symlink_retarget_changes_reader_generation(tmp_path):
++    a, b = tmp_path / 'a', tmp_path / 'b'
++    a.mkdir()
++    b.mkdir()
++    make_board(a / 'board.db', 1)
++    make_board(b / 'board.db', 2)
++    link = tmp_path / 'current'
++    link.symlink_to(a, target_is_directory=True)
++    watch = watch_module.BoardWatch()
++    try:
++        before = watch.query(link / 'board.db', SQL, unchanged_ok=True)
++        link.unlink()
++        link.symlink_to(b, target_is_directory=True)
++        after = watch.query(link / 'board.db', SQL, unchanged_ok=True)
++        assert before[1] == (1,) and after[1] == (2,)
++        assert before[0] != after[0]
++        assert len(watch._conns) == 1
++    finally:
++        watch.reset()
++
++
++def test_alias_read_error_drops_its_reader_and_answer(tmp_path):
++    path = make_board(tmp_path / 'board.db', 1)
++    link = tmp_path / 'alias.db'
++    link.symlink_to(path)
++    watch = watch_module.BoardWatch()
++    try:
++        assert watch.query(link, SQL, unchanged_ok=True)[1] == (1,)
++        next(iter(watch._conns.values()))[1].close()
++        assert watch.query(link, SQL, unchanged_ok=True) is None
++        assert not watch._conns and not watch._answers
++        assert watch.query(link, SQL, unchanged_ok=True)[1] == (1,)
++        link.unlink()
++        assert watch.release_gone() == 1
++        assert not watch._conns
++    finally:
++        watch.reset()
++
++
++def test_alias_readers_remain_bounded(tmp_path):
++    path = make_board(tmp_path / 'board.db', 1)
++    watch = watch_module.BoardWatch()
++    watch.MAX = 2
++    handles = []
++    try:
++        for index in range(4):
++            link = tmp_path / f'alias-{index}.db'
++            link.symlink_to(path)
++            assert watch.query(link, SQL, unchanged_ok=True)[1] == (1,)
++            handles.append(list(watch._conns.values())[-1][1])
++            assert len(watch._conns) <= 2
++        import pytest
++        with pytest.raises(sqlite3.ProgrammingError):
++            handles[0].execute('SELECT 1')
++    finally:
++        watch.reset()
++
++
++def test_aliases_and_relative_parent_keep_filesystem_semantics(tmp_path, monkeypatch):
++    parent = tmp_path / 'parent'
++    nested = parent / 'nested'
++    nested.mkdir(parents=True)
++    make_board(tmp_path / 'board.db', 1)
++    make_board(parent / 'board.db', 2)
++    link = tmp_path / 'link'
++    link.symlink_to(nested, target_is_directory=True)
++    monkeypatch.chdir(tmp_path)
++    watch = watch_module.BoardWatch()
++    try:
++        # Lexically collapsing link/.. would read the WRONG board (value 1).
++        relative = type(link)('link/../board.db')
++        assert watch.query(relative, SQL, unchanged_ok=True)[1] == (2,)
++        assert watch.query(parent / 'board.db', SQL, unchanged_ok=True)[1] == (2,)
++        conn = sqlite3.connect(parent / 'board.db')
++        conn.execute('UPDATE probe SET value=3')
++        conn.commit()
++        conn.close()
++        assert watch.query(relative, SQL, unchanged_ok=True)[1] == (3,)
++        assert watch.query(parent / 'board.db', SQL, unchanged_ok=True)[1] == (3,)
++    finally:
++        watch.reset()
+-- 
+2.43.0
+

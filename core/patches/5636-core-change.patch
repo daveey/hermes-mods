@@ -1,0 +1,93 @@
+From 6427b2f196ffe0a9ef4cb86232ac66501ea3173d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:49:02 +0000
+Subject: [PATCH] fix(worker): rate-limit failed automatic heartbeat starts
+ [daveey]
+
+Consume the existing attempt window on thread construction or start refusal, preventing per-stream-chunk retry/traceback storms without admitting an unfenced fallback. Preserve propagation and independent steering. Regression: 200 activity touches per failure kind and phase; one attempt/warning, zero writes, retry only at 60 seconds. RED 6 failures on 7c40fd5b; GREEN 45 tests across 4 related files, retries disabled.
+---
+ .../tools/test_kanban_heartbeat_background.py | 53 +++++++++++++++++++
+ tools/kanban_heartbeat_background.py          |  3 ++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/tests/tools/test_kanban_heartbeat_background.py b/tests/tools/test_kanban_heartbeat_background.py
+index b0bf6bf66c..61490e8166 100644
+--- a/tests/tools/test_kanban_heartbeat_background.py
++++ b/tests/tools/test_kanban_heartbeat_background.py
+@@ -150,6 +150,59 @@ def test_background_start_refusal_is_logged_without_unfenced_fallback(monkeypatc
+     assert any('automatic worker heartbeat could not start' in r.getMessage() for r in caplog.records)
+ 
+ 
++@pytest.mark.parametrize('phase', ['construct', 'start'])
++@pytest.mark.parametrize('failure', [RuntimeError, OSError, 'drain'])
++def test_start_refusal_consumes_rate_window_and_keeps_steering(monkeypatch, caplog, phase, failure):
++    import logging
++    from types import SimpleNamespace
++    from hermes_cli.worker_drain_fence import DrainRefused
++    from agent.activity_tracking import ActivityTrackingMixin
++    from tools import kanban_tools as kt
++    import tools.kanban_heartbeat_background as background
++
++    clock = [1000.0]
++    attempts, writes, injections = [], [], []
++    error = DrainRefused if failure == 'drain' else failure
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    monkeypatch.setattr(kt, '_is_delegated_child_context', lambda: False)
++    monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++    monkeypatch.setattr(background, '_worker', None)
++    monkeypatch.setattr(background.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(kt, 'heartbeat_current_worker_from_env', lambda: writes.append('write'))
++    monkeypatch.setattr(kt, 'inject_new_comments_from_env', lambda agent: injections.append('comments'))
++    monkeypatch.setattr(kt, 'inject_soft_deadline_from_env', lambda agent: injections.append('deadline'))
++
++    class RefusedThread:
++        def start(self):
++            raise error('cannot start')
++
++    def spawn(*args, **kwargs):
++        attempts.append(phase)
++        if phase == 'construct':
++            raise error('cannot construct')
++        return RefusedThread()
++
++    monkeypatch.setattr(background, 'spawn_context_thread', spawn)
++    agent = SimpleNamespace(_persist_session_activity_if_due=lambda: None)
++    with caplog.at_level(logging.WARNING, logger=background.__name__):
++        for _ in range(200):
++            ActivityTrackingMixin._touch_activity(agent, 'stream chunk')
++        warnings = [r for r in caplog.records if 'automatic worker heartbeat could not start' in r.getMessage()]
++        assert len(attempts) == 1
++        assert len(warnings) == 1
++        assert warnings[0].exc_info[0] is error
++        assert injections == ['comments', 'deadline'] * 200
++        assert writes == []
++        assert background._worker is None
++        clock[0] += kt._AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS - 0.001
++        assert background.heartbeat_in_background() is None
++        clock[0] += 0.001
++        with pytest.raises(error):
++            background.heartbeat_in_background()
++        assert len(attempts) == 2
++        assert writes == []
++
++
+ @pytest.mark.parametrize('failure', ['resource', 'drain'])
+ def test_activity_thread_start_failure_keeps_operator_injections(monkeypatch, failure):
+     from hermes_cli.worker_drain_fence import DrainRefused
+diff --git a/tools/kanban_heartbeat_background.py b/tools/kanban_heartbeat_background.py
+index 8f03a883a2..ab67a5bab0 100644
+--- a/tools/kanban_heartbeat_background.py
++++ b/tools/kanban_heartbeat_background.py
+@@ -37,6 +37,9 @@ def heartbeat_in_background():
+             _worker.start()
+         except Exception:
+             _worker = None
++            # Failed admission also consumes the window: stream chunks must not
++            # retry thread creation and emit a traceback on every activity touch.
++            kt._auto_heartbeat_last_attempt = time.monotonic()
+             logger.warning('automatic worker heartbeat could not start; no fallback admitted', exc_info=True)
+             raise
+         return _worker
+-- 
+2.43.0
+

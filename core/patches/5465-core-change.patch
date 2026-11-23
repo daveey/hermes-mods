@@ -1,0 +1,890 @@
+From 87a30f05258aeb1d98aacd0b0e844b781975a469 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:02:20 +0000
+Subject: [PATCH] fix(dashboard): thread lanes keep /api/status answering when
+ slow reads fill the pool [daveey]
+
+On one occasion the hub's always-on backend spent ~2 h with AnyIO's shared
+40-thread pool full of session and kanban reads waiting on locks
+(session-panel /changes up to 926 s, /api/sessions 627 s). /api/status, which
+makes ~10 run_in_threadpool calls, queued behind them for up to 632 s; Desktop
+timed out (30 s) on every hub call and retried, and the backend ran every
+abandoned read to completion.
+
+hermes_cli/web_thread_lanes.py gives route groups their own thread budget:
+- control (4): /api/status thread work, the sidebar cache-hit lookup.
+- sessions (8): /api/sessions, /api/profiles/sessions, the sidebar and
+  projects-tree misses, /api/session-kanban-tasks.
+- probe (2, 2 s deadline in /api/status): the state.db reads inside
+  /api/status (storage probe, active-session count, FTS status). A busy probe
+  lane leaves those fields degraded/0 instead of holding the answer.
+- feed (6): for plugin catch-up reads (hermes-mods session-panel, user-steps).
+A caller waits at most dashboard.thread_lanes.queue_deadline_s (25 s, below
+Desktop's 30 s) for a lane thread, or until its client disconnects; then it
+gets 503 + Retry-After and the work never starts. Started work runs to the
+end. Lane threads never use the shared pool. Sizes and the deadline come from
+config.yaml, read once at start-up off the loop. /api/health reports per-lane
+counters (in_use, waiting, served, rejected, disconnected, max_wait_s).
+
+Tests: unit tests for waiting, the deadline (503, never run), disconnects,
+lane isolation, independence from the shared pool, config; a load test that
+fills the shared pool and the sessions lane through the real routes and
+requires the real get_status() and /api/health to stay fast. It fails on
+main's routes ("/api/status is stuck behind the slow reads"). Each guard was
+mutation-checked. test_profile_scan_http_admission now asserts scans take 0
+shared-pool threads (was 1) and run on the sessions lane.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/web_routers/profiles.py            |   9 +-
+ hermes_cli/web_routers/sessions.py            |  13 +-
+ hermes_cli/web_routers/status.py              |  42 ++--
+ hermes_cli/web_server_app.py                  |   5 +
+ hermes_cli/web_thread_lanes.py                | 229 ++++++++++++++++++
+ .../test_dashboard_thread_starvation.py       | 127 ++++++++++
+ .../test_profile_scan_http_admission.py       |   5 +-
+ tests/hermes_cli/test_web_thread_lanes.py     | 183 ++++++++++++++
+ 8 files changed, 590 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/web_thread_lanes.py
+ create mode 100644 tests/hermes_cli/test_dashboard_thread_starvation.py
+ create mode 100644 tests/hermes_cli/test_web_thread_lanes.py
+
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index e2015ba688..65c77415f8 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -14,6 +14,7 @@ import contextlib
+ import copy
+ import functools
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli.web_thread_lanes import lane_runner, run_in_lane
+ from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ import inspect
+@@ -394,7 +395,9 @@ def _sidebar_singleflight_cache(func):
+             return result
+ 
+     # The HTTP path JSON-encodes in the worker thread (web_json_response), never on the loop.
+-    admitted = coalesced_read(encoded_in_thread(wrapped), thread_runner=lambda func: run_in_threadpool(func))
++    # Misses read state.db per profile: the sessions lane. A fresh hit is an in-memory copy: control, so it
++    # never queues behind a slow miss. (web_thread_lanes) [daveey]
++    admitted = coalesced_read(encoded_in_thread(wrapped), thread_runner=lane_runner("sessions"))
+ 
+     def _lookup_encoded(key):
+         cached = _lookup(key)
+@@ -406,7 +409,7 @@ def _sidebar_singleflight_cache(func):
+         if _SIDEBAR_CACHE_TTL_SECONDS > 0:
+             bound = signature.bind(*args, **kwargs)
+             bound.apply_defaults()
+-            cached = await run_in_threadpool(_lookup_encoded, tuple(bound.arguments.items()))
++            cached = await run_in_lane("control", _lookup_encoded, tuple(bound.arguments.items()))
+             if cached is not miss:
+                 return per_request_response(cached)
+         return per_request_response(await admitted(*args, **kwargs))
+@@ -538,7 +541,7 @@ _SESSION_STAMP_COLUMNS = ("cwd", "git_branch", "git_repo_root", "outcome", "mute
+ # The body is JSON-encoded once per coalesced read, in the worker thread: FastAPI's
+ # jsonable_encoder walk of a 200-row page on the loop was most of this route's CPU. [daveey]
+ _profiles_sessions_admitted = coalesced_read(
+-    encoded_in_thread(get_profiles_sessions), thread_runner=lambda func: run_in_threadpool(func))
++    encoded_in_thread(get_profiles_sessions), thread_runner=lane_runner("sessions"))
+ 
+ 
+ @functools.wraps(_profiles_sessions_admitted)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 1d9ea9e602..a8d0c643e0 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -24,6 +24,7 @@ from hermes_cli.session_listing import automated_listing_exclusion, stamp_automa
+ from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli.web_thread_lanes import lane_runner, run_in_lane
+ from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+@@ -194,9 +195,8 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
+             raise
+ 
+ 
+-@list_router.get("/api/session-kanban-tasks")
+ @_la.accounted("route/sessions.kanban_tasks")
+-def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
++def _session_kanban_tasks_read(ids: str):
+     """Open, blocked and review kanban cards that any of the comma-separated
+     session ``ids`` (one compression lineage) created or shepherds, across every
+     board — the cards behind the sidebar row's kanban counts. Lets the desktop
+@@ -206,6 +206,12 @@ def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
+     return {"tasks": session_kanban_tasks(wanted, stale_ok=True)}
+ 
+ 
++@list_router.get("/api/session-kanban-tasks")
++async def get_session_kanban_tasks(request: Request, ids: str = Query(..., max_length=4000)):
++    # Reads every board's linked cards: on the sessions lane, so a slow board never holds the shared pool. [daveey]
++    return await run_in_lane("sessions", _session_kanban_tasks_read, ids, request=request)
++
++
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+ # row (plus correlated-subquery preview work) out of SQLite in a single hit.
+ def get_sessions(
+@@ -245,7 +251,8 @@ def get_sessions(
+ # Queue expensive list contenders before consuming the shared HTTP worker pool.
+ # The body is JSON-encoded in the worker thread (web_json_response), never on the loop. [daveey]
+ _sessions_admitted = coalesced_read(
+-    encoded_in_thread(get_sessions), admission_key=lambda args: args["profile"], max_concurrent=2)
++    encoded_in_thread(get_sessions), admission_key=lambda args: args["profile"], max_concurrent=2,
++    thread_runner=lane_runner("sessions"))
+ 
+ 
+ def _peek_sessions(arguments):
+diff --git a/hermes_cli/web_routers/status.py b/hermes_cli/web_routers/status.py
+index 7b4ffa78db..0155bb587f 100644
+--- a/hermes_cli/web_routers/status.py
++++ b/hermes_cli/web_routers/status.py
+@@ -10,6 +10,7 @@ import importlib
+ import logging
+ import re
+ import asyncio
++import functools
+ import os
+ import sys
+ import threading
+@@ -17,7 +18,14 @@ import time
+ from fastapi import APIRouter
+ from hermes_cli.web_deps import LateState, late
+ from hermes_cli.web_server_gateway import _display_system_platform
+-from starlette.concurrency import run_in_threadpool
++from hermes_cli.web_thread_lanes import run_in_lane, stats as _lane_stats
++
++# /api/status thread work runs on its own lane so a full shared pool never delays it. Its few state.db
++# reads may wait on a lock, so they use the small probe lane with a short deadline: a busy probe lane
++# leaves those fields unknown/degraded instead of holding the answer (web_thread_lanes). [daveey]
++_STATUS_PROBE_DEADLINE_S = 2.0
++_control = functools.partial(run_in_lane, "control")
++_storage = functools.partial(run_in_lane, "probe", deadline=_STATUS_PROBE_DEADLINE_S)
+ from fastapi import HTTPException, Request
+ from gateway.status import (
+     derive_gateway_busy, derive_gateway_drainable, normalize_updated_at, parse_active_agents,
+@@ -144,7 +152,7 @@ def _state_store_key(path: Path) -> Optional[tuple]:
+ async def _status_active_sessions() -> int:
+     try:
+         return await asyncio.wait_for(
+-            run_in_threadpool(_count_status_active_sessions),
++            _storage(_count_status_active_sessions),
+             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT)
+     except TimeoutError:
+         _log.debug("/api/status active session count exceeded %.2fs; returning 0",
+@@ -175,7 +183,9 @@ async def get_health():
+     info = get_version_info()
+     return {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
+             "commit": info.commit,
+-            "auth_required": bool(getattr(app.state, "auth_required", False))}
++            "auth_required": bool(getattr(app.state, "auth_required", False)),
++            # Per-lane thread counters (counts only); in-memory, so this route still never waits. [daveey]
++            "thread_lanes": _lane_stats()}
+ 
+ 
+ @router.get("/api/host/identity")
+@@ -232,7 +242,7 @@ async def post_health_retirement(request: Request):
+         raise HTTPException(status_code=400, detail="action must be prepare, commit, or cancel")
+     action = body["action"]
+     if action == "prepare":
+-        return await run_in_threadpool(retirement.prepare)
++        return await _control(retirement.prepare)
+     token = body.get("token")
+     if not isinstance(token, str) or not token:
+         raise HTTPException(status_code=400, detail="token required")
+@@ -357,7 +367,7 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> di
+     """
+     local_runtime = (read_runtime_status(path=profile_dir / "gateway_state.json")
+                      if profile_dir else read_runtime_status())
+-    liveness = await run_in_threadpool(lambda: resolve_gateway_liveness(
++    liveness = await _control(lambda: resolve_gateway_liveness(
+         profile_dir=profile_dir, runtime=local_runtime,
+         health_probe=_bounded_health_probe if health_url else None,
+         pid_probe=get_running_pid_cached, runtime_reader=read_runtime_status,
+@@ -366,7 +376,7 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> di
+     remote_health_body: dict | None = liveness.health_body
+ 
+     try:
+-        configured = await run_in_threadpool(_load_configured_gateway_platforms)
++        configured = await _control(_load_configured_gateway_platforms)
+     except Exception:
+         configured = None
+ 
+@@ -392,7 +402,7 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> di
+         # shared rule (also the messaging card's) picks the multiplexer record only when the lock
+         # holder IS the multiplexer and the profile's own record proves no live gateway.
+         try:
+-            runtime = await run_in_threadpool(
++            runtime = await _control(
+                 served_profile_runtime, own_home, local_runtime, gateway_pid=local_liveness_pid(liveness)) or runtime
+         except Exception:  # health: allow BLE001 -- status route must never 500; traceback is logged
+             # A failed lookup keeps the profile's own record.
+@@ -499,7 +509,7 @@ async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
+         "dashboard": DASHBOARD_HEALTH.snapshot()}
+     try:
+         from gateway.readiness import _probe_state_db
+-        storage_check = await run_in_threadpool(_probe_state_db, get_hermes_home())
++        storage_check = await _storage(_probe_state_db, get_hermes_home())
+         components["storage"] = {"status": storage_check.get("status", "degraded")}
+         # The one reason enum consumers key off; same latch as readiness and the session lists.
+         if storage_check.get("detail") == "corrupt":
+@@ -527,13 +537,13 @@ async def _advisory_pressure(status: dict[str, Any], home: Path) -> None:
+                                    ("disk", "gateway.disk_status", "collect_disk_status")):
+         try:
+             collect = getattr(importlib.import_module(mod_name), fn_name)
+-            status[key] = await run_in_threadpool(collect, home)
++            status[key] = await _control(collect, home)
+         except Exception:
+             status[key] = {"pressure": "unknown"}
+ 
+     try:
+         # SQLite open + read: off the loop like the rest of the probe.
+-        _rebuild = await run_in_threadpool(_fts_rebuild_status)
++        _rebuild = await _storage(_fts_rebuild_status)
+         if _rebuild is not None:
+             status["fts_rebuild"] = _rebuild
+     except Exception:
+@@ -584,7 +594,7 @@ async def _status_caller_verified(request: Request) -> bool:
+         return True
+     if getattr(request.app.state, "auth_required", False) and getattr(request.state, "session", None) is None:
+         from hermes_cli.dashboard_auth.middleware import peek_session
+-        request.state.session = await run_in_threadpool(peek_session, request)
++        request.state.session = await _control(peek_session, request)
+     try:
+         _require_token(request)
+     except HTTPException:
+@@ -622,14 +632,14 @@ async def get_status(profile: Optional[str] = None,
+         status_scope.__enter__()
+ 
+     try:
+-        local = await run_in_threadpool(_status_local_reads)
++        local = await _control(_status_local_reads)
+         gateway = await _resolve_gateway_status(profile_dir, _GATEWAY_HEALTH_URL)
+         gateway_running, gateway_state = gateway["gateway_running"], gateway["gateway_state"]
+ 
+         # Topology (cached, TTL 10s) is fetched before the platform rollup so per-profile
+         # gateway failures fold into the machine-level view (see
+         # _merge_profile_gateway_platforms); a ``?profile=`` request is left unmerged.
+-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
++        topology = await _control(_collect_profile_gateway_topology_cached)
+         if not requested_profile:
+             gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
+                 gateway["gateway_platforms"], topology.get("profile_platforms") or {})
+@@ -642,7 +652,7 @@ async def get_status(profile: Optional[str] = None,
+         active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
+         # Off-loop: on a cold Windows install the first import of hermes_cli.gateway blocks
+         # 15-30s (.pyc compilation + Defender), exceeding the desktop handshake's 15s timeout.
+-        restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout)
++        restart_drain_timeout = await _control(_resolve_restart_drain_timeout)
+         auth = _auth_gate_status()
+ 
+         status = {
+@@ -669,13 +679,13 @@ async def get_status(profile: Optional[str] = None,
+ 
+         # Stable per-install identity (first call may touch disk). Omitted (not null) when
+         # unpersistable so older-client behavior and the no-identity fallback stay identical.
+-        install_id = await run_in_threadpool(get_install_id)
++        install_id = await _control(get_install_id)
+         if install_id:
+             status["install_id"] = install_id
+ 
+         # Advisory only. Expose no paths or process identities on this public probe.
+         from hermes_cli.shared_profile_warning import shared_profile_warning
+-        status["shared_profile_warning"] = bool(await run_in_threadpool(shared_profile_warning))
++        status["shared_profile_warning"] = bool(await _control(shared_profile_warning))
+ 
+         components = await _component_health(gateway)
+         status["components"] = components
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 9f2605ecd4..464863161d 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -227,6 +227,11 @@ async def standalone_lifespan(app: "FastAPI"):
+ 
+     await asyncio.to_thread(hold_bind_for_prewarm)
+ 
++    # Thread-lane sizes from config.yaml, read off the loop before the first request (web_thread_lanes). [daveey]
++    from hermes_cli import web_thread_lanes
++
++    await asyncio.to_thread(web_thread_lanes.configure)
++
+     try:
+         yield
+     finally:
+diff --git a/hermes_cli/web_thread_lanes.py b/hermes_cli/web_thread_lanes.py
+new file mode 100644
+index 0000000000..6588c59466
+--- /dev/null
++++ b/hermes_cli/web_thread_lanes.py
+@@ -0,0 +1,229 @@
++"""Bounded thread lanes for dashboard routes. [daveey]
++
++Every synchronous route and ``run_in_threadpool`` call shares AnyIO's default limiter (40 worker
++threads). On one occasion the hub's always-on backend spent ~2 h with that pool full of session and kanban
++reads waiting on locks (``/changes`` up to 926 s): ``/api/status`` queued behind them for up to 632 s,
++Desktop gave up at 30 s and retried, and the backend kept running reads nobody was waiting for.
++
++A lane is a group of routes with its own thread budget:
++
++* ``control`` -- the thread work of ``/api/status`` and Desktop's small control reads. Never a kanban or
++  ``state.db`` read: those may wait on a lock, and this lane must stay free.
++* ``sessions`` -- session lists, project trees, linked kanban cards.
++* ``probe`` -- the short, bounded ``state.db`` reads inside ``/api/status`` (storage probe, active-session
++  count, FTS rebuild status), with a short deadline: they must not wait behind session lists, and a busy
++  probe lane only marks those fields unknown/degraded instead of holding the status answer.
++* ``feed`` -- plugin catch-up reads (``session-panel`` ``/changes``, ``user-steps``).
++
++A full lane holds only its own threads, never the shared pool. A caller waits at most
++``queue_deadline_s`` (below Desktop's 30 s timeout) for one of them; then, or as soon as its client has
++disconnected, it gets ``503`` with ``Retry-After`` and the work never starts, so a retry is always safe.
++Work that already started runs to the end: a Python thread cannot be interrupted safely.
++
++Sizes and the deadline come from ``dashboard.thread_lanes`` in config.yaml, read once at app start-up
++(``configure()`` in a worker thread); until then the built-in defaults apply.
++"""
++from __future__ import annotations
++
++import functools
++import logging
++import threading
++import time
++import weakref
++from typing import Any, Callable, Optional
++
++import anyio
++import anyio.to_thread as _to_thread  # looked up per call: loop accounting wraps ``run_sync`` on the module
++from fastapi import HTTPException
++
++_log = logging.getLogger(__name__)
++
++DEFAULT_SIZES = {"control": 4, "sessions": 8, "feed": 6, "probe": 2}
++QUEUE_DEADLINE_S = 25.0      # below Desktop's 30 s request timeout: a waiter it gave up on never runs
++RETRY_AFTER_S = 2
++DISCONNECT_POLL_S = 1.0
++REJECT_LOG_EVERY_S = 10.0
++
++
++class LaneBusy(HTTPException):
++    """503: the lane had no free thread within the deadline (or the client left). The work never started."""
++
++    def __init__(self, lane: str, reason: str, waited_s: float):
++        super().__init__(status_code=503, headers={"Retry-After": str(RETRY_AFTER_S)},
++                         detail={"error": "lane_busy", "lane": lane, "reason": reason,
++                                 "waited_s": round(waited_s, 2)})
++        self.lane, self.reason, self.waited_s = lane, reason, waited_s
++
++
++class _Lane:
++    def __init__(self, name: str, size: int):
++        self.name, self.size = name, int(size)
++        self._limiters: weakref.WeakKeyDictionary[Any, tuple[anyio.CapacityLimiter, anyio.CapacityLimiter]] = (
++            weakref.WeakKeyDictionary())
++        self._lock = threading.Lock()
++        self.in_use = self.waiting = self.served = self.rejected = self.disconnected = 0
++        self.max_wait_s = 0.0
++        self._last_reject_log = 0.0
++
++    def limiters(self) -> tuple[anyio.CapacityLimiter, anyio.CapacityLimiter]:
++        """(gate, runner) for the running event loop. The gate is what callers queue on (with a deadline);
++        the runner, the same size, is what the threads run under, so it never makes an admitted caller wait
++        and never touches the shared default limiter."""
++        import asyncio
++        loop = asyncio.get_running_loop()
++        with self._lock:
++            pair = self._limiters.get(loop)
++            if pair is None:
++                pair = (anyio.CapacityLimiter(self.size), anyio.CapacityLimiter(self.size))
++                self._limiters[loop] = pair
++            return pair
++
++    def stats(self) -> dict[str, Any]:
++        with self._lock:
++            return {"size": self.size, "in_use": self.in_use, "waiting": self.waiting, "served": self.served,
++                    "rejected": self.rejected, "disconnected": self.disconnected,
++                    "max_wait_s": round(self.max_wait_s, 3)}
++
++    def _add(self, **deltas: int) -> None:
++        with self._lock:
++            for key, value in deltas.items():
++                setattr(self, key, getattr(self, key) + value)
++
++    def _waited(self, seconds: float) -> None:
++        with self._lock:
++            self.max_wait_s = max(self.max_wait_s, seconds)
++
++    def _should_log_reject(self) -> bool:
++        now = time.monotonic()
++        with self._lock:
++            if now - self._last_reject_log < REJECT_LOG_EVERY_S:
++                return False
++            self._last_reject_log = now
++            return True
++
++
++_lanes: dict[str, _Lane] = {}
++_deadline_s: Optional[float] = None
++_config_lock = threading.Lock()
++
++
++def _read_config() -> tuple[dict[str, int], float]:
++    sizes, deadline = dict(DEFAULT_SIZES), QUEUE_DEADLINE_S
++    try:
++        from hermes_cli.config import load_config
++        section = ((load_config().get("dashboard") or {}).get("thread_lanes") or {})
++    except BaseException:  # health: allow BLE001 -- ConfigBackendUnavailable is a SystemExit; keep the defaults
++        _log.debug("thread lanes: config unreadable; using defaults", exc_info=True)
++        return sizes, deadline
++    if not isinstance(section, dict):
++        return sizes, deadline
++    for name in sizes:
++        value = section.get(name)
++        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
++            sizes[name] = value
++    value = section.get("queue_deadline_s")
++    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
++        deadline = float(value)
++    return sizes, deadline
++
++
++def configure(sizes: Optional[dict[str, int]] = None, queue_deadline_s: Optional[float] = None) -> None:
++    """Set the lanes (``None``: read config.yaml). Resets every counter; for start-up and tests."""
++    global _deadline_s
++    read_sizes, read_deadline = _read_config() if sizes is None or queue_deadline_s is None else ({}, 0.0)
++    sizes = dict(sizes) if sizes is not None else read_sizes
++    with _config_lock:
++        _lanes.clear()
++        _lanes.update({name: _Lane(name, size) for name, size in sizes.items()})
++        _deadline_s = float(queue_deadline_s) if queue_deadline_s is not None else read_deadline
++
++
++def _lane(name: str) -> _Lane:
++    # Never read config.yaml here (this runs on the event loop): the app's start-up calls configure() in a
++    # thread; before that, or in a process that never does, the built-in defaults apply.
++    if _deadline_s is None:
++        with _config_lock:
++            needed = _deadline_s is None
++        if needed:
++            configure(DEFAULT_SIZES, QUEUE_DEADLINE_S)
++    lane = _lanes.get(name)
++    if lane is None:
++        raise KeyError(f"unknown thread lane {name!r}; known: {sorted(_lanes)}")
++    return lane
++
++
++def queue_deadline_s() -> float:
++    _lane(next(iter(DEFAULT_SIZES)))
++    return float(_deadline_s or QUEUE_DEADLINE_S)
++
++
++async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, request: Any) -> str:
++    """'ok' once ``token`` holds a gate slot; else 'deadline' or 'disconnected' (and nothing is held).
++    CapacityLimiter.acquire_on_behalf_of releases what it took when it is cancelled, so no outcome leaks."""
++    outcome = "deadline"
++    with anyio.move_on_after(deadline):
++        async with anyio.create_task_group() as tg:
++            async def take() -> None:
++                nonlocal outcome
++                await gate.acquire_on_behalf_of(token)
++                outcome = "ok"
++                tg.cancel_scope.cancel()
++
++            async def watch() -> None:
++                nonlocal outcome
++                while True:
++                    await anyio.sleep(DISCONNECT_POLL_S)
++                    if await request.is_disconnected():
++                        outcome = "disconnected"
++                        tg.cancel_scope.cancel()
++                        return
++
++            tg.start_soon(take)
++            if request is not None:
++                tg.start_soon(watch)
++    return outcome
++
++
++async def run_in_lane(lane: str, fn: Callable[..., Any], *args: Any, request: Any = None,
++                      deadline: Optional[float] = None, **kwargs: Any) -> Any:
++    """``run_in_threadpool`` on a lane: wait at most the queue deadline (or a shorter ``deadline`` for this
++    call) for one of the lane's threads, then run ``fn(*args, **kwargs)`` there. Raises :class:`LaneBusy`
++    (503) without running ``fn`` when no thread freed up in time, or when ``request`` (optional)
++    disconnected while waiting."""
++    entry = _lane(lane)
++    limit = queue_deadline_s() if deadline is None else min(float(deadline), queue_deadline_s())
++    gate, runner = entry.limiters()
++    token = object()
++    started = time.monotonic()
++    entry._add(waiting=1)
++    try:
++        outcome = await _admit(gate, token, limit, request)
++    finally:
++        entry._add(waiting=-1)
++    waited = time.monotonic() - started
++    entry._waited(waited)
++    if outcome != "ok":
++        entry._add(**({"disconnected": 1} if outcome == "disconnected" else {"rejected": 1}))
++        if outcome == "deadline" and entry._should_log_reject():
++            _log.warning("thread lane %s full: refused a call after %.1fs (%s)", lane, waited, entry.stats())
++        raise LaneBusy(lane, outcome, waited)
++    entry._add(in_use=1)
++    try:
++        return await _to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=runner)
++    finally:
++        entry._add(in_use=-1, served=1)
++        gate.release_on_behalf_of(token)
++
++
++def lane_runner(lane: str) -> Callable[[Callable[[], Any]], Any]:
++    """A ``coalesced_read(thread_runner=...)`` that runs the shared read on ``lane``."""
++    async def run(func: Callable[[], Any]) -> Any:
++        return await run_in_lane(lane, func)
++    run.__name__ = f"lane_runner_{lane}"
++    return run
++
++
++def stats() -> dict[str, Any]:
++    """Per-lane counters for ``/api/health`` (counts only: no paths or arguments)."""
++    deadline = queue_deadline_s()
++    return {"queue_deadline_s": deadline, **{name: lane.stats() for name, lane in sorted(_lanes.items())}}
+diff --git a/tests/hermes_cli/test_dashboard_thread_starvation.py b/tests/hermes_cli/test_dashboard_thread_starvation.py
+new file mode 100644
+index 0000000000..fdbea09a1d
+--- /dev/null
++++ b/tests/hermes_cli/test_dashboard_thread_starvation.py
+@@ -0,0 +1,127 @@
++"""/api/status keeps answering while slow reads fill every other thread (web_thread_lanes). [daveey]
++
++Observed in production: a burst of Desktop requests while slow session/kanban reads
++held the shared AnyIO pool for minutes (session-panel /changes, /api/sessions), and
++/api/status queued behind them for minutes, so Desktop timed out (30 s) on everything. This drives the
++real routes into that state and requires /api/status and /api/health to stay fast.
++"""
++import asyncio
++import threading
++import time
++
++import anyio.to_thread
++import httpx
++import pytest
++from fastapi import FastAPI
++
++from hermes_cli import web_thread_lanes as lanes
++
++TIMEOUT = 10.0
++
++SHARED_POOL = 4      # the shared AnyIO pool, shrunk so a test can fill it
++BURST = 30           # per slow route: well past every pool and lane
++
++
++async def _until(predicate, timeout=TIMEOUT):
++    from tests.waiting import async_wait_until
++    await async_wait_until(predicate, timeout=timeout)
++
++
++@pytest.mark.asyncio
++async def test_status_and_health_answer_while_slow_reads_fill_the_shared_pool_and_the_sessions_lane(monkeypatch):
++    from hermes_cli.web_routers import sessions as sessions_router
++    from hermes_cli.web_routers import status as status_router
++
++    lanes.configure(dict(lanes.DEFAULT_SIZES), lanes.QUEUE_DEADLINE_S)
++    release = threading.Event()
++    in_kanban = []
++    in_other = []
++
++    def slow_kanban_tasks(wanted, stale_ok=False):  # a board read stuck on its lock
++        in_kanban.append(1)
++        assert release.wait(60)
++        return []
++
++    monkeypatch.setattr(sessions_router, "session_kanban_tasks", slow_kanban_tasks)
++
++    app = FastAPI()
++    app.include_router(sessions_router.list_router)
++    app.include_router(status_router.router)
++
++    @app.get("/slow-other")
++    def slow_other():  # any other sync route on the shared pool (the plugins' reads before they move)
++        in_other.append(1)
++        assert release.wait(60)
++        return {"ok": True}
++
++    # Unloaded baseline for the real /api/status in this environment.
++    t0 = time.monotonic()
++    await asyncio.wait_for(status_router.get_status(), 30)
++    baseline = time.monotonic() - t0
++
++    limiter = anyio.to_thread.current_default_thread_limiter()
++    previous = limiter.total_tokens
++    limiter.total_tokens = SHARED_POOL
++    tasks = []
++    try:
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
++                                     timeout=120) as client:
++            tasks += [asyncio.create_task(client.get("/slow-other")) for _ in range(BURST)]
++            tasks += [asyncio.create_task(client.get("/api/session-kanban-tasks", params={"ids": f"s{i}"}))
++                      for i in range(BURST)]
++            # The shared pool is full of stuck reads (with or without lanes), and more are queued.
++            await _until(lambda: len(in_other) + len(in_kanban) >= SHARED_POOL
++                         and limiter.statistics().tasks_waiting > 0)
++
++            t0 = time.monotonic()
++            try:
++                status = await asyncio.wait_for(status_router.get_status(), baseline + 3.0)
++            except TimeoutError:
++                pytest.fail("/api/status is stuck behind the slow reads (the earlier outage)")
++            took = time.monotonic() - t0
++            assert status["version"]
++            assert took < baseline + 1.0, f"/api/status took {took:.2f}s under load (unloaded {baseline:.2f}s)"
++
++            health = await asyncio.wait_for(client.get("/api/health"), 2.0)
++            assert health.status_code == 200
++            report = health.json()["thread_lanes"]
++            assert len(in_other) == SHARED_POOL  # the other routes kept the shared pool full throughout
++            assert report["sessions"]["in_use"] == lanes.DEFAULT_SIZES["sessions"]
++            assert report["sessions"]["waiting"] > 0
++            # The slow reads never touched the control lane's budget.
++            assert report["control"]["in_use"] == 0 and report["control"]["rejected"] == 0
++    finally:
++        release.set()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        limiter.total_tokens = previous
++
++
++@pytest.mark.asyncio
++async def test_status_does_not_wait_out_a_full_probe_lane(monkeypatch):
++    from hermes_cli.web_routers import status as status_router
++
++    lanes.configure(dict(lanes.DEFAULT_SIZES), lanes.QUEUE_DEADLINE_S)
++    t0 = time.monotonic()
++    await asyncio.wait_for(status_router.get_status(), 30)
++    baseline = time.monotonic() - t0
++
++    release = threading.Event()
++    started = []
++
++    def stuck_db_read():  # a state.db read that holds its probe thread
++        started.append(1)
++        release.wait(60)
++
++    holders = [asyncio.create_task(lanes.run_in_lane("probe", stuck_db_read))
++               for _ in range(lanes.DEFAULT_SIZES["probe"])]
++    try:
++        await _until(lambda: len(started) == lanes.DEFAULT_SIZES["probe"])
++        t0 = time.monotonic()
++        status = await asyncio.wait_for(status_router.get_status(), baseline + 2 * status_router._STATUS_PROBE_DEADLINE_S + 3)
++        took = time.monotonic() - t0
++        # Each probe-lane read gives up after its short deadline and the field degrades; never the 25 s one.
++        assert took < baseline + 2 * status_router._STATUS_PROBE_DEADLINE_S + 1.0
++        assert status["version"]
++    finally:
++        release.set()
++        await asyncio.gather(*holders)
+diff --git a/tests/hermes_cli/test_profile_scan_http_admission.py b/tests/hermes_cli/test_profile_scan_http_admission.py
+index e0a42823de..fdff546a18 100644
+--- a/tests/hermes_cli/test_profile_scan_http_admission.py
++++ b/tests/hermes_cli/test_profile_scan_http_admission.py
+@@ -89,7 +89,10 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+                 response = await asyncio.wait_for(client.get('/api/status'), 0.5)
+                 assert response.status_code == 200
+                 assert response.json() == {'ok': True}
+-                assert limiter.borrowed_tokens == 1
++                # Scans run on the sessions thread lane (web_thread_lanes): none of the shared pool. [daveey]
++                from hermes_cli import web_thread_lanes
++                assert limiter.borrowed_tokens == 0
++                assert web_thread_lanes.stats()["sessions"]["in_use"] == 1
+                 if route == '/api/sessions':
+                     other = await asyncio.wait_for(client.get(route, params={'profile': 'other'}), 0.5)
+                     assert other.status_code == 200
+diff --git a/tests/hermes_cli/test_web_thread_lanes.py b/tests/hermes_cli/test_web_thread_lanes.py
+new file mode 100644
+index 0000000000..f69aab9c79
+--- /dev/null
++++ b/tests/hermes_cli/test_web_thread_lanes.py
+@@ -0,0 +1,183 @@
++"""Thread lanes: each route group has its own thread budget and a queue deadline (web_thread_lanes). [daveey]
++
++Observed in production: the always-on backend's shared AnyIO pool filled with session/kanban reads waiting on locks
++for minutes; /api/status queued behind them and Desktop timed out on every call.
++"""
++import asyncio
++import threading
++import time
++
++import anyio
++import anyio.to_thread
++import pytest
++
++from hermes_cli import web_thread_lanes as lanes
++
++TIMEOUT = 5.0
++
++
++@pytest.fixture(autouse=True)
++def _lanes():
++    lanes.configure({"control": 2, "sessions": 1, "feed": 1, "probe": 1}, queue_deadline_s=5.0)
++    yield
++    lanes.configure(dict(lanes.DEFAULT_SIZES), lanes.QUEUE_DEADLINE_S)
++
++
++def _blocker():
++    release = threading.Event()
++    started = threading.Event()
++
++    def work(value="done"):
++        started.set()
++        assert release.wait(10), "test never released the blocker"
++        return value
++    return work, started, release
++
++
++async def _until(predicate, timeout=TIMEOUT):
++    from tests.waiting import async_wait_until
++    await async_wait_until(predicate, timeout=timeout)
++
++
++@pytest.mark.asyncio
++async def test_a_full_lane_makes_the_next_caller_wait_then_runs_it():
++    work, started, release = _blocker()
++    first = asyncio.create_task(lanes.run_in_lane("sessions", work, "first"))
++    await _until(started.is_set)
++    ran = []
++    second = asyncio.create_task(lanes.run_in_lane("sessions", lambda: ran.append(1) or "second"))
++    await _until(lambda: lanes.stats()["sessions"]["waiting"] == 1)
++    assert ran == [] and not second.done()  # the lane's only thread is taken
++    release.set()
++    assert await first == "first" and await second == "second" and ran == [1]
++    assert lanes.stats()["sessions"]["served"] == 2
++
++
++@pytest.mark.asyncio
++async def test_a_waiter_past_the_deadline_gets_503_and_never_runs():
++    lanes.configure({"control": 1, "sessions": 1, "feed": 1, "probe": 1}, queue_deadline_s=0.2)
++    work, started, release = _blocker()
++    holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
++    await _until(started.is_set)
++    ran = []
++    with pytest.raises(lanes.LaneBusy) as caught:
++        await lanes.run_in_lane("sessions", lambda: ran.append(1))
++    assert caught.value.status_code == 503 and caught.value.headers["Retry-After"] == str(lanes.RETRY_AFTER_S)
++    assert caught.value.detail["reason"] == "deadline" and caught.value.detail["lane"] == "sessions"
++    assert ran == []  # refused before it started: a retry is always safe
++    release.set()
++    await holder
++    s = lanes.stats()["sessions"]
++    assert s["rejected"] == 1 and s["in_use"] == 0 and s["waiting"] == 0
++
++
++@pytest.mark.asyncio
++async def test_a_per_call_deadline_is_shorter_than_the_lane_deadline():
++    work, started, release = _blocker()
++    holder = asyncio.create_task(lanes.run_in_lane("probe", work))
++    await _until(started.is_set)
++    t0 = time.monotonic()
++    with pytest.raises(lanes.LaneBusy):
++        await lanes.run_in_lane("probe", lambda: None, deadline=0.1)
++    assert time.monotonic() - t0 < 1.0  # not the 5 s lane deadline
++    release.set()
++    await holder
++
++
++class _Request:
++    def __init__(self):
++        self.gone = False
++
++    async def is_disconnected(self):
++        return self.gone
++
++
++@pytest.mark.asyncio
++async def test_a_waiter_whose_client_left_is_dropped_without_running(monkeypatch):
++    monkeypatch.setattr(lanes, "DISCONNECT_POLL_S", 0.01)
++    work, started, release = _blocker()
++    holder = asyncio.create_task(lanes.run_in_lane("sessions", work))
++    await _until(started.is_set)
++    request, ran = _Request(), []
++    waiter = asyncio.create_task(lanes.run_in_lane("sessions", lambda: ran.append(1), request=request))
++    await _until(lambda: lanes.stats()["sessions"]["waiting"] == 1)
++    request.gone = True
++    with pytest.raises(lanes.LaneBusy) as caught:
++        await asyncio.wait_for(waiter, 2)
++    assert caught.value.detail["reason"] == "disconnected" and ran == []
++    release.set()
++    await holder
++    assert lanes.stats()["sessions"]["disconnected"] == 1
++    # The refused waiter held no slot: the lane takes a new call at once.
++    assert await asyncio.wait_for(lanes.run_in_lane("sessions", lambda: "next"), 2) == "next"
++
++
++@pytest.mark.asyncio
++async def test_one_full_lane_never_delays_another():
++    work, started, release = _blocker()
++    holders = [asyncio.create_task(lanes.run_in_lane("sessions", work))]
++    await _until(started.is_set)
++    holders += [asyncio.create_task(lanes.run_in_lane("sessions", work)) for _ in range(5)]  # queued
++    t0 = time.monotonic()
++    assert await asyncio.wait_for(lanes.run_in_lane("control", lambda: "ok"), 2) == "ok"
++    assert time.monotonic() - t0 < 1.0
++    release.set()
++    await asyncio.gather(*holders)
++
++
++@pytest.mark.asyncio
++async def test_lanes_do_not_use_the_shared_default_pool():
++    limiter = anyio.to_thread.current_default_thread_limiter()
++    previous = limiter.total_tokens
++    limiter.total_tokens = 1
++    release = threading.Event()
++    started = threading.Event()
++
++    def hog():
++        started.set()
++        release.wait(10)
++    hog_task = asyncio.create_task(anyio.to_thread.run_sync(hog))
++    try:
++        await _until(started.is_set)
++        # The shared pool is full; a lane call still runs at once.
++        assert await asyncio.wait_for(lanes.run_in_lane("control", lambda: "ran"), 2) == "ran"
++    finally:
++        release.set()
++        await hog_task
++        limiter.total_tokens = previous
++
++
++@pytest.mark.asyncio
++async def test_lane_runner_runs_a_coalesced_read_on_the_lane():
++    from hermes_cli.web_read_coalescing import coalesced_read
++    seen = []
++    read = coalesced_read(lambda key: seen.append(lanes.stats()["sessions"]["in_use"]) or key,
++                          thread_runner=lanes.lane_runner("sessions"))
++    assert await read("x") == "x"
++    assert seen == [1]  # counted on the sessions lane while it ran
++
++
++def test_configure_reads_sizes_and_deadline_from_config(monkeypatch):
++    import hermes_cli.config as config_mod
++    monkeypatch.setattr(config_mod, "load_config", lambda: {"dashboard": {"thread_lanes": {
++        "control": 3, "sessions": 12, "feed": "bad", "probe": 0, "queue_deadline_s": 9}}})
++    lanes.configure()
++    s = lanes.stats()
++    assert s["queue_deadline_s"] == 9.0
++    assert (s["control"]["size"], s["sessions"]["size"]) == (3, 12)
++    # Invalid values keep the defaults.
++    assert s["feed"]["size"] == lanes.DEFAULT_SIZES["feed"] and s["probe"]["size"] == lanes.DEFAULT_SIZES["probe"]
++
++
++def test_an_unconfigured_process_uses_the_defaults_without_reading_config(monkeypatch):
++    import hermes_cli.config as config_mod
++    monkeypatch.setattr(lanes, "_deadline_s", None)
++    monkeypatch.setattr(config_mod, "load_config", lambda: pytest.fail("config read on the event loop path"))
++    assert lanes.queue_deadline_s() == lanes.QUEUE_DEADLINE_S
++    assert lanes.stats()["sessions"]["size"] == lanes.DEFAULT_SIZES["sessions"]
++
++
++@pytest.mark.asyncio
++async def test_unknown_lane_is_a_programming_error():
++    with pytest.raises(KeyError):
++        await lanes.run_in_lane("nope", lambda: None)
+-- 
+2.43.0
+

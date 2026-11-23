@@ -1,0 +1,829 @@
+From 019ae9cd77e02157f7a2fd42763a85437cc31ed3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:24:00 +0000
+Subject: [PATCH] feat(desktop): sessions.filter plugin area for the session
+ list [daveey]
+
+Plugins could not filter the desktop session list. Add the `sessions.filter`
+contribution area (store/session-filter.ts), following `sidebarNav.prefs`:
+
+- applySessionFilters: AND over every contribution's data.match; a match that
+  is not a function or throws counts as matching (console.warn once per id).
+- sessionHasOpenCards: the fields the row's card squares read.
+- sidebar sessionMatchesFilters applies it after the status/profile/PR checks
+  and before project navigation; sidebarFiltersNarrow takes pluginFilters so
+  the 'filters on' state shows; resetSidebarView calls each onClear.
+- SDK: SESSION_FILTER_AREA, SessionFilterContribution, sessionHasOpenCards,
+  useSidebarSessions (core-filtered list, without plugin filters).
+
+No change to existing filters, the filter menu or card colours.
+Approved: operation 7de742f9 / request 6dec271f rev 2.
+Hermes-Card: t_3fbf983dd78af293
+---
+ .../sidebar/chat-sidebar.integration.test.tsx |  32 +++
+ apps/desktop/src/app/chat/sidebar/index.tsx   | 107 ++--------
+ .../app/chat/sidebar/session-filters.test.ts  |  31 +++
+ .../src/app/chat/sidebar/session-filters.ts   |   8 +-
+ .../app/chat/sidebar/use-session-filters.ts   | 186 ++++++++++++++++++
+ apps/desktop/src/sdk/index.ts                 |  21 +-
+ apps/desktop/src/store/layout.ts              |   3 +
+ apps/desktop/src/store/session-filter.test.ts | 105 ++++++++++
+ apps/desktop/src/store/session-filter.ts      |  96 +++++++++
+ 9 files changed, 498 insertions(+), 91 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/session-filters.test.ts
+ create mode 100644 apps/desktop/src/app/chat/sidebar/use-session-filters.ts
+ create mode 100644 apps/desktop/src/store/session-filter.test.ts
+ create mode 100644 apps/desktop/src/store/session-filter.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+index 5eb28764d0..c361f6acfa 100644
+--- a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+@@ -16,6 +16,7 @@ import {
+   $sidebarShowArchived,
+   $sidebarShowAutomated,
+   $sidebarStatusFilter,
++  resetSidebarView,
+   setSidebarAgentsGrouped,
+   setSidebarGrouping
+ } from '@/store/layout'
+@@ -32,6 +33,7 @@ import {
+   $sessionsLoading,
+   $workspaceCwdOwner
+ } from '@/store/session'
++import { $sidebarSessionsPrePlugin, SESSION_FILTER_AREA } from '@/store/session-filter'
+ import { $removedSessionIds } from '@/store/session-removal'
+ import { $archivedSessions } from '@/store/sidebar-archive'
+ import { SIDEBAR_NAV_PREFS_AREA } from '@/store/sidebar-nav'
+@@ -221,6 +223,36 @@ describe('ChatSidebar navigation activity', () => {
+     act(() => dispose())
+     expect(screen.getByRole('button', { name: 'Kanban' })).toBeTruthy()
+   })
++
++  // `sessions.filter`: a contribution hides non-matching rows, its disposer
++  // restores them, and clearing the sidebar filters calls its onClear.
++  it('hides non-matching session rows while a sessions.filter contribution is registered', () => {
++    renderSidebar('/', 'chat')
++    expect(screen.getByText('Tile one')).toBeTruthy()
++    expect(screen.getByText('Tile two')).toBeTruthy()
++
++    const onClear = vi.fn()
++
++    let dispose = () => {}
++
++    act(() => {
++      dispose = registry.register({
++        area: SESSION_FILTER_AREA,
++        data: { match: (s: { id: string }) => s.id === 'tile-one', onClear },
++        id: 'lane'
++      })
++    })
++    expect(screen.getByText('Tile one')).toBeTruthy()
++    expect(screen.queryByText('Tile two')).toBeNull()
++    // The SDK list stays pre-plugin: both rows.
++    expect($sidebarSessionsPrePlugin.get().map(s => s.id)).toEqual(['tile-one', 'tile-two'])
++
++    act(() => resetSidebarView())
++    expect(onClear).toHaveBeenCalledTimes(1)
++
++    act(() => dispose())
++    expect(screen.getByText('Tile two')).toBeTruthy()
++  })
+ })
+ 
+ // #67600: a cold-start read that failed used to render as an empty account.
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 0b144282dd..77752f8c77 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -32,7 +32,7 @@ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $activeConnectionId } from '@/store/connections'
+ import { $cronJobs } from '@/store/cron'
+ import { recordAction } from '@/store/desktop-metrics'
+-import { $hiddenGatewayIds, sessionOnHiddenGateway } from '@/store/gateway-visibility'
++import { $hiddenGatewayIds } from '@/store/gateway-visibility'
+ import { $showsAdvancedChrome } from '@/store/interface-mode'
+ import { $bindings } from '@/store/keybinds'
+ import {
+@@ -85,7 +85,6 @@ import {
+   type AgentProfileRoute,
+   ALL_PROFILES,
+   messagingTotalsKey,
+-  normalizeProfileKey,
+   sidebarProfileForScope
+ } from '@/store/profile'
+ import { $profileRailVisible } from '@/store/profile-rail-prefs'
+@@ -108,7 +107,6 @@ import {
+ import {
+   $prBranchBySession,
+   $pullRequestsByBranch,
+-  pullRequestBucket,
+   recoverSessionPullRequests,
+   refreshPullRequests,
+   sessionPrKey
+@@ -128,7 +126,7 @@ import {
+   markAllSessionsRead,
+   sessionPinId
+ } from '@/store/session'
+-import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
++import { $sessionDotStateById } from '@/store/session-dot-state'
+ import { $focusedSessionIsTile, $focusedStoredSessionId } from '@/store/session-focus'
+ import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
+ import { $removedSessionIds } from '@/store/session-removal'
+@@ -169,7 +167,6 @@ import {
+   ProjectBackRow,
+   projectTreeCwd,
+   sessionBucketId,
+-  sessionMatchesProjectFilter,
+   sessionRecency as sessionTime,
+   type SidebarProjectTree,
+   type SidebarWorkspaceTree,
+@@ -192,12 +189,12 @@ import {
+   SidebarStorageCorruptNotice
+ } from './section-states'
+ import { GlobalSessionRenameDialog } from './session-actions-menu'
+-import { sidebarFiltersNarrow } from './session-filters'
+ import { buildSessionByAnyId, resolvePinnedSessions, useOfflineFallback } from './session-index'
+ import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+ import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
+ import { useOverviewPreviews } from './use-overview-previews'
+ import { useServerSessionSearch } from './use-server-session-search'
++import { useSessionFilters } from './use-session-filters'
+ import { useSidebarDndSensors } from './use-sidebar-dnd-sensors'
+ import { useSidebarNavCollapsed } from './use-sidebar-nav-collapsed'
+ 
+@@ -489,89 +486,26 @@ export function ChatSidebar({
+ 
+   const executionNow = useExecutionObservationClock(executionRows)
+ 
+-  const sessionMatchesFilters = useCallback(
+-    // The shared tick must invalidate memoized filters even when the dot stays `background`.
+-    (session: SessionInfo) => {
+-      // [daveey] A hidden gateway's rows leave every list and lane.
+-      if (sessionOnHiddenGateway(session, hiddenGatewayIds, gatewayRegistry)) {
+-        return false
+-      }
+-
+-      // [daveey] Bot / test rows leave every list and lane unless shown (pinned
+-      // and blocked / needs-input rows stay). Same predicate ⌘] / ⌘[ use.
+-      if (
+-        sessionHiddenAsAutomated(session, showAutomated, {
+-          nowSeconds: executionNow,
+-          dotState: dotStates[session.id] ?? 'idle',
+-          pinnedIds: pinnedSessionIds
+-        })
+-      ) {
+-        return false
+-      }
+-
+-      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
+-        return false
+-      }
+-
+-      // Narrowing to a few of the profiles on screen. Scoped to one profile the
+-      // list is already that profile's, so a stale selection can't blank it.
+-      if (showAllProfiles && profileFilter.length && !profileFilter.includes(normalizeProfileKey(session.profile))) {
+-        return false
+-      }
+-
+-      if (prFilter.length) {
+-        const key = sessionPrKey(session)
+-
+-        if (!prFilter.includes(pullRequestBucket(key ? pullRequests[key] : undefined))) {
+-          return false
+-        }
+-      }
+-
+-      // Same membership the sidebar groups and colors by (backend owner first,
+-      // cwd walk otherwise), so a filtered row lands in the lane the user
+-      // picked it from.
+-      return navigation.matches(
+-        session,
+-        projectFilter,
+-        navigationGroups,
+-        sessionMatchesProjectFilter(session, projectFilter, projects, projectOwners, knownProjects)
+-      )
+-    },
+-    [
+-      hiddenGatewayIds,
+-      gatewayRegistry,
+-      showAutomated,
+-      pinnedSessionIds,
+-      statusFilter,
+-      projectFilter,
+-      navigationGroups,
+-      profileFilter,
+-      showAllProfiles,
+-      prFilter,
+-      pullRequests,
+-      projects,
+-      projectOwners,
+-      knownProjects,
+-      dotStates,
+-      executionNow
+-    ]
+-  )
+-
+-  const filtersNarrow = sidebarFiltersNarrow({
++  const { filtersNarrow, pluginFilters, sessionMatchesFilters, visibleSessions } = useSessionFilters({
++    dotStates,
++    executionNow,
++    gatewayRegistry,
+     hiddenGatewayIds,
+-    showAutomated,
+-    statusFilter,
+-    projectFilter,
++    knownProjects,
++    navigationGroups,
++    pinnedSessionIds,
+     prFilter,
++    profileFilter,
++    projectFilter,
++    projectOwners,
++    projects,
++    pullRequests,
++    scopedSessions,
+     showAllProfiles,
+-    profileFilter
++    showAutomated,
++    statusFilter
+   })
+ 
+-  const visibleSessions = useMemo(
+-    () => (filtersNarrow ? scopedSessions.filter(sessionMatchesFilters) : scopedSessions),
+-    [scopedSessions, filtersNarrow, sessionMatchesFilters]
+-  )
+-
+   // Recents by activity (last_active || started_at). User send stamps
+   // last_active immediately. Ordering by status doesn't sort here — it re-slots
+   // rows *inside* whatever dividers are on, via sortOrderIds below — so the
+@@ -1211,10 +1145,7 @@ export function ChatSidebar({
+   // [daveey] Hiding automated chats is the fork's default view, not a narrowed one: a profile whose
+   // chats are all automated (or none) still keeps its empty section.
+   const profileListNarrow =
+-    hiddenGatewayIds.length > 0 ||
+-    statusFilter.length > 0 ||
+-    projectFilter.length > 0 ||
+-    prFilter.length > 0 ||
++    [hiddenGatewayIds, statusFilter, projectFilter, prFilter, pluginFilters].some(list => list.length > 0) ||
+     (showAllProfiles && profileFilter.length > 0)
+ 
+   const profileGroups = useGatewaySessionGroups(agentSessions, ownerGrouped, profileListNarrow)
+diff --git a/apps/desktop/src/app/chat/sidebar/session-filters.test.ts b/apps/desktop/src/app/chat/sidebar/session-filters.test.ts
+new file mode 100644
+index 0000000000..5da33e924c
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/session-filters.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it } from 'vitest'
++
++import { type SidebarFilterNarrowInput, sidebarFiltersNarrow } from './session-filters'
++
++const none: SidebarFilterNarrowInput = {
++  hiddenGatewayIds: [],
++  pluginFilters: [],
++  prFilter: [],
++  profileFilter: [],
++  projectFilter: [],
++  showAllProfiles: false,
++  showAutomated: true,
++  statusFilter: []
++}
++
++describe('sidebarFiltersNarrow', () => {
++  it('does not narrow with nothing set', () => {
++    expect(sidebarFiltersNarrow(none)).toBe(false)
++  })
++
++  it('narrows when a plugin filter is contributed', () => {
++    expect(sidebarFiltersNarrow({ ...none, pluginFilters: [{ id: 'lanes' }] })).toBe(true)
++  })
++
++  it('keeps the existing narrowing rules', () => {
++    expect(sidebarFiltersNarrow({ ...none, showAutomated: false })).toBe(true)
++    expect(sidebarFiltersNarrow({ ...none, statusFilter: ['a'] })).toBe(true)
++    expect(sidebarFiltersNarrow({ ...none, profileFilter: ['p'] })).toBe(false)
++    expect(sidebarFiltersNarrow({ ...none, profileFilter: ['p'], showAllProfiles: true })).toBe(true)
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/session-filters.ts b/apps/desktop/src/app/chat/sidebar/session-filters.ts
+index 920386ba93..f20426e684 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-filters.ts
++++ b/apps/desktop/src/app/chat/sidebar/session-filters.ts
+@@ -8,6 +8,8 @@ export interface SidebarFilterNarrowInput {
+   prFilter: readonly unknown[]
+   showAllProfiles: boolean
+   profileFilter: readonly unknown[]
++  /** `sessions.filter` plugin contributions: any narrows. */
++  pluginFilters: readonly unknown[]
+ }
+ 
+ export function sidebarFiltersNarrow({
+@@ -17,7 +19,8 @@ export function sidebarFiltersNarrow({
+   projectFilter,
+   prFilter,
+   showAllProfiles,
+-  profileFilter
++  profileFilter,
++  pluginFilters
+ }: SidebarFilterNarrowInput): boolean {
+   return (
+     hiddenGatewayIds.length > 0 ||
+@@ -25,6 +28,7 @@ export function sidebarFiltersNarrow({
+     statusFilter.length > 0 ||
+     projectFilter.length > 0 ||
+     prFilter.length > 0 ||
+-    (showAllProfiles && profileFilter.length > 0)
++    (showAllProfiles && profileFilter.length > 0) ||
++    pluginFilters.length > 0
+   )
+ }
+diff --git a/apps/desktop/src/app/chat/sidebar/use-session-filters.ts b/apps/desktop/src/app/chat/sidebar/use-session-filters.ts
+new file mode 100644
+index 0000000000..d7afaa47bf
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/use-session-filters.ts
+@@ -0,0 +1,186 @@
++import { useCallback, useEffect, useMemo } from 'react'
++
++import { useContributions } from '@/contrib/react/use-contributions'
++import type { SessionInfo } from '@/hermes'
++import { sessionOnHiddenGateway } from '@/store/gateway-visibility'
++import { normalizeProfileKey } from '@/store/profile'
++import type { $pullRequestsByBranch} from '@/store/pull-requests';
++import { pullRequestBucket, sessionPrKey } from '@/store/pull-requests'
++import type { $sessionDotStateById} from '@/store/session-dot-state';
++import { sessionStatusBucket } from '@/store/session-dot-state'
++import { $sidebarSessionsPrePlugin, applySessionFilters, SESSION_FILTER_AREA } from '@/store/session-filter'
++import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
++
++import { presentationNavigation as navigation } from './projects/presentation-navigation'
++import { sessionMatchesProjectFilter } from './projects/workspace-groups'
++import { sidebarFiltersNarrow } from './session-filters'
++
++type MatchesArgs = Parameters<typeof sessionMatchesProjectFilter>
++
++export interface SessionFilterInputs {
++  dotStates: ReturnType<typeof $sessionDotStateById.get>
++  executionNow: number
++  gatewayRegistry: Parameters<typeof sessionOnHiddenGateway>[2]
++  hiddenGatewayIds: Parameters<typeof sessionOnHiddenGateway>[1]
++  knownProjects: MatchesArgs[4]
++  navigationGroups: Parameters<typeof navigation.matches>[2]
++  pinnedSessionIds: readonly string[]
++  prFilter: readonly string[]
++  profileFilter: readonly string[]
++  projectFilter: MatchesArgs[1]
++  projectOwners: MatchesArgs[3]
++  projects: MatchesArgs[2]
++  pullRequests: ReturnType<typeof $pullRequestsByBranch.get>
++  scopedSessions: SessionInfo[]
++  showAllProfiles: boolean
++  showAutomated: boolean
++  statusFilter: readonly string[]
++}
++
++/** The sidebar's session filters in one place: the shared predicate (core
++ *  filters + `sessions.filter` plugin contributions), the filtered list, and
++ *  the pre-plugin list published for the SDK's `useSidebarSessions`. */
++export function useSessionFilters(inputs: SessionFilterInputs) {
++  const {
++    dotStates,
++    executionNow,
++    gatewayRegistry,
++    hiddenGatewayIds,
++    knownProjects,
++    navigationGroups,
++    pinnedSessionIds,
++    prFilter,
++    profileFilter,
++    projectFilter,
++    projectOwners,
++    projects,
++    pullRequests,
++    scopedSessions,
++    showAllProfiles,
++    showAutomated,
++    statusFilter
++  } = inputs
++
++  const pluginFilters = useContributions(SESSION_FILTER_AREA)
++
++  const matchesFilters = useCallback(
++    // The shared tick must invalidate memoized filters even when the dot stays `background`.
++    (session: SessionInfo, withPlugins: boolean) => {
++      // [daveey] A hidden gateway's rows leave every list and lane.
++      if (sessionOnHiddenGateway(session, hiddenGatewayIds, gatewayRegistry)) {
++        return false
++      }
++
++      // [daveey] Bot / test rows leave every list and lane unless shown (pinned
++      // and blocked / needs-input rows stay). Same predicate ⌘] / ⌘[ use.
++      if (
++        sessionHiddenAsAutomated(session, showAutomated, {
++          nowSeconds: executionNow,
++          dotState: dotStates[session.id] ?? 'idle',
++          pinnedIds: pinnedSessionIds
++        })
++      ) {
++        return false
++      }
++
++      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
++        return false
++      }
++
++      // Narrowing to a few of the profiles on screen. Scoped to one profile the
++      // list is already that profile's, so a stale selection can't blank it.
++      if (showAllProfiles && profileFilter.length && !profileFilter.includes(normalizeProfileKey(session.profile))) {
++        return false
++      }
++
++      if (prFilter.length) {
++        const key = sessionPrKey(session)
++
++        if (!prFilter.includes(pullRequestBucket(key ? pullRequests[key] : undefined))) {
++          return false
++        }
++      }
++
++      // [daveey] Plugin `sessions.filter` contributions: ANDed, fail-open.
++      if (withPlugins && !applySessionFilters(session, pluginFilters)) {
++        return false
++      }
++
++      // Same membership the sidebar groups and colors by (backend owner first,
++      // cwd walk otherwise), so a filtered row lands in the lane the user
++      // picked it from.
++      return navigation.matches(
++        session,
++        projectFilter,
++        navigationGroups,
++        sessionMatchesProjectFilter(session, projectFilter, projects, projectOwners, knownProjects)
++      )
++    },
++    [
++      hiddenGatewayIds,
++      gatewayRegistry,
++      showAutomated,
++      pinnedSessionIds,
++      statusFilter,
++      projectFilter,
++      navigationGroups,
++      profileFilter,
++      showAllProfiles,
++      prFilter,
++      pullRequests,
++      projects,
++      projectOwners,
++      knownProjects,
++      dotStates,
++      executionNow,
++      pluginFilters
++    ]
++  )
++
++  const sessionMatchesFilters = useCallback(
++    (session: SessionInfo) => matchesFilters(session, true),
++    [matchesFilters]
++  )
++
++  const filtersNarrow = sidebarFiltersNarrow({
++    hiddenGatewayIds,
++    showAutomated,
++    statusFilter,
++    projectFilter,
++    prFilter,
++    showAllProfiles,
++    profileFilter,
++    pluginFilters
++  })
++
++  const coreFiltersNarrow = sidebarFiltersNarrow({
++    hiddenGatewayIds,
++    showAutomated,
++    statusFilter,
++    projectFilter,
++    prFilter,
++    showAllProfiles,
++    profileFilter,
++    pluginFilters: []
++  })
++
++  const visibleSessions = useMemo(
++    () => (filtersNarrow ? scopedSessions.filter(sessionMatchesFilters) : scopedSessions),
++    [scopedSessions, filtersNarrow, sessionMatchesFilters]
++  )
++
++  // What the SDK's `useSidebarSessions` hands plugins: the list with core
++  // filters applied but not `sessions.filter` contributions.
++  const prePluginSessions = useMemo(
++    () => (coreFiltersNarrow ? scopedSessions.filter(session => matchesFilters(session, false)) : scopedSessions),
++    [scopedSessions, coreFiltersNarrow, matchesFilters]
++  )
++
++  useEffect(() => {
++    $sidebarSessionsPrePlugin.set(prePluginSessions)
++  }, [prePluginSessions])
++
++  useEffect(() => () => $sidebarSessionsPrePlugin.set([]), [])
++
++  return { filtersNarrow, pluginFilters, sessionMatchesFilters, visibleSessions }
++}
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index 0bbc6d175f..14356545e6 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -18,6 +18,7 @@
+  *  - `ui.*` — the design language, so plugin UI looks native by default.
+  */
+ 
++import { useStore } from '@nanostores/react'
+ import { computed, type ReadableAtom } from 'nanostores'
+ import type { ReactNode } from 'react'
+ 
+@@ -46,7 +47,7 @@ import {
+ import { onGatewayEvent } from '@/contrib/events'
+ import { registry } from '@/contrib/registry'
+ import type { WorkspaceMode } from '@/contrib/types'
+-import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
++import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway, type SessionInfo } from '@/hermes'
+ import { traceIdentityChange } from '@/lib/identity-trace'
+ import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+ import {
+@@ -92,6 +93,7 @@ import {
+   setResumeExhaustedSessionId,
+   setSessionOwnerHint
+ } from '@/store/session'
++import { $sidebarSessionsPrePlugin } from '@/store/session-filter'
+ import { $focusedStoredSessionId } from '@/store/session-focus'
+ import {
+   $focusedRuntimeId,
+@@ -1915,6 +1917,13 @@ export {
+ } from '@/lib/transcript-directives'
+ export { cn } from '@/lib/utils'
+ export { gatewayActivationEpoch, useGatewayActivationEpoch } from '@/store/gateway'
++/** `sessions.filter`: narrow the session list by CONTRIBUTING a predicate
++ *  (`data: SessionFilterContribution` — `match(session)`, optional `label` and
++ *  `onClear`). Every contribution is ANDed with core's own filters; a `match`
++ *  that is not a function or throws counts as matching. `onClear` runs when
++ *  the user resets the sidebar filters. `sessionHasOpenCards` is the same
++ *  open-card test the row's card squares use. */
++export { SESSION_FILTER_AREA, type SessionFilterContribution, sessionHasOpenCards } from '@/store/session-filter'
+ /** THE unread store behind `SessionStatusDot`'s emerald dot. A plugin that
+  *  learns out-of-band that a session produced something the user hasn't seen
+  *  (a roster poll's activity watermark, say) writes HERE rather than keeping
+@@ -1934,6 +1943,16 @@ export { ackStoredSessionId, forgetSessionUnread, markSessionUnreadFinished } fr
+  *  contribution, not a `host.sidebar` verb, so it is attributed and dropped
+  *  on disable. */
+ export { SIDEBAR_NAV_PREFS_AREA, type SidebarNavPrefsContribution } from '@/store/sidebar-nav'
++
++/** The sessions the sidebar would list for the active scope with every CORE
++ *  filter applied (hidden gateways, automated, status / profile / PR /
++ *  project filters) but WITHOUT any `sessions.filter` plugin contribution.
++ *  Includes pinned rows; excludes cron and messaging-platform rows, which the
++ *  sidebar lists separately. Empty until a ChatSidebar is mounted. */
++export function useSidebarSessions(): readonly SessionInfo[] {
++  return useStore($sidebarSessionsPrePlugin)
++}
++
+ export type { StatusResponse } from '@/types/hermes'
+ /** Public SDK name for the shared gateway wire event; kept stable for plugins. */
+ export type { GatewayEvent as RpcEvent } from '@hermes/shared'
+diff --git a/apps/desktop/src/store/layout.ts b/apps/desktop/src/store/layout.ts
+index a703bbef5f..09d32e67d7 100644
+--- a/apps/desktop/src/store/layout.ts
++++ b/apps/desktop/src/store/layout.ts
+@@ -30,6 +30,7 @@ import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride }
+ import { $showAllProfiles, setShowAllProfiles } from './profile'
+ import type { PullRequestBucket } from './pull-requests'
+ import type { SessionStatusBucket } from './session-dot-state'
++import { clearSessionFilterContributions } from './session-filter'
+ 
+ export const SIDEBAR_DEFAULT_WIDTH = 237
+ export const SIDEBAR_MAX_WIDTH = 360
+@@ -960,6 +961,8 @@ function clearSidebarFilters() {
+   $sidebarPrFilter.set([])
+   $sidebarShowArchived.set(false)
+   $sidebarShowAutomated.set(false)
++  // Plugins' own `sessions.filter` selections go with the core ones.
++  clearSessionFilterContributions()
+ }
+ 
+ /** Every knob the filter menu owns, back to the sidebar as it ships. Ordering
+diff --git a/apps/desktop/src/store/session-filter.test.ts b/apps/desktop/src/store/session-filter.test.ts
+new file mode 100644
+index 0000000000..a168c38ded
+--- /dev/null
++++ b/apps/desktop/src/store/session-filter.test.ts
+@@ -0,0 +1,105 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { registry } from '@/contrib/registry'
++import type { Contribution } from '@/contrib/types'
++import { resetSidebarView } from '@/store/layout'
++import { makeSessionInfo } from '@/test/session-info'
++
++import {
++  applySessionFilters,
++  clearSessionFilterContributions,
++  SESSION_FILTER_AREA,
++  sessionHasOpenCards
++} from './session-filter'
++
++const session = makeSessionInfo({ id: 's1', title: 'one' })
++
++const c = (id: string, data: unknown): Contribution => ({ area: SESSION_FILTER_AREA, data, id })
++
++afterEach(() => vi.restoreAllMocks())
++
++describe('applySessionFilters', () => {
++  it('matches everything when there are no contributions', () => {
++    expect(applySessionFilters(session, [])).toBe(true)
++  })
++
++  it('ANDs every contribution', () => {
++    const yes = c('yes', { match: () => true })
++    const no = c('no', { match: () => false })
++
++    expect(applySessionFilters(session, [yes, yes])).toBe(true)
++    expect(applySessionFilters(session, [yes, no])).toBe(false)
++    expect(applySessionFilters(session, [no, yes])).toBe(false)
++  })
++
++  it('passes the session to match', () => {
++    const match = vi.fn(() => true)
++
++    applySessionFilters(session, [c('spy', { match })])
++    expect(match).toHaveBeenCalledWith(session)
++  })
++
++  it('fails open on a throwing match and warns once per contribution id', () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++    const boom = c('boom-throws', {
++      match: () => {
++        throw new Error('nope')
++      }
++    })
++
++    expect(applySessionFilters(session, [boom])).toBe(true)
++    expect(applySessionFilters(session, [boom])).toBe(true)
++    expect(applySessionFilters(session, [boom, c('no', { match: () => false })])).toBe(false)
++    expect(warn).toHaveBeenCalledTimes(1)
++  })
++
++  it('fails open on a non-function match or missing data, warning once per id', () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++    expect(applySessionFilters(session, [c('bad-match', { match: 'x' }), c('no-data', undefined)])).toBe(true)
++    expect(applySessionFilters(session, [c('bad-match', { match: 'x' }), c('no-data', undefined)])).toBe(true)
++    expect(warn).toHaveBeenCalledTimes(2)
++  })
++})
++
++describe('sessionHasOpenCards', () => {
++  it('is false with no open cards', () => {
++    expect(sessionHasOpenCards(session)).toBe(false)
++    expect(sessionHasOpenCards({ ...session, kanban_active: 0, needs_you: [] })).toBe(false)
++  })
++
++  it.each([['kanban_active'], ['kanban_blocked'], ['kanban_held'], ['kanban_parked']] as const)('is true for %s', key => {
++    expect(sessionHasOpenCards({ ...session, [key]: 1 })).toBe(true)
++  })
++
++  it('is true when needs_you is non-empty', () => {
++    expect(sessionHasOpenCards({ ...session, needs_you: [{ id: 'x' }] as never })).toBe(true)
++  })
++})
++
++describe('onClear', () => {
++  it('runs every contribution onClear on clear/reset, surviving a throwing one', () => {
++    vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++    const first = vi.fn(() => {
++      throw new Error('x')
++    })
++
++    const second = vi.fn()
++
++    const dispose = registry.registerMany([
++      { area: SESSION_FILTER_AREA, data: { match: () => true, onClear: first }, id: 'a' },
++      { area: SESSION_FILTER_AREA, data: { match: () => true, onClear: second }, id: 'b' },
++      { area: SESSION_FILTER_AREA, data: { match: () => true }, id: 'c' }
++    ])
++
++    clearSessionFilterContributions()
++    expect(first).toHaveBeenCalledTimes(1)
++    expect(second).toHaveBeenCalledTimes(1)
++
++    resetSidebarView()
++    expect(second).toHaveBeenCalledTimes(2)
++    dispose()
++  })
++})
+diff --git a/apps/desktop/src/store/session-filter.ts b/apps/desktop/src/store/session-filter.ts
+new file mode 100644
+index 0000000000..e2c5f93acb
+--- /dev/null
++++ b/apps/desktop/src/store/session-filter.ts
+@@ -0,0 +1,96 @@
++import { atom } from 'nanostores'
++
++import { registry } from '@/contrib/registry'
++import type { Contribution } from '@/contrib/types'
++import type { SessionInfo } from '@/hermes'
++
++// Session-list filters — the `sessions.filter` registry area. A plugin (the
++// lanes strip) narrows the desktop session list by CONTRIBUTING a predicate;
++// core still owns rendering and ANDs every contribution with its own filters.
++// Same shape as `sidebarNav.prefs` (./sidebar-nav.ts): a contribution is
++// attributed and dropped by the loader's per-plugin disposer on disable /
++// reload, so the rows come back on their own.
++
++export const SESSION_FILTER_AREA = 'sessions.filter'
++
++/** Payload (`data`) of a `sessions.filter` contribution. */
++export interface SessionFilterContribution {
++  /** Whether the session stays listed. Contributions AND together. A `match`
++   *  that is not a function or throws counts as matching (fail-open). */
++  match: (session: SessionInfo) => boolean
++  /** Human label for the filter (reserved for the filter indicator). */
++  label?: string
++  /** Called when the user clears the sidebar filters, so the plugin can drop
++   *  its own selection. Errors are swallowed. */
++  onClear?: () => void
++}
++
++const warned = new Set<string>()
++
++function warnOnce(id: string, reason: string, error?: unknown): void {
++  if (warned.has(id)) {
++    return
++  }
++
++  warned.add(id)
++  console.warn(`[sessions.filter] contribution "${id}" ${reason}; treating it as matching`, error ?? '')
++}
++
++/** AND over every contribution's `data.match`. Pure. An empty list matches
++ *  everything; a contribution whose `match` is not a function or throws counts
++ *  as matching (console.warn once per contribution id). */
++export function applySessionFilters(session: SessionInfo, contributions: readonly Contribution[]): boolean {
++  for (const c of contributions) {
++    const match = (c.data as Partial<SessionFilterContribution> | undefined)?.match
++
++    if (typeof match !== 'function') {
++      warnOnce(c.id, '`match` is not a function')
++
++      continue
++    }
++
++    try {
++      if (!match(session)) {
++        return false
++      }
++    } catch (error) {
++      warnOnce(c.id, '`match` threw', error)
++    }
++  }
++
++  return true
++}
++
++/** Whether the session has any open kanban card: the fields the row's card
++ *  squares read (session-row-card-squares.tsx). */
++export function sessionHasOpenCards(session: SessionInfo): boolean {
++  return (
++    (session.kanban_active ?? 0) > 0 ||
++    (session.kanban_blocked ?? 0) > 0 ||
++    (session.kanban_held ?? 0) > 0 ||
++    (session.kanban_parked ?? 0) > 0 ||
++    (session.needs_you?.length ?? 0) > 0
++  )
++}
++
++/** Run every contribution's `onClear` (each in its own try/catch). */
++export function clearSessionFilterContributions(): void {
++  for (const c of registry.getArea(SESSION_FILTER_AREA)) {
++    const onClear = (c.data as Partial<SessionFilterContribution> | undefined)?.onClear
++
++    if (typeof onClear !== 'function') {
++      continue
++    }
++
++    try {
++      onClear()
++    } catch (error) {
++      console.warn(`[sessions.filter] contribution "${c.id}" onClear threw`, error)
++    }
++  }
++}
++
++/** The sidebar's session list with core filters applied but WITHOUT plugin
++ *  session filters. Published by ChatSidebar while mounted; read via the SDK's
++ *  `useSidebarSessions`. */
++export const $sidebarSessionsPrePlugin = atom<readonly SessionInfo[]>([])
+-- 
+2.43.0
+

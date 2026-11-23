@@ -1,0 +1,869 @@
+From 007eab9c6a06b8b2a540ac9033988804003cfe4d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:05:06 -0800
+Subject: [PATCH] fix(update): interrupt and carry background reviews so a busy
+ session no longer blocks a core update [daveey]
+
+A background review holds an admission reservation for its whole run and read the drain's pause request
+only between provider calls, so one long call kept the reservation past the drain's claim hold and the
+update deferred 60 minutes (a laptop: "admission reservations busy (1)", one
+background_review of a Desktop session that reviews after nearly every turn).
+
+- Each review's watcher interrupts its in-flight call once a pause request has stood 5 s
+  (REVIEW_UPDATE_PAUSE_GRACE_S); the review releases its reservation and is requeued as before.
+- A review the update's admission hold refuses at spawn is queued (bounded) instead of dropped.
+- Requeued reviews are also recorded per session on disk (agent/review_update_carry.py), so the
+  session's next finished turn after the update's restart runs the review; a review that starts clears it.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ agent/background_review.py                    |   6 +
+ agent/review_idle_queue.py                    |  14 +-
+ agent/review_update_carry.py                  | 113 +++++
+ agent/turn_finalizer.py                       |   9 +
+ hermes_cli/backend_retirement.py              | 100 ++++-
+ run_agent.py                                  |  21 +-
+ ...test_background_review_update_interrupt.py | 423 ++++++++++++++++++
+ .../test_background_review_update_pause.py    |   7 +-
+ 8 files changed, 680 insertions(+), 13 deletions(-)
+ create mode 100644 agent/review_update_carry.py
+ create mode 100644 tests/hermes_cli/test_background_review_update_interrupt.py
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index a1ed6dc197..9ae4d9815b 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1282,6 +1282,12 @@ def _run_review_fork(
+         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
+     st.review_agent._review_attended = explicit
+     st.review_agent._retirement_review_hold = getattr(review_run, "retirement_hold", None)
++    if st.review_agent._retirement_review_hold is not None:  # [daveey] its update-pause watcher interrupts this fork
++        st.review_agent._retirement_review_hold.review_agent = st.review_agent
++        if st.review_agent._retirement_review_hold.wind_down.is_set():
++            from hermes_cli.backend_retirement import stop_review_for_update
++            stop_review_for_update(st.review_agent._retirement_review_hold,
++                                   why="stopped while its fork was being built")
+     _track_review_fork(agent, st.review_agent, register=True)
+     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
+     review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
+diff --git a/agent/review_idle_queue.py b/agent/review_idle_queue.py
+index 87032079ce..e32cff890b 100644
+--- a/agent/review_idle_queue.py
++++ b/agent/review_idle_queue.py
+@@ -304,12 +304,14 @@ def requeue_update_paused_review(agent: Any, hold: Any, session_key: str, kwargs
+     """[daveey] t_01a1d521213ff881: a review a core-update pause request stopped between provider calls
+     (``backend_retirement.review_stop_reason``) is queued to run again once the update's admission hold lifts,
+     whatever its runtime; out of attempts, or if the queue refuses it, it is dropped and logged (a review is
+-    best-effort, and the queue is in-memory: a backend the update restarts loses it). Returns whether ``hold``
++    best-effort; the queue is in-memory, so ``review_update_carry`` also records it for the session's next turn
++    after a restart). Returns whether ``hold``
+     was such a stop (the caller then skips its other requeue rules). Never raises."""
+     from hermes_cli.backend_retirement import WIND_DOWN_UPDATE_PAUSE
+ 
+-    if getattr(hold, "wind_down_reason", None) != WIND_DOWN_UPDATE_PAUSE:
+-        return False
++    if (getattr(hold, "wind_down_reason", None) != WIND_DOWN_UPDATE_PAUSE
++            or getattr(hold, "stopped_for_update", False) is not True):
++        return False  # not stopped for an update (a review whose last call finished is done, not requeued)
+     session = session_key[-12:]
+     try:
+         attempts = int(kwargs.get("_requeue_attempts", 0))
+@@ -317,9 +319,11 @@ def requeue_update_paused_review(agent: Any, hold: Any, session_key: str, kwargs
+             logger.info("Background review stopped for a Hermes update: dropped after %d requeues (session=%s)",
+                         max_attempts, session)
+             return True
++        from agent import review_update_carry
++        review_update_carry.record(agent, kwargs)  # first (a dispatch clears it); the update's restart loses QUEUE
+         QUEUE.enqueue(agent, session_key, dict(kwargs))
+-        logger.info("Background review stopped for a Hermes update before its next provider call: requeued to "
+-                    "run after the update (session=%s, attempt=%d)", session, attempts)
++        logger.info("Background review stopped for a Hermes update: requeued to run after the update "
++                    "(session=%s, attempt=%d)", session, attempts)
+     except Exception:  # health: allow BLE001 -- best-effort requeue on the review thread's exit; logged with traceback
+         logger.warning("Background review stopped for a Hermes update: dropped, requeue failed (session=%s)",
+                        session, exc_info=True)
+diff --git a/agent/review_update_carry.py b/agent/review_update_carry.py
+new file mode 100644
+index 0000000000..2eac700405
+--- /dev/null
++++ b/agent/review_update_carry.py
+@@ -0,0 +1,113 @@
++"""[daveey] A background review a core update stopped survives the update's restart.
++
++``review_idle_queue`` keeps a review that a core-update pause stopped (or that the update's admission hold refused)
++in memory, so it runs once the hold lifts without a restart. The update itself restarts the backend, which loses
++that queue. Each such review also leaves one small record here, keyed by session: the session's next finished
++turn (``agent.turn_finalizer``) takes it and runs the review over its full conversation, even when that turn
++would not have reviewed on its own. A review that does start clears the record. Best-effort, never raises:
++reviews are self-improvement work, and a lost record only means one review fewer.
++"""
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import logging
++import os
++import time
++import uuid
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++#: A record older than this is stale (the session moved on long ago): it is dropped, not run.
++MAX_AGE_S = 7 * 24 * 3600.0
++
++
++def _path(session_id: str) -> Path:
++    from hermes_constants import get_hermes_home
++
++    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
++    return Path(get_hermes_home()) / "cache" / "review-carry" / f"{digest}.json"
++
++
++def _session(agent: Any) -> Optional[str]:
++    session = getattr(agent, "session_id", None)
++    return session if isinstance(session, str) and session else None
++
++
++def record(agent: Any, kwargs: dict[str, Any]) -> bool:
++    """Note that ``agent``'s session owes a review (its memory/skill flags). Returns whether it was written."""
++    session = _session(agent)
++    if session is None or kwargs.get("focus") is not None or kwargs.get("explicit"):
++        return False  # /refine reviews are interactive: they are not carried across a restart
++    tmp = None
++    try:
++        path = _path(session)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        _prune(path.parent)
++        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++        tmp.write_text(json.dumps({
++            "version": 1, "session_id": session, "created_at": time.time(),
++            "review_memory": bool(kwargs.get("review_memory")), "review_skills": bool(kwargs.get("review_skills")),
++        }), encoding="utf-8")
++        os.replace(tmp, path)
++        return True
++    except OSError:
++        logger.warning("Could not record a carried background review (session=%s)", session[-12:], exc_info=True)
++        if tmp is not None:
++            with contextlib.suppress(OSError):
++                tmp.unlink(missing_ok=True)
++        return False
++
++
++def _prune(directory: Path) -> None:
++    """Drop records (and stray temp files) older than MAX_AGE_S: sessions that never took another turn."""
++    cutoff = time.time() - MAX_AGE_S
++    with contextlib.suppress(OSError):
++        for entry in directory.iterdir():
++            with contextlib.suppress(OSError):
++                if entry.stat().st_mtime < cutoff:
++                    entry.unlink(missing_ok=True)
++
++
++def clear(agent: Any) -> None:
++    """The session's review started: its carried record (if any) is done."""
++    session = _session(agent)
++    if session is not None:
++        try:
++            _path(session).unlink(missing_ok=True)
++        except OSError:
++            logger.debug("Could not clear a carried background review", exc_info=True)
++
++
++def take(agent: Any) -> Optional[dict[str, bool]]:
++    """Remove and return the session's carried review flags (``review_memory``/``review_skills``), or None.
++    A record for another session (hash collision), a stale record or an unreadable one is dropped."""
++    session = _session(agent)
++    if session is None:
++        return None
++    path = _path(session)
++    # Claim by rename: of two processes taking the same record, exactly one gets it.
++    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.taken")
++    try:
++        os.replace(path, claimed)
++    except FileNotFoundError:
++        return None
++    except OSError:
++        logger.debug("Could not claim a carried background review", exc_info=True)
++        return None
++    try:
++        body = json.loads(claimed.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        body = None
++    finally:
++        with contextlib.suppress(OSError):
++            claimed.unlink(missing_ok=True)
++    if (not isinstance(body, dict) or body.get("session_id") != session
++            or not isinstance(body.get("created_at"), (int, float))
++            or not 0 <= time.time() - float(body["created_at"]) < MAX_AGE_S):
++        return None
++    flags = {"review_memory": body.get("review_memory") is True, "review_skills": body.get("review_skills") is True}
++    return flags if any(flags.values()) else None
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 7698d597f4..219d34965f 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -740,6 +740,15 @@ def _mirror_turn_to_memory(
+     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
+     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
+     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
++    if (final_response and not interrupted and not getattr(agent, "skip_background_review", False)
++            and getattr(agent, "_delegate_depth", 0) == 0 and getattr(agent, "_persist_disabled", False) is not True):
++        # [daveey] A review a Hermes update stopped before the restart runs on the session's next finished turn.
++        # Only the session's own agent takes it: review, /btw and plugin forks share its session id
++        # (build_cache_parity_fork sets _persist_disabled on every one of them).
++        from agent import review_update_carry
++        if carried := review_update_carry.take(agent):
++            review_memory = review_memory or carried["review_memory"]
++            review_skills = review_skills or carried["review_skills"]
+     if (
+         final_response
+         and not interrupted
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index 2575694cc7..054db8beff 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -160,6 +160,13 @@ BACKGROUND_REVIEW_HARD_CAP_S = 900.0
+ # reason is ``review_<reason>_wind_down``.
+ WIND_DOWN_RETIREMENT = "retirement"
+ WIND_DOWN_UPDATE_PAUSE = "update_pause"
++# [daveey] A review mid provider call reads the drain's pause request only when that call returns (minutes on
++# a long call) and holds its admission reservation meanwhile, so the update waited on it and gave up
++# (a laptop: "admission reservations busy" from one background_review, update deferred
++# 60 m). Once a live pause request has stood REVIEW_UPDATE_PAUSE_GRACE_S, the review's watcher interrupts it
++# mid-call: the calls that already ran have landed, and the spawner requeues the review for after the update.
++REVIEW_UPDATE_PAUSE_GRACE_S = 5.0
++_REVIEW_PAUSE_POLL_S = 1.0
+ 
+ 
+ class BackgroundReviewHold:
+@@ -175,6 +182,15 @@ class BackgroundReviewHold:
+         self.reservation = reservation
+         self.root = root
+         self.session = session
++        self.interrupted = False
++        # The review actually stopped for an update (broke at a step boundary, or its call was interrupted), so it
++        # is requeued. A wind-down label alone is not enough: the call in flight may have been its last.
++        self.stopped_for_update = False
++        self.review_agent = None  # the review fork, once built (agent.background_review); interrupted on update
++        self.ended = threading.Event()
++        # Serializes an update stop against the review's end: a review that finished is never re-labelled
++        # update-paused (its spawner would requeue a completed review).
++        self.stop_lock = threading.Lock()
+ 
+ 
+ def review_stop_reason(hold):
+@@ -185,8 +201,9 @@ def review_stop_reason(hold):
+     review's ``wind_down``, as a pending retirement does past BACKGROUND_REVIEW_WAIT_S. The review held its
+     admission reservation for its whole run and read only the retirement signal, so hermes-sync's worker
+     reclaim, which waits for every reservation, never opened while one long review ran and the update gave
+-    up at its 3-minute claim hold (laptop-1 2026-11-13 05:25). Never mid-call: writes from the calls that
+-    already ran have landed, and the spawner requeues the review to run after the update."""
++    up at its 3-minute claim hold (a laptop). Here only between calls; a call still in flight
++    after REVIEW_UPDATE_PAUSE_GRACE_S is interrupted by ``watch_update_pause``. Writes from the calls that already
++    ran have landed, and the spawner requeues the review to run after the update."""
+     wind_down = getattr(hold, "wind_down", None)
+     if wind_down is None:
+         return None
+@@ -200,10 +217,72 @@ def review_stop_reason(hold):
+             _log.info("Background review (session=%s) stopping before its next provider call: a Hermes update "
+                       "asked turns to pause", str(getattr(hold, "session", None) or "?")[-12:])
+     if wind_down.is_set():
+-        return getattr(hold, "wind_down_reason", None) or WIND_DOWN_RETIREMENT
++        reason = getattr(hold, "wind_down_reason", None) or WIND_DOWN_RETIREMENT
++        if reason == WIND_DOWN_UPDATE_PAUSE:
++            hold.stopped_for_update = True  # the fork breaks here, before its next provider call
++        return reason
+     return None
+ 
+ 
++def stop_review_for_update(hold, *, why="after a pause request stood its grace"):
++    """Wind ``hold``'s review down for a core update; interrupt its in-flight provider call unless a tool is running
++    (a memory/skill write is short and must not be cut: the review then stops at the boundary after it). Returns
++    whether the review is (now) stopping for the update: False once it ended, or when a retirement already wound it
++    down (that path keeps its own reason and requeue rules). Never raises."""
++    with hold.stop_lock:
++        if hold.ended.is_set():
++            return False
++        if hold.wind_down.is_set() and hold.wind_down_reason != WIND_DOWN_UPDATE_PAUSE:
++            return False
++        hold.wind_down_reason = WIND_DOWN_UPDATE_PAUSE
++        hold.wind_down.set()
++    agent = hold.review_agent
++    if agent is None:  # not built yet: it stops at its first step boundary (review_stop_reason)
++        return True
++    try:
++        from agent.update_pause_cancel import COMPRESSION_CALL_ID, MODEL_CALL_ID, in_flight
++
++        # Only real tool calls wait: the model-request and compression markers are the provider calls this cuts.
++        if any(call not in (MODEL_CALL_ID, COMPRESSION_CALL_ID) for call in in_flight(agent)):
++            return True  # the watcher retries the interrupt once the tool returns
++        if getattr(hold, "interrupted", False):
++            return True
++        from agent.interrupt_compat import request_hard_interrupt
++        from agent.interrupt_control import _REASON_UPDATE_PAUSE
++
++        with hold.stop_lock:  # a review that ended meanwhile finished on its own: it is not requeued
++            if hold.ended.is_set():
++                return False
++            hold.interrupted = hold.stopped_for_update = True
++        request_hard_interrupt(agent, "stopped for a Hermes update", tool_reason=_REASON_UPDATE_PAUSE)
++    except Exception:  # health: allow BLE001 -- the wind-down above still stops it at the next boundary
++        _log.warning("Background review interrupt for a Hermes update failed", exc_info=True)
++        return True
++    _log.info("Background review (session=%s) interrupted for a Hermes update (%s); it is requeued to run after "
++              "the update", str(hold.session or "?")[-12:], why)
++    return True
++
++
++def watch_update_pause(hold, *, poll_s=None, grace_s=None):
++    """Poll ``hold.root``'s pause request until the review ends; stop the review once the request has stood
++    ``grace_s``. A request that lapses resets the grace. Runs on its own daemon thread (``begin_background_review``)."""
++    from hermes_cli.admission_fence import pause_requested
++
++    poll_s = _REVIEW_PAUSE_POLL_S if poll_s is None else poll_s
++    grace_s = REVIEW_UPDATE_PAUSE_GRACE_S if grace_s is None else grace_s
++    seen = None
++    while not hold.ended.wait(poll_s):
++        if not pause_requested(hold.root):
++            seen = None
++            continue
++        now = time.monotonic()
++        seen = now if seen is None else seen
++        if now - seen >= grace_s:
++            if not stop_review_for_update(hold) or getattr(hold, "interrupted", False):
++                return
++            # A tool was running (or the fork is not built yet): retry the interrupt on the next poll.
++
++
+ class RetirementFence:
+     """Exclusive 30-second prepare permit; commit closes admission permanently.
+ 
+@@ -281,7 +360,16 @@ class RetirementFence:
+                 return None
+             hold = BackgroundReviewHold(self._now(), pending, root, session_id)
+             self._reviews.add(hold)
+-            return hold
++        if root is not None:
++            try:
++                from agent.memory_provider import spawn_context_thread
++
++                # passive: infrastructure, never local-work custody (a drain would wait on its own watcher)
++                spawn_context_thread(watch_update_pause, args=(hold,), name="bg-review-update-pause",
++                                     passive=True).start()
++            except RuntimeError:  # the review still stops at its next step boundary (review_stop_reason)
++                _log.warning("Background review update-pause watcher did not start", exc_info=True)
++        return hold
+ 
+     def end_background_review(self, hold):
+         if hold is None:
+@@ -290,6 +378,10 @@ class RetirementFence:
+         # keeps the file locked until unlink, so there is no false-idle gap.
+         with self._lock:
+             self._reviews.discard(hold)
++        ended = getattr(hold, "ended", None)
++        if ended is not None:
++            with hold.stop_lock:  # after this no update stop can relabel the finished review
++                ended.set()  # also stops the review's update-pause watcher
+         if hold.reservation is not None:
+             hold.reservation.close()
+ 
+diff --git a/run_agent.py b/run_agent.py
+index e8c33ce5bb..d6db7c622d 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -851,8 +851,25 @@ class AIAgent(
+         from hermes_cli.backend_retirement import retirement
+         hold = retirement.begin_background_review(getattr(self, "session_id", None))
+         if hold is None:
+-            logger.info("Background review skipped: this backend is retiring")
+             finish_background_review_run(self, review_run)
++            from agent.review_idle_queue import QUEUE, _update_admission_held
++            # [daveey] A core update's admission hold refuses the reservation: queue the review to run once the
++            # hold lifts (bounded) instead of dropping it; a retiring backend still skips it.
++            if (not retirement.retiring() and _update_admission_held()
++                    and _requeue_attempts < self._REVIEW_REQUEUE_MAX_ATTEMPTS):
++                try:
++                    from agent import review_update_carry
++                    # Record first: a dispatch right after the enqueue clears it (no orphan record).
++                    review_update_carry.record(self, dict(review_memory=review_memory, review_skills=review_skills,
++                                                          focus=focus, explicit=explicit))
++                    QUEUE.enqueue(self, _review_queue_key(self), dict(
++                        messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
++                        focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1, explicit=explicit))
++                    logger.info("Background review queued: a Hermes update holds admission; it runs after the update")
++                except Exception:  # health: allow BLE001 -- best-effort (e.g. a drain refusing the queue lease)
++                    logger.warning("Background review under a Hermes update hold: not queued", exc_info=True)
++            else:
++                logger.info("Background review skipped: this backend is retiring")
+             return
+         review_run.retirement_hold = hold
+         try:
+@@ -890,6 +907,8 @@ class AIAgent(
+ 
+             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
+             # right profile.
++            from agent import review_update_carry
++            review_update_carry.clear(self)  # the spawn succeeded: this review covers any one an update carried
+             threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()  # health: allow HX012 -- target already wrapped by propagate_context_to_thread
+             if _work:
+                 _work.clear()  # started: the thread's finally owns the token
+diff --git a/tests/hermes_cli/test_background_review_update_interrupt.py b/tests/hermes_cli/test_background_review_update_interrupt.py
+new file mode 100644
+index 0000000000..eb54360b94
+--- /dev/null
++++ b/tests/hermes_cli/test_background_review_update_interrupt.py
+@@ -0,0 +1,423 @@
++"""A core update no longer waits on a background review that is mid provider call.
++
++A review reads the drain's pause request only at step boundaries, and holds its admission reservation for its
++whole run. One long provider call therefore kept the reservation past the drain's claim hold and the update gave up
++for 60 minutes (a laptop, "admission reservations busy: /Users/me/.hermes (1)", one
++``background_review``). Now each review's watcher interrupts it mid-call once a pause request has stood
++``REVIEW_UPDATE_PAUSE_GRACE_S``; the review releases its reservation and is requeued, in memory and on disk
++(``agent.review_update_carry``) so it still runs after the update restarts the backend. A review the update's
++admission hold refuses at spawn is queued the same way instead of dropped.
++"""
++from __future__ import annotations
++
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from hermes_cli import admission_fence, backend_retirement
++from hermes_cli.backend_retirement import WIND_DOWN_RETIREMENT, WIND_DOWN_UPDATE_PAUSE, RetirementFence
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    return tmp_path
++
++
++@pytest.fixture
++def fast(monkeypatch):
++    monkeypatch.setattr(backend_retirement, "REVIEW_UPDATE_PAUSE_GRACE_S", 0.3)
++    monkeypatch.setattr(backend_retirement, "_REVIEW_PAUSE_POLL_S", 0.05)
++
++
++@pytest.fixture
++def fence(monkeypatch):
++    fence = RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    return fence
++
++
++@pytest.fixture
++def queue(monkeypatch):
++    from agent import review_idle_queue
++
++    queue = review_idle_queue.ReviewIdleQueue()
++    monkeypatch.setattr(queue, "_ensure_thread", lambda: None)
++    monkeypatch.setattr(review_idle_queue, "QUEUE", queue)
++    return queue
++
++
++class _Fork:
++    """A review fork mid provider call: ``hard_interrupt`` is what ends the call."""
++
++    def __init__(self):
++        self.interrupted = threading.Event()
++        self.messages = []
++
++    def hard_interrupt(self, message=None, *, tool_reason=None):
++        self.messages.append((message, tool_reason))
++        self.interrupted.set()
++
++
++def _ask_turns_to_pause(root, *, expires_in=60.0):
++    admission_fence.set_hold(root)
++    admission_fence.request_pause(root, expires_at=time.time() + expires_in)
++
++
++def test_a_review_mid_call_is_interrupted_once_the_pause_request_has_stood_its_grace(root, fence, fast):
++    hold = fence.begin_background_review(session_id="20000101_000000_d36eab")
++    fork = _Fork()
++    hold.review_agent = fork
++    try:
++        started = time.monotonic()
++        _ask_turns_to_pause(root)
++        assert fork.interrupted.wait(10), "the review's in-flight call was never interrupted"
++        assert time.monotonic() - started >= 0.3 - 0.05  # not before the grace
++        assert hold.wind_down.is_set() and hold.wind_down_reason == WIND_DOWN_UPDATE_PAUSE
++        assert fork.messages == [("stopped for a Hermes update", "hermes update pause")]  # the survivable reason
++    finally:
++        fence.end_background_review(hold)
++    assert admission_fence.state(root)["reservations"] == 0
++
++
++def test_no_pause_request_leaves_the_review_alone(root, fence, fast):
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    hold.review_agent = fork
++    try:
++        assert not fork.interrupted.wait(0.8)
++        assert not hold.wind_down.is_set()
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_a_request_that_lapses_inside_the_grace_does_not_interrupt(root, fence, fast):
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    hold.review_agent = fork
++    try:
++        _ask_turns_to_pause(root, expires_in=0.1)  # expires before the 0.3 s grace is up
++        assert not fork.interrupted.wait(0.8)
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_a_retirement_wind_down_keeps_its_reason_and_is_not_interrupted(root, fence, fast):
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    hold.review_agent = fork
++    hold.wind_down_reason = WIND_DOWN_RETIREMENT
++    hold.wind_down.set()
++    try:
++        _ask_turns_to_pause(root)
++        assert not fork.interrupted.wait(0.8)  # well past the 0.3 s grace
++        assert hold.wind_down_reason == WIND_DOWN_RETIREMENT
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_the_watcher_thread_exits_when_the_review_ends(root, fence, fast):
++    before = set(threading.enumerate())
++    hold = fence.begin_background_review()
++    (watcher,) = [t for t in threading.enumerate() if t not in before and t.name == "bg-review-update-pause"]
++    fence.end_background_review(hold)
++    watcher.join(timeout=5)
++    assert not watcher.is_alive()
++
++
++def test_a_review_stopped_before_its_fork_was_built_is_interrupted_when_the_fork_links(root, fence):
++    from hermes_cli.backend_retirement import stop_review_for_update
++
++    hold = fence.begin_background_review()
++    try:
++        assert stop_review_for_update(hold) is True  # no fork yet: wind-down only
++        fork = _Fork()
++        hold.review_agent = fork
++        assert stop_review_for_update(hold) is True
++        assert fork.interrupted.is_set()
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_a_review_that_already_ended_is_never_relabelled_update_paused(root, fence):
++    """The watcher racing the review's own end: a finished review must not be requeued as update-paused."""
++    from hermes_cli.backend_retirement import stop_review_for_update
++
++    hold = fence.begin_background_review()
++    fence.end_background_review(hold)
++    assert stop_review_for_update(hold) is False
++    assert not hold.wind_down.is_set() and hold.wind_down_reason is None
++
++
++def test_a_long_provider_call_after_a_tool_is_interrupted(root, fence, fast):
++    """The model-request and compression markers sit in the same in-flight table as tools: they are the long calls
++    the watcher exists to cut, never a reason to wait (re-review of 7e96ec02697)."""
++    from agent import update_pause_cancel
++
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    vars(fork)[update_pause_cancel._IN_FLIGHT] = {update_pause_cancel.MODEL_CALL_ID: time.monotonic(),
++                                                  update_pause_cancel.COMPRESSION_CALL_ID: time.monotonic()}
++    hold.review_agent = fork
++    try:
++        _ask_turns_to_pause(root)
++        assert fork.interrupted.wait(10), "a long second provider call was never interrupted"
++        assert hold.stopped_for_update
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_a_review_whose_last_call_finished_under_a_wind_down_is_not_requeued(root, fence, queue):
++    """Wound down while a tool ran, then the review finished on its own: done, not requeued as update-paused."""
++    from agent.review_idle_queue import requeue_update_paused_review
++    from hermes_cli.backend_retirement import stop_review_for_update
++    from agent import update_pause_cancel
++
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    vars(fork)[update_pause_cancel._IN_FLIGHT] = {"call_1": time.monotonic()}
++    hold.review_agent = fork
++    stop_review_for_update(hold)  # labelled, not interrupted: a tool was running
++    fence.end_background_review(hold)  # ...and that was its last step
++    assert hold.wind_down_reason == WIND_DOWN_UPDATE_PAUSE and not hold.stopped_for_update
++    assert requeue_update_paused_review(_agent(), hold, "key", {"review_memory": True}, 3) is False
++    assert queue.pending_count() == 0
++
++
++def test_a_running_tool_is_not_cut_the_interrupt_waits_for_it(root, fence, fast):
++    from agent import update_pause_cancel
++
++    hold = fence.begin_background_review()
++    fork = _Fork()
++    vars(fork)[update_pause_cancel._IN_FLIGHT] = {"call_1": time.monotonic()}  # skill_manage is writing
++    hold.review_agent = fork
++    try:
++        _ask_turns_to_pause(root)
++        assert not fork.interrupted.wait(1.0), "interrupted while a tool was running"
++        assert hold.wind_down.is_set()  # it still stops at the boundary after the tool
++        vars(fork)[update_pause_cancel._IN_FLIGHT] = {}
++        assert fork.interrupted.wait(5), "the interrupt never followed once the tool returned"
++    finally:
++        fence.end_background_review(hold)
++
++
++def test_a_review_stuck_in_a_call_is_released_requeued_and_carried_end_to_end(root, fence, queue, fast,
++                                                                               monkeypatch):
++    """Through the real spawner: the provider call never returns on its own; the update's pause interrupts it."""
++    from agent import background_review, review_update_carry
++
++    agent = _spawning_agent()
++    in_call, done = threading.Event(), threading.Event()
++
++    class _BlockedFork(_Fork):
++        def hard_interrupt(self, message=None, *, tool_reason=None):
++            super().hard_interrupt(message, tool_reason=tool_reason)
++
++    fork = _BlockedFork()
++
++    def _target():
++        try:
++            agent._background_review_run.retirement_hold.review_agent = fork  # what _run_review_fork links
++            in_call.set()
++            assert fork.interrupted.wait(30), "the long call was never interrupted"
++        finally:
++            done.set()
++
++    monkeypatch.setattr(background_review, "spawn_background_review_thread", lambda *a, **k: (_target, "prompt"))
++    before = set(threading.enumerate())
++    agent._spawn_background_review_now(messages_snapshot=[{"role": "user", "content": "hi"}], review_memory=True)
++    (thread,) = [t for t in threading.enumerate() if t not in before and t.name == "bg-review"]
++    assert in_call.wait(10)
++    assert admission_fence.state(root)["reservations"] == 1
++    _ask_turns_to_pause(root)
++    thread.join(timeout=30)
++    assert not thread.is_alive()
++    assert admission_fence.state(root)["reservations"] == 0
++    assert queue._pending["20000101_000000_d36eab"].kwargs["_requeue_attempts"] == 1
++    assert review_update_carry.take(agent) == {"review_memory": True, "review_skills": False}
++
++
++# --- requeue survives the update's restart -------------------------------------------------------------------
++
++
++def test_a_fork_sharing_the_session_does_not_take_the_carried_review(root):
++    """Review, /btw and plugin forks share the session id; only the session's own agent runs the owed review."""
++    from agent import review_update_carry as carry
++    from agent.turn_finalizer import _mirror_turn_to_memory
++
++    fork = MagicMock(session_id="20000101_000000_d36eab", skip_background_review=False, _persist_disabled=True,
++                     _delegate_depth=0)
++    carry.record(fork, {"review_memory": True})
++    _mirror_turn_to_memory(fork, original_user_message="btw?", final_response="answer", interrupted=False,
++                           messages=[], review_memory=False, review_skills=False, vetoed=False)
++    fork._spawn_background_review.assert_not_called()
++    child = MagicMock(session_id="20000101_000000_d36eab", skip_background_review=False, _persist_disabled=False,
++                      _delegate_depth=1)
++    _mirror_turn_to_memory(child, original_user_message="sub", final_response="done", interrupted=False,
++                           messages=[], review_memory=False, review_skills=False, vetoed=False)
++    child._spawn_background_review.assert_not_called()
++    assert carry.take(fork) == {"review_memory": True, "review_skills": False}  # still owed to the session
++
++
++def test_only_one_taker_gets_a_carried_review(root):
++    from agent import review_update_carry as carry
++
++    agent = _agent()
++    carry.record(agent, {"review_memory": True})
++    results = []
++    threads = [threading.Thread(target=lambda: results.append(carry.take(agent))) for _ in range(8)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert sum(r is not None for r in results) == 1
++    assert not list(carry._path(agent.session_id).parent.glob(".*"))  # no claim or temp file left
++
++
++def test_stale_records_are_pruned_when_a_new_one_is_written(root):
++    import os as _os
++    from agent import review_update_carry as carry
++
++    old = _agent("old-session")
++    carry.record(old, {"review_memory": True})
++    path = carry._path(old.session_id)
++    stale = time.time() - carry.MAX_AGE_S - 10
++    _os.utime(path, (stale, stale))
++    carry.record(_agent("new-session"), {"review_memory": True})
++    assert not path.exists()
++
++
++def _agent(session_id="20000101_000000_d36eab"):
++    return SimpleNamespace(session_id=session_id)
++
++
++def test_carry_record_round_trips_once(root):
++    from agent import review_update_carry as carry
++
++    agent = _agent()
++    assert carry.take(agent) is None
++    assert carry.record(agent, {"review_memory": True, "review_skills": False}) is True
++    assert carry.take(agent) == {"review_memory": True, "review_skills": False}
++    assert carry.take(agent) is None  # taken once
++
++
++def test_carry_is_per_session_and_skips_refine_reviews(root):
++    from agent import review_update_carry as carry
++
++    carry.record(_agent("a"), {"review_skills": True})
++    assert carry.take(_agent("b")) is None
++    assert carry.take(_agent("a")) == {"review_memory": False, "review_skills": True}
++    assert carry.record(_agent("a"), {"review_skills": True, "focus": "tidy skills"}) is False
++    assert carry.record(_agent("a"), {"review_skills": True, "explicit": True}) is False
++    assert carry.record(SimpleNamespace(session_id=None), {"review_skills": True}) is False
++
++
++def test_a_stale_or_corrupt_carry_record_is_dropped(root, monkeypatch):
++    from agent import review_update_carry as carry
++
++    agent = _agent()
++    carry.record(agent, {"review_memory": True})
++    later = time.time() + carry.MAX_AGE_S + 1
++    monkeypatch.setattr(carry.time, "time", lambda: later)
++    assert carry.take(agent) is None
++    monkeypatch.undo()
++    carry._path(agent.session_id).parent.mkdir(parents=True, exist_ok=True)
++    carry._path(agent.session_id).write_text("{not json")
++    assert carry.take(agent) is None
++    assert not carry._path(agent.session_id).exists()
++
++
++def test_carry_clear_removes_the_record(root):
++    from agent import review_update_carry as carry
++
++    agent = _agent()
++    carry.record(agent, {"review_memory": True})
++    carry.clear(agent)
++    assert carry.take(agent) is None
++
++
++def test_an_update_paused_requeue_is_also_carried_to_disk(root, queue):
++    from agent import review_update_carry as carry
++    from agent.review_idle_queue import requeue_update_paused_review
++
++    hold = SimpleNamespace(wind_down_reason=WIND_DOWN_UPDATE_PAUSE, stopped_for_update=True)
++    agent = _agent()
++    assert requeue_update_paused_review(agent, hold, "key", {"review_memory": True, "_requeue_attempts": 1}, 3)
++    assert queue.pending_count() == 1
++    assert carry.take(agent) == {"review_memory": True, "review_skills": False}
++
++
++def test_the_sessions_next_finished_turn_runs_the_carried_review(root):
++    from agent import review_update_carry as carry
++    from agent.turn_finalizer import _mirror_turn_to_memory
++
++    agent = MagicMock(session_id="20000101_000000_d36eab", skip_background_review=False, _persist_disabled=False,
++                      _delegate_depth=0)
++    carry.record(agent, {"review_memory": True, "review_skills": True})
++    _mirror_turn_to_memory(agent, original_user_message="hi", final_response="done", interrupted=False,
++                           messages=[{"role": "user", "content": "hi"}], review_memory=False, review_skills=False,
++                           vetoed=False)
++    agent._spawn_background_review.assert_called_once()
++    kwargs = agent._spawn_background_review.call_args.kwargs
++    assert kwargs["review_memory"] is True and kwargs["review_skills"] is True
++    assert carry.take(agent) is None
++
++
++def test_an_interrupted_turn_keeps_the_carried_review_for_a_later_turn(root):
++    from agent import review_update_carry as carry
++    from agent.turn_finalizer import _mirror_turn_to_memory
++
++    agent = MagicMock(session_id="s1", skip_background_review=False, _persist_disabled=False, _delegate_depth=0)
++    carry.record(agent, {"review_memory": True})
++    _mirror_turn_to_memory(agent, original_user_message="hi", final_response="", interrupted=True,
++                           messages=[], review_memory=False, review_skills=False, vetoed=False)
++    agent._spawn_background_review.assert_not_called()
++    assert carry.take(agent) == {"review_memory": True, "review_skills": False}
++
++
++# --- a review refused by the update hold is queued, not dropped ------------------------------------------------
++
++
++def _spawning_agent(session_id="20000101_000000_d36eab"):
++    from run_agent import AIAgent
++
++    agent = MagicMock()
++    agent.session_id = session_id
++    agent._background_review_lock = threading.Lock()
++    agent._background_review_run = None
++    agent._REVIEW_REQUEUE_MAX_ATTEMPTS = AIAgent._REVIEW_REQUEUE_MAX_ATTEMPTS
++    agent._spawn_background_review_now = AIAgent._spawn_background_review_now.__get__(agent)
++    return agent
++
++
++def test_a_review_spawned_under_the_update_hold_is_queued_and_carried(root, fence, queue):
++    from agent import review_update_carry as carry
++
++    _ask_turns_to_pause(root)
++    agent = _spawning_agent()
++    agent._spawn_background_review_now(messages_snapshot=[{"role": "user", "content": "hi"}], review_memory=True)
++    assert admission_fence.state(root)["reservations"] == 0
++    pending = queue._pending["20000101_000000_d36eab"]
++    assert pending.kwargs["review_memory"] is True and pending.kwargs["_requeue_attempts"] == 1
++    assert carry.take(agent) == {"review_memory": True, "review_skills": False}
++
++
++def test_a_review_out_of_attempts_under_the_hold_is_dropped(root, fence, queue):
++    _ask_turns_to_pause(root)
++    agent = _spawning_agent()
++    agent._spawn_background_review_now(messages_snapshot=[], review_memory=True,
++                                       _requeue_attempts=agent._REVIEW_REQUEUE_MAX_ATTEMPTS)
++    assert queue.pending_count() == 0
++
++
++def test_a_retiring_backend_still_skips_the_review(root, fence, queue, monkeypatch):
++    monkeypatch.setattr(fence, "retiring", lambda: True)
++    _ask_turns_to_pause(root)
++    agent = _spawning_agent()
++    agent._spawn_background_review_now(messages_snapshot=[], review_memory=True)
++    assert queue.pending_count() == 0
+diff --git a/tests/hermes_cli/test_background_review_update_pause.py b/tests/hermes_cli/test_background_review_update_pause.py
+index 14611c2dae..0cd422ea19 100644
+--- a/tests/hermes_cli/test_background_review_update_pause.py
++++ b/tests/hermes_cli/test_background_review_update_pause.py
+@@ -4,8 +4,9 @@ A review holds an admission reservation for its whole run, and hermes-sync's dra
+ worker reclaim only once no reservation is held. The review used to ignore the window's pause request
+ (its only stop signal was process retirement, after 300 s), so one long review outlasted the drain's
+ 3-minute claim hold and the update gave up (laptop-1 2026-11-13 05:25, incident 51354-1794576303896).
+-Now the review reads the request at every step boundary: it stops before its next provider call (never
+-mid-call), releases the reservation and is requeued to run after the update.
++Now the review reads the request at every step boundary: it stops before its next provider call, releases the
++reservation and is requeued to run after the update. A call still in flight once the request has stood
++``REVIEW_UPDATE_PAUSE_GRACE_S`` is interrupted by the review's watcher (test_background_review_update_interrupt.py).
+ """
+ from __future__ import annotations
+ 
+@@ -170,7 +171,7 @@ def test_gateway_review_winds_down_releases_its_reservation_and_is_requeued(root
+     assert in_call.wait(30)  # provider call #1 is in flight
+     assert admission_fence.state(root, details=True)["reservations"] == 1
+     _drain_asks_turns_to_pause(root)
+-    assert admission_fence.state(root)["reservations"] == 1  # never cut mid-call: the claim stands until it returns
++    assert admission_fence.state(root)["reservations"] == 1  # inside the grace the call is not cut: the claim stands
+     finish_call.set()
+     _join(thread)
+     assert len(calls) == 1  # it stopped at the boundary: provider call #2 never started
+-- 
+2.43.0
+

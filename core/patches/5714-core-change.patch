@@ -1,0 +1,523 @@
+From d542a122262c6d7fc361296c435f41b06a6a62f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:09:42 +0000
+Subject: [PATCH] perf(metrics): answer the sync report's run census from kept
+ board readers [daveey]
+
+The sync loop's metrics report called active_card_runs every 10 s, which opens
+a fresh read-only connection per board and parses each board's schema before
+its first statement. On the idle Mac gateway (10 boards) that was the report
+step's cost: 0.257 s of CPU over 12 reports in a 120 s window, 2.28 ms per
+sync round.
+
+The loop's Reporter now reads the census through the BoardWatch readers the
+loop already keeps for outbox_pending, and reuses a board's running rows while
+that reader's data_version is unchanged. Pool counts are recomputed each call.
+Admission, grant-echo exclusion, owner output and every other collect() caller
+keep the fresh per-call read. A board the one-statement read cannot decide, or
+that the kept reader cannot open, falls back to active_card_runs.
+
+BoardWatch stores one answer per (path, tag), so the census and the outbox
+probe do not evict each other.
+
+10-board Linux fixture, 30 warmed calls: due report 23.5 ms -> 2.2 ms.
+---
+ hermes_cli/kanban_sync_board_watch.py         |  30 +-
+ hermes_cli/kanban_sync_client.py              |   2 +
+ hermes_cli/machine_metrics.py                 |  14 +-
+ hermes_cli/machine_report_census.py           |  72 +++++
+ .../hermes_cli/test_machine_report_census.py  | 277 ++++++++++++++++++
+ 5 files changed, 384 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/machine_report_census.py
+ create mode 100644 tests/hermes_cli/test_machine_report_census.py
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 487ca38f0e..05b92eb415 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -5,7 +5,7 @@ import os
+ import sqlite3
+ import threading
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any, Callable, Optional
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ 
+@@ -42,7 +42,7 @@ class BoardWatch:
+         self._lock = threading.Lock()
+         self._conns: dict[str, tuple[tuple[int, int, int, int], sqlite3.Connection, int]] = {}
+         self._gen = 0
+-        self._answers: dict[str, tuple[int, str, Any]] = {}
++        self._answers: dict[str, dict[str, tuple[Any, Any]]] = {}  # path -> tag -> (data_version, answer)
+ 
+     def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
+         # Keep the requested spelling (including symlink/.. semantics). stat
+@@ -90,25 +90,37 @@ class BoardWatch:
+ 
+     def query(self, path: Path, sql: str, *, unchanged_ok: bool = False) -> Optional[tuple[int, Any]]:
+         """(generation, first row) or None when the file cannot be read."""
++        return self.read(path, sql, lambda conn: conn.execute(sql).fetchone(), unchanged_ok=unchanged_ok)
++
++    def read(self, path: Path, tag: str, compute: Callable[[sqlite3.Connection], Any], *,
++             unchanged_ok: bool = False) -> Optional[tuple[int, Any]]:
++        """(generation, ``compute(conn)``) on the kept connection, or None when the file cannot be read.
++
++        ``unchanged_ok``: the answer stored under *tag* is reused while this connection's ``data_version`` has
++        not moved (no other connection committed) and the kept reader was not reopened. Each tag has its own
++        answer, so two questions about one board never evict each other. ``compute`` must be a pure function
++        of the database content (no clock, config or process state) and must leave no transaction open: it
++        runs under the watch lock on a connection other readers share. A SQLite error drops the reader and
++        every answer for the path; any other exception propagates and stores nothing."""
+         with self._lock:
++            key = str(Path(path).absolute())
+             try:
+                 got = self._conn(path)
+                 if got is None:
+                     return None
+                 conn, gen = got
+-                key = str(Path(path).absolute())
+                 version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
+-                cached = self._answers.get(key)
+-                if unchanged_ok and cached is not None and cached[:2] == (version, sql):
+-                    return gen, cached[2]
+-                answer = conn.execute(sql).fetchone()
++                cached = self._answers.get(key, {}).get(tag)
++                if unchanged_ok and cached is not None and cached[0] == version:
++                    return gen, cached[1]
++                answer = compute(conn)
+                 if unchanged_ok:
+                     # Version is read BEFORE the query: a concurrent commit may cause
+                     # one extra read, but cannot publish a stale answer as current.
+-                    self._answers[key] = (version, sql, answer)
++                    self._answers.setdefault(key, {})[tag] = (version, answer)
+                 return gen, answer
+             except sqlite3.Error:
+-                self._drop(str(Path(path).absolute()))
++                self._drop(key)
+                 return None
+ 
+     def release_gone(self) -> int:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 7f67787411..6b95f2c35f 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1506,6 +1506,8 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     links = _LINKS_RUNNER = LinksPass(ident.gateway)
+     from hermes_cli.machine_metrics import Reporter
+     metrics = Reporter(hub.report_metrics)
++    from hermes_cli.machine_report_census import census  # unchanged boards are not re-read per report [daveey]
++    metrics.census_fn = census(_WATCH)
+     # Hub CPU advisory: measured on its own thread, so a slow sync round can neither void nor delay it. [daveey]
+     from hermes_cli.machine_cpu_sampler import AdvisorySampler
+     sampler = AdvisorySampler()
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index e2a9aeb9c0..a95ae28a55 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -211,6 +211,11 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+         return None
+ 
+ 
++# The sync loop's Reporter names its census (machine_report_census: kept readers, reused while a board's
++# data_version is unchanged) for the collect() it runs on this thread; every other caller reads fresh connections.
++_REPORT = threading.local()
++
++
+ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}`` plus the throughput counters
+     (``machine_throughput_metrics``); a value that cannot be read is left out."""
+@@ -231,7 +236,7 @@ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+         except Exception:  # health: allow BLE001 -- malformed worker observations must report unknown capacity
+             out = {"active_card_runs": None}
+     else:
+-        out = machine_admission_metrics.collect(active_card_runs)
++        out = machine_admission_metrics.collect(getattr(_REPORT, "census", None) or active_card_runs)
+     from hermes_cli import machine_persistent_jobs
+     out.update(machine_persistent_jobs.collect())
+     out.update(machine_drain_metrics.collect())
+@@ -314,6 +319,7 @@ class Reporter:
+         self.cpu_wait_fn: Optional[Callable[[float], Any]] = None
+         self.sent_at: Optional[float] = None  # the latest report actually sent (either path)
+         self.suppressed = 0  # CPU-less reports withheld while the gate was on
++        self.census_fn: Optional[Callable[..., Optional[int]]] = None  # the loop's kept-reader census, else fresh
+ 
+     def _sample(self, sample: dict, measured: Optional[dict]) -> dict:
+         from hermes_cli import kanban_sync_timing as timing
+@@ -375,7 +381,11 @@ class Reporter:
+             from hermes_cli import machine_cpu_metrics as cpu
+             from hermes_cli.machine_drain_metrics import send_compatible
+             with timing.span("collect"):
+-                sample = dict((self.collect_fn or collect)())
++                _REPORT.census = self.census_fn
++                try:
++                    sample = dict((self.collect_fn or collect)())
++                finally:
++                    _REPORT.census = None
+             with timing.span("limit"):
+                 state, limit = (self.cpu_limit_fn or cpu.root_limit)()
+             measured = None
+diff --git a/hermes_cli/machine_report_census.py b/hermes_cli/machine_report_census.py
+new file mode 100644
+index 0000000000..2fa5e68f8a
+--- /dev/null
++++ b/hermes_cli/machine_report_census.py
+@@ -0,0 +1,72 @@
++"""The metrics report's census of running card runs, on the sync loop's kept board readers. [daveey]
++
++``machine_metrics.active_card_runs`` opens a fresh read-only connection per board on every call, and each fresh
++connection parses that board's whole schema before its first statement. The sync loop's report runs it every
++``REPORT_EVERY_S``: on a 10-board host that was the report's whole cost (a laptop during the observation window, idle gateway:
++``sync.step/...kanban_sync_timing.report`` 0.257 s of CPU over 12 reports in 120 s, 2.28 ms per sync round; a
++10-board fixture measures 23 ms per census, 22 ms of it in the first statement of the ten fresh connections).
++
++:func:`census` answers the same question from ``BoardWatch`` readers the loop already keeps open for
++``outbox_pending``. Per board it reuses the stored running rows while that reader's ``data_version`` is unchanged:
++a real change key (any other connection's commit moves it; a replaced or restored file reopens the reader), never
++a timer. The rows are a pure function of the board file (no clock, no config), and pool counts are recomputed from
++them on every call.
++
++Only the report uses this. Admission (``kanban_admission``, grant-echo exclusion, owner output, an explicit board
++inventory) keeps calling ``active_card_runs`` and its fresh per-call snapshot. Anything this reader cannot answer
++exactly the way that function's one-statement path does (a pre-receipt schema, no JSON1, lease holders without
++sync state, a board that cannot be read) falls back to ``active_card_runs`` for the whole census, so such hosts
++report exactly what they did before.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Callable, Optional
++
++TAG = "machine_report_census.running_rows"
++
++
++def census(watch: Any, fallback: Optional[Callable[..., Optional[int]]] = None) -> Callable[..., Optional[int]]:
++    """``count(detail=None)`` for ``machine_admission_metrics.collect``, reading through *watch*."""
++
++    def count(detail: Optional[dict] = None) -> Optional[int]:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli import machine_metrics as mm
++        from hermes_cli.kanban_db_boards import named_board_db_files
++
++        uncached = fallback or mm.active_card_runs
++        try:
++            default = kb.kanban_home() / "kanban.db"
++            total = 0
++            receipts: list = []
++            seen = set()
++            for path in (default, *(p for _, p in named_board_db_files())):
++                try:
++                    stat = path.stat()
++                except FileNotFoundError:
++                    if path == default:
++                        continue  # a never-created default board holds no runs
++                    raise  # a vanished named board invalidates the sample, as in active_card_runs
++                identity = (stat.st_dev, stat.st_ino)
++                if identity in seen:
++                    continue
++                seen.add(identity)
++                got = watch.read(path, TAG, mm._running_rows, unchanged_ok=True)
++                if got is None or got[1] is None:
++                    return uncached(detail=detail)  # unreadable here, or a schema the long path must decide
++                synced, own_id, rows = got[1]
++                if synced and not own_id:
++                    return None
++                total += len(rows)
++                receipts.extend(row[1:] for row in rows)
++            if detail is not None:
++                if "pools" in detail:
++                    from hermes_cli.kanban_admission_pools import count_pools
++                    for pool, n in count_pools(receipts, origins=detail.get("capacity_origins")).items():
++                        detail["pools"][pool] += n
++                detail["excluded"] = 0
++            return total
++        except (OSError, sqlite3.Error, ValueError):
++            return None
++
++    return count
+diff --git a/tests/hermes_cli/test_machine_report_census.py b/tests/hermes_cli/test_machine_report_census.py
+new file mode 100644
+index 0000000000..e2edb22d73
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_report_census.py
+@@ -0,0 +1,277 @@
++"""The sync loop's report census reuses unchanged boards and still reports what a fresh read reports."""
++import os
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_db_boards
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import machine_metrics as mm
++from hermes_cli import machine_report_census as census
++from hermes_cli.kanban_sync_board_watch import BoardWatch
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def host(tmp_path, monkeypatch):
++    """A synced default board and two named boards; yields ({slug: path}, run(slug) -> task id)."""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    paths = {"default": home / "kanban.db"}
++    for slug in ("one", "two"):
++        kanban_db_boards.create_board(slug)
++        paths[slug] = kanban_db.kanban_db_path(board=slug)
++    for slug, path in paths.items():
++        conn = kbc.connect(path)
++        client.ensure_identity(conn, slug, "fixture")
++        sync.set_mode(conn, "primary")
++        conn.close()
++
++    def run(slug, status="running"):
++        conn = kbc.connect(paths[slug])
++        try:
++            task = kanban_db.create_task(conn, title="t", assignee="default")
++            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task))
++            conn.commit()
++            return task
++        finally:
++            conn.close()
++
++    watch = BoardWatch()
++    try:
++        yield paths, run, watch
++    finally:
++        watch.reset()
++        client.reset_board_watch()
++
++
++def both(watch):
++    """(kept-reader answer, fresh-connection answer), each as (count, pools)."""
++    out = []
++    for count in (census.census(watch), mm.active_card_runs):
++        detail = {"pools": {"regular": 0, "priority": 0}}
++        out.append((count(detail=detail), detail))
++    return out
++
++
++def reads(monkeypatch):
++    seen = []
++    original = mm._running_rows
++
++    def counted(db):
++        seen.append(db)
++        return original(db)
++
++    monkeypatch.setattr(mm, "_running_rows", counted)
++    return seen
++
++
++def test_census_equals_a_fresh_read_and_follows_other_connections_writes(host):
++    paths, run, watch = host
++    kept, fresh = both(watch)
++    assert kept == fresh and kept[0] == 0
++    run("default")
++    run("one")
++    run("two", status="ready")
++    kept, fresh = both(watch)
++    assert kept == fresh and kept[0] == 2
++    done = run("two")
++    assert both(watch)[0][0] == 3
++    conn = kbc.connect(paths["two"])
++    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
++    conn.commit()
++    conn.close()
++    kept, fresh = both(watch)
++    assert kept == fresh and kept[0] == 2
++
++
++def test_unchanged_boards_are_not_read_again_and_one_write_rereads_one_board(host, monkeypatch):
++    _paths, run, watch = host
++    run("one")
++    count = census.census(watch)
++    assert count() == 1
++    seen = reads(monkeypatch)
++    assert count() == 1 and count() == 1
++    assert seen == []  # no board changed: no statement over tasks
++    run("two")
++    assert count() == 2
++    assert len(seen) == 1
++    assert count() == 2 and len(seen) == 1
++
++
++def test_the_census_opens_no_connection_once_its_readers_are_kept(host, monkeypatch):
++    _paths, _run, watch = host
++    count = census.census(watch)
++    assert count() == 0
++    opened = []
++    original = sqlite3.connect
++    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: opened.append(a) or original(*a, **k))
++    assert count() == 0
++    assert opened == []
++
++
++def test_a_replaced_board_file_is_read_again(host, monkeypatch):
++    paths, run, watch = host
++    run("one")
++    count = census.census(watch)
++    assert count() == 1
++    conn = kbc.connect(paths["one"])
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    conn.close()
++    copy = paths["one"].with_name("copy.db")
++    copy.write_bytes(paths["one"].read_bytes())
++    edit = sqlite3.connect(copy)
++    edit.execute("UPDATE tasks SET status = 'done'")
++    edit.commit()
++    edit.close()
++    os.replace(copy, paths["one"])
++    kept, fresh = both(watch)
++    assert kept == fresh and kept[0] == 0
++
++
++def test_a_schema_the_one_statement_read_cannot_decide_uses_the_fresh_census(host, monkeypatch):
++    paths, _run, watch = host
++    old = paths["one"].parent.parent / "old" / "kanban.db"
++    old.parent.mkdir()
++    db = sqlite3.connect(old)
++    db.executescript("CREATE TABLE tasks (id TEXT, status TEXT); INSERT INTO tasks VALUES ('a','running'),('b','ready');")
++    db.commit()
++    db.close()
++    calls = []
++    original = mm.active_card_runs
++
++    def fallback(**kwargs):
++        calls.append(kwargs)
++        return original(**kwargs)
++
++    count = census.census(watch, fallback)
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    assert count() == original() == 1
++    assert count(detail=detail) == original(detail={"pools": {"regular": 0, "priority": 0}})
++    assert len(calls) == 2 and calls[1]["detail"] is detail
++
++
++def test_an_unreadable_board_uses_the_fresh_census(host, monkeypatch):
++    _paths, _run, watch = host
++    monkeypatch.setattr(watch, "read", lambda *a, **k: None)
++    calls = []
++    assert census.census(watch, lambda detail=None: calls.append(detail) or 7)() == 7
++    assert calls == [None]
++
++
++def test_a_vanished_named_board_is_unknown_and_an_absent_default_board_is_empty(host, monkeypatch):
++    paths, run, watch = host
++    run("one")
++    count = census.census(watch)
++    paths["default"].unlink()
++    for suffix in ("-wal", "-shm"):
++        paths["default"].with_name("kanban.db" + suffix).unlink(missing_ok=True)
++    assert count() == mm.active_card_runs() == 1
++    from hermes_cli import kanban_db_boards as boards
++    gone = paths["two"].with_name("gone.db")
++    monkeypatch.setattr(boards, "named_board_db_files", lambda: [("gone", gone)])
++    assert count() is None and mm.active_card_runs() is None
++
++
++def test_a_synced_board_without_its_own_gateway_id_is_unknown(host):
++    paths, _run, watch = host
++    conn = kbc.connect(paths["two"])
++    conn.execute("UPDATE kanban_sync_state SET gateway_id = ''")
++    conn.commit()
++    conn.close()
++    kept, fresh = both(watch)
++    assert kept[0] is None and fresh[0] is None
++
++
++def test_two_questions_about_one_board_keep_separate_answers(host):
++    paths, run, watch = host
++    path = paths["default"]
++    sql = "SELECT count(*) FROM tasks"
++    computed = []
++
++    def rows(conn):
++        computed.append(1)
++        return conn.execute("SELECT count(*) FROM tasks WHERE status = 'running'").fetchone()[0]
++
++    for _ in range(3):
++        assert watch.query(path, sql, unchanged_ok=True)[1][0] == 0
++        assert watch.read(path, "t", rows, unchanged_ok=True)[1] == 0
++    assert computed == [1]
++    run("default")
++    assert watch.read(path, "t", rows, unchanged_ok=True)[1] == 1
++    assert watch.query(path, sql, unchanged_ok=True)[1][0] == 1
++    assert watch.read(path, "t", rows, unchanged_ok=True)[1] == 1
++    assert computed == [1, 1]
++
++
++def test_a_compute_error_stores_nothing_and_keeps_the_reader(host):
++    paths, _run, watch = host
++    path = paths["default"]
++
++    def broken(conn):
++        raise ValueError("not sqlite")
++
++    with pytest.raises(ValueError):
++        watch.read(path, "t", broken, unchanged_ok=True)
++    assert watch.read(path, "t", lambda conn: 5, unchanged_ok=True)[1] == 5
++
++
++def test_only_the_reporters_own_collect_uses_the_kept_census(host, monkeypatch):
++    """Admission and every other collect() caller keep the fresh per-call read."""
++    _paths, _run, _watch = host
++    used = []
++    monkeypatch.setattr(mm, "active_card_runs", lambda **kw: used.append("fresh") or 0)
++    sent = []
++    reporter = mm.Reporter(sent.append, clock=lambda: 1000.0)
++    reporter.census_fn = lambda **kw: used.append("kept") or 4
++    assert reporter.report_due()
++    assert used == ["kept"] and sent[0]["active_card_runs"] == 4
++    assert getattr(mm._REPORT, "census", None) is None
++    assert mm.collect()["active_card_runs"] == 0
++    assert used == ["kept", "fresh"]
++
++
++def test_a_failed_report_collect_does_not_leave_the_kept_census_installed(host, monkeypatch):
++    _paths, _run, _watch = host
++
++    def boom():
++        assert mm._REPORT.census is not None
++        raise OSError("disk")
++
++    reporter = mm.Reporter(lambda sample: None, collect_fn=boom, clock=lambda: 1000.0)
++    reporter.census_fn = lambda **kw: 4
++    try:
++        reporter.report_due()
++    except OSError:
++        pass
++    assert getattr(mm._REPORT, "census", None) is None
++
++
++def test_the_sync_loop_gives_its_reporter_the_kept_census(monkeypatch):
++    from types import SimpleNamespace
++    from unittest.mock import Mock
++    from hermes_cli import kanban_sync_links_pass, kanban_sync_schema_alert, machine_cpu_sampler, machine_metrics_sender
++
++    made = []
++
++    def reporter(*args):
++        made.append(Mock())
++        return made[-1]
++
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="test", url="unused"))
++    monkeypatch.setattr(client, "Hub", lambda ident: Mock())
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(kanban_sync_schema_alert, "note_start", lambda: None)
++    monkeypatch.setattr(kanban_sync_links_pass, "LinksPass", lambda gateway: Mock())
++    monkeypatch.setattr(mm, "Reporter", reporter)
++    monkeypatch.setattr(machine_cpu_sampler, "AdvisorySampler", Mock)
++    monkeypatch.setattr(machine_metrics_sender, "MetricsSender", lambda *a: Mock())
++    monkeypatch.setattr(machine_metrics_sender, "board_post", lambda ident: None)
++    client._run_forever(lambda: False, 1, Mock())
++    assert len(made) == 1
++    assert made[0].census_fn.__qualname__ == census.census(client._WATCH).__qualname__
++    assert made[0].census_fn.__closure__ is not None
++    assert client._WATCH in [cell.cell_contents for cell in made[0].census_fn.__closure__]
+-- 
+2.43.0
+

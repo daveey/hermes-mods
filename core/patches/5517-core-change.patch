@@ -1,0 +1,586 @@
+From c1e3435d050646eb89911a013eada78fe8b0e308 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:01:09 +0000
+Subject: [PATCH] fix(kanban): order materialized parents ahead of dependent
+ retries [daveey]
+
+Review6005624020: one synthetic-parent refusal inserted a task at the FIFO tail; global synthesis suppression then sent child,parent forever against a healthy Board. Keep existing parent ownership and immutable uncertain identities, but promote that queued parent and hold dependents through backoff/quarantine and pre-head filtering. Apply limits after filtering so unrelated cards progress. Independent probes reproduce 4 failures/8 passes on66bf8e and12/12 pass after. Additional dependency and containment rekey controls pass;832 consumer tests and21 package checks pass. Full CI and exact-head review remain required; final-collection replay remains OPEN.
+---
+ docs/designs/kanban-frozen-replay.md          |  12 +-
+ hermes_cli/kanban_sync_client.py              |   7 +-
+ hermes_cli/kanban_sync_parent_order.py        |  54 +++++
+ hermes_cli/kanban_sync_quarantine.py          |  20 +-
+ tests/hermes_cli/test_kanban_sync_envelope.py |  28 +++
+ .../test_kanban_sync_parent_order.py          |  59 +++++
+ tests/hermes_cli/test_sync_parent_review3.py  | 215 ++++++++++++++++++
+ tests/hermes_cli/test_sync_parent_review5.py  |  86 +++++++
+ 8 files changed, 467 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_parent_order.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_parent_order.py
+ create mode 100644 tests/hermes_cli/test_sync_parent_review3.py
+ create mode 100644 tests/hermes_cli/test_sync_parent_review5.py
+
+diff --git a/docs/designs/kanban-frozen-replay.md b/docs/designs/kanban-frozen-replay.md
+index 19b73298fb..d3b73b1931 100644
+--- a/docs/designs/kanban-frozen-replay.md
++++ b/docs/designs/kanban-frozen-replay.md
+@@ -10,7 +10,7 @@ The serving clock is max-merged into durable hlc_last in the envelope transactio
+ 
+ `status_origin` is op-level, not a writable task column: empty string means no terminal/reopen at intent capture; event UID means newest lifecycle event at capture; NULL/missing is legacy/unknown. It is bound before the outer capture transaction commits, including its own row-before-event transition evidence. Multiple status intents in one transaction, untracked autocommit and historical records are not upgraded by guessing. Connection-local temp tracking rolls back with real SQLite savepoints. One bounded current-status descriptor/task supports synthetic parents and is invalidated by status mutation/deletion on any connection and on trigger detach/reinstall.
+ 
+-Unseen-task first-send enrichment is a full CURRENT row. Keep its current status with the current status's persisted capture descriptor (including a status equality check); never splice an old delta status into new metadata and never use merely the latest event at send. Seen-task deltas retain their own captured association. Already frozen uncertain snapshots are unchanged even after newer local edits. Explicit definitive schema/transient refusal may produce a new identity through existing bounded remap; carry status_origin into each replacement INSERT. Permanent synthetic-parent refusals neither create diagnostic fanout nor poison later synthesis with a cached refusal. A materialized retry in backoff suppresses competing parent synthesis.
++Unseen-task first-send enrichment is a full CURRENT row. Keep its current status with the current status's persisted capture descriptor (including a status equality check); never splice an old delta status into new metadata and never use merely the latest event at send. Seen-task deltas retain their own captured association. Already frozen uncertain snapshots are unchanged even after newer local edits. Explicit definitive schema/transient refusal may produce a new identity through existing bounded remap; carry status_origin into each replacement INSERT. Permanent synthetic-parent refusals neither create diagnostic fanout nor poison later synthesis with a cached refusal. A materialized retry in backoff suppresses competing parent synthesis. Existing pending task envelopes are selected before their unacknowledged dependents, even when their durable FIFO timestamp is later or outside the original batch. Backoff/quarantine holds dependents without consuming their attempt budget, but selection scans onward for unrelated work before applying the batch limit. The pre-feed-head filter is reapplied as a dependency constraint: it must not leave a child eligible when it removed that child's promoted parent.
+ 
+ ## Evidenced why-chain
+ 
+@@ -27,6 +27,16 @@ Broad CI of native head4de59d3a then caught shared-transaction integration regre
+ 
+ The next broad run at0dc03e exposed the same family at a different entry: standalone `SYNC_SCHEMA_SQL` consumers intentionally have no `tasks` table, so the identity-cleanup CREATE TRIGGER failed at schema boot. Three unchanged drain consumer files reproduced RED, and a fresh/repeated standalone-schema regression failed before repair. The task-specific trigger now lives in `wanted_triggers`, where application tables exist; FK cleanup and identity revocation remain unchanged. Six-file validation including all three drain consumers, origin capture/repairs and native identity replacement passes51 tests (`core-schema-green2.log`). This extends integration coverage rather than modifying the drain fixtures to hide the dependency.
+ 
++## Parent retry regression (review6005624020)
++
++Problem: on unchanged66bf8e, one synthetic-parent storage refusal leaves its task/comment/event rejected after20 attempts even after the Board is healthy. The reviewer's unchanged probes reproduce4 failures/8 passes: both capability modes fail permanent-delivery and beyond-batch parent-order controls (`parent-review-red.log`).
++
++Why1: a child reaches the Board before its unacknowledged parent, poisoning that card's remaining request ops through `depends_on_rejected`.
++Why2: a refused synthetic parent is materialized at the FIFO tail, but a global pending-parent check prevents any new synthesis; both retries then share backoff and retain child-before-parent order.
++Root(happened): suppressing duplicate producers did not enforce the corresponding materialized-parent dependency. Root(not caught): earlier hubs accepted a parent after rejecting its child, unlike real Board request-order semantics. Recurrence: this corrects the earlier bounded-row-growth countermeasure; it does not revert its one-parent ownership rule.
++
++Countermeasures/proof: select the oldest existing pending parent before dependents without mutating identity, timestamps or frozen bytes; defer children while parent is in backoff/held; scan past that prefix before limiting; retain pre-feed-head dependency filtering. Unchanged reviewer probes now pass12/12, including peak-one-parent inventory and cached permanent-refusal recovery (`parent-review-green.log`). Additional three dependency selection controls and containment rekey test pass (`parent-final2-green.log`). The containment test freezes a seen-row request, strips lifecycle fields with a new identity, and proves next-send stored/wire identity matches the replacement, never old frozen bytes. That is not proof for every unacknowledged full-snapshot/containment combination. Explicitly rejected ops may remap because the server caches their definitive refusal; no-charge byte-preservation applies to uncertain sends, not explicit rejects.
++
+ ## Coverage boundaries
+ 
+ - Pre-upgrade or unbound historical uncertain sends cannot recover their original envelope or origin. Legacy ambiguity after reopen remains documented; never claim universal old-client safety.
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index dc9049d0b2..eee39cc05b 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -697,11 +697,14 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+     out, seen = PushResult(), {} if seen is None else seen
+     for _ in range(max_batches):
+-        from hermes_cli.kanban_sync_quarantine import pending_batch
+-        rows = selected = pending_batch(conn, int(time.time()), PUSH_BATCH)
++        from hermes_cli.kanban_sync_quarantine import pending_rows
++        from hermes_cli.kanban_sync_parent_order import parent_first
++        now = int(time.time())
++        rows = selected = parent_first(conn, pending_rows(conn, now), now, PUSH_BATCH)
+         stopped = False
+         if before_head:
+             rows, stopped = backlog.sendable_before_head(conn, hub, board, rows, seen)
++            rows = parent_first(conn, rows, now, PUSH_BATCH, allowed={r['op_id'] for r in rows})
+         if not rows:
+             break
+         from hermes_cli.kanban_sync_status_origin import absorb_clock, capability
+diff --git a/hermes_cli/kanban_sync_parent_order.py b/hermes_cli/kanban_sync_parent_order.py
+new file mode 100644
+index 0000000000..6a750b059e
+--- /dev/null
++++ b/hermes_cli/kanban_sync_parent_order.py
+@@ -0,0 +1,54 @@
++"""Order existing unacknowledged task envelopes before their dependent rows. [daveey]"""
++from __future__ import annotations
++
++import json
++
++
++def parent_first(conn, rows, now: int, limit: int, *, allowed: set[str] | None = None) -> list[dict]:
++    """Promote the existing FIFO parent, never synthesize a competing retry identity.
++
++    Only an unacknowledged card needs this dependency ordering. A parent's backoff
++    or quarantine also holds its children, without charging them refusal attempts.
++    Wire envelopes and the durable FIFO timestamps are not rewritten.
++    """
++    from hermes_cli.kanban_sync_quarantine import sendable
++
++    parents: dict[str, dict | None] = {}
++    out: list[dict] = []
++    included: set[str] = set()
++    for row in rows:
++        if len(out) >= limit:
++            break
++        needed = []
++        if row['table_name'] == 'task_links' and row['op'] == 'upsert':
++            needed = str(row['row_uid']).split('>', 1)
++        elif row['table_name'] != 'tasks':
++            fields = row['fields'] if isinstance(row['fields'], dict) else json.loads(row['fields'] or '{}')
++            needed = [fields.get('task_id')]
++        required = []
++        blocked = False
++        for tid in filter(None, needed):
++            if tid not in parents:
++                hit = conn.execute(
++                    "SELECT o.* FROM kanban_sync_outbox o JOIN tasks t ON t.id=o.row_uid "
++                    "WHERE o.table_name='tasks' AND o.state='pending' AND o.op!='release' "
++                    "AND t.id=? AND t.sync_version IS NULL ORDER BY o.created_at,o.rowid LIMIT 1", (tid,)).fetchone()
++                parents[tid] = dict(hit) if hit else None
++            parent = parents[tid]
++            if parent is None:
++                continue  # normal synthetic-parent path, including its omission guard
++            if ((parent['retry_after'] or 0) > now or not sendable(conn, [parent])
++                    or (allowed is not None and parent['op_id'] not in allowed)):
++                blocked = True
++                break
++            if parent['op_id'] not in included and all(p['op_id'] != parent['op_id'] for p in required):
++                required.append(parent)
++        if blocked:
++            continue
++        # Keep both link parents together with their child when possible. If the
++        # batch is full, the ordinary next round drains the remaining FIFO rows.
++        for item in required + [row]:
++            if item['op_id'] not in included and len(out) < limit:
++                out.append(item)
++                included.add(item['op_id'])
++    return out
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index e4f5e00dc3..183a2274ee 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -410,22 +410,20 @@ def _mirror(source) -> None:
+         adopt(source, dest)
+ 
+ 
+-def pending_batch(conn, now: int, limit: int) -> list[dict]:
+-    """Limit after filtering: a held FIFO prefix cannot starve another task."""
++def pending_rows(conn, now: int):
++    """Yield eligible FIFO rows so additional dependency filters precede the limit."""
+     blocked = tasks(conn)
+-    if not blocked:
+-        return [dict(r) for r in conn.execute(
+-            "SELECT * FROM kanban_sync_outbox WHERE state='pending' AND (retry_after IS NULL OR retry_after<=?) "
+-            "ORDER BY created_at,rowid LIMIT ?", (now, limit))]
+     cursor = conn.execute(
+         "SELECT * FROM kanban_sync_outbox WHERE state='pending' AND (retry_after IS NULL OR retry_after<=?) "
+         "ORDER BY created_at,rowid", (now,))
+-    batch = []
+     for row in cursor:
+-        batch.extend(sendable(conn, [dict(row)], blocked=blocked))
+-        if len(batch) >= limit:
+-            break
+-    return batch
++        yield from sendable(conn, [dict(row)], blocked=blocked) if blocked else [dict(row)]
++
++
++def pending_batch(conn, now: int, limit: int) -> list[dict]:
++    """Limit after filtering: a held FIFO prefix cannot starve another task."""
++    from itertools import islice
++    return list(islice(pending_rows(conn, now), limit))
+ 
+ 
+ def save_rebuild(conn, path: Path) -> None:
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope.py b/tests/hermes_cli/test_kanban_sync_envelope.py
+index 382e9ac573..05a6a942c3 100644
+--- a/tests/hermes_cli/test_kanban_sync_envelope.py
++++ b/tests/hermes_cli/test_kanban_sync_envelope.py
+@@ -82,3 +82,31 @@ def test_release_retries_preserve_entire_envelope(board):
+     send(conn, hub)
+     assert hub.batches[1] == hub.batches[0]
+     assert json.loads(hub.batches[0])[0]["op"] == "release"
++
++
++def test_containment_rekey_does_not_replay_retired_frozen_envelope(board):
++    from hermes_cli.kanban_containment_outbox import strip_lifecycle
++
++    conn, _ = board
++    tid = kb.create_task(conn, title="annotation survives", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET sync_version=1 WHERE id=?", (tid,))
++    hub = LostReply()
++    send(conn, hub)
++    original = next(op for op in json.loads(hub.batches[0]) if op["table"] == "tasks")
++    assert original["fields"]["status"] and original["frozen_replay"] == 1
++    with kbc.write_txn(conn):
++        strip_lifecycle(conn, tid)
++    replacement = conn.execute("SELECT op_id,wire_json FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()
++    assert replacement and replacement[0] != original["client_op_id"]
++    # The stale stored bytes remain until outbound replaces them; identity is the fence.
++    assert json.loads(replacement[1])["client_op_id"] == original["client_op_id"]
++    send(conn, hub)
++    current = next(op for op in json.loads(hub.batches[-1]) if op["table"] == "tasks")
++    assert current["client_op_id"] == replacement[0]
++    assert "status" not in current["fields"]
++    assert current["fields"]["title"] == "annotation survives"
++    assert current["frozen_replay"] == 1
++    stored = conn.execute("SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?", (replacement[0],)).fetchone()[0]
++    assert json.loads(stored) == current
++
+diff --git a/tests/hermes_cli/test_kanban_sync_parent_order.py b/tests/hermes_cli/test_kanban_sync_parent_order.py
+new file mode 100644
+index 0000000000..4fa65e491c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_parent_order.py
+@@ -0,0 +1,59 @@
++"""Dependency selection must not mint competing envelopes or starve other cards."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_sync_parent_order import parent_first
++from hermes_cli.kanban_sync_quarantine import pending_rows
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    db = kbc.connect(home / 'kanban.db')
++    client.ensure_identity(db, 'default', 'sender')
++    yield db
++    db.close()
++
++
++def test_backoff_prefix_does_not_hide_independent_card(conn):
++    now = int(client.time.time())
++    tid = kb.create_task(conn, title='backoff', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_outbox SET retry_after=? WHERE table_name='tasks'", (now + 600,))
++    for i in range(client.PUSH_BATCH + 1):
++        kb.add_comment(conn, tid, 'author', str(i))
++    other = kb.create_task(conn, title='unrelated', assignee='worker')
++    selected = parent_first(conn, pending_rows(conn, now), now, client.PUSH_BATCH)
++    assert selected and all(r['row_uid'] == other or json.loads(r['fields']).get('task_id') == other for r in selected)
++    assert conn.execute("SELECT MAX(attempts) FROM kanban_sync_outbox").fetchone()[0] == 0
++
++
++def test_before_head_filter_cannot_reintroduce_missing_parent(conn):
++    tid = kb.create_task(conn, title='parent', assignee='worker')
++    kb.add_comment(conn, tid, 'author', 'child')
++    now = int(client.time.time())
++    selected = parent_first(conn, pending_rows(conn, now), now, client.PUSH_BATCH)
++    filtered = [r for r in selected if r['table_name'] != 'tasks']
++    assert filtered
++    assert parent_first(conn, filtered, now, client.PUSH_BATCH,
++                        allowed={r['op_id'] for r in filtered}) == []
++
++
++def test_promoting_materialized_parent_keeps_frozen_bytes(conn):
++    tid = kb.create_task(conn, title='parent', assignee='worker')
++    kb.add_comment(conn, tid, 'author', 'child')
++    with kbc.write_txn(conn):
++        parent = conn.execute("SELECT op_id FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0]
++        wire = json.dumps({'client_op_id': parent, 'hlc': '0000000000001-0000-sender', 'frozen_replay': 1})
++        conn.execute("UPDATE kanban_sync_outbox SET created_at=created_at+9999,wire_json=? WHERE op_id=?", (wire, parent))
++    now = int(client.time.time())
++    selected = parent_first(conn, pending_rows(conn, now), now, client.PUSH_BATCH)
++    assert selected[0]['op_id'] == parent and selected[0]['wire_json'] == wire
++    assert len({r['op_id'] for r in selected}) == len(selected)
++    assert conn.execute("SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?", (parent,)).fetchone()[0] == wire
+diff --git a/tests/hermes_cli/test_sync_parent_review3.py b/tests/hermes_cli/test_sync_parent_review3.py
+new file mode 100644
+index 0000000000..122bd376c3
+--- /dev/null
++++ b/tests/hermes_cli/test_sync_parent_review3.py
+@@ -0,0 +1,215 @@
++"""Reviewer probes for PR 3913 @66bf8e1894 (not part of the PR). Every hub here advertises the capability,
++so the frozen (activated) path runs, unlike a bare SimpleNamespace(ops=...) hub."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++CAP = {"status_origin": 1, "frozen_replay": 1, "hlc": "0000000000000-0000-server"}
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "sender")
++    yield conn, home
++    conn.close()
++
++
++class Hub:
++    def __init__(self, ops, cap=True):
++        self.ops = ops
++        if cap:
++            self.status_origin_capability = lambda board: CAP
++
++
++@pytest.mark.parametrize("cap", [True, False])
++@pytest.mark.parametrize("reason", ["live_claim", "invalid"])
++def test_p1_parent_recovers_after_permanent_refusal_lifts(board, monkeypatch, reason, cap):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    receipts, known, refusing, parent_ids, sizes = {}, set(), [True], [], []
++
++    def ops(_board, wire):
++        results = []
++        sizes.append(len(wire))
++        for op in wire:
++            cid = op["client_op_id"]
++            if cid not in receipts:
++                if op["table"] == "tasks":
++                    if refusing[0]:
++                        receipts[cid] = {"status": "rejected", "reason": reason}
++                    else:
++                        known.add(op["uid"])
++                        receipts[cid] = {"status": "applied", "version": 1}
++                elif (op.get("fields") or {}).get("task_id") in known:
++                    receipts[cid] = {"status": "applied", "version": 1}
++                else:
++                    receipts[cid] = {"status": "rejected", "reason": "depends_on_rejected"}
++            if op["table"] == "tasks":
++                parent_ids.append(cid)
++            results.append({"client_op_id": cid, **receipts[cid]})
++        return {"results": results}
++
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    for i in range(10):
++        if i == 3:
++            refusing[0] = False
++        client.push(conn, Hub(ops, cap), "default", "sender", primary=False, max_batches=1)
++        now[0] += 400
++    print("P1", reason, "cap", cap, "distinct parent ids:", len(set(parent_ids)), "sends:", len(parent_ids),
++          "acked:", tid in known, "batch sizes:", sizes,
++          "task rows:", [tuple(r) for r in conn.execute("SELECT state,attempts FROM kanban_sync_outbox WHERE table_name='tasks'")],
++          "envelopes:", conn.execute("SELECT COUNT(*) FROM kanban_sync_parent_envelopes").fetchone()[0],
++          "sync_rejected events:", conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='sync_rejected'").fetchone()[0])
++    assert tid in known
++
++
++@pytest.mark.parametrize("cap", [True, False])
++def test_p2_children_during_parent_backoff(board, monkeypatch, cap):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent v1", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    down, sent = [True], []
++
++    def ops(_board, wire):
++        results = []
++        for op in wire:
++            if down[0]:
++                reason = "storage_error" if op["table"] == "tasks" else "depends_on_rejected"
++                results.append({"client_op_id": op["client_op_id"], "status": "rejected", "reason": reason})
++            else:
++                sent.append(op)
++                results.append({"client_op_id": op["client_op_id"], "status": "applied", "version": len(sent)})
++        return {"results": results}
++
++    hub = Hub(ops, cap)
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    peak = 0
++    for i in range(6):
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++        now[0] += 400
++        kb.add_comment(conn, tid, "author", f"later child {i}")
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++        kb.add_comment(conn, tid, "author", f"in-backoff child {i}")
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++        peak = max(peak, conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0])
++    rows = [tuple(r) for r in conn.execute("SELECT state, attempts FROM kanban_sync_outbox WHERE table_name='tasks'")]
++    down[0] = False
++    for _ in range(6):
++        now[0] += 400
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++    task_ops = [op for op in sent if op["table"] == "tasks"]
++    left = [tuple(r) for r in conn.execute("SELECT table_name,state,attempts FROM kanban_sync_outbox")]
++    print("P2 cap", cap, "peak task rows:", peak, "rows while down:", rows, "task upserts delivered:", len(task_ops),
++          "leftover:", left)
++    assert peak <= 1 and len(task_ops) == 1 and not left
++
++
++class Lost:
++    def __init__(self):
++        self.batches = []
++        self.status_origin_capability = lambda board: CAP
++
++    def ops(self, board, wire):
++        self.batches.append(json.loads(json.dumps(wire)))
++        raise OSError("lost")
++
++
++@pytest.mark.parametrize("captured_in_txn", [True, False])
++def test_p3_frozen_wake_after_completion_arrives(board, captured_in_txn):
++    conn, _ = board
++    tid = kb.create_task(conn, title="acked", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET sync_version=1 WHERE id=?", (tid,))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    if captured_in_txn:
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++    else:
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++        conn.commit()
++    hub = Lost()
++    with pytest.raises(OSError):
++        client.push(conn, hub, "default", "sender", primary=False)
++    first_ids = [op["client_op_id"] for op in hub.batches[0]]
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id NOT IN (%s)" % ",".join("?" * len(first_ids)), first_ids)  # noqa: UP031 -- unchanged independent probe
++    with kbc.write_txn(conn):
++        kb._append_event(conn, tid, "completed", {})
++        conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id NOT IN (%s)" % ",".join("?" * len(first_ids)), first_ids)  # noqa: UP031 -- unchanged independent probe
++    with pytest.raises(OSError):
++        client.push(conn, hub, "default", "sender", primary=False)
++    show = lambda b: [(op["fields"].get("status"), op.get("status_origin", "<none>"), op.get("frozen_replay"), op["hlc"])
++                      for op in b if op["table"] == "tasks"]
++    print("P3 in_txn", captured_in_txn, "first:", show(hub.batches[0]), "second:", show(hub.batches[1]),
++          "identical:", hub.batches[0] == hub.batches[1])
++    second = [op for op in hub.batches[1] if op["table"] == "tasks"]
++    for op in second:
++        if "status" in op["fields"]:
++            # a status that still travels after the completion arrived must be origin-bound and marked
++            assert op.get("frozen_replay") == 1 and "status_origin" in op, op
++
++
++def _fake_board(known, log):
++    def ops(_board, wire):
++        results = []
++        for op in wire:
++            cid = op["client_op_id"]
++            if op["table"] == "tasks":
++                known.add(op["uid"])
++                res = {"status": "applied", "version": 1}
++            elif (op.get("fields") or {}).get("task_id") in known:
++                res = {"status": "applied", "version": 1}
++            else:
++                res = {"status": "rejected", "reason": "not_found", "detail": f"no task {(op.get('fields') or {}).get('task_id')}"}
++            log.append((op["table"], res["status"]))
++            results.append({"client_op_id": cid, **res})
++        return {"results": results}
++    return ops
++
++
++@pytest.mark.parametrize("cap", [True, False])
++def test_p4_child_ahead_of_its_cards_row_beyond_the_batch(board, monkeypatch, cap):
++    """A child queued before its unacknowledged card's own tasks row, with that row beyond this batch's tail."""
++    conn, _ = board
++    filler = kb.create_task(conn, title="filler", assignee="worker")
++    tid = kb.create_task(conn, title="late card", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET sync_version=1 WHERE id=?", (filler,))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child ahead of its card")
++    for i in range(client.PUSH_BATCH + 5):
++        kb.add_comment(conn, filler, "author", f"filler {i}")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET title='late card edited' WHERE id=?", (tid,))
++    order = [r[0] for r in conn.execute("SELECT table_name FROM kanban_sync_outbox ORDER BY created_at,rowid")]
++    assert order[-1] == "tasks" and order.index("tasks") >= client.PUSH_BATCH, (order.index("tasks"), len(order))
++    known, log = {filler}, []
++    hub = Hub(_fake_board(known, log), cap)
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    rounds = []
++    for _ in range(6):
++        res = client.push(conn, hub, "default", "sender", primary=False)
++        rounds.append((res.sent, res.applied, res.deferred, res.rejected))
++        if not conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone():
++            break
++        now[0] += 1
++    refused = sum(1 for _t, s in log if s == "rejected")
++    left = [tuple(r) for r in conn.execute("SELECT table_name,state,attempts,last_error FROM kanban_sync_outbox")]
++    print("P4 cap", cap, "rounds (sent,applied,deferred,rejected):", rounds, "Board refusals:", refused, "leftover:", left)
++    assert refused == 0, "the child reached the Board ahead of its card"
+diff --git a/tests/hermes_cli/test_sync_parent_review5.py b/tests/hermes_cli/test_sync_parent_review5.py
+new file mode 100644
+index 0000000000..1a8176f2f8
+--- /dev/null
++++ b/tests/hermes_cli/test_sync_parent_review5.py
+@@ -0,0 +1,86 @@
++"""Reviewer probe 5 for PR 3913 @66bf8e1894 (not part of the PR).
++
++The fake Board follows hermes-hub fbbf27e worker/src/board.ts applyOps: ops apply in order, a child of an unknown
++card is refused not_found "no task <id>" (rows.ts:231), and every later op on a card that had a refusal in the same
++request is refused depends_on_rejected (board.ts:344). Answers are remembered by client_op_id."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++CAP = {"status_origin": 1, "frozen_replay": 1, "hlc": "0000000000000-0000-server"}
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "sender")
++    yield conn
++    conn.close()
++
++
++class Board:
++    def __init__(self, cap, known=()):
++        self.known, self.receipts, self.storage_down, self.log = set(known), {}, False, []
++        if cap:
++            self.status_origin_capability = lambda board: CAP
++
++    def ops(self, _board, wire):
++        results, rejected_cards = [], set()
++        for op in wire:
++            cid = op["client_op_id"]
++            card = op["uid"] if op["table"] == "tasks" else (op.get("fields") or {}).get("task_id")
++            if cid in self.receipts:
++                res = self.receipts[cid]
++            elif card in rejected_cards:
++                res = {"status": "rejected", "reason": "depends_on_rejected"}
++            elif op["table"] == "tasks":
++                if self.storage_down:
++                    res = {"status": "rejected", "reason": "storage_error"}
++                else:
++                    self.known.add(card)
++                    res = {"status": "applied", "version": 1}
++            elif card is None or card in self.known:
++                res = {"status": "applied", "version": 1}
++            else:
++                res = {"status": "rejected", "reason": "not_found", "detail": f"no task {card}"}
++            self.receipts[cid] = res
++            if res["status"] == "rejected" and card:
++                rejected_cards.add(card)
++            self.log.append((op["table"], res["status"], res.get("reason")))
++            results.append({"client_op_id": cid, **res})
++        return {"results": results}
++
++
++@pytest.mark.parametrize("cap", [True, False])
++def test_p5_one_transient_parent_refusal_then_healthy_board(board, monkeypatch, cap):
++    """An unacknowledged card with only child rows queued; the Board has ONE storage hiccup, then is healthy."""
++    conn = board
++    tid = kb.create_task(conn, title="card", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    hub = Board(cap)
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    hub.storage_down = True
++    client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++    hub.storage_down = False
++    rounds = 0
++    for rounds in range(1, 60):
++        now[0] += 301  # past every backoff
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++        if tid in hub.known and not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone():
++            break
++    rows = [tuple(r) for r in conn.execute(
++        "SELECT table_name,state,attempts,substr(last_error,1,40) FROM kanban_sync_outbox ORDER BY created_at,rowid")]
++    healthy = [entry for entry in hub.log[2:]]
++    print("P5 cap", cap, "rounds on a healthy Board:", rounds, "card on Board:", tid in hub.known,
++          "refusals from the healthy Board:", sum(1 for _t, s, _r in healthy if s == "rejected"),
++          "outbox:", rows)
++    assert tid in hub.known, "the card never reached a healthy Board"
++    assert not [r for r in rows if r[1] == "rejected"], rows
+-- 
+2.43.0
+

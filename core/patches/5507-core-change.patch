@@ -1,0 +1,1172 @@
+From f3873fd5322dd81c883c30cc60841bc7bdb88241 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:44:48 +0000
+Subject: [PATCH] fix(kanban): keep full integrity scans out of the schema lock
+ convoy [daveey]
+
+---
+ hermes_cli/kanban_db_connect.py               | 144 ++----
+ tests/hermes_cli/enrollment_cli_child.py      |  22 -
+ .../hermes_cli/test_enrollment_cli_convoy.py  |  66 +++
+ .../hermes_cli/test_enrollment_cli_create.py  |  44 +-
+ .../test_kanban_integrity_generation.py       | 464 ------------------
+ .../test_kanban_integrity_preprobe.py         | 138 ++++++
+ .../test_kanban_connect_integrity_stamp.py    | 154 ------
+ 7 files changed, 252 insertions(+), 780 deletions(-)
+ create mode 100644 tests/hermes_cli/test_enrollment_cli_convoy.py
+ delete mode 100644 tests/hermes_cli/test_kanban_integrity_generation.py
+ create mode 100644 tests/hermes_cli/test_kanban_integrity_preprobe.py
+ delete mode 100644 tests/tools/test_kanban_connect_integrity_stamp.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 8cd4d85995..e779246712 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -37,6 +37,7 @@ from typing import Optional
+ 
+ _INITIALIZED_PATHS: set[str] = set()
+ _INIT_LOCK = threading.RLock()
++_COLD_PATH_LOCKS: dict[str, threading.RLock] = {}
+ _SQLITE_HEADER = b"SQLite format 3\x00"
+ DEFAULT_BUSY_TIMEOUT_MS = 120_000
+ 
+@@ -52,14 +53,6 @@ _CONTENT_ADDRESSED_BACKUP = re.compile(r"\.corrupt\.[0-9a-f]{16}\.bak")
+ # then proceed without the lock (in-process _INIT_LOCK + idempotent init backstop).
+ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
+ _INIT_LOCK_POLL_SECONDS = 0.05
+-# A clean full ``integrity_check`` is O(board size) (3.0 s at the hub's 700 MB) and ran once PER PROCESS, under the
+-# cross-process init lock, so N concurrent ``hermes kanban`` CLIs cost N serial scans (9-20 s each).
+-# A clean result is stamped only for an unchanged DB+WAL metadata generation. Ordinary writes,
+-# replacements and recovery/checkpoint side effects invalidate it; continuous writers may get no hits.
+-# This is not a media-integrity certificate: unchanged metadata can conceal silent storage corruption.
+-# The six-hour TTL bounds reuse even without a visible write. A TTL of 0 always scans.
+-_INTEGRITY_STAMP_SUFFIX = ".integrity-ok"
+-_INTEGRITY_STAMP_TTL_SECONDS = 6 * 3600.0
+ 
+ 
+ def _resolve_busy_timeout_ms() -> int:
+@@ -678,80 +671,6 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
+     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
+ 
+ 
+-def _integrity_stamp_path(resolved: Path) -> Path:
+-    return resolved.with_name(resolved.name + _INTEGRITY_STAMP_SUFFIX)
+-
+-
+-def _integrity_generation(resolved: Path) -> Optional[dict]:
+-    """Conservative change detector, not a content hash or a media-integrity guarantee.
+-
+-    WAL contains committed pages absent from the main file. SHM contains coordination,
+-    not persistent pages. A rollback journal may need recovery: never cache that case.
+-    ctime also invalidates ordinary in-place writes that restore the old mtime.
+-    """
+-    try:
+-        try:
+-            Path(str(resolved) + "-journal").stat()
+-        except FileNotFoundError:
+-            pass
+-        else:
+-            return None
+-        generation = {}
+-        for suffix in ("", "-wal"):
+-            try:
+-                st = Path(str(resolved) + suffix).stat()
+-            except FileNotFoundError:
+-                if not suffix:
+-                    return None
+-                generation[suffix] = None
+-            else:
+-                generation[suffix] = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+-        return generation
+-    except OSError:
+-        return None
+-
+-
+-def _integrity_stamp_fresh(resolved: Path) -> bool:
+-    """Reuse only a clean check of an unchanged DB/WAL generation within the TTL."""
+-    ttl = _INTEGRITY_STAMP_TTL_SECONDS
+-    if ttl <= 0:
+-        return False
+-    try:
+-        generation = _integrity_generation(resolved)
+-        stamp = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
+-        age = time.time() - float(stamp["verified_at"])
+-        return (generation is not None and stamp["version"] == 2
+-                and stamp["generation"] == generation and 0 <= age < ttl)
+-    except (OSError, ValueError, KeyError, TypeError):
+-        return False
+-
+-
+-def _invalidate_integrity_stamp(resolved: Path) -> None:
+-    with contextlib.suppress(OSError):
+-        _integrity_stamp_path(resolved).unlink(missing_ok=True)
+-
+-
+-def _write_integrity_stamp(resolved: Path, generation: Optional[dict]) -> None:
+-    """Publish only the generation sampled BEFORE the check, if unchanged after close.
+-
+-    Probe recovery/checkpoint, schema writes and active WAL writers can prevent reuse.
+-    A racing write after this comparison invalidates the captured generation on use.
+-    """
+-    if _INTEGRITY_STAMP_TTL_SECONDS <= 0 or generation is None:
+-        return
+-    target = _integrity_stamp_path(resolved)
+-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+-    try:
+-        if generation != _integrity_generation(resolved):
+-            return
+-        tmp.write_text(json.dumps({"version": 2, "generation": generation,
+-                                  "verified_at": time.time(), "pid": os.getpid()}), encoding="utf-8")
+-        os.replace(tmp, target)
+-    except OSError:
+-        with contextlib.suppress(OSError):
+-            tmp.unlink()
+-
+-
+ def _guard_existing_db_is_healthy(path: Path) -> None:
+     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
+ 
+@@ -762,9 +681,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
+     the file + sidecars and raise :class:`KanbanDbCorruptError` so callers
+     never recreate the schema on top of a damaged DB. ``OperationalError``
+     (lock/busy) is NOT corruption and propagates raw (no spurious backup).
+-    No-op for missing / zero-byte files, paths already proven healthy this
+-    process, and files another process fully checked within the stamp TTL.
+-    All writes are confined to the resolved path's parent.
++    No-op for missing / zero-byte files and paths already proven healthy this
++    process. All writes are confined to the resolved path's parent.
+     """
+     try:
+         resolved = path.resolve()
+@@ -772,13 +690,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
+         return
+     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
+         return
+-    if _integrity_stamp_fresh(resolved):
+-        return
+-    generation = _integrity_generation(resolved)
+-    _invalidate_integrity_stamp(resolved)
+     messages, reason = _probe_for_corruption(resolved)
+     if reason is None:
+-        _write_integrity_stamp(resolved, generation)
+         return
+     # The probe ran in THIS process, whose view can be stale (deleted WAL/SHM
+     # generation after a sibling's close). Only an independently confirmed failure
+@@ -841,7 +754,6 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
+         return RepairResult(status="missing", db_path=resolved)
+ 
+     with _cross_process_init_lock(resolved):
+-        _invalidate_integrity_stamp(resolved)
+         messages, reason = _probe_for_corruption(resolved)
+         if reason is not None:
+             messages, reason = _confirm_corruption(resolved, messages, reason)
+@@ -988,6 +900,29 @@ def _ensure_activity_revision(conn: sqlite3.Connection, resolved: str) -> None:
+                          resolved, exc)
+ 
+ 
++def _db_file_identity(path: Path) -> Optional[tuple[int, int]]:
++    """Identity only: ordinary WAL commits do not invalidate a checked snapshot."""
++    try:
++        st = path.stat()
++        return (st.st_dev, st.st_ino) if st.st_size else None
++    except OSError:
++        return None
++
++
++def _healthy_preprobe_identity(path: Path) -> Optional[tuple[int, int]]:
++    """Full SQLite snapshot check without owning the schema/init turn.
++
++    No repair/quarantine here. Suspicion is rechecked by the existing guard under
++    the init lock; replacement is rechecked there too. No result survives this
++    connect call, so every fresh CLI still pays its own full integrity check.
++    """
++    identity = _db_file_identity(path)
++    if identity is None:
++        return None
++    _messages, reason = _probe_for_corruption(path.resolve())
++    return identity if reason is None else None
++
++
+ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None,
+             check_same_thread: bool = True) -> sqlite3.Connection:
+     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
+@@ -1051,16 +986,29 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None,
+             path,
+         )
+ 
++    with _INIT_LOCK:
++        cold_lock = _COLD_PATH_LOCKS.setdefault(resolved, threading.RLock())
++    with cold_lock:
++        # One probe per cold path in this process; unrelated processes can scan
++        # concurrently. Do not hold _INIT_LOCK while waiting for another process.
++        if resolved in _INITIALIZED_PATHS:
++            return connect(path, check_same_thread=check_same_thread)
++        return _connect_cold(path, check_same_thread=check_same_thread)
++
++
++def _connect_cold(path: Path, *, check_same_thread: bool) -> sqlite3.Connection:
++    # Imports/attestation and full scans must not convoy unrelated fresh CLIs
++    # behind the exclusive schema turn. SQLite protects the probe's snapshot;
++    # all application repair/quarantine and schema changes remain below the lock.
++    from hermes_state import preflight_db_writability
++    preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
++    _validate_sqlite_header(path)
++    checked_identity = _healthy_preprobe_identity(path)
+     with _cross_process_init_lock(path):
+-        # Read-only file/sidecar preflight first, so a stray read-only kanban.db
+-        # fails actionably instead of "attempt to write a readonly database".
+-        # See #12508.
+-        from hermes_state import preflight_db_writability
+         preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
+-        # Cheap byte-level header check before any sqlite connection, then the
+-        # full integrity probe (cached per path via _INITIALIZED_PATHS).
+         _validate_sqlite_header(path)
+-        _guard_existing_db_is_healthy(path)
++        if checked_identity is None or checked_identity != _db_file_identity(path):
++            _guard_existing_db_is_healthy(path)
+         resolved = str(path.resolve())
+ 
+         def _init_if_needed(conn: sqlite3.Connection) -> Optional[str]:
+diff --git a/tests/hermes_cli/enrollment_cli_child.py b/tests/hermes_cli/enrollment_cli_child.py
+index 5e171fd8f8..b715816d83 100644
+--- a/tests/hermes_cli/enrollment_cli_child.py
++++ b/tests/hermes_cli/enrollment_cli_child.py
+@@ -60,30 +60,8 @@ def main():
+             sync.set_mode(conn, "primary")
+         return
+ 
+-    # Always run the real integrity check in this harness; a TTL stamp is NOT a
+-    # correctness oracle and must not hide our injected slow/hung integrity seam.
+-    if not mode.startswith("cached"):
+-        kbc._INTEGRITY_STAMP_TTL_SECONDS = 0
+     real_check = kbc._run_integrity_check
+ 
+-    if mode.startswith("cached") and hasattr(kbc, "_integrity_generation"):
+-        # Observe the production detector without changing its answer, metadata,
+-        # stamp, or connection lifecycle. Cache misses must name the generation
+-        # mismatch rather than assume that a read-only command is byte-quiescent.
+-        real_generation = kbc._integrity_generation
+-
+-        def observed_generation(path):
+-            generation = real_generation(path)
+-            try:
+-                stamp = json.loads(kbc._integrity_stamp_path(path).read_text())
+-            except (OSError, ValueError):
+-                stamp = None
+-            with marker.with_suffix(".generations").open("a") as log:
+-                log.write(json.dumps({"generation": generation, "stamp": stamp}) + "\n")
+-            return generation
+-
+-        kbc._integrity_generation = observed_generation
+-
+     def checked(conn):
+         marker.with_suffix(".integrity-entered").write_text(str(os.getpid()))
+         if mode in {"integrity-gate", "cached-gate"}:
+diff --git a/tests/hermes_cli/test_enrollment_cli_convoy.py b/tests/hermes_cli/test_enrollment_cli_convoy.py
+new file mode 100644
+index 0000000000..654dc72026
+--- /dev/null
++++ b/tests/hermes_cli/test_enrollment_cli_convoy.py
+@@ -0,0 +1,66 @@
++"""A stalled full scan must not own the schema turn of unrelated real CLI creates."""
++from __future__ import annotations
++
++import json
++import sqlite3
++import subprocess
++import threading
++
++import pytest
++
++from tests.hermes_cli import test_enrollment_cli_create as cli
++from tests.hermes_cli.test_enrollment_cli_create import await_marker, create_argv
++
++sandbox = cli.sandbox
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.mark.parametrize("kind", ["canary", "failure-report"])
++def test_stalled_scan_does_not_block_create_with_live_wal_writer(sandbox, kind):
++    box = sandbox
++    # This independent fixture table keeps the DB changing; no health-cache
++    # priming, forged stamps or relaxed freshness predicates can pass the test.
++    with sqlite3.connect(box.db) as conn:
++        conn.execute("CREATE TABLE fixture_writer (value INTEGER)")
++        conn.execute("INSERT INTO fixture_writer VALUES (0)")
++    stop = threading.Event()
++    committed = threading.Event()
++    failures = []
++
++    def writer():
++        try:
++            with sqlite3.connect(box.db, timeout=5) as conn:
++                while not stop.is_set():
++                    conn.execute("UPDATE fixture_writer SET value=value+1")
++                    conn.commit()
++                    committed.set()
++                    # health: allow HX013 -- bounded background writer models concurrent WAL changes, not readiness
++                    stop.wait(.02)
++        except BaseException as exc:
++            failures.append(exc)
++
++    thread = threading.Thread(target=writer)
++    thread.start()
++    try:
++        assert committed.wait(5)
++        blocked = box.start("integrity-gate", "blocked", create_argv("canary", "convoy:blocked"))
++        await_marker(box, "blocked", ".integrity-entered", blocked)
++        sibling = box.start("normal", "sibling", create_argv(kind, "convoy:sibling"))
++        try:
++            out, err = sibling.communicate(timeout=6)
++        except subprocess.TimeoutExpired:
++            box.stop(sibling)
++            pytest.fail("unrelated actual CLI create queued behind a stalled integrity scan")
++        assert sibling.returncode == 0, (out, err)
++        assert (box.root / "sibling.integrity-done").exists(), "must retain its own full integrity scan"
++        assert blocked.poll() is None
++        assert len(box.rows()) == 1
++        assert box.rows()[0]["id"] == json.loads(out)["id"]
++        with sqlite3.connect(box.db) as conn:
++            assert conn.execute("SELECT value FROM fixture_writer").fetchone()[0] > 1
++    finally:
++        stop.set()
++        thread.join(timeout=10)
++    assert not thread.is_alive()
++    assert failures == []
+diff --git a/tests/hermes_cli/test_enrollment_cli_create.py b/tests/hermes_cli/test_enrollment_cli_create.py
+index 2f916b362c..426774b089 100644
+--- a/tests/hermes_cli/test_enrollment_cli_create.py
++++ b/tests/hermes_cli/test_enrollment_cli_create.py
+@@ -5,8 +5,8 @@ Run: bash scripts/run_tests.sh tests/hermes_cli/test_enrollment_cli_create.py -v
+ Scaler-equivalent canary/file_card argv (hermes_worker_scaler.HubCards), but all
+ state is disposable and registry input is fixture-owned. No scaler lifecycle,
+ service enrollment, Board HTTP synchronization, live board, or model is exercised.
+-These tests prove timeout/retry semantics, NOT that PR3945's stamp is safe or
+-that connect-only latency/count tests establish production create fairness.
++These tests prove timeout/retry semantics; the separate convoy suite proves
++that a slow full scan cannot monopolize other real create commands.
+ """
+ from __future__ import annotations
+ 
+@@ -218,43 +218,3 @@ def test_concurrent_real_cli_same_create_key_returns_one_committed_card(sandbox)
+     rows = box.rows()
+     assert len(rows) == 1 and rows[0]["id"] == ids[0]
+     assert rows[0]["idempotency_key"] == key
+-
+-
+-@pytest.mark.parametrize("kind", ["canary", "failure-report"])
+-def test_actual_create_reuses_unchanged_verified_generation_within_budget(sandbox, kind):
+-    """Old full CLI enters the blocked probe and times out; unchanged verified DB needs no second scan.
+-
+-    This is an injected scan-stall boundary on a quiescent board, not a large-DB
+-    benchmark or an assertion that a continuously written board obtains cache hits.
+-    """
+-    box = sandbox
+-    warm_argv = create_argv("canary", "worker-scaler:canary:i-warm")
+-    # The first observer's real probe closes the last SQLite connection and
+-    # checkpoints the warm create's WAL. That changes the main-file generation
+-    # during verification, so production correctly refuses to publish its stamp.
+-    # A second real observer verifies that now-quiescent generation. Do not fake
+-    # a stamp, hold a reader open, or reset timestamps to manufacture a cache hit.
+-    for i in range(3):  # create, checkpointing observer, verifying observer
+-        p = box.start("cached", f"warm-{i}", warm_argv)
+-        out, err = p.communicate(timeout=30)
+-        assert p.returncode == 0, (out, err)
+-        if i == 0:
+-            warm_argv = ["kanban", "--board", "default", "show", json.loads(out)["id"], "--json"]
+-    # Both observers must have exercised the real probe: the first cannot stamp
+-    # a checkpoint-changing generation; the second establishes the cache premise.
+-    assert (box.root / "warm-1.integrity-done").exists()
+-    assert (box.root / "warm-2.integrity-done").exists()
+-    argv = create_argv(kind, f"worker-scaler:{kind}:i-budget")
+-    p = box.start("cached-gate", "budget", argv)
+-    try:
+-        out, err = p.communicate(timeout=10)
+-    except subprocess.TimeoutExpired:
+-        box.stop(p)
+-        traces = {p.name: [json.loads(line) for line in p.read_text().splitlines()]
+-                  for p in sorted(box.root.glob("*.generations"))}
+-        pytest.fail("actual create repeated the full probe; generation/stamp observations:\n"
+-                    + json.dumps(traces, indent=2))
+-    assert p.returncode == 0, (out, err)
+-    assert not (box.root / "budget.integrity-entered").exists()
+-    assert json.loads(out)["id"] in {row["id"] for row in box.rows()}
+-    assert len(box.rows()) == 2
+diff --git a/tests/hermes_cli/test_kanban_integrity_generation.py b/tests/hermes_cli/test_kanban_integrity_generation.py
+deleted file mode 100644
+index d9f571c82a..0000000000
+--- a/tests/hermes_cli/test_kanban_integrity_generation.py
++++ /dev/null
+@@ -1,464 +0,0 @@
+-"""Generation-bound integrity stamp: a stamp may only skip the full scan for the exact DB/WAL generation it certified.
+-
+-Behavioral tests through the public ``connect`` entry point (full guard path), plus the stamp helpers where a race
+-has to be injected deterministically.
+-"""
+-import json
+-import os
+-import shutil
+-import sqlite3
+-import time
+-from pathlib import Path
+-
+-import pytest
+-
+-from hermes_cli import kanban_db_connect as kbc
+-
+-
+-@pytest.fixture
+-def board(tmp_path, monkeypatch):
+-    home = tmp_path / "home"
+-    home.mkdir()
+-    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
+-        monkeypatch.delenv(key, raising=False)
+-    monkeypatch.setenv("HERMES_HOME", str(home))
+-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+-    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 6 * 3600.0)
+-    path = home / "kanban.db"
+-    kbc.init_db(path)
+-    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
+-    yield path
+-    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
+-
+-
+-@pytest.fixture
+-def checks(monkeypatch):
+-    """Count full integrity scans."""
+-    calls = []
+-    real = kbc._run_integrity_check
+-
+-    def counted(conn):
+-        calls.append(1)
+-        return real(conn)
+-
+-    monkeypatch.setattr(kbc, "_run_integrity_check", counted)
+-    return calls
+-
+-
+-def _forget(path):
+-    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
+-
+-
+-def _stamp(path):
+-    return path.with_name(path.name + ".integrity-ok")
+-
+-
+-def _stamped(path):
+-    """Run a full connect that must scan and leave a stamp; return with the process cache cleared."""
+-    _forget(path)
+-    kbc._guard_existing_db_is_healthy(path)
+-    _forget(path)
+-    assert _stamp(path).exists(), "clean scan of a quiescent DB must stamp"
+-    assert kbc._integrity_stamp_fresh(path.resolve())
+-    return path
+-
+-
+-def _fresh(path):
+-    return kbc._integrity_stamp_fresh(path.resolve())
+-
+-
+-def _connect_scans(path, checks):
+-    _forget(path)
+-    before = len(checks)
+-    kbc.connect(path).close()
+-    return len(checks) - before
+-
+-
+-def test_valid_stamp_skips_scan_on_unchanged_db(board, checks):
+-    _stamped(board)
+-    assert _connect_scans(board, checks) == 0
+-
+-
+-def test_same_inode_corruption_after_stamp_fails_closed(board, checks):
+-    _stamped(board)
+-    ino = board.stat().st_ino
+-    # a real tasks-table page must be damaged: overwrite every non-header page
+-    size = board.stat().st_size
+-    assert size >= 8192
+-    with open(board, "r+b") as f:
+-        f.seek(4096)
+-        f.write(b"\xff" * (size - 4096))
+-    assert board.stat().st_ino == ino
+-    _forget(board)
+-    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
+-        kbc.connect(board).close()
+-
+-
+-def test_same_inode_corruption_with_restored_mtime_fails_closed(board, checks):
+-    _stamped(board)
+-    st = board.stat()
+-    with open(board, "r+b") as f:
+-        f.seek(4096)
+-        f.write(b"\xff" * (st.st_size - 4096))
+-        f.flush()
+-        os.fsync(f.fileno())
+-    os.utime(board, ns=(st.st_atime_ns, st.st_mtime_ns))
+-    after = board.stat()
+-    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (st.st_ino, st.st_size, st.st_mtime_ns)
+-    assert not _fresh(board), "ctime must invalidate an in-place write that restored mtime"
+-    _forget(board)
+-    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
+-        kbc.connect(board).close()
+-
+-
+-def test_same_size_garbage_in_place_restored_mtime_not_fresh(board):
+-    _stamped(board)
+-    st = board.stat()
+-    with open(board, "r+b") as f:
+-        f.seek(st.st_size - 16)
+-        f.write(b"\x00" * 16)
+-    os.utime(board, ns=(st.st_atime_ns, st.st_mtime_ns))
+-    assert not _fresh(board)
+-
+-
+-def test_wal_only_ordinary_mutation_invalidates(board, checks):
+-    _stamped(board)
+-    holder = sqlite3.connect(board)
+-    try:
+-        holder.execute("PRAGMA journal_mode=WAL")
+-        holder.execute("PRAGMA wal_autocheckpoint=0")
+-        main_before = board.stat()
+-        holder.execute("CREATE TABLE IF NOT EXISTS walmut (x)")
+-        holder.execute("INSERT INTO walmut VALUES (1)")
+-        holder.commit()
+-        wal = Path(str(board) + "-wal")
+-        assert wal.exists() and wal.stat().st_size > 0
+-        assert board.stat().st_size == main_before.st_size  # change lives only in the WAL
+-        assert not _fresh(board)
+-        # and a later WAL-only write changes it again
+-        stamped_gen = kbc._integrity_generation(board.resolve())
+-        holder.execute("INSERT INTO walmut VALUES (2)")
+-        holder.commit()
+-        assert kbc._integrity_generation(board.resolve()) != stamped_gen
+-    finally:
+-        holder.close()
+-
+-
+-def test_connect_after_wal_mutation_rescans(board, checks):
+-    _stamped(board)
+-    holder = sqlite3.connect(board)
+-    try:
+-        holder.execute("PRAGMA wal_autocheckpoint=0")
+-        holder.execute("CREATE TABLE walmut2 (x)")
+-        holder.commit()
+-        assert _connect_scans(board, checks) >= 1
+-    finally:
+-        holder.close()
+-
+-
+-def test_db_replacement_invalidates(board, tmp_path):
+-    _stamped(board)
+-    twin = tmp_path / "twin.db"
+-    shutil.copyfile(board, twin)  # identical bytes, different inode
+-    os.replace(twin, board)
+-    assert not _fresh(board)
+-
+-
+-def test_db_replacement_with_copystat_invalidates(board, tmp_path):
+-    _stamped(board)
+-    twin = tmp_path / "twin.db"
+-    shutil.copy2(board, twin)
+-    os.replace(twin, board)
+-    assert not _fresh(board)
+-
+-
+-def test_wal_creation_invalidates(board):
+-    _stamped(board)
+-    wal = Path(str(board) + "-wal")
+-    assert not wal.exists()
+-    wal.write_bytes(b"")
+-    assert not _fresh(board)
+-
+-
+-def test_wal_removal_invalidates(board):
+-    # stamp while a WAL exists (a held-open WAL connection keeps it)
+-    holder = sqlite3.connect(board)
+-    try:
+-        holder.execute("PRAGMA wal_autocheckpoint=0")
+-        holder.execute("CREATE TABLE w (x)")
+-        holder.commit()
+-        wal = Path(str(board) + "-wal")
+-        assert wal.exists()
+-        resolved = board.resolve()
+-        gen = kbc._integrity_generation(resolved)
+-        assert gen is not None and gen["-wal"] is not None
+-        kbc._write_integrity_stamp(resolved, gen)
+-        assert _fresh(board)
+-        holder.close()  # last close checkpoints and removes the WAL
+-        if wal.exists():
+-            wal.unlink()
+-        assert not _fresh(board)
+-    finally:
+-        with pytest.raises(sqlite3.ProgrammingError):
+-            holder.execute("select 1")
+-
+-
+-def test_wal_truncation_invalidates(board):
+-    holder = sqlite3.connect(board)
+-    try:
+-        holder.execute("PRAGMA wal_autocheckpoint=0")
+-        holder.execute("CREATE TABLE w (x)")
+-        holder.executemany("INSERT INTO w VALUES (?)", [(i,) for i in range(200)])
+-        holder.commit()
+-        wal = Path(str(board) + "-wal")
+-        resolved = board.resolve()
+-        gen = kbc._integrity_generation(resolved)
+-        kbc._write_integrity_stamp(resolved, gen)
+-        assert _fresh(board)
+-        os.truncate(wal, wal.stat().st_size // 2)
+-        assert not _fresh(board)
+-    finally:
+-        holder.close()
+-
+-
+-def test_wal_replacement_invalidates(board, tmp_path):
+-    holder = sqlite3.connect(board)
+-    try:
+-        holder.execute("PRAGMA wal_autocheckpoint=0")
+-        holder.execute("CREATE TABLE w (x)")
+-        holder.commit()
+-        wal = Path(str(board) + "-wal")
+-        resolved = board.resolve()
+-        kbc._write_integrity_stamp(resolved, kbc._integrity_generation(resolved))
+-        assert _fresh(board)
+-        twin = tmp_path / "wal.copy"
+-        shutil.copyfile(wal, twin)
+-        os.replace(twin, wal)
+-        assert not _fresh(board)
+-    finally:
+-        holder.close()
+-
+-
+-def test_rollback_journal_disables_cache(board, checks):
+-    _stamped(board)
+-    journal = Path(str(board) + "-journal")
+-    journal.write_bytes(b"")
+-    assert kbc._integrity_generation(board.resolve()) is None
+-    assert not _fresh(board)
+-    # and a stamp cannot be written while a journal is present
+-    _stamp(board).unlink()
+-    kbc._write_integrity_stamp(board.resolve(), kbc._integrity_generation(board.resolve()))
+-    assert not _stamp(board).exists()
+-
+-
+-def test_mutation_during_probe_is_not_certified(board, monkeypatch):
+-    real = kbc._probe_for_corruption
+-
+-    def racing(resolved):
+-        out = real(resolved)
+-        c = sqlite3.connect(resolved)
+-        c.execute("PRAGMA wal_autocheckpoint=0")
+-        c.execute("CREATE TABLE raced (x)")
+-        c.commit()
+-        c.close()
+-        return out
+-
+-    monkeypatch.setattr(kbc, "_probe_for_corruption", racing)
+-    _forget(board)
+-    kbc._guard_existing_db_is_healthy(board)
+-    assert not _stamp(board).exists()
+-    assert not _fresh(board)
+-
+-
+-def test_wal_mutation_during_probe_with_held_writer_is_not_certified(board, monkeypatch):
+-    holder = sqlite3.connect(board)
+-    holder.execute("PRAGMA wal_autocheckpoint=0")
+-    real = kbc._probe_for_corruption
+-
+-    def racing(resolved):
+-        out = real(resolved)
+-        holder.execute("CREATE TABLE raced_wal (x)")
+-        holder.commit()
+-        return out
+-
+-    monkeypatch.setattr(kbc, "_probe_for_corruption", racing)
+-    try:
+-        _forget(board)
+-        kbc._guard_existing_db_is_healthy(board)
+-        assert not _stamp(board).exists()
+-        assert not _fresh(board)
+-    finally:
+-        holder.close()
+-
+-
+-def test_write_stamp_refuses_stale_before_generation(board):
+-    resolved = board.resolve()
+-    before = kbc._integrity_generation(resolved)
+-    c = sqlite3.connect(board)
+-    c.execute("CREATE TABLE changed (x)")
+-    c.commit()
+-    c.close()
+-    assert kbc._integrity_generation(resolved) != before
+-    kbc._write_integrity_stamp(resolved, before)
+-    assert not _stamp(board).exists()
+-
+-
+-def test_write_stamp_refuses_none_generation_and_zero_ttl(board, monkeypatch):
+-    resolved = board.resolve()
+-    kbc._write_integrity_stamp(resolved, None)
+-    assert not _stamp(board).exists()
+-    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 0)
+-    kbc._write_integrity_stamp(resolved, kbc._integrity_generation(resolved))
+-    assert not _stamp(board).exists()
+-
+-
+-def _write_stamp(board, **over):
+-    resolved = board.resolve()
+-    doc = {"version": 2, "generation": kbc._integrity_generation(resolved),
+-           "verified_at": time.time(), "pid": 1}
+-    doc.update(over)
+-    _stamp(board).write_text(json.dumps(doc), encoding="utf-8")
+-
+-
+-def test_hand_built_good_stamp_is_fresh_control(board):
+-    _write_stamp(board)
+-    assert _fresh(board)
+-
+-
+-@pytest.mark.parametrize("raw", [
+-    "", "not json", "[]", "null", "{}", '{"version": 2}',
+-    '{"version": 2, "verified_at": "x", "generation": {}}',
+-    b"\xff\xfe\x00garbage",
+-])
+-def test_malformed_stamps_do_not_skip(board, raw):
+-    if isinstance(raw, bytes):
+-        _stamp(board).write_bytes(raw)
+-    else:
+-        _stamp(board).write_text(raw)
+-    assert not _fresh(board)
+-
+-
+-def test_legacy_v1_stamp_does_not_skip(board, checks):
+-    st = board.stat()
+-    _stamp(board).write_text(json.dumps({
+-        "version": 1, "dev": st.st_dev, "ino": st.st_ino, "size": st.st_size,
+-        "mtime_ns": st.st_mtime_ns, "verified_at": time.time(), "pid": 1}))
+-    assert not _fresh(board)
+-    assert _connect_scans(board, checks) >= 1
+-
+-
+-def test_unversioned_legacy_stamp_does_not_skip(board):
+-    st = board.stat()
+-    _stamp(board).write_text(json.dumps({
+-        "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "verified_at": time.time()}))
+-    assert not _fresh(board)
+-
+-
+-def test_wrong_version_does_not_skip(board):
+-    for v in (0, 1, 3, "2", None):
+-        _write_stamp(board, version=v)
+-        assert not _fresh(board), v
+-
+-
+-def test_future_stamp_does_not_skip(board):
+-    _write_stamp(board, verified_at=time.time() + 3600)
+-    assert not _fresh(board)
+-
+-
+-def test_expired_stamp_does_not_skip(board):
+-    _write_stamp(board, verified_at=time.time() - 6 * 3600.0 - 5)
+-    assert not _fresh(board)
+-
+-
+-def test_generation_mismatch_does_not_skip(board):
+-    gen = kbc._integrity_generation(board.resolve())
+-    assert gen is not None
+-    gen[""][2] += 1
+-    _write_stamp(board, generation=gen)
+-    assert not _fresh(board)
+-
+-
+-def test_ttl_zero_never_skips(board, monkeypatch):
+-    _write_stamp(board)
+-    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 0)
+-    assert not _fresh(board)
+-
+-
+-def test_stat_failure_does_not_skip(board, monkeypatch):
+-    _write_stamp(board)
+-    assert _fresh(board)
+-    real_stat = Path.stat
+-
+-    def boom(self, *a, **k):
+-        if self.name.startswith("kanban.db") and not self.name.endswith(".integrity-ok"):
+-            raise PermissionError("denied")
+-        return real_stat(self, *a, **k)
+-
+-    monkeypatch.setattr(Path, "stat", boom)
+-    assert kbc._integrity_generation(board.resolve()) is None
+-    assert not _fresh(board)
+-    kbc._write_integrity_stamp(board.resolve(), None)
+-
+-
+-def test_missing_db_generation_is_none(tmp_path):
+-    assert kbc._integrity_generation(tmp_path / "absent.db") is None
+-
+-
+-def test_corrupt_db_with_forged_current_stamp_still_detected_after_write(board):
+-    """A stamp forged for the pre-corruption generation cannot survive the corrupting write."""
+-    _write_stamp(board)
+-    assert _fresh(board)
+-    size = board.stat().st_size
+-    with open(board, "r+b") as f:
+-        f.seek(4096)
+-        f.write(b"\xff" * (size - 4096))
+-    assert not _fresh(board)
+-    _forget(board)
+-    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
+-        kbc.connect(board).close()
+-
+-
+-def test_corrupt_db_is_never_stamped(board):
+-    size = board.stat().st_size
+-    with open(board, "r+b") as f:
+-        f.seek(4096)
+-        f.write(b"\xff" * (size - 4096))
+-    _forget(board)
+-    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
+-        kbc.connect(board).close()
+-    assert not _stamp(board).exists()
+-
+-
+-def test_connect_write_side_effects_invalidate(board, checks):
+-    _stamped(board)
+-    conn = kbc.connect(board)  # skip path: process-cached from here on
+-    conn.close()
+-    _forget(board)
+-    c = sqlite3.connect(board)
+-    c.execute("CREATE TABLE side_effect (x)")
+-    c.execute("INSERT INTO side_effect VALUES (1)")
+-    c.commit()
+-    c.close()
+-    assert not _fresh(board)
+-    assert _connect_scans(board, checks) >= 1
+-
+-
+-def test_schema_write_by_connect_not_certified_by_older_stamp(board, checks):
+-    """A write performed under the stamped generation (e.g. a migration) changes it: the next process rescans."""
+-    _stamped(board)
+-    gen = kbc._integrity_generation(board.resolve())
+-    conn = kbc.connect(board)
+-    try:
+-        conn.execute("CREATE TABLE IF NOT EXISTS migr (x)")
+-        conn.commit()
+-    finally:
+-        conn.close()
+-    _forget(board)
+-    assert kbc._integrity_generation(board.resolve()) != gen
+-    assert not _fresh(board)
+-
+-
+-def test_explicit_repair_revokes_prior_shared_certificate(board):
+-    _stamped(board)
+-    assert kbc.repair_db(board).status == "ok"
+-    assert not _stamp(board).exists()
+diff --git a/tests/hermes_cli/test_kanban_integrity_preprobe.py b/tests/hermes_cli/test_kanban_integrity_preprobe.py
+new file mode 100644
+index 0000000000..2f249cedf7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_integrity_preprobe.py
+@@ -0,0 +1,138 @@
++"""Per-connect full probes stay mandatory; repair remains under the init turn."""
++from contextlib import contextmanager
++from concurrent.futures import ThreadPoolExecutor
++import threading
++import os
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli.test_kanban_db_lock_safety import _board
++
++
++def observe_lock(monkeypatch, before=None):
++    held = []
++    original = kbc._cross_process_init_lock
++
++    @contextmanager
++    def locked(path):
++        if before:
++            before(path)
++        with original(path):
++            held.append(True)
++            try:
++                yield
++            finally:
++                held.pop()
++    monkeypatch.setattr(kbc, "_cross_process_init_lock", locked)
++    return held
++
++
++def test_full_check_outside_init_turn_then_schema_inside(tmp_path, monkeypatch):
++    db = _board(tmp_path)
++    held = observe_lock(monkeypatch)
++    calls = []
++    real = kbc._probe_integrity
++    schema = kbc.apply_schema_steps
++
++    def probe(path):
++        calls.append(bool(held))
++        return real(path)
++
++    def initialize(conn):
++        assert held
++        return schema(conn)
++    monkeypatch.setattr(kbc, "_probe_integrity", probe)
++    monkeypatch.setattr(kbc, "apply_schema_steps", initialize)
++    with kbc.connect_closing(db):
++        pass
++    assert calls == [False]
++    with kbc.connect_closing(db):
++        pass
++    assert calls == [False], "existing process fast path remains unchanged"
++    kbc._INITIALIZED_PATHS.discard(str(db.resolve()))
++    with kbc.connect_closing(db):
++        pass
++    assert calls == [False, False], "new process must never trust a durable health stamp"
++
++
++def test_cold_threads_share_one_full_probe(tmp_path, monkeypatch):
++    db = _board(tmp_path)
++    barrier = threading.Barrier(4)
++    calls = []
++    real = kbc._probe_integrity
++
++    def probe(path):
++        calls.append(path)
++        return real(path)
++
++    def opened(_):
++        barrier.wait(timeout=10)
++        with kbc.connect_closing(db) as conn:
++            return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    monkeypatch.setattr(kbc, "_probe_integrity", probe)
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        assert list(pool.map(opened, range(4))) == [8] * 4
++    assert calls == [db.resolve()]
++
++
++@pytest.mark.parametrize("replacement", ["corrupt", "empty", "healthy"])
++def test_replaced_file_after_preprobe_is_checked_under_lock(tmp_path, monkeypatch, replacement):
++    db = _board(tmp_path)
++    other = tmp_path / "other.db"
++    if replacement == "corrupt":
++        other.write_bytes(b"SQLite format 3\x00" + b"\xff" * 8192)
++    elif replacement == "empty":
++        other.touch()
++    else:
++        with sqlite3.connect(other) as conn:
++            conn.execute("CREATE TABLE preserved(value)")
++            conn.execute("INSERT INTO preserved VALUES (42)")
++    held = observe_lock(monkeypatch, before=lambda path: os.replace(other, db))
++    calls = []
++    guard = kbc._guard_existing_db_is_healthy
++
++    def guarded(path):
++        assert held
++        calls.append(path)
++        return guard(path)
++    monkeypatch.setattr(kbc, "_guard_existing_db_is_healthy", guarded)
++    if replacement == "corrupt":
++        with pytest.raises(kbc.KanbanDbCorruptError) as caught:
++            kbc.connect(db)
++        assert caught.value.backup_path.exists()
++    else:
++        with kbc.connect_closing(db) as conn:
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++            if replacement == "healthy":
++                assert conn.execute("SELECT value FROM preserved").fetchone()[0] == 42
++    assert calls == [db]
++
++
++def test_corruption_only_confirmed_and_backed_up_under_lock(tmp_path, monkeypatch):
++    db = tmp_path / "bad.db"
++    db.write_bytes(b"SQLite format 3\x00" + b"\xff" * 8192)
++    held = observe_lock(monkeypatch)
++    real_probe = kbc._probe_integrity
++    confirm = kbc._confirm_corruption
++    backup = kbc._backup_corrupt_db
++    calls = []
++
++    def probe(path):
++        calls.append(bool(held))
++        return real_probe(path)
++
++    def confirmed(*args):
++        assert held
++        return confirm(*args)
++
++    def backed_up(*args):
++        assert held
++        return backup(*args)
++    monkeypatch.setattr(kbc, "_probe_integrity", probe)
++    monkeypatch.setattr(kbc, "_confirm_corruption", confirmed)
++    monkeypatch.setattr(kbc, "_backup_corrupt_db", backed_up)
++    with pytest.raises(kbc.KanbanDbCorruptError):
++        kbc.connect(db)
++    assert calls == [False, True]
+diff --git a/tests/tools/test_kanban_connect_integrity_stamp.py b/tests/tools/test_kanban_connect_integrity_stamp.py
+deleted file mode 100644
+index dd8b86e9e6..0000000000
+--- a/tests/tools/test_kanban_connect_integrity_stamp.py
++++ /dev/null
+@@ -1,154 +0,0 @@
+-"""A fresh ``hermes kanban`` process must not re-scan the whole board DB, nor queue behind the others that do.
+-
+-Observed on the hub: every ``hermes kanban show/create/archive`` took 9-20 s. cProfile of the installed launcher:
+-9.2 s asleep in ``_cross_process_init_lock`` (another CLI held ``kanban.db.init.lock``) + 2.6 s in
+-``PRAGMA integrity_check`` of the 700 MB board; imports and argparse were under 1.5 s. ``connect()`` ran the full
+-integrity probe once PER PROCESS (the ``_INITIALIZED_PATHS`` cache is in-process) while holding the cross-process lock,
+-so N concurrent CLIs cost N serial scans and the waiters' 10 s bound expired (the hub scaler's 10 s subprocess
+-ceiling, then 30 s, was only the symptom). A clean full check now leaves a verified stamp next to the DB: processes
+-that find a fresh stamp for the same file skip the O(DB) scan.
+-
+-Real subprocesses (not a mocked ``connect``) enter through ``kanban_db_connect.connect`` like the CLI does.
+-"""
+-import json
+-import os
+-import sqlite3
+-import subprocess
+-import sys
+-import time
+-from pathlib import Path
+-
+-import pytest
+-
+-REPO = Path(__file__).resolve().parents[2]
+-
+-CHILD = r"""
+-import os, sys, threading
+-from pathlib import Path
+-from hermes_cli import kanban_db_connect as kbc
+-
+-log = os.environ["CHECK_LOG"]
+-real = kbc._run_integrity_check
+-
+-def counted(conn):
+-    with open(log, "a") as f:
+-        f.write(f"{os.getpid()}\n")
+-    threading.Event().wait(float(os.environ.get("CHECK_SLEEP_S", "0")))  # a slow scan, as on a 700 MB board
+-    return real(conn)
+-
+-kbc._run_integrity_check = counted
+-if "CHECK_TTL_S" in os.environ:
+-    kbc._INTEGRITY_STAMP_TTL_SECONDS = float(os.environ["CHECK_TTL_S"])
+-kbc.connect(Path(sys.argv[1])).close()
+-"""
+-
+-
+-@pytest.fixture
+-def board(tmp_path, monkeypatch):
+-    home = tmp_path / "home"
+-    home.mkdir()
+-    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
+-        monkeypatch.delenv(key, raising=False)
+-    monkeypatch.setenv("HERMES_HOME", str(home))
+-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+-    from hermes_cli import kanban_db_connect as kbc
+-    path = home / "kanban.db"
+-    kbc.init_db(path)
+-    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
+-    return path
+-
+-
+-def _env(tmp_path, board_path, **extra):
+-    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_KANBAN_", "PYTEST"))}
+-    env.update(HERMES_HOME=str(board_path.parent), HERMES_KANBAN_HOME=str(board_path.parent),
+-               CHECK_LOG=str(tmp_path / "checks.log"), PYTHONPATH=str(REPO), **extra)
+-    return env
+-
+-
+-def _spawn(tmp_path, board_path, n, **extra):
+-    env = _env(tmp_path, board_path, **extra)
+-    procs = [subprocess.Popen([sys.executable, "-c", CHILD, str(board_path)], env=env, cwd=REPO,
+-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(n)]
+-    try:
+-        for p in procs:
+-            _out, err = p.communicate(timeout=120)
+-            assert p.returncode == 0, err[-2000:]
+-    finally:
+-        for p in procs:
+-            if p.poll() is None:
+-                p.kill()
+-            p.communicate(timeout=10)
+-    log = tmp_path / "checks.log"
+-    return log.read_text().split() if log.exists() else []
+-
+-
+-def _stamp(board_path):
+-    return board_path.with_name(board_path.name + ".integrity-ok")
+-
+-
+-def test_concurrent_cli_processes_share_one_integrity_check(tmp_path, board):
+-    """Old: every process scanned (6 checks, serialized behind the init lock). Fixed: the first scans, the rest skip."""
+-    checks = _spawn(tmp_path, board, 6, CHECK_SLEEP_S="0.4")
+-    assert len(checks) == 1, checks
+-    assert _stamp(board).exists()
+-
+-
+-def test_next_process_after_a_clean_check_skips_the_scan(tmp_path, board):
+-    assert len(_spawn(tmp_path, board, 1)) == 1
+-    started = time.monotonic()
+-    assert len(_spawn(tmp_path, board, 1, CHECK_SLEEP_S="5")) == 1  # still the first run's single line: no second scan
+-    assert time.monotonic() - started < 5
+-
+-
+-def test_an_expired_stamp_forces_a_fresh_full_check(tmp_path, board):
+-    _spawn(tmp_path, board, 1)
+-    stamp = json.loads(_stamp(board).read_text())
+-    stamp["verified_at"] -= 7 * 3600
+-    _stamp(board).write_text(json.dumps(stamp))
+-    assert len(_spawn(tmp_path, board, 6, CHECK_SLEEP_S="0.4")) == 2
+-
+-
+-def test_a_stamp_for_a_replaced_file_is_ignored(tmp_path, board):
+-    _spawn(tmp_path, board, 1)
+-    data = board.read_bytes()
+-    replacement = board.with_name("kanban.db.restore")
+-    replacement.write_bytes(data)  # allocated while the old file still holds its inode number
+-    for suffix in ("-wal", "-shm"):
+-        Path(str(board) + suffix).unlink(missing_ok=True)
+-    os.replace(replacement, board)  # same bytes, new inode: the stamp vouched for another file
+-    assert len(_spawn(tmp_path, board, 1)) == 2
+-
+-
+-def test_ttl_zero_disables_the_stamp(tmp_path, board):
+-    assert len(_spawn(tmp_path, board, 2, CHECK_TTL_S="0")) == 2
+-    assert not _stamp(board).exists()
+-
+-
+-def test_corruption_is_still_caught_when_the_check_runs_and_never_stamped(tmp_path, board):
+-    from hermes_cli import kanban_db_connect as kbc
+-    conn = sqlite3.connect(board)
+-    conn.execute("CREATE TABLE IF NOT EXISTS pad(x TEXT)")
+-    conn.executemany("INSERT INTO pad VALUES (?)", [("x" * 500,)] * 3000)
+-    conn.commit()
+-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+-    conn.close()
+-    raw = bytearray(board.read_bytes())
+-    for off in range(len(raw) // 2, len(raw) // 2 + 4096, 8):  # smash interior pages: the header stays valid
+-        raw[off] = 0xFF
+-    board.write_bytes(bytes(raw))
+-    for suffix in ("-wal", "-shm"):
+-        Path(str(board) + suffix).unlink(missing_ok=True)
+-    kbc._INITIALIZED_PATHS.discard(str(board.resolve()))
+-    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
+-        kbc.connect(board).close()
+-    assert not _stamp(board).exists()
+-
+-
+-def test_an_unwritable_stamp_never_fails_the_connect(board, monkeypatch):
+-    from hermes_cli import kanban_db_connect as kbc
+-
+-    def refuse(*_a, **_k):
+-        raise OSError("read-only filesystem")
+-    monkeypatch.setattr(kbc.os, "replace", refuse)
+-    kbc._INITIALIZED_PATHS.discard(str(board.resolve()))
+-    kbc.connect(board).close()
+-- 
+2.43.0
+

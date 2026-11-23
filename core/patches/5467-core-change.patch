@@ -1,0 +1,110 @@
+From 3670dc8b4c86b560e991907af8f9e691e5b6378a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:31:44 +0000
+Subject: [PATCH] fix(dashboard): lanes take a free slot without awaiting
+ [daveey]
+
+Second review of #3936: with a free slot, anyio's uncontended
+acquire_on_behalf_of passes a shielded checkpoint, and a native cancel landing
+there makes it release on behalf of the current task instead of the token
+(RuntimeError). The slot stayed borrowed with in_use 0 (e.g. /api/status's
+0.75 s wait_for after a loop stall). _admit now takes a free slot with
+acquire_on_behalf_of_nowait and awaits only a contended wait, whose
+cancellation releases correctly. On the request= path a native cancel absorbed
+by the task group's already-cancelled scope is re-raised (task.cancelling()).
+
+Tests: a cancel 0-4 turns after an uncontended acquire leaves nothing borrowed
+(failed on the previous head); work cancelled before a thread picks it up
+never runs, and a late pickup does nothing.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/web_thread_lanes.py            | 15 +++++++++
+ tests/hermes_cli/test_web_thread_lanes.py | 41 +++++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/hermes_cli/web_thread_lanes.py b/hermes_cli/web_thread_lanes.py
+index 48204ff9ce..3b02919a16 100644
+--- a/hermes_cli/web_thread_lanes.py
++++ b/hermes_cli/web_thread_lanes.py
+@@ -173,6 +173,16 @@ async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, re
+     acquired = False
+     gone = False
+     try:
++        # A free slot is taken without awaiting: anyio's uncontended acquire passes a shielded checkpoint, and a
++        # native cancel landing there makes it release on behalf of the wrong borrower (RuntimeError, slot
++        # leaked). Only a contended wait awaits, and that path releases correctly when cancelled.
++        try:
++            gate.acquire_on_behalf_of_nowait(token)
++            acquired = True
++        except anyio.WouldBlock:
++            pass
++        if acquired:
++            return "ok"
+         with anyio.move_on_after(deadline):
+             if request is None:
+                 await gate.acquire_on_behalf_of(token)
+@@ -194,6 +204,11 @@ async def _admit(gate: anyio.CapacityLimiter, token: object, deadline: float, re
+                     await gate.acquire_on_behalf_of(token)
+                     acquired = True
+                     tg.cancel_scope.cancel()
++                # A native cancel of this task that the task group's own (already cancelled) scope absorbed
++                # must still reach the caller.
++                task = asyncio.current_task()
++                if task is not None and task.cancelling():
++                    raise asyncio.CancelledError()
+     except BaseException:
+         if acquired:
+             gate.release_on_behalf_of(token)
+diff --git a/tests/hermes_cli/test_web_thread_lanes.py b/tests/hermes_cli/test_web_thread_lanes.py
+index ab8e7fd1a3..2d649a67b3 100644
+--- a/tests/hermes_cli/test_web_thread_lanes.py
++++ b/tests/hermes_cli/test_web_thread_lanes.py
+@@ -270,3 +270,44 @@ async def test_an_exception_from_the_work_releases_the_slot():
+     with pytest.raises(ValueError):
+         await lanes.run_in_lane("sessions", boom)
+     assert lanes.stats()["sessions"]["in_use"] == 0 and _borrowed("sessions") == 0
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("turns", range(5))
++async def test_a_cancel_right_after_an_uncontended_acquire_never_leaks_the_slot(turns):
++    # Second review of #3936: with a free slot, a native cancel one loop turn after anyio's uncontended
++    # acquire raised RuntimeError and left the slot borrowed with in_use 0.
++    ran = []
++    task = asyncio.create_task(lanes.run_in_lane("probe", lambda: ran.append(1)))
++    for _ in range(turns):
++        await asyncio.sleep(0)
++    task.cancel()
++    try:
++        await task
++    except asyncio.CancelledError:
++        pass
++    await _until(lambda: lanes.stats()["probe"]["in_use"] == 0)
++    assert _borrowed("probe") == 0
++    assert await asyncio.wait_for(lanes.run_in_lane("probe", lambda: "next"), 2) == "next"
++
++
++@pytest.mark.asyncio
++async def test_work_cancelled_before_a_thread_picks_it_up_never_runs(monkeypatch):
++    picked = []
++    never = asyncio.Event()
++
++    class _SlowPool:
++        @staticmethod
++        async def run_sync(call, limiter=None):
++            picked.append(call)
++            await never.wait()  # no thread has picked it up yet
++
++    monkeypatch.setattr(lanes, "_to_thread", _SlowPool)
++    ran = []
++    task = asyncio.create_task(lanes.run_in_lane("sessions", lambda: ran.append(1)))
++    await _until(lambda: picked)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++    assert lanes.stats()["sessions"]["in_use"] == 0 and _borrowed("sessions") == 0
++    assert picked[0]() is None and ran == []  # a late pickup does nothing
+-- 
+2.43.0
+

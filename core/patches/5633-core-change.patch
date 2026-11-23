@@ -1,0 +1,609 @@
+From 69c9011967fa920a1da596284cc4ac7d713f0a44 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:32:08 +0000
+Subject: [PATCH] perf(worker): overlap catalog fetch and automatic heartbeat
+ I/O [daveey]
+
+---
+ agent/activity_tracking.py                    |   8 +-
+ agent/agent_init.py                           |  21 +--
+ agent/agent_init_output_budget.py             |  20 ++
+ agent/model_metadata.py                       |  48 +----
+ agent/model_metadata_codex_prefetch.py        | 124 ++++++++++++
+ tests/agent/test_codex_catalog_prefetch.py    | 177 ++++++++++++++++++
+ .../tools/test_kanban_heartbeat_background.py |  72 +++++++
+ tools/kanban_heartbeat_background.py          |  37 ++++
+ 8 files changed, 439 insertions(+), 68 deletions(-)
+ create mode 100644 agent/agent_init_output_budget.py
+ create mode 100644 agent/model_metadata_codex_prefetch.py
+ create mode 100644 tests/agent/test_codex_catalog_prefetch.py
+ create mode 100644 tests/tools/test_kanban_heartbeat_background.py
+ create mode 100644 tools/kanban_heartbeat_background.py
+
+diff --git a/agent/activity_tracking.py b/agent/activity_tracking.py
+index f5057fa918..2702114683 100644
+--- a/agent/activity_tracking.py
++++ b/agent/activity_tracking.py
+@@ -77,11 +77,9 @@ class ActivityTrackingMixin:
+         if os.environ.get("HERMES_KANBAN_TASK"):
+             # Never let the bridge break the loop; this guard covers import-time failures.
+             with suppress(Exception):
+-                from tools.kanban_tools import (
+-                    heartbeat_current_worker_from_env, inject_new_comments_from_env,
+-                    inject_soft_deadline_from_env,
+-                )
+-                heartbeat_current_worker_from_env()
++                from tools.kanban_tools import inject_new_comments_from_env, inject_soft_deadline_from_env
++                from tools.kanban_heartbeat_background import heartbeat_in_background
++                heartbeat_in_background()
+                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+                 inject_new_comments_from_env(self)
+                 # Near max_runtime: tell the worker to checkpoint via kanban_continue.
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index b3f155b17e..7770140e75 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -22,6 +22,7 @@ from types import SimpleNamespace
+ from typing import Any, Callable, Dict, List, Optional
+ from urllib.parse import parse_qs, urlparse, urlunparse
+ 
++from agent.agent_init_output_budget import _compressor_max_tokens
+ from agent.context_compressor import ContextCompressor
+ from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
+ from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
+@@ -1754,24 +1755,6 @@ def _select_context_engine(_agent_cfg):
+     return _selected_engine
+ 
+ 
+-def _compressor_max_tokens(agent):
+-    """``agent.max_tokens``, or the native-Gemini adapter default when unset: generateContent
+-    still sends maxOutputTokens=65,535 and the threshold is pct×(window − max_tokens), so
+-    reserving 0 let the provider 400 before compaction fired."""
+-    if agent.max_tokens is not None:
+-        return agent.max_tokens
+-    with suppress(Exception):
+-        from agent.gemini_native_adapter import (
+-            GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
+-        )
+-        _gemini_provider = str(agent.provider or "").strip().lower() in {
+-            "gemini", "google", "google-gemini", "google-ai-studio",
+-        }
+-        if _gemini_provider or is_native_gemini_base_url(agent.base_url):
+-            return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+-    return None
+-
+-
+ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
+     _selected_engine = _select_context_engine(_agent_cfg)
+     if _selected_engine is not None:
+@@ -2128,6 +2111,8 @@ def init_agent(
+     from agent.model_provider_guard import check_model_matches_provider
+     check_model_matches_provider(agent)
+     _init_fallback_chain(agent, fallback_model)
++    from agent.model_metadata_codex_prefetch import prefetch_agent
++    prefetch_agent(agent)
+     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+     _init_session_state(
+         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+diff --git a/agent/agent_init_output_budget.py b/agent/agent_init_output_budget.py
+new file mode 100644
+index 0000000000..ec45c9cd38
+--- /dev/null
++++ b/agent/agent_init_output_budget.py
+@@ -0,0 +1,20 @@
++"""Constructor output-token reservation, including native Gemini defaults."""
++from contextlib import suppress
++
++
++def _compressor_max_tokens(agent):
++    """``agent.max_tokens``, or the native-Gemini adapter default when unset: generateContent
++    still sends maxOutputTokens=65,535 and the threshold is pct×(window − max_tokens), so
++    reserving 0 let the provider 400 before compaction fired."""
++    if agent.max_tokens is not None:
++        return agent.max_tokens
++    with suppress(Exception):
++        from agent.gemini_native_adapter import (
++            GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
++        )
++        _gemini_provider = str(agent.provider or "").strip().lower() in {
++            "gemini", "google", "google-gemini", "google-ai-studio",
++        }
++        if _gemini_provider or is_native_gemini_base_url(agent.base_url):
++            return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
++    return None
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 2f38868cc0..4a562c8fa5 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -1829,51 +1829,9 @@ def _remember_no_codex_catalog(cache_key: str) -> None:
+ 
+ 
+ def _fetch_codex_oauth_context_lengths_with_source(access_token: str, base_url: str = "") -> tuple[dict[str, int], bool]:
+-    """Account-scoped catalogue context lengths and HTTP freshness; also retain max-context and
+-    speed metadata. In-process hits report False and must not drive persistent writes."""
+-    if not _codex_catalog_probe_allowed(access_token, base_url):
+-        return {}, False
+-    now = time.time()
+-    cache_key = _codex_oauth_token_fingerprint(access_token, base_url)
+-    cached = _codex_oauth_context_cache.get(cache_key)
+-    if cached is not None and now - cached[1] < _CODEX_OAUTH_CONTEXT_CACHE_TTL:
+-        return cached[0], False
+-    # Without ChatGPT-Account-ID /backend-api/codex/models returns ``{"models":[]}`` (HTTP 200) and
+-    # the probe silently falls back; residency-enforced workspaces 401 without the residency header.
+-    from agent.codex_headers import codex_account_headers
+-    headers = {"Authorization": f"Bearer {access_token}", **codex_account_headers(access_token)}
+-    try:
+-        entries, status = fetch_codex_catalog_entries(
+-            lambda url: model_metadata_http.get(url, headers=headers, timeout=(5, 10), verify=model_metadata_http.resolve_verify()),
+-            base_url=base_url,
+-        )
+-        if status != 200:
+-            logger.debug("Codex /models probe returned HTTP %s; falling back to hardcoded defaults", status)
+-            _remember_no_codex_catalog(cache_key)
+-            return {}, False
+-    except Exception as exc:
+-        logger.debug("Codex /models probe failed: %s", exc)
+-        _remember_no_codex_catalog(cache_key)
+-        return {}, False
+-    from agent.codex_service_tiers import remember_catalog
+-    remember_catalog(cache_key, entries)
+-    result: dict[str, int] = {}
+-    max_result: dict[str, int] = {}
+-    for item in entries:
+-        slug, ctx, max_ctx = (item.get("slug"), item.get("context_window"), item.get("max_context_window")) if isinstance(item, dict) else (None, None, None)
+-        if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
+-            result[slug.strip()] = ctx
+-            if isinstance(max_ctx, int) and max_ctx > 0:
+-                max_result[slug.strip()] = max_ctx
+-    if not result:
+-        _remember_no_codex_catalog(cache_key)
+-        return {}, False
+-    # Max first: a reader that sees the fresh context entry must also see its cap.
+-    with MEMO_LOCK:
+-        bound_codex_caches(cache_key)
+-        _codex_oauth_max_context_cache[cache_key] = max_result
+-        _codex_oauth_context_cache[cache_key] = (result, now)
+-    return result, True
++    """Coalesce a concurrent boot prefetch; do not cache beyond the existing metadata TTL."""
++    from agent.model_metadata_codex_prefetch import fetch, resolve
++    return resolve(access_token, base_url, fetch)
+ 
+ 
+ def _codex_catalog_key(keys, slug: str) -> Optional[str]:
+diff --git a/agent/model_metadata_codex_prefetch.py b/agent/model_metadata_codex_prefetch.py
+new file mode 100644
+index 0000000000..9fed9a7dbd
+--- /dev/null
++++ b/agent/model_metadata_codex_prefetch.py
+@@ -0,0 +1,124 @@
++"""Overlap cold Codex catalog I/O with independent boot work, without stale metadata.
++
++Only in-flight requests are shared. The existing metadata function owns authentication,
++route checks, TTLs, negative results, caps and service-tier publication.
++"""
++from concurrent.futures import Future
++import logging
++import threading
++from agent.memory_provider import spawn_context_thread
++
++logger = logging.getLogger(__name__)
++
++
++def fetch(access_token: str, base_url: str = "") -> tuple[dict[str, int], bool]:
++    """Existing account-scoped fetch; all cache/security seams remain on model_metadata."""
++    from agent import model_metadata as mm
++    if not mm._codex_catalog_probe_allowed(access_token, base_url):
++        return {}, False
++    now = mm.time.time()
++    cache_key = mm._codex_oauth_token_fingerprint(access_token, base_url)
++    cached = mm._codex_oauth_context_cache.get(cache_key)
++    if cached is not None and now - cached[1] < mm._CODEX_OAUTH_CONTEXT_CACHE_TTL:
++        return cached[0], False
++    # Workspace account/residency headers must accompany the selected credential.
++    from agent.codex_headers import codex_account_headers
++    headers = {"Authorization": f"Bearer {access_token}", **codex_account_headers(access_token)}
++    try:
++        entries, status = mm.fetch_codex_catalog_entries(
++            lambda url: mm.model_metadata_http.get(url, headers=headers, timeout=(5, 10), verify=mm.model_metadata_http.resolve_verify()),
++            base_url=base_url,
++        )
++        if status != 200:
++            logger.debug("Codex /models probe returned HTTP %s; falling back to hardcoded defaults", status)
++            mm._remember_no_codex_catalog(cache_key)
++            return {}, False
++    except Exception:
++        logger.debug("Codex /models probe failed", exc_info=True)
++        mm._remember_no_codex_catalog(cache_key)
++        return {}, False
++    from agent.codex_service_tiers import remember_catalog
++    remember_catalog(cache_key, entries)
++    result: dict[str, int] = {}
++    max_result: dict[str, int] = {}
++    for item in entries:
++        slug, ctx, max_ctx = (item.get("slug"), item.get("context_window"), item.get("max_context_window")) if isinstance(item, dict) else (None, None, None)
++        if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
++            result[slug.strip()] = ctx
++            if isinstance(max_ctx, int) and max_ctx > 0:
++                max_result[slug.strip()] = max_ctx
++    if not result:
++        mm._remember_no_codex_catalog(cache_key)
++        return {}, False
++    # Max first: a reader that sees the fresh context entry must also see its cap.
++    with mm.MEMO_LOCK:
++        mm.bound_codex_caches(cache_key)
++        mm._codex_oauth_max_context_cache[cache_key] = max_result
++        mm._codex_oauth_context_cache[cache_key] = (result, now)
++    return result, True
++
++_lock = threading.Lock()
++_inflight: dict[str, Future] = {}
++
++
++def resolve(token, base_url, fetch):
++    """Join the same token/endpoint request or perform it with the existing fetcher."""
++    from agent.model_metadata import _codex_oauth_token_fingerprint
++    key = _codex_oauth_token_fingerprint(token, base_url)
++    with _lock:
++        pending = _inflight.get(key)
++        owner = pending is None
++        if owner:
++            pending = _inflight[key] = Future()
++    if not owner:
++        return pending.result()[0], False
++    try:
++        result = fetch(token, base_url)
++        pending.set_result(result)
++        return result
++    except BaseException as exc:
++        pending.set_exception(exc)
++        raise
++    finally:
++        with _lock:
++            if _inflight.get(key) is pending:
++                del _inflight[key]
++
++
++def prefetch(token, base_url):
++    """Start one daemon request with this caller's profile, TLS and secret scope."""
++    result = Future()
++
++    def run():
++        from agent.model_metadata import _fetch_codex_oauth_context_lengths_with_source
++        try:
++            result.set_result(_fetch_codex_oauth_context_lengths_with_source(token, base_url))
++        except BaseException as exc:
++            logger.debug('catalog prefetch failed', exc_info=True)
++            result.set_exception(exc)
++
++    spawn_context_thread(run, name='codex-catalog-prefetch').start()
++    return result
++
++
++def prefetch_agent(agent):
++    """Only after credential selection; pinned/ambiguous routes keep their old lazy path."""
++    if agent.provider != 'openai-codex' or not agent.api_key:
++        return
++    try:
++        from hermes_cli.config import load_config_readonly
++        config = load_config_readonly()
++        model = config.get('model') or {}
++        if not isinstance(model, dict) or model.get('context_length') is not None or config.get('custom_providers'):
++            return
++    except Exception:
++        logger.debug('catalog prefetch configuration unavailable', exc_info=True)
++        return  # This is optional overlap, never a new startup failure.
++    try:
++        return prefetch(agent.api_key, agent.base_url)
++    except (RuntimeError, OSError) as exc:
++        from hermes_cli.worker_drain_fence import DrainRefused
++        if isinstance(exc, DrainRefused):
++            raise  # Optional overlap must not bypass physical-custody admission.
++        logger.debug('catalog prefetch could not start; using synchronous resolution', exc_info=True)
++        return None
+diff --git a/tests/agent/test_codex_catalog_prefetch.py b/tests/agent/test_codex_catalog_prefetch.py
+new file mode 100644
+index 0000000000..4eee602323
+--- /dev/null
++++ b/tests/agent/test_codex_catalog_prefetch.py
+@@ -0,0 +1,177 @@
++"""Cold agent boot overlaps the *same* authenticated catalog request, never stale context."""
++import concurrent.futures
++import threading
++from types import SimpleNamespace
++
++
++def test_prefetch_and_context_resolution_share_one_fresh_request(monkeypatch):
++    from agent import model_metadata as mm
++    from agent.model_metadata_codex_prefetch import prefetch
++
++    entered, release = threading.Event(), threading.Event()
++    calls = []
++    token = 'fake-codex-prefetch-test'
++    monkeypatch.setattr(mm, '_codex_catalog_probe_allowed', lambda *_: True)
++    monkeypatch.setattr(mm, '_codex_oauth_context_cache', {})
++    monkeypatch.setattr(mm, '_codex_oauth_max_context_cache', {})
++    monkeypatch.setattr('agent.codex_headers.codex_account_headers', lambda _: {})
++
++    def get(url, **kwargs):
++        calls.append((url, kwargs['headers']['Authorization']))
++        entered.set()
++        assert release.wait(5)
++        return SimpleNamespace(status_code=200, json=lambda: {'models': [
++            {'slug': 'prefetch-model', 'context_window': 123456, 'max_context_window': 234567}]})
++
++    monkeypatch.setattr(mm.model_metadata_http, 'get', get)
++    future = prefetch(token, 'https://chatgpt.com/backend-api/codex')
++    assert entered.wait(5)
++    try:
++        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
++            resolution = executor.submit(mm._fetch_codex_oauth_context_lengths_with_source,
++                                         token, 'https://chatgpt.com/backend-api/codex')
++            release.set()
++            assert resolution.result(5)[0] == {'prefetch-model': 123456}
++        assert future.result(5)[0] == {'prefetch-model': 123456}
++        assert len(calls) == 1
++        assert calls[0][1] == 'Bearer ' + token
++        key = mm._codex_oauth_token_fingerprint(token, 'https://chatgpt.com/backend-api/codex')
++        assert mm._codex_oauth_max_context_cache[key] == {'prefetch-model': 234567}
++    finally:
++        release.set()
++        future.result(5)
++
++
++def test_agent_prefetch_uses_final_route_before_tools(monkeypatch):
++    from agent.model_metadata_codex_prefetch import prefetch_agent
++
++    agent = SimpleNamespace(provider='openai-codex', api_key='selected-token',
++                            base_url='https://chatgpt.com/backend-api/codex')
++    calls = []
++    monkeypatch.setattr('hermes_cli.config.load_config_readonly', dict)
++    monkeypatch.setattr('agent.model_metadata_codex_prefetch.prefetch',
++                        lambda token, base: calls.append((token, base)))
++    prefetch_agent(agent)
++    assert calls == [(agent.api_key, agent.base_url)]
++    # Keep source-order coverage behavioral: the real constructor must reach tool
++    # discovery while its selected account's HTTP request is still in flight.
++
++
++def test_real_constructor_overlaps_catalog_with_tools(monkeypatch):
++    from unittest.mock import patch
++    from agent import model_metadata as mm
++    from run_agent import AIAgent
++
++    entered, release = threading.Event(), threading.Event()
++    calls = []
++    monkeypatch.setattr(mm, '_codex_catalog_probe_allowed', lambda *_: True)
++    monkeypatch.setattr(mm, '_codex_oauth_context_cache', {})
++    monkeypatch.setattr(mm, '_codex_oauth_max_context_cache', {})
++    monkeypatch.setattr('agent.codex_headers.codex_account_headers', lambda _: {})
++
++    def get(url, **kwargs):
++        calls.append(kwargs['headers']['Authorization'])
++        entered.set()
++        assert release.wait(5)
++        return SimpleNamespace(status_code=200, json=lambda: {'models': [
++            {'slug': 'gpt-5.5', 'context_window': 123456, 'max_context_window': 234567}]})
++
++    overlap = []
++    def tools(*args, **kwargs):
++        try:
++            overlap.append(entered.wait(5))
++        finally:
++            release.set()
++        return []
++
++    monkeypatch.setattr(mm.model_metadata_http, 'get', get)
++    with (patch('hermes_cli.config.load_config', return_value={}),
++          patch('hermes_cli.config.load_config_readonly', return_value={}),
++          patch('model_tools.get_tool_definitions', side_effect=tools),
++          patch('model_tools.check_toolset_requirements', return_value={}),
++          patch('agent.process_bootstrap.OpenAI')):
++        try:
++            agent = AIAgent(model='gpt-5.5', provider='openai-codex', api_key='selected-account',
++                            base_url='https://chatgpt.com/backend-api/codex',
++                            quiet_mode=True, skip_context_files=True, skip_memory=True)
++            assert agent.context_compressor.context_length == 123456
++            assert agent.api_key == 'selected-account'
++            assert overlap == [True], 'tools did not overlap the live catalog request'
++            assert calls == ['Bearer selected-account']
++        finally:
++            release.set()
++
++
++def test_pinned_non_codex_and_ambiguous_config_do_not_prefetch(monkeypatch):
++    from agent.model_metadata_codex_prefetch import prefetch_agent
++    calls = []
++    monkeypatch.setattr('agent.model_metadata_codex_prefetch.prefetch', lambda *args: calls.append(args))
++    for provider, key, config in [
++        ('anthropic', 'account', {}), ('openai-codex', '', {}),
++        ('openai-codex', 'account', {'model': {'context_length': 123456}}),
++        ('openai-codex', 'account', {'model': 'legacy-model'}),
++        ('openai-codex', 'account', {'custom_providers': [{'name': 'private'}]}),
++    ]:
++        monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda: config)
++        assert prefetch_agent(SimpleNamespace(provider=provider, api_key=key, base_url='https://example.test')) is None
++    assert calls == []
++
++
++def test_singleflight_is_scoped_to_token_and_endpoint_and_recovers_after_error():
++    import pytest
++    from agent.model_metadata_codex_prefetch import resolve, _inflight
++
++    calls = []
++    def fetch(token, base):
++        calls.append((token, base))
++        return {token + base: 100}, True
++    assert resolve('a', 'https://one', fetch) == ({'ahttps://one': 100}, True)
++    assert resolve('b', 'https://one', fetch) == ({'bhttps://one': 100}, True)
++    assert resolve('a', 'https://two', fetch) == ({'ahttps://two': 100}, True)
++    # Completed requests are not an additional/stale cache.
++    assert resolve('a', 'https://one', fetch) == ({'ahttps://one': 100}, True)
++    assert len(calls) == 4
++    def broken(*args):
++        raise OSError('fixture outage')
++    with pytest.raises(OSError, match='fixture outage'):
++        resolve('a', 'https://one', broken)
++    assert not _inflight
++    assert resolve('a', 'https://one', fetch) == ({'ahttps://one': 100}, True)
++
++
++def test_prefetch_copies_profile_context_and_retains_failure(monkeypatch):
++    import contextvars
++    import pytest
++    from agent import model_metadata as mm
++    from agent.model_metadata_codex_prefetch import prefetch
++    scope = contextvars.ContextVar('catalog-test-scope')
++    token = scope.set(('secondary-profile', 'selected-credential'))
++    observed = []
++    def fetch(*args):
++        observed.append(scope.get())
++        raise OSError('fixture outage')
++    monkeypatch.setattr(mm, '_fetch_codex_oauth_context_lengths_with_source', fetch)
++    try:
++        with pytest.raises(OSError, match='fixture outage'):
++            prefetch('selected', 'https://one').result(5)
++        assert observed == [('secondary-profile', 'selected-credential')]
++    finally:
++        scope.reset(token)
++
++
++def test_optional_prefetch_start_failure_falls_back_but_drain_refusal_propagates(monkeypatch):
++    import pytest
++    from agent.model_metadata_codex_prefetch import prefetch_agent
++    from hermes_cli.worker_drain_fence import DrainRefused
++    agent = SimpleNamespace(provider='openai-codex', api_key='selected-token',
++                            base_url='https://chatgpt.com/backend-api/codex')
++    monkeypatch.setattr('hermes_cli.config.load_config_readonly', dict)
++    for error in (RuntimeError('cannot start thread'), OSError('resource unavailable')):
++        def unavailable(*args, **kwargs):
++            raise error
++        monkeypatch.setattr('agent.model_metadata_codex_prefetch.spawn_context_thread', unavailable)
++        assert prefetch_agent(agent) is None
++    monkeypatch.setattr('agent.model_metadata_codex_prefetch.spawn_context_thread',
++                        lambda *args, **kwargs: (_ for _ in ()).throw(DrainRefused('draining')))
++    with pytest.raises(DrainRefused):
++        prefetch_agent(agent)
+diff --git a/tests/tools/test_kanban_heartbeat_background.py b/tests/tools/test_kanban_heartbeat_background.py
+new file mode 100644
+index 0000000000..405177a37c
+--- /dev/null
++++ b/tests/tools/test_kanban_heartbeat_background.py
+@@ -0,0 +1,72 @@
++"""Auto liveness I/O must not block the agent's first user message."""
++import contextvars
++import threading
++
++
++def test_auto_heartbeat_does_not_wait_and_keeps_run_context(monkeypatch):
++    from tools import kanban_tools as kt
++    from tools.kanban_heartbeat_background import heartbeat_in_background
++
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    scope = contextvars.ContextVar('heartbeat-test-scope', default=None)
++    token = scope.set(('profile', 'task', 'run', 'owner'))
++    calls = []
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: True)
++    monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++
++    def heartbeat():
++        try:
++            calls.append(scope.get())
++            entered.set()
++            assert release.wait(5)
++        finally:
++            finished.set()
++
++    monkeypatch.setattr(kt, 'heartbeat_current_worker_from_env', heartbeat)
++    try:
++        worker = heartbeat_in_background()
++        assert entered.wait(5)
++        assert not finished.is_set(), 'scheduling waited for the network call'
++        assert heartbeat_in_background() is None
++        release.set()
++        worker.join(5)
++        assert not worker.is_alive()
++        assert calls == [('profile', 'task', 'run', 'owner')]
++    finally:
++        release.set()
++        if 'worker' in locals() and worker is not None:
++            worker.join(5)
++        scope.reset(token)
++
++
++def test_delegates_and_rate_limited_activity_schedule_nothing(monkeypatch):
++    import time
++    from tools import kanban_tools as kt
++    from tools.kanban_heartbeat_background import heartbeat_in_background
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: False)
++    monkeypatch.setattr(kt, 'heartbeat_current_worker_from_env', lambda: (_ for _ in ()).throw(AssertionError('not owner')))
++    assert heartbeat_in_background() is None
++    monkeypatch.setattr(kt, '_is_dispatcher_owned_worker', lambda: True)
++    monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', time.monotonic())
++    assert heartbeat_in_background() is None
++    monkeypatch.delenv('HERMES_KANBAN_TASK')
++    monkeypatch.setattr(kt, '_auto_heartbeat_last_attempt', 0)
++    assert heartbeat_in_background() is None
++
++
++def test_activity_calls_background_bridge_and_keeps_operator_injection(monkeypatch):
++    from types import SimpleNamespace
++    from agent.activity_tracking import ActivityTrackingMixin
++    calls = []
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 'task')
++    monkeypatch.setattr('tools.kanban_heartbeat_background.heartbeat_in_background', lambda: calls.append('background'))
++    monkeypatch.setattr('tools.kanban_tools.heartbeat_current_worker_from_env',
++                        lambda: (_ for _ in ()).throw(AssertionError('synchronous heartbeat')))
++    monkeypatch.setattr('tools.kanban_tools.inject_new_comments_from_env', lambda agent: calls.append('comments'))
++    monkeypatch.setattr('tools.kanban_tools.inject_soft_deadline_from_env', lambda agent: calls.append('deadline'))
++    agent = SimpleNamespace(_persist_session_activity_if_due=lambda: calls.append('activity'))
++    ActivityTrackingMixin._touch_activity(agent, 'starting')
++    assert calls == ['background', 'comments', 'deadline', 'activity']
++    assert agent._last_activity_desc == 'starting'
+diff --git a/tools/kanban_heartbeat_background.py b/tools/kanban_heartbeat_background.py
+new file mode 100644
+index 0000000000..bf7be97c75
+--- /dev/null
++++ b/tools/kanban_heartbeat_background.py
+@@ -0,0 +1,37 @@
++"""Observation-only automatic heartbeat: bounded single-flight, never on the turn thread.
++
++Explicit heartbeat/lifecycle tools remain synchronous. The existing writer rechecks
++run/claim/owner fences using the caller's copied context before extending anything.
++"""
++from agent.memory_provider import spawn_context_thread
++import logging
++import os
++import threading
++import time
++
++_lock = threading.Lock()
++_worker = None
++logger = logging.getLogger(__name__)
++
++
++def heartbeat_in_background():
++    """Schedule at most one automatic heartbeat; return its thread for bounded teardown."""
++    global _worker
++    from tools import kanban_tools as kt
++    if not os.environ.get('HERMES_KANBAN_TASK') or not kt._is_dispatcher_owned_worker():
++        return None
++    with _lock:
++        if _worker is not None and _worker.is_alive():
++            return None
++        if time.monotonic() - kt._auto_heartbeat_last_attempt < kt._AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
++            return None
++
++        def run():
++            try:
++                kt.heartbeat_current_worker_from_env()
++            except Exception:
++                logger.debug('automatic worker heartbeat failed', exc_info=True)
++
++        _worker = spawn_context_thread(run, name='kanban-auto-heartbeat')
++        _worker.start()
++        return _worker
+-- 
+2.43.0
+

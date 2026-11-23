@@ -1,0 +1,226 @@
+From a672e6b8775021e8e22ae17b9589a2fa1362d39c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:22:44 +0000
+Subject: [PATCH] [daveey] SessionDB finalizer never waits for
+ sqlite_safe_read._live_lock
+
+CI hung 600 s after a passing test (PR #4046 job 137264310241): main thread in
+SessionDB.__del__ -> close -> registry release -> _TrackingMixin.close ->
+`with _live_lock`. Only the main thread had a Python stack, so the lock owner was
+another thread that never released it (a daemon frozen at interpreter teardown,
+same family as 5a72af2525). _live_lock is an RLock, so this was not same-thread
+reentrancy.
+
+Fix: SessionDB.__del__ runs close() inside sqlite_safe_read.finalizer_close().
+In that scope _TrackingMixin.close takes _live_lock non-blocking; if it is held
+it queues the connection in _deferred_closes, which the next registry operation
+(_apply_releases, under the lock) closes. Explicit close() is unchanged.
+
+Proof: tests/hermes_state/test_finalizer_live_lock.py. RED on origin/main
+(in-process finalizer blocks 5 s; real-interpreter exit with a daemon owning
+_live_lock times out at 30 s), GREEN after. 42 files / 2150 tests of all
+sqlite_safe_read consumers + registry finalization + the CI file pass;
+scripts/check ok. Detection gap: the earlier finalizer fix covered only the
+import lock, not _live_lock.
+---
+ hermes_cli/sqlite_safe_read.py                |  31 ++++++
+ hermes_state.py                               |   4 +-
+ .../hermes_state/test_finalizer_live_lock.py  | 104 ++++++++++++++++++
+ 3 files changed, 138 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_state/test_finalizer_live_lock.py
+
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 3347ef39ef..71d2480f5a 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -31,6 +31,11 @@ _live_connections: dict[str, int] = {}
+ # garbage collection) and applied under _live_lock by the next registry read. Lock-free on purpose:
+ # a collection can run while any lock is held, so it must never wait for _live_lock.
+ _released: deque[str] = deque()
++# Connections whose finalizer-time close() could not take _live_lock without waiting (another thread holds it, or
++# was frozen holding it at interpreter teardown). Closed by the next registry operation that holds the lock.
++_deferred_closes: deque = deque()
++# Set while a garbage-collection finalizer (SessionDB.__del__) closes: such a close must never block on _live_lock.
++_finalizer_state = threading.local()
+ # Private, randomised name so no caller overloads it by accident (that would free the release
+ # object early, while the connection is still open).
+ _RELEASE_FUNCTION = f"_hermes_release_{secrets.token_hex(8)}"
+@@ -89,10 +94,31 @@ def untrack_connection(path: Path | str) -> None:
+ 
+ def _apply_releases() -> None:
+     """Untrack every connection SQLite has finished closing (caller holds ``_live_lock``)."""
++    while _deferred_closes:
++        conn = _deferred_closes.popleft()
++        try:
++            sqlite3.Connection.close(conn)
++        except Exception:  # e.g. cross-thread ProgrammingError: the entry stays, as for any failed close
++            logger.debug("Deferred connection close failed", exc_info=True)
++        else:
++            conn._hermes_tracked_path = None
+     while _released:
+         _track_key(_released.popleft(), -1)
+ 
+ 
++@contextlib.contextmanager
++def finalizer_close():
++    """Mark closes on this thread as running inside a finalizer: :class:`_TrackingMixin` then never waits
++    for ``_live_lock`` (a collection can run while another thread holds it, or after that thread was
++    frozen at interpreter teardown) and defers the close to the next registry operation instead."""
++    previous = getattr(_finalizer_state, "active", False)
++    _finalizer_state.active = True
++    try:
++        yield
++    finally:
++        _finalizer_state.active = previous
++
++
+ class _ReleaseOnClose:
+     """Registered as a SQL function on each tracked connection, so SQLite holds the only reference.
+     SQLite frees a connection's functions after it has closed the database files (btrees first,
+@@ -149,6 +175,11 @@ class _TrackingMixin:
+     _hermes_tracked_path: str | None = None
+ 
+     def close(self) -> None:  # type: ignore[misc]
++        if getattr(_finalizer_state, "active", False):
++            if not _live_lock.acquire(blocking=False):
++                _deferred_closes.append(self)
++                return
++            _live_lock.release()  # we own it now (reentrant): the ``with`` below cannot block
+         with _live_lock:
+             super().close()  # type: ignore[misc]
+             self._hermes_tracked_path = None
+diff --git a/hermes_state.py b/hermes_state.py
+index 1e64592dae..ac93fe4be2 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -74,6 +74,7 @@ from hermes_state_dbfile import (
+     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
+ )
+ from hermes_state_messages import SessionMessagesMixin
++from hermes_cli.sqlite_safe_read import finalizer_close as _finalizer_close  # bound now: __del__ must not import
+ from hermes_state_prune_rewrite import SessionPruneRewriteMixin
+ from hermes_state_api_content import SessionApiContentMixin
+ from hermes_state_coverage import SessionCoverageMixin
+@@ -1777,7 +1778,8 @@ class SessionDB(
+         guarded: module teardown order is undefined."""
+         if self.__dict__.get("_conn") is not None:
+             try:
+-                self.close()
++                with _finalizer_close():
++                    self.close()
+             except Exception:
+                 pass
+ 
+diff --git a/tests/hermes_state/test_finalizer_live_lock.py b/tests/hermes_state/test_finalizer_live_lock.py
+new file mode 100644
+index 0000000000..6e1affcd74
+--- /dev/null
++++ b/tests/hermes_state/test_finalizer_live_lock.py
+@@ -0,0 +1,104 @@
++"""SessionDB.__del__ must never wait for sqlite_safe_read._live_lock.
++
++CI hung 600 s after a passing test: the main thread sat in __del__ -> close ->
++_TrackingMixin.close -> ``with _live_lock`` while another thread owned the lock
++(a daemon frozen at interpreter teardown can own it forever).
++"""
++
++import subprocess
++import sys
++import textwrap
++import threading
++from pathlib import Path
++
++from hermes_cli import sqlite_safe_read as safe
++from hermes_state import SessionDB
++
++
++def _hold_live_lock():
++    held, release = threading.Event(), threading.Event()
++
++    def holder():
++        with safe._live_lock:
++            held.set()
++            release.wait(30)
++
++    thread = threading.Thread(target=holder, daemon=True)
++    thread.start()
++    assert held.wait(10)
++    return release, thread
++
++
++def test_finalizer_does_not_wait_for_live_lock_held_by_another_thread(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    path = db.db_path
++    release, holder = _hold_live_lock()
++    finished = threading.Event()
++
++    def finalize():
++        db.__del__()
++        finished.set()
++
++    runner = threading.Thread(target=finalize, daemon=True)
++    runner.start()
++    try:
++        assert finished.wait(5), "SessionDB.__del__ blocked on _live_lock"
++    finally:
++        release.set()
++        holder.join(10)
++        runner.join(10)
++    # The deferred close lands on the next registry operation.
++    assert safe.has_live_connection(path) is False
++
++
++def test_explicit_close_still_waits_for_live_lock(tmp_path):
++    """Only finalizers skip the wait: close() keeps its \"unregister under the lock\" contract."""
++    db = SessionDB(tmp_path / "state.db")
++    release, holder = _hold_live_lock()
++    finished = threading.Event()
++
++    def close():
++        db.close()
++        finished.set()
++
++    runner = threading.Thread(target=close, daemon=True)
++    runner.start()
++    try:
++        assert not finished.wait(0.5)
++    finally:
++        release.set()
++        holder.join(10)
++    assert finished.wait(10)
++    runner.join(10)
++
++
++_EXIT_PROBE = """
++import sys, threading
++from pathlib import Path
++from hermes_cli import sqlite_safe_read as safe
++import hermes_state
++
++import types
++holder = types.ModuleType('hermes_probe_holder')  # cleared with sys.modules at teardown, so __del__ runs then
++holder.db = hermes_state.SessionDB(Path(sys.argv[1]) / 'state.db')
++sys.modules['hermes_probe_holder'] = holder
++del holder
++held = threading.Event()
++def hold():
++    with safe._live_lock:
++        held.set()
++        threading.Event().wait()
++threading.Thread(target=hold, daemon=True).start()
++assert held.wait(10)
++print('main-returning', flush=True)
++"""
++
++
++def test_interpreter_exit_does_not_hang_when_a_daemon_owns_live_lock(tmp_path):
++    result = subprocess.run(
++        [sys.executable, "-c", textwrap.dedent(_EXIT_PROBE), str(tmp_path)],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
++    )
++    assert "main-returning" in result.stdout, result.stderr
++    assert result.returncode == 0, result.stderr
+-- 
+2.43.0
+

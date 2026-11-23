@@ -1,0 +1,233 @@
+From 749ea86d9e290fd0ff52ce601651493d5aa86d69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:24:37 +0000
+Subject: [PATCH] fix(kanban): retire refused parent identities without retry
+ fanout [daveey]
+
+Problem: PR3913's first review correction kept a permanently refused synthetic
+parent under one cached op ID forever, and new child rows during materialized
+parent backoff synthesized competing full-row retries.
+
+Why1: permanent rejection preserved the uncertain-send envelope even though the
+server returned a definitive verdict; Worker applied_ops recalls that rejection.
+Why2: _unacked_parents counted only selected parent rows, not pending backoff rows.
+Root(happened): uncertain transport custody was conflated with definitive refusal,
+and pending retry ownership was scoped to the current batch instead of the outbox.
+Root(not caught): the original eight-round fake did not cache rejection receipts
+and did not add children while the parent retry was in backoff.
+Recurrence: corrections to reviewer6004212104 were incomplete; re-review
+6004316360/6004319562 supplied the missing behavior probes.
+
+Countermeasures:
+- retire any definitively refused synthetic envelope without growing rejected
+  parent rows or diagnostic children; keep uncertain retries immutable.
+- pending task retries suppress duplicate parent synthesis even while backed off.
+- receipt-caching recovery and new-child/backoff tests: RED3 on a92a1edb68;
+  GREEN797 in 11 focused files after correction, full21 check suite GREEN.
+
+Known OPEN review finding3: immutable retry can carry stale wake status after a
+completion arrives. Altering its payload conflicts with the agreed exact-byte
+contract; authoritative terminal event-order arbitration needs the owning
+orchestrator's source-contract disposition. This commit does not waive that
+finding, approve the PR, land it, or claim overall replay safety.
+---
+ hermes_cli/kanban_sync_client.py              |  5 +-
+ hermes_cli/kanban_sync_compat.py              |  9 +-
+ .../test_kanban_sync_envelope_edges.py        |  2 +-
+ ...kanban_sync_envelope_rejection_recovery.py | 94 +++++++++++++++++++
+ .../test_kanban_sync_forbidden_field.py       | 12 ++-
+ 5 files changed, 114 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_envelope_rejection_recovery.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 122eca0c75..397d706151 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -627,7 +627,10 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     if not any(r["table_name"] != "tasks" for r in rows):
+         return []
+     in_batch = {r["row_uid"] for r in rows if r["table_name"] == "tasks"}
+-    # Only omission custody suppresses resynthesis; ordinary parent backoff retains its old path.
++    # A materialized parent owns its retry even during backoff. New children must
++    # not synthesize a competing full-row upsert while that retry is pending.
++    in_batch.update(r[0] for r in conn.execute(
++        "SELECT row_uid FROM kanban_sync_outbox WHERE table_name='tasks' AND state='pending' AND op!='release'"))
+     in_batch.update(r[0] for r in conn.execute(
+         "SELECT row_uid FROM kanban_sync_omissions WHERE table_name='tasks' AND state!='delivered'"))
+     from hermes_cli.kanban_sync_reserved_key import replacement_children
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index f8a68bd11d..1f127d59c9 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -23,13 +23,14 @@ def rejected_parent(conn: sqlite3.Connection, parents: list[tuple[dict, str]], r
+         if result.get("status") != "rejected":
+             return None
+         from hermes_cli.kanban_sync_client import transient_rejection
++        # Every explicit rejection is definitive, unlike a lost answer. Its cached
++        # verdict must not poison the next synthesis after the refusal cause lifts.
++        retire_parent(conn, tid)
+         if result.get("reason") != "forbidden_field" and not transient_rejection(result):
+-            # Permanent refusals keep their frozen identity, as do uncertain sends.
+-            # Materializing one here would add a rejected row (and live_claim event)
+-            # each time pending children ask for their still-unacknowledged parent.
++            # Do not materialize permanent refusals as rejected rows/diagnostic
++            # children: that grows one new row per pending-child round.
+             return None
+         # Only recoverable/schema refusals enter the existing bounded remap path.
+-        retire_parent(conn, tid)
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, hlc, created_at) "
+             "VALUES (?, 'tasks', ?, 'upsert', ?, ?, ?)",
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope_edges.py b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+index 544b6d8678..9146f6afb7 100644
+--- a/tests/hermes_cli/test_kanban_sync_envelope_edges.py
++++ b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+@@ -66,7 +66,7 @@ def test_synthetic_parent_rejection_does_not_accumulate_across_rounds(board, mon
+         assert rows[0]["attempts"] == 8
+     else:
+         assert not rows
+-        assert len({next(op["client_op_id"] for op in wire if op["table"] == "tasks") for wire in batches}) == 1
++        assert len({next(op["client_op_id"] for op in wire if op["table"] == "tasks") for wire in batches}) == 8
+     assert len({len(wire) for wire in batches}) == 1
+     assert not conn.execute("SELECT 1 FROM task_events WHERE kind='sync_rejected'").fetchone()
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope_rejection_recovery.py b/tests/hermes_cli/test_kanban_sync_envelope_rejection_recovery.py
+new file mode 100644
+index 0000000000..6683449696
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_envelope_rejection_recovery.py
+@@ -0,0 +1,94 @@
++"""Receipt-aware refusal recovery and bounded parent custody. [daveey]"""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_sync_envelope as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize("reason", ["live_claim", "invalid"])
++def test_definitive_parent_refusal_retires_receipt_identity(board, monkeypatch, reason):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    receipts, known, parent_ids = {}, set(), []
++    refusing = [True]
++
++    def ops(_board, wire):
++        results = []
++        for op in wire:
++            cid = op["client_op_id"]
++            if cid not in receipts:
++                if op["table"] == "tasks":
++                    if refusing[0]:
++                        receipts[cid] = {"status": "rejected", "reason": reason}
++                    else:
++                        known.add(op["uid"])
++                        receipts[cid] = {"status": "applied", "version": 1}
++                elif op.get("fields", {}).get("task_id") in known:
++                    receipts[cid] = {"status": "applied", "version": 1}
++                else:
++                    receipts[cid] = {"status": "rejected", "reason": "depends_on_rejected"}
++            if op["table"] == "tasks":
++                parent_ids.append(cid)
++            results.append({"client_op_id": cid, **receipts[cid]})
++        return {"results": results}
++
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    for i in range(10):
++        refusing[0] = i < 3
++        client.push(conn, SimpleNamespace(ops=ops), "default", "sender", primary=False, max_batches=1)
++        now[0] += 400
++        assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()
++        assert not conn.execute("SELECT 1 FROM task_events WHERE kind='sync_rejected'").fetchone()
++    assert tid in known
++    assert len(parent_ids) == len(set(parent_ids)) == 4
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
++    assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
++
++
++def test_new_children_do_not_resynthesize_parent_during_backoff(board, monkeypatch):
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    down, delivered = [True], []
++
++    def ops(_board, wire):
++        results = []
++        for op in wire:
++            if down[0]:
++                reason = "storage_error" if op["table"] == "tasks" else "depends_on_rejected"
++                result = {"status": "rejected", "reason": reason}
++            else:
++                delivered.append(op)
++                result = {"status": "applied", "version": len(delivered)}
++            results.append({"client_op_id": op["client_op_id"], **result})
++        return {"results": results}
++
++    hub = SimpleNamespace(ops=ops)
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    for i in range(6):
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++        now[0] += 400
++        for j in range(2):
++            kb.add_comment(conn, tid, "author", f"later child {i}/{j}")
++            client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++            rows = conn.execute("SELECT state FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
++            assert len(rows) == 1 and rows[0][0] == "pending"
++    down[0] = False
++    for _ in range(4):
++        now[0] += 400
++        client.push(conn, hub, "default", "sender", primary=False, max_batches=1)
++    assert len([op for op in delivered if op["table"] == "tasks"]) == 1
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
+diff --git a/tests/hermes_cli/test_kanban_sync_forbidden_field.py b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+index 402d53813b..b51058e943 100644
+--- a/tests/hermes_cli/test_kanban_sync_forbidden_field.py
++++ b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+@@ -92,7 +92,7 @@ def test_synthetic_parent_non_schema_rejections_use_bounded_outbox_handling(live
+     rows = live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
+     if reason == "live_claim":
+         assert not rows  # permanent synthetic refusal must not manufacture a rejected row
+-        assert live.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
++        assert not live.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
+     else:
+         [parent] = rows
+         assert parent["attempts"] == 1
+@@ -100,7 +100,7 @@ def test_synthetic_parent_non_schema_rejections_use_bounded_outbox_handling(live
+ 
+ 
+ @pytest.mark.parametrize("state", ["pending", "rejected"])
+-def test_ordinary_parent_outside_batch_does_not_suppress_prepend(live, svc, state):
++def test_pending_parent_owns_backoff_but_rejected_parent_can_be_synthesized(live, svc, state):
+     tid = kb.create_task(live, title="parent outside batch", assignee="worker")
+     live.execute("UPDATE kanban_sync_outbox SET state=?,retry_after=9999999999 WHERE table_name='tasks'", (state,))
+     live.commit()
+@@ -110,6 +110,14 @@ def test_ordinary_parent_outside_batch_does_not_suppress_prepend(live, svc, stat
+         calls.extend(copy.deepcopy(batch))
+         return hub.ops(board, batch)
+     client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
++    if state == "pending":
++        assert not any(op["table"] == "tasks" for op in calls)
++        assert len(live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()) == 1
++        assert tid not in svc.board("default")["rows"].get("tasks", {})
++        live.execute("UPDATE kanban_sync_outbox SET retry_after=0")
++        live.commit()
++        calls.clear()
++        client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
+     assert calls[0]["table"] == "tasks" and calls[0]["uid"] == tid
+     assert tid in svc.board("default")["rows"]["tasks"]
+ 
+-- 
+2.43.0
+

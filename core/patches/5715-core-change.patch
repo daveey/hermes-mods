@@ -1,0 +1,158 @@
+From 0bc1b9dc800c81c6d49f6b53279f55879f2100fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:50:15 +0000
+Subject: [PATCH] fix(accounting): retire abandoned lease intervals [daveey]
+
+Release discards the open token under the snapshot lock without recording a pass. A foreign-thread close retires its interval before refusing CPU booking, preserving existing no-pass semantics without leaking future unrelated CPU.
+
+Proof: both independent reviewer cases RED on prior head; expanded five controls GREEN. Four exact-anchor mutants killed. Consumer run: 749 passed, 13 skipped, one exited-thread native-liveness assertion failed; unchanged residual suite rerun plus retirement tests passed with retries disabled. Full check found stale-base unrelated Desktop cap and synthetic OS marker; marker corrected, canonical ship rebase/check still required.
+---
+ hermes_cli/host_loop_lease.py                 |  9 ++-
+ hermes_cli/loop_accounting.py                 |  8 +-
+ .../test_loop_accounting_lease_retirement.py  | 74 +++++++++++++++++++
+ 3 files changed, 87 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_loop_accounting_lease_retirement.py
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 501e59184e..e46d00e1ae 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -410,7 +410,7 @@ class HostLoopLease:
+ 
+     def release(self) -> None:
+         """Give the lease up (shutdown). A later ``held()`` competes for it again."""
+-        self._pass = None  # a held() with no beat() (shut down mid-pass) records no pass
++        self._account_pass(discard=True)  # shutdown abandons the pass without booking its CPU
+         with self._mu:
+             if self._held:
+                 self._drop()
+@@ -428,13 +428,16 @@ class HostLoopLease:
+ 
+     # -- internals -----------------------------------------------------------------------------
+ 
+-    def _account_pass(self, *, error: bool = False) -> None:
++    def _account_pass(self, *, error: bool = False, discard: bool = False) -> None:
+         opened, self._pass = self._pass, None
+         if opened is None:
+             return
+         try:
+             from hermes_cli import loop_accounting
+-            loop_accounting.span_close(opened, error=error)  # a beat() on another thread records nothing
++            if discard:
++                loop_accounting.span_discard(opened)
++            else:
++                loop_accounting.span_close(opened, error=error)  # a foreign beat retires without booking
+         except Exception:  # health: allow BLE001 -- accounting never touches the lease
+             logger.debug("host loop %s: pass accounting failed", self.name, exc_info=True)
+ 
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 654934d534..0c0a5327cd 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -336,6 +336,12 @@ def span_open(name: str) -> tuple:
+         return token
+ 
+ 
++def span_discard(token: tuple) -> None:
++    """Retire an abandoned span on any thread without recording a completed pass."""
++    with _lock:
++        _open_intervals.close(token[1], id(token))
++
++
+ def span_close(token: tuple, *, error: bool = False, error_kind: Optional[str] = None) -> bool:
+     with _lock:
+         return _span_close_locked(token, error=error, error_kind=error_kind)
+@@ -345,9 +351,9 @@ def _span_close_locked(token: tuple, *, error: bool = False, error_kind: Optiona
+     """Close a :func:`span_open` token. False (nothing recorded) when called on another thread. ``error_kind``
+     names the exception class of an ``error`` (else it counts as ``unknown``)."""
+     name, tid, c0, w0, acc0 = token
++    _open_intervals.close(tid, id(token))
+     if tid != _native_id():
+         return False
+-    _open_intervals.close(tid, id(token))
+     cpu = _thread_time() - c0
+     wall = _perf() - w0
+     with _lock:
+diff --git a/tests/hermes_cli/test_loop_accounting_lease_retirement.py b/tests/hermes_cli/test_loop_accounting_lease_retirement.py
+new file mode 100644
+index 0000000000..8b7b66e3b6
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_lease_retirement.py
+@@ -0,0 +1,74 @@
++"""Review regression: discarded lease tokens must not own future CPU."""
++import threading
++import pytest
++from hermes_cli import loop_accounting as la
++from hermes_cli import host_loop_lease as leases
++from types import SimpleNamespace
++
++@pytest.fixture
++def cpu_clock(monkeypatch):
++    la.reset()
++    clock = [1.0]
++    tid = la._native_id()
++    monkeypatch.setattr(la, '_thread_time', lambda: clock[0])
++    monkeypatch.setattr(la.os, 'listdir', lambda _: [])
++    monkeypatch.setattr(la.sys, 'platform', 'darwin')  # os-marker: ok — synthetic CPU clock, no native ABI call
++    monkeypatch.setattr(la, '_darwin_thread_cpu', lambda: [(tid, 'MainThread', clock[0])])
++    monkeypatch.setattr(la.os, 'times', lambda: SimpleNamespace(user=clock[0], system=0.0))
++    monkeypatch.setattr(la, '_process_start_time', lambda: 1.0)
++    monkeypatch.setattr(la, '_role_guess', lambda: 'test')
++    yield clock
++    la.reset()
++
++@pytest.mark.parametrize('end', ['release', 'foreign_beat', 'foreign_release'])
++def test_discarded_lease_does_not_account_future_unscoped_cpu(cpu_clock, monkeypatch, tmp_path, end):
++    monkeypatch.setattr(leases, 'enabled', lambda: False)
++    lease = leases.HostLoopLease('review-probe', 'gateway', interval=1, home=tmp_path)
++    assert lease.held()
++    cpu_clock[0] = 1.04
++    if end == 'release':
++        lease.release()
++    else:
++        thread = threading.Thread(target=lease.beat if end == 'foreign_beat' else lease.release)
++        thread.start()
++        thread.join(5)
++        assert not thread.is_alive()
++    assert lease._pass is None
++    start = la.snapshot()
++    cpu_clock[0] = 1.14
++    finish = la.snapshot()
++    before = start['process']['accounted_cpu_s']
++    after = finish['process']['accounted_cpu_s']
++    assert after - before == pytest.approx(0), (end, start['threads'], finish['threads'])
++    assert 'lease.review-probe' not in la.counters()
++    lease.release()  # repeated retirement is harmless; a new pass still books normally
++    assert lease.held()
++    cpu_clock[0] += 0.02
++    lease.beat()
++    assert la.counters()['lease.review-probe']['runs'] == 1
++    assert la.counters()['lease.review-probe']['cpu_s'] == pytest.approx(0.02)
++
++
++def test_discard_keeps_other_open_intervals_and_closed_inner_cpu(cpu_clock):
++    outer = la.span_open('outer')
++    abandoned = la.span_open('abandoned')
++    with la.pass_('inner'):
++        cpu_clock[0] += 0.02
++    la.span_discard(abandoned)
++    cpu_clock[0] += 0.03
++    assert la.snapshot()['process']['accounted_cpu_s'] == pytest.approx(0.05)
++    assert la.span_close(outer)
++    assert la.snapshot()['process']['accounted_cpu_s'] == pytest.approx(0.05)
++    assert 'abandoned' not in la.counters()
++
++
++def test_discard_is_serialized_with_snapshot(cpu_clock):
++    token = la.span_open('discard')
++    finished = threading.Event()
++    thread = threading.Thread(target=lambda: (la.span_discard(token), finished.set()))
++    with la._lock:
++        thread.start()
++        assert not finished.wait(0.05)
++    thread.join(5)
++    assert finished.is_set()
++
+-- 
+2.43.0
+

@@ -1,0 +1,406 @@
+From fb2efcf0923b6ecfcc254e699142ec4e05545038 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 05:55:35 +0000
+Subject: [PATCH] perf(workers): reuse negative quota probes and coalesce
+ metadata receipts [daveey]
+
+Problem: post-load pool boot median remains 6.415s; real Codex trace
+spends 1.57s probing an exhausted account and 1.01s in worker-store apply.
+
+Why: quota recovery's five-minute throttle was process-local, so every
+fresh worker repeated the same negative HTTPS check. Startup metadata
+also fsynced both its pending journal and successful receipt clear.
+
+Keep a 60-second negative-only cross-process throttle scoped to the exact
+token, endpoint, reset and failure generation. No positive recovery is
+persisted or trusted: absent, invalid and stale records take the live path.
+An exhausted account remains exhausted under a memo hit.
+
+Coalesce only same-scope session.prompt/model/sidecars/tools ACK clears
+into the next before-send durable pending write. A crash replays the same
+sequence/digest through unchanged owner fences. Child, transcript,
+compression and terminal receipts still clear synchronously; close flushes.
+
+Detection: new call-count and save-count tests fail on the prior head;
+real subprocesses verify negative reuse, and real SQLite verifies crash
+windows and fresh-generation refusal. Tests include TTL, home, token,
+endpoint and failure/reset separation; positive/unknown results are not shared.
+
+Causal boundary: date/route cohorts show both a shift toward slower Codex
+and within-Codex slowdown. PR-merge windows are not controlled deployment
+windows and do not prove a PR regression. Preserve original-query natural
+post-load >=50-session measurement as the unchanged <=4s acceptance gate.
+No forced restarts, routing/pacing changes or weakened persistence fences.
+---
+ agent/runtime_session_store.py                |  14 ++-
+ hermes_cli/auth_codex.py                      |   6 +
+ hermes_cli/auth_codex_quota_negative.py       |  54 ++++++++
+ ...test_runtime_session_receipt_coalescing.py |  31 +++++
+ .../test_auth_codex_quota_negative_memo.py    | 117 ++++++++++++++++++
+ .../test_runtime_worker_receipt_coalescing.py |  62 ++++++++++
+ 6 files changed, 283 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/auth_codex_quota_negative.py
+ create mode 100644 tests/agent/test_runtime_session_receipt_coalescing.py
+ create mode 100644 tests/hermes_cli/test_auth_codex_quota_negative_memo.py
+ create mode 100644 tests/hermes_state/test_runtime_worker_receipt_coalescing.py
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index e82d20df37..50aa946de2 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -396,6 +396,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         self.max_bytes = max_bytes
+         self.lock = threading.RLock()
+         self.failure = None
++        self._receipt_clear_dirty = False
+         self.path = Path(outbox_dir) / 'pending.json'
+         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
+         if self.path.parent.is_symlink() or self.path.is_symlink():
+@@ -474,6 +475,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         from utils import atomic_write_bytes
+         # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
+         atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
++        self._receipt_clear_dirty = False
+ 
+     def _session(self, session_id):
+         if session_id != self.scope['session_id']:
+@@ -592,7 +594,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+                         candidate = self._acked(candidate, entry)
+                     else:
+                         candidate = {key: value for key, value in candidate.items() if key != 'acked'}
+-                    self._save(candidate)
++                    # Only idempotent same-target startup metadata: keep the durable pending
++                    # entry until the next BEFORE-send save atomically carries its ACK forward.
++                    # A crash replays the exact sequence/digest through the unchanged owner fences.
++                    # Child, compression, transcript and terminal receipts retain immediate clears.
++                    if (entry['operation'] in {'session.prompt', 'session.model', 'session.sidecars', 'session.tools'}
++                            and candidate['scope'] == self.scope and not result.get('worker_assignment')):
++                        self._receipt_clear_dirty = True
++                    else:
++                        self._save(candidate)
+                     self.scope = candidate['scope']
+                     self.journal = candidate
+                     results.append(result)
+@@ -797,5 +807,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         with self.lock:
+             try:
+                 self.flush_token_counts()
++                if self._receipt_clear_dirty:
++                    self._save(self.journal)
+             finally:
+                 self._outbox_owner.close()
+diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
+index 56254db250..178d24bad6 100644
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -773,6 +773,10 @@ def _probe_codex_quota_restored(
+         return None
+     cache_key = _codex_quota_probe_cache_key(token)
+     scope = (reset_at, failure_at)
++    from hermes_cli import auth_codex_quota_negative as negative
++    negative_key = negative.key(token, _codex_usage_probe_url(base_url), reset_at, failure_at)
++    if negative.hit(negative_key, min_interval_seconds):
++        return False
+     now = time.monotonic()
+     with _codex_quota_probe_lock:
+         cached = _codex_quota_probe_cache.get(cache_key)
+@@ -799,6 +803,8 @@ def _probe_codex_quota_restored(
+     except Exception:
+         logger.debug("Codex quota probe failed", exc_info=True)
+         result = None
++    if result is False:
++        negative.remember(negative_key)
+     with _codex_quota_probe_lock:
+         _codex_quota_probe_cache[cache_key] = (now, result)
+     return result
+diff --git a/hermes_cli/auth_codex_quota_negative.py b/hermes_cli/auth_codex_quota_negative.py
+new file mode 100644
+index 0000000000..a5d8fe1ed7
+--- /dev/null
++++ b/hermes_cli/auth_codex_quota_negative.py
+@@ -0,0 +1,54 @@
++"""Cross-process *negative-only* Codex quota probe throttle.
++
++An exhausted grant never becomes usable from this file. Missing, stale or invalid
++records fall through to the live probe; positive results stay process-local.
++"""
++import hashlib
++import json
++import time
++
++MAX_BYTES = 65536
++MAX_ENTRIES = 128
++TTL_SECONDS = 60.0
++
++
++def _path():
++    from hermes_constants import get_hermes_home
++    return get_hermes_home() / 'cache' / 'codex-quota-negative.json'
++
++
++def _records(path):
++    try:
++        if path.stat().st_size <= MAX_BYTES:
++            records = json.loads(path.read_text(encoding='utf-8-sig'))
++            if isinstance(records, dict) and len(records) <= MAX_ENTRIES:
++                return records
++    except (OSError, ValueError, TypeError):
++        pass
++    return {}
++
++
++def key(token, url, reset_at, failure_at):
++    raw = json.dumps([token, url, reset_at, failure_at], allow_nan=False).encode()
++    return hashlib.sha256(raw).hexdigest()
++
++
++def hit(cache_key, interval):
++    stamp = _records(_path()).get(cache_key)
++    return (type(stamp) in (int, float)
++            and 0 <= time.time() - stamp < min(interval, TTL_SECONDS))
++
++
++def remember(cache_key):
++    from utils import atomic_write_bytes
++    path, now = _path(), time.time()
++    records = {k: v for k, v in _records(path).items()
++               if type(v) in (int, float) and 0 <= now - v < TTL_SECONDS}
++    records[cache_key] = now
++    records = dict(sorted(records.items(), key=lambda item: item[1])[-MAX_ENTRIES:])
++    try:
++        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++        # Concurrent last-writer-wins can only discard a negative memo (an extra live probe).
++        atomic_write_bytes(path, json.dumps(records).encode(), mode=0o600)
++    except (OSError, ValueError, TypeError):
++        pass  # A throttle write never changes the live quota verdict.
+diff --git a/tests/agent/test_runtime_session_receipt_coalescing.py b/tests/agent/test_runtime_session_receipt_coalescing.py
+new file mode 100644
+index 0000000000..94b2e71aa0
+--- /dev/null
++++ b/tests/agent/test_runtime_session_receipt_coalescing.py
+@@ -0,0 +1,31 @@
++"""Coalesce metadata ACK clears without ever sending an unjournaled mutation."""
++import json
++
++from agent.runtime_session_store import RuntimeSessionStore
++
++
++def test_metadata_ack_clear_coalesces_into_next_pending_save(tmp_path, monkeypatch):
++    seen, saves = [], []
++    def rpc(method, **params):
++        disk = json.loads(store.path.read_text())
++        assert disk['pending'][0]['sequence'] == params['sequence']
++        assert disk['pending'][0]['payload'] == params['payload']
++        seen.append(params['sequence'])
++        return {}
++    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'outbox')
++    original = store._save
++    def save(journal):
++        saves.append(json.loads(json.dumps(journal)))
++        original(journal)
++    monkeypatch.setattr(store, '_save', save)
++    try:
++        store.update_session_tool_names('s', ['terminal'])
++        store.update_session_tool_names('s', ['terminal', 'read_file'])
++        assert seen == [1, 2]
++        assert len(saves) == 2  # before-send durability only; ACK piggybacks on the next save
++        assert saves[1]['acked'][0]['sequence'] == 1
++        assert store.journal['pending'] == []
++        assert json.loads(store.path.read_text())['pending'][0]['sequence'] == 2
++    finally:
++        store.close()
++    assert json.loads(store.path.read_text())['pending'] == []
+diff --git a/tests/hermes_cli/test_auth_codex_quota_negative_memo.py b/tests/hermes_cli/test_auth_codex_quota_negative_memo.py
+new file mode 100644
+index 0000000000..7a05f624f8
+--- /dev/null
++++ b/tests/hermes_cli/test_auth_codex_quota_negative_memo.py
+@@ -0,0 +1,117 @@
++"""Fresh worker processes must reuse only scoped negative quota evidence."""
++import base64
++import json
++from contextlib import contextmanager
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import auth, auth_codex
++
++
++def token(name='one'):
++    claim = base64.urlsafe_b64encode(json.dumps({'sub': name, 'exp': 9999999999}).encode()).decode().rstrip('=')
++    return f'e30.{claim}.sig'
++
++
++def test_negative_probe_survives_fresh_process_cache(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    calls = []
++
++    @contextmanager
++    def client(**kwargs):
++        calls.append(kwargs)
++        yield SimpleNamespace(get=lambda *a, **k: SimpleNamespace(status_code=429))
++
++    monkeypatch.setattr(auth_codex, '_codex_http_client', client)
++    auth._codex_quota_probe_cache.clear()
++    scope = dict(base_url='https://example.test/backend-api/codex', failure_at=100., reset_at=10000.)
++    assert auth_codex._probe_codex_quota_restored(token(), **scope) is False
++    auth._codex_quota_probe_cache.clear()  # no process-local throttle, as at a fresh worker boot
++    assert auth_codex._probe_codex_quota_restored(token(), **scope) is False
++    assert len(calls) == 1
++
++
++def test_negative_memo_is_shared_by_real_subprocesses(tmp_path):
++    import os
++    import subprocess
++    import sys
++    script = tmp_path / 'selector.py'
++    script.write_text('''from contextlib import contextmanager
++from pathlib import Path
++from hermes_cli import auth_codex
++@contextmanager
++def client(**kw):
++    with Path(__file__).with_suffix('.calls').open('a') as out: out.write('call\\n')
++    class Response: status_code = 429
++    class Client:
++        def get(self, *a, **kw): return Response()
++    yield Client()
++auth_codex._codex_http_client = client
++assert auth_codex._probe_codex_quota_restored(TOKEN, failure_at=100, reset_at=1000) is False
++'''.replace('TOKEN', repr(token())))
++    from pathlib import Path
++    env = dict(os.environ, HERMES_HOME=str(tmp_path / 'home'),
++               PYTHONPATH=str(Path(__file__).resolve().parents[2]))
++    for _ in range(2):
++        subprocess.run([sys.executable, str(script)], env=env, check=True, timeout=20)
++    assert script.with_suffix('.calls').read_text().splitlines() == ['call']
++
++
++@pytest.mark.parametrize('change', ['token', 'url', 'reset', 'failure', 'home', 'ttl', 'future', 'corrupt'])
++def test_negative_memo_never_crosses_evidence_scope(tmp_path, monkeypatch, change):
++    from hermes_cli import auth_codex_quota_negative as memo
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    clock = [1000.]
++    monkeypatch.setattr(memo.time, 'time', lambda: clock[0])
++    key = memo.key(token(), 'https://one.test/usage', 2000., 900.)
++    memo.remember(key)
++    assert memo.hit(key, 300)
++    if change == 'token': key = memo.key(token('two'), 'https://one.test/usage', 2000., 900.)
++    if change == 'url': key = memo.key(token(), 'https://two.test/usage', 2000., 900.)
++    if change == 'reset': key = memo.key(token(), 'https://one.test/usage', 3000., 900.)
++    if change == 'failure': key = memo.key(token(), 'https://one.test/usage', 2000., 950.)
++    if change == 'home': monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'other'))
++    if change == 'ttl': clock[0] += 60
++    if change == 'future': clock[0] -= 1
++    if change == 'corrupt': memo._path().write_text('{invalid')
++    assert not memo.hit(key, 300)
++
++
++@pytest.mark.parametrize('status,result', [(200, True), (401, None), (500, None)])
++def test_positive_and_unknown_results_are_not_shared(tmp_path, monkeypatch, status, result):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    calls = []
++    @contextmanager
++    def client(**kwargs):
++        calls.append(1)
++        payload = {'rate_limit': {'primary_window': {'used_percent': 0}, 'secondary_window': {'used_percent': 0}}}
++        yield SimpleNamespace(get=lambda *a, **k: SimpleNamespace(status_code=status, json=lambda: payload))
++    monkeypatch.setattr(auth_codex, '_codex_http_client', client)
++    for _ in range(2):
++        auth._codex_quota_probe_cache.clear()
++        assert auth_codex._probe_codex_quota_restored(token()) is result
++    assert len(calls) == 2
++
++
++def test_cached_negative_never_selects_exhausted_account(tmp_path, monkeypatch):
++    import time
++    from agent.credential_pool import CredentialPool, PooledCredential
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    calls = []
++    @contextmanager
++    def client(**kwargs):
++        calls.append(1)
++        yield SimpleNamespace(get=lambda *a, **k: SimpleNamespace(status_code=429))
++    monkeypatch.setattr(auth_codex, '_codex_http_client', client)
++    now = time.time()
++    row = dict(id='exhausted', label='exhausted', auth_type='oauth', source='manual:device_code',
++               access_token=token(), last_status='exhausted', last_status_at=now,
++               last_error_code=429, last_error_reason='usage_limit_reached', last_error_reset_at=now + 3600)
++    (tmp_path / 'auth.json').write_text(json.dumps({'version': 1, 'credential_pool': {'openai-codex': [row]}}))
++    for _ in range(3):
++        auth._codex_quota_probe_cache.clear()
++        pool = CredentialPool('openai-codex', [PooledCredential.from_dict('openai-codex', row)])
++        assert pool.select() is None
++        assert pool.entries()[0].last_status == 'exhausted'
++    assert len(calls) == 1
+diff --git a/tests/hermes_state/test_runtime_worker_receipt_coalescing.py b/tests/hermes_state/test_runtime_worker_receipt_coalescing.py
+new file mode 100644
+index 0000000000..28844b46ae
+--- /dev/null
++++ b/tests/hermes_state/test_runtime_worker_receipt_coalescing.py
+@@ -0,0 +1,62 @@
++"""Crash and fence coverage for startup metadata receipt-clear coalescing."""
++import json
++
++import pytest
++
++from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
++from tests.hermes_state.test_runtime_worker_lifecycle import setup_store
++
++
++@pytest.mark.parametrize('crash_point', ['after_ack', 'before_next_rpc', 'after_next_ack'])
++def test_metadata_receipts_replay_exactly_across_crash(tmp_path, crash_point):
++    db, store, scope = setup_store(tmp_path)
++    original = store.rpc
++    recovered = None
++    seen = []
++    def rpc(method, **params):
++        seen.append(params['sequence'])
++        return original(method, **params)
++    store.rpc = rpc
++    try:
++        store.update_system_prompt('owned', 'first')
++        assert json.loads(store.path.read_text())['pending'][0]['sequence'] == 1
++        if crash_point == 'before_next_rpc':
++            def crash(method, **params):
++                raise RuntimeError('simulated process loss before send')
++            store.rpc = crash
++            with pytest.raises(RuntimeError, match='simulated process loss'):
++                store.update_system_prompt('owned', 'second')
++        elif crash_point == 'after_next_ack':
++            store.update_system_prompt('owned', 'second')
++        expected = 1 if crash_point == 'after_ack' else 2
++        journal = json.loads(store.path.read_text())
++        assert journal['pending'][0]['sequence'] == expected
++        store._outbox_owner.close()  # simulate process loss: deliberately do NOT call close/flush
++        recovered = RuntimeSessionStore(rpc, scope, store.path.parent)
++        assert seen[-1] == expected
++        assert db.get_session('owned')['system_prompt'] == ('first' if expected == 1 else 'second')
++        assert recovered.journal['next_sequence'] == expected + 1
++        recovered.update_system_prompt('owned', 'third')
++        assert seen[-1] == expected + 1
++        assert db.get_session('owned')['system_prompt'] == 'third'
++    finally:
++        if recovered:
++            recovered.close()
++        else:
++            store.close()
++        db.close()
++
++
++def test_next_metadata_write_still_rejects_changed_generation(tmp_path):
++    db, store, _scope = setup_store(tmp_path)
++    try:
++        store.update_system_prompt('owned', 'first')
++        db._execute_write(lambda conn: conn.execute(
++            'UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id=?', ('owned',)))
++        with pytest.raises(WorkerPersistenceError, match='stale_generation'):
++            store.update_system_prompt('owned', 'forbidden')
++        assert db.get_session('owned')['system_prompt'] == 'first'
++        assert json.loads(store.path.read_text())['pending'][0]['sequence'] == 2
++    finally:
++        store._outbox_owner.close()
++        db.close()
+-- 
+2.43.0
+

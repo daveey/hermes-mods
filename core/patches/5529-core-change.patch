@@ -1,0 +1,68 @@
+From d41fad1299252be4d87fe32da7ae9f4e1e115a3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:30:42 +0000
+Subject: [PATCH] fix(worker): preserve owner fault codes on exhausted context
+ reads [daveey]
+
+---
+ agent/runtime_session_compression.py           |  8 ++++++--
+ tests/agent/test_worker_session_context_rpc.py | 15 +++++++++++++--
+ 2 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/agent/runtime_session_compression.py b/agent/runtime_session_compression.py
+index 88de4a3605..10f1fbf63f 100644
+--- a/agent/runtime_session_compression.py
++++ b/agent/runtime_session_compression.py
+@@ -27,7 +27,8 @@ class RuntimeSessionCompressionMixin:
+ 
+     def get_session(self, session_id):
+         from agent.runtime_session_store import (
+-            WorkerPersistenceError, is_retryable_owner_error, _RETRYABLE_ATTEMPTS, _retryable_owner_errors,
++            WorkerPersistenceError, exhausted_resend_code, is_retryable_owner_error,
++            _RETRYABLE_ATTEMPTS, _retryable_owner_errors,
+         )
+         with self.lock:
+             # A read may not overtake an unacknowledged write or hide its sticky failure.
+@@ -46,8 +47,11 @@ class RuntimeSessionCompressionMixin:
+                         self._legacy_session_context = True
+                         break
+                     except _retryable_owner_errors() as exc:
+-                        if not is_retryable_owner_error(exc) or attempt + 1 == _RETRYABLE_ATTEMPTS:
++                        if not is_retryable_owner_error(exc):
+                             raise
++                        if attempt + 1 == _RETRYABLE_ATTEMPTS:
++                            # Preserve owner-fault booking without poisoning this read-only store.
++                            raise WorkerPersistenceError(exhausted_resend_code(exc)) from exc
+             # Old owners journal reads; reject foreign targets before enqueueing one.
+             if session_id != self.scope['session_id']:
+                 ids = self._apply('compression.lineage', {'target': self.scope['session_id']})['readable_ids']
+diff --git a/tests/agent/test_worker_session_context_rpc.py b/tests/agent/test_worker_session_context_rpc.py
+index effdabf878..8328ea25db 100644
+--- a/tests/agent/test_worker_session_context_rpc.py
++++ b/tests/agent/test_worker_session_context_rpc.py
+@@ -65,9 +65,20 @@ def test_context_failed_read_never_falls_back_to_a_write(tmp_path, kind):
+     store = RuntimeSessionStore(rpc, {'session_id': 'owned'}, tmp_path / 'outbox')
+     before = store.path.read_bytes()
+     try:
+-        with pytest.raises(type(error)) as caught:
++        expected_type = TimeoutError if kind == 'other_timeout' else WorkerPersistenceError
++        with pytest.raises(expected_type) as caught:
+             store.get_session('owned')
+-        assert caught.value is error
++        if kind == 'other_timeout':
++            assert caught.value is error
++        else:
++            expected_code = 'worker_receipt_timeout' if kind == 'timeout' else 'owner_link_closed'
++            assert str(caught.value) == expected_code
++            assert caught.value.__cause__ is error
++            from hermes_cli.kanban_owner_storage_refusal import _proof
++            envelope = f'Worker failed: {type(caught.value).__name__}: {caught.value}'
++            assert _proof({'exit_code': 1, 'last_output': envelope}) == {
++                'kind': 'owner_unreachable', 'phase': 'midrun', 'reason': expected_code,
++            }
+         assert calls == ['worker.sessionContext'] * (1 if kind == 'other_timeout' else 2)
+         assert store.path.read_bytes() == before
+         assert store.failure is None
+-- 
+2.43.0
+

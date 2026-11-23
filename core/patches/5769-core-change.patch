@@ -1,0 +1,186 @@
+From b7e9d7c895065c212faa35a75ec305fac0cfe06c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 18:27:51 +0000
+Subject: [PATCH] [daveey] Done-check passes: a failing close keeps the
+ verdicts; pin four untested clauses
+
+Review of d5272c1a50 (t_48e11e339dbcccf7) found one missing guard and three
+untested clauses in the per-part annotation refresh.
+
+Missing guard: attention_task_counts closed the checks' read passes unguarded.
+A pass whose exit raised left the function after every check had answered and
+before the result was stored; read_annotation_parts then published attention {}
+while the holder read counted as successful, so flagged cards read as "nothing
+needs attention" for as long as the close kept failing. The close now runs under
+the same catch-and-log as the entry: the pass is an optimisation, never a
+requirement. The other passes are still closed.
+
+Tests added (each red on the mutant the review named, green here):
+- a pass whose exit raises keeps the verdicts and the other pass is closed
+  (red on d5272c1a50: {} != {'s1': 2});
+- a class-based pass is closed with the count, and when the count raises
+  (generator passes are closed by collection, which hid a dropped close);
+- a stat-keyed replica too fresh to vouch reruns the checks;
+- counts held in a saved scope slot are not re-read before their age.
+
+register_done_check's docstring now says a declared board or sync replica is
+keyed by its content revision, not by its file.
+---
+ .../kanban_session_activity_attention.py      | 16 +++-
+ .../test_kanban_annotation_parts.py           | 95 +++++++++++++++++++
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index d66d0e5a26..f5e2aeed1a 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -112,7 +112,10 @@ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
+     ``summary`` (latest run summary, else ``result``), ``completed_at``, ``board`` and ``board_path``. Re-registering a
+     name replaces it; the returned callable unregisters. Optional event callbacks
+     have the same no-DB-read contract as ``register_waiting_source``; undeclared
+-    checks retain bounded fallback rather than silently missing external inputs."""
++    checks retain bounded fallback rather than silently missing external inputs.
++    A declared board or sync replica is keyed by its content revision (``kanban_activity_revision.LOCAL_TABLES`` /
++    ``SHADOW_TABLES``), not by its file: a check that reads a table outside those lists does not rerun on a write
++    to it until the attention cache's own bound. Other declared files are keyed by their stat."""
+     from hermes_cli import kanban_session_activity as activity
+     activity._host_copy.declare_events(name, fn, watch_paths, next_deadline, done_check=True)
+     activity._done_checks[name] = fn
+@@ -145,6 +148,15 @@ def _check_passes(checks) -> contextlib.ExitStack:
+     return stack
+ 
+ 
++def _close_passes(passes: contextlib.ExitStack) -> None:
++    """Close every entered pass. A pass whose exit raises is logged like one that cannot be entered: the checks
++    have already answered, and their verdicts must not be lost to a plugin's failing close."""
++    try:
++        passes.close()
++    except Exception:  # health: allow BLE001 -- a plugin's pass is an optimisation, never a requirement
++        _log.debug("kanban done check pass close failed", exc_info=True)
++
++
+ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     """``{session_id: completed cards a registered check flags}`` over the last ``activity.ATTENTION_WINDOW_S``. Cached;
+     a check that raises counts as False."""
+@@ -174,7 +186,7 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     try:
+         _flag_recent_done(activity, paths, since, checks, boards, scope, mono, forced, pairs, windows)
+     finally:
+-        passes.close()
++        _close_passes(passes)
+     counts: dict[str, int] = {}
+     for sid, _tid in pairs:
+         counts[sid] = counts.get(sid, 0) + 1
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 48b0b9d916..f27e131dc2 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import contextvars
++import sqlite3
+ import threading
+ import time
+ from types import SimpleNamespace
+@@ -329,3 +330,97 @@ def test_a_burst_of_board_writes_is_a_bounded_number_of_reads_and_the_last_write
+             events.wake()
+             thread.join(5)
+     assert not thread.is_alive()
++
++
++class _Pass:
++    """Not a generator: nothing but an explicit exit closes it."""
++
++    def __init__(self, seen):
++        self.seen = seen
++
++    def __enter__(self):
++        self.seen.append('open')
++
++    def __exit__(self, *exc):
++        self.seen.append('close')
++        return False
++
++
++def _check_with_pass(monkeypatch, seen, factory=None):
++    def check(card):
++        seen.append(f"check {card['id']}")
++        return True
++    check.attention_pass = factory or (lambda: _Pass(seen))
++    monkeypatch.setattr(ksa, '_done_checks', {'fixture': check})
++    monkeypatch.setattr(host, '_done_event_sources', {})
++
++
++def test_a_pass_that_is_not_a_generator_is_closed_with_the_count(world, monkeypatch):
++    seen: list[str] = []
++    _check_with_pass(monkeypatch, seen)
++    _refresh()
++    assert seen == ['open', 'check d1', 'close']
++
++
++def test_a_pass_is_closed_when_the_count_raises(world, monkeypatch):
++    seen: list[str] = []
++    _check_with_pass(monkeypatch, seen)
++
++    def boom(path, since, *a):
++        raise RuntimeError('unexpected')
++    monkeypatch.setattr(ksa._recent_done, 'memoized', boom)
++    _refresh()
++    assert seen == ['open', 'close']
++
++
++def test_a_pass_whose_exit_raises_keeps_the_verdicts_and_closes_the_other_passes(world, monkeypatch):
++    seen: list[str] = []
++
++    @contextlib.contextmanager
++    def failing():
++        try:
++            yield
++        finally:
++            raise RuntimeError('close failed')
++
++    def other(card):
++        return False
++    other.attention_pass = lambda: _Pass(seen)
++    _check_with_pass(monkeypatch, seen, failing)
++    monkeypatch.setattr(ksa, '_done_checks', {'other': other, **ksa._done_checks})
++    monkeypatch.setattr(ksa._recent_done, 'memoized', lambda path, since, *a: [
++        ('s1', {'id': f'd{n}', 'completed_at': time.time() - 60, 'title': 'done', 'summary': 'ok'}) for n in (1, 2)])
++    _refresh()
++    assert seen == ['open', 'check d1', 'check d2', 'close']
++    assert _published()[10] == {'s1': 2}, 'a failing close lost the verdicts the checks returned'
++
++
++def test_a_replica_whose_revision_cannot_vouch_reruns_the_checks(world, monkeypatch, tmp_path):
++    shadow = tmp_path / 'sync-shadow'
++    shadow.mkdir()
++    replica = sqlite3.connect(shadow / 'b.db', isolation_level=None)  # no revision triggers: stat fallback
++    replica.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    replica.execute("INSERT INTO tasks VALUES ('r1', 'running', 's9')")
++    try:
++        monkeypatch.setattr(parts, '_replica_dir', lambda: str(shadow))
++        check = ksa._done_checks['fixture']
++        monkeypatch.setattr(host, '_done_event_sources', {
++            'fixture': (check, lambda: [world.board, shadow / 'b.db'], lambda: None)})
++        assert ksa._board_content_key(shadow / 'b.db', ksa._revision.SHADOW_TABLES)[:1] == ('stat',)
++        _refresh()
++        before = world.checks
++        _refresh()  # written < STAT_SETTLED_S ago: the stat vouches for nothing, so the checks rerun
++        assert world.checks == before + 1, 'an unsettled stat-keyed replica was trusted'
++    finally:
++        replica.close()
++
++
++def test_a_scope_whose_counts_sit_in_a_saved_slot_is_not_renewed_before_its_age(world, monkeypatch):
++    _refresh()
++    assert world.counts == 1
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('annotation-parts-test', 'other'))
++    ksa._all_counts()  # another profile's poll owns the active slot
++    assert world.counts == 2
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: SCOPE)
++    _refresh()
++    assert world.counts == 2, 'fresh counts in a saved slot were read again'
+-- 
+2.43.0
+

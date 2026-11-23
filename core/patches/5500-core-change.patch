@@ -1,0 +1,383 @@
+From 5176ec93ba94a788ff8ad0ec7a0e989f614289b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:36:59 +0000
+Subject: [PATCH] [daveey] Add receipt-only native session tickets
+
+A prompt receipt poller previously had to request an interactive ticket, receiving control and operator privileges. Add explicit prompt-receipt purpose with session:receipt only, preserve interactive owner semantics, and gate receipt sockets to the single read RPC. Receipt-only reads retain principal and local ownership checks; write callers retain submit authorization.
+
+Proof: existing interactive ticket reproduction on main e539dac returned a foreign receipt (RED). New purpose was rejected before implementation. Receipt-only tests are now GREEN, including independent local/principal mismatches, full handler refusal inventory, direct cancel denial, and GUI/CLI interactive controls. Focused authority/run_api/WS suite: 36 passed, 6 Windows-only skips. Additional native socket and drain coverage included. scripts/check: 21 checks OK.
+---
+ gateway/run_api.py                            |  24 +--
+ gateway/runtime_bootstrap.py                  |   1 +
+ gateway/session_authority.py                  |   8 +-
+ gateway/session_controls.py                   |   7 +-
+ tests/gateway/test_prompt_receipt_ticket.py   | 167 ++++++++++++++++++
+ tests/gateway/test_runtime_bootstrap.py       |  12 +-
+ tests/gateway/test_session_socket_preload.py  |   5 +-
+ .../docs/developer-guide/gateway-internals.md |  18 +-
+ 8 files changed, 219 insertions(+), 23 deletions(-)
+ create mode 100644 tests/gateway/test_prompt_receipt_ticket.py
+
+diff --git a/gateway/run_api.py b/gateway/run_api.py
+index c2102c138e..1d190fff8a 100644
+--- a/gateway/run_api.py
++++ b/gateway/run_api.py
+@@ -505,20 +505,20 @@ class GatewayRuntimeAPI:
+                 or ws.headers.get('origin') or not native_peer):
+             await ws.close(code=4403)
+             return
+-        operator = True
+-        try:
+-            grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose='interactive')
+-        except PermissionError:
+-            operator = False
++        for purpose in ('interactive', 'worker-adoption', 'prompt-receipt'):
+             try:
+-                grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose='worker-adoption')
++                grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose=purpose)
++                break
+             except PermissionError:
+-                # Browser/OAuth tickets have a separate issuer.
+-                if draining_socket:
+-                    await ws.close(code=1013)
+-                    return
+-                return await self.app(scope, receive, send)
+-        allow_draining = not operator
++                continue
++        else:
++            # Browser/OAuth tickets have a separate issuer.
++            if draining_socket:
++                await ws.close(code=1013)
++                return
++            return await self.app(scope, receive, send)
++        operator = purpose == 'interactive'
++        allow_draining = purpose == 'worker-adoption'
+         # Decided here, at admission, not at the mint: a restart wait that opened after the client's
+         # discovery still refuses the machine poller that asked to stay out of it (a Kanban worker),
+         # which would otherwise hold the turn the wait is waiting on.
+diff --git a/gateway/runtime_bootstrap.py b/gateway/runtime_bootstrap.py
+index 97e860e480..2551c81aae 100644
+--- a/gateway/runtime_bootstrap.py
++++ b/gateway/runtime_bootstrap.py
+@@ -7,6 +7,7 @@ import threading
+ import time
+ 
+ _PURPOSE_CAPABILITIES = {
++    'prompt-receipt': frozenset({'session:receipt'}),
+     'interactive': frozenset({'session:create', 'session:read', 'session:submit',
+                               'session:control', 'session:approve', 'session:respond'}),
+     'native-http': frozenset({'http:owner'}),
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index c7e43df48e..2da9bb0e3e 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -806,13 +806,15 @@ class SessionAuthority:
+             logging.getLogger(__name__).exception(
+                 'Releasing refused attachments of request %s failed', request.request_id)
+ 
+-    async def receipt(self, actor, ref, admission_id):
+-        self.authorize(actor, ref, 'session:submit')
++    async def receipt(self, actor, ref, admission_id, *, receipt_only=False):
++        # Write callers retain submit authorization; only prompt.receipt opts into the read grant.
++        self.authorize(actor, ref, 'session:receipt' if receipt_only else 'session:submit')
+         row = get_session_admission(self.db, admission_id=admission_id)
+         if row is None or row['target_session_id'] != ref.session_id:
+             raise RuntimeStoreError('not_found')
+         from gateway.owner_identity import same_owner
+-        if not same_owner(row['principal_id'], actor.subject) and 'session:control' not in actor.capabilities:
++        if (not same_owner(row['principal_id'], actor.subject)
++                and (receipt_only or 'session:control' not in actor.capabilities)):
+             raise RuntimeStoreError('permission_denied')
+         live = self.sessions[ref.session_id]
+         with live.event_stream.lock:
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 2f2222fe7e..6a88cfa3f4 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -312,6 +312,10 @@ class AuthorityConnection:
+             return None
+         rid = request.get('id')
+         method = request.get('method')
++        # Receipt tickets are not interactive viewers, including for plugin/ancillary RPCs.
++        if 'session:receipt' in self.actor.capabilities and method != 'prompt.receipt':
++            return {'jsonrpc': '2.0', 'id': rid, 'error': {
++                'code': 4001, 'message': 'permission_denied', 'data': {'reason': 'permission_denied'}}}
+         params = request.get('params') or {}
+         if not isinstance(params, dict):
+             # Every handler indexes params as a mapping; refuse the frame before ``.get``.
+@@ -939,7 +943,8 @@ class AuthorityConnection:
+         return result
+ 
+     async def receipt(self, ref, params):
+-        receipt = await self.authority.receipt(self.actor, ref, params.get('admission_id'))
++        receipt = await self.authority.receipt(self.actor, ref, params.get('admission_id'),
++            receipt_only='session:receipt' in self.actor.capabilities)
+         out = asdict(receipt)
+         if params.get('include_result') is True and receipt.status == 'terminal':
+             # The exact structured result the turn committed with settlement (`finish_result`):
+diff --git a/tests/gateway/test_prompt_receipt_ticket.py b/tests/gateway/test_prompt_receipt_ticket.py
+new file mode 100644
+index 0000000000..18ffa58b01
+--- /dev/null
++++ b/tests/gateway/test_prompt_receipt_ticket.py
+@@ -0,0 +1,167 @@
++"""Receipt pollers must not inherit the native interactive operator grant."""
++from types import SimpleNamespace
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++import pytest_asyncio
++
++from gateway.session_contract import SessionActor, Submission
++from gateway.session_controls import AuthorityConnection
++from hermes_state_runtime import RuntimeStoreError, get_session_admission
++
++
++@pytest_asyncio.fixture
++async def receipt_owner(tmp_path, monkeypatch):
++    from gateway import run
++    from gateway.config import GatewayConfig
++    from gateway.session import SessionStore
++    from gateway.session_authority import initialize_session_authority
++
++    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
++    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
++    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
++    authority = await initialize_session_authority(runner, profile_id=str(Path(store._db.db_path).parent), instance_id='fixture')
++    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
++    try:
++        yield authority
++    finally:
++        store._db.close()
++
++
++async def _queued(authority, subject, request, principal=None, source='gui'):
++    from gateway.session_local import create_local_session
++
++    actor = SessionActor(subject, authority.profile_id,
++                         frozenset({'session:create', 'session:submit'}), request)
++    ref = create_local_session(authority, actor, {'request_id': request, 'source': source,
++        'cwd': authority.profile_id, 'model': 'fixture', 'toolsets': []})
++    if principal is not None:
++        actor = replace(actor, subject=principal, capabilities=actor.capabilities | {'session:operator'})
++    receipt = await authority.submit(actor, Submission(request, ref, {'text': 'fixture'}, 'queue'))
++    return ref, receipt
++
++
++async def _redeem(authority, monkeypatch, purpose):
++    from gateway import run_api
++    from gateway.owner_identity import host_owner_subject
++    from gateway.runtime_bootstrap import TicketStore
++    from hermes_cli import web_server as web
++    from tests.gateway.test_session_socket_preload import _attach_scope
++
++    runner = authority.runner
++    runner.session_runtime_descriptor = {'state': 'ready'}
++    runner.session_ticket_store = TicketStore(authority.instance_id, frozenset({authority.profile_id}))
++    ticket = runner.session_ticket_store.mint(profile_id=authority.profile_id,
++        subject=host_owner_subject(), purpose=purpose)
++    connections = []
++
++    async def handler(ws, *, auth_identity, operator, subprotocol):
++        connections.append(AuthorityConnection(authority, object(), auth_identity, operator=operator))
++        await ws.close()
++
++    async def load_handler():
++        return handler
++
++    async def fallback(*args):
++        pytest.fail('native ticket fell through to browser authentication')
++
++    async def receive():
++        return {'type': 'websocket.connect'}
++
++    async def send(message):
++        pass
++
++    monkeypatch.setattr(run_api, 'session_socket_handler', load_handler)
++    monkeypatch.setattr(web, '_DASHBOARD_EMBEDDED_CHAT_ENABLED', True)
++    from hermes_cli import web_server_chat
++    monkeypatch.setattr(web_server_chat, '_ws_request_is_allowed', lambda ws: True)
++    await run_api.GatewayRuntimeAPI(fallback, runner, web.app)(_attach_scope(ticket), receive, send)
++    assert len(connections) == 1
++    return connections[0]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('foreign', ['owner', 'principal', 'both'])
++async def test_receipt_ticket_cannot_read_foreign_local_owner(receipt_owner, monkeypatch, foreign):
++    from gateway.owner_identity import host_owner_subject
++
++    authority = receipt_owner
++    subject = host_owner_subject()
++    ref, receipt = await _queued(authority,
++        subject if foreign == 'principal' else 'foreign-owner', 'foreign',
++        subject if foreign == 'owner' else 'foreign-principal')
++    connection = await _redeem(authority, monkeypatch, 'prompt-receipt')
++    try:
++        reply = await connection.dispatch({'id': 1, 'method': 'prompt.receipt',
++            'params': {'session_id': ref.session_id, 'admission_id': receipt.admission_id}})
++        assert reply.get('error', {}).get('message') == 'permission_denied', reply
++        if foreign == 'principal':
++            # Receipt-only reads must not reuse the interactive control bypass even internally.
++            elevated = replace(connection.actor, capabilities=connection.actor.capabilities | {'session:control'})
++            with pytest.raises(RuntimeStoreError, match='permission_denied'):
++                await authority.receipt(elevated, ref, receipt.admission_id, receipt_only=True)
++    finally:
++        await connection.close()
++
++
++def test_receipt_ticket_binding_and_single_use():
++    from gateway.runtime_bootstrap import TicketStore
++
++    store = TicketStore('fixture', frozenset({'one', 'two'}))
++    with pytest.raises(PermissionError, match='bootstrap binding rejected'):
++        store.mint(profile_id='one', subject='uid:1000', purpose='prompt-receipt', scope='host')
++    ticket = store.mint(profile_id='one', subject='uid:1000', purpose='prompt-receipt')
++    for profile, purpose in [('two', 'prompt-receipt'), ('one', 'interactive'), ('one', 'worker-adoption')]:
++        with pytest.raises(PermissionError, match='bootstrap binding rejected'):
++            store.redeem(ticket, profile_id=profile, purpose=purpose)
++    grant = store.redeem(ticket, profile_id='one', purpose='prompt-receipt')
++    assert grant['capabilities'] == frozenset({'session:receipt'})
++    with pytest.raises(PermissionError, match='invalid bootstrap ticket'):
++        store.redeem(ticket, profile_id='one', purpose='prompt-receipt')
++
++
++@pytest.mark.asyncio
++async def test_receipt_ticket_reads_own_admission_but_no_other_rpc(receipt_owner, monkeypatch):
++    from gateway.owner_identity import host_owner_subject
++
++    authority = receipt_owner
++    ref, receipt = await _queued(authority, host_owner_subject(), 'own')
++    connection = await _redeem(authority, monkeypatch, 'prompt-receipt')
++    params = {'session_id': ref.session_id, 'admission_id': receipt.admission_id}
++    try:
++        assert connection.actor.capabilities == frozenset({'session:receipt'})
++        reply = await connection.dispatch({'id': 1, 'method': 'prompt.receipt', 'params': params})
++        assert reply['result']['admission_id'] == receipt.admission_id
++        assert reply['result']['status'] == 'queued'
++        before = get_session_admission(authority.db, admission_id=receipt.admission_id)
++        # Enumerate the whole core surface plus group and plugin routes, even handlers with no session checks.
++        methods = set(connection.handlers()) | {'profiles.list', 'group.create', 'fixture.plugin'}
++        for method in sorted(methods - {'prompt.receipt'}):
++            denied = await connection.dispatch({'id': 2, 'method': method, 'params': params})
++            assert denied['error']['message'] == 'permission_denied', (method, denied)
++        # Internal receipt-then-write callers must retain their submit/control gate too.
++        with pytest.raises(RuntimeStoreError, match='permission_denied'):
++            await authority.cancel_queued(connection.actor, ref, receipt.admission_id)
++        assert get_session_admission(authority.db, admission_id=receipt.admission_id) == before
++    finally:
++        await connection.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('source', ['gui', 'cli'])
++async def test_interactive_owner_keeps_receipts_and_controls(receipt_owner, monkeypatch, source):
++    from gateway.owner_identity import host_owner_subject
++
++    authority = receipt_owner
++    ref, receipt = await _queued(authority, host_owner_subject(), source, source=source)
++    connection = await _redeem(authority, monkeypatch, 'interactive')
++    try:
++        assert {'session:operator', 'session:control', 'session:submit'} <= connection.actor.capabilities
++        params = {'session_id': ref.session_id, 'admission_id': receipt.admission_id}
++        result = await connection.dispatch({'id': 1, 'method': 'prompt.receipt', 'params': params})
++        assert result['result']['status'] == 'queued'
++        cancelled = await connection.dispatch({'id': 2, 'method': 'prompt.cancel', 'params': params})
++        assert cancelled['result']['status'] == 'terminal'
++    finally:
++        await connection.close()
+diff --git a/tests/gateway/test_runtime_bootstrap.py b/tests/gateway/test_runtime_bootstrap.py
+index 4a8411c1f9..29762e1f14 100644
+--- a/tests/gateway/test_runtime_bootstrap.py
++++ b/tests/gateway/test_runtime_bootstrap.py
+@@ -8,7 +8,8 @@ import pytest
+ 
+ @pytest.mark.platforms("linux")
+ @pytest.mark.asyncio
+-async def test_private_control_peer_mints_profile_bound_ticket(tmp_path):
++@pytest.mark.parametrize('purpose', ['interactive', 'prompt-receipt'])
++async def test_private_control_peer_mints_profile_bound_ticket(tmp_path, purpose):
+     from gateway.control_socket import GatewayControlServer, resolve_client_socket_path
+     home = tmp_path / 'home'
+     home.mkdir(mode=0o700)
+@@ -28,15 +29,18 @@ async def test_private_control_peer_mints_profile_bound_ticket(tmp_path):
+         writer.close()
+         await writer.wait_closed()
+         return reply
+-    params = {'profile_id': str(home.resolve()), 'instance_id': 'instance', 'purpose': 'interactive'}
++    params = {'profile_id': str(home.resolve()), 'instance_id': 'instance', 'purpose': purpose}
+     try:
+         reply = await request(params)
+         assert reply['ok'], reply
+         ticket = reply['result']['ticket']
+-        grant = server.ticket_store.redeem(ticket, profile_id=params['profile_id'], purpose='interactive')
++        grant = server.ticket_store.redeem(ticket, profile_id=params['profile_id'], purpose=purpose)
+         assert grant['subject'] == f'uid:{os.getuid()}'
+         assert grant['instance_id'] == 'instance'
+-        assert 'session:create' in grant['capabilities']
++        if purpose == 'interactive':
++            assert 'session:create' in grant['capabilities']
++        else:
++            assert grant['capabilities'] == frozenset({'session:receipt'})
+         for invalid in ({**params, 'instance_id': 'old'}, {**params, 'profile_id': '/wrong'}, {**params, 'subject': 'admin'}):
+             assert not (await request(invalid))['ok']
+         assert not (await request(params, origin='http://browser'))['ok']
+diff --git a/tests/gateway/test_session_socket_preload.py b/tests/gateway/test_session_socket_preload.py
+index 4edb2068ee..f63431597e 100644
+--- a/tests/gateway/test_session_socket_preload.py
++++ b/tests/gateway/test_session_socket_preload.py
+@@ -129,10 +129,11 @@ async def test_an_attach_counts_as_a_client_while_its_handler_is_still_loading(t
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_drain_that_began_while_the_handler_loaded_refuses_the_attach(tmp_path, monkeypatch):
++@pytest.mark.parametrize('purpose', ['interactive', 'prompt-receipt'])
++async def test_a_drain_that_began_while_the_handler_loaded_refuses_the_attach(tmp_path, monkeypatch, purpose):
+     """Admission is re-checked after the fetch: an interactive client is refused (1013) by a drain
+     that started while the handler loaded, exactly as if it had arrived after the drain."""
+     def drain(runner):
+         runner._draining = True
+-    handled, sent = await _attach_while_loading(tmp_path, monkeypatch, during_load=drain)
++    handled, sent = await _attach_while_loading(tmp_path, monkeypatch, during_load=drain, purpose=purpose)
+     assert not handled and sent[-1] == {'type': 'websocket.close', 'code': 1013, 'reason': ''}
+diff --git a/website/docs/developer-guide/gateway-internals.md b/website/docs/developer-guide/gateway-internals.md
+index 68eb7f326e..86bdfc99bf 100644
+--- a/website/docs/developer-guide/gateway-internals.md
++++ b/website/docs/developer-guide/gateway-internals.md
+@@ -480,7 +480,7 @@ Each gateway listens on a local control socket. It is how a client on the same m
+ gateway that serves its profile and gets a WebSocket ticket, without spawning Python. Three verbs
+ are public: `identify` (read-only), `resolve-profile` and the public form of `session-ticket`.
+ Every other verb, the `session-ticket` parameters `subject` and `scope`, and purposes other than
+-`interactive` are internal to Hermes (Desktop, the dashboard, the updater) and may change.
++`interactive` and `prompt-receipt` are internal to Hermes (Desktop, the dashboard, the updater) and may change.
+ Starting or recovering a gateway stays `hermes gateway attach --start` / `--recover`
+ ([below](#hermes-gateway-attach)).
+ 
+@@ -517,6 +517,22 @@ and `runtime_protocol: 1`; its `ticket` expires after `expires_in_seconds` (30).
+ with no `Origin` header, and check that the server selected `ws_protocol`. Mint a new ticket for
+ every connection and reconnect.
+ 
++For a client that only polls `prompt.receipt`, request `"purpose": "prompt-receipt"`
++instead. This profile-bound ticket carries only `session:receipt`, never
++`session:control` or `session:operator`, and the socket refuses every other RPC.
++The receipt must belong to the caller's admission principal and, for a local
++session, its local owner (including the existing legacy same-owner mappings).
++Receipt reads may include the saved terminal result. They cannot submit, cancel,
++steer, resume, or inspect other session state. A receipt-only ticket cannot use
++host scope. Like an interactive ticket, it does not bypass draining admission;
++machine pollers should send `"restart_wait": "refuse"`.
++
++An older gateway rejects this purpose: do not silently retry with `interactive`
++when least privilege is required. Interactive tickets intentionally retain the
++Desktop/TUI owner's full controls and cross-session operator access. This is
++capability attenuation for a ticket holder, not isolation against the same OS
++user who can request a separate interactive ticket from the private socket.
++
+ | Case | `error` |
+ |---|---|
+ | `resolve-profile`: bad envelope | `PermissionError: invalid resolve envelope` |
+-- 
+2.43.0
+

@@ -1,0 +1,322 @@
+From 7e425be777ba12acf38f2cae3ad1b51fb378c5a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:21:28 +0000
+Subject: [PATCH] [daveey] Settle an ended local turn's failed lease release
+ before admission
+
+Five whys:
+1. Automatic Desktop turns showed an ownership card after the previous turn ended.
+2. Durable preflight saw the still-present old writer row as another owner.
+3. Database release failed and DurableTurnLease cleared the active holder anyway.
+4. Preflight had no terminal, process-local custody receipt to retry that exact release.
+5. Prior coverage covered lock-abandoned acquisition, not this earlier synthesized gate
+   after a non-lock database failure.
+
+Retain an agent-local receipt of failed terminal release, binding process, store,
+original session and exact per-turn holder. Preflight retries only that conditional
+DELETE and reads ownership again. It never treats a receipt as write authority,
+exempts a missing row, steals by PID, repairs corruption or changes marker policy.
+Still-failing releases remain coordination-unavailable with lease_self_orphan and
+proven holder_pid; holder mismatch is lease_foreign without invented PID/birth.
+
+Historical limitations: retained hub agent.log.10 and agent.log.3 independently
+show SQLITE_CORRUPT/append failure, release failure, then automatic SESSION_NOT_OWNED
+on two separate occasions. Those logs do not preserve the exact durable
+holder or prove process/birth equality. The SQLite fault-injection regression proves
+the mechanism on current main, not the identity of either historical writer. Quarantined
+handles must still refuse writes; this does not reopen or repair them.
+
+Proof: canonical current-main9fee390a RED: synthesized admission returned None and
+emitted SESSION_NOT_OWNED after failed release. Recovery GREEN: 13 focused cases,
+including still-failed DB, same-PID foreign holder, custody boundaries, compressed
+lineage and racing successor. Existing facade+real CLI takeover tests:17 passed.
+Further consumer, mutation, static and independent exact-head CI gates run before ship.
+
+hotspot: tui_gateway/session_lifecycle.py is shared with parent A and sibling C;
+this change is limited to durable lease preflight, not marker classification.
+---
+ agent/turn_facade_lease.py                    |   2 +
+ agent/turn_lease_recovery.py                  |  49 ++++++
+ .../test_self_orphan_turn_lease.py            | 146 ++++++++++++++++++
+ tui_gateway/session_lifecycle.py              |  27 +++-
+ 4 files changed, 218 insertions(+), 6 deletions(-)
+ create mode 100644 agent/turn_lease_recovery.py
+ create mode 100644 tests/tui_gateway/test_self_orphan_turn_lease.py
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index a55eee20ab..7aacc2e7c2 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -216,6 +216,8 @@ class DurableTurnLease:
+         try:
+             self.db.release_session_turn_lease(self.session_id, self.holder)
+         except Exception as exc:
++            from agent.turn_lease_recovery import remember_failed_release
++            remember_failed_release(agent, self.db, self.session_id, self.holder)
+             if classify_persistence_error(exc) == "locked":
+                 logger.warning(
+                     "Session turn lease release deferred (state.db busy); retrying in the background: %s (%s)",
+diff --git a/agent/turn_lease_recovery.py b/agent/turn_lease_recovery.py
+new file mode 100644
+index 0000000000..96f8734c77
+--- /dev/null
++++ b/agent/turn_lease_recovery.py
+@@ -0,0 +1,49 @@
++"""Process-local custody of an ended turn whose durable release failed."""
++import os
++import sqlite3
++from dataclasses import dataclass
++from pathlib import Path
++
++
++@dataclass(frozen=True)
++class FailedTurnRelease:
++    pid: int
++    store: Path
++    session_id: str
++    holder: str
++
++
++class FailedTurnReleasePending(RuntimeError):
++    """A proven ended self-holder remains because its store still refuses release."""
++
++    def __init__(self, receipt: FailedTurnRelease):
++        super().__init__('Ended turn lease release is still unavailable')
++        self.receipt = receipt
++
++
++def remember_failed_release(agent, db, session_id: str, holder: str) -> None:
++    """Only the lease's terminal release creates this receipt, never a PID observation."""
++    path = getattr(db, 'db_path', None)
++    if isinstance(path, (str, Path)):
++        agent._failed_turn_release = FailedTurnRelease(os.getpid(), Path(path).resolve(), session_id, holder)
++
++
++def settle_failed_release(agent, db, owner: dict) -> bool:
++    """Retry an exact ended holder's conditional DELETE; never exempt it from DB admission.
++
++    Called under the agent admission lock. Failure propagates: a readable owner row is not
++    evidence that the store can release it. A successor between read and DELETE is protected
++    by SessionDB's holder comparison, and the caller must re-read ownership afterwards.
++    """
++    receipt = getattr(agent, '_failed_turn_release', None)
++    path = getattr(db, 'db_path', None)
++    if (not isinstance(receipt, FailedTurnRelease) or receipt.pid != os.getpid()
++            or not isinstance(path, (str, Path)) or Path(path).resolve() != receipt.store
++            or owner['holder'] != receipt.holder):
++        return False
++    try:
++        db.release_session_turn_lease(receipt.session_id, receipt.holder)
++    except (sqlite3.Error, RuntimeError, OSError) as exc:
++        raise FailedTurnReleasePending(receipt) from exc
++    agent._failed_turn_release = None
++    return True
+diff --git a/tests/tui_gateway/test_self_orphan_turn_lease.py b/tests/tui_gateway/test_self_orphan_turn_lease.py
+new file mode 100644
+index 0000000000..695425d8db
+--- /dev/null
++++ b/tests/tui_gateway/test_self_orphan_turn_lease.py
+@@ -0,0 +1,146 @@
++"""Failed release must not turn this agent's ended turn into a foreign owner."""
++import contextlib
++import os
++import sqlite3
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from agent.turn_facade_lease import DurableTurnLease
++from hermes_state import SessionDB
++from hermes_state_pidns import holder_namespace_token
++from tui_gateway import server
++
++
++@pytest.fixture
++def orphan(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('root', source='desktop')
++    holder = f'pid={os.getpid()}{holder_namespace_token()}:turn=ended:platform=desktop'
++    assert db.try_acquire_session_turn_lease('root', holder)
++    agent = SimpleNamespace(_session_db=db, session_id='root',
++                            _active_session_turn_lease_holder=holder, clear_interrupt=lambda: None)
++    lease = DurableTurnLease(agent, db, 'root', holder)
++    release = db.release_session_turn_lease
++    def failed(*args, **kwargs):
++        raise sqlite3.DatabaseError('injected unavailable database')
++    monkeypatch.setattr(db, 'release_session_turn_lease', failed)
++    lease.release()
++    assert agent._active_session_turn_lease_holder is None
++    monkeypatch.setattr(db, 'release_session_turn_lease', release)
++    session = {'session_key': 'root', 'agent': agent, 'history_lock': threading.Lock(),
++               'history': [], 'running': True, '_synthesized_turn': True, 'attached_images': [],
++               'active_session_lease': object()}
++    monkeypatch.setattr(server, '_get_db', lambda: db)
++    monkeypatch.setattr(server, '_session_moved_refusal', lambda _: None)
++    monkeypatch.setattr(server, 'admit_synthesized_turn', lambda _: True)
++    monkeypatch.setattr(server, '_start_inflight_turn', lambda *a, **k: None)
++    errors = []
++    monkeypatch.setattr(server, '_emit_terminal_turn_error', lambda *a, **k: errors.append(a[2]))
++    yield SimpleNamespace(db=db, agent=agent, lease=lease, holder=holder, session=session,
++                          release=release, errors=errors, fail=failed)
++    db.close()
++
++
++def test_synthesized_admission_settles_exact_failed_release(orphan):
++    state = orphan
++    assert state.db.session_turn_lease_owner('root')['holder'] == state.holder
++    result = server._admit_prompt_turn('ui', state.session, 'notice', [], None, None, None)
++    assert result == ([], state.agent)
++    assert state.errors == []
++    assert state.db.session_turn_lease_owner('root') is None
++    assert state.db.try_acquire_session_turn_lease('root', 'next-turn')
++
++
++def test_still_failed_store_is_coordination_failure_with_self_provenance(orphan, monkeypatch):
++    monkeypatch.setattr(orphan.db, 'release_session_turn_lease', orphan.fail)
++    refusal = server._durable_owner_refusal(orphan.session)
++    assert getattr(refusal, 'reason', None) == 'SESSION_COORDINATION_UNAVAILABLE'
++    assert refusal.ownership_cause == 'lease_self_orphan'
++    assert refusal.holder_pid == os.getpid()
++    assert orphan.db.session_turn_lease_owner('root')['holder'] == orphan.holder
++    monkeypatch.setattr(orphan.db, 'release_session_turn_lease', orphan.release)
++    assert server._durable_owner_refusal(orphan.session) is None
++
++
++def test_different_holder_even_in_same_process_stays_fenced(orphan):
++    orphan.release('root', orphan.holder)
++    foreign = f'pid={os.getpid()}{holder_namespace_token()}:turn=foreign:platform=desktop'
++    assert orphan.db.try_acquire_session_turn_lease('root', foreign)
++    refusal = server._durable_owner_refusal(orphan.session)
++    assert refusal.reason == 'SESSION_NOT_OWNED'
++    assert refusal.ownership_cause == 'lease_foreign'
++    assert getattr(refusal, 'holder_pid', None) is None
++    assert orphan.db.session_turn_lease_owner('root')['holder'] == foreign
++
++
++@pytest.mark.parametrize('boundary', ['agent', 'process', 'store', 'missing_store', 'receipt_type'])
++def test_receipt_cannot_authorize_a_different_custodian(orphan, monkeypatch, tmp_path, boundary):
++    from dataclasses import replace
++    receipt = orphan.agent._failed_turn_release
++    if boundary == 'agent':
++        orphan.session['agent'] = SimpleNamespace()
++    elif boundary == 'process':
++        orphan.agent._failed_turn_release = replace(receipt, pid=-1)
++    elif boundary == 'receipt_type':
++        orphan.agent._failed_turn_release = SimpleNamespace(**receipt.__dict__)
++    else:
++        # Adapter reports another/missing store while retaining real row reads.
++        proxy = SimpleNamespace(db_path=None if boundary == 'missing_store' else tmp_path / 'other.db',
++                                session_turn_lease_owner=orphan.db.session_turn_lease_owner,
++                                release_session_turn_lease=orphan.release)
++        monkeypatch.setattr(server, '_session_db', lambda _: contextlib.nullcontext(proxy))
++    calls = []
++    target = proxy if boundary in ('store', 'missing_store') else orphan.db
++    monkeypatch.setattr(target, 'release_session_turn_lease', lambda *args: calls.append(args))
++    refusal = server._durable_owner_refusal(orphan.session)
++    assert refusal.reason == 'SESSION_NOT_OWNED'
++    assert refusal.ownership_cause == 'lease_foreign'
++    assert calls == []
++
++
++def test_successor_racing_settlement_is_re_read_and_fenced(orphan, monkeypatch):
++    def racing_release(session_id, holder):
++        orphan.release(session_id, holder)
++        assert orphan.db.try_acquire_session_turn_lease('root', 'successor')
++        orphan.release(session_id, holder)  # old holder cannot remove successor
++    monkeypatch.setattr(orphan.db, 'release_session_turn_lease', racing_release)
++    refusal = server._durable_owner_refusal(orphan.session)
++    assert refusal.reason == 'SESSION_NOT_OWNED'
++    assert orphan.db.session_turn_lease_owner('root')['holder'] == 'successor'
++
++
++def test_live_exact_holder_is_not_settled(orphan, monkeypatch):
++    orphan.agent._active_session_turn_lease_holder = orphan.holder
++    calls = []
++    monkeypatch.setattr(orphan.db, 'release_session_turn_lease', lambda *args: calls.append(args))
++    assert server._durable_owner_refusal(orphan.session) is None
++    assert calls == []
++    assert orphan.db.session_turn_lease_owner('root')['holder'] == orphan.holder
++
++
++def test_compressed_tip_settles_original_root_only(orphan):
++    orphan.db.end_session('root', 'compression')
++    orphan.db.create_session('tip', source='desktop', parent_session_id='root')
++    orphan.session['session_key'] = 'tip'
++    assert server._durable_owner_refusal(orphan.session) is None
++    assert orphan.db.session_turn_lease_owner('tip') is None
++
++
++def test_unreadable_store_does_not_use_receipt_as_admission(orphan, monkeypatch):
++    monkeypatch.setattr(orphan.db, 'session_turn_lease_owner', orphan.fail)
++    assert server._durable_owner_refusal(orphan.session) is not None
++    assert orphan.agent._failed_turn_release is not None
++
++
++def test_successful_release_never_creates_recovery_authority(tmp_path):
++    db = SessionDB(tmp_path / 'healthy.db')
++    try:
++        assert db.try_acquire_session_turn_lease('root', 'holder')
++        agent = SimpleNamespace(_active_session_turn_lease_holder='holder')
++        lease = DurableTurnLease(agent, db, 'root', 'holder')
++        lease.release()
++        assert getattr(agent, '_failed_turn_release', None) is None
++    finally:
++        db.close()
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 50e74c60fd..66602edc6a 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -114,16 +114,29 @@ def _foreign_turn_owner(session: dict):
+     key = str(session.get("session_key") or "")
+     if not key:
+         return None
+-    with _session_db(session) as db:
+-        owner = db.session_turn_lease_owner(key)
+-    own_holder = getattr(session.get("agent"), "_active_session_turn_lease_holder", None)
+-    return owner if owner and owner["holder"] != own_holder else None
++    from agent.turn_facade_lease import turn_admission_lock
++    from agent.turn_lease_recovery import settle_failed_release
++    agent = session.get("agent")
++    with turn_admission_lock(agent) if agent is not None else contextlib.nullcontext():
++        with _session_db(session) as db:
++            owner = db.session_turn_lease_owner(key)
++            own_holder = getattr(agent, "_active_session_turn_lease_holder", None)
++            if owner and owner["holder"] != own_holder and settle_failed_release(agent, db, owner):
++                owner = db.session_turn_lease_owner(key)
++        return owner if owner and owner["holder"] != own_holder else None
+ 
+ 
+ def _durable_owner_refusal(session: dict):
+-    from hermes_cli.active_sessions import ActiveSessionRefusal, SESSION_NOT_OWNED
++    from hermes_cli.active_sessions import ActiveSessionRefusal, SESSION_NOT_OWNED, SESSION_COORDINATION_UNAVAILABLE
++    from agent.turn_lease_recovery import FailedTurnReleasePending
+     try:
+         owner = _foreign_turn_owner(session)
++    except FailedTurnReleasePending as exc:
++        logger.warning("Could not settle ended self turn lease", exc_info=True)
++        refusal = ActiveSessionRefusal(_SESSION_OWNERSHIP_UNAVAILABLE, SESSION_COORDINATION_UNAVAILABLE)
++        refusal.ownership_cause = "lease_self_orphan"
++        refusal.holder_pid = exc.receipt.pid
++        return refusal
+     except Exception:
+         logger.warning("Could not inspect durable turn owner", exc_info=True)
+         return _SESSION_OWNERSHIP_UNAVAILABLE
+@@ -131,11 +144,13 @@ def _durable_owner_refusal(session: dict):
+         return None
+     holder = owner["holder"]
+     surface = holder.rsplit(":platform=", 1)[-1] if ":platform=" in holder else "unknown"
+-    return ActiveSessionRefusal(
++    refusal = ActiveSessionRefusal(
+         "This chat is active in another Hermes window/terminal. Use Take over here "
+         "(session.take_over), or wait for that turn to finish.\n"
+         f"Details: session {owner['conversation_id']} opened by {surface}. "
+         f"Writer: {holder}", SESSION_NOT_OWNED)
++    refusal.ownership_cause = "lease_foreign"
++    return refusal
+ 
+ 
+ #: Display kinds of turns Hermes starts on its own (no human typed them): the turn-starting notices
+-- 
+2.43.0
+

@@ -1,0 +1,599 @@
+From 743d95b4f9c811d701d2f3590182a827661da84f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:12:23 +0000
+Subject: [PATCH] [daveey] Isolate notification subscription revisions and
+ private reader memos
+
+Problem: unrelated board content commits repeatedly scanned every notification
+subscription; private cached_ro fallbacks displaced the retained shared memo.
+
+Why: covered_revision(table) checks coverage but returns the global annotation
+counter. Titles, comments and runs move it. A private fallback was unconditionally
+published then closed, so the next shared read reset event history to zero.
+Root (happened): invalidation scope and reader custody did not match memo inputs.
+Root (not caught): existing no-rescan tests/benchmark only exercised claim_expires
+bookkeeping and subscription cursor changes, not unrelated substantive writes or
+shared/private signature publication. Earlier 622dc84/e8d9f6b/438f8a4 retained this
+coupling. Historical cause of all serve timeouts remains undetermined.
+
+Add an independent notify counter with exact SQL coverage for six read columns,
+installed/repaired transactionally by writable board init. Unknown coverage keeps
+literal fresh reads. Read coverage/counter/rows in one snapshot. Missing-counter
+repair changes schema generation too. Generic revision triggers stay unchanged.
+Only retained shared readers publish signature memos; private results stay local.
+No timeout, polling interval, delivery or at-most-once semantics change.
+
+Proof:
+- Authentic predecessor RED: title/comment/run rescan and private publication
+  assertions failed; heartbeat negative control passed.
+- Canonical focused consumers: 185 passed across 13 files (pre-expansion).
+- Expanded notify pair: 36 passed, including actual SQL counts, every read column,
+  legacy/partial/foreign schema, repair rollback, missing-row reuse, WAL/DB and
+  same-file connection replacement, concurrent commit and private contention.
+- 16 exact-anchor mutants killed; two original survivors received explicit
+  no-write foreign-schema and snapshot-boundary assertions and were re-killed.
+- scripts/check --base origin/main: all 21 checks passed.
+- Synthetic 2,887 TUI / 8,748 total subscriptions, 10k events, 200 unrelated title
+  commits x 10 chat polls: read thread CPU 720.338 -> 83.413 ms; full-subscription
+  scans 200 -> 0, inflight scans 200 -> 0, same signatures/event highwater.
+  Writer CPU excluded; this is not whole-serve or incident recovery proof.
+
+Incident owner retains final-process authenticated endpoint measurements and
+unchanged 30-minute detector acceptance after natural deployment.
+---
+ hermes_cli/kanban_db_connect.py            |   6 +
+ hermes_cli/kanban_notify_revision.py       |  69 +++++
+ hermes_cli/kanban_reader_lifecycle.py      |   8 +
+ tests/tui_gateway/test_notify_revision.py  | 304 +++++++++++++++++++++
+ tests/tui_gateway/test_notify_subs_gate.py |  11 +-
+ tui_gateway/notification_idle.py           |  38 ++-
+ 6 files changed, 410 insertions(+), 26 deletions(-)
+ create mode 100644 hermes_cli/kanban_notify_revision.py
+ create mode 100644 tests/tui_gateway/test_notify_revision.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 9d88b4c748..02da8c0fef 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -898,6 +898,12 @@ def _ensure_activity_revision(conn: sqlite3.Connection, resolved: str) -> None:
+     except sqlite3.Error as exc:
+         _kb._log.warning("kanban activity revision not installed on %s (%s); annotation caches stay stat-keyed",
+                          resolved, exc)
++    from hermes_cli import kanban_notify_revision as notify_rev
++    try:
++        notify_rev.ensure_revision(conn)
++    except sqlite3.Error as exc:
++        _kb._log.warning("kanban notify revision not installed on %s (%s); notification reads stay literal",
++                         resolved, exc)
+ 
+ 
+ def _db_file_identity(path: Path) -> Optional[tuple[int, int]]:
+diff --git a/hermes_cli/kanban_notify_revision.py b/hermes_cli/kanban_notify_revision.py
+new file mode 100644
+index 0000000000..5d59f87cd5
+--- /dev/null
++++ b/hermes_cli/kanban_notify_revision.py
+@@ -0,0 +1,69 @@
++"""Subscription-only revision, independent of the annotation's global counter.
++
++Installed by writable board initialization; readers never repair schema. Exact SQL
++coverage is checked in the caller's snapshot. Missing/older/partial coverage
++means a literal read; no coverage proof is reused across reader/file generations.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++TABLE = "kanban_notify_revision"
++PREFIX = "kanban_notify_rev_"
++COLUMNS = ("chat_id", "task_id", "platform", "thread_id", "last_event_id", "inflight_from")
++DDL = f"CREATE TABLE {TABLE} (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)"
++BUMP = f"UPDATE {TABLE} SET revision = revision + 1 WHERE id = 1;"
++_CHANGED = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in COLUMNS)
++TRIGGERS = {
++    f"{PREFIX}{op.lower()}": (
++        f"CREATE TRIGGER {PREFIX}{op.lower()} AFTER {op} ON kanban_notify_subs"
++        + (f" WHEN {_CHANGED}" if op == "UPDATE" else "")
++        + f" BEGIN {BUMP} END"
++    ) for op in ("INSERT", "DELETE", "UPDATE")
++}
++
++
++def _schema(conn):
++    return dict(conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE name = ? OR (type = 'trigger' AND name GLOB ?)",
++        (TABLE, PREFIX + "*")))
++
++
++def ensure_revision(conn: sqlite3.Connection) -> None:
++    """Repair atomically and bump across any uncovered interval; intact opens do not write."""
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
++    if not set(COLUMNS) <= columns:
++        return  # older schema: the reader remains on literal subscription reads
++    wanted = {TABLE: DDL, **TRIGGERS}
++    found = _schema(conn)
++    if found == wanted and conn.execute(f"SELECT 1 FROM {TABLE} WHERE id = 1").fetchone():
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        found = _schema(conn)
++        if TABLE not in found:
++            conn.execute(DDL)
++        elif found[TABLE] != DDL:
++            return  # foreign schema: never silently replace its data or certify it
++        had_row = conn.execute(f"SELECT 1 FROM {TABLE} WHERE id = 1").fetchone() is not None
++        conn.execute(f"INSERT OR IGNORE INTO {TABLE} VALUES (1, 0)")
++        conn.execute(BUMP)
++        for name in set(found) - {TABLE} - set(TRIGGERS):
++            conn.execute(f'DROP TRIGGER "{name.replace(chr(34), chr(34) * 2)}"')
++        for name, sql in TRIGGERS.items():
++            if found.get(name) != sql or not had_row:
++                # A lost counter may restart at a previously cached value. Change
++                # schema generation too, so an unseen gap cannot certify old rows.
++                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                conn.execute(sql)
++
++
++def read_revision(conn: sqlite3.Connection, identity: tuple) -> tuple | None:
++    """Read inside the subscription snapshot, verifying coverage and schema afresh."""
++    schema = int(conn.execute("PRAGMA schema_version").fetchone()[0])
++    if _schema(conn) != {TABLE: DDL, **TRIGGERS}:
++        return None
++    row = conn.execute(f"SELECT revision FROM {TABLE} WHERE id = 1").fetchone()
++    if row is None:
++        return None
++    return (*identity, int(row[0]), schema)
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index e985edc054..959efda3da 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -27,6 +27,14 @@ def cached_entry(path, busy_budget=0.5):
+     return retry_open(lambda remaining: _cached_entry_once(path, remaining), busy_budget)
+ 
+ 
++def is_shared_reader(path, conn) -> bool:
++    """Whether this borrowed connection has retained custody (not a private fallback)."""
++    from hermes_cli import kanban_session_activity as activity
++    with activity._RO_CACHE_LOCK:
++        entry = activity._RO_CACHE.get(str(path))
++        return entry is not None and entry[0] is conn
++
++
+ def _cached_entry_once(path, remaining):
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli.kanban_lockguard import shm_identity
+diff --git a/tests/tui_gateway/test_notify_revision.py b/tests/tui_gateway/test_notify_revision.py
+new file mode 100644
+index 0000000000..16275fb847
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_revision.py
+@@ -0,0 +1,304 @@
++"""Real SQL regressions for subscription-local invalidation and reader custody."""
++import contextlib
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_notify_revision as revision
++from tui_gateway import notification_idle as idle
++from tests.tui_gateway import test_notify_subs_gate as helpers
++
++board = helpers.board
++CHAT = helpers.CHAT
++_subs_reads = helpers._subs_reads
++
++
++@contextlib.contextmanager
++def writer(path):
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        with conn:
++            yield conn
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE tasks SET title = title || ' changed'",
++    "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, 'test', 'comment', 1)",
++    "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)",
++    "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'claimed', '{}', 1)",
++    "INSERT INTO task_runs(task_id, profile, status, started_at) VALUES (?, 'default', 'running', 1)",
++])
++def test_unrelated_content_does_not_scan_subscriptions(board, sql):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    with _subs_reads(path) as reads:
++        for _ in range(3):
++            with writer(path) as conn:
++                conn.execute(sql, (_tasks[0],) if '?' in sql else ())
++            assert idle.board_signature(path, CHAT) == before
++    assert reads == []
++
++
++def test_private_fallback_does_not_displace_shared_memo(board):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    shared = idle._SIGS[str(path)]
++    ready, release = threading.Event(), threading.Event()
++
++    def hold():
++        with activity.cached_ro(path):
++            ready.set()
++            assert release.wait(5)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert ready.wait(5)
++        with writer(path) as conn:
++            conn.execute("UPDATE kanban_notify_subs SET last_event_id = 88 WHERE chat_id = ?", (CHAT,))
++        for _ in range(3):
++            fresh = idle.board_signature(path, CHAT)
++            assert fresh != before
++            assert fresh[2][0][4] == 88
++            assert idle._SIGS[str(path)] is shared
++    finally:
++        release.set()
++        thread.join(5)
++    assert not thread.is_alive()
++    with activity.cached_ro(path) as conn:
++        sql = []
++        conn.set_trace_callback(sql.append)
++    try:
++        assert idle.board_signature(path, CHAT) == fresh
++        assert idle._SIGS[str(path)][0] is shared[0]
++        assert not any('WHERE id > 0 ' in s for s in sql), sql
++    finally:
++        with activity.cached_ro(path) as conn:
++            conn.set_trace_callback(None)
++
++
++@pytest.mark.parametrize('column,value', [
++    ('chat_id', 'new-chat'), ('task_id', 'new-task'), ('platform', 'telegram'),
++    ('thread_id', 'new-thread'), ('last_event_id', 42), ('inflight_from', 0),
++])
++def test_every_read_column_invalidates_exact_rows(board, column, value):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    other = idle.board_signature(path, helpers.OTHER)
++    with writer(path) as conn:
++        conn.execute(f"UPDATE kanban_notify_subs SET {column} = ? WHERE chat_id = ? AND task_id = ?",
++                     (value, CHAT, _tasks[0]))
++    with _subs_reads(path) as scans:
++        after = idle.board_signature(path, CHAT)
++    assert len(scans) == 1
++    assert after != before
++    assert idle.board_signature(path, helpers.OTHER) == other
++    with activity.cached_ro(path) as conn:
++        expected = tuple(tuple(r) for r in conn.execute(idle._SUBS_SQL) if r[0] == CHAT)
++    assert after[2] == expected
++
++
++@pytest.mark.parametrize('damage', ['missing', 'partial', 'wrong-sql', 'missing-row', 'foreign-schema'])
++def test_uncovered_schema_reads_fresh_and_repair_bumps(board, damage):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    with writer(path) as conn:
++        old = conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0]
++        if damage in ('missing', 'foreign-schema'):
++            for name in revision.TRIGGERS:
++                conn.execute(f"DROP TRIGGER {name}")
++            conn.execute(f"DROP TABLE {revision.TABLE}")
++            if damage == 'foreign-schema':
++                conn.execute(f"CREATE TABLE {revision.TABLE}(id, revision)")
++        elif damage == 'missing-row':
++            conn.execute(f"DELETE FROM {revision.TABLE}")
++        else:
++            conn.execute(f"DROP TRIGGER {revision.PREFIX}update")
++            if damage == 'wrong-sql':
++                conn.execute(f"CREATE TRIGGER {revision.PREFIX}update AFTER UPDATE ON kanban_notify_subs "
++                             "BEGIN SELECT 1; END")
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 57 WHERE chat_id = ?", (CHAT,))
++    with activity.cached_ro(path) as conn:
++        assert revision.read_revision(conn, ('damaged',)) is None
++    with _subs_reads(path) as scans:
++        assert idle.board_signature(path, CHAT) != before
++    assert len(scans) == 1
++    previous = idle.board_signature(path, CHAT)
++    with writer(path) as conn:
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 58 WHERE chat_id = ?", (CHAT,))
++    assert idle.board_signature(path, CHAT) != previous
++    with writer(path) as conn:
++        schema_before = revision._schema(conn)
++        changes_before = conn.total_changes
++        revision.ensure_revision(conn)
++        if damage == 'foreign-schema':
++            assert revision._schema(conn) == schema_before
++            assert conn.total_changes == changes_before
++            assert revision.read_revision(conn, ('foreign',)) is None
++            return
++        repaired = conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0]
++        assert repaired > (old if damage in ('partial', 'wrong-sql') else 0)
++        statements = []
++        conn.set_trace_callback(statements.append)
++        revision.ensure_revision(conn)
++        assert not any(s.startswith(('UPDATE', 'INSERT', 'CREATE', 'DROP')) for s in statements)
++    with _subs_reads(path) as scans:
++        idle.board_signature(path, CHAT)
++    assert len(scans) == 1  # repair revokes the literal fallback publication
++
++
++def test_generic_trigger_maintenance_leaves_narrow_coverage(board):
++    from hermes_cli import kanban_activity_revision as generic
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    with writer(path) as conn:
++        generic.drop_triggers(conn)
++        generic.ensure_revision(conn, generic.LOCAL_TABLES)
++    with _subs_reads(path) as scans:
++        assert idle.board_signature(path, CHAT) == before
++    assert len(scans) == 1  # schema change invalidates even when rows equal
++    with writer(path) as conn:
++        conn.execute("UPDATE tasks SET title = 'another title'")
++    with _subs_reads(path) as scans:
++        assert idle.board_signature(path, CHAT) == before
++    assert scans == []
++
++
++def test_revision_and_rows_share_snapshot(board, monkeypatch):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    original = idle._subs_revision
++    injected = []
++    snapshots = []
++
++    def commit_after_stamp(conn, path):
++        snapshots.append(conn.in_transaction)
++        stamp = original(conn, path)
++        if not injected:
++            injected.append(True)
++            with writer(path) as raw:
++                raw.execute("UPDATE kanban_notify_subs SET last_event_id = 63 WHERE chat_id = ?", (CHAT,))
++        return stamp
++
++    monkeypatch.setattr(idle, '_subs_revision', commit_after_stamp)
++    with writer(path) as conn:
++        conn.execute("UPDATE tasks SET title = 'force poll'")
++    assert idle.board_signature(path, CHAT) == before
++    assert injected
++    assert snapshots == [True]
++    assert idle.board_signature(path, CHAT)[2][0][4] == 63
++
++
++def test_same_file_new_connection_does_not_reuse_data_version(board):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    old = idle._SIGS[str(path)][0]
++    activity.evict_readers(str(path.resolve()))
++    with writer(path) as conn:
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 74 WHERE chat_id = ?", (CHAT,))
++    assert idle.board_signature(path, CHAT) != before
++    assert idle._SIGS[str(path)][0] is not old
++
++
++def test_replaced_database_rebuilds_event_and_subscription_state(board):
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    replacement = path.with_name('replacement.db')
++    with contextlib.closing(sqlite3.connect(path)) as source:
++        with contextlib.closing(sqlite3.connect(replacement)) as target:
++            source.backup(target)
++    activity.evict_readers(str(path.resolve()))
++    with writer(replacement) as conn:
++        conn.execute("DELETE FROM task_events")
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 81 WHERE chat_id = ?", (CHAT,))
++    replacement.replace(path)
++    assert idle.board_signature(path, CHAT) != before
++    assert idle.board_signature(path, CHAT)[2][0][4] == 81
++
++
++def test_deleted_wal_generation_discards_signature_reader(board):
++    from pathlib import Path
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    old = idle._SIGS[str(path)][0]
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        assert conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
++    Path(str(path) + '-wal').unlink(missing_ok=True)
++    Path(str(path) + '-shm').unlink(missing_ok=True)
++    assert idle.board_signature(path, CHAT) == before
++    assert idle._SIGS[str(path)][0] is not old
++
++
++def test_unknown_reader_has_no_shared_custody(tmp_path):
++    from hermes_cli.kanban_reader_lifecycle import is_shared_reader
++    with contextlib.closing(sqlite3.connect(':memory:')) as conn:
++        assert not is_shared_reader(tmp_path / 'unknown.db', conn)
++
++
++def test_install_failure_preserves_literal_fallback(board, monkeypatch, caplog):
++    from hermes_cli import kanban_db_connect as connect
++    path, _tasks = board
++    with writer(path) as conn:
++        for name in revision.TRIGGERS:
++            conn.execute(f'DROP TRIGGER {name}')
++    def fail(conn):
++        raise sqlite3.OperationalError('controlled install refusal')
++    monkeypatch.setattr(revision, 'ensure_revision', fail)
++    with writer(path) as conn:
++        connect._ensure_activity_revision(conn, str(path))
++        assert revision.read_revision(conn, ('failed',)) is None
++    assert 'notification reads stay literal' in caplog.text
++
++
++def test_old_schema_install_is_read_only(tmp_path):
++    with contextlib.closing(sqlite3.connect(tmp_path / 'old.db')) as conn:
++        conn.execute('CREATE TABLE kanban_notify_subs(task_id)')
++        revision.ensure_revision(conn)
++        assert revision.read_revision(conn, ('old',)) is None
++        assert conn.execute('SELECT name FROM sqlite_master WHERE name = ?', (revision.TABLE,)).fetchone() is None
++
++
++def test_repair_is_atomic_and_removes_extra_owned_trigger(board):
++    path, _tasks = board
++    with writer(path) as conn:
++        conn.execute(f"DROP TRIGGER {revision.PREFIX}update")
++        conn.execute(f"CREATE TRIGGER {revision.PREFIX}extra AFTER UPDATE ON kanban_notify_subs BEGIN SELECT 1; END")
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        old_schema = revision._schema(conn)
++        old_revision = conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0]
++        conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_TRIGGER
++                            else sqlite3.SQLITE_OK)
++        with pytest.raises(sqlite3.DatabaseError):
++            revision.ensure_revision(conn)
++        conn.set_authorizer(None)
++        assert revision._schema(conn) == old_schema
++        assert conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0] == old_revision
++        revision.ensure_revision(conn)
++        assert revision._schema(conn) == {revision.TABLE: revision.DDL, **revision.TRIGGERS}
++
++
++def test_missing_counter_repair_cannot_reuse_an_old_revision(board):
++    path, _tasks = board
++    with writer(path) as conn:
++        conn.execute(f"UPDATE {revision.TABLE} SET revision = 1")
++    before = idle.board_signature(path, CHAT)
++    with writer(path) as conn:
++        conn.execute(f"DELETE FROM {revision.TABLE}")
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 92 WHERE chat_id = ?", (CHAT,))
++    with writer(path) as conn:
++        revision.ensure_revision(conn)
++        assert conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0] == 1
++    assert idle.board_signature(path, CHAT) != before
++
++
++def test_unchanged_and_unread_columns_do_not_bump(board):
++    path, _tasks = board
++    idle.board_signature(path, CHAT)
++    with writer(path) as conn:
++        start = conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0]
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = last_event_id, inflight_at = 123")
++        assert conn.execute(f"SELECT revision FROM {revision.TABLE}").fetchone()[0] == start
++    with _subs_reads(path) as scans:
++        idle.board_signature(path, CHAT)
++    assert scans == []
+diff --git a/tests/tui_gateway/test_notify_subs_gate.py b/tests/tui_gateway/test_notify_subs_gate.py
+index f7434cd18e..ace425ecb2 100644
+--- a/tests/tui_gateway/test_notify_subs_gate.py
++++ b/tests/tui_gateway/test_notify_subs_gate.py
+@@ -4,8 +4,8 @@ they are made of.
+ ``notification_idle.board_signature`` runs once per board commit for every chat poller in the process. The hub's
+ main board moved ``data_version`` 92 times a minute and its activity revision 9 times (heartbeats, claims and run
+ stamps are bookkeeping), so re-reading every tui subscription row (2.1k rows, 3 ms) on each commit was most of the
+-serve's poll. The rows are now reused while the activity revision (its triggers cover every read column) and the
+-in-flight marks (the one bookkeeping column a chat's poll acts on) are unchanged. Every input change is still seen
++serve's poll. The rows are now reused while the independent subscription revision (including the in-flight mark)
++is unchanged. The annotation's activity revision is global, not table-local. Every input change is still seen
+ on the next call, and a chat with a claim in flight is polled every tick, so a claim that goes stale on the clock
+ is recovered with no other change.
+ """
+@@ -92,7 +92,7 @@ def test_a_new_and_a_removed_subscription_are_seen(board):
+ 
+ 
+ def test_an_in_flight_mark_alone_is_seen(board):
+-    """inflight_* are bookkeeping columns: they do not move the activity revision, so the key reads them itself."""
++    """inflight_from moves the notify counter even though annotation bookkeeping excludes it."""
+     path, tasks = board
+     before = idle.board_signature(path, CHAT)
+     _write("UPDATE kanban_notify_subs SET inflight_from = 0, inflight_pid = 4242 WHERE task_id = ? AND chat_id = ?",
+@@ -105,10 +105,11 @@ def test_an_in_flight_mark_alone_is_seen(board):
+ 
+ def test_without_the_counter_triggers_the_rows_are_read_on_every_commit(board):
+     """An older writer that dropped the triggers: the revision cannot vouch for the rows."""
+-    from hermes_cli.kanban_activity_revision import drop_triggers
++    from hermes_cli.kanban_notify_revision import TRIGGERS
+     path, tasks = board
+     with contextlib.closing(sqlite3.connect(path)) as raw:  # a plain writer: nothing reinstalls the triggers
+-        drop_triggers(raw)
++        for name in TRIGGERS:
++            raw.execute(f"DROP TRIGGER {name}")
+         raw.commit()
+     before = idle.board_signature(path, CHAT)
+     with _subs_reads(path) as reads:
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index c645c64b1a..f9fea1eb7d 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -72,23 +72,17 @@ _SIGS_LOCK = threading.Lock()
+ _SIGS_MAX = 64
+ _SUBS_SQL = ("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
+              "FROM kanban_notify_subs WHERE LOWER(platform) = 'tui' ORDER BY chat_id, task_id, platform, thread_id")
+-# Card J (t_01a1d563324d7e8e): re-reading every tui subscription row (2.1k on the hub) on each of those commits was
+-# most of the serve's kanban poll. The rows are keyed instead on the activity revision, whose triggers move on every
+-# insert, delete and update of a read column of kanban_notify_subs (cursor, identity), plus the in-flight marks (the
+-# one bookkeeping column read here; ``kanban_activity_revision.BOOKKEEPING_COLUMNS``), read in the rows' snapshot.
+-_INFLIGHT_SQL = ("SELECT chat_id, task_id, platform, thread_id, inflight_from FROM kanban_notify_subs "
+-                 "WHERE inflight_from IS NOT NULL AND LOWER(platform) = 'tui' "
+-                 "ORDER BY chat_id, task_id, platform, thread_id")
++# The annotation revision is global, even for one table's coverage. Use a
++# subscription-only counter, including inflight_from, in the rows' snapshot.
++
+ 
+ 
+ def _subs_revision(conn, path):
+-    """``(dev, ino, revision, schema_version)`` when the activity counter covers ``kanban_notify_subs``, else None
+-    (an older writer without the triggers: the rows are read on every commit, as before)."""
++    """Subscription revision in the caller's snapshot; absent coverage reads literally."""
+     import os
+-    from hermes_cli.kanban_activity_revision import covered_revision
++    from hermes_cli.kanban_notify_revision import read_revision
+     st = os.stat(path)
+-    revision = covered_revision(conn, Path(path), (st.st_dev, st.st_ino), ("kanban_notify_subs",))
+-    return None if revision is None else (st.st_dev, st.st_ino, *revision)
++    return read_revision(conn, (str(path), st.st_dev, st.st_ino))
+ 
+ 
+ def _notify_content(conn, version, held, path=None):
+@@ -97,12 +91,12 @@ def _notify_content(conn, version, held, path=None):
+                                           "('task_events', 'kanban_notify_subs')")}
+     if len(present) != 2:
+         return None  # not a board (yet): fall back to the commit revision
+-    revision = None
+-    if path is not None:
+-        with contextlib.suppress(Exception):  # unknown coverage: read the rows
+-            revision = _subs_revision(conn, path)  # before the snapshot: a commit in between only re-reads next time
+     conn.execute("BEGIN")  # one snapshot for the event scan and the subscription rows
+     try:
++        revision = None
++        if path is not None:
++            with contextlib.suppress(Exception):  # unknown coverage: read the rows
++                revision = _subs_revision(conn, path)
+         top = int(conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0)
+         start, newest = (held[2], held[3]) if held is not None and held[2] <= top else (0, 0)
+         if top > start:
+@@ -110,7 +104,7 @@ def _notify_content(conn, version, held, path=None):
+             row = conn.execute(f"SELECT MAX(id) FROM task_events WHERE id > ? AND id <= ? AND kind IN ({marks})",
+                                (start, top, *_KANBAN_NOTIFY_KINDS)).fetchone()
+             newest = max(newest, int(row[0] or 0))
+-        subs_key = None if revision is None else (revision, tuple(conn.execute(_INFLIGHT_SQL).fetchall()))
++        subs_key = revision  # includes inflight_from; no per-commit subscription scan
+         by_chat = held[4] if subs_key is not None and held is not None and held[5] == subs_key else None
+         rows = conn.execute(_SUBS_SQL).fetchall() if by_chat is None else ()
+     finally:
+@@ -128,6 +122,7 @@ def board_signature(path, chat_id=None):
+     change to that chat's subscription rows, so a bookkeeping commit (heartbeat, claim of another card, run
+     stamps) keeps it. A board without the notify tables keys on its commit revision. Raises like any read."""
+     from hermes_cli.kanban_session_activity import cached_ro
++    from hermes_cli.kanban_reader_lifecycle import is_shared_reader
+     key = str(path)
+     with cached_ro(Path(path)) as conn:
+         version = conn.execute("PRAGMA data_version").fetchone()[0]
+@@ -139,10 +134,11 @@ def board_signature(path, chat_id=None):
+             held = _notify_content(conn, version, held, path)
+             if held is None:
+                 return conn, version
+-            with _SIGS_LOCK:
+-                if len(_SIGS) >= _SIGS_MAX:
+-                    _SIGS.clear()
+-                _SIGS[key] = held
++            if is_shared_reader(path, conn):
++                with _SIGS_LOCK:
++                    if len(_SIGS) >= _SIGS_MAX:
++                        _SIGS.clear()
++                    _SIGS[key] = held
+     subs = held[4] if chat_id is None else held[4].get(chat_id, ())
+     return "notify", held[3], subs
+ 
+-- 
+2.43.0
+

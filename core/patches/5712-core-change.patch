@@ -1,0 +1,577 @@
+From 7a10ee89c4379f362d55f5ecff7a2e8747fee5e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:32:44 +0000
+Subject: [PATCH] fix(metrics): include open intervals in thread accounting
+ snapshots [daveey]
+
+A scope crossing the first snapshot books pre-window CPU when it closes, yielding a negative interval residual. Keep an open interval registry and overlay its union at the same native-thread sampling boundary as completed accounting. Serialize entry/close/sampling; preserve completed loop counters and nested subtraction. Retain Linux tick-granular split beside the high-resolution total.
+
+Proof: deterministic old-code pair produces -0.08 seconds residual; nested open control also fails. Nine accounting files pass including native Linux interval and close serialization controls; 26 surrounding consumer files pass 465 tests. Four exact-anchor mutants fail named tests (open term, inner subtraction, union root, sampling lock); full scripts/check passes21 gates. Phase2 WIP: further boundary failure-path coverage and report/wait reductions remain before publication. No Mac sample, PR or acceptance claim.
+---
+ hermes_cli/loop_accounting.py                 |  98 ++++++++++++---
+ hermes_cli/loop_accounting_open.py            |  53 ++++++++
+ .../test_loop_accounting_open_boundary.py     | 118 ++++++++++++++++++
+ .../test_loop_accounting_open_native.py       |  88 +++++++++++++
+ .../test_loop_accounting_thread_targets.py    |   5 +-
+ 5 files changed, 342 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/loop_accounting_open.py
+ create mode 100644 tests/hermes_cli/test_loop_accounting_open_boundary.py
+ create mode 100644 tests/hermes_cli/test_loop_accounting_open_native.py
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 9358745fc2..128f79ac74 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -67,8 +67,8 @@ ended threads at the end of ``run``). It is an overlay, not additive with ``fami
+ ``loop_accounting.thread_targets`` (default on) switches it off; cost is one ``Thread.run`` wrapper: about
+ 3-6 µs of CPU per thread lifecycle (``tests/hermes_cli/test_loop_accounting_thread_targets.py`` pins <= 50 µs).
+ 
+-**Cost.** One pass is two ``thread_time`` and two ``perf_counter`` reads, a thread-local depth and one
+-uncontended lock: a few microseconds (``tests/hermes_cli/test_loop_accounting_bench.py`` pins <= 20 µs).
++**Cost.** One pass is two ``thread_time`` and two ``perf_counter`` reads, a thread-local depth and two
++uncontended lock rounds: a few microseconds (``tests/hermes_cli/test_loop_accounting_bench.py`` pins <= 20 µs).
+ """
+ 
+ from __future__ import annotations
+@@ -87,6 +87,7 @@ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+ from hermes_cli import http_body_accounting, loop_callback_latency
++from hermes_cli.loop_accounting_open import OpenIntervals
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -144,7 +145,8 @@ class _Stat:
+                 "last_at": round(self.last_at, 3)}
+ 
+ 
+-_lock = threading.Lock()
++_lock = threading.RLock()
++_open_intervals = OpenIntervals()
+ _stats: dict[str, _Stat] = {}
+ _thread_accounted: dict[int, float] = {}  # native thread id -> CPU of its outermost passes
+ _local = threading.local()
+@@ -193,6 +195,7 @@ def _fold_exited() -> None:
+         except IndexError:
+             return
+         gone = _thread_accounted.pop(tid, None)
++        _open_intervals.discard(tid)
+         if gone:
+             _state["exited_accounted"] = _state.get("exited_accounted", 0.0) + gone
+ 
+@@ -219,7 +222,7 @@ class Pass:
+     """One accounted pass (a context manager); see the module docstring. Mark the outcome with
+     :meth:`skip`, :meth:`change`, :meth:`fallback` and :meth:`rows` at any point before it exits."""
+ 
+-    __slots__ = ("_c0", "_gen", "_outer", "_w0", "changed", "fell_back", "name", "nrows", "skipped")
++    __slots__ = ("_c0", "_gen", "_outer", "_tid", "_w0", "changed", "fell_back", "name", "nrows", "skipped")
+ 
+     def __init__(self, name: str, skipped: bool = False, changed: Optional[bool] = None, fallback: bool = False,
+                  rows: Optional[int] = None) -> None:
+@@ -247,10 +250,19 @@ class Pass:
+         self._outer = depth == 0
+         self._gen = _fork["gen"]
+         self._w0 = _perf()
+-        self._c0 = _thread_time()
++        with _lock:
++            self._tid = _own_tid()
++            _fold_exited()
++            self._c0 = _thread_time()
++            _open_intervals.enter(self._tid, self, self.name, self._c0,
++                                  _thread_accounted.get(self._tid, 0.0))
+         return self
+ 
+     def __exit__(self, exc_type, exc, tb) -> None:
++        with _lock:
++            self._close(exc_type)
++
++    def _close(self, exc_type) -> None:
+         if self._gen == _fork["gen"]:
+             cpu = _thread_time() - self._c0
+             wall = _perf() - self._w0
+@@ -261,6 +273,7 @@ class Pass:
+         _local.depth = max(0, getattr(_local, "depth", 1) - 1)
+         tid = _own_tid() if self._outer else 0
+         with _lock:
++            _open_intervals.close(self._tid, self)
+             st = _stat(self.name)
+             st.runs += 1
+             if self.skipped:
+@@ -318,15 +331,23 @@ def span_open(name: str) -> tuple:
+     with _lock:
+         _fold_exited()
+         acc0 = _thread_accounted.get(tid, 0.0)
+-    return name, tid, _thread_time(), _perf(), acc0
++        token = name, tid, _thread_time(), _perf(), acc0
++        _open_intervals.enter(tid, id(token), name, token[2], acc0)
++        return token
+ 
+ 
+ def span_close(token: tuple, *, error: bool = False, error_kind: Optional[str] = None) -> bool:
++    with _lock:
++        return _span_close_locked(token, error=error, error_kind=error_kind)
++
++
++def _span_close_locked(token: tuple, *, error: bool = False, error_kind: Optional[str] = None) -> bool:
+     """Close a :func:`span_open` token. False (nothing recorded) when called on another thread. ``error_kind``
+     names the exception class of an ``error`` (else it counts as ``unknown``)."""
+     name, tid, c0, w0, acc0 = token
+     if tid != _native_id():
+         return False
++    _open_intervals.close(tid, id(token))
+     cpu = _thread_time() - c0
+     wall = _perf() - w0
+     with _lock:
+@@ -471,6 +492,14 @@ def _darwin_thread_cpu() -> list[tuple[int, str, float]]:
+ 
+ 
+ def thread_cpu() -> list[dict[str, Any]]:
++    with _lock:
++        rows = _thread_cpu_locked()
++        for row in rows:
++            _open_intervals.apply(row)
++        return rows
++
++
++def _thread_cpu_locked() -> list[dict[str, Any]]:
+     """Every live thread of this process: native id, name and CPU seconds (user + system), plus the CPU its
+     outermost accounted passes took. Linux reads ``/proc/self/task``; elsewhere only live accounted threads are
+     listed (their ``cpu_s`` is None)."""
+@@ -490,12 +519,17 @@ def thread_cpu() -> list[dict[str, Any]]:
+         if got is None:
+             continue
+         comm, user, system = got
+-        out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(user + system, 3),
++        try:
++            cpu = time.clock_gettime((~tid << 3) | 6)  # Linux numeric TID CPUCLOCK_SCHED, not a pthread pointer
++        except (OSError, ValueError):
++            cpu = user + system
++        out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(cpu, 6),
++                    "cpu_stat_s": round(user + system, 3),
+                     "user_s": round(user, 3), "system_s": round(system, 3),
+                     "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
+     if not tids and sys.platform == "darwin":
+         for tid, name, cpu in _darwin_thread_cpu():
+-            row = {"tid": tid, "name": names.get(tid) or name or "?", "cpu_s": round(cpu, 3),
++            row = {"tid": tid, "name": names.get(tid) or name or "?", "cpu_s": round(cpu, 6),
+                    "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)}
+             if tid in _thread_split:
+                 row["user_s"], row["system_s"] = (round(v, 3) for v in _thread_split[tid])
+@@ -518,6 +552,23 @@ def _process_start_time() -> Optional[float]:
+ 
+ 
+ def snapshot() -> dict[str, Any]:
++    """Sample native CPU and open Pass/Scope/span intervals under the booking lock.
++
++    Thread totals include the unbooked part of the oldest open interval (its
++    nested completed work is subtracted). ``open_accounting`` names that part;
++    completed loop counters are unchanged. Callback hooks remain best-effort.
++    Linux cpu_s uses the numeric-TID high-resolution clock; cpu_stat_s retains
++    the tick-granular user/system sum. Diagnostic metadata is read afterwards.
++    """
++    with _lock:
++        result = _snapshot_locked()
++    result.update(process_start_time=_process_start_time(),
++                  slow_callbacks=loop_callback_latency.snapshot(), http=http_body_accounting.snapshot(),
++                  diagnostic_code=loop_callback_latency.code_provenance())
++    return result
++
++
++def _snapshot_locked() -> dict[str, Any]:
+     """The JSON-ready snapshot this process writes (see the module docstring)."""
+     times = os.times()
+     threads = thread_cpu()
+@@ -533,6 +584,8 @@ def snapshot() -> dict[str, Any]:
+     with _lock:
+         _fold_exited()
+         by_tid = _copy_accounted()
++        by_tid.update({t["tid"]: t["accounted_cpu_s"] for t in threads
++                       if t.get("open_accounting") and t["tid"] in _open_intervals.by_tid})
+         if live_tids:
+             for tid in [tid for tid in by_tid if tid not in live_tids]:
+                 _state["exited_accounted"] = _state.get("exited_accounted", 0.0) + by_tid.pop(tid)
+@@ -545,7 +598,6 @@ def snapshot() -> dict[str, Any]:
+         "role": _state["role"] or _role_guess(),
+         "pid": os.getpid(),
+         "started_at": round(_started_at, 3),
+-        "process_start_time": _process_start_time(),
+         "written_at": round(time.time(), 3),
+         "uptime_s": round(time.time() - _started_at, 3),
+         "process": {
+@@ -559,9 +611,6 @@ def snapshot() -> dict[str, Any]:
+         "threads": threads,
+         "residual": _residual(threads, process_cpu, accounted_total, procfs),
+         "loops": counters(),
+-        "slow_callbacks": loop_callback_latency.snapshot(),
+-        "http": http_body_accounting.snapshot(),
+-        "diagnostic_code": loop_callback_latency.code_provenance(),
+     }
+ 
+ 
+@@ -816,6 +865,7 @@ def reset() -> None:
+     with _lock:
+         _stats.clear()
+         _thread_accounted.clear()
++        _open_intervals.clear()
+         _exited_tids.clear()
+         _cb_stats.clear()
+         _cb_cache.clear()
+@@ -846,14 +896,21 @@ class Scope:
+         self.skipped = True
+ 
+     def __enter__(self) -> Scope:
+-        self._tid = _own_tid()
+-        self._acc0 = _thread_accounted.get(self._tid, 0.0)
+-        self._gen = _fork["gen"]
+-        self._w0 = _perf()
+-        self._c0 = _thread_time()
++        with _lock:
++            self._tid = _own_tid()
++            _fold_exited()
++            self._acc0 = _thread_accounted.get(self._tid, 0.0)
++            self._gen = _fork["gen"]
++            self._w0 = _perf()
++            self._c0 = _thread_time()
++            _open_intervals.enter(self._tid, self, self.name, self._c0, self._acc0)
+         return self
+ 
+     def __exit__(self, exc_type, exc, tb) -> None:
++        with _lock:
++            self._close(exc_type)
++
++    def _close(self, exc_type) -> None:
+         if self._gen == _fork["gen"]:
+             cpu = _thread_time() - self._c0
+             wall = _perf() - self._w0
+@@ -862,6 +919,7 @@ class Scope:
+             wall = _perf() - _fork["w0"]
+         tid = self._tid
+         with _lock:
++            _open_intervals.close(tid, self)
+             inner = max(0.0, _thread_accounted.get(tid, 0.0) - self._acc0)
+             own = max(0.0, cpu - inner)
+             st = _stat(self.name)
+@@ -1130,8 +1188,8 @@ def instrument_thread_targets() -> bool:
+         finally:
+             if key is not None:
+                 try:
+-                    cpu = _thread_time()
+                     with _lock:
++                        cpu = _thread_time()
+                         if _exited_tids:
+                             _fold_exited()
+                         acc = _thread_accounted.get(tid, 0.0)
+@@ -1233,7 +1291,8 @@ THREAD_TARGETS_DEFAULT = True  # per-target thread naming: two lock rounds per t
+ 
+ def _after_fork_child() -> None:
+     global _lock, _started_at
+-    _lock = threading.Lock()
++    _lock = threading.RLock()
++    old_tid = getattr(getattr(_local, "exit_mark", None), "tid", 0)
+     _stats.clear()
+     _thread_accounted.clear()
+     _cb_stats.clear()
+@@ -1248,6 +1307,7 @@ def _after_fork_child() -> None:
+     _local.depth = depth  # child-opened passes remain nested until the inherited outer pass exits
+     _exited_tids.clear()
+     _fork.update(gen=_fork["gen"] + 1, c0=_thread_time(), w0=_perf())
++    _open_intervals.after_fork(old_tid, _native_id(), _fork["c0"])
+ 
+ 
+ if hasattr(os, "register_at_fork"):
+diff --git a/hermes_cli/loop_accounting_open.py b/hermes_cli/loop_accounting_open.py
+new file mode 100644
+index 0000000000..fb2defd72d
+--- /dev/null
++++ b/hermes_cli/loop_accounting_open.py
+@@ -0,0 +1,53 @@
++"""Open accounting intervals at a native-thread sampling boundary. [daveey]
++
++The caller serializes entry, close and sampling with its accounting lock. This
++registry does not book counters: its overlay is discarded after each snapshot.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++
++class OpenIntervals:
++    def __init__(self) -> None:
++        self.by_tid: dict[int, dict[Any, tuple[str, float, float]]] = {}
++
++    def enter(self, tid: int, token: object, name: str, cpu: float, accounted: float) -> None:
++        self.by_tid.setdefault(tid, {})[token] = (name, cpu, accounted)
++
++    def close(self, tid: int, token: object) -> None:
++        entries = self.by_tid.get(tid)
++        if entries is not None:
++            entries.pop(token, None)
++            if not entries:
++                self.by_tid.pop(tid, None)
++
++    def discard(self, tid: int) -> None:
++        self.by_tid.pop(tid, None)
++
++    def clear(self) -> None:
++        self.by_tid.clear()
++
++    def after_fork(self, old_tid: int, new_tid: int, cpu: float) -> None:
++        inherited = self.by_tid.get(old_tid, {})
++        self.by_tid.clear()
++        for token, (name, _, _) in inherited.items():
++            # Only context managers survive as usable child intervals. span tokens
++            # deliberately retain their original native-thread identity.
++            if isinstance(token, int):
++                continue
++            token._tid = new_tid
++            if hasattr(token, "_acc0"):
++                token._acc0 = 0.0
++            self.enter(new_tid, token, name, cpu, 0.0)
++
++    def apply(self, row: dict[str, Any]) -> None:
++        entries = self.by_tid.get(row["tid"])
++        if not entries or row["cpu_s"] is None:
++            return
++        # Context managers are nested on one native thread. The oldest interval
++        # covers the union; subtract closed inner intervals, never count them twice.
++        name, cpu0, acc0 = next(iter(entries.values()))
++        pending = row["cpu_s"] - cpu0 - (row["accounted_cpu_s"] - acc0)
++        row["open_accounting"] = {"name": name, "cpu_s": round(pending, 6), "depth": len(entries)}
++        row["accounted_cpu_s"] = round(row["accounted_cpu_s"] + pending, 6)
+diff --git a/tests/hermes_cli/test_loop_accounting_open_boundary.py b/tests/hermes_cli/test_loop_accounting_open_boundary.py
+new file mode 100644
+index 0000000000..4c6305c1d5
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_open_boundary.py
+@@ -0,0 +1,118 @@
++"""Deterministic open-scope snapshot boundary regressions. [daveey]"""
++
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture
++def cpu_clock(monkeypatch):
++    la.reset()
++    clock = [1.0]
++    tid = la._native_id()
++    monkeypatch.setattr(la, "_thread_time", lambda: clock[0])
++    monkeypatch.setattr(la.os, "listdir", lambda _path: [])
++    monkeypatch.setattr(la.sys, "platform", "darwin")  # os-marker: ok — synthetic clock, not Darwin ABI coverage
++    monkeypatch.setattr(la, "_darwin_thread_cpu", lambda: [(tid, "pool_0", clock[0])])
++    monkeypatch.setattr(la.os, "times", lambda: SimpleNamespace(user=clock[0], system=0.0))
++    monkeypatch.setattr(la, "_process_start_time", lambda: 1.0)
++    monkeypatch.setattr(la, "_role_guess", lambda: "test")
++    monkeypatch.setitem(la._thread_targets, tid, "concurrent.futures.thread._worker")
++    yield clock
++    la.reset()
++
++
++def _pool(snap):
++    return snap["residual"]["targets"]["concurrent.futures.thread._worker"]
++
++
++def test_scope_open_at_start_does_not_make_interval_residual_negative(cpu_clock):
++    with la.scope("thread/worker"):
++        cpu_clock[0] = 1.08
++        start = la.snapshot()
++        cpu_clock[0] = 1.10
++    end = la.snapshot()
++    before, after = _pool(start), _pool(end)
++    used = after["cpu_s"] - before["cpu_s"]
++    accounted = after["accounted_cpu_s"] - before["accounted_cpu_s"]
++    assert used - accounted == pytest.approx(0.0, abs=1e-6)
++    assert before["accounted_cpu_s"] == pytest.approx(0.08)
++    assert after["accounted_cpu_s"] == pytest.approx(0.10)
++
++
++def test_open_nested_scope_and_pass_union_is_counted_once(cpu_clock):
++    with la.scope("thread/worker"):
++        cpu_clock[0] = 1.02
++        with la.scope("sync.round/loop"):
++            cpu_clock[0] = 1.03
++            with la.pass_("sync.board/default"):
++                cpu_clock[0] = 1.08
++                inside = la.snapshot()
++            after_pass = la.snapshot()
++        after_round = la.snapshot()
++    closed = la.snapshot()
++    for snap in (inside, after_pass, after_round, closed):
++        assert _pool(snap)["accounted_cpu_s"] == pytest.approx(0.08)
++        assert snap["process"]["accounted_cpu_s"] == pytest.approx(0.08)
++
++
++@pytest.mark.parametrize("kind", ["pass", "span", "scope"])
++def test_snapshot_overlay_does_not_book_or_repeat_cpu(cpu_clock, kind):
++    observed = la.pass_("open") if kind == "pass" else la.scope("open")
++    token = la.span_open("open") if kind == "span" else observed.__enter__()
++    try:
++        cpu_clock[0] = 1.04
++        for _ in range(2):
++            snap = la.snapshot()
++            assert _pool(snap)["accounted_cpu_s"] == pytest.approx(0.04)
++            assert "open" not in snap["loops"]
++            row = next(t for t in snap["threads"] if t["tid"] == la._native_id())
++            assert row["open_accounting"]["name"] == "open"
++            assert not la._thread_accounted
++    finally:
++        if kind == "span":
++            assert la.span_close(token)
++        else:
++            observed.__exit__(None, None, None)
++    assert la.counters()["open"]["cpu_s"] == pytest.approx(0.04)
++    assert not la._open_intervals.by_tid
++
++
++def test_unscoped_gap_is_not_absorbed_by_next_scope(cpu_clock):
++    with la.scope("first"):
++        cpu_clock[0] = 1.04
++    cpu_clock[0] = 1.08
++    with la.scope("second"):
++        cpu_clock[0] = 1.10
++        snap = la.snapshot()
++    assert _pool(snap)["accounted_cpu_s"] == pytest.approx(0.06)
++    assert la.counters()["first"]["cpu_s"] == pytest.approx(0.04)
++    assert la.counters()["second"]["cpu_s"] == pytest.approx(0.02)
++
++
++def test_scope_inside_outer_pass_counts_union_once(cpu_clock):
++    with la.pass_("outer"):
++        cpu_clock[0] = 1.02
++        with la.scope("inner"):
++            cpu_clock[0] = 1.08
++            inside = la.snapshot()
++        middle = la.snapshot()
++    closed = la.snapshot()
++    for snap in (inside, middle, closed):
++        assert _pool(snap)["accounted_cpu_s"] == pytest.approx(0.08)
++
++
++def test_child_open_scope_uses_child_clock_and_discards_foreign_threads(cpu_clock):
++    with la.scope("inherited"):
++        cpu_clock[0] = 1.08
++        la._open_intervals.enter(-123, object(), "foreign", 0.0, 0.0)
++        cpu_clock[0] = 0.005
++        la._after_fork_child()
++        assert -123 not in la._open_intervals.by_tid
++        cpu_clock[0] = 0.015
++        inside = la.snapshot()
++        assert inside["process"]["accounted_cpu_s"] == pytest.approx(0.01)
++    assert la.counters()["inherited"]["cpu_s"] == pytest.approx(0.01)
++    assert not la._open_intervals.by_tid
+diff --git a/tests/hermes_cli/test_loop_accounting_open_native.py b/tests/hermes_cli/test_loop_accounting_open_native.py
+new file mode 100644
+index 0000000000..846cd3474e
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_open_native.py
+@@ -0,0 +1,88 @@
++"""Real thread clocks and publication/close serialization. [daveey]"""
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture(autouse=True)
++def fresh():
++    la.reset()
++    yield
++    la.reset()
++
++
++def burn(seconds):
++    until = time.thread_time() + seconds
++    while time.thread_time() < until:
++        pass
++
++
++@pytest.mark.platforms("linux", "macos")
++def test_open_native_thread_interval_includes_only_post_snapshot_cpu():
++    ready, advance, finished, release = (threading.Event() for _ in range(4))
++
++    def worker():
++        with la.scope("thread/native_boundary"):
++            burn(0.08)
++            ready.set()
++            assert advance.wait(10)
++            burn(0.02)
++        finished.set()
++        assert release.wait(10)
++
++    thread = threading.Thread(target=worker, name="boundary-pool_0")
++    thread.start()
++    try:
++        assert ready.wait(10)
++        start = next(row for row in la.thread_cpu() if row["tid"] == thread.native_id)
++        advance.set()
++        assert finished.wait(10)
++        end = next(row for row in la.thread_cpu() if row["tid"] == thread.native_id)
++        assert start["accounted_cpu_s"] >= 0.075
++        used = end["cpu_s"] - start["cpu_s"]
++        booked = end["accounted_cpu_s"] - start["accounted_cpu_s"]
++        # Event/lock release after closing is deliberately unscoped. This is a
++        # native-clock correctness tolerance, not the live collector's policy.
++        assert -0.00001 <= used - booked < 0.01
++    finally:
++        advance.set()
++        release.set()
++        thread.join(10)
++    assert not thread.is_alive()
++    assert not la._open_intervals.by_tid
++
++
++def test_native_sampling_serializes_scope_close(monkeypatch):
++    ready, close_go, attempted, closed = (threading.Event() for _ in range(4))
++
++    def worker():
++        with la.scope("thread/closing"):
++            ready.set()
++            assert close_go.wait(10)
++            attempted.set()
++        closed.set()
++
++    thread = threading.Thread(target=worker)
++    thread.start()
++    assert ready.wait(10)
++    original = la._thread_cpu_locked
++
++    def sample_while_closing():
++        close_go.set()
++        assert attempted.wait(10)
++        assert not closed.wait(0.05), "scope closed while its native snapshot was in flight"
++        return original()
++
++    monkeypatch.setattr(la, "_thread_cpu_locked", sample_while_closing)
++    try:
++        la.thread_cpu()
++    finally:
++        close_go.set()
++        thread.join(10)
++    assert closed.is_set()
++    assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_loop_accounting_thread_targets.py b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+index 13d7518f4d..da62d7dfb2 100644
+--- a/tests/hermes_cli/test_loop_accounting_thread_targets.py
++++ b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+@@ -191,7 +191,10 @@ def test_user_system_split_matches_cpu_and_family_sum_still_reconciles():
+     finally:
+         release.set()
+     for t in snap["threads"]:
+-        assert abs(t["user_s"] + t["system_s"] - t["cpu_s"]) <= 0.011
++        # proc stat truncates user and system separately to ticks; the boundary
++        # clock is now precise, while this split retains its original raw units.
++        assert abs(t["user_s"] + t["system_s"] - t["cpu_stat_s"]) <= 0.001
++        assert abs(t["cpu_stat_s"] - t["cpu_s"]) <= 2 / la._clk_tck() + 0.001
+     res = snap["residual"]
+     fam = res["families"]["tt-split"]
+     assert fam["user_s"] + fam["system_s"] == pytest.approx(fam["cpu_s"], abs=0.02)
+-- 
+2.43.0
+

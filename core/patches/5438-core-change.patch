@@ -1,0 +1,124 @@
+From 9c06312fd92f18ffc8432af985a9d0e6f0fd25ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:50:18 +0000
+Subject: [PATCH] fix(always-on): roll a backend that is running but stops
+ answering health [daveey]
+
+On one occasion the active always-on backend (:9148) stayed active for about 2 h
+while its threadpool was starved: /api/health and every Desktop call through the
+proxy timed out at 30 s (about 90 a minute). drift() treated a missing health body
+as "no drift", so the roller never replaced it; a manual warm roll fixed it at once.
+
+drift() now reports "does not answer /api/health" for a running backend with no
+health answer, and supervise() rolls on it after UNRESPONSIVE_CONFIRMATIONS (4)
+consecutive polls, about 1-2 min, so a seconds-long stall never rolls. A roll
+leaves the old backend running to retire through its idle fence, so live turns
+are not cut.
+
+Tests: the roller tests stub the real-port probe. pick_port skipped ports held by
+the hub's live backends, so four roll tests failed on the hub only.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/always_on_rollover.py            | 11 +++++-
+ tests/hermes_cli/test_always_on_rollover.py | 41 +++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 237122e04c..cacc5d8b4a 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -76,6 +76,10 @@ WARM_WORKERS = 6
+ WARM_MAX_REPLAYS = 40
+ SUPERVISE_POLL_S = 15.0
+ DRIFT_CONFIRMATIONS = 2      # consecutive polls a commit/runtime drift must persist before it rolls
++# Consecutive polls an alive backend must miss /api/health before it rolls (~1-2 min at SUPERVISE_POLL_S). Higher
++# than DRIFT_CONFIRMATIONS: a busy backend stalls for seconds routinely, and a roll leaves the old one running.
++UNRESPONSIVE_CONFIRMATIONS = 4
++UNRESPONSIVE_REASON = "does not answer /api/health"
+ FAILED_ROLL_BACKOFF_S = 300.0
+ SUPERSEDED_GRACE_S = 900.0   # a superseded backend not retired by then is retired by the roller through its idle fence
+ SUPERSEDED_HARD_S = 6 * 3600.0  # ... and stopped (SIGTERM, turns checkpoint) once this old, busy or not
+@@ -753,6 +757,10 @@ class Roller:
+         if self.update_in_progress():
+             return None
+         body = self.health(port)
++        if body is None:
++            # Running but not answering (a starved threadpool): every Desktop call through the proxy
++            # times out until a roll moves new connections to a fresh backend.
++            return f"active backend :{port} {UNRESPONSIVE_REASON}"
+         head = self.head()
+         if body and self.same_commit(body.get("commit"), head) is False:
+             return f"active backend :{port} runs {str(body.get('commit'))[:10]}, checkout is at {str(head)[:10]}"
+@@ -826,7 +834,8 @@ class Roller:
+                 reason = self.drift()
+                 dead = bool(reason) and "not running" in reason or reason == "no active backend recorded"
+                 seen = seen + 1 if reason else 0
+-                if reason and (dead or seen >= DRIFT_CONFIRMATIONS) and self.clock() >= retry_at:
++                need = UNRESPONSIVE_CONFIRMATIONS if reason and UNRESPONSIVE_REASON in reason else DRIFT_CONFIRMATIONS
++                if reason and (dead or seen >= need) and self.clock() >= retry_at:
+                     seen = 0
+                     if not self.roll(reason):
+                         retry_at = self.clock() + FAILED_ROLL_BACKOFF_S
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 876af6c118..81589b53d6 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -29,6 +29,9 @@ from hermes_cli import web_server_skew_exit as skew
+ def home(tmp_path, monkeypatch):
+     monkeypatch.setenv("HOME", str(tmp_path))
+     monkeypatch.delenv("HERMES_HOME", raising=False)
++    # pick_port probes real 127.0.0.1 ports: on a host running always-on backends (the hub) it skipped the
++    # ports FakeHost expects and the roll tests failed there only.
++    monkeypatch.setattr(ro, "_port_listening", lambda port: False)
+     return tmp_path
+ 
+ 
+@@ -368,6 +371,44 @@ def test_supervisor_rolls_on_a_dead_backend_and_on_confirmed_commit_drift(home):
+     assert rolls and "not running" in rolls[0]
+ 
+ 
++def test_supervisor_rolls_an_alive_backend_only_after_it_stops_answering_for_several_polls(home):
++    # Observed live: the active backend stayed `active` but its loop was saturated by turns for ~2 h; every
++    # Desktop call through the proxy timed out at 30 s and drift() saw no reason to roll (no health body).
++    host = FakeHost(running={9148}, commits={9148: "c" * 40})
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    rolls = []
++    roller.roll = lambda reason: rolls.append(reason) or True  # type: ignore[method-assign]
++    host.answers = False
++    assert "does not answer" in roller.drift()
++    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS - 1)
++    assert rolls == []  # a short stall (a few slow polls) is not a reason to roll
++    host.answers = True
++    roller.supervise(max_polls=1)
++    host.answers = False
++    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS - 1)
++    assert rolls == []  # one good answer resets the count
++
++
++def test_supervisor_rolls_after_consecutive_unanswered_health_polls(home):
++    host = FakeHost(running={9148}, commits={9148: "c" * 40}, answers=False)
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    rolls = []
++    roller.roll = lambda reason: rolls.append(reason) or True  # type: ignore[method-assign]
++    roller.supervise(max_polls=ro.UNRESPONSIVE_CONFIRMATIONS)
++    assert len(rolls) == 1 and "does not answer" in rolls[0]
++    assert ro.UNRESPONSIVE_CONFIRMATIONS > ro.DRIFT_CONFIRMATIONS
++
++
++def test_unanswered_health_mid_update_is_not_a_reason_to_roll(home):
++    host = FakeHost(running={9148}, commits={9148: "c" * 40}, answers=False)
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    (home / "no-marker").write_text("")
++    assert roller.drift() is None
++
++
+ class FakeFence:
+     """``/api/health/retirement`` of each backend: prepare refuses while the port is busy (a live turn)."""
+ 
+-- 
+2.43.0
+

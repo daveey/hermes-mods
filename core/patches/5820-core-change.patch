@@ -1,0 +1,284 @@
+From 301990a8e9eef369391f2ab2901df0596c071d9f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:51:09 +0000
+Subject: [PATCH] [daveey] Scope renewal: take the renewing identity from the
+ whole process ancestry
+
+renew-scope read the session and the Kanban task from the CLI process's own
+environment, which its parent chooses. An agent, including a run of the stopped
+card, could name the owning chat's session and drop its task markers to renew
+as that chat.
+
+The session and task now come from the start-time environment of every
+ancestor: a task marker anywhere counts, the card's own run is refused first,
+and an ancestry that does not name exactly the claimed session has no identity.
+An unreadable ancestry is refused.
+
+Also pass the task id to the TUI spend notice so it prints the real
+renew-scope command.
+---
+ hermes_cli/kanban_comment_writer.py           | 24 +++++++
+ hermes_cli/kanban_scope_renewal.py            |  3 +
+ hermes_cli/kanban_scope_renewal_cli.py        | 46 +++++++++++---
+ tests/hermes_cli/test_kanban_scope_renewal.py | 62 ++++++++++++++++++-
+ .../test_kanban_scope_renewal_synced.py       |  3 +-
+ tui_gateway/session_notifications.py          |  2 +-
+ 6 files changed, 128 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+index 4237c8763b..41bdf46940 100644
+--- a/hermes_cli/kanban_comment_writer.py
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -262,6 +262,30 @@ def agent_ancestor(pid: Optional[int] = None, *, read: Optional[ProcReader] = No
+     raise Inconclusive(f"ancestry deeper than {MAX_ANCESTRY}")
+ 
+ 
++def ancestry_environs(pid: Optional[int] = None, *, read: Optional[ProcReader] = None) -> list[Mapping[str, str]]:
++    """Start-time environments of ``pid`` (default: this process) and EVERY ancestor up to init, nearest first.
++
++    Unlike :func:`agent_ancestor` the walk does not stop at the first marker: a caller that needs the identity a
++    process was started with (not only "is this an agent") must see what each ancestor carried, because the
++    nearest process's environment is whatever its parent chose to pass. A skipped OS supervisor contributes
++    nothing. Raises :class:`Inconclusive` when the walk can't be completed."""
++    read = read or _read_proc
++    current = os.getpid() if pid is None else int(pid)
++    seen: set[int] = set()
++    found: list[Mapping[str, str]] = []
++    for _ in range(MAX_ANCESTRY):
++        if current in seen:
++            raise Inconclusive(f"ancestry loop at pid {current}")
++        seen.add(current)
++        ppid, environ = read(current)
++        if environ:
++            found.append(environ)
++        if current == 1 or ppid <= 0:
++            return found
++        current = ppid
++    raise Inconclusive(f"ancestry deeper than {MAX_ANCESTRY}")
++
++
+ def is_agent_handle(author: Optional[str]) -> bool:
+     """True for an agent comment handle: ``<gateway>/t_<16 hex>`` or ``hub-chat-<6+ hex>``."""
+     return _AGENT_HANDLE.fullmatch(author or "") is not None
+diff --git a/hermes_cli/kanban_scope_renewal.py b/hermes_cli/kanban_scope_renewal.py
+index 4d5dc64944..c5781637c2 100644
+--- a/hermes_cli/kanban_scope_renewal.py
++++ b/hermes_cli/kanban_scope_renewal.py
+@@ -119,6 +119,9 @@ def reopened(conn: sqlite3.Connection, task_id: str, ordinary: list[dict]) -> Op
+     decision. Without this, a promotion older than the scope annotation would release the card at renewal.
+     "After" is arrival order (the row id), as on the Board (its ``ord``): an event's ``created_at`` and uid are
+     its writer's clock, and a promotion recorded before the renewal must not decide it whatever time it states.
++    On a synced board a replica's row id is its own arrival order, not the Board's: a promotion another gateway
++    recorded before the renewal can be pulled after it. This reader may then show the stop decided; execution
++    still needs the Board's lease, and the Board decides by its own ``ord`` (``spend_decision_pending``).
+     ``ordinary``: stop/promotion/archive events.
+     """
+     renewed = sorted(renewals(conn, task_id), key=lambda e: int(e["id"]), reverse=True)
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index fdda71993e..01c9f4e270 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -1,7 +1,13 @@
+ """``hermes kanban renew-scope``: who is asking, and where the renewal is decided. [daveey]
+ 
+-The caller is identified exactly as ``hermes kanban comment`` identifies a comment's writer
+-(``kanban_comment_writer.cli_comment_writer``); no flag names a role or session. On a synced board the canonical
++The caller is classified exactly as ``hermes kanban comment`` classifies a comment's writer
++(``kanban_comment_writer.cli_comment_writer``); no flag names a role or session. For a comment the session only
++lowers authority; here it selects it, so the session and the Kanban task are not taken from this process's
++environment alone, which its parent chose (``HERMES_SESSION_ID=<owning chat> env -u HERMES_KANBAN_TASK hermes``).
++They are what the WHOLE process ancestry was started with (:func:`caller_identity`): a task marker on any
++ancestor counts even when the caller dropped it, and an ancestry naming two sessions has no identity. This is
++process provenance, not authentication: a same-user process that leaves its ancestry (double-fork, a command
++handed to another process) is out of its reach, as for comments. On a synced board the canonical
+ Board decides and writes the ``scope_renewed`` event (one ``renew_scope`` op, so a card whose home is another
+ gateway needs no courier); a board that never synced validates and appends in one local transaction.
+ """
+@@ -12,7 +18,7 @@ import json
+ import os
+ import re
+ import sqlite3
+-from typing import Mapping, Optional
++from typing import Mapping, Optional, Sequence
+ 
+ from hermes_cli import kanban_scope_renewal as renewal
+ from hermes_cli.kanban_scope_renewal import Actor, RenewalRefused
+@@ -54,19 +60,33 @@ def _owning_sub(conn: sqlite3.Connection, task_id: str, session: str) -> Optiona
+     return None
+ 
+ 
+-def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, env: Mapping[str, str],
++def caller_identity(environs: Sequence[Mapping[str, str]]) -> tuple[set, set]:
++    """``(sessions, tasks)``: every session id and Kanban task named by any of ``environs`` (the start-time
++    environments of the caller and its ancestors, plus the caller's current one)."""
++    from hermes_cli.kanban_comment_writer import marker_session
++    sessions, tasks = set(), set()
++    for env in environs:
++        sessions |= {str(env.get("HERMES_SESSION_ID") or "").strip()[:200], marker_session(env) or ""}
++        tasks |= {str(env.get(name) or "").strip() for name in _TASK_MARKERS}
++    return sessions - {""}, tasks - {""}
++
++
++def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, environs: Sequence[Mapping[str, str]],
+                   gateway: str, profile: str) -> Actor:
+     """The renewing authority, or :class:`RenewalRefused`. The stopped card's own runs are refused first."""
+     from hermes_cli.kanban_archive_scope import _creator_task_id
+     kind, session, evidence = writer
+     if kind == "human":
+         return Actor("human", None, "human", None, gateway, profile)
+-    marked = {str(env.get(name) or "").strip() for name in _TASK_MARKERS} - {""}
+-    if task_id in marked or (session and session in _sessions(conn, task_id)):
++    sessions, marked = caller_identity(environs)
++    if task_id in marked or (sessions | ({session} if session else set())) & _sessions(conn, task_id):
+         raise RenewalRefused("own_run", f"a run of {task_id} cannot renew its own stopped scope")
+     if kind != "agent" or not session or not _MARKED.fullmatch(str(evidence)):
+         raise RenewalRefused("identity_unavailable", "the caller's identity is missing or ambiguous "
+                              f"({evidence}); renew from the owning chat, the creator task or a human terminal")
++    if sessions != {session}:
++        raise RenewalRefused("identity_unavailable", "the caller's process ancestry does not name exactly the "
++                             "session it claims; run renew-scope directly from the authority's own terminal")
+     if len(marked) > 1:
+         raise RenewalRefused("identity_unavailable", "the caller carries two different task identities")
+     creator = _creator_task_id(conn, task_id)
+@@ -121,13 +141,21 @@ def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict
+ 
+ def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str,
+           board: Optional[str] = None, writer: Optional[tuple] = None,
+-          env: Optional[Mapping[str, str]] = None) -> dict:
++          env: Optional[Mapping[str, str]] = None,
++          ancestry: Optional[Sequence[Mapping[str, str]]] = None) -> dict:
++    """``writer``/``env``/``ancestry`` are test seams; the command passes none and each is read from the process."""
+     from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli.kanban_comment_writer import cli_comment_writer
++    from hermes_cli.kanban_comment_writer import Inconclusive, ancestry_environs, cli_comment_writer
+     from hermes_cli.kanban_origin import gateway_names
+     from hermes_cli.profiles import get_active_profile_name
+     env = os.environ if env is None else env
+-    actor = resolve_actor(conn, task_id, writer=writer or cli_comment_writer(env=env), env=env,
++    writer = writer or cli_comment_writer(env=env)
++    if ancestry is None and writer[0] != "human":
++        try:
++            ancestry = ancestry_environs()
++        except Inconclusive as exc:
++            raise RenewalRefused("identity_unavailable", f"the caller's process ancestry could not be read ({exc})")
++    actor = resolve_actor(conn, task_id, writer=writer, environs=[*(ancestry or ()), env],
+                           gateway=gateway_names()[0], profile=get_active_profile_name() or "default")
+     mode = sync.board_mode(conn)
+     if mode == "off" and not sync.sync_state(conn):
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal.py b/tests/hermes_cli/test_kanban_scope_renewal.py
+index 9075e8dabc..4e847f169a 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal.py
+@@ -47,7 +47,29 @@ def mandate(board, tid, *, session=CHAT, kind='agent', body='Renewed scope: one
+ 
+ 
+ def renew(board, tid, episode, comment, *, writer=AGENT, env=None, reason='origin chat authorized the round'):
+-    return cli.renew(board, tid, episode=episode, comment_id=comment, reason=reason, writer=writer, env=env or {})
++    """``env``: what the caller's shell was started with, next to the session the writer names."""
++    started = {**({'HERMES_SESSION_ID': writer[1]} if writer[1] else {}), **(env or {})}
++    return cli.renew(board, tid, episode=episode, comment_id=comment, reason=reason, writer=writer, env=started,
++                     ancestry=[started])
++
++
++def ancestry(monkeypatch, *environs):
++    """Model the real process walk: this process started with ``environs[0]``, its parent with the next, ..."""
++    import os
++    from hermes_cli import kanban_comment_writer as writer
++    tree = {os.getpid() if i == 0 else 100 + i: (0 if i == len(environs) - 1 else 101 + i, env)
++            for i, env in enumerate(environs)}
++    monkeypatch.setattr(writer, '_read_proc', lambda pid: tree[pid])
++    return environs[0]
++
++
++def spoofed(board, tid, episode, comment, code, env):
++    """The real command path: no writer or ancestry handed in; identity is read from the (modelled) processes."""
++    with pytest.raises(RenewalRefused) as caught:
++        cli.renew(board, tid, episode=episode, comment_id=comment, reason='x', env=env)
++    assert caught.value.code == code
++    assert not board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++    assert decision.execution_restricted(board, tid)
+ 
+ 
+ def refused(board, tid, episode, comment, code, **kw):
+@@ -141,6 +163,41 @@ def test_c_stopped_cards_own_run_is_refused(board, monkeypatch):
+     refused(board, tid, episode, comment, 'own_run', env={'HERMES_KANBAN_TASK': tid})
+ 
+ 
++def test_c_own_run_naming_the_owning_chats_session_with_its_markers_dropped_is_refused(board, monkeypatch):
++    """``HERMES_SESSION_ID=<owning chat> env -u HERMES_KANBAN_TASK -u HERMES_KANBAN_WORKER_TASK hermes kanban ...``"""
++    tid, session, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)  # written with the same spoofed session
++    shell = {'HERMES_KANBAN_WORKER_TASK': tid, 'HERMES_SESSION_ID': session}
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT}, shell, {})
++    spoofed(board, tid, episode, comment, 'own_run', env)
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT}, {'HERMES_KANBAN_TASK': tid}, {})  # session unbound
++    spoofed(board, tid, episode, comment, 'own_run', env)
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT}, {'HERMES_SESSION_ID': session}, {})
++    spoofed(board, tid, episode, comment, 'own_run', env)
++
++
++def test_d_agent_naming_the_owning_chats_session_is_refused_and_the_chat_itself_renews(board, monkeypatch):
++    from hermes_cli import kanban_comment_writer as writer
++    tid, _, episode = stopped(board, monkeypatch)
++    link(board, tid)
++    comment = mandate(board, tid)
++    other = {'HERMES_SESSION_ID': 'local-' + 'a' * 64, 'HERMES_KANBAN_WORKER_TASK': 't_00000000deadbeef'}
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT}, other, {})  # another card's worker
++    spoofed(board, tid, episode, comment, 'identity_unavailable', env)
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT}, {'HERMES_SESSION_ID': '20261101_000000_abcdef'}, {})
++    spoofed(board, tid, episode, comment, 'identity_unavailable', env)  # another chat
++    ancestry(monkeypatch, {'HERMES_AGENT': '1'}, {'HERMES_SESSION_ID': '20261101_000000_abcdef'}, {})
++    spoofed(board, tid, episode, comment, 'identity_unavailable', {'HERMES_SESSION_ID': CHAT})  # set after start
++
++    def unreadable(pid):
++        raise writer.Inconclusive('pid 7: environment unreadable')
++    monkeypatch.setattr(writer, '_read_proc', unreadable)
++    spoofed(board, tid, episode, comment, 'identity_unavailable', {'HERMES_SESSION_ID': CHAT})
++    env = ancestry(monkeypatch, {'HERMES_SESSION_ID': CHAT, 'HERMES_AGENT': '1'}, {'HERMES_SESSION_ID': CHAT}, {})
++    assert cli.renew(board, tid, episode=episode, comment_id=comment, reason='x', env=env)['authority_kind'] == 'chat'
++
++
+ @pytest.mark.parametrize('writer', [AGENT, ('agent', None, '4242:HERMES_AGENT'), ('agent', CHAT, 'inconclusive:pid 1'),
+                                     ('agent', CHAT, 'runner:systemd:x.service'), ('agent', CHAT, '5:runner:cron'),
+                                     ('agent', CHAT, 'author_handle')])
+@@ -266,6 +323,9 @@ def test_h_notice_and_unblock_text_name_the_route_only_for_scope_stops(board, mo
+     assert f'hermes kanban renew-scope {tid} --episode' in text and f'hermes kanban promote {tid}' in text
+     notice = decision.notice({'cause': 'scope_stopped', 'task_id': tid})
+     assert f'hermes kanban renew-scope {tid} --episode' in notice and 'owning chat' in notice
++    from types import SimpleNamespace
++    from tui_gateway.session_notifications import _kb_spend_budget
++    assert f'renew-scope {tid} --episode' in _kb_spend_budget(SimpleNamespace(id=tid), {'cause': 'scope_stopped'}, '')
+     safety = decision.notice({'cause': 'safety_refusal', 'task_id': tid})
+     assert 'renew-scope' not in safety
+     kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal'})
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_synced.py b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+index 61deed4db8..99e4394848 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal_synced.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+@@ -68,7 +68,8 @@ def stopped(live, monkeypatch, hub):
+ 
+ 
+ def renew(live, tid, episode, comment):
+-    return cli.renew(live, tid, episode=episode, comment_id=comment, reason='authorized', writer=AGENT, env={})
++    return cli.renew(live, tid, episode=episode, comment_id=comment, reason='authorized', writer=AGENT, env={},
++                     ancestry=[{'HERMES_SESSION_ID': CHAT}])
+ 
+ 
+ def test_board_applies_and_the_exact_event_is_projected(live, monkeypatch):
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 94e4c81780..c57ca085ab 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -627,7 +627,7 @@ def _kb_completed(task, payload: dict, title: str) -> str:
+ # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
+ def _kb_spend_budget(task, payload, title):
+     from hermes_cli.kanban_spend_decision import notice
+-    return ": " + notice(payload)
++    return ": " + notice({**(payload or {}), "task_id": getattr(task, "id", None)})
+ 
+ 
+ def _kb_decision_requested(payload):
+-- 
+2.43.0
+

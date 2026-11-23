@@ -1,0 +1,124 @@
+From 23307a4440c3ecfedcadbf73682f71733d84cb16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:54:50 +0000
+Subject: [PATCH] fix(kanban): keep permanent synthetic-parent refusals inert
+ [daveey]
+
+Problem: independent PR3913 review found live_claim/invalid synthetic-parent
+refusals add one rejected outbox row per push; live_claim also manufactures
+sync_rejected children, sustaining the loop.
+Why 1: rejected_parent materialized every refusal as a durable tasks outbox row.
+Why 2: the parent remains unacknowledged, so later child batches synthesize it again.
+Root (happened): definitive transport refusal was conflated with recoverable
+schema/transient refusal when adding first-send envelope durability.
+Root (not caught): prior test observed one round, not repeated production push rounds.
+Recurrence: PR3913 review6004212104, reproduced exactly; not a deployed regression.
+Countermeasure: materialize only schema/transient refusals; preserve the frozen
+identity of permanent refusals without new outbox rows or diagnostic events.
+Proof: new eight-round live_claim/invalid regressions fail on aabf2187db;
+fixed sender/envelope/edge/compat selection: 118 tests pass. storage_error stays
+one pending row with eight attempts; uncertain-send byte identity tests pass.
+---
+ hermes_cli/kanban_sync_compat.py              | 10 ++++--
+ .../test_kanban_sync_envelope_edges.py        | 32 +++++++++++++++++++
+ .../test_kanban_sync_forbidden_field.py       | 13 +++++---
+ 3 files changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 88a70e5d16..f8a68bd11d 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -22,9 +22,13 @@ def rejected_parent(conn: sqlite3.Connection, parents: list[tuple[dict, str]], r
+             retire_parent(conn, tid)
+         if result.get("status") != "rejected":
+             return None
+-        # A definitive refusal is not an uncertain send. Move synthetic parents
+-        # into the normal bounded rejection/remap path rather than replaying a
+-        # cached refusal forever under their frozen id.
++        from hermes_cli.kanban_sync_client import transient_rejection
++        if result.get("reason") != "forbidden_field" and not transient_rejection(result):
++            # Permanent refusals keep their frozen identity, as do uncertain sends.
++            # Materializing one here would add a rejected row (and live_claim event)
++            # each time pending children ask for their still-unacknowledged parent.
++            return None
++        # Only recoverable/schema refusals enter the existing bounded remap path.
+         retire_parent(conn, tid)
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, hlc, created_at) "
+diff --git a/tests/hermes_cli/test_kanban_sync_envelope_edges.py b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+index e4d4934d10..544b6d8678 100644
+--- a/tests/hermes_cli/test_kanban_sync_envelope_edges.py
++++ b/tests/hermes_cli/test_kanban_sync_envelope_edges.py
+@@ -39,6 +39,38 @@ def test_rejected_synthetic_parent_enters_bounded_retry_path(board):
+     assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
+ 
+ 
++@pytest.mark.parametrize("reason", ["live_claim", "invalid", "storage_error"])
++def test_synthetic_parent_rejection_does_not_accumulate_across_rounds(board, monkeypatch, reason):
++    from types import SimpleNamespace
++    conn, _ = board
++    tid = kb.create_task(conn, title="parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child")
++    batches = []
++
++    def ops(_board, wire):
++        batches.append(wire)
++        return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
++                             "reason": reason if op["table"] == "tasks" else "depends_on_rejected"}
++                            for op in wire]}
++
++    now = [client.time.time()]
++    monkeypatch.setattr(client.time, "time", lambda: now[0])
++    for _ in range(8):
++        client.push(conn, SimpleNamespace(ops=ops), "default", "sender", primary=False, max_batches=1)
++        now[0] += 400
++    rows = conn.execute("SELECT state, attempts FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
++    if reason == "storage_error":
++        assert len(rows) == 1 and rows[0]["state"] == "pending"
++        assert rows[0]["attempts"] == 8
++    else:
++        assert not rows
++        assert len({next(op["client_op_id"] for op in wire if op["table"] == "tasks") for wire in batches}) == 1
++    assert len({len(wire) for wire in batches}) == 1
++    assert not conn.execute("SELECT 1 FROM task_events WHERE kind='sync_rejected'").fetchone()
++
++
+ def test_envelopes_commit_before_io_and_ack_cleans_pending_storage(board):
+     conn, home = board
+     kb.create_task(conn, title="durable", assignee="worker")
+diff --git a/tests/hermes_cli/test_kanban_sync_forbidden_field.py b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+index bcf67a413c..402d53813b 100644
+--- a/tests/hermes_cli/test_kanban_sync_forbidden_field.py
++++ b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+@@ -89,9 +89,14 @@ def test_synthetic_parent_non_schema_rejections_use_bounded_outbox_handling(live
+         return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
+                              "reason": reason, "detail": "no task missing"} for op in batch]}
+     client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
+-    [parent] = live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
+-    assert parent["attempts"] == 1
+-    assert parent["state"] == ("rejected" if reason == "live_claim" else "pending")
++    rows = live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
++    if reason == "live_claim":
++        assert not rows  # permanent synthetic refusal must not manufacture a rejected row
++        assert live.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()
++    else:
++        [parent] = rows
++        assert parent["attempts"] == 1
++        assert parent["state"] == "pending"
+ 
+ 
+ @pytest.mark.parametrize("state", ["pending", "rejected"])
+@@ -123,7 +128,7 @@ def test_synthetic_parent_acknowledgement_is_successful_version_only(live, statu
+     parent = {"client_op_id": "parent-op", "fields": {"title": "parent acknowledgement"},
+               "hlc": "0000000000001-0000-macbook"}
+     queued = compat.rejected_parent(live, [(parent, tid)], result)
+-    assert (queued is not None) == (status == "rejected")
++    assert queued is None  # unknown/permanent refusal must not become a retry row
+     assert live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0] == expected
+ 
+ 
+-- 
+2.43.0
+

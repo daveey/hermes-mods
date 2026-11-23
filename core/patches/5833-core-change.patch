@@ -1,0 +1,339 @@
+From 26e7dd6f59e0a52f90a533d735807f788e941f71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:29:55 +0000
+Subject: [PATCH] [daveey] fence competing spend-stop budget decisions
+ atomically
+
+Problem: one spend-stop notice woke creator, observer and shepherd chats; shared default-profile deciders stacked four unconditional last-writer-wins overrides. Producer custody identified only kind=chats, and existing tests asserted one event, not one budget decision. Promote checked unread comments too late to prevent budget mutation.
+
+Countermeasure: under the existing budget writer transaction, compare --seen against the latest committed episode budget comment. Resolve synced comments by portable UID, refuse incomplete evidence, preserve the fence after promotion, and allow deliberate readback reconciliation. Ordinary no-stop overrides retain newest-wins behavior. This does not suppress observer notices or prohibit free-text comments.
+
+Proof: initial regression on main allowed both independent writers (four tests failed). Final consumer run: 48 files,1126 passed,5 skipped; full scripts/check 21 checks passed. Hub read-only replay across all board DBs including sync-shadow: a subset of stop-card rows would require acknowledgment of an existing budget decision (project shadow, default shadow and primary). No production budget changed. Natural post-deploy hold proof and independent exact-head review remain required. Incident and notice row evidence is recorded on the owning card.
+---
+ hermes_cli/kanban_parser.py                   |   1 +
+ hermes_cli/kanban_spend_budget.py             |  18 +-
+ hermes_cli/kanban_spend_budget_cli.py         |  10 +-
+ hermes_cli/kanban_spend_override_fence.py     |  57 ++++++
+ .../test_kanban_spend_override_fence.py       | 168 ++++++++++++++++++
+ 5 files changed, 249 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_spend_override_fence.py
+ create mode 100644 tests/hermes_cli/test_kanban_spend_override_fence.py
+
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 2e59b89ca4..5ea0ebfc35 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -657,6 +657,7 @@ _SPECS = [
+             "stop). Does not promote: run `hermes kanban promote` afterwards"),
+     _cmd("spend-budget", [
+         _TASK_ID,
++        _arg("--seen", dest="seen_comment_id", type=int, help="Newest decision comment read; refuse replacing an unread spend-stop budget decision."),
+         _arg("--runs", type=_nonnegative_int, help="This card's spending-run limit (0 = no limit)"),
+         _arg("--cache-read-tokens", type=_nonnegative_int, help="This card's cache-read token limit (0 = no limit)"),
+         _arg("--exempt", action="store_true", help="No spend budget for this card (standing cards)"),
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index af36af6d95..a7d5d7ecdf 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -129,9 +129,11 @@ def _has_override(conn: sqlite3.Connection, task_id: str) -> bool:
+ 
+ 
+ def set_override(conn: sqlite3.Connection, task_id: str, *, runs: Optional[int] = None,
+-                 cache_read_tokens: Optional[int] = None, by: str, reason: str) -> dict:
++                 cache_read_tokens: Optional[int] = None, by: str, reason: str,
++                 seen: Optional[int] = None, board: Optional[str] = None) -> dict:
+     """Give ``task_id`` its own limits (0 = no limit; None = the board's), recorded as a ``spend_budget_set``
+-    event and a comment naming ``by`` and ``reason``. Both None clears the override. The newest event wins.
++    event and a comment naming ``by`` and ``reason``. Both None clears the override. Replacing a spend-stop
++    decision requires ``seen`` to acknowledge its comment, checked atomically even after promotion.
+     For cards meant to run indefinitely (standing shepherds), set explicitly, never inferred from a title."""
+     from hermes_cli import kanban_db as kb
+ 
+@@ -145,9 +147,17 @@ def set_override(conn: sqlite3.Connection, task_id: str, *, runs: Optional[int]
+     with kb.write_txn(conn):
+         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+             raise ValueError(f"unknown task {task_id}")
++        from hermes_cli.kanban_spend_override_fence import check
++        if episode := check(conn, task_id, seen=seen, board=board):
++            payload['episode'] = episode
++        cid = kb.add_comment(conn, task_id, AUTHOR,
++                             f"Spend budget for this card: {_override_text(payload)}, set by {by}: {reason}.", system=True)
++        if episode:
++            note = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
++            payload['decision_comment'] = {'comment_id': cid, 'author': AUTHOR}
++            if 'uid' in note.keys() and note['uid']:
++                payload['decision_comment']['comment_uid'] = note['uid']
+         kb._append_event(conn, task_id, OVERRIDE_EVENT, payload)
+-        kb.add_comment(conn, task_id, AUTHOR, f"Spend budget for this card: {_override_text(payload)}, set by {by}: "
+-                       f"{reason}.", system=True)
+     return payload
+ 
+ 
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index 0838f26daa..7bb71f9ff3 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -4,6 +4,9 @@ Without a change flag it prints the card's effective limits, its override (who s
+ spend. ``--runs N`` / ``--cache-read-tokens N`` (0 = no limit), ``--exempt`` (both 0) or ``--clear`` (back to
+ the board's limits) record a ``spend_budget_set`` event and need ``--reason``. Worker and delegate_task shells
+ are fenced from this verb like every other board write, so a looping card cannot exempt itself.
++For a spend-stop episode, an existing budget decision must be read before replacement (``--seen COMMENT_ID``).
++This acknowledgment is checked under the writer lock, survives promotion, and is not a retry instruction:
++keep the first decision unless an explicit reconciliation is warranted. Read-only display is unchanged.
+ """
+ from __future__ import annotations
+ 
+@@ -40,7 +43,12 @@ def command(args: argparse.Namespace) -> int:
+         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone() is None:
+             return _err(f"kanban spend-budget: unknown task {tid}")
+         if changing:
+-            ksb.set_override(conn, tid, runs=runs, cache_read_tokens=cache, by=_actor(), reason=args.reason)
++            from hermes_cli.kanban_release_comments import UNREAD_EXIT, UnreadComments
++            try:
++                ksb.set_override(conn, tid, runs=runs, cache_read_tokens=cache, by=_actor(), reason=args.reason,
++                                 seen=getattr(args, 'seen_comment_id', None), board=getattr(args, 'board', None))
++            except UnreadComments as exc:
++                return _err(str(exc), UNREAD_EXIT)
+         lim = ksb.card_limits(conn, tid, ksb.limits())
+         override = ksb.card_override(conn, tid)
+         spent = ksb.spend(conn, tid)
+diff --git a/hermes_cli/kanban_spend_override_fence.py b/hermes_cli/kanban_spend_override_fence.py
+new file mode 100644
+index 0000000000..fddcaea8e7
+--- /dev/null
++++ b/hermes_cli/kanban_spend_override_fence.py
+@@ -0,0 +1,57 @@
++"""Atomic read-before-replace fence for a spend-stop episode's budget decision. [daveey]
++
++Observers may all see a stop; only the first stale reader may change its budget.
++A deliberate correction must acknowledge the committed decision's local comment.
++The fence survives promotion: a delayed observer must not overwrite the release.
++"""
++from __future__ import annotations
++
++import json
++import shlex
++
++from hermes_cli import kanban_release_comments as comments
++from hermes_cli.kanban_sync_divergence import _event_order
++
++
++def check(conn, task_id, *, seen=None, board=None):
++    """Under the budget writer lock; return the latest stop identity, or None.
++
++    Use portable event order and comment UID resolution, never a wire-local id as
++    the receiving board's read watermark. Legacy decisions resolve through their
++    following system comment. Incomplete evidence refuses rather than grants.
++    """
++    events = [dict(r) for r in conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind IN "
++        "('spend_budget_triaged','spend_budget_set','commented')", (task_id,))]
++    events.sort(key=_event_order)
++    stops = [e for e in events if e['kind'] == 'spend_budget_triaged']
++    if not stops:
++        return None
++    stop = stops[-1]
++    episode = stop.get('uid') or str(stop['id'])
++    changed = [e for e in events if e['kind'] == 'spend_budget_set' and _event_order(e) > _event_order(stop)]
++    if not changed:
++        return episode
++    last = changed[-1]
++    reference = json.loads(last['payload'] or '{}').get('decision_comment')
++    notes = [e for e in events if e['kind'] == 'commented' and _event_order(e) > _event_order(last)
++             and json.loads(e['payload'] or '{}').get('author') == 'kanban-spend-budget']
++    rows = conn.execute("SELECT * FROM task_comments WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
++    note = last if isinstance(reference, dict) else (notes[0] if notes else last)
++    payload = reference if isinstance(reference, dict) else json.loads(note['payload'] or '{}')
++    resolved = comments._resolve(rows, note, payload) if isinstance(reference, dict) or notes else []
++    listing_payload = {**payload, 'writer_session': f"spend decision for episode {episode}"}
++    if not resolved:
++        unread = [comments._listing(None, 'Budget decision comment unavailable; wait for sync and reread. '
++                                    '--seen cannot acknowledge missing evidence.', note, listing_payload)]
++    else:
++        unread = [comments._listing(r['id'], r['body'], note, listing_payload)
++                  for r in resolved if seen is None or r['id'] > seen]
++    if unread:
++        command = ['hermes', 'kanban']
++        if board:
++            command += ['--board', board]
++        newest = max((r['id'] for r in unread if r['id'] is not None), default=seen or 0)
++        command += ['spend-budget', task_id, '--seen', str(newest)]
++        raise comments.UnreadComments(unread, shlex.join(command))
++    return episode
+diff --git a/tests/hermes_cli/test_kanban_spend_override_fence.py b/tests/hermes_cli/test_kanban_spend_override_fence.py
+new file mode 100644
+index 0000000000..bbc4ea35d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_override_fence.py
+@@ -0,0 +1,168 @@
++"""Spend-stop decisions compare the last read with the committed budget, not the shared profile."""
++from __future__ import annotations
++
++import json
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli.kanban_release_comments import UnreadComments
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _stop(conn, tid):
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, budget.EVENT, {"reason": "bounded stop"})
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++    return helpers._events(conn, tid, budget.EVENT)[-1]
++
++
++def _card(conn):
++    tid = kb.create_task(conn, title="One spend decision", assignee="default")
++    return tid, _stop(conn, tid)
++
++
++def _write(conn, tid, runs=3, **kw):
++    return budget.set_override(conn, tid, runs=runs, by="default", reason="bounded rescope", **kw)
++
++
++@pytest.mark.parametrize('acknowledge', [False, True], ids=['no-read', 'same-read-watermark'])
++def test_independent_writers_cannot_stack_decisions(kanban_home, acknowledge):
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++        if acknowledge:
++            _write(conn, tid, 1)
++        seen = kb.list_comments(conn, tid)[-1].id if acknowledge else None
++    barrier = threading.Barrier(2)
++
++    def decide(runs):
++        with kbc.connect_closing() as conn:
++            barrier.wait(timeout=10)
++            try:
++                _write(conn, tid, runs, **({'seen': seen} if acknowledge else {}))
++                return "applied"
++            except UnreadComments as exc:
++                return exc
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(decide, (3, 17)))
++    assert results.count("applied") == 1, results
++    refusal = next(r for r in results if isinstance(r, UnreadComments))
++    with kbc.connect_closing() as conn:
++        assert len(helpers._events(conn, tid, budget.OVERRIDE_EVENT)) == 1 + acknowledge
++        comments = kb.list_comments(conn, tid)
++        assert len(comments) == 1 + acknowledge
++        assert refusal.comments[0]["id"] == comments[-1].id
++        assert f"--seen {comments[-1].id}" in str(refusal)
++        assert "spend-budget" in refusal.rerun
++
++
++def test_single_decider_receipt_and_deliberate_reconciliation(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, stop = _card(conn)
++        receipt = _write(conn, tid)
++        assert receipt["episode"] == (stop.uid or str(stop.id))
++        comment = kb.list_comments(conn, tid)[-1]
++        _write(conn, tid, 2, seen=comment.id)
++        assert budget.card_override(conn, tid)["runs"] == 2
++        with pytest.raises(UnreadComments):
++            _write(conn, tid, 17, seen=comment.id)
++        assert len(helpers._events(conn, tid, budget.OVERRIDE_EVENT)) == 2
++
++
++def test_delayed_decision_after_promotion_is_still_stale(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++        _write(conn, tid)
++        assert kb.promote_task(conn, tid, actor="operator", reason="bounded")[0]
++        with pytest.raises(UnreadComments):
++            _write(conn, tid, 17)
++        assert budget.card_override(conn, tid)["runs"] == 3
++
++
++def test_new_episode_and_ordinary_updates_are_not_old_decisions(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="ordinary", assignee="default")
++        _write(conn, tid)
++        _write(conn, tid, 4)
++        _stop(conn, tid)
++        _write(conn, tid, 2)
++        assert kb.promote_task(conn, tid, actor="operator", reason="bounded")[0]
++        _stop(conn, tid)
++        _write(conn, tid, 1)
++        assert budget.card_override(conn, tid)["runs"] == 1
++
++
++def test_cli_refuses_stale_budget_and_accepts_readback(kanban_home):
++    from hermes_cli import kanban as cli
++
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++    command = f"spend-budget {tid} --runs 3 --reason bounded"
++    assert "spend budget" in cli.run_slash(command)
++    refused = cli.run_slash(command)
++    assert "unread_comments" in refused
++    with kbc.connect_closing() as conn:
++        cid = kb.list_comments(conn, tid)[-1].id
++    assert "spend budget" in cli.run_slash(f"{command} --seen {cid}")
++
++
++@pytest.mark.parametrize('missing', ['comment', 'reference'])
++def test_missing_evidence_cannot_be_acknowledged(kanban_home, missing):
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++        _write(conn, tid)
++        with kb.write_txn(conn):
++            if missing == 'comment':
++                conn.execute('DELETE FROM task_comments WHERE task_id=?', (tid,))
++            else:
++                conn.execute("UPDATE task_events SET payload=json_remove(payload,'$.decision_comment') "
++                             "WHERE task_id=? AND kind=?", (tid, budget.OVERRIDE_EVENT))
++        with pytest.raises(UnreadComments, match='unavailable'):
++            _write(conn, tid, 17, seen=10**9)
++        assert len(helpers._events(conn, tid, budget.OVERRIDE_EVENT)) == 1
++
++
++def test_legacy_event_before_comment_and_aged_hold(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.OVERRIDE_EVENT, {'runs': 3})
++            cid = kb.add_comment(conn, tid, budget.AUTHOR, 'Legacy decision', system=True)
++            conn.execute('UPDATE task_events SET created_at=created_at-7200 WHERE task_id=?', (tid,))
++        with pytest.raises(UnreadComments) as refused:
++            _write(conn, tid, 17, board='other-board')
++        assert f'--board other-board spend-budget {tid} --seen {cid}' in refused.value.rerun
++        _write(conn, tid, 2, seen=cid)
++
++
++def test_portable_comment_reference_ignores_foreign_integer(kanban_home):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from tests.hermes_cli import kanban_sync_support as support
++
++    support.write_sync_config(kanban_home, True)
++    with kbc.connect_closing() as conn:
++        sync.install_or_remove(conn, str(kanban_home / 'kanban.db'))
++        client.ensure_identity(conn, 'default', 'fixture')
++        tid, _ = _card(conn)
++        _write(conn, tid)
++        cid = kb.list_comments(conn, tid)[-1].id
++        with kb.write_txn(conn):
++            # Model a synced receiver: local row ID differs from the producer's.
++            conn.execute("UPDATE task_comments SET uid='portable-decision' WHERE id=?", (cid,))
++            event = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND kind=?',
++                                 (tid, budget.OVERRIDE_EVENT)).fetchone()
++            data = json.loads(event['payload'])
++            data['decision_comment'].update(comment_id=999999, comment_uid='portable-decision')
++            conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(data), event['id']))
++        with pytest.raises(UnreadComments) as refused:
++            _write(conn, tid, 17, seen=cid-1)
++        assert refused.value.comments[0]['id'] == cid
++        _write(conn, tid, 2, seen=cid)
+-- 
+2.43.0
+

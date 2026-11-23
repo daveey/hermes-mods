@@ -1,0 +1,112 @@
+From 5d8f536bc0864a08dda931d4f652ff42f4facb3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:35:16 +0000
+Subject: [PATCH] [daveey] Keep subscribed asks with their owner and pin pacing
+ fixture clock
+
+---
+ hermes_cli/kanban_retained_wait.py            |  5 ++++
+ hermes_state_outcome.py                       |  3 ++-
+ .../test_kanban_retained_wait_status.py       | 27 ++++++++++++++++---
+ tests/plugins/test_kanban_pacing_detail.py    |  7 +++++
+ 4 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_retained_wait.py b/hermes_cli/kanban_retained_wait.py
+index 4c8d947f42..641ac06590 100644
+--- a/hermes_cli/kanban_retained_wait.py
++++ b/hermes_cli/kanban_retained_wait.py
+@@ -68,6 +68,11 @@ def explanation(conn: sqlite3.Connection, task_id: str, *, generated_only: bool
+         swept = _latest(conn, task_id, (SWEEP_EVENT,))
+         if swept is None or swept[0] < retained[0]:
+             return None
++        # A later explicit ask supersedes the old system stamp, even within the same retained episode.
++        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? AND json_valid(payload) "
++                        "AND json_type(payload, '$.human_request')='object' LIMIT 1",
++                        (task_id, swept[0])).fetchone():
++            return None
+     parent = _open_parent(conn, task_id)
+     if parent:
+         return f"card:{parent}"
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 9fcfac5099..8ac26ecd69 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -369,7 +369,8 @@ def _read_card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+         wait = card.get("wait") if isinstance(card.get("wait"), dict) else {}
+         human = card_is_open_human_ask(status, card.get("block_kind"), request)
+         explained = card.get("retained_wait") if isinstance(card.get("retained_wait"), str) else None
+-        if human and not explained:
++        # A notification subscription observes another chat's card; it does not adopt its human decision.
++        if human and not explained and card.get("via") != "subscribed":
+             req = request if isinstance(request, dict) else {}
+             decisions.append({"id": f"card:{tid}", "question": _str(req.get("action")) or _str(card.get("title")),
+                               "choices": _choices(req.get("choices")), "card_id": tid, "state": "open"})
+diff --git a/tests/hermes_cli/test_kanban_retained_wait_status.py b/tests/hermes_cli/test_kanban_retained_wait_status.py
+index 5bc6158bb6..d3472ef3c6 100644
+--- a/tests/hermes_cli/test_kanban_retained_wait_status.py
++++ b/tests/hermes_cli/test_kanban_retained_wait_status.py
+@@ -110,12 +110,16 @@ def test_a_wait_recorded_before_the_retain_or_on_a_closed_card_does_not_explain_
+     assert [d["card_id"] for d in decisions] == [tid]
+ 
+ 
+-def test_a_real_request_on_a_retained_card_still_asks_with_an_open_parent(board) -> None:
+-    """Not the sweep's generated ask (no ``stranded_park_escalated`` after the retain): somebody asked the operator."""
++@pytest.mark.parametrize("swept", [False, True])
++def test_a_real_request_on_a_retained_card_still_asks_with_an_open_parent(board, swept) -> None:
++    """A real ask, including one filed after the sweep's stamp, remains red."""
+     real = dict(SWEEP_ASK, action="Approve the restart of the hub gateway. Unblock = restart; archive = skip.",
+                 why_human="Only the operator can approve a gateway restart")
+     with kbc.connect_closing() as conn:
+-        tid = _retained(conn, parent=_running(conn), swept=False, request=real)
++        tid = _retained(conn, parent=_running(conn), swept=swept, request=real)
++        if swept:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "blocked", {"human_request": real})
+     decisions, _ = _items()
+     assert [d["card_id"] for d in decisions] == [tid]
+ 
+@@ -134,6 +138,23 @@ def test_the_sweep_writes_no_ask_on_a_retained_card_an_open_parent_explains(boar
+         assert not ksp._excluded(conn, row, 10**10, age=10**6, defer=0)
+ 
+ 
++@pytest.mark.parametrize("reason", ["touch", "shepherd"])
++def test_a_subscription_does_not_adopt_another_cards_human_ask(board, reason) -> None:
++    from hermes_cli.kanban_db_notify import add_notify_sub
++
++    with kbc.connect_closing() as conn:
++        tid = _retained(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id='other-chat' WHERE id=?", (tid,))
++        add_notify_sub(conn, task_id=tid, platform="tui", chat_id="s1", delivery_metadata={"reason": reason})
++    decisions, waits = _items()
++    assert decisions == []
++    assert [w["id"] for w in waits] == ([tid] if reason == "shepherd" else [])
++    # Ownership, rather than an incidental subscription, still owns the red ask.
++    decisions, _ = so._read_card_items(["other-chat"])
++    assert [d["card_id"] for d in decisions] == [tid]
++
++
+ def _schedule(args):
+     from hermes_cli import kanban as kcli
+     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+diff --git a/tests/plugins/test_kanban_pacing_detail.py b/tests/plugins/test_kanban_pacing_detail.py
+index 11e6f2b44e..4f6a6a6443 100644
+--- a/tests/plugins/test_kanban_pacing_detail.py
++++ b/tests/plugins/test_kanban_pacing_detail.py
+@@ -21,6 +21,13 @@ _UNTIL_TEXT = time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(int(_UNTIL)))
+ 
+ @pytest.mark.parametrize('replica', [False, True])
+ def test_card_detail_names_pacing_provider_and_reset(kanban_home, api, monkeypatch, replica):
++    import time
++    from types import SimpleNamespace
++    from hermes_cli import kanban_dispatch_skip as skips
++
++    # Pin the dated view just like the queue-level fixture; today's date drops the day.
++    monkeypatch.setattr(skips, 'time', SimpleNamespace(
++        time=lambda: 0, gmtime=time.gmtime, strftime=time.strftime))
+     tid = make_replica_card(kanban_home) if replica else _live_card()
+     if replica:
+         enable_sync(monkeypatch)
+-- 
+2.43.0
+

@@ -1,0 +1,111 @@
+From bf643fb98ce514d73becd3a5d00b95a362b00fe4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:07:26 +0000
+Subject: [PATCH] fix(always-on): start-up demotion waits for the update and
+ needs every probe to miss [daveey]
+
+Third review of #3920: Roller.start() demoted after a single 10 s health miss,
+decided before the update marker cleared (so during a core update, its main
+case, it never probed). It now waits for the marker like roll() does, then
+demotes only when all UNRESPONSIVE_CONFIRMATIONS probes, START_PROBE_GAP_S
+apart, miss: the same bar supervise() uses. Tests: a backend that answers its
+last probe is not demoted; no probe runs while the marker is present.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/always_on_rollover.py            | 18 ++++++++--
+ tests/hermes_cli/test_always_on_rollover.py | 39 +++++++++++++++++++++
+ 2 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index b4ec013374..dcb137868c 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -82,6 +82,7 @@ DRIFT_CONFIRMATIONS = 2      # consecutive polls a commit/runtime drift must per
+ # Consecutive polls an alive backend must miss /api/health before it rolls (~1-2 min at SUPERVISE_POLL_S). Higher
+ # than DRIFT_CONFIRMATIONS: a busy backend stalls for seconds routinely, and a roll leaves the old one running.
+ UNRESPONSIVE_CONFIRMATIONS = 4
++START_PROBE_GAP_S = 3.0      # between the start-up health probes of the active backend (Roller.start)
+ UNRESPONSIVE_REASON = "does not answer /api/health"
+ FAILED_ROLL_BACKOFF_S = 300.0
+ SUPERSEDED_GRACE_S = 900.0   # a superseded backend not retired by then is retired by the roller through its idle fence
+@@ -813,12 +814,23 @@ class Roller:
+         self.demote(port)
+         return True
+ 
++    def _never_answers(self, port: int) -> bool:
++        for i in range(UNRESPONSIVE_CONFIRMATIONS):
++            if i:
++                self.sleep(START_PROBE_GAP_S)
++            if self.health(port) is not None:
++                return False
++        return True
++
+     def start(self) -> bool:
+         """The roller's first roll. A starved active backend found at start (a core update restarts the roller)
+-        is demoted like one supervise() rolls away from, so it is not adopted again or kept for 6 h."""
++        is demoted like one supervise() rolls away from, so it is not adopted again or kept for 6 h. Decided after
++        the update marker clears (a backend paused for the update is not starved) and only when every one of
++        UNRESPONSIVE_CONFIRMATIONS probes misses, the same bar supervise() uses."""
++        if not aod.wait_for_update_clear(self.marker, sleep=self.sleep, now=self.clock):
++            log("update marker still present; rolling anyway")
+         before = read_active(self.home)
+-        starved = (before is not None and self.unit_active(before["port"]) and not self.update_in_progress()
+-                   and self.health(before["port"]) is None)
++        starved = before is not None and self.unit_active(before["port"]) and self._never_answers(before["port"])
+         ok = self.roll("roller started")
+         if ok and starved:
+             self.demote_if_replaced(before["port"])
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 24a2b450bd..56432d6e46 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -487,6 +487,45 @@ def test_start_demotes_a_starved_active_backend_it_replaces(home):
+     assert ro.read_active()["port"] == 9149 and set(roller._load_demoted()) == {9148}
+ 
+ 
++def test_start_does_not_demote_a_backend_that_answers_one_of_its_probes(home):
++    host = FakeHost(running={9148}, commits={9148: "a" * 40})
++    ro.write_active(9148)
++    real_get = host.get
++    misses = [ro.UNRESPONSIVE_CONFIRMATIONS - 1]
++
++    def get(port, path, timeout):
++        if port == 9148 and path == "/api/health" and misses[0] > 0:
++            misses[0] -= 1
++            return None, 0.0, None  # busy for a few probes, then answers
++        return real_get(port, path, timeout)
++    roller = make_roller(home, host)
++    roller.get = get
++    assert roller.start() is True
++    assert ro.read_active()["port"] == 9149 and roller._load_demoted() == {}
++
++
++def test_start_probes_only_after_the_update_marker_clears(home):
++    host = FakeHost(running={9148}, commits={9148: "c" * 40})
++    ro.write_active(9148)
++    marker = home / "no-marker"
++    marker.write_text("")
++    probes = []
++    real_get = host.get
++
++    def get(port, path, timeout):
++        if port == 9148 and path == "/api/health":
++            probes.append(marker.exists())
++            return None, 0.0, None
++        return real_get(port, path, timeout)
++    roller = make_roller(home, host)
++    roller.get = get
++    real_sleep = roller.sleep
++    roller.sleep = lambda s: (marker.unlink(missing_ok=True), real_sleep(s))  # the update finishes while waiting
++    assert roller.start() is True
++    assert probes and not any(probes)  # never probed while the update held the marker
++    assert set(roller._load_demoted()) == {9148}
++
++
+ def test_start_does_not_demote_a_healthy_active_backend(home):
+     host = FakeHost(running={9148}, commits={9148: "a" * 40})
+     ro.write_active(9148)
+-- 
+2.43.0
+

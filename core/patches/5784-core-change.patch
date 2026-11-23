@@ -1,0 +1,144 @@
+From 334bb8ffc2c15c9cb2f35530d8dfe85a57afc7ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:29:09 +0000
+Subject: [PATCH] [daveey] Carry tenant-bearing producer cards through the
+ worker pool
+
+The Board already serializes tenant and pickup preserves it. Exempt tenant only from pool structural restrictions, retaining legacy courier refusal. Spend-decision and core-wt review creators no longer need a hub slot just for their tenant. No evidence cards are modified.
+
+Proof: all 8 initial regressions fail on old core and pass after. Final coverage includes six prevention receipt shapes, review tool/CLI creation, both tenant values through real sync/import using FakeService, and independent uncarried-option controls. Candidate hub_pin_audit replays report neither option nor uncarried option for fresh decision shapes. Focused placement/pool/spend suites and scripts/check pass.
+---
+ hermes_cli/kanban_placement.py              |   4 +-
+ tests/hermes_cli/test_kanban_pool_tenant.py | 105 ++++++++++++++++++++
+ 2 files changed, 108 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pool_tenant.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 94b65d6537..3e506abb0b 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -240,7 +240,9 @@ UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "proje
+                      "runs_on", "pin_mandatory")  # courier cannot preserve mandatory model pins either
+ # Of those, the ones the pool route carries anyway: Board row fields a worker's pickup copies. A mandatory model
+ # pin rides model_pin_mandatory; kanban_mandatory_pin gates it on the destination's attestation. [daveey]
+-POOL_CARRIED_OPTIONS = ("pin_mandatory",)
++# Tenant is already part of the synced Board row; it is not a host-local resource.
++# Keep it in UNCARRIED_OPTIONS: the legacy create-task courier still cannot carry it.
++POOL_CARRIED_OPTIONS = ("pin_mandatory", "tenant")
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+diff --git a/tests/hermes_cli/test_kanban_pool_tenant.py b/tests/hermes_cli/test_kanban_pool_tenant.py
+new file mode 100644
+index 0000000000..25160e1217
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pool_tenant.py
+@@ -0,0 +1,105 @@
++"""Tenant-bearing producer cards use the Board pool, not the legacy courier."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_pool_queue as helpers
++
++hub = helpers.hub
++svc = helpers.svc
++
++# Every receipt on the prevention card: six original/decision shapes and one review.
++RECEIPTS = (
++    ("worker-1: cut spot interruptions, reap leftover processes", "other"),
++    ("Fix red state CI: daveey/hermes (since f32a275f)", "hermes"),
++    ("Resolve unattended upstream merge conflict", "hermes"),
++    ("Repair FailedTailProbe clock assertion blocking PR3604 post-merge CI", "other"),
++    ("Investigate state.db structural-corruption latch", "other"),
++    ("Decide and implement durable unpushed-source custody", "other"),
++)
++
++
++@pytest.mark.parametrize("title,tenant", RECEIPTS)
++def test_spend_producer_preserves_tenant_and_queues(hub, title, tenant):
++    helpers._registry()
++    root = kb.create_task(hub.conn, title=title, assignee="default", tenant=tenant)
++    with kb.write_txn(hub.conn):
++        result = decision.producer(hub.conn, root, "Spend budget reached")
++    assert result["kind"] == "supervisor"
++    tid = result["task_id"]
++    task = kb.get_task(hub.conn, tid)
++    assert task.tenant == tenant
++    assert "Do not run the original work here" in task.body
++    assert helpers._runs_on(hub.conn, tid) == [helpers.POOL]
++    payload = hub.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()[0]
++    assert json.loads(payload)["portable_reason"] != "uncarried option"
++
++
++def test_review_tool_and_cli_preserve_tenant_and_queue(hub):
++    from hermes_cli import kanban as cli
++    from tools import kanban_tools
++
++    helpers._registry()
++    title = "Independent exact-head review PR #3751 @386117f65a (core-wt ship review required)"
++    out = json.loads(kanban_tools._handle_create({
++        "title": title, "body": "Independent review only; you must not land.",
++        "assignee": "default", "tenant": "hermes", "requires": ["terminal", "git"],
++    }))
++    assert out.get("ok"), out
++    tid = out["task_id"]
++    assert helpers._runs_on(hub.conn, tid) == [helpers.POOL]
++    assert kb.get_task(hub.conn, tid).tenant == "hermes"
++    out = json.loads(cli.run_slash(
++        'create "Review another published patch" --assignee default --tenant other --json'))
++    assert helpers._runs_on(hub.conn, out["id"]) == [helpers.POOL]
++    assert kb.get_task(hub.conn, out["id"]).tenant == "other"
++
++
++@pytest.mark.parametrize("tenant", ["hermes", "other"])
++def test_board_transport_carries_tenant_to_worker(hub, tmp_path, monkeypatch, tenant):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_worker_node as wn
++
++    helpers._registry()
++    tid = kb.create_task(hub.conn, title="Review a published change", assignee="default", tenant=tenant)
++    assert helpers._runs_on(hub.conn, tid) == [helpers.POOL]
++    hub.round()
++    worker = helpers.Gateway(tmp_path, helpers.WORKER, hub.svc, monkeypatch, pickup="true")
++    try:
++        wn.set_registry_fetch(lambda: {"me": helpers.WORKER,
++                                       "machines": helpers.seen_now(helpers._machines().values())})
++        result = client.sync_board("default", worker.home / "kanban.db",
++                                   hub.svc.hub(helpers.WORKER), helpers.WORKER)
++        assert not result.error, result
++        replica = wn.open_replica(worker.conn)
++        assert replica is not None
++        try:
++            row = replica.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++            assert row is not None and row["tenant"] == tenant
++            assert wn.eligible(dict(row), helpers.WORKER, helpers._machines()) is None
++            assert wn.import_cards(worker.conn, replica, [tid]) == [tid]
++        finally:
++            replica.close()
++        task = kb.get_task(worker.conn, tid)
++        assert task is not None and task.tenant == tenant
++        assert helpers._runs_on(worker.conn, tid) == [helpers.POOL]
++    finally:
++        worker.conn.close()
++        sync.set_lease_client(None)
++        hub.enter()
++
++
++def test_tenant_remains_uncarried_by_legacy_courier():
++    card = {"title": "Review a published patch", "assignee": "default", "tenant": "hermes"}
++    assert kp.structural_reason(card, helpers.CFG) is None
++    assert kp._uncarried(card, kp._Cfg({}), carries=True) == ["tenant"]
++    for key, value in (("human_request", {"action": "approve"}), ("max_retries", 2),
++                       ("workspace_path", "/host/unpublished")):
++        assert kp.structural_reason({**card, key: value}, helpers.CFG) == "uncarried option"
+-- 
+2.43.0
+

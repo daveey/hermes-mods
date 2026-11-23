@@ -1,0 +1,697 @@
+From a0daa1ee5db52856037bd98a035fbec2c98f309b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:56:05 +0000
+Subject: [PATCH] [daveey] Project lanes from fresh whole-card local and fleet
+ sources
+
+---
+ hermes_cli/kanban_lane_daily_limits.py        |   5 +-
+ hermes_cli/kanban_lanes.py                    |   5 +-
+ hermes_cli/kanban_lanes_cli.py                |  24 +-
+ hermes_cli/kanban_lanes_flow.py               |   7 +-
+ hermes_cli/kanban_lanes_flow_evidence.py      |  14 +-
+ hermes_cli/kanban_lanes_sources.py            | 177 ++++++++++
+ tests/hermes_cli/test_kanban_lanes_sources.py | 316 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |   2 +-
+ 8 files changed, 527 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/kanban_lanes_sources.py
+ create mode 100644 tests/hermes_cli/test_kanban_lanes_sources.py
+
+diff --git a/hermes_cli/kanban_lane_daily_limits.py b/hermes_cli/kanban_lane_daily_limits.py
+index 18cf449d6c..533f93fd01 100644
+--- a/hermes_cli/kanban_lane_daily_limits.py
++++ b/hermes_cli/kanban_lane_daily_limits.py
+@@ -32,13 +32,14 @@ def exempt(conn, lane, opts):
+     return False
+ 
+ 
+-def reason(conn, pol, lane_name, opts, *, now=None):
++def reason(conn, pol, lane_name, opts, *, now=None, provenance_conn=None):
+     from hermes_cli import kanban_lanes as lanes
+     from hermes_cli.kanban_admission_score import _alarm_key
+ 
+     lane = pol.lanes[pol.lane_of(lane_name)]
+     if (opts.get("created_by") in lanes.RECOVERY_CREATORS or opts.get("admission_class") == "urgent"
+-            or _alarm_key(opts.get("idempotency_key")) or exempt(conn, lane, opts)):
++            or _alarm_key(opts.get("idempotency_key")) or exempt(
++                conn if provenance_conn is None else provenance_conn, lane, opts)):
+         return None
+     now = time.time() if now is None else now
+     if lane.usd_per_day is not None and lanes.spent_today(conn, pol, lane.name, now=now) >= lane.usd_per_day:
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index fb4e851b51..601745458d 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -692,7 +692,7 @@ def drop_paused(conn, rows: list) -> list:
+ 
+ # ── report ──────────────────────────────────────────────────────────────────
+ 
+-def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None) -> dict[str, dict]:
++def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None, evidence=None) -> dict[str, dict]:
+     """Per lane on one connection: target and actual share of run-seconds in the window, and what is waiting.
+ 
+     ``blocked_on_you`` is the count of ``blocked``/``triage`` cards whose stored ask ``needs_human`` (the same
+@@ -755,4 +755,7 @@ def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None) -> d
+         row["target"] = 0.0 if row["paused"] else round(row["share"] / total_share, 4)
+         row["actual"] = round(row["run_seconds"] / total_run, 4)
+         row["admitted_today"] = admitted_today(conn, name, now=now) if row["gated"] else 0
++    if evidence is not None:
++        from hermes_cli.kanban_lanes_sources import open_counts
++        open_counts(out, pol, evidence, now)
+     return out
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 6f93951d51..0b894c599f 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -29,21 +29,20 @@ def _fleet(conn, local: bool):
+         return None
+ 
+ 
+-def snapshot(conn, *, hours: float, local: bool = False) -> dict:
++def snapshot(conn, *, hours: float, local: bool = False, evidence=None) -> dict:
+     from hermes_cli import kanban_lanes_plan as plan
+ 
+     pol = lanes.policy()
+     if pol is None:
+         return {"configured": False}
+-    replica = _fleet(conn, local)
+-    try:
+-        rows = lanes.usage(replica or conn, pol, window_s=int(hours * 3600))
+-    finally:
+-        if replica is not None:
+-            replica.close()
++    if evidence is None:
++        from hermes_cli.kanban_lanes_sources import read_view
++        with read_view(conn, local=local) as evidence:
++            return snapshot(conn, hours=hours, local=local, evidence=evidence)
++    rows = lanes.usage(evidence.conn, pol, window_s=int(hours * 3600), evidence=evidence)
+     for name, lane in pol.lanes.items():
+         rows[name]["describe"] = lane.describe
+-    return {"configured": True, "window_hours": hours, "scope": "fleet" if replica is not None else "local",
++    return {"configured": True, "window_hours": hours, "scope": "fleet" if evidence.conn is not conn else "local",
+             "default": pol.default, "agent_priority_cap": pol.priority_cap, "shadow": pol.shadow, "lanes": rows,
+             "planner": plan.read_notes()}
+ 
+@@ -211,14 +210,11 @@ def _set(args) -> int:
+ 
+ def _flow(args) -> int:
+     from hermes_cli import kanban_lanes_flow as flow
++    from hermes_cli.kanban_lanes_sources import read_view
+ 
+     with kbc.connect_closing() as conn:
+-        replica = _fleet(conn, local=False)
+-        try:
+-            data = flow.snapshot(replica or conn, window=args.window)
+-        finally:
+-            if replica is not None:
+-                replica.close()
++        with read_view(conn) as evidence:
++            data = flow.snapshot(evidence.conn, window=args.window, evidence=evidence)
+     if not _json_out(args, data):
+         print(json.dumps(data, indent=2))
+     return 0
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index 9def684c92..74b7c4d8bb 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -259,12 +259,13 @@ def _awaiting(task, events=()) -> Optional[dict]:
+ 
+ def _card_from_row(conn, task, now: float, reader=None, pol=None, *, evidence=None) -> dict:
+     events = _events(conn, task["id"]) if evidence is None else evidence.events(task["id"])
++    source = conn if evidence is None else evidence.connection(task['id'])
+     awaited = _awaiting(task, events)
+-    held = conn.execute(f"SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}", (task["id"],)).fetchone() is not None
++    held = source.execute(f"SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}", (task["id"],)).fetchone() is not None
+     gate_reason = _gate_reason(events) if held else None
+     if gate_reason and pol is not None:
+         from hermes_cli.kanban_lane_daily_limits import reason, row_opts
+-        gate_reason = reason(conn, pol, task["tenant"], row_opts(conn, task), now=now)
++        gate_reason = reason(conn, pol, task["tenant"], row_opts(source, task), now=now, provenance_conn=source)
+     creator = next((_payload(dict(e)).get("creator_task_id") for e in events if e["kind"] == "created"), None)
+     human = _json_obj(task["human_request"] if "human_request" in task.keys() else None)
+     age = max(0.0, (now - float(task["created_at"] or now)) / 3600.0)
+@@ -315,8 +316,8 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+     if pol is None:
+         pol = lanes.parse({"lanes": {"other": {}}})
+     window_s = WINDOWS[window]
+-    usage = lanes.usage(conn, pol, window_s=window_s, now=now)
+     evidence = Evidence(conn) if evidence is None else evidence
++    usage = lanes.usage(conn, pol, window_s=window_s, now=now, evidence=evidence)
+     rows = evidence.rows
+     if reader is None:
+         from hermes_cli.kanban_lanes_flow_pr import Reader
+diff --git a/hermes_cli/kanban_lanes_flow_evidence.py b/hermes_cli/kanban_lanes_flow_evidence.py
+index 2fe5ae0a6e..f7de794ed6 100644
+--- a/hermes_cli/kanban_lanes_flow_evidence.py
++++ b/hermes_cli/kanban_lanes_flow_evidence.py
+@@ -9,17 +9,27 @@ from __future__ import annotations
+ class Evidence:
+     """Read each card's ordered history and parent state at most once per view."""
+ 
+-    def __init__(self, conn):
++    def __init__(self, conn, *, rows=None):
+         from hermes_cli import kanban_lanes_flow as flow
+ 
+         self.conn = conn
+-        self.rows = conn.execute(
++        self.rows = (conn.execute(
+             f"SELECT * FROM tasks WHERE status IN {flow._OPEN} ORDER BY created_at, id").fetchall()
++            if rows is None else rows)
++        self._identity = tuple(tuple(r) for r in conn.execute('PRAGMA database_list'))
++        if not any(r[2] for r in self._identity):
++            self._identity = ('memory', id(conn))
+         self._rows = {row["id"]: row for row in self.rows}
+         self._events = {}
+         self._parents = {}
+         self._urls = {}
+ 
++    def connection(self, task_id):
++        return self.conn
++
++    def identity(self, task_id):
++        return self._identity
++
+     def row(self, task_id):
+         if task_id not in self._rows:
+             self._rows[task_id] = self.conn.execute(
+diff --git a/hermes_cli/kanban_lanes_sources.py b/hermes_cli/kanban_lanes_sources.py
+new file mode 100644
+index 0000000000..7cbfcd6b01
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_sources.py
+@@ -0,0 +1,177 @@
++"""Read-only, whole-card source selection for lanes presentation. [daveey]
++
++Only primary boards overlay their local (including picked-up) rows. Pending
++changes pin the complete local row/history/edges; otherwise a strictly newer
++replica revision wins. A deletion is final on either source, as in sync apply.
++Accounting stays on the canonical replica; no runs or event ids are merged.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from contextlib import contextmanager, ExitStack
++from typing import Any
++
++from hermes_cli.kanban_lanes_flow_evidence import Evidence
++
++_CHILDREN = frozenset(('task_events', 'task_runs'))  # direct classifier/held evidence only
++
++
++@contextmanager
++def read_view(conn, *, local=False):
++    """One request's short reader snapshots; close only the replica we opened."""
++    from hermes_cli import kanban_lanes_cli as cli
++
++    with ExitStack() as scope:
++        replica = cli._fleet(conn, local)
++        if replica is not None:
++            scope.callback(replica.close)
++        for db in (conn, replica):
++            if db is not None and not db.in_transaction:
++                db.execute('BEGIN')
++                scope.callback(db.rollback)
++        yield presentation(conn, replica)
++
++
++def presentation(local, fleet=None):
++    """Borrowed readers; non-primary/legacy boards retain their old source."""
++    from hermes_cli import kanban_db_sync as sync
++
++    if fleet is None:
++        return Evidence(local)
++    try:
++        primary = sync.board_mode(local) == 'primary'
++    except sqlite3.Error:
++        primary = False
++    return Sources(local, fleet) if primary else Evidence(fleet)
++
++
++def _metadata(db):
++    return {r['id']: r for r in db.execute('SELECT id,status,sync_version FROM tasks')}
++
++
++def open_counts(out, pol, evidence, now):
++    """Replace only open-card metrics, never canonical run/cost/admission usage."""
++    from hermes_cli import kanban_lanes as lanes
++    from hermes_cli.kanban_session_wait_rows import _stored_needs_human
++
++    for tally in out.values():
++        tally.update(open=0, running=0, ready=0, held=0, blocked_on_you=0, oldest_ready_s=None)
++    for row in evidence.rows:
++        tally = out[pol.lane_of(row['tenant'])]
++        tally['open'] += 1
++        if row['status'] in ('running', 'ready'):
++            tally[row['status']] += 1
++        if row['status'] == 'ready':
++            age = int(now) - int(row['created_at'] or now)
++            previous = tally['oldest_ready_s']
++            tally['oldest_ready_s'] = age if previous is None else max(previous, age)
++        if row['status'] in ('blocked', 'triage') and _stored_needs_human(row['human_request'], row['block_kind']):
++            tally['blocked_on_you'] += 1
++        if row['status'] == 'triage' and row['block_kind'] == lanes.GATE_KIND:
++            db = evidence.connection(row['id'])
++            tally['held'] += int(db.execute(
++                f'SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}', (row['id'],)).fetchone() is not None)
++
++
++def _deleted(db):
++    return {r[0] for r in db.execute(
++        "SELECT row_uid FROM kanban_sync_tombstones WHERE table_name='tasks'")}
++
++
++def _pending(db):
++    pending = set()
++    for table, uid, raw in db.execute(
++            "SELECT table_name,row_uid,fields FROM kanban_sync_outbox WHERE state != 'rejected'"):
++        if table == 'tasks':
++            pending.add(uid)  # malformed fields do not obscure the row's known identity
++        elif table == 'task_links':
++            if not isinstance(uid, str) or '>' not in uid or not all(uid.split('>', 1)):
++                continue
++            pending.add(uid.split('>', 1)[1])
++        elif table in _CHILDREN:
++            try:
++                fields = json.loads(raw)
++            except (ValueError, TypeError):
++                fields = None
++            tid = fields.get('task_id') if isinstance(fields, dict) else None
++            if not isinstance(tid, str) or not tid:
++                row = db.execute(f'SELECT task_id FROM {table} WHERE uid=?', (uid,)).fetchone()
++                tid = row[0] if row else None
++            if not isinstance(tid, str) or not tid:
++                # A deleted child may have no surviving identity. It cannot pin
++                # an invented card or disable freshness for unrelated cards.
++                continue
++            pending.add(tid)
++    return pending
++
++
++class Sources(Evidence):
++    """Request-local selected open cards, lazy parents and source-owned histories.
++
++    Caller owns both connections and their short read snapshots. Metadata scans
++    contain no bodies; full terminal rows are read only when a parent needs one.
++    """
++
++    def __init__(self, local, fleet):
++        from hermes_cli import kanban_lanes_flow as flow
++
++        self.conn = fleet
++        self.local = local
++        self._rows: dict[str, Any] = {}
++        self._parents: dict[str, list] = {}
++        self._urls: dict[str, Any] = {}
++        self._readers = {id(db): Evidence(db, rows=[]) for db in (local, fleet)}
++        local_meta, fleet_meta = _metadata(local), _metadata(fleet)
++        pending = _pending(local)
++        self._deleted = _deleted(local) | _deleted(fleet)
++        self._source: dict[str, Any] = {}
++        selected = {}
++        for tid in local_meta.keys() | fleet_meta.keys():
++            if tid in self._deleted:
++                continue
++            own, remote = local_meta.get(tid), fleet_meta.get(tid)
++            use_local = own is not None and (tid in pending or remote is None or
++                int(own['sync_version'] or 0) >= int(remote['sync_version'] or 0))
++            self._source[tid] = local if use_local else fleet
++            selected[tid] = own if use_local else remote
++        for db in (local, fleet):
++            ids = [tid for tid, row in selected.items()
++                   if self._source[tid] is db and row['status'] in flow._OPEN]
++            for start in range(0, len(ids), 400):
++                batch = ids[start:start + 400]
++                marks = ','.join('?' for _ in batch)
++                self._rows.update((r['id'], r) for r in db.execute(
++                    f'SELECT * FROM tasks WHERE id IN ({marks})', batch))
++        self.rows = sorted(self._rows.values(), key=lambda r: (r['created_at'], r['id']))
++
++    def connection(self, task_id) -> sqlite3.Connection:
++        return self._source[task_id] if task_id in self._source else self.conn
++
++    def identity(self, task_id):
++        return self._readers[id(self.connection(task_id))].identity(task_id)
++
++    def row(self, task_id):
++        if task_id in self._deleted:
++            return None
++        if task_id not in self._rows:
++            self._rows[task_id] = self._readers[id(self.connection(task_id))].row(task_id)
++        return self._rows[task_id]
++
++    def events(self, task_id):
++        return self._readers[id(self.connection(task_id))].events(task_id)
++
++    def parents(self, task_id):
++        from hermes_cli import kanban_db as kb
++
++        if task_id not in self._parents:
++            out = []
++            for parent_id, _fallback in kb.parent_states(self.connection(task_id), task_id):
++                parent = self.row(parent_id)
++                # The full replica and local snapshot are newer than the local
++                # remote-parent mirror; absence on both remains missing.
++                status = parent['status'] if parent is not None else None
++                if status not in ('done', 'archived'):
++                    out.append((parent_id, status if status is not None else 'missing'))
++            self._parents[task_id] = out
++        return self._parents[task_id]
+diff --git a/tests/hermes_cli/test_kanban_lanes_sources.py b/tests/hermes_cli/test_kanban_lanes_sources.py
+new file mode 100644
+index 0000000000..4c29acd92f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_sources.py
+@@ -0,0 +1,316 @@
++"""One whole-card source precedes every lanes presentation filter."""
++import contextlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++
++
++@pytest.fixture
++def copies(conn, tmp_path):
++    with contextlib.closing(kbc.connect(tmp_path / 'fleet.db')) as fleet:
++        for db in (conn, fleet):
++            columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
++            if 'sync_version' not in columns:
++                db.execute('ALTER TABLE tasks ADD COLUMN sync_version INTEGER DEFAULT 0')
++            db.execute('CREATE TABLE IF NOT EXISTS kanban_sync_outbox '
++                       '(row_uid TEXT,table_name TEXT,op TEXT,state TEXT,fields TEXT)')
++            db.execute('CREATE TABLE IF NOT EXISTS kanban_sync_tombstones '
++                       '(table_name TEXT,row_uid TEXT,deleted_at INTEGER)')
++        yield conn, fleet
++
++
++def card(db, tid, status, version=1):
++    db.execute('INSERT INTO tasks(id,title,status,tenant,created_at,sync_version) VALUES(?,?,?,?,?,?)',
++               (tid, tid, status, 'myapp', 100, version))
++
++
++@pytest.mark.parametrize('live_version,fleet_version,pending,expected', [
++    (1, 2, False, 'ready'), (2, 1, False, 'running'), (2, 2, False, 'running'),
++    (1, 2, True, 'running'), (2, 1, True, 'running'),
++])
++def test_pending_local_state_wins_else_newer_revision(copies, configured, live_version, fleet_version, pending, expected):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running', live_version)
++    card(fleet, 'c', 'ready', fleet_version)
++    if pending:
++        live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                     ('c', 'tasks', 'upsert', 'pending', json.dumps({'status': 'running'})))
++    chosen = Sources(live, fleet)
++    assert chosen.row('c')['status'] == expected
++    assert chosen.connection('c') is (live if expected == 'running' else fleet)
++
++
++def test_archive_filter_tombstone_and_foreign_only(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'archived', 'archived', 2)
++    card(fleet, 'archived', 'running', 1)
++    card(fleet, 'deleted', 'ready')
++    card(fleet, 'foreign', 'ready')
++    live.execute("INSERT INTO kanban_sync_tombstones VALUES('tasks','deleted',100)")
++    chosen = Sources(live, fleet)
++    assert [row['id'] for row in chosen.rows] == ['foreign']
++    assert chosen.row('deleted') is None
++    assert chosen.row('archived')['status'] == 'archived'
++
++
++def test_child_source_owns_empty_edges_parent_status_and_history(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'child', 'todo', 2)
++    card(fleet, 'child', 'todo', 1)
++    card(fleet, 'parent', 'ready')
++    fleet.execute("INSERT INTO task_links(parent_id,child_id) VALUES('parent','child')")
++    chosen = Sources(live, fleet)
++    assert chosen.parents('child') == []
++    live.execute("INSERT INTO task_links(parent_id,child_id) VALUES('parent','child')")
++    live.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('child','commented','{}',100)")
++    chosen = Sources(live, fleet)
++    assert chosen.parents('child') == [('parent', 'ready')]
++    assert len(chosen.events('child')) == 1
++
++
++@pytest.mark.parametrize('table,uid,fields', [
++    ('task_events', 'event-uid', {'task_id': 'c'}),
++    ('task_links', 'parent>c', {}),
++])
++def test_pending_history_and_link_delete_pin_whole_card(copies, configured, table, uid, fields):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running', 1)
++    card(fleet, 'c', 'ready', 2)
++    live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                 (uid, table, 'delete', 'pending', json.dumps(fields)))
++    assert Sources(live, fleet).connection('c') is live
++
++
++@pytest.mark.parametrize('pending', [False, True])
++def test_fleet_delete_is_final_even_before_live_apply(copies, configured, pending):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'deleted', 'running')
++    fleet.execute("INSERT INTO kanban_sync_tombstones VALUES('tasks','deleted',100)")
++    if pending:
++        live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                     ('deleted', 'tasks', 'upsert', 'pending', '{}'))
++    chosen = Sources(live, fleet)
++    assert chosen.rows == []
++    assert chosen.row('deleted') is None
++
++
++@pytest.mark.parametrize('raw', ['broken', '[]', 'null', '{"task_id": 5}'])
++def test_malformed_task_fields_still_pin_by_task_uid(copies, configured, raw):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running', 1)
++    card(fleet, 'c', 'ready', 2)
++    live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                 ('c', 'tasks', 'upsert', 'pending', raw))
++    assert Sources(live, fleet).connection('c') is live
++
++
++def test_rejected_and_unrelated_table_do_not_pin(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running', 1)
++    card(fleet, 'c', 'ready', 2)
++    for state, table in [('rejected', 'tasks'), ('pending', 'other')]:
++        live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                     ('c', table, 'upsert', state, '{"task_id":"c"}'))
++    assert Sources(live, fleet).connection('c') is fleet
++
++
++def test_foreign_child_uses_selected_local_parent_and_complete_edges(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'parent', 'done', 2)
++    card(fleet, 'parent', 'ready', 1)
++    card(fleet, 'child', 'todo')
++    fleet.execute("INSERT INTO task_links(parent_id,child_id) VALUES('parent','child')")
++    chosen = Sources(live, fleet)
++    assert chosen.parents('child') == []
++    assert chosen.row('parent')['status'] == 'done'
++
++
++def test_selected_history_never_mixes_integer_event_ids(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'scheduled', 1)
++    card(fleet, 'c', 'scheduled', 2)
++    for db, kind in [(live, 'created'), (fleet, 'scheduled')]:
++        db.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('c',?,'{}',100)", (kind,))
++    selected = Sources(live, fleet)
++    assert [e['kind'] for e in selected.events('c')] == ['scheduled']
++
++    # A different database with equal integer event ids MUST change PR context identity.
++    before = selected.identity('c')
++    live.execute('UPDATE tasks SET sync_version=3 WHERE id=?', ('c',))
++    assert Sources(live, fleet).identity('c') != before
++
++
++def test_source_selection_only_in_primary_mode(copies, configured, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_lanes_sources import presentation
++    live, fleet = copies
++    card(live, 'c', 'running', 2)
++    card(fleet, 'c', 'ready', 1)
++    for mode in ['off', 'shadow', None, 'primary']:
++        monkeypatch.setattr(sync, 'board_mode', lambda db: mode)
++        evidence = presentation(live, fleet)
++        assert evidence.rows[0]['status'] == ('running' if mode == 'primary' else 'ready')
++    assert presentation(live, None).rows[0]['status'] == 'running'
++
++
++def test_terminal_bodies_are_not_bulk_loaded(copies, configured):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running')
++    for i in range(100):
++        card(fleet, f'terminal-{i}', 'done')
++    queries = []
++    for db in (live, fleet):
++        db.set_trace_callback(queries.append)
++    try:
++        chosen = Sources(live, fleet)
++        assert [r['id'] for r in chosen.rows] == ['c']
++    finally:
++        for db in (live, fleet):
++            db.set_trace_callback(None)
++    full = [q for q in queries if q.startswith('SELECT * FROM tasks')]
++    assert full and all('WHERE id IN' in q for q in full), full
++
++
++def test_flow_held_predicate_reads_selected_source(copies, configured):
++    from hermes_cli import kanban_lanes_flow as flow
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'triage', 2)
++    card(fleet, 'c', 'ready', 1)
++    live.execute("UPDATE tasks SET block_kind='lane_gate' WHERE id='c'")
++    chosen = Sources(live, fleet)
++    result = flow._card_from_row(fleet, chosen.row('c'), 200, evidence=chosen)
++    assert result['held'] is True
++
++
++def test_usage_counts_chosen_cards_but_keeps_canonical_run_accounting(copies, configured):
++    from hermes_cli import kanban_lanes as lanes
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'local', 'running', 2)
++    card(fleet, 'local', 'ready', 1)
++    card(fleet, 'foreign', 'ready')
++    card(live, 'finished', 'done', 2)
++    card(fleet, 'finished', 'running', 1)
++    for db in (live, fleet):
++        db.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at) VALUES('local','done',100,150)")
++        db.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('local','worker_result',?,150)",
++                   (json.dumps({'usage': {'cost_usd': 2.5, 'input_tokens': 100, 'output_tokens': 10}}),))
++    # Existing canonical usage is the oracle for every non-open metric.
++    pol = lanes.policy()
++    assert pol is not None
++    canonical = lanes.usage(fleet, pol, window_s=3600, now=200)
++    chosen = Sources(live, fleet)
++    actual = lanes.usage(fleet, pol, window_s=3600, now=200, evidence=chosen)
++    assert actual['myapp']['open'] == 2
++    assert actual['myapp']['running'] == 1
++    assert actual['myapp']['ready'] == 1
++    for name in canonical:
++        for key in ['done', 'cost_usd', 'tokens', 'runs', 'run_seconds', 'usage_runs', 'actual']:
++            assert actual[name][key] == canonical[name][key]
++    assert actual['myapp']['run_seconds'] == 50
++    assert actual['myapp']['cost_usd'] == 2.5
++    assert actual['myapp']['tokens'] == 110
++
++
++def test_unresolved_deleted_attachment_does_not_hide_unrelated_owner_state(copies, configured, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_lanes_sources import presentation
++    live, fleet = copies
++    card(live, 'c', 'running', 2)
++    card(fleet, 'c', 'ready', 1)
++    live.execute('ALTER TABLE task_attachments ADD COLUMN uid TEXT')
++    live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                 ('deleted-uid', 'task_attachments', 'delete', 'pending', '{}'))
++    monkeypatch.setattr(sync, 'board_mode', lambda db: 'primary')
++    assert presentation(live, fleet).rows[0]['status'] == 'running'
++
++
++def test_absent_parent_does_not_trust_stale_mirror(copies, configured, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'child', 'todo')
++    live.execute('CREATE TABLE kanban_sync_remote_parents(parent_id TEXT,status TEXT,refreshed_at INTEGER)')
++    live.execute("INSERT INTO task_links(parent_id,child_id) VALUES('absent','child')")
++    live.execute("INSERT INTO kanban_sync_remote_parents VALUES('absent','done',100)")
++    monkeypatch.setattr(sync, 'has_remote_parents', lambda db: db is live)
++    assert Sources(live, fleet).parents('child') == [('absent', 'missing')]
++
++
++def test_local_card_daily_limit_uses_canonical_usage(copies, configured):
++    from hermes_cli import kanban_lanes_flow as flow, kanban_lanes as lanes
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'held', 'triage', 2)
++    live.execute("UPDATE tasks SET block_kind='lane_gate' WHERE id='held'")
++    live.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('held','lane_gated',?,100)",
++                 (json.dumps({'reason': 'limit:cards_per_day'}),))
++    card(fleet, 'foreign', 'running')
++    fleet.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('foreign','lane_admitted',?,100)",
++                  (json.dumps({'lane': 'myapp'}),))
++    pol = lanes.parse({'lane_default': 'myapp', 'lanes': {'myapp': {'cards_per_day': 1}}})
++    sources = Sources(live, fleet)
++    result = flow._card_from_row(fleet, sources.row('held'), 200, pol=pol, evidence=sources)
++    assert result['gate_reason'] == 'limit:cards_per_day'
++
++
++def test_cli_and_flow_share_one_view_without_reopening(copies, configured, monkeypatch):
++    from hermes_cli import kanban_lanes_cli as cli, kanban_lanes_flow as flow
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'c', 'running', 2)
++    card(fleet, 'c', 'ready', 1)
++    evidence = Sources(live, fleet)
++    monkeypatch.setattr(cli, '_fleet', lambda *a, **k: pytest.fail('borrowed view reopened replica'))
++    class EmptyReader:
++        def prefetch(self, urls):
++            pass
++        def get(self, url):
++            return {}
++    strip = cli.snapshot(live, hours=6, evidence=evidence)
++    panel = flow.snapshot(fleet, window='6h', evidence=evidence, reader=EmptyReader())
++    assert strip['lanes']['myapp']['running'] == 1
++    assert strip['lanes']['myapp']['open'] == len(panel['cards']) == 1
++    assert panel['cards'][0]['step'] == 'running'
++
++
++def test_read_view_releases_only_its_transactions_and_replica(copies, configured, monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_lanes_cli as cli
++    from hermes_cli.kanban_lanes_sources import read_view
++    live, fleet = copies
++    card(live, 'local', 'ready')
++    monkeypatch.setattr(cli, '_fleet', lambda *a, **k: fleet)
++    with read_view(live) as evidence:
++        assert evidence.conn is fleet
++        assert live.in_transaction and fleet.in_transaction
++    assert not live.in_transaction
++    with pytest.raises(sqlite3.ProgrammingError):
++        fleet.execute('SELECT 1')
++    monkeypatch.setattr(cli, '_fleet', lambda *a, **k: None)
++    live.execute('BEGIN')
++    card(live, 'caller-uncommitted', 'ready')
++    with read_view(live) as evidence:
++        assert len(evidence.rows) == 2
++    assert live.in_transaction
++    live.rollback()
++    assert live.execute("SELECT 1 FROM tasks WHERE id='caller-uncommitted'").fetchone() is None
++
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index b13714d059..ef1573d646 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1668,7 +1668,7 @@ Flow dependency waits include `blockers: [{id, pr}]` for all unsatisfied direct
+ 
+ Flow uses the latest scheduled event's `awaiting` record, current review/rework events, and bounded read-only GitHub PR observations (a 30-second wall-clock budget per report, concurrent reads cached per unique PR). Flow observes native non-author GitHub approvals or commit-bound COMMENT reviews starting with `VERDICT: APPROVE` (optionally bold, case-insensitive), the fleet's shared-login review format. The latest explicit verdict supersedes older verdicts from that login; bots, old-head approvals and ordinary prose do not approve. This display signal is not ship authorization: independent reviewer-session custody is still verified by ship. The COMMENT verdict must start the first nonempty line; other approval-like prose is deliberately not interpreted. Known failing required checks, like pending checks, report `ci`. Missing checks or exhausted lookup budget never establish green; absent evidence stays `landing_unclassified`. A merged PR stays in deploy until there is explicit live readback. Deployment systems can persist `metadata.flow_pr: {url: <PR URL>, merged: true, deployed: true, verified: false}` on a task event to report live verification (`test`); this is observation only, not authority to merge or declare success. All three flags are strict booleans and the URL must match the card's PR. The command does not infer installation from merge time.
+ 
+-`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `lanes flow --json [--window 1h|6h|24h|7d]` lists every open card with step, reason and source plus per-lane done/run-hours/cost and today's cap usage. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--cards-per-day N] [--usd-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a person's `admit` does not spend the daily budget (an agent's does); `promote` and `unblock` also release a held card and are not budgeted; `explain <id>` says which lane a card is in and why it waits. Unset `cards_per_day` / `usd_per_day` means unlimited. Over the cap, new cards wait at the gate with reason `limit:cards_per_day` or `limit:usd_per_day`; both reset at local midnight.
++`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it uses canonical fleet accounting unless `--local`. In primary mode, open-card presentation selects one whole row/history/edge source per card: an unanswered local task/history/link edit keeps the local copy, otherwise a strictly newer fleet revision wins and ties keep local. Tombstones on either side suppress the deleted card. Strip and flow use this same selected set without merging source-local event/run IDs; run-hours, cost, throughput and daily budget totals remain canonical (not summed across copies). Shadow/off modes keep the prior replica presentation. `lanes flow --json [--window 1h|6h|24h|7d]` lists every open card with step, reason and source plus per-lane done/run-hours/cost and today's cap usage. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--cards-per-day N] [--usd-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a person's `admit` does not spend the daily budget (an agent's does); `promote` and `unblock` also release a held card and are not budgeted; `explain <id>` says which lane a card is in and why it waits. Unset `cards_per_day` / `usd_per_day` means unlimited. Over the cap, new cards wait at the gate with reason `limit:cards_per_day` or `limit:usd_per_day`; both reset at local midnight.
+ 
+ `hermes kanban lanes apply <file|->` applies a planner's JSON action list. Each action is validated on its own and refused with a reason when it breaks a limit: `admit` (at most `admit_per_day` per local day, never a `never_admit` title), `merge` (a held card into an open card of the same lane; it stays held), `reprioritize` (0 to 1000, never a pinned card), `relane` (only a card placed by inheritance or by default, never into or out of a gated lane) and `note`. Every action except `note` needs a one-line `reason`; one plan applies at most 50 actions.
+ 
+-- 
+2.43.0
+

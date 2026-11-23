@@ -1,0 +1,240 @@
+From 2dbb6de374646d273d4312d9800de82ff0377f85 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:20:26 +0000
+Subject: [PATCH] fix(resume): retry ordinary interrupted turns throughout
+ backend lifetime [daveey]
+
+The boot sweep can see a still-live writer, or finish before a later turn is
+interrupted. The lifetime observer only considered update-pause/job reasons,
+so ordinary interruption markers were never adopted after those races.
+
+Observe every eligible marker and enter the same session.resume admission
+path, retaining freshness, attempt-cap, opt-out, writer, code-skew and deletion
+guards. Rename the private helpers and migrate their test consumers.
+
+Proof: new ordinary-marker regression fails on baseline (no resume call), then
+passes with this fix. Focused startup/restart/observer/queue suites: 153 passed.
+Remaining startup-resume consumers: 266 passed. Full scripts/check: 21 checks ok.
+Reference implementation: fedbf7d1234616636651b035e532bea88ba1117e (not published).
+---
+ tests/tui_gateway/test_startup_resume.py      | 34 +++++++++++++++++++
+ .../test_startup_resume_late_pause.py         |  4 +--
+ .../test_startup_resume_observer_guards.py    | 12 +++----
+ .../test_update_hold_submit_queue.py          |  2 +-
+ .../tui_gateway/test_update_queue_recovery.py |  4 +--
+ tui_gateway/startup_resume.py                 | 22 ++++++------
+ 6 files changed, 56 insertions(+), 22 deletions(-)
+
+diff --git a/tests/tui_gateway/test_startup_resume.py b/tests/tui_gateway/test_startup_resume.py
+index 234dc36dd6..35b7987950 100644
+--- a/tests/tui_gateway/test_startup_resume.py
++++ b/tests/tui_gateway/test_startup_resume.py
+@@ -76,6 +76,40 @@ def test_one_failure_does_not_stop_the_sweep(tmp_path):
+     assert [r["ok"] for r in out] == [False, False]
+ 
+ 
++def test_lifetime_observer_retries_an_ordinary_interrupted_marker(tmp_path, monkeypatch):
++    import threading
++    from types import SimpleNamespace
++
++    from gateway import code_skew
++    from hermes_cli import config
++
++    stop = threading.Event()
++    calls = []
++    waits = []
++    _write(tmp_path, {"ordinary": _entry(pid=os.getpid())})
++    assert sr.pending_resumes(tmp_path, CFG) == [], "boot scan must leave the live writer alone"
++
++    def sleep(seconds):
++        waits.append(seconds)
++        if len(waits) == 1:
++            _write(tmp_path, {"ordinary": _entry()})
++        else:
++            stop.set()
++
++    def resume(rid, params):
++        calls.append(params)
++        sr.clear_turn_marker(tmp_path, params["session_id"])
++        return {"result": {"auto_continue": {"attempt": 1}}}
++
++    monkeypatch.setattr(sr, "time", SimpleNamespace(sleep=sleep, time=time.time))
++    monkeypatch.setattr(config, "load_config", lambda: CFG)
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
++    sr._observe_markers(resume, tmp_path, CFG, stop)
++    assert calls == [{"session_id": "ordinary", "omit_messages": True, "source_from_store": True}]
++    assert waits == [5.0, 30.0]
++    assert _markers(tmp_path) == set()
++
++
+ def test_start_is_noop_when_disabled(monkeypatch):
+     from hermes_cli import config
+     monkeypatch.setattr(config, "load_config", lambda: {"desktop": {"auto_continue": {"resume_on_startup": False}}})
+diff --git a/tests/tui_gateway/test_startup_resume_late_pause.py b/tests/tui_gateway/test_startup_resume_late_pause.py
+index eb4ad6fa84..fdb5e5815b 100644
+--- a/tests/tui_gateway/test_startup_resume_late_pause.py
++++ b/tests/tui_gateway/test_startup_resume_late_pause.py
+@@ -77,5 +77,5 @@ def test_boot_observer_recovers_late_pause_after_writer_exit(tmp_path, monkeypat
+ 
+     monkeypatch.setattr(memory_provider, "spawn_context_thread", spawn)
+     sr.start_startup_resume_sweep(stop=stop)
+-    assert waits[:2] == [5.0, 30.0], "idle observation must back off without terminating"
+-    assert resumed == (["chat"] if disposition == "pause" else [])
++    assert waits[:2] == [5.0, 5.0], "live writers remain eligible for observation, not adoption"
++    assert resumed == (["chat"] if disposition in {"pause", "crash"} else [])
+diff --git a/tests/tui_gateway/test_startup_resume_observer_guards.py b/tests/tui_gateway/test_startup_resume_observer_guards.py
+index 8d97ff5a35..2528030e67 100644
+--- a/tests/tui_gateway/test_startup_resume_observer_guards.py
++++ b/tests/tui_gateway/test_startup_resume_observer_guards.py
+@@ -34,16 +34,16 @@ def test_observer_refreshes_guards_and_recovers(tmp_path, monkeypatch, caplog, m
+         return True
+ 
+     def resume(*args, **kwargs):
+-        assert kwargs == {"paused_only": True}
++        assert kwargs == {}
+         calls.append(tick[0])
+         return [{"ok": False, "scheduled": False}] if mode == "refused" else []
+ 
+     monkeypatch.setattr(sr, "time", SimpleNamespace(sleep=sleep))
+     monkeypatch.setattr(config, "load_config", load)
+     monkeypatch.setattr(code_skew, "detect_code_skew", lambda: object() if mode == "skew" and tick[0] < 3 else None)
+-    monkeypatch.setattr(sr, "_paused_markers_remain", pending)
++    monkeypatch.setattr(sr, "_markers_remain", pending)
+     monkeypatch.setattr(sr, "resume_interrupted_sessions", resume)
+-    sr._observe_pauses(lambda *a: None, tmp_path, {}, stop)
++    sr._observe_markers(lambda *a: None, tmp_path, {}, stop)
+     assert calls and calls[-1] == 7
+     if mode in {"skew", "disabled"}:
+         assert min(calls) >= 3
+@@ -88,10 +88,10 @@ def test_observer_recovers_to_fast_cadence(tmp_path, monkeypatch, failure):
+     monkeypatch.setattr(sr, "time", SimpleNamespace(sleep=sleep))
+     monkeypatch.setattr(config, "load_config", dict)
+     monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
+-    monkeypatch.setattr(sr, "_paused_markers_remain", lambda *a: True)
++    monkeypatch.setattr(sr, "_markers_remain", lambda *a: True)
+     monkeypatch.setattr(sr, "resume_interrupted_sessions", resume)
+     monkeypatch.setattr(builtins, "__import__", importing)
+-    sr._observe_pauses(lambda *a: None, tmp_path, {}, stop)
++    sr._observe_markers(lambda *a: None, tmp_path, {}, stop)
+     assert waits == [5, {"import": 30, "refused": 10, "deleted": 5}[failure], 5, 5]
+     assert calls == ([2, 3] if failure == "import" else [1, 2, 3])
+ 
+@@ -114,7 +114,7 @@ def test_boot_scan_failure_still_starts_observer(tmp_path, monkeypatch):
+         raise OSError("boot marker scan failed")
+ 
+     monkeypatch.setattr(sr, "resume_interrupted_sessions", fail)
+-    monkeypatch.setattr(sr, "_observe_pauses", lambda *a: observed.append(a))
++    monkeypatch.setattr(sr, "_observe_markers", lambda *a: observed.append(a))
+     thread = sr.start_startup_resume_sweep(stop=stop)
+     assert thread is not None
+     thread.join(5)
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+index 08ce2aa4d2..95e5471769 100644
+--- a/tests/tui_gateway/test_update_hold_submit_queue.py
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -206,7 +206,7 @@ def test_startup_sweep_retries_hold_prompts_past_the_turn_freshness_window(held)
+     rows = startup_resume.pending_resumes(held.home, cfg, log_skips=False)
+     # The writer is this (live) test process, so the boot sweep holds it back until the old writer is gone,
+     # but keeps retrying: the hold-queue reason is in the update-recovery retry set and within its age bound.
+-    assert rows == [] and startup_resume._paused_markers_remain(held.home, cfg)
++    assert rows == [] and startup_resume._markers_remain(held.home, cfg)
+ 
+ 
+ def _desktop_lease_replay(db, admitted):
+diff --git a/tests/tui_gateway/test_update_queue_recovery.py b/tests/tui_gateway/test_update_queue_recovery.py
+index 319f860db3..c0026b676e 100644
+--- a/tests/tui_gateway/test_update_queue_recovery.py
++++ b/tests/tui_gateway/test_update_queue_recovery.py
+@@ -356,7 +356,7 @@ def test_observer_redrives_all_profiles_before_skew_deferral(tmp_path, monkeypat
+     stopped = threading.Event()
+     homes = [(None, tmp_path), ("named", tmp_path / "profiles" / "named")]
+     monkeypatch.setattr(startup_resume, "_homes", lambda home: homes)
+-    monkeypatch.setattr(startup_resume, "_paused_markers_remain", lambda *a: True)
++    monkeypatch.setattr(startup_resume, "_markers_remain", lambda *a: True)
+     monkeypatch.setattr(startup_resume.time, "sleep", lambda *a: None)
+     monkeypatch.setattr(config, "load_config", dict)
+     calls = []
+@@ -368,7 +368,7 @@ def test_observer_redrives_all_profiles_before_skew_deferral(tmp_path, monkeypat
+ 
+     monkeypatch.setattr(code_skew, "detect_code_skew", skew)
+     monkeypatch.setattr(startup_resume, "resume_interrupted_sessions", lambda *a, **k: pytest.fail("skewed backend replayed"))
+-    startup_resume._observe_pauses(None, tmp_path, {}, stopped)
++    startup_resume._observe_markers(None, tmp_path, {}, stopped)
+     assert calls == [home for _, home in homes]
+ 
+ 
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index f05503829b..ddd2065d64 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -9,9 +9,9 @@ sessions run detached until a client attaches; opening one later reuses the live
+ 
+ All the existing auto-continue guards still apply inside ``session.resume`` (freshness window, ``max_attempts``
+ crash-loop breaker, live-writer ownership, hosted-room exclusion); this module only pre-filters to avoid resuming
+-sessions that would not continue anyway. After boot a passive observer keeps checking update-paused turns:
+-blue/green predecessors can publish a new pause long after the initial marker scan becomes empty. Ordinary
+-crash markers remain boot-only; recovery still enters the normal session.resume admission path.
++sessions that would not continue anyway. After boot a passive observer keeps checking interrupted turns:
++writers can exit or publish new markers long after the initial marker scan becomes empty. Recovery still
++enters the normal session.resume admission path.
+ """
+ 
+ from __future__ import annotations
+@@ -165,23 +165,23 @@ def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path,
+     return results
+ 
+ 
+-def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
++def _markers_remain(home: Path, cfg: dict | None) -> bool:
+     # Include live writers: they can still be retiring during the first boot sweep.
+     _, fresh, max_attempts, _ = _settings(cfg)
+     now = time.time()
+-    return any(entry.get("reason") in _RETRY_REASONS and entry.get("auto_continue", True)
++    return any(entry.get("auto_continue", True)
+                and now - freshness_since(entry) <= _max_age(entry, fresh)
+                and int(entry.get("attempts") or 0) < max_attempts
+                for _, h in _homes(home) for key in _load(_marker_path(h))
+                if (entry := read_turn_marker(h, key)) is not None)
+ 
+ 
+-def _observe_pauses(handler: Callable, home: Path, cfg: dict, stopped: threading.Event) -> None:
++def _observe_markers(handler: Callable, home: Path, cfg: dict, stopped: threading.Event) -> None:
+     """Passive lifetime observer; refusals back off, but never retire the observer."""
+     retry_delay = 5.0
+     while not stopped.is_set():
+         try:
+-            wait = retry_delay if _paused_markers_remain(home, cfg) else 30.0
++            wait = retry_delay if _markers_remain(home, cfg) else 30.0
+         except Exception:
+             logger.exception("startup resume observer iteration failed")
+             wait = 30.0
+@@ -201,10 +201,10 @@ def _observe_pauses(handler: Callable, home: Path, cfg: dict, stopped: threading
+             if not _settings(cfg)[0] or detect_code_skew() is not None:
+                 retry_delay = 30.0
+                 continue
+-            done = resume_interrupted_sessions(handler, home, cfg, paused_only=True)
++            done = resume_interrupted_sessions(handler, home, cfg)
+             if any(not row.get("scheduled") and not row.get("deleted") for row in done):
+                 retry_delay = min(300.0, retry_delay * 2)
+-                logger.warning("startup resume: paused turns remain unscheduled; retry in %.0fs", retry_delay)
++                logger.warning("startup resume: interrupted turns remain unscheduled; retry in %.0fs", retry_delay)
+             else:
+                 retry_delay = 5.0
+         except Exception:
+@@ -245,11 +245,11 @@ def start_startup_resume_sweep(*, stop: threading.Event | None = None) -> thread
+                 logger.info("startup resume: %d interrupted session(s) processed", len(done))
+             # A warm successor may boot before the old writer continues and pauses again.
+             # An empty scan (or a fixed boot deadline) is not a completed handoff.
+-            # Keep observing PAUSES only; ordinary crash recovery remains boot-only.
++            # Keep observing every eligible marker, including ordinary interrupted turns.
+         except Exception:
+             logger.exception("startup resume sweep failed")
+         if handler is not None:
+-            _observe_pauses(handler, home, cfg, stop or threading.Event())
++            _observe_markers(handler, home, cfg, stop or threading.Event())
+ 
+     from agent.memory_provider import spawn_context_thread
+     t = spawn_context_thread(_run, name="startup-resume-sweep", passive=True)
+-- 
+2.43.0
+

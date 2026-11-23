@@ -1,0 +1,635 @@
+From 4a24be5d85d6ce8e2efefcdc0bdfe326bf09c38a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:44:44 +0000
+Subject: [PATCH] [daveey] attribute links checks by board reason and strict
+ source work
+
+Why: the retained 1.806% sync.links window cannot distinguish strict source publications from background builds or identify which board inputs invalidated the skip. Add bounded passive reason/component counters, per-board inclusive CPU, separate fingerprint/projection/ledger slicing CPU, and start/end in-flight brackets. No cache policy, TTL, schema or configuration change.
+
+Proof: new counter assertions RED on base (12 failed, 1 passed); focused GREEN 78 tests in five files; full scripts/check passes after staging all seven files. Real SQLite same-profile membership insertion, required-read failure/age retry, one-read pass reuse and concurrent strict/background ownership covered. Broad consumer smoke and exact-head CI are separate receipts. Live performance is not accepted by these tests; the historical 1.806% miss remains failed pending one natural-deployment window.
+---
+ docs/kanban-links-diagnostics.md              |  62 +++++
+ hermes_cli/kanban_links_chat_key.py           |   1 +
+ hermes_cli/kanban_links_diagnostics.py        | 101 ++++++++
+ hermes_cli/kanban_session_activity.py         |  42 ++--
+ hermes_cli/kanban_sync_client.py              |  16 +-
+ .../test_kanban_links_reason_counters.py      | 219 ++++++++++++++++++
+ .../test_kanban_links_reason_integration.py   |  51 ++++
+ 7 files changed, 468 insertions(+), 24 deletions(-)
+ create mode 100644 docs/kanban-links-diagnostics.md
+ create mode 100644 hermes_cli/kanban_links_diagnostics.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_reason_counters.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_reason_integration.py
+
+diff --git a/docs/kanban-links-diagnostics.md b/docs/kanban-links-diagnostics.md
+new file mode 100644
+index 0000000000..d164a18ab9
+--- /dev/null
++++ b/docs/kanban-links-diagnostics.md
+@@ -0,0 +1,62 @@
++# Link reconciliation diagnostic counters
++
++These counters do not change cache policy, TTL, skip admission, projection order,
++or failure/retry behavior. They are exported by existing loop-accounting snapshots.
++
++## Reading the counters
++
++- `sync.links.board.<slug>.work`: inclusive CPU/wall per board, including borrow,
++  input collection, replay, and reconciliation. The existing `sync.links.board`
++  remains its aggregate, **not an additional cost**.
++- `sync.links.board.<slug>.reason.{skip,missing,changed,degraded,chat-replay,age}`:
++  one zero-CPU decision event for an unchanged-enabled board check. `degraded`
++  means unknown required inputs or failed replay; `chat-replay` means changed
++  answers. `age` applies only to the existing uncertified/legacy max-age fallback.
++- `sync.links.board.<slug>.changed.{identity,revision,replica,ledger,mode,signature}`:
++  overlapping component changes, compared from the already collected input tuple.
++  No extra store probes. A changed replica stat does not itself prove business DML.
++- `.certificate.degraded`: a completed reconciliation whose chat reads could not
++  be certified. This is an **outcome**, not a second decision. Existing age retry
++  remains in effect. Missing whole input keys still publish no completed memo.
++- `links_strict.hit`, `links_strict.miss.{missing,inputs,age,age_inputs}`:
++  the final strict lookup decision, including the locked double-check. These are
++  distinct from background refresh checks. A hit after another thread publishes
++  does not count as a strict publication.
++- `links_strict.publish` and `links_refresh.publish`: count the actual copy-on-
++  publish assignment, not just a build attempt. Failed projection publishes none.
++- `links_{strict,refresh,display,other}.projection`: CPU of the actual projection;
++  `links_{strict,refresh}.fingerprint`: CPU of fingerprint collection.
++  `sync.links.ledger_slices`: CPU of slicing the returned cards, separately from
++  strict fingerprint/projection and the existing inclusive `sync.links.sources`.
++  `links_strict` includes strict callers other than sync; it is not automatically
++  a subset of `sync.links.sources` across a whole process. Background costs are on
++  their worker thread and must not be charged as sync-thread CPU.
++- Existing `links_refresh.{skip,cold,inputs,age,age_inputs,build,changed.*}` retain
++  their definitions and distinguish wrapper checks from builds.
++- `links_display.stale`: the warm stale path still avoids fingerprints/locks.
++
++At most 16 board slugs of at most 80 characters retain names per process; other
++boards fold into `other`, without evicting earlier identities. Event reason and
++component suffixes are fixed enums. The existing global accounting cap also applies.
++
++## Observation bracket
++
++`{sync.links,links_strict,links_display,links_refresh}.{enter,exit}` are zero-CPU
++start/end events, including exception exits. Their cumulative difference is the
++number in flight. An endpoint with unequal counters can straddle an unfinished
++pass whose CPU will only publish at its exit; report that contamination rather
++than selecting a later passing interval. Background enter occurs after lock and
++scope validation, so queued work additionally requires the worker's existing busy
++state if relevant. These counters are not agent-activity measurements.
++
++Before selecting the first newly published accounting snapshot, start read-only
++polling of the gateway runtime status and record its activity throughout. Preserve
++all raw snapshots and activity polls. Require one complete >=900-second window,
++>=3000-second gateway uptime at its start, and stable PID, OS birth, loaded SHA.
++Retain interruptions, non-idle observations and in-flight endpoint uncertainty;
++do not slide the interval until it passes. Use thread-CPU deltas from `sync.links`
++for percent of one core (`100 * cpu_delta / wall_delta`), not process CPU or the
++sum of nested spans. An active window remains useful attribution but is not idle
++budget acceptance. Name the dominant measured component and estimate any proposed
++saving from its whole-window contribution; conditional per-miss means alone are
++not a full-window saving. No fix is implied by these diagnostics.
+diff --git a/hermes_cli/kanban_links_chat_key.py b/hermes_cli/kanban_links_chat_key.py
+index 83d1908c67..8310e93f3c 100644
+--- a/hermes_cli/kanban_links_chat_key.py
++++ b/hermes_cli/kanban_links_chat_key.py
+@@ -81,6 +81,7 @@ class ChatReads:
+                 _replay(self, recorded)
+             return not self.degraded and self.used == recorded
+         except (OSError, sqlite3.Error, KeyError):  # KeyError: a read kind this code cannot replay
++            self.degraded = True  # diagnostic reason; the False/retry policy is unchanged
+             return False
+         finally:
+             self.used = None
+diff --git a/hermes_cli/kanban_links_diagnostics.py b/hermes_cli/kanban_links_diagnostics.py
+new file mode 100644
+index 0000000000..f72c486b76
+--- /dev/null
++++ b/hermes_cli/kanban_links_diagnostics.py
+@@ -0,0 +1,101 @@
++"""Diagnostic-only links attribution. No IO, extra freshness probes or cache policy.
++
++Reason counters are zero-CPU events, not additive timing spans. Board work and
++source fingerprint/projection spans are inclusive subsets of their callers.
++Enter minus exit is in-flight work; a bracket is quiet only with equal counters
++at BOTH endpoints and no enters between them. Names retain at most 16 board
++slugs (then ``other``), independent of the process-wide accounting name bound.
++"""
++from contextlib import contextmanager
++from contextvars import ContextVar
++import threading
++
++
++from hermes_cli import loop_accounting as la
++
++_lane = ContextVar("links_diagnostic_lane", default="links_other")
++_boards: dict[str, str] = {}
++_lock = threading.Lock()
++_COMPONENTS = ("identity", "revision", "replica", "ledger", "mode", "signature")
++
++
++def event(name: str) -> None:
++    la.record(name, outer=False)
++
++
++def board_name(slug: str) -> str:
++    if len(slug) > 80:
++        return "sync.links.board.other"
++    with _lock:
++        name = _boards.get(slug)
++        if name is None:
++            if len(_boards) >= 16:
++                return "sync.links.board.other"
++            # Slugs are existing board identifiers, not paths or card/session IDs.
++            name = "sync.links.board." + slug
++            _boards[slug] = name
++        return name
++
++
++def board_reason(slug: str, reason: str, old=None, new=None) -> None:
++    prefix = board_name(slug)
++    event(prefix + ".reason." + reason)
++    if old is not None and new is not None:
++        for component, before, after in zip(_COMPONENTS, old, new):
++            if before != after:
++                event(prefix + ".changed." + component)
++
++
++@contextmanager
++def source(lane: str):
++    token = _lane.set(lane)
++    event(lane + ".enter")
++    try:
++        yield
++    finally:
++        event(lane + ".exit")
++        _lane.reset(token)
++
++
++def timed(part: str, fn, *args):
++    return la.timed(_lane.get() + "." + part, fn, *args)
++
++
++def source_decision(hit, fingerprint, fresh: bool, now: float) -> None:
++    lane = _lane.get()
++    if fresh:
++        event(lane + ".hit")
++        return
++    reason = "missing" if hit is None else (
++        "age_inputs" if now >= hit[0] and hit[2] != fingerprint else
++        "age" if now >= hit[0] else "inputs")
++    event(lane + ".miss." + reason)
++
++
++def published() -> None:
++    event(_lane.get() + ".publish")
++
++
++def board_decision(done, inputs, started, max_age, reads) -> str:
++    """Original short-circuit admission, with its reason exposed; never replay twice."""
++    if inputs is None:
++        return "degraded"
++    if done is None:
++        return "missing"
++    if done[0] != inputs:
++        return "changed"
++    if done[2] is None:
++        return "age" if started - done[1] >= max_age else "skip"
++    if not reads.unchanged(done[2]):
++        return "degraded" if reads.degraded else "chat-replay"
++    return "skip"
++
++
++def refresh(scope, cache, fingerprint_fn, fresh_fn, publish_fn, clock) -> None:
++    """Instrument the existing background decision under its caller-owned lock."""
++    from hermes_cli.kanban_links_refresh import refresh_decided
++    with source("links_refresh"):
++        fingerprint = timed("fingerprint", fingerprint_fn)
++        hit = cache.get(scope)
++        fresh = hit is not None and fresh_fn(hit, fingerprint)
++        refresh_decided(hit, fingerprint, fresh, clock(), lambda: publish_fn(scope, fingerprint))
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index df81cd78ce..c5bd075f30 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -46,7 +46,8 @@ from hermes_cli.kanban_session_activity_attention import AttentionCache as _Atte
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+-from hermes_cli.kanban_links_refresh import ScopeRefresher, refresh_decided
++from hermes_cli.kanban_links_refresh import ScopeRefresher
++from hermes_cli import kanban_links_diagnostics as diag
+ from hermes_cli import kanban_links_narrow as _links_narrow, kanban_external_activity as _external_activity
+ from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
+ from hermes_cli.kanban_open_asks import card_is_open_human_ask, stamp_needs_you
+@@ -932,22 +933,27 @@ def _links_entry(stale_ok: bool, *, with_rows: bool = False):
+ 
+ 
+ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
+-    hit = _links_cache.get(scope)
+-    # Even revision/fingerprint reads can wait on Python locks. A matching warm
+-    # stale read must precede ALL of that work; an evicted/cold scope still waits.
+-    if stale_ok and hit is not None:
+-        _refresh_links_in_background(scope)
+-        return hit
+-    fingerprint = _links_fingerprint()
+-    if hit is not None and _links_fresh(hit, fingerprint):
+-        return hit
+-    with _links_lock:
++    with diag.source("links_display" if stale_ok else "links_strict"):
+         hit = _links_cache.get(scope)
+-        if hit is not None and _links_fresh(hit, fingerprint):
+-            return hit
++        # A warm display read still precedes ALL fingerprint and lock work.
+         if stale_ok and hit is not None:
++            diag.event("links_display.stale")
++            _refresh_links_in_background(scope)
++            return hit
++        fingerprint = diag.timed("fingerprint", _links_fingerprint)
++        if hit is not None and _links_fresh(hit, fingerprint):
++            diag.source_decision(hit, fingerprint, True, time.monotonic())
+             return hit
+-        return _publish_links(scope, fingerprint)
++        with _links_lock:
++            hit = _links_cache.get(scope)
++            if hit is not None and _links_fresh(hit, fingerprint):
++                diag.source_decision(hit, fingerprint, True, time.monotonic())
++                return hit
++            if stale_ok and hit is not None:
++                diag.event("links_display.stale")
++                return hit
++            diag.source_decision(hit, fingerprint, False, time.monotonic())
++            return _publish_links(scope, fingerprint)
+ 
+ 
+ def _links_fresh(hit: tuple, fingerprint: tuple) -> bool:
+@@ -966,7 +972,7 @@ def _store_links(scope: tuple, fingerprint: tuple) -> tuple:
+     global _links_cache
+     _origin_rows_sink.rows = []
+     try:
+-        cards = _project_remote_links()
++        cards = diag.timed("projection", _project_remote_links)
+         rows = _origin_rows_sink.rows
+     finally:
+         _origin_rows_sink.rows = None
+@@ -978,6 +984,7 @@ def _store_links(scope: tuple, fingerprint: tuple) -> tuple:
+     while len(updated) > _LINKS_SCOPE_CAP:
+         del updated[next(iter(updated))]
+     _links_cache = updated
++    diag.published()
+     return entry
+ 
+ 
+@@ -991,10 +998,7 @@ def _refresh_links_scope(scope: tuple) -> None:
+         # changed meanwhile: never publish another origin's projection under this key.
+         if _origin_scope() != scope:
+             return
+-        fingerprint = _links_fingerprint()
+-        hit = _links_cache.get(scope)
+-        fresh = hit is not None and _links_fresh(hit, fingerprint)
+-        refresh_decided(hit, fingerprint, fresh, time.monotonic(), lambda: _publish_links(scope, fingerprint))
++        diag.refresh(scope, _links_cache, _links_fingerprint, _links_fresh, _publish_links, time.monotonic)
+ 
+ 
+ _links_refresher = ScopeRefresher(lambda scope: _refresh_links_scope(scope), _LINKS_SCOPE_CAP)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index c14ec3fe75..47bb045053 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1280,10 +1280,12 @@ def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float,
+     reconcile succeeded (unreadable inputs or a raising reconcile leave it dropped). A skip ``LINKS_SLOW_LOG_S`` or
+     more after ``began`` names its board; ``began`` is taken before the board's connection is
+     borrowed, so that time counts the connect (a lock wait included), ``board_mode`` and the inputs read."""
++    from hermes_cli import kanban_links_diagnostics as diag
+     done = _LINKS_DONE.pop(key, None)
+     started = _links_clock()
+-    if inputs is None or done is None or done[0] != inputs or (
+-            started - done[1] >= LINKS_MAX_AGE_S if done[2] is None else not reads.unchanged(done[2])):
++    reason = diag.board_decision(done, inputs, started, LINKS_MAX_AGE_S, reads)
++    diag.board_reason(slug, reason, done[0] if done is not None else None, inputs)
++    if reason != "skip":
+         return False, started
+     _LINKS_DONE[key] = done
+     took = _links_pass_clock() - began
+@@ -1340,14 +1342,16 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+     nothing, so the next one retries. Explicit callers (``hermes kanban sync links``) always reconcile. Boards are
+     borrowed through the loop's connection scope (``kanban_sync_connections``). [daveey]"""
+     from hermes_cli import kanban_chat_links, kanban_links_chat_key as chat_key
++    from hermes_cli import kanban_links_diagnostics as diag
+     from hermes_cli.kanban_placement import config_snapshot
+     pass_began = _links_pass_clock()
+-    with config_snapshot() as placement, chat_key.pass_reads() as reads:
++    with diag.source("sync.links"), config_snapshot() as placement, chat_key.pass_reads() as reads:
+         ledger: Optional[dict[str, frozenset]] = None
+         try:
+             from hermes_cli.kanban_session_activity import _remote_links
+             with la.pass_("sync.links.sources"):
+-                ledger = ledger_slices(_remote_links(), gateway)
++                cards = _remote_links()
++                ledger = la.timed("sync.links.ledger_slices", ledger_slices, cards, gateway)
+             local = {slug for slug, _path in boards}
+             if not skip_unchanged or set(ledger) - local:
+                 created = la.timed("sync.links.ensure_boards", ensure_link_boards, set(ledger), gateway)
+@@ -1362,7 +1366,7 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+             counts: dict = {}
+             began = _links_pass_clock()
+             try:
+-                with la.pass_("sync.links.board") as accounting, connection(path, lambda: _connect(path)) as conn:
++                with la.pass_("sync.links.board") as accounting, la.pass_(diag.board_name(slug) + ".work"), connection(path, lambda: _connect(path)) as conn:
+                     mode = sync.board_mode(conn)
+                     if mode == "off":
+                         continue
+@@ -1377,6 +1381,8 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                         counts = kanban_chat_links.reconcile(conn, slug, gateway)
+                     if inputs is not None:
+                         _LINKS_DONE[key] = (inputs, started, reads.key())
++                        if reads.key() is None:
++                            diag.event(diag.board_name(slug) + ".certificate.degraded")
+                 took = _links_pass_clock() - began
+                 if any(counts.values()) or took >= LINKS_SLOW_LOG_S:
+                     _log.info("kanban sync: %s chat links %s in %.1fs", slug, counts, took)
+diff --git a/tests/hermes_cli/test_kanban_links_reason_counters.py b/tests/hermes_cli/test_kanban_links_reason_counters.py
+new file mode 100644
+index 0000000000..6dc1d90ba2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_reason_counters.py
+@@ -0,0 +1,219 @@
++"""Diagnostic attribution must not change link-cache admission or read custody."""
++from types import SimpleNamespace
++import threading
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli import kanban_links_chat_key as chat
++from hermes_cli import loop_accounting as la
++from tests.hermes_cli import test_kanban_links_refresh_accounting as refresh
++
++harness = refresh.harness
++
++
++def runs():
++    return refresh.runs()
++
++
++def delta(before, name):
++    return refresh.delta(before, name)
++
++
++def test_strict_unchanged_skip_without_publish(harness):
++    state, scope = harness
++    activity._links_lookup(scope, False)
++    before = runs()
++    activity._links_lookup(scope, False)
++    assert state["builds"] == 1
++    assert delta(before, "links_strict.hit") == 1
++    assert delta(before, "links_strict.publish") == 0
++    assert delta(before, "links_strict.fingerprint") == 1
++
++
++def test_strict_same_profile_inventory_insertion_publishes(harness):
++    state, scope = harness
++    activity._links_lookup(scope, False)
++    before = runs()
++    state["fingerprint"] += (("/same-profile-new-board.db", (1,)),)
++    activity._links_lookup(scope, False)
++    assert state["builds"] == 2
++    assert delta(before, "links_strict.miss.inputs") == 1
++    assert delta(before, "links_strict.publish") == 1
++    assert delta(before, "links_strict.projection") == 1
++
++
++def test_strict_expiry_is_age(harness):
++    state, scope = harness
++    activity._links_lookup(scope, False)
++    state["now"] += activity._LINKS_MAX_AGE_S
++    before = runs()
++    activity._links_lookup(scope, False)
++    assert delta(before, "links_strict.miss.age") == 1
++    assert delta(before, "links_strict.publish") == 1
++
++
++def test_failed_strict_projection_retries_without_publish(harness):
++    state, scope = harness
++    state["fail"] = True
++    before = runs()
++    with pytest.raises(ValueError):
++        activity._links_lookup(scope, False)
++    assert scope not in activity._links_cache
++    assert delta(before, "links_strict.publish") == 0
++    assert delta(before, "links_strict.projection") == 1
++    assert delta(before, "links_strict.enter") == delta(before, "links_strict.exit") == 1
++    state["fail"] = False
++    activity._links_lookup(scope, False)
++    assert delta(before, "links_strict.publish") == 1
++
++
++@pytest.mark.parametrize("case,reason,component", [
++    ("missing", "missing", None), ("inputs", "degraded", None),
++    ("changed", "changed", "ledger"), ("age", "age", None),
++    ("chat", "chat-replay", None), ("degraded", "degraded", None),
++    ("skip", "skip", None),
++])
++def test_board_reason_from_original_decision(monkeypatch, case, reason, component):
++    inputs = ((1, 2), (3,), ("absent",), frozenset(), "on", ("config",))
++    done = (inputs, 10.0, {} if case not in ("age",) else None)
++    monkeypatch.setattr(sync, "_LINKS_DONE", {} if case == "missing" else {"key": done})
++    monkeypatch.setattr(sync, "_links_clock", lambda: 10.0 + sync.LINKS_MAX_AGE_S)
++    if case == "changed":
++        inputs = (*inputs[:3], frozenset({"new"}), *inputs[4:])
++    if case == "inputs":
++        inputs = None
++    reads = SimpleNamespace(unchanged=lambda key: case not in ("chat", "degraded"),
++                            degraded=case == "degraded")
++    before = runs()
++    skipped, _ = sync._links_unchanged("key", inputs, "reason-test", 0, reads)
++    assert skipped == (case == "skip")
++    prefix = "sync.links.board.reason-test."
++    assert delta(before, prefix + "reason." + reason) == 1
++    if component:
++        assert delta(before, prefix + "changed." + component) == 1
++    assert ("key" in sync._LINKS_DONE) == skipped
++
++
++def test_concurrent_strict_and_background_attribution(harness, monkeypatch):
++    state, scope = harness
++    entered, release = threading.Event(), threading.Event()
++    original = activity._project_remote_links
++    errors = []
++
++    def blocked():
++        entered.set()
++        assert release.wait(5)
++        return original()
++
++    def background():
++        try:
++            activity._refresh_links_scope(scope)
++        except BaseException as exc:
++            errors.append(exc)
++
++    monkeypatch.setattr(activity, "_project_remote_links", blocked)
++    before = runs()
++    thread = threading.Thread(target=background)
++    thread.start()
++    try:
++        assert entered.wait(5)
++        assert delta(before, "links_refresh.enter") == 1
++        assert delta(before, "links_refresh.exit") == 0
++    except BaseException:
++        release.set()
++        thread.join(5)
++        raise
++    strict_entered = threading.Event()
++    fingerprint = activity._links_fingerprint
++
++    def strict_fingerprint():
++        strict_entered.set()
++        return fingerprint()
++
++    def strict():
++        try:
++            activity._links_lookup(scope, False)
++        except BaseException as exc:
++            errors.append(exc)
++
++    monkeypatch.setattr(activity, "_links_fingerprint", strict_fingerprint)
++    strict_thread = threading.Thread(target=strict)
++    strict_thread.start()
++    try:
++        assert strict_entered.wait(5)
++        assert delta(before, "links_strict.enter") == 1
++        assert delta(before, "links_strict.exit") == 0
++    finally:
++        release.set()
++    strict_thread.join(5)
++    thread.join(5)
++    assert not strict_thread.is_alive() and not thread.is_alive() and not errors
++    assert state["builds"] == 1
++    assert delta(before, "links_refresh.build") == 1
++    assert delta(before, "links_refresh.publish") == 1
++    assert delta(before, "links_strict.publish") == 0
++    assert delta(before, "links_strict.hit") == 1
++    assert delta(before, "links_refresh.enter") == delta(before, "links_refresh.exit") == 1
++
++
++def test_pass_local_reuse_keeps_one_read():
++    calls = []
++    with chat.pass_reads() as reads, reads.board():
++        assert reads.answer(("source", "path", "id"), lambda: calls.append(1) or "desktop") == "desktop"
++        assert reads.answer(("source", "path", "id"), lambda: calls.append(2)) == "desktop"
++        chat.degrade()
++    assert calls == [1] and reads.key() is None
++
++
++@pytest.mark.parametrize("index,component", enumerate(("identity", "revision", "replica", "ledger", "mode", "signature")))
++def test_each_changed_component_is_named(index, component):
++    from hermes_cli import kanban_links_diagnostics as diag
++    old = (1, 2, 3, 4, 5, 6)
++    new = list(old)
++    new[index] = "changed"
++    before = runs()
++    diag.board_reason("components", "changed", old, tuple(new))
++    assert delta(before, "sync.links.board.components.changed." + component) == 1
++    for other in diag._COMPONENTS:
++        if other != component:
++            assert delta(before, "sync.links.board.components.changed." + other) == 0
++
++
++def test_board_names_are_bounded_without_evicting_admitted_boards(monkeypatch):
++    from hermes_cli import kanban_links_diagnostics as diag
++    monkeypatch.setattr(diag, "_boards", {})
++    first = diag.board_name("first")
++    for i in range(100):
++        diag.board_name(str(i))
++    assert len(diag._boards) == 16
++    assert diag.board_name("first") == first
++    assert diag.board_name("new") == "sync.links.board.other"
++    assert diag.board_name("x" * 81) == "sync.links.board.other"
++    assert len(diag._boards) == 16
++
++
++def test_nested_source_context_is_restored_after_error():
++    from hermes_cli import kanban_links_diagnostics as diag
++    before = runs()
++    with diag.source("links_strict"):
++        with pytest.raises(ValueError), diag.source("links_refresh"):
++            raise ValueError("read failed")
++        diag.published()
++    assert delta(before, "links_strict.publish") == 1
++    assert delta(before, "links_refresh.publish") == 0
++    assert diag._lane.get() == "links_other"
++
++
++def test_replay_exception_is_degraded_not_value_change(monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_links_diagnostics as diag
++
++    def failed(*args):
++        raise sqlite3.OperationalError("required read failed")
++
++    monkeypatch.setattr(chat, "_replay", failed)
++    with chat.pass_reads() as reads:
++        assert diag.board_decision(((1,), 0, {}), (1,), 0, 300, reads) == "degraded"
++        assert reads.used is None and reads.degraded
+diff --git a/tests/hermes_cli/test_kanban_links_reason_integration.py b/tests/hermes_cli/test_kanban_links_reason_integration.py
+new file mode 100644
+index 0000000000..d6ccd0237e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_reason_integration.py
+@@ -0,0 +1,51 @@
++"""Real membership insertion and degraded-read custody with diagnostic counters."""
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli import kanban_links_diagnostics as diag
++from tests.hermes_cli import test_kanban_publication_index as membership
++from tests.hermes_cli import test_kanban_links_refresh_accounting as refresh
++from tests.hermes_cli import test_kanban_sync_links_chat_key as key_helpers
++
++harness = refresh.harness
++source = membership.source
++kanban_home = key_helpers.kanban_home
++ledger = key_helpers.ledger
++live = key_helpers.live
++scope = key_helpers.scope
++spies = key_helpers.spies
++clock = key_helpers.clock
++
++
++def test_same_profile_insertion_refreshes_real_membership_and_publishes(source, harness, monkeypatch):
++    _, origin = harness
++    monkeypatch.setattr(activity, "_links_fingerprint", lambda: tuple(source.execute(
++        "SELECT gw, key FROM replica WHERE coll='tasks'")))
++    monkeypatch.setattr(activity, "_project_remote_links", lambda: [
++        {"member": membership.reader(source).has_other(membership.owner(), {"created_at": 1})}])
++    first = activity._links_lookup(origin, False)
++    assert first[3] == [{"member": False}]
++    membership.put(source)  # p/board/new under the already discovered profile p
++    before = refresh.runs()
++    second = activity._links_lookup(origin, False)
++    assert second[3] == [{"member": True}]
++    assert refresh.delta(before, "links_strict.miss.inputs") == 1
++    assert refresh.delta(before, "links_strict.publish") == 1
++
++
++def test_required_read_error_remains_uncertified_and_retries_by_original_age(
++        live, ledger, kanban_home, spies, scope, clock):
++    key_helpers._state(kanban_home, table=False)
++    before = refresh.runs()
++    key_helpers.helpers._settled(live, ledger, kanban_home, spies)
++    name = diag.board_name("default")
++    assert refresh.delta(before, name + ".certificate.degraded") >= 1
++    assert sync._LINKS_DONE[str(kanban_home / "kanban.db")][2] is None
++    clock[0] += sync.LINKS_MAX_AGE_S
++    before = refresh.runs()
++    key_helpers.helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert refresh.delta(before, name + ".reason.age") == 1
++    assert refresh.delta(before, name + ".certificate.degraded") == 1
++    assert sync._LINKS_DONE[str(kanban_home / "kanban.db")][2] is None
++    assert refresh.delta(before, "sync.links.ledger_slices") == 1
++    assert refresh.delta(before, "sync.links.enter") == refresh.delta(before, "sync.links.exit") == 1
+-- 
+2.43.0
+

@@ -1,0 +1,584 @@
+From bf8a3cb4ba668c3d00703dbd7a6e7afffabe7bfe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:05:09 +0000
+Subject: [PATCH] [daveey] perf(kanban origin): look up only the projection's
+ own cards instead of indexing every replica task key
+
+_Publications answered "does another gateway publish this card?" for removed-owner obligations by pulling
+every task key of every listed gateway into Python and indexing it. The replica now holds 25,511 task keys,
+past the 25,000-key memo bound, so that ran on every linked-card projection; inside the busy Desktop backend
+the one-row-at-a-time read was the largest part of a ~8 s projection (43 ms standalone), to answer ~18 rows.
+
+Now project() passes the (board, task id) of its own obligations, and the first ask runs ONE query that
+SQLite filters in C (exact "/<board>/<task>" suffix of 3-part keys, no LIKE/GLOB wildcards), returning only
+those cards' rows. A card outside that set gets one exact lookup. Answers stay fixed per projection and
+payloads stay live, as before. kanban_publication_index (the full-inventory memo) is removed; its tests are
+rewritten against the same behaviors plus the one-query read.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_origin_ledger.py            |  82 +++---
+ hermes_cli/kanban_publication_index.py        |  37 ---
+ .../test_kanban_links_reason_integration.py   |   2 +-
+ .../test_kanban_origin_publications.py        | 133 ++++++++++
+ .../test_kanban_publication_index.py          | 235 ------------------
+ 5 files changed, 176 insertions(+), 313 deletions(-)
+ delete mode 100644 hermes_cli/kanban_publication_index.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_publications.py
+ delete mode 100644 tests/hermes_cli/test_kanban_publication_index.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index f5cd7a52dc..067981b833 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -478,41 +478,41 @@ def _removed_owner(elsewhere: _Publications, listed: frozenset, owner: dict, tas
+ class _Publications:
+     """Which gateways publish a card, for ``_removed_owner``. [daveey]
+ 
+-    Built at most once per projection, and only when a removed owner's row asks: for every gateway the replica
+-    lists, one read of its task keys through the ``(gw, coll, key)`` primary key, which covers the read (no row
+-    data; 13 ms for 23,000 keys on the MacBook), then one keyed read per candidate record. A per-obligation
+-    ``key GLOB`` scanned the whole table each time (review 5965756952). Discovery does not depend on a gateway's
+-    announced scopes: a replacement whose owner announces no scope for the board is still found, so a re-homed
+-    running card is never settled from its removed owner's old completion (review 5970563622).
+-
+-    Every projection still reads the complete ordered membership. Only its pure index derivation is reused for
+-    an exactly equal inventory; payloads, owner liveness and terminal evidence remain live. The bounded memo is
+-    immutable and published as one generation (``kanban_publication_index``)."""
+-
+-    def __init__(self, source: sqlite3.Connection | None, listed: frozenset):
+-        self.source = source
+-        self.listed = listed
+-        self.keys = None
++    A card's replica key is ``<profile>/<board>/<task id>`` on whichever gateway publishes it. Discovery does not
++    depend on a gateway's announced scopes: a replacement whose owner announces no scope for the board is still
++    found, so a re-homed running card is never settled from its removed owner's old completion (review 5970563622).
+ 
+-    def _index(self):
+-        if self.keys is None:
+-            from hermes_cli import kanban_publication_index as membership
++    Only the projection's own cards (``wanted``: every obligation's (board, task id)) are looked up, in ONE query
++    on the first ask that SQLite filters in C; a card outside ``wanted`` gets one exact lookup of its own. Each
++    answer is then fixed for this projection; payloads stay live (one keyed read per candidate record).
++    [daveey] Hub observation: the previous full index pulled every task key into Python (a very large board, past the
++    25,000-key memo bound, so on every projection) to answer a few removed-owner rows; inside the busy Desktop
++    backend that row loop dominated a ~8 s projection that the same read finishes in 43 ms standalone."""
+ 
+-            groups = []
+-            scanned = False
+-            try:
+-                for gw in sorted(self.listed):
+-                    keys = []
+-                    groups.append((gw, keys))
+-                    for (key,) in self.source.execute("SELECT key FROM replica WHERE gw=? AND coll='tasks'", (gw,)):
+-                        keys.append(str(key))
+-                scanned = True
+-            finally:
+-                if not scanned:
+-                    # Preserve the old partial instance after a failed read; never publish it for reuse.
+-                    self.keys = membership.build(groups)
+-            self.keys = membership.derive(groups)
+-        return self.keys
++    _SUFFIX_MATCH = ("SELECT gw, key FROM replica WHERE coll='tasks'"
++                     " AND length(key) - length(replace(key, '/', '')) = 2 AND substr(key, instr(key, '/')) ")
++
++    def __init__(self, source: sqlite3.Connection | None, listed: frozenset, wanted=None):
++        self.source = source
++        self.listed = listed
++        self.wanted = frozenset(wanted or ())
++        self.found: dict[tuple, tuple] | None = None  # (board, task id) -> ((gw, key), ...), filled on first ask
++
++    def _publishers(self, board: str, task_id: str) -> tuple:
++        """``(gw, key)`` of every listed gateway's record of this card, in (gw, key) order."""
++        pair = (board, task_id)
++        if self.found is None or pair not in self.found:
++            batch = self.wanted if self.found is None and pair in self.wanted else frozenset({pair})
++            suffixes = {f'/{b}/{t}': (b, t) for b, t in batch if '/' not in b and '/' not in t}
++            rows = self.source.execute(self._SUFFIX_MATCH + "IN (SELECT value FROM json_each(?))",
++                                       (json.dumps(sorted(suffixes)),)).fetchall() if suffixes else []
++            found = {p: [] for p in batch}
++            for gw, key in sorted((str(gw), str(key)) for gw, key in rows):
++                parts = key.split('/')
++                if gw in self.listed and (parts[1], parts[2]) in found:
++                    found[(parts[1], parts[2])].append((gw, key))
++            self.found = {**(self.found or {}), **{p: tuple(v) for p, v in found.items()}}
++        return self.found[pair]
+ 
+     def has_other(self, owner: dict, task: dict) -> bool:
+         """Another gateway's replica record of this card: same board and id, same non-null ``created_at`` (a re-home
+@@ -521,7 +521,7 @@ class _Publications:
+         if self.source is None or created is None or isinstance(created, bool) \
+                 or not isinstance(created, (int, float, str)):
+             return False
+-        for gw, key in self._index().get((owner['board'], owner['task_id']), ()):
++        for gw, key in self._publishers(owner['board'], owner['task_id']):
+             if gw == owner['gateway']:
+                 continue
+             row = self.source.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+@@ -605,19 +605,21 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+         # its info row; a machine removed from the Board has neither (``_removed_owner``). Read once per projection,
+         # inside the try so a failed read still closes the replica connection (review 5965756952).
+         listed = _listed_gateways(source if fresh else None)
+-        elsewhere = _Publications(source, listed)
+         with closing(_ro(path)) as conn:
+             from hermes_cli.kanban_origin_legacy import aliases_for_projection
++            from hermes_cli import kanban_origin_structure as structure
++
+             alias_receipts = {}
+             for receipt_raw, in conn.execute('SELECT receipt_json FROM origin_receipts'):
+                 ack = json.loads(receipt_raw)
+                 if 'legacy_alias' in ack:
+                     alias_receipts.setdefault(ack['binding_hash'], []).append(ack)
+-            for raw, resolved, payload, version, released in conn.execute(
+-                    "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations"):
+-                from hermes_cli import kanban_origin_structure as structure
+-
+-                binding = structure.binding(raw)
++            obligations = [(raw, structure.binding(raw), *rest) for raw, *rest in conn.execute(
++                "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations")]
++            elsewhere = _Publications(source, listed, wanted={
++                (b['owner']['board'], b['owner']['task_id']) for _, b, *_ in obligations
++                if (b['origin']['gateway'], b['origin']['profile']) == (gateway, profile)})
++            for raw, binding, resolved, payload, version, released in obligations:
+                 origin, owner = binding['origin'], binding['owner']
+                 if (origin['gateway'], origin['profile']) != (gateway, profile):
+                     continue
+diff --git a/hermes_cli/kanban_publication_index.py b/hermes_cli/kanban_publication_index.py
+deleted file mode 100644
+index 3d046e7d40..0000000000
+--- a/hermes_cli/kanban_publication_index.py
++++ /dev/null
+@@ -1,37 +0,0 @@
+-"""One bounded immutable membership derivation; payloads are never retained. [daveey]"""
+-from types import MappingProxyType
+-
+-# Exact ordered inventories, not clocks, connection versions or pathname guesses.
+-# A single tuple publication prevents readers from pairing different generations.
+-_MAX_KEYS = 25_000
+-_MAX_CHARS = 2_000_000
+-_memo = None
+-
+-
+-def build(groups):
+-    result = {}
+-    for gateway, keys in groups:
+-        for key in keys:
+-            parts = key.split('/')
+-            if len(parts) == 3:
+-                result.setdefault((parts[1], parts[2]), []).append((gateway, key))
+-    return MappingProxyType({key: tuple(value) for key, value in result.items()})
+-
+-
+-def derive(groups):
+-    """Reuse only an identical complete inventory; keep one generation under churn.
+-
+-    Admission limits retained state, not the caller's existing unbounded scan.
+-    Instances can retain their borrowed immutable index until that projection ends.
+-    """
+-    global _memo
+-    inventory = tuple((gateway, tuple(keys)) for gateway, keys in groups)
+-    memo = _memo
+-    typed = all(type(gateway) is str for gateway, _ in inventory)
+-    if typed and memo is not None and memo[0] == inventory:
+-        return memo[1]
+-    index = build(inventory)
+-    admitted = (typed and sum(len(keys) for _, keys in inventory) <= _MAX_KEYS
+-                and sum(len(gateway) + sum(map(len, keys)) for gateway, keys in inventory) <= _MAX_CHARS)
+-    _memo = (inventory, index) if admitted else None
+-    return index
+diff --git a/tests/hermes_cli/test_kanban_links_reason_integration.py b/tests/hermes_cli/test_kanban_links_reason_integration.py
+index d6ccd0237e..f29aadee0d 100644
+--- a/tests/hermes_cli/test_kanban_links_reason_integration.py
++++ b/tests/hermes_cli/test_kanban_links_reason_integration.py
+@@ -2,7 +2,7 @@
+ from hermes_cli import kanban_session_activity as activity
+ from hermes_cli import kanban_sync_client as sync
+ from hermes_cli import kanban_links_diagnostics as diag
+-from tests.hermes_cli import test_kanban_publication_index as membership
++from tests.hermes_cli import test_kanban_origin_publications as membership
+ from tests.hermes_cli import test_kanban_links_refresh_accounting as refresh
+ from tests.hermes_cli import test_kanban_sync_links_chat_key as key_helpers
+ 
+diff --git a/tests/hermes_cli/test_kanban_origin_publications.py b/tests/hermes_cli/test_kanban_origin_publications.py
+new file mode 100644
+index 0000000000..39f5033cff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_publications.py
+@@ -0,0 +1,133 @@
++"""Which gateways publish a card: only the projection's own cards are read, answers fixed per projection. [daveey]"""
++import json
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli.kanban_origin_ledger import _Publications
++
++
++@pytest.fixture
++def source():
++    with closing(sqlite3.connect(':memory:')) as db:
++        db.execute('CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT,PRIMARY KEY(gw,coll,key))')
++        db.execute("INSERT INTO replica VALUES('peer','tasks','p/board/existing','{}')")
++        yield db
++
++
++def reader(db, listed=frozenset({'peer'}), wanted=(('board', 'new'), ('board', 'existing'))):
++    return _Publications(db, listed, wanted)
++
++
++def owner(tid='new'):
++    return {'gateway': 'gone', 'board': 'board', 'task_id': tid}
++
++
++def put(db, key='p/board/new', created=1, gw='peer'):
++    db.execute("INSERT OR REPLACE INTO replica VALUES(?,'tasks',?,?)", (gw, key, json.dumps({'created_at': created})))
++
++
++def key_reads(db):
++    reads = []
++    db.set_trace_callback(reads.append)
++    return lambda: [sql for sql in reads if 'json_each' in sql]
++
++
++def test_wanted_cards_are_read_in_one_query_and_nothing_else_is_returned(source):
++    for i in range(50):
++        put(source, f'p/board/other{i}')
++    put(source)
++    reads = key_reads(source)
++    current = reader(source)
++    assert current.has_other(owner(), {'created_at': 1})
++    assert not current.has_other(owner('existing'), {'created_at': 1})
++    assert len(reads()) == 1  # both wanted cards from the first ask's single query
++    assert set(current.found) == {('board', 'new'), ('board', 'existing')}
++
++
++def test_card_outside_wanted_gets_its_own_exact_lookup(source):
++    put(source, 'p/board/late')
++    reads = key_reads(source)
++    current = reader(source)
++    assert current.has_other(owner('late'), {'created_at': 1})
++    assert current.has_other(owner('late'), {'created_at': 1})
++    assert len(reads()) == 1
++    assert ('board', 'new') not in current.found  # the unasked batch was not read for an outside card
++
++
++def test_answers_fixed_within_projection_but_fresh_between(source):
++    current = reader(source)
++    assert not current.has_other(owner(), {'created_at': 1})
++    put(source)
++    assert not current.has_other(owner(), {'created_at': 1})
++    assert reader(source).has_other(owner(), {'created_at': 1})
++
++
++def test_payload_changes_are_live(source):
++    put(source)
++    assert reader(source).has_other(owner(), {'created_at': 1})
++    put(source, created=2)
++    second = reader(source)
++    assert not second.has_other(owner(), {'created_at': 1})
++    assert second.has_other(owner(), {'created_at': 2})
++
++
++def test_deletion_and_reinsertion(source):
++    put(source)
++    source.execute("DELETE FROM replica WHERE key='p/board/new'")
++    assert not reader(source).has_other(owner(), {'created_at': 1})
++    put(source, created=2)
++    assert reader(source).has_other(owner(), {'created_at': 2})
++
++
++def test_listed_gateway_changes(source):
++    put(source)
++    assert reader(source).has_other(owner(), {'created_at': 1})
++    assert not reader(source, frozenset()).has_other(owner(), {'created_at': 1})
++
++
++def test_owner_gateway_own_record_does_not_count(source):
++    put(source, gw='gone')
++    assert not reader(source, frozenset({'peer', 'gone'})).has_other(owner(), {'created_at': 1})
++
++
++@pytest.mark.parametrize('created', [None, True, [], {}])
++def test_invalid_created_does_not_read(source, created):
++    source.close()
++    assert not reader(source).has_other(owner(), {'created_at': created})
++
++
++def test_failed_read_raises_and_is_not_cached(source):
++    class Broken:
++        def execute(self, *_):
++            raise sqlite3.OperationalError('injected')
++
++    current = reader(Broken())
++    with pytest.raises(sqlite3.OperationalError, match='injected'):
++        current.has_other(owner(), {'created_at': 1})
++    assert current.found is None
++    current.source = source
++    put(source)
++    assert current.has_other(owner(), {'created_at': 1})
++
++
++def test_malformed_keys_follow_the_three_part_rule(source):
++    keys = ['empty', 'too/many/parts/here', '/board/empty-profile', 'p//empty-board', 'p/board/',
++            'π/board/unicode', 'p/board/under_score', 'p/board/per%cent', 'board/new']
++    for key in keys:
++        put(source, key)
++    wanted = {('board', 'empty-profile'), ('', 'empty-board'), ('board', ''), ('board', 'unicode'),
++              ('board', 'under_score'), ('board', 'per%cent'), ('board', 'new'), ('parts', 'here'),
++              ('board', 'under-score'), ('board', 'perXcent'), ('many/parts', 'here')}
++    current = reader(source, wanted=wanted)
++    expected = {}
++    for key, in source.execute("SELECT key FROM replica WHERE gw='peer' AND coll='tasks' ORDER BY key"):
++        parts = str(key).split('/')
++        if len(parts) == 3 and (parts[1], parts[2]) in wanted:
++            expected.setdefault((parts[1], parts[2]), []).append(('peer', str(key)))
++    actual = {pair: list(current._publishers(*pair)) for pair in sorted(wanted)}
++    assert {pair: rows for pair, rows in actual.items() if rows} == expected
++    # LIKE/GLOB wildcards in ids are literal here, and 'board/new' (two parts) is not a publication.
++    assert actual[('board', 'under-score')] == [] and actual[('board', 'perXcent')] == []
++    assert actual[('board', 'new')] == []
+diff --git a/tests/hermes_cli/test_kanban_publication_index.py b/tests/hermes_cli/test_kanban_publication_index.py
+deleted file mode 100644
+index 38c8ca2272..0000000000
+--- a/tests/hermes_cli/test_kanban_publication_index.py
++++ /dev/null
+@@ -1,235 +0,0 @@
+-"""Membership reuse must not cache live publication payloads or extend membership."""
+-import json
+-import sqlite3
+-from contextlib import closing
+-
+-import pytest
+-
+-from hermes_cli.kanban_origin_ledger import _Publications
+-
+-
+-@pytest.fixture
+-def source():
+-    with closing(sqlite3.connect(':memory:')) as db:
+-        db.execute('CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT,PRIMARY KEY(gw,coll,key))')
+-        db.execute("INSERT INTO replica VALUES('peer','tasks','p/board/existing','{}')")
+-        yield db
+-
+-
+-def reader(db, listed=frozenset({'peer'})):
+-    return _Publications(db, listed)
+-
+-
+-def owner(tid='new'):
+-    return {'gateway': 'gone', 'board': 'board', 'task_id': tid}
+-
+-
+-def put(db, key='p/board/new', created=1):
+-    db.execute("INSERT OR REPLACE INTO replica VALUES('peer','tasks',?,?)", (key, json.dumps({'created_at': created})))
+-
+-
+-def test_same_inventory_skips_membership_rebuild(source):
+-    first = reader(source)._index()
+-    second = reader(source)._index()
+-    assert second is first
+-
+-
+-def test_membership_frozen_within_projection_but_fresh_between(source):
+-    current = reader(source)
+-    assert not current.has_other(owner(), {'created_at': 1})
+-    put(source)
+-    assert not current.has_other(owner(), {'created_at': 1})
+-    assert reader(source).has_other(owner(), {'created_at': 1})
+-
+-
+-def test_payload_changes_are_live_on_reused_membership(source):
+-    put(source)
+-    first = reader(source)
+-    assert first.has_other(owner(), {'created_at': 1})
+-    put(source, created=2)
+-    second = reader(source)
+-    assert not second.has_other(owner(), {'created_at': 1})
+-    assert second.has_other(owner(), {'created_at': 2})
+-    assert second._index() is first._index()
+-
+-
+-def test_deletion_and_reinsertion_invalidate(source):
+-    put(source)
+-    old = reader(source)._index()
+-    source.execute("DELETE FROM replica WHERE key='p/board/new'")
+-    assert not reader(source).has_other(owner(), {'created_at': 1})
+-    put(source, created=2)
+-    assert reader(source).has_other(owner(), {'created_at': 2})
+-    assert ('board', 'new') in old
+-
+-
+-def test_listed_gateway_changes_invalidate(source):
+-    put(source)
+-    assert reader(source).has_other(owner(), {'created_at': 1})
+-    assert not reader(source, frozenset()).has_other(owner(), {'created_at': 1})
+-
+-
+-@pytest.mark.parametrize('created', [None, True, [], {}])
+-def test_invalid_created_does_not_read(source, created):
+-    source.close()
+-    assert not reader(source).has_other(owner(), {'created_at': created})
+-
+-
+-def test_error_keeps_partial_index(source):
+-    class Broken:
+-        def execute(self, *_):
+-            yield ('p/board/one',)
+-            raise sqlite3.OperationalError('injected')
+-
+-    current = reader(Broken())
+-    with pytest.raises(sqlite3.OperationalError, match='injected'):
+-        current._index()
+-    assert list(current._index()[('board', 'one')]) == [('peer', 'p/board/one')]
+-
+-
+-def test_malformed_keys_and_order(source):
+-    keys = ['empty', 'too/many/parts/here', '/board/empty-profile', 'p//empty-board', 'p/board/', 'π/board/unicode']
+-    for key in keys:
+-        put(source, key)
+-    actual = reader(source)._index()
+-    expected = {}
+-    for key, in source.execute("SELECT key FROM replica WHERE gw='peer' AND coll='tasks'"):
+-        parts = str(key).split('/')
+-        if len(parts) == 3:
+-            expected.setdefault((parts[1], parts[2]), []).append(('peer', str(key)))
+-    assert [(k, list(v)) for k, v in actual.items()] == list(expected.items())
+-
+-
+-def test_reused_index_is_immutable(source):
+-    current = reader(source)._index()
+-    with pytest.raises(TypeError):
+-        current[('board', 'existing')] = ()
+-    with pytest.raises(TypeError):
+-        current[('board', 'existing')][0] = ('wrong', 'wrong')
+-    assert reader(source)._index() is current
+-
+-
+-@pytest.mark.parametrize('bound,value', [('_MAX_KEYS', 1), ('_MAX_CHARS', 1)])
+-def test_oversize_drops_retained_entry_but_preserves_answer(source, monkeypatch, bound, value):
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    put(source)
+-    reader(source)._index()
+-    monkeypatch.setattr(membership, bound, value)
+-    # New inventory must be admitted independently, never use the old bound's hit.
+-    put(source, 'q/board/another')
+-    assert reader(source).has_other(owner(), {'created_at': 1})
+-    assert membership._memo is None
+-
+-
+-def test_churn_replaces_single_entry_and_resumes_hits(source):
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    for i in range(30):
+-        put(source, 'p/board/churn' + str(i))
+-        first = reader(source)._index()
+-        assert reader(source)._index() is first
+-        assert membership._memo[1] is first
+-
+-
+-def test_full_inventory_is_still_read_and_build_skipped(source, monkeypatch):
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    monkeypatch.setattr(membership, '_memo', None)
+-    build = membership.build
+-    builds = []
+-    reads = []
+-    source.set_trace_callback(reads.append)
+-
+-    def tracked(groups):
+-        builds.append(1)
+-        return build(groups)
+-
+-    monkeypatch.setattr(membership, 'build', tracked)
+-    reader(source)._index()
+-    reader(source)._index()
+-    assert len(builds) == 1
+-    assert len([sql for sql in reads if 'SELECT key FROM replica' in sql]) == 2
+-
+-
+-def test_failed_scan_never_publishes_partial_entry(source):
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    reader(source)._index()
+-    old = membership._memo
+-
+-    class Broken:
+-        def execute(self, *_):
+-            yield ('p/board/partial',)
+-            raise sqlite3.OperationalError('injected')
+-
+-    failed = reader(Broken())
+-    with pytest.raises(sqlite3.OperationalError, match='injected'):
+-        failed._index()
+-    assert membership._memo is old
+-    assert ('board', 'partial') in failed._index()
+-    assert ('board', 'partial') not in reader(source)._index()
+-
+-
+-def test_non_text_gateway_does_not_reuse_string_equal_inventory():
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    membership.derive([(1, ['p/b/t'])])
+-    assert membership._memo is None
+-    result = membership.derive([(True, ['p/b/t'])])
+-    assert result[('b', 't')][0][0] is True
+-    assert membership._memo is None
+-
+-    class Gateway(str):
+-        pass
+-
+-    seed = membership.derive([('peer', ['p/b/t'])])
+-    gateway = Gateway('peer')
+-    special = membership.derive([(gateway, ['p/b/t'])])
+-    assert special is not seed
+-    assert special[('b', 't')][0][0] is gateway
+-    assert membership._memo is None
+-
+-
+-def test_order_change_is_part_of_inventory(source):
+-    forward = reader(source)._index()
+-    source.execute('PRAGMA reverse_unordered_selects=ON')
+-    put(source)
+-    reverse = reader(source)._index()
+-    assert list(reverse) == [('board', 'new'), ('board', 'existing')]
+-    source.execute('PRAGMA reverse_unordered_selects=OFF')
+-    forward = reader(source)._index()
+-    assert list(forward) == [('board', 'existing'), ('board', 'new')]
+-    assert forward is not reverse
+-
+-
+-def test_concurrent_different_inventories_are_not_cross_paired():
+-    from concurrent.futures import ThreadPoolExecutor
+-    from threading import Barrier
+-    from hermes_cli import kanban_publication_index as membership
+-
+-    barrier = Barrier(4)
+-
+-    def collect(i):
+-        groups = [('peer', ['p/b/' + str(i)])]
+-        barrier.wait(timeout=10)
+-        for _ in range(50):
+-            result = membership.derive(groups)
+-            assert list(result) == [('b', str(i))]
+-            assert result[('b', str(i))] == (('peer', 'p/b/' + str(i)),)
+-
+-    with ThreadPoolExecutor(max_workers=4) as pool:
+-        list(pool.map(collect, range(4)))
+-
+-
+-@pytest.mark.parametrize('key', [None, 123, b'p/b/t', b'plain'])
+-def test_sqlite_storage_types_keep_original_string_normalization(source, key):
+-    source.execute("INSERT INTO replica VALUES('peer','tasks',?,'{}')", (key,))
+-    actual = reader(source)._index()
+-    expected = {}
+-    for value, in source.execute("SELECT key FROM replica WHERE gw='peer' AND coll='tasks'"):
+-        parts = str(value).split('/')
+-        if len(parts) == 3:
+-            expected.setdefault((parts[1], parts[2]), []).append(('peer', str(value)))
+-    assert [(k, list(v)) for k, v in actual.items()] == list(expected.items())
+-
+-- 
+2.43.0
+

@@ -1,0 +1,2466 @@
+From 166979e2ce99fc1f22842a51508700d264936e95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:06:16 +0000
+Subject: [PATCH] [daveey] Drive annotation holder from native source events
+
+Replace fixed input polling with Linux filesystem invalidation and one-shot projection deadlines, keeping lease beats source-read-free. Preserve bounded fallback for undeclared plugins, request age-expiry reads, watch-loss recovery, mutation/demand propagation, and short-lived local board reads. Close local observation and replica projection handles before final derivation.
+
+Proof: canonical annotation and consumer suites pass including 61s real projection idle/demand churn below 500 voluntary cs/s, change under 1s, source removal, read recovery, deadline transitions, watch loss and injected overflow. scripts/check passes all 21 checks.
+
+Known residuals per approved bounded scope: request/adoption age expiry keeps existing fingerprint/read behavior; chat-closeout remains undeclared with logged bounded fallback; whole-refresh single-open batching is not claimed. Isolated fixture uses controlled discovery/lease/providers, not live hub acceptance. No live serve signals; combined measurement belongs t_1c8084f47fd24c4f. Mods WIP excluded.
+---
+ hermes_cli/annotation_event_loop.py           |  57 +++
+ hermes_cli/annotation_file_events.py          | 163 ++++++
+ hermes_cli/kanban_annotation_host.py          | 234 ++++++++-
+ hermes_cli/kanban_execution_receipt.py        |  40 +-
+ hermes_cli/kanban_primary_execution.py        |  41 +-
+ hermes_cli/kanban_session_activity.py         | 184 ++++---
+ .../kanban_session_activity_attention.py      | 106 +++-
+ .../test_annotation_attention_events.py       | 100 ++++
+ .../hermes_cli/test_annotation_done_events.py |  68 +++
+ .../hermes_cli/test_annotation_event_loop.py  | 115 +++++
+ .../test_annotation_event_sources.py          |  96 ++++
+ .../hermes_cli/test_annotation_file_events.py | 250 ++++++++++
+ .../test_annotation_links_events.py           |  85 ++++
+ .../test_annotation_native_holder.py          | 467 ++++++++++++++++++
+ .../test_kanban_execution_receipt.py          |  28 ++
+ .../test_kanban_primary_execution.py          |  29 +-
+ 16 files changed, 1932 insertions(+), 131 deletions(-)
+ create mode 100644 hermes_cli/annotation_event_loop.py
+ create mode 100644 hermes_cli/annotation_file_events.py
+ create mode 100644 tests/hermes_cli/test_annotation_attention_events.py
+ create mode 100644 tests/hermes_cli/test_annotation_done_events.py
+ create mode 100644 tests/hermes_cli/test_annotation_event_loop.py
+ create mode 100644 tests/hermes_cli/test_annotation_event_sources.py
+ create mode 100644 tests/hermes_cli/test_annotation_file_events.py
+ create mode 100644 tests/hermes_cli/test_annotation_links_events.py
+ create mode 100644 tests/hermes_cli/test_annotation_native_holder.py
+
+diff --git a/hermes_cli/annotation_event_loop.py b/hermes_cli/annotation_event_loop.py
+new file mode 100644
+index 0000000000..d3cdf4ff65
+--- /dev/null
++++ b/hermes_cli/annotation_event_loop.py
+@@ -0,0 +1,57 @@
++"""One event wait for projection work; lease maintenance never reads inputs."""
++from __future__ import annotations
++
++import logging
++import time
++
++log = logging.getLogger(__name__)
++
++
++def run(events, stop, lease, refresh, *, interval=2.0):
++    """refresh installs coverage before reading and returns an absolute deadline.
++
++    A deadline is one-shot: refresh must consume it and return its successor or
++    None. Heartbeats and standby takeover retain their existing lease cadence,
++    but neither invokes refresh without a change, deadline, or new ownership.
++    Errors schedule a bounded recovery attempt without certifying old inputs.
++    """
++    dirty, owned = True, False
++    due = None
++    beat_at = time.monotonic()
++    while not stop.is_set():
++        now = time.monotonic()
++        if now >= beat_at:
++            try:
++                held = lease.held()
++                if held:
++                    lease.beat()
++                if held and not owned:
++                    events.control_only = False
++                dirty |= held and not owned
++                owned = held
++            except Exception:  # health: allow BLE001 -- lease I/O failure must not retire the holder
++                log.warning('annotation lease maintenance failed', exc_info=True)
++                owned = False  # no source read until ownership is established again
++                dirty = True
++            beat_at = now + interval
++        if owned and (dirty or (due is not None and time.time() >= due)):
++            try:
++                due = refresh()
++                # An expired provider deadline must not create a busy spin.
++                if due is not None and due <= time.time():
++                    due = time.time() + interval
++            except Exception:  # health: allow BLE001 -- preserve holder after a failed source read
++                log.warning('annotation event refresh failed', exc_info=True)
++                due = time.time() + interval
++            dirty = False
++        timeout = max(0.0, beat_at - time.monotonic())
++        if owned and due is not None:
++            timeout = min(timeout, max(0.0, due - time.time()))
++        try:
++            dirty |= events.wait(timeout)
++        except OSError:
++            log.warning('annotation event wait failed', exc_info=True)
++            # Do not spin on a broken descriptor. The refresh reinstalls coverage.
++            stop.wait(interval)
++            events.control_only = False
++            dirty = True
+diff --git a/hermes_cli/annotation_file_events.py b/hermes_cli/annotation_file_events.py
+new file mode 100644
+index 0000000000..a21d4ed75f
+--- /dev/null
++++ b/hermes_cli/annotation_file_events.py
+@@ -0,0 +1,163 @@
++"""Native annotation input notifications (no input polling). [daveey]"""
++from __future__ import annotations
++
++import ctypes
++import errno
++import os
++import select
++import struct
++import sys
++import threading
++from pathlib import Path
++
++_HEADER = struct.Struct('iIII')
++_CHANGE = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
++_LOST = 0x400 | 0x800 | 0x2000 | 0x8000
++_OVERFLOW = 0x4000
++
++
++class FileEvents:
++    """Single-owner native source; only wake() may be called from another thread.
++
++    Install coverage BEFORE reading a snapshot. On invalidation, reinstall before
++    rereading: watches may have been lost or an absent ancestor created. Directory
++    subscriptions cover immediate children; consumers must rediscover descendants.
++    No polling fallback is permitted on platforms without a native adapter.
++    """
++
++    def __init__(self):
++        if not sys.platform.startswith('linux'):
++            raise NotImplementedError('annotation native notifications require Linux inotify')
++        self._lib = ctypes.CDLL(None, use_errno=True)
++        self._lib.inotify_init1.argtypes = [ctypes.c_int]
++        self._lib.inotify_init1.restype = ctypes.c_int
++        self._lib.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
++        self._lib.inotify_add_watch.restype = ctypes.c_int
++        self._fd = self._open()
++        try:
++            self._wake_read, self._wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
++        except OSError:
++            os.close(self._fd)
++            raise
++        self._names: dict[int, set[str]] = {}
++        self._directories: set[int] = set()
++        self._controls: dict[int, set[str]] = {}
++        self.control_only = False
++        self._wake_lock = threading.Lock()
++
++    def _open(self):
++        fd = self._lib.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
++        if fd < 0:
++            code = ctypes.get_errno()
++            raise OSError(code, os.strerror(code))
++        return fd
++
++    def _install(self, fd, directory):
++        wd = self._lib.inotify_add_watch(fd, os.fsencode(directory), _CHANGE)
++        if wd < 0:
++            code = ctypes.get_errno()
++            if code in (errno.ENOENT, errno.ENOTDIR):
++                return None
++            raise OSError(code, os.strerror(code), str(directory))
++        return wd
++
++    def replace(self, files, *, directories=(), controls=()):
++        """Atomically replace coverage; failure preserves the previous watches.
++
++        A successful call requires a new snapshot, even if paths are unchanged:
++        events queued on the previous descriptor are intentionally discarded.
++        SQLite sidecars are watched even when absent at installation time.
++        """
++        names: dict[int, set[str]] = {}
++        directory_wds: set[int] = set()
++        # Keep lexical coverage for retargeting and resolved coverage for direct
++        # writes/creation outside the alias tree, including dangling targets.
++        def expanded(values):
++            result = set()
++            for value in values:
++                path = Path(value).absolute()
++                result.add(path)
++                result.add(path.resolve(strict=False))
++                for parent in path.parents:
++                    result.add(parent.resolve(strict=False) / path.relative_to(parent))
++            return result
++
++        paths = expanded(files)
++        control_paths = expanded(controls)
++        control_names: dict[int, set[str]] = {}
++        dirs = expanded(directories)
++        fd = self._open()
++        try:
++            for path in [*paths, *dirs, *control_paths]:
++                for child in reversed([path, *path.parents[:-1]]):
++                    wd = self._install(fd, child.parent)
++                    if wd is None:
++                        break
++                    target = control_names if child == path and path in control_paths else names
++                    target.setdefault(wd, set()).add(child.name)
++                    if child == path and path in paths:
++                        names[wd].update(path.name + suffix for suffix in ('-wal', '-shm', '-journal'))
++            for directory in dirs:
++                wd = self._install(fd, directory)
++                if wd is not None:
++                    directory_wds.add(wd)
++        except BaseException:
++            os.close(fd)
++            raise
++        old, self._fd = self._fd, fd
++        self._names, self._directories, self._controls = names, directory_wds, control_names
++        os.close(old)
++
++    def wake(self):
++        """Interrupt a wait (e.g. demand, mutation or stop); no source I/O."""
++        with self._wake_lock:
++            if self._fd < 0:
++                return
++            try:
++                os.write(self._wake_write, b'!')
++            except BlockingIOError:
++                pass  # A full pipe is already a pending wake.
++
++    def wait(self, timeout=None):
++        readable, _, _ = select.select([self._fd, self._wake_read], [], [], timeout)
++        changed = self._wake_read in readable
++        self.control_only = not changed
++        if changed:
++            os.read(self._wake_read, 65536)
++        if self._fd not in readable:
++            return changed
++        # Bound drain work under a continuous writer; remaining bytes stay ready.
++        for _batch in range(16):
++            try:
++                data = os.read(self._fd, 65536)
++            except BlockingIOError:
++                return changed
++            if not data:
++                raise OSError(errno.EIO, 'inotify closed during event read')
++            offset = 0
++            while offset < len(data):
++                wd, mask, _cookie, length = _HEADER.unpack_from(data, offset)
++                offset += _HEADER.size
++                name = os.fsdecode(data[offset:offset + length].split(b'\0', 1)[0])
++                offset += length
++                source = bool(mask & (_OVERFLOW | _LOST)) or wd in self._directories or (
++                    name in self._names.get(wd, ())
++                )
++                control = name in self._controls.get(wd, ())
++                changed |= source or control
++                self.control_only &= not source
++        return changed
++
++    def close(self):
++        """Close after the owner has left wait(); wake/join before closing."""
++        with self._wake_lock:
++            if self._fd >= 0:
++                for fd in (self._fd, self._wake_read, self._wake_write):
++                    os.close(fd)
++                self._fd = -1
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_exc):
++        self.close()
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 9557368b39..355e9376c5 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -36,6 +36,7 @@ import contextvars
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import threading
+ import time
+@@ -109,6 +110,72 @@ def _waiting_inputs(sources: dict[str, Any]) -> tuple[list, bool]:
+     return out, complete
+ 
+ 
++# Event coverage is distinct from fingerprint inputs: obtaining a fingerprint may
++# read SQL, whereas these callbacks must only enumerate paths / retained deadlines.
++_event_sources: dict[str, tuple[Any, Any, Any]] = {}
++_done_event_sources: dict[str, tuple[Any, Any, Any]] = {}
++_event_warned: set[tuple[str, str]] = set()
++
++
++def declare_events(name, fn, watch_paths, next_deadline, *, done_check=False) -> None:
++    registry = _done_event_sources if done_check else _event_sources
++    if fn is None or watch_paths is None:
++        registry.pop(name, None)
++    else:
++        registry[name] = (fn, watch_paths, next_deadline)
++
++
++def register_waiting_source(name: str, fn, inputs=None, *, watch_paths=None, next_deadline=None) -> None:
++    """Register a waiting provider; ``fn=None`` removes it.
++
++    ``inputs()`` is its exact JSON cache key. ``watch_paths()`` declares every file
++    dependency (SQLite sidecars are added by the holder); ``next_deadline()`` returns
++    its next absolute wall-clock transition or None. Event callbacks must not read
++    databases. Undeclared providers retain a logged, bounded 60-second fallback.
++    """
++    from hermes_cli import kanban_session_activity as activity
++    declare_inputs(name, fn, inputs)
++    declare_events(name, fn, watch_paths, next_deadline)
++    if fn is None:
++        activity._waiting_sources.pop(name, None)
++    else:
++        activity._waiting_sources[name] = fn
++    wake_holder()
++
++
++def waiting_events(now: float) -> tuple[set[Path], float | None]:
++    """Paths plus earliest absolute wall deadline; undeclared sources stay bounded.
++
++    An empty declared path list explicitly means a clock-only/pure provider.
++    None from next_deadline means no pending clock transition, not unknown inputs.
++    """
++    from hermes_cli import kanban_session_activity as _ksa
++
++    paths: set[Path] = set()
++    deadlines: list[float] = []
++    providers = [('waiting source', name, fn, _event_sources.get(name))
++                 for name, fn in list(_ksa._waiting_sources.items())]
++    providers += [('done check', name, fn, _done_event_sources.get(name))
++                  for name, fn in list(_ksa._done_checks.items())]
++    for kind, name, fn, declaration in providers:
++        if declaration is None or declaration[0] is not fn:
++            if (kind, name) not in _event_warned:
++                log.warning("annotation %s %s has no watch_paths; using bounded 60s refresh", kind, name)
++                _event_warned.add((kind, name))
++            deadlines.append(now + HOLDER_REFRESH_AGE_S)
++            continue
++        try:
++            paths.update(Path(p) for p in declaration[1]())
++            due = declaration[2]() if declaration[2] is not None else None
++            if due is not None:
++                due = float(due)
++                deadlines.append(due if math.isfinite(due) and due > now else now + HOLDER_INTERVAL_S)
++        except Exception:  # health: allow BLE001 -- plugin failure retains bounded recovery
++            log.warning("annotation %s %s event declaration failed", kind, name, exc_info=True)
++            deadlines.append(now + HOLDER_INTERVAL_S)
++    return paths, min(deadlines, default=None)
++
++
+ # -- code identity ------------------------------------------------------------------------------------------------
+ 
+ _code_ids: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+@@ -500,7 +567,136 @@ _holder: list = []
+ # come. ``_seen``: the last signature observed.
+ _gates: dict[tuple[str, ...], tuple[str, float, float | None]] = {}
+ _seen: dict[tuple[str, ...], str | None] = {}
+-_wake = threading.Event()  # an in-process kick wakes the holder before its next tick
++_wake = threading.Event()  # compatibility for direct legacy holder callers
++_native_events: list = []
++_clock_deadlines: dict[tuple[str, ...], list[float]] = {}
++_event_ready: set[tuple[str, ...]] = set()
++
++
++def note_deadline(due: float | None) -> None:
++    """Record a clock boundary while projecting already-read source rows."""
++    pending = getattr(_holder_ctx, 'deadlines', None)
++    if pending is not None and due is not None and due > time.time():
++        pending.append(due)
++
++
++def wake_holder() -> None:
++    """Wake native demand/registration changes without reading any source."""
++    _wake.set()
++    for events in tuple(_native_events):
++        events.wake()
++
++
++def _discovery_paths() -> tuple[set[Path], set[Path]]:
++    """Watch creation as well as existing inputs, using the readers' roots."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_db, kanban_sync_client
++
++    home = get_hermes_home()
++    boards = kanban_db.boards_root()
++    hub = Path(os.environ.get('HERMES_HUB_STATE') or str(Path.home() / '.local/state/hermes-hub'))
++    mail = Path(os.environ.get('HERMES_MAIL_CONFIG') or str(Path.home() / '.config/hermes-mail/config.json'))
++    files = {kanban_db.kanban_home() / 'kanban.db', hub / 'hub.db',
++             home / 'config.yaml', mail, kanban_db.current_board_path()}
++    directories = {boards, kanban_sync_client.shadow_path('default').parent}
++    if boards.is_dir():
++        directories.update(p for p in boards.iterdir() if p.is_dir())
++    return files, directories
++
++
++def _scope_interested(scope: tuple[str, ...]) -> bool:
++    """Read only demand-file metadata, never source DBs, in the scope's context."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    age = _disk.demand_age(scope)
++    return age is not None and age <= DEMAND_WINDOW_S and _ksa._origin_scope() == scope
++
++
++def _scope_retry(scope: tuple[str, ...]) -> float:
++    now = time.time()
++    due = now + HOLDER_INTERVAL_S
++    _clock_deadlines[scope] = sorted({due, *[t for t in _clock_deadlines.get(scope, ()) if t > now]})
++    return due
++
++
++def _event_refresh(events) -> float | None:
++    """Install all scope coverage before reading; return the next one-shot due time.
++
++    Re-enumeration is event-driven, including absent source parents and discovery
++    directories. No lease beat enters this function.
++    """
++    from hermes_cli import kanban_session_activity as _ksa
++
++    # Demand files carry interest, not source invalidation. Keep the existing
++    # descriptor (and queued source events) when all scopes are already current.
++    due = min((t for times in _clock_deadlines.values() for t in times), default=None)
++    # A failed/busy scope has an explicit retry deadline, not a valid result.
++    # Demand churn must not bypass that backoff; a source event still does.
++    settled = _event_ready | {scope for scope, times in _clock_deadlines.items() if times}
++    if getattr(events, 'control_only', False):
++        # An unrequested scope is settled for this wake, not certified. Recheck
++        # its demand metadata each control event so first demand still activates it.
++        settled |= {scope for scope, ctx in list(_known.items())
++                    if scope not in settled and not ctx.run(_scope_interested, scope)}
++        if set(_known) <= settled and (due is None or due > time.time()):
++            return due
++    files, directories, controls, scopes = set(), set(), set(), []
++    deadlines = []
++    for scope, ctx in list(_known.items()):
++        def coverage():
++            _paths_memo.pop(scope, None)
++            dbs, plain = _watch_paths(scope)
++            plugin, _ = waiting_events(time.time())
++            discovery_files, discovery_dirs = _discovery_paths()
++            demand_path = _disk._path(scope)
++            return ({*(Path(p) for p in dbs + plain), *plugin, *discovery_files},
++                    discovery_dirs,
++                    {demand_path.with_suffix('.demand'), demand_path.with_suffix('.strict-demand')})
++        try:
++            scoped_files, scoped_dirs, scoped_controls = ctx.run(coverage)
++        except Exception:  # health: allow BLE001 -- one profile's unavailable discovery must not starve peers
++            log.warning('annotation scope coverage failed', exc_info=True)
++            deadlines.append(_scope_retry(scope))
++            continue
++        files.update(scoped_files)
++        directories.update(scoped_dirs)
++        controls.update(scoped_controls)
++        scopes.append((scope, ctx))
++    events.replace(files, directories=directories, controls=controls)
++    _event_ready.clear()
++    for scope, ctx in scopes:
++        def refresh_scope():
++            if not _scope_interested(scope):
++                _clock_deadlines.pop(scope, None)
++                return None
++            if not _ksa._annotate_refresh_lock.acquire(blocking=False):
++                return _scope_retry(scope)
++            _holder_ctx.active = True
++            # Inner caches can return without emitting their clock boundaries.
++            # Preserve those until consumed; replacing the list needs per-cache
++            # deadline ownership, not just a successful outer projection.
++            _holder_ctx.deadlines = [t for t in _clock_deadlines.get(scope, ()) if t > time.time()]
++            _ksa._revalidate.force_read.scope = scope
++            try:
++                _ksa._refresh_annotation_locked(scope)
++                _, due = waiting_events(time.time())
++                note_deadline(due)
++                _clock_deadlines[scope] = sorted(set(_holder_ctx.deadlines))
++                _event_ready.add(scope)
++                return min(_clock_deadlines[scope], default=None)
++            finally:
++                _holder_ctx.deadlines = None
++                _holder_ctx.active = False
++                _ksa._revalidate.force_read.scope = None
++                _ksa._annotate_refresh_lock.release()
++        try:
++            due = ctx.run(refresh_scope)
++        except Exception:  # health: allow BLE001 -- failed scopes must not starve healthy scopes
++            log.warning('annotation scope refresh failed', exc_info=True)
++            due = _scope_retry(scope)
++        if due is not None:
++            deadlines.append(due)
++    return min(deadlines, default=None)
+ 
+ 
+ def kick(scope: tuple[str, ...]) -> None:
+@@ -513,7 +709,7 @@ def kick(scope: tuple[str, ...]) -> None:
+         _mutation.record(scope)
+     except (OSError, ValueError):
+         log.warning("kanban annotation mutation cue not recorded", exc_info=True)
+-    _wake.set()
++    wake_holder()
+ 
+ 
+ def demand(scope: tuple[str, ...], *, strict: bool = False) -> None:
+@@ -526,10 +722,13 @@ def demand(scope: tuple[str, ...], *, strict: bool = False) -> None:
+     if now - _touched.get(key, -1e9) < DEMAND_TOUCH_S:
+         return
+     _touched[key] = now
++    new_scope = scope not in _known
+     _known[scope] = contextvars.copy_context()
+     _disk.touch_demand(scope)
+     if strict:
+         _disk.touch_demand(scope, strict=True)
++    if new_scope:
++        wake_holder()
+ 
+ 
+ def _renew_age(scope: tuple[str, ...]) -> float:
+@@ -658,19 +857,24 @@ def start_holder(role: str) -> threading.Thread | None:
+     except Exception:  # health: allow BLE001 -- a scope polls register themselves too
+         log.debug("kanban annotation holder: own scope unavailable", exc_info=True)
+ 
++    from hermes_cli.annotation_file_events import FileEvents
++    from hermes_cli.annotation_event_loop import run
++    try:
++        events = FileEvents()
++    except (OSError, NotImplementedError):
++        # Local request reads remain authoritative. Never disguise a timed poll
++        # as native notification support on an unsupported platform.
++        log.warning("annotation native holder unavailable; using request reads", exc_info=True)
++        return None
++    _native_events.append(events)
++
+     def loop() -> None:
+-        while not stop.is_set():
+-            # [daveey] A tick polls only watch signatures of sleeping scopes; an in-process kick wakes it at once.
+-            _wake.wait(HOLDER_INTERVAL_S)
+-            _wake.clear()
+-            if stop.is_set():
+-                break
+-            try:
+-                if lease.held():
+-                    _holder_pass()
+-                    lease.beat()
+-            except Exception:  # health: allow BLE001 -- the refresher must outlive one bad pass
+-                log.warning("kanban annotation holder pass failed", exc_info=True)
++        try:
++            run(events, stop, lease, lambda: _event_refresh(events), interval=HOLDER_INTERVAL_S)
++        finally:
++            _native_events.remove(events)
++            events.close()
++            lease.release()
+ 
+     thread = spawn_context_thread(loop, name="kanban-annotation-holder")
+     thread.start()
+@@ -679,6 +883,8 @@ def start_holder(role: str) -> threading.Thread | None:
+ 
+ 
+ def reset() -> None:
++    _event_ready.clear()
++    _clock_deadlines.clear()
+     _known.clear()
+     _touched.clear()
+     _code_ids.clear()
+diff --git a/hermes_cli/kanban_execution_receipt.py b/hermes_cli/kanban_execution_receipt.py
+index 192a90cc3d..5aaef7daeb 100644
+--- a/hermes_cli/kanban_execution_receipt.py
++++ b/hermes_cli/kanban_execution_receipt.py
+@@ -64,17 +64,29 @@ def assemble_done(conn, ids, *, board, gateway, profile, observed_at):
+     the caller already knows are done. Must run on an authoritative LOCAL board, like
+     ``kanban_execution_source.assemble``: a pulled mirror cannot attest its owner.
+     """
++    inputs = materialize_done(conn, ids, board=board, gateway=gateway, profile=profile)
++    return derive_done(inputs, board=board, gateway=gateway, profile=profile, observed_at=observed_at)
++
++
++def materialize_done(conn, ids, *, board, gateway, profile):
++    """Materialize completion facts and admitted receipts in the caller's snapshot."""
+     from hermes_cli.kanban_completion_inputs import read_completions
+     from hermes_cli.kanban_completion_receipt_projection import read_completed_many
+ 
+     ids = list(dict.fromkeys(ids))
+     if not ids or not (gateway and profile):
+-        return {}
++        return {}, {}
+     facts = read_completions(conn, ids)
+     candidates = [tid for tid, f in facts.items() if f.status == "done" and f.verified and not f.legacy]
+     bundles = read_completed_many(conn, candidates, board=board, gateway=gateway)
++    return {tid: facts[tid] for tid in candidates}, bundles
++
++
++def derive_done(inputs, *, board, gateway, profile, observed_at):
++    """Pure observation derivation; does not own a source connection."""
++    facts, bundles = inputs
+     out = {}
+-    for tid in candidates:
++    for tid in facts:
+         raw = done_raw(tid, facts[tid], bundles.get(tid), board=board, gateway=gateway, profile=profile,
+                        observed_at=observed_at)
+         if raw is not None:
+@@ -89,14 +101,34 @@ def counts_done(conn, *, board, gateway, profile, observed_at, counted_sub_claus
+     constant batch of :func:`assemble_done`. Optional evidence: any adapter failure, or a non-authoritative
+     mirror (``authority`` raises), yields nothing, so done is simply not observed (never inferred).
+     """
++    inputs = materialize_counts(conn, board=board, gateway=gateway, profile=profile, observed_at=observed_at,
++                                counted_sub_clause=counted_sub_clause, authority=authority, window=window)
++    return derive_counts(inputs, board=board, gateway=gateway, profile=profile, observed_at=observed_at)
++
++
++def materialize_counts(conn, *, board, gateway, profile, observed_at, counted_sub_clause, authority, window):
++    """Read the sidebar done bucket without deriving execution observations."""
+     from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
+     from hermes_cli.kanban_session_activity_recent_done import done_pairs_on
+ 
+     try:
+         authority(conn)
+         pairs = done_pairs_on(conn, observed_at - window, counted_sub_clause)
+-        raws = assemble_done(conn, {tid for _, tid in pairs}, board=board, gateway=gateway, profile=profile,
+-                             observed_at=observed_at)
++        inputs = materialize_done(conn, {tid for _, tid in pairs}, board=board, gateway=gateway, profile=profile)
++    except ADAPTER_ERRORS:
++        import logging
++        logging.getLogger(__name__).debug("done evidence unavailable for board %s", board, exc_info=True)
++        return [], ({}, {})
++    return pairs, inputs
++
++
++def derive_counts(materialized, *, board, gateway, profile, observed_at):
++    """Pure sidebar bucket derivation, retaining the optional-evidence fallback."""
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
++
++    pairs, inputs = materialized
++    try:
++        raws = derive_done(inputs, board=board, gateway=gateway, profile=profile, observed_at=observed_at)
+     except ADAPTER_ERRORS:
+         import logging
+         logging.getLogger(__name__).debug("done evidence unavailable for board %s", board, exc_info=True)
+diff --git a/hermes_cli/kanban_primary_execution.py b/hermes_cli/kanban_primary_execution.py
+index aa95a96f1d..d8a3f2e13f 100644
+--- a/hermes_cli/kanban_primary_execution.py
++++ b/hermes_cli/kanban_primary_execution.py
+@@ -13,14 +13,19 @@ def attach(conn, rows, *, gateway, profile, board):
+     attempt's UID and executor event; task timestamps, pull time and read time attest nothing.
+     Missing old-schema columns leave the ordinary unknown path intact.
+     """
++    return attach_materialized(materialize(conn, rows), rows, gateway=gateway, profile=profile, board=board)
++
++
++def materialize(conn, rows):
++    """Fetch current-run tuples; the returned list owns no cursor or connection."""
+     tasks = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+     runs = {r[1] for r in conn.execute('PRAGMA table_info(task_runs)')}
+     events = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
+     if not ({'id', 'status', 'current_run_id', 'assignee'} <= tasks
+             and {'id', 'task_id', 'uid', 'status', 'ended_at'} <= runs
+             and {'task_id', 'run_id', 'kind', 'created_at', 'uid'} <= events):
+-        return {}
+-    values = {}
++        return []
++    values = []
+     ids = list(rows)
+     for start in range(0, len(ids), 500):
+         chunk = ids[start:start + 500]
+@@ -31,17 +36,23 @@ def attach(conn, rows, *, gateway, profile, board):
+             'ON r.id=t.current_run_id AND r.task_id=t.id '
+             "WHERE t.status='running' AND r.status='running' AND r.ended_at IS NULL "
+             f"AND t.id IN ({','.join('?' for _ in chunk)})")
+-        for tid, uid, beat, assignee in conn.execute(query, (*LIVENESS_KINDS, *chunk)):
+-            evidence = run_evidence({'status': 'running', 'run_uid': uid, 'run_beat': beat})
+-            if evidence is None:
+-                continue
+-            row = rows[tid]
+-            row.update(board=board, status='running', assignee=assignee)
+-            from hermes_cli.kanban_execution_observations import _request
+-            row['human_request'] = _request(row.get('human_request'))
+-            # Display enrichment runs only on lists; it must not change the shared evidence record.
+-            # Evidence ownership is private adapter data, not remote-card UI routing.
+-            row['_replica_run'] = {**evidence, 'activity_at': None, 'activity_kind': None,
+-                                   'scope': {'gateway': gateway, 'owner_profile': profile}}
+-            values[tid] = raw(row)
++        values.extend(conn.execute(query, (*LIVENESS_KINDS, *chunk)).fetchall())
+     return values
++
++
++def attach_materialized(values, rows, *, gateway, profile, board):
++    """Derive executor evidence after the source transaction has closed."""
++    out = {}
++    for tid, uid, beat, assignee in values:
++        evidence = run_evidence({'status': 'running', 'run_uid': uid, 'run_beat': beat})
++        if evidence is None:
++            continue
++        row = rows[tid]
++        row.update(board=board, status='running', assignee=assignee)
++        from hermes_cli.kanban_execution_observations import _request
++        row['human_request'] = _request(row.get('human_request'))
++        # Evidence ownership is private adapter data, not remote-card UI routing.
++        row['_replica_run'] = {**evidence, 'activity_at': None, 'activity_kind': None,
++                               'scope': {'gateway': gateway, 'owner_profile': profile}}
++        out[tid] = raw(row)
++    return out
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index c5bd075f30..ed161bac98 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -14,6 +14,7 @@ seconds because the sidebar polls.
+ 
+ from __future__ import annotations
+ 
++
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli.kanban_ro_batch import batch as _ro_batch
+ from hermes_cli import kanban_activity_identity as _identity
+@@ -366,6 +367,10 @@ def _stalled_counts(pairs: set[tuple[str, str]], parked: dict[str, tuple], event
+     if not pairs:
+         return {}
+     info = _describe_waits(parked, events, now=now)
++    from hermes_cli.kanban_wait_info import STALL_AFTER_S
++    for wait in info.values():
++        if wait.get('agent_owned') and wait.get('waiting_since') is not None:
++            _host_copy.note_deadline(wait['waiting_since'] + STALL_AFTER_S)
+     out: dict[str, int] = {}
+     for sid, tid in pairs:
+         if (info.get(tid) or {}).get("wait_state") == "stalled":
+@@ -622,7 +627,14 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         version_column = 'version' if 'version' in columns else 'NULL'
+         info_rows = conn.execute("SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'").fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
++        if last_ok is not None and offline is None:
++            _host_copy.note_deadline(last_ok + HUB_STALE_AFTER_S + .001)
++        for beat, window in _scope_heartbeats(info_rows).values():
++            _host_copy.note_deadline(beat)
++            _host_copy.note_deadline(beat + window + .001)
+         key = view = rows = probe = None
++        packed = '[]'
++        memo_hit = None
+         stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+         if live and {'seq', 'version'} <= columns:
+             probe = conn.execute(_REPLICA_PROBE).fetchone()
+@@ -637,38 +649,44 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+             # memo compares those instead of ``last_ok`` itself.
+             if (key is not None and memo is not None and memo[0] == key and memo[1] <= now
+                     and memo[6] == stale and memo[7] == _replica_synced(memo[8], last_ok)):
+-                if qualified_out is not None:
+-                    qualified_out.update(memo[4])
+-                if owners_out is not None:
+-                    owners_out.update(memo[5])
+-                if moved_out is not None:
+-                    moved_out.update(memo[9])
+-                if closed_out is not None:
+-                    closed_out.update(memo[10])
+-                _note_known_gateways(moved_out, info_rows)
+-                return list(memo[3])  # cards are read-only, as in ``_links_cache``
+-        if key is not None:  # [daveey] a miss reads and re-projects only the rows whose seq moved
+-            from hermes_cli.kanban_replica_memo import finish
+-            view = _replica_rows.read(conn, path, version_column, probe, ident, me=me)
+-            cards = finish(view, now, me, info_rows, last_ok, offline, key, stale,
+-                          qualified_out=qualified_out, owners_out=owners_out,
+-                          moved_out=moved_out, closed_out=closed_out)
+-            _note_known_gateways(moved_out, info_rows)
+-            return cards
++                memo_hit = memo
++        if key is not None:
++            if memo_hit is None:  # a miss materializes only rows whose seq moved
++                from hermes_cli.kanban_replica_scalar_rows import SnapshotRows
++                view = _replica_rows.read(conn, path, version_column, probe, ident, me=me)
++                # The filtered reader is lazy and snapshot-bound, not detached.
++                if isinstance(view, SnapshotRows):
++                    view = view.consume()
+         else:
+             # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
+             # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
+             packed = conn.execute(f"SELECT json_group_array(json_array(gw, key, data, updated_at, {version_column})) "
+                                   "FROM replica WHERE coll = 'tasks'").fetchone()[0]
+-            rows = [tuple(row) for row in json.loads(packed)]
+     finally:
+         conn.close()
+-    if key is None:
++    # Finish and publish only detached data: no source handle survives projection.
++    if memo_hit is not None:
++        if qualified_out is not None:
++            qualified_out.update(memo_hit[4])
++        if owners_out is not None:
++            owners_out.update(memo_hit[5])
++        if moved_out is not None:
++            moved_out.update(memo_hit[9])
++        if closed_out is not None:
++            closed_out.update(memo_hit[10])
++        cards = list(memo_hit[3])
++    elif key is not None:
++        from hermes_cli.kanban_replica_memo import finish
++        cards = finish(view, now, me, info_rows, last_ok, offline, key, stale,
++                       qualified_out=qualified_out, owners_out=owners_out,
++                       moved_out=moved_out, closed_out=closed_out)
++    else:
++        rows = [tuple(row) for row in json.loads(packed)]
+         cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+                                 qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out,
+                                 closed_out=closed_out)
+-        _note_known_gateways(moved_out, info_rows)
+-        return cards
++    _note_known_gateways(moved_out, info_rows)
++    return cards
+ 
+ 
+ def _replica_synced(seen_at: dict[str, float], last_ok: float | None) -> tuple:
+@@ -934,6 +952,12 @@ def _links_entry(stale_ok: bool, *, with_rows: bool = False):
+ 
+ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
+     with diag.source("links_display" if stale_ok else "links_strict"):
++        # Native source/clock invalidation must cross the inner TTL cache too:
++        # state/config inputs and wall-time verdicts can move without this key.
++        if getattr(_revalidate.force_read, 'scope', None) == scope:
++            with _links_lock:
++                fingerprint = diag.timed("fingerprint", _links_fingerprint)
++                return _publish_links(scope, fingerprint)
+         hit = _links_cache.get(scope)
+         # A warm display read still precedes ALL fingerprint and lock work.
+         if stale_ok and hit is not None:
+@@ -1296,14 +1320,17 @@ def _require_local_execution_authority(conn: sqlite3.Connection) -> None:
+ 
+ 
+ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, Any], bool]:
+-    """Every count read of one board, on its shared connection in one read transaction (one snapshot; five fresh
+-    opens cost ~5 ms on a board with no rows): ``(reads, complete)``. ``complete`` is False when a display-only read
+-    failed (unseen/stalled log and count nothing, as before); such a read is not memoized, so the next pass retries."""
++    """Every count read of one board in one short-lived read transaction.
++
++    The connection is closed before these detached results reach waiting-provider
++    callbacks or cross-board derivation. ``complete`` is False when a display-only
++    read failed; such results are not memoized and the next pass retries.
++    """
+     global _pairs_sink
+     reads: dict[str, Any] = {}
+     read_at = time.time()
+     complete = True
+-    with cached_ro(path) as conn:
++    with contextlib.closing(_open_ro(path)) as conn:
+         conn.execute("BEGIN")
+         try:
+             try:
+@@ -1323,29 +1350,22 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                 from hermes_cli.kanban_execution_source import assemble, safe_raw, unknown_raw
+                 from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_scope
+                 gateway, profile = card_scope(path)
+-                from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
++                from hermes_cli.kanban_primary_execution import PrimaryMirror, materialize
++                sources, replica_rows = None, None
+                 try:
+                     try:
+                         _require_local_execution_authority(conn)
+                     except PrimaryMirror:
+-                        replica = attach(conn, tasks, board=_board_slug(path), gateway=gateway, profile=profile)
+-                        reads["execution"] = {
+-                            tid: replica.get(tid) or unknown_raw(tasks[tid], gateway=gateway, profile=profile,
+-                                                                 board=_board_slug(path))
+-                            for _, tid in reads["pairs"]}
++                        replica_rows = materialize(conn, tasks)
+                     else:
+                         sources = assemble(conn, {tid for _, tid in reads["pairs"]}, board=_board_slug(path),
+                                            gateway=gateway, profile=profile, observed_at=read_at)
+-                        reads["execution"] = {tid: safe_raw(source["task"], source) for tid, source in sources.items()}
+                 except ADAPTER_ERRORS:
+-                    # Optional evidence only: legacy counts and asks stay; each card is an explicit unknown.
++                    # Preserve legacy counts/asks; derive explicit unknowns after close.
+                     _log.debug("kanban execution source failed for %s", path, exc_info=True)
+-                    reads["execution"] = {tid: unknown_raw(tasks[tid], gateway=gateway, profile=profile,
+-                                                           board=_board_slug(path))
+-                                          for _, tid in reads["pairs"]}
+             finally:
+                 _pairs_sink = outer
+-            reads["done_pairs"], reads["done_execution"] = _receipts.counts_done(
++            done_inputs = _receipts.materialize_counts(
+                 conn, board=_board_slug(path), gateway=gateway, profile=profile, observed_at=read_at,
+                 counted_sub_clause=_counted_sub_clause, authority=_require_local_execution_authority,
+                 window=ATTENTION_WINDOW_S)
+@@ -1365,6 +1385,24 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                     complete = False
+         finally:
+             conn.execute("COMMIT")
++    try:
++        if sources is not None:
++            reads["execution"] = {tid: safe_raw(source["task"], source) for tid, source in sources.items()}
++        else:
++            from hermes_cli.kanban_primary_execution import attach_materialized
++            replica = (attach_materialized(replica_rows, tasks, board=_board_slug(path),
++                                           gateway=gateway, profile=profile)
++                       if replica_rows is not None else {})
++            reads["execution"] = {
++                tid: replica.get(tid) or unknown_raw(tasks[tid], gateway=gateway, profile=profile,
++                                                    board=_board_slug(path))
++                for _, tid in reads["pairs"]}
++    except ADAPTER_ERRORS:
++        _log.debug("kanban execution derivation failed for %s", path, exc_info=True)
++        reads["execution"] = {tid: unknown_raw(tasks[tid], gateway=gateway, profile=profile,
++                                               board=_board_slug(path)) for _, tid in reads["pairs"]}
++    reads["done_pairs"], reads["done_execution"] = _receipts.derive_counts(
++        done_inputs, board=_board_slug(path), gateway=gateway, profile=profile, observed_at=read_at)
+     reads["source_read_at"] = read_at
+     return reads, complete
+ 
+@@ -1402,6 +1440,10 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+             reads = None
+         if reads is None:  # [daveey] a busy board reuses its last good counts (kanban-359833be53)
+             reads, complete, fresh = _busy.board_reads(path, key, hit, sink is not None, stalled is not None, _read_board)
++            if not (fresh and complete):
++                # Event-driven holders cannot rely on another commit to recover
++                # from busy last-good or partial display reads.
++                _host_copy.note_deadline(time.time() + _host_copy.HOLDER_INTERVAL_S)
+             if fresh:
+                 _board_memo.pop(str(path), None)
+             if fresh and complete:
+@@ -1436,15 +1478,9 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+ _waiting_sources: dict[str, Any] = {}
+ 
+ 
+-def register_waiting_source(name: str, fn, inputs=None) -> None:
+-    """Register (or replace, ``fn=None`` removes) a plugin source of waiting card ids per session. [daveey] ``inputs()``
+-    (optional) returns a JSON key that moves whenever ``fn`` could answer differently: other processes may then adopt
+-    this host's annotation instead of re-running ``fn`` (``kanban_annotation_host``)."""
+-    _host_copy.declare_inputs(name, fn, inputs)
+-    if fn is None:
+-        _waiting_sources.pop(name, None)
+-    else:
+-        _waiting_sources[name] = fn
++def register_waiting_source(name: str, fn, inputs=None, *, watch_paths=None, next_deadline=None) -> None:
++    """Register a waiting provider with optional no-DB watch/deadline declarations."""
++    _host_copy.register_waiting_source(name, fn, inputs, watch_paths=watch_paths, next_deadline=next_deadline)
+ 
+ 
+ def _extra_waiting() -> dict[str, set[str]]:
+@@ -1671,19 +1707,11 @@ _done_checks: dict[str, Callable[[dict[str, Any]], bool]] = {}
+ _attention = _AttentionCache(_ATTENTION_TTL_S, max_age_s=_ATTENTION_MAX_AGE_S)
+ 
+ 
+-def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool]) -> Callable[[], None]:
+-    """Register ``fn(card) -> bool`` (True = this completed card needs attention). ``card`` has ``id``, ``title``,
+-    ``summary`` (latest run summary, else ``result``), ``completed_at``, ``board`` and ``board_path``. Re-registering a
+-    name replaces it; the returned callable unregisters."""
+-    _done_checks[name] = fn
+-    _attention.clear()
+-
+-    def _dispose() -> None:
+-        if _done_checks.get(name) is fn:
+-            _done_checks.pop(name, None)
+-            _attention.clear()
+-
+-    return _dispose
++def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
++                        watch_paths=None, next_deadline=None) -> Callable[[], None]:
++    """Register a done check with optional no-DB watch/deadline declarations."""
++    from hermes_cli.kanban_session_activity_attention import register_done_check as register
++    return register(name, fn, watch_paths=watch_paths, next_deadline=next_deadline)
+ 
+ 
+ def _read_recent_done(path: Path, since: float) -> list[tuple[str, dict[str, Any]]]:
+@@ -1692,39 +1720,9 @@ def _read_recent_done(path: Path, since: float) -> list[tuple[str, dict[str, Any
+ 
+ 
+ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+-    """``{session_id: completed cards a registered check flags}`` over the last ``ATTENTION_WINDOW_S``. Cached;
+-    a check that raises counts as False."""
+-    if not _done_checks:
+-        return {}
+-    scope = _origin_scope()
+-    mono = time.monotonic()
+-    hit = _attention.get(scope, mono)
+-    if hit is not None:
+-        return hit
+-    inputs = _revalidate.attention_key()
+-    hit = _attention.get(scope, mono, inputs)
+-    if hit is not None:
+-        return hit
+-    since = (time.time() if now is None else now) - ATTENTION_WINDOW_S
+-    checks = list(_done_checks.values())
+-    paths = list(_board_db_paths())
+-    boards = tuple(str(p) for p in paths)
+-    pairs: set[tuple[str, str]] = set()
+-    for path in paths:
+-        try:
+-            recent = _recent_done.memoized(path, since, _read_recent_done, _revalidate.board_memo_key, scope)  # [daveey]
+-        except sqlite3.Error as exc:
+-            _log.debug("kanban attention read failed for %s: %s", path, exc)
+-            continue
+-        for sid, card in recent:
+-            key = (boards, str(path), str(card["id"]), card.get("completed_at"), card.get("title"), card.get("summary"))
+-            if _attention.verdict(key, mono, lambda card=card: _run_done_checks(checks, card)):
+-                pairs.add((sid, key[2]))
+-    counts: dict[str, int] = {}
+-    for sid, _tid in pairs:
+-        counts[sid] = counts.get(sid, 0) + 1
+-    _attention.put(scope, mono, counts, inputs)
+-    return counts
++    """Count recent completed cards requiring attention, preserving scoped freshness."""
++    from hermes_cli.kanban_session_activity_attention import attention_task_counts as counts
++    return counts(now)
+ 
+ 
+ # [daveey] The read itself lives with the host copy that publishes it (kanban_annotation_host); monkeypatching
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index 215e8736d5..6b3c9aa2fa 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -14,6 +14,7 @@ laptop-1 every expiry re-ran every check (~125 ms of CPU each 30 s) while no lo
+ from __future__ import annotations
+ 
+ import logging
++import math
+ import threading
+ from typing import Any, Callable
+ 
+@@ -28,6 +29,10 @@ def run_checks(checks: list[Callable[[dict[str, Any]], bool]], card: dict[str, A
+                 return True
+         except Exception:  # health: allow BLE001 -- a registered plugin check may raise anything; it counts as False
+             _log.debug("kanban done check failed on %s", card.get("id"), exc_info=True)
++            # The caller intentionally keeps the historical False-on-error
++            # result, but a native holder needs a retry even without a new write.
++            from hermes_cli import kanban_annotation_host as host
++            host.note_deadline(host.time.time() + host.HOLDER_INTERVAL_S)
+     return False
+ 
+ 
+@@ -42,18 +47,24 @@ class AttentionCache:
+         self.max_scopes = max_scopes
+         self.counts: dict[tuple[str, ...], tuple[float, dict[str, int], Any, float]] = {}
+         self.verdicts: dict[tuple, tuple[float, bool]] = {}
++        self.windows: dict[tuple[str, ...], float] = {}
+         self._lock = threading.Lock()
+ 
+     def clear(self) -> None:
+         with self._lock:
+             self.counts.clear()
+             self.verdicts.clear()
++            self.windows.clear()
+ 
+-    def get(self, scope: tuple[str, ...], mono: float, key: Any = None) -> dict[str, int] | None:
++    def get(self, scope: tuple[str, ...], mono: float, key: Any = None,
++            *, wall: float | None = None) -> dict[str, int] | None:
+         """The cached counts within the TTL; past it, only while ``key`` (not None) equals the key they were read
+         under and they are younger than ``max_age_s``."""
+         with self._lock:
+             hit = self.counts.get(scope)
++            window = self.windows.get(scope)
++        if wall is not None and window is not None and wall >= window:
++            return None
+         if hit is None:
+             return None
+         if mono < hit[0]:
+@@ -62,22 +73,109 @@ class AttentionCache:
+             return hit[1]
+         return None
+ 
+-    def put(self, scope: tuple[str, ...], mono: float, counts: dict[str, int], key: Any = None) -> None:
++    def deadline(self, scope: tuple[str, ...]) -> float | None:
++        """The wall-time window boundary, including on a cached-count hit."""
++        with self._lock:
++            return self.windows.get(scope)
++
++    def put(self, scope: tuple[str, ...], mono: float, counts: dict[str, int], key: Any = None,
++            *, window: float | None = None) -> None:
+         with self._lock:
+             self.counts[scope] = (mono + self.ttl_s, counts, key, mono)
++            self.windows.pop(scope, None)
++            if window is not None:
++                self.windows[scope] = window
+             for k in [k for k, v in self.counts.items() if v[3] + self.max_age_s <= mono]:
+                 self.counts.pop(k, None)
+             for k in [k for k, v in self.verdicts.items() if v[0] <= mono]:
+                 self.verdicts.pop(k, None)
+             while len(self.counts) > self.max_scopes:
+                 self.counts.pop(next(iter(self.counts)))
++            for k in set(self.windows) - self.counts.keys():
++                self.windows.pop(k, None)
+ 
+-    def verdict(self, key: tuple, mono: float, compute: Callable[[], bool]) -> bool:
++    def verdict(self, key: tuple, mono: float, compute: Callable[[], bool], *, force: bool = False) -> bool:
+         with self._lock:
+             memo = self.verdicts.get(key)
+-        if memo is not None and mono < memo[0]:
++        if not force and memo is not None and mono < memo[0]:
+             return memo[1]
+         flagged = compute()
+         with self._lock:
+             self.verdicts[key] = (mono + self.ttl_s, flagged)
+         return flagged
++
++
++def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
++                        watch_paths=None, next_deadline=None) -> Callable[[], None]:
++    """Register ``fn(card) -> bool`` (True = this completed card needs attention). ``card`` has ``id``, ``title``,
++    ``summary`` (latest run summary, else ``result``), ``completed_at``, ``board`` and ``board_path``. Re-registering a
++    name replaces it; the returned callable unregisters. Optional event callbacks
++    have the same no-DB-read contract as ``register_waiting_source``; undeclared
++    checks retain bounded fallback rather than silently missing external inputs."""
++    from hermes_cli import kanban_session_activity as activity
++    activity._host_copy.declare_events(name, fn, watch_paths, next_deadline, done_check=True)
++    activity._done_checks[name] = fn
++    activity._attention.clear()
++    activity._host_copy.wake_holder()
++
++    def _dispose() -> None:
++        if activity._done_checks.get(name) is fn:
++            activity._done_checks.pop(name, None)
++            activity._host_copy.declare_events(name, None, None, None, done_check=True)
++            activity._attention.clear()
++            activity._host_copy.wake_holder()
++
++    return _dispose
++
++
++def attention_task_counts(now: float | None = None) -> dict[str, int]:
++    """``{session_id: completed cards a registered check flags}`` over the last ``activity.ATTENTION_WINDOW_S``. Cached;
++    a check that raises counts as False."""
++    from hermes_cli import kanban_session_activity as activity
++    if not activity._done_checks:
++        return {}
++    scope = activity._origin_scope()
++    mono = activity.time.monotonic()
++    wall = activity.time.time() if now is None else now
++    forced = getattr(activity._revalidate.force_read, 'scope', None) == scope
++    hit = None if forced else activity._attention.get(scope, mono, wall=wall)
++    if hit is not None:
++        activity._host_copy.note_deadline(activity._attention.deadline(scope))
++        return hit
++    inputs = activity._revalidate.attention_key()
++    hit = None if forced else activity._attention.get(scope, mono, inputs, wall=wall)
++    if hit is not None:
++        activity._host_copy.note_deadline(activity._attention.deadline(scope))
++        return hit
++    since = wall - activity.ATTENTION_WINDOW_S
++    checks = list(activity._done_checks.values())
++    paths = list(activity._board_db_paths())
++    boards = tuple(str(p) for p in paths)
++    pairs: set[tuple[str, str]] = set()
++    windows: list[float] = []
++    for path in paths:
++        try:
++            recent = activity._recent_done.memoized(path, since, activity._read_recent_done, activity._revalidate.board_memo_key, scope)  # [daveey]
++        except activity.sqlite3.Error as exc:
++            activity._log.debug("kanban attention read failed for %s: %s", path, exc)
++            # A swallowed read failure must own a retry: native notifications
++            # need not arrive again when a transient SQLite lock clears.
++            activity._host_copy.note_deadline(activity.time.time() + activity._host_copy.HOLDER_INTERVAL_S)
++            continue
++        for sid, card in recent:
++            completed = card.get('completed_at')
++            if isinstance(completed, (int, float)) and math.isfinite(completed):
++                # Inclusive cutoff: advance both operands so subtraction at the
++                # emitted wake cannot round back onto the completion timestamp.
++                windows.append(math.nextafter(math.nextafter(completed, math.inf) + activity.ATTENTION_WINDOW_S,
++                                              math.inf))
++            key = (boards, str(path), str(card["id"]), card.get("completed_at"), card.get("title"), card.get("summary"))
++            if activity._attention.verdict(key, mono, lambda card=card: activity._run_done_checks(checks, card), force=forced):
++                pairs.add((sid, key[2]))
++    counts: dict[str, int] = {}
++    for sid, _tid in pairs:
++        counts[sid] = counts.get(sid, 0) + 1
++    window = min(windows, default=None)
++    activity._attention.put(scope, mono, counts, inputs, window=window)
++    activity._host_copy.note_deadline(window)
++    return counts
+diff --git a/tests/hermes_cli/test_annotation_attention_events.py b/tests/hermes_cli/test_annotation_attention_events.py
+new file mode 100644
+index 0000000000..3e312b2d1a
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_attention_events.py
+@@ -0,0 +1,100 @@
++"""Attention cache clock transitions under native annotation refresh."""
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_session_activity_attention import AttentionCache
++
++
++@pytest.fixture
++def attention(monkeypatch):
++    clock = SimpleNamespace(wall=1000.0, mono=100.0)
++    monkeypatch.setattr(ksa, 'time', SimpleNamespace(time=lambda: clock.wall, monotonic=lambda: clock.mono))
++    monkeypatch.setattr(ksa, '_attention', AttentionCache(30, max_age_s=300))
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('attention-events',))
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [Path('fixture.db')])
++    monkeypatch.setattr(ksa._revalidate, 'attention_key', lambda: 'unchanged')
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', None, raising=False)
++    rows = [('chat', {'id': 'task', 'completed_at': clock.wall - ksa.ATTENTION_WINDOW_S + 1,
++                      'title': 'done', 'summary': 'check'})]
++    monkeypatch.setattr(ksa._recent_done, 'memoized',
++                        lambda path, since, *args: [(sid, card) for sid, card in rows
++                                                   if card['completed_at'] >= since])
++    flagged = [True]
++    monkeypatch.setattr(ksa, '_done_checks', {'fixture': lambda card: flagged[0]})
++    deadlines = []
++    monkeypatch.setattr(host, 'note_deadline', deadlines.append)
++    return clock, rows, flagged, deadlines
++
++
++def test_attention_window_emits_deadline_even_on_cached_counts(attention):
++    clock, _, _, deadlines = attention
++    assert ksa.attention_task_counts() == {'chat': 1}
++    assert deadlines and 1001.0 < deadlines[-1] < 1001.001
++    first = deadlines[-1]
++    deadlines.clear()
++    clock.wall += .25
++    clock.mono += .25
++    assert ksa.attention_task_counts() == {'chat': 1}
++    assert deadlines == [first], 'cache hit lost the window clock'
++
++
++def test_attention_window_expires_inside_cache_ttl(attention):
++    clock, _, _, _ = attention
++    assert ksa.attention_task_counts() == {'chat': 1}
++    clock.wall += 1.01
++    clock.mono += 1.01
++    assert ksa.attention_task_counts() == {}, 'TTL hid a completed card leaving the window'
++
++
++def test_attention_window_is_inclusive_then_expires_at_emitted_deadline(attention):
++    clock, _, _, deadlines = attention
++    assert ksa.attention_task_counts() == {'chat': 1}
++    due = deadlines[-1]
++    clock.wall = 1001.0
++    clock.mono = 101.0
++    assert ksa.attention_task_counts() == {'chat': 1}
++    clock.wall = due
++    assert ksa.attention_task_counts() == {}, 'emitted wake still includes the expired row'
++
++
++def test_attention_read_error_schedules_recovery_without_a_write(attention, monkeypatch):
++    clock, rows, _, deadlines = attention
++    rows[0][1]['completed_at'] = clock.wall
++    original = ksa._recent_done.memoized
++
++    def unavailable(*args):
++        raise ksa.sqlite3.OperationalError('temporary source failure')
++
++    monkeypatch.setattr(ksa._recent_done, 'memoized', unavailable)
++    assert ksa.attention_task_counts() == {}
++    retries = [due for due in deadlines if due is not None]
++    assert retries and retries[-1] == clock.wall + host.HOLDER_INTERVAL_S
++    clock.wall = retries[-1]
++    clock.mono += host.HOLDER_INTERVAL_S
++    monkeypatch.setattr(ksa._recent_done, 'memoized', original)
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', ('attention-events',))
++    assert ksa.attention_task_counts() == {'chat': 1}
++
++
++def test_window_state_is_bounded_replaced_and_cleared():
++    cache = AttentionCache(30, max_scopes=1)
++    cache.put(('a',), 0, {}, window=50)
++    cache.put(('b',), 0, {}, window=60)
++    assert cache.deadline(('a',)) is None
++    cache.put(('b',), 1, {})
++    assert cache.deadline(('b',)) is None
++    cache.put(('b',), 2, {}, window=70)
++    cache.clear()
++    assert cache.deadline(('b',)) is None
++
++
++def test_source_refresh_bypasses_counts_and_check_verdict(attention, monkeypatch):
++    _, _, flagged, _ = attention
++    assert ksa.attention_task_counts() == {'chat': 1}
++    flagged[0] = False
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', ('attention-events',))
++    assert ksa.attention_task_counts() == {}, 'source refresh reused the old done-check verdict'
+diff --git a/tests/hermes_cli/test_annotation_done_events.py b/tests/hermes_cli/test_annotation_done_events.py
+new file mode 100644
+index 0000000000..1911f72037
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_done_events.py
+@@ -0,0 +1,68 @@
++"""Done-check inputs must not disappear when annotation timers are removed."""
++import pytest
++
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_session_activity_attention import run_checks
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch):
++    monkeypatch.setattr(ksa, '_done_checks', {})
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    monkeypatch.setattr(host, '_done_event_sources', {}, raising=False)
++    monkeypatch.setattr(host, '_event_warned', set())
++    monkeypatch.setattr(ksa, '_attention', ksa._AttentionCache(30))
++
++
++def test_legacy_done_check_has_bounded_fallback(caplog):
++    ksa.register_done_check('legacy', lambda card: False)
++    assert host.waiting_events(100) == (set(), 160)
++    assert host.waiting_events(101) == (set(), 161)
++    assert len([r for r in caplog.records if 'legacy' in r.message]) == 1
++
++
++def test_done_check_registration_and_disposal_wake_holder(monkeypatch):
++    wakes = []
++    monkeypatch.setattr(host, 'wake_holder', lambda: wakes.append(True))
++    dispose = ksa.register_done_check('check', lambda card: False)
++    assert len(wakes) == 1
++    dispose()
++    assert len(wakes) == 2
++    dispose()
++    assert len(wakes) == 2
++
++
++def test_done_check_events_are_separate_from_same_named_waiting_source(tmp_path):
++    ksa.register_waiting_source('same', dict, watch_paths=lambda: [tmp_path / 'waiting.db'])
++    dispose = ksa.register_done_check('same', lambda card: False,
++                                      watch_paths=lambda: [tmp_path / 'done.db'], next_deadline=lambda: 105)
++    assert host.waiting_events(100) == ({tmp_path / 'waiting.db', tmp_path / 'done.db'}, 105)
++    dispose()
++    assert host.waiting_events(100) == ({tmp_path / 'waiting.db'}, None)
++
++
++def test_old_disposer_cannot_remove_replacement_coverage(tmp_path):
++    dispose = ksa.register_done_check('same', lambda card: False,
++                                      watch_paths=lambda: [tmp_path / 'old.db'])
++    ksa.register_done_check('same', lambda card: True, watch_paths=lambda: [tmp_path / 'new.db'])
++    dispose()
++    assert host.waiting_events(100) == ({tmp_path / 'new.db'}, None)
++
++
++def test_failed_done_check_retries_without_another_input_write(monkeypatch):
++    due = []
++    monkeypatch.setattr(host, 'note_deadline', due.append)
++    monkeypatch.setattr(host.time, 'time', lambda: 100)
++    def broken(card):
++        raise OSError('temporary external input failure')
++    assert run_checks([broken], {'id': 'done'}) is False
++    assert due == [100 + host.HOLDER_INTERVAL_S]
++
++
++def test_declared_done_check_failure_keeps_recovery_bounded():
++    def broken():
++        raise OSError('input discovery unavailable')
++    ksa.register_done_check('check', lambda card: False, watch_paths=broken)
++    assert host.waiting_events(100) == (set(), 102)
+diff --git a/tests/hermes_cli/test_annotation_event_loop.py b/tests/hermes_cli/test_annotation_event_loop.py
+new file mode 100644
+index 0000000000..47a1eb5df2
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_event_loop.py
+@@ -0,0 +1,115 @@
++"""Real native waits with independent lease maintenance."""
++import resource
++import threading
++import time
++from types import SimpleNamespace
++
++from hermes_cli.annotation_event_loop import run
++from hermes_cli.annotation_file_events import FileEvents
++
++
++def test_idle_beats_do_not_read_inputs_and_change_wakes(tmp_path):
++    source = tmp_path / 'source'
++    source.write_text('one')
++    stop = threading.Event()
++    ready = threading.Event()
++    updated = threading.Event()
++    reads, beats = [], []
++    with FileEvents() as events:
++        def refresh():
++            events.replace([source])
++            reads.append(source.read_text() if source.exists() else None)
++            ready.set()
++            if len(reads) > 1:
++                updated.set()
++        lease = SimpleNamespace(held=lambda: True, beat=lambda: beats.append(1))
++        usage = []
++        def worker():
++            before = resource.getrusage(resource.RUSAGE_THREAD)
++            started = time.monotonic()
++            run(events, stop, lease, refresh, interval=.2)
++            after = resource.getrusage(resource.RUSAGE_THREAD)
++            usage.append((after.ru_nvcsw - before.ru_nvcsw) / (time.monotonic() - started))
++        thread = threading.Thread(target=worker, name='kanban-annotation-holder')
++        thread.start()
++        try:
++            assert ready.wait(1)
++            assert not updated.wait(61)
++            assert len(beats) >= 3
++            started = time.monotonic()
++            source.unlink()
++            assert updated.wait(1)
++            assert time.monotonic() - started < 1
++            assert reads == ['one', None]
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(2)
++        assert not thread.is_alive()
++        assert usage[0] < 500
++        print(f'isolated native scheduler voluntary cs/s: {usage[0]:.3f}')
++
++
++def test_lease_errors_recover_without_reading_under_lost_ownership():
++    stop = threading.Event()
++    calls = []
++    held_calls = []
++    beat_calls = []
++
++    class Events:
++        def wait(self, timeout):
++            stop.wait(timeout)
++            return False
++
++    def held():
++        held_calls.append(1)
++        if len(held_calls) == 1:
++            raise OSError('lease temporarily unreadable')
++        return True
++
++    def beat():
++        beat_calls.append(1)
++        if len(beat_calls) == 1:
++            raise OSError('lease heartbeat failed')
++
++    def refresh():
++        calls.append((len(held_calls), len(beat_calls)))
++        stop.set()
++
++    # Bounded even if recovery regresses; exceptions remain test failures.
++    timer = threading.Timer(1, stop.set)
++    timer.start()
++    try:
++        run(Events(), stop, SimpleNamespace(held=held, beat=beat), refresh, interval=.01)
++    finally:
++        timer.cancel()
++        timer.join()
++    assert calls == [(3, 2)]
++
++
++def test_one_shot_deadline_and_read_error_retry(tmp_path):
++    stop = threading.Event()
++    done = threading.Event()
++    calls = []
++    with FileEvents() as events:
++        def refresh():
++            events.replace([])
++            calls.append(time.monotonic())
++            if len(calls) == 1:
++                raise OSError('transient input failure')
++            if len(calls) == 2:
++                return time.time() + .05
++            done.set()
++            return None
++        lease = SimpleNamespace(held=lambda: True, beat=lambda: None)
++        thread = threading.Thread(target=run, args=(events, stop, lease, refresh), kwargs={'interval': .02})
++        thread.start()
++        try:
++            assert done.wait(1)
++            assert not stop.wait(.08)
++            assert len(calls) == 3
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(2)
++        assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_annotation_event_sources.py b/tests/hermes_cli/test_annotation_event_sources.py
+new file mode 100644
+index 0000000000..8655a13730
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_event_sources.py
+@@ -0,0 +1,96 @@
++"""Waiting providers declare event coverage independently of cache keys."""
++from pathlib import Path
++import pytest
++
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++
++
++def test_discovery_covers_absent_configured_sources(monkeypatch, tmp_path):
++    from hermes_cli import kanban_db
++    from hermes_constants import get_hermes_home
++
++    root = tmp_path / 'shared-boards'
++    hub = tmp_path / 'hub-state'
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(root))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(hub))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(tmp_path / 'mail.json'))
++    files, directories = host._discovery_paths()
++    assert root / 'kanban.db' in files
++    assert hub / 'hub.db' in files
++    assert kanban_db.boards_root() in directories
++    assert root / 'kanban' / 'sync-shadow' in directories
++    assert get_hermes_home() / 'config.yaml' in files
++    assert tmp_path / 'mail.json' in files
++    # An existing empty board directory must be watched for later DB creation.
++    board = kanban_db.boards_root() / 'new'
++    board.mkdir(parents=True)
++    _, directories = host._discovery_paths()
++    assert board in directories
++
++
++def test_configured_source_creation_notifies_native_holder(monkeypatch, tmp_path):
++    from hermes_cli.annotation_file_events import FileEvents
++
++    root = tmp_path / 'boards-root'
++    root.mkdir()
++    hub = tmp_path / 'hub-root'
++    hub.mkdir()
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(root))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(hub))
++    with FileEvents() as events:
++        files, directories = host._discovery_paths()
++        events.replace(files, directories=directories)
++        (hub / 'hub.db').write_bytes(b'new')
++        assert events.wait(0.5)
++        events.replace(files, directories=directories)
++        (root / 'kanban.db').write_bytes(b'new')
++        assert events.wait(0.5)
++
++
++def test_declared_source_has_no_periodic_deadline(monkeypatch, tmp_path):
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    fn = dict
++    ksa.register_waiting_source('events', fn, watch_paths=lambda: [tmp_path / 'state.db'],
++                               next_deadline=lambda: None)
++    assert host.waiting_events(100) == ({tmp_path / 'state.db'}, None)
++
++
++def test_unknown_provider_is_bounded_and_logged_once(monkeypatch, caplog):
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    monkeypatch.setattr(host, '_event_warned', set())
++    ksa.register_waiting_source('legacy', dict)
++    assert host.waiting_events(100) == (set(), 160)
++    assert host.waiting_events(101) == (set(), 161)
++    assert len([r for r in caplog.records if 'legacy' in r.message]) == 1
++
++
++def test_replacement_removes_old_coverage(monkeypatch):
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    ksa.register_waiting_source('events', dict, watch_paths=lambda: [Path('/old')])
++    ksa.register_waiting_source('events', dict)
++    assert host.waiting_events(100) == (set(), 160)
++    ksa.register_waiting_source('events', None)
++    assert host.waiting_events(100) == (set(), None)
++
++
++def test_deadline_is_absolute_and_bad_declaration_retries(monkeypatch):
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    ksa.register_waiting_source('clock', dict, watch_paths=list, next_deadline=lambda: 105)
++    assert host.waiting_events(100) == (set(), 105)
++    def broken():
++        raise OSError('source unavailable')
++    ksa.register_waiting_source('clock', dict, watch_paths=broken)
++    assert host.waiting_events(100) == (set(), 102)
++
++
++@pytest.mark.parametrize('due', [float('nan'), float('inf'), -float('inf'), 'bad', 99])
++def test_invalid_or_unconsumed_deadline_has_bounded_retry(monkeypatch, due):
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(host, '_event_sources', {})
++    ksa.register_waiting_source('clock', dict, watch_paths=list, next_deadline=lambda: due)
++    assert host.waiting_events(100) == (set(), 102)
+diff --git a/tests/hermes_cli/test_annotation_file_events.py b/tests/hermes_cli/test_annotation_file_events.py
+new file mode 100644
+index 0000000000..31a0a2fce9
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_file_events.py
+@@ -0,0 +1,250 @@
++"""Native notification boundary for annotation snapshots. [daveey]"""
++import sys
++import struct
++import errno
++import os
++
++import pytest
++
++from hermes_cli import annotation_file_events as module
++from hermes_cli.annotation_file_events import FileEvents
++
++pytestmark = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux native notification boundary')
++
++
++def test_queue_overflow_invalidates_every_snapshot(tmp_path, monkeypatch):
++    with FileEvents() as events:
++        events.replace([tmp_path / 'input'])
++        monkeypatch.setattr(module.select, 'select', lambda *args: ([events._fd], [], []))
++        reads = iter([struct.pack('iIII', -1, 0x4000, 0, 0)])
++
++        def read(*args):
++            try:
++                return next(reads)
++            except StopIteration:
++                raise BlockingIOError from None
++
++        monkeypatch.setattr(module.os, 'read', read)
++        assert events.wait(0)
++        assert not events.control_only
++
++@pytest.mark.parametrize('mask', [0x400, 0x800, 0x2000, 0x8000])
++def test_watch_loss_invalidates_snapshot(tmp_path, monkeypatch, mask):
++    with FileEvents() as events:
++        events.replace([tmp_path / 'input'])
++        wd = next(iter(events._names))
++        monkeypatch.setattr(module.select, 'select', lambda *args: ([events._fd], [], []))
++        reads = iter([struct.pack('iIII', wd, mask, 0, 0)])
++
++        def read(*args):
++            try:
++                return next(reads)
++            except StopIteration:
++                raise BlockingIOError from None
++
++        monkeypatch.setattr(module.os, 'read', read)
++        assert events.wait(0)
++        assert not events.control_only
++
++
++def test_continuous_events_have_bounded_drain(tmp_path, monkeypatch):
++    with FileEvents() as events:
++        events.replace([tmp_path / 'input'])
++        monkeypatch.setattr(module.select, 'select', lambda *args: ([events._fd], [], []))
++        calls = []
++
++        def read(*args):
++            calls.append(True)
++            assert len(calls) <= 16, 'continuous writer starved caller'
++            return struct.pack('iIII', -1, 0x4000, 0, 0)
++
++        monkeypatch.setattr(module.os, 'read', read)
++        assert events.wait(0)
++        assert not events.control_only
++
++
++def test_file_write_wakes_without_input_polling(tmp_path):
++    source = tmp_path / 'input'
++    source.write_text('before')
++    with FileEvents() as events:
++        events.replace([str(source)])
++        assert not events.wait(0)
++        source.write_text('after')
++        assert events.wait(0.8)
++        assert not events.wait(0)
++
++
++def test_wake_after_owner_close_is_harmless():
++    events = FileEvents()
++    events.close()
++    events.wake()
++    events.close()
++
++
++def test_control_notifications_do_not_hide_source_events(tmp_path):
++    source, demand = tmp_path / 'input', tmp_path / 'demand'
++    with FileEvents() as events:
++        events.replace([source], controls=[demand])
++        demand.write_text('interest')
++        assert events.wait(.8)
++        assert events.control_only
++        demand.write_text('renewed')
++        source.write_text('changed')
++        assert events.wait(.8)
++        assert not events.control_only
++        events.wake()
++        assert events.wait(.8)
++        assert not events.control_only
++
++
++def test_replaced_subscription_ignores_removed_source(tmp_path):
++    old = tmp_path / 'old'
++    new = tmp_path / 'new'
++    old.write_text('before')
++    new.write_text('before')
++    with FileEvents() as events:
++        events.replace([str(old)])
++        events.replace([str(new)])
++        old.write_text('after')
++        assert not events.wait(0.1)
++        new.unlink()
++        assert events.wait(0.8)
++
++
++def test_missing_ancestors_are_covered_before_snapshot(tmp_path):
++    source = tmp_path / 'missing' / 'nested' / 'state.db'
++    with FileEvents() as events:
++        events.replace([source])
++        source.parent.mkdir(parents=True)
++        assert events.wait(0.8)
++        events.replace([source])
++        source.write_text('created')
++        assert events.wait(0.8)
++        events.replace([source])
++        source.write_text('updated')
++        assert events.wait(0.8)
++
++
++def test_failed_install_keeps_previous_subscription_without_fd_leak(tmp_path, monkeypatch):
++    old = tmp_path / 'old'
++    with FileEvents() as events:
++        events.replace([old])
++        before = set(os.listdir('/proc/self/fd'))
++        add = events._lib.inotify_add_watch
++        calls = 0
++
++        def failing_add(*args):
++            nonlocal calls
++            calls += 1
++            if calls == 2:
++                module.ctypes.set_errno(errno.ENOSPC)
++                return -1
++            return add(*args)
++
++        monkeypatch.setattr(events._lib, 'inotify_add_watch', failing_add)
++        with pytest.raises(OSError, match='No space'):
++            events.replace([tmp_path / 'other'])
++        assert set(os.listdir('/proc/self/fd')) == before
++        old.write_text('still watched')
++        assert events.wait(0.8)
++
++
++def test_explicit_wake_interrupts_wait_without_filesystem_reads(tmp_path):
++    import threading
++    with FileEvents() as events:
++        events.replace([tmp_path / 'input'])
++        result = []
++        thread = threading.Thread(target=lambda: result.append(events.wait(5)))
++        thread.start()
++        try:
++            events.wake()
++            thread.join(0.8)
++            assert not thread.is_alive()
++            assert result == [True]
++            assert not events.wait(0)
++        finally:
++            thread.join(6)
++
++
++def test_directory_discovery_and_wal_creation(tmp_path):
++    with FileEvents() as events:
++        events.replace([tmp_path / 'state.db'], directories=[tmp_path / 'boards'])
++        (tmp_path / 'state.db-wal').write_text('wal')
++        assert events.wait(0.8)
++        (tmp_path / 'boards').mkdir()
++        assert events.wait(0.8)
++        events.replace([tmp_path / 'state.db'], directories=[tmp_path / 'boards'])
++        (tmp_path / 'boards' / 'new-board').mkdir()
++        assert events.wait(0.8)
++
++
++def test_parent_replacement_rearms(tmp_path):
++    parent = tmp_path / 'parent'
++    parent.mkdir()
++    source = parent / 'input'
++    with FileEvents() as events:
++        events.replace([source])
++        parent.rename(tmp_path / 'retired')
++        parent.mkdir()
++        assert events.wait(0.8)
++        events.replace([source])
++        source.write_text('new inode')
++        assert events.wait(0.8)
++
++
++def test_symlink_target_write_and_retarget_are_observed(tmp_path):
++    target = tmp_path / 'target'
++    target.mkdir()
++    other = tmp_path / 'other'
++    other.mkdir()
++    alias = tmp_path / 'alias'
++    alias.symlink_to(target, target_is_directory=True)
++    with FileEvents() as events:
++        events.replace([alias / 'input'])
++        (target / 'input').write_text('first')
++        assert events.wait(0.8)
++        alias.unlink()
++        alias.symlink_to(other, target_is_directory=True)
++        assert events.wait(0.8)
++        events.replace([alias / 'input'])
++        (other / 'input').write_text('second')
++        assert events.wait(0.8)
++
++
++def test_file_symlink_target_and_missing_target_creation(tmp_path):
++    target = tmp_path / 'outside' / 'nested' / 'input'
++    alias = tmp_path / 'input-link'
++    alias.symlink_to(target)
++    with FileEvents() as events:
++        events.replace([alias])
++        target.parent.mkdir(parents=True)
++        assert events.wait(0.5), 'creation of missing symlink target ancestors was missed'
++        events.replace([alias])
++        target.write_text('created')
++        assert events.wait(0.5)
++        events.replace([alias])
++        target.write_text('changed')
++        assert events.wait(0.5), 'direct writes to a file symlink target were missed'
++
++
++def test_read_error_propagates_and_can_reinstall(tmp_path, monkeypatch):
++    source = tmp_path / 'input'
++    with FileEvents() as events:
++        events.replace([source])
++        source.write_text('before')
++        with monkeypatch.context() as patch:
++            def failed_read(*args):
++                raise OSError(errno.EIO, 'injected read failure')
++            patch.setattr(module.os, 'read', failed_read)
++            with pytest.raises(OSError, match='injected read failure'):
++                events.wait(0.8)
++        events.replace([source])
++        source.write_text('after')
++        assert events.wait(0.8)
++
++
++def test_unsupported_platform_has_no_polling_fallback(monkeypatch):
++    monkeypatch.setattr(module.sys, 'platform', 'unsupported')
++    with pytest.raises(NotImplementedError):
++        FileEvents()
++
+diff --git a/tests/hermes_cli/test_annotation_links_events.py b/tests/hermes_cli/test_annotation_links_events.py
+new file mode 100644
+index 0000000000..85e36b96ef
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_links_events.py
+@@ -0,0 +1,85 @@
++"""Event invalidation must cross inner links caches and close before derivation."""
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_replica_memo as replica
++
++
++@pytest.mark.parametrize('display', [False, True])
++def test_forced_scope_reprojects_even_with_unchanged_links_key(monkeypatch, display):
++    scope = ('event-scope',)
++    old = (time.monotonic() + 100, scope, ('unchanged',), [{'stale': False}], [])
++    new = (time.monotonic() + 100, scope, ('unchanged',), [{'stale': True}], [])
++    monkeypatch.setattr(ksa, '_links_cache', {scope: old})
++    monkeypatch.setattr(ksa, '_links_fingerprint', lambda: ('unchanged',))
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', scope, raising=False)
++    published = []
++    monkeypatch.setattr(ksa, '_publish_links', lambda s, f: published.append((s, f)) or new)
++    background = []
++    monkeypatch.setattr(ksa, '_refresh_links_in_background', background.append)
++    assert ksa._links_lookup(scope, display) is new
++    assert published == [(scope, ('unchanged',))]
++    assert background == []
++
++
++def test_force_is_scope_local_and_ordinary_cache_still_reuses(monkeypatch):
++    scope = ('ordinary-scope',)
++    old = (time.monotonic() + 100, scope, ('unchanged',), [], [])
++    monkeypatch.setattr(ksa, '_links_cache', {scope: old})
++    monkeypatch.setattr(ksa, '_links_fingerprint', lambda: ('unchanged',))
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', ('other',), raising=False)
++    monkeypatch.setattr(ksa, '_publish_links', lambda *a: pytest.fail('unrelated scope forced'))
++    assert ksa._links_lookup(scope, False) is old
++
++
++@pytest.mark.parametrize('mode', ['incremental', 'full', 'memo'])
++def test_replica_finish_runs_after_source_connection_closes(tmp_path, monkeypatch, mode):
++    path = tmp_path / 'replica.db'
++    writer = sqlite3.connect(path)
++    writer.execute('CREATE TABLE replica (coll TEXT, key TEXT, gw TEXT, data TEXT, updated_at INTEGER, seq INTEGER, version INTEGER)')
++    writer.commit()
++    writer.close()
++    opened = []
++    original = ksa._open_ro
++    def open_one(path):
++        conn = original(path)
++        opened.append(conn)
++        return conn
++    monkeypatch.setattr(ksa, '_open_ro', open_one)
++    monkeypatch.setattr(ksa, '_self_gateway', lambda conn: 'local')
++    monkeypatch.setattr(ksa, '_meta_float', lambda conn, name: None)
++    monkeypatch.setattr(ksa, '_remote_read_memo', {})
++    original_finish, original_project = replica.finish, ksa._project_replica
++    derived, annotated = [], []
++    def closed():
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++    def finish(captured, *args, **kwargs):
++        assert isinstance(captured, ksa._replica_rows.Rows), 'lazy SQL escaped the snapshot'
++        closed()
++        derived.append('incremental')
++        return original_finish(captured, *args, **kwargs)
++    def project(*args, **kwargs):
++        closed()
++        derived.append('full')
++        return original_project(*args, **kwargs)
++    def annotate(*args):
++        closed()
++        annotated.append(True)
++    monkeypatch.setattr(replica, 'finish', finish)
++    monkeypatch.setattr(ksa, '_project_replica', project)
++    monkeypatch.setattr(ksa, '_note_known_gateways', annotate)
++    assert ksa._read_remote_links(path, now=time.time() if mode == 'full' else None) == []
++    assert derived == ['full' if mode == 'full' else 'incremental']
++    assert annotated == [True]
++    if mode == 'memo':
++        opened.clear()
++        derived.clear()
++        annotated.clear()
++        assert ksa._read_remote_links(path) == []
++        assert derived == [], 'unchanged materialized memo must not reproject'
++        assert annotated == [True]
+diff --git a/tests/hermes_cli/test_annotation_native_holder.py b/tests/hermes_cli/test_annotation_native_holder.py
+new file mode 100644
+index 0000000000..270be2ab26
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_native_holder.py
+@@ -0,0 +1,467 @@
++"""Exercise native scheduling through the actual annotation projection path."""
++import contextvars
++import resource
++import sqlite3
++
++import pytest
++import threading
++import time
++from types import SimpleNamespace
++
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.annotation_event_loop import run
++from hermes_cli.annotation_file_events import FileEvents
++from tests.hermes_cli import test_kanban_annotation_host as helpers
++
++
++def test_failed_scope_does_not_starve_other_scopes(monkeypatch, tmp_path):
++    current = contextvars.ContextVar('annotation-test-scope')
++    scopes = [('failed',), ('healthy',)]
++    contexts = {}
++    for scope in scopes:
++        ctx = contextvars.copy_context()
++        ctx.run(current.set, scope)
++        contexts[scope] = ctx
++    monkeypatch.setattr(host, '_known', contexts)
++    monkeypatch.setattr(host, '_clock_deadlines', {})
++    monkeypatch.setattr(host, '_event_ready', set())
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([], []))
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), None))
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / scope[0])
++    monkeypatch.setattr(disk, 'demand_age', lambda scope: 0)
++    monkeypatch.setattr(ksa, '_origin_scope', current.get)
++    calls = []
++    def refresh(scope):
++        calls.append(scope)
++        if scope == scopes[0]:
++            raise OSError('failed source')
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', refresh)
++    events = SimpleNamespace(replace=lambda *a, **kw: None)
++    started = time.time()
++    due = host._event_refresh(events)
++    assert calls == scopes
++    assert due is not None
++    assert started < due <= time.time() + host.HOLDER_INTERVAL_S
++    assert host._event_ready == {scopes[1]}
++
++
++def test_dormant_scope_does_not_amplify_active_demand(monkeypatch, tmp_path):
++    current = contextvars.ContextVar('dormant-scope')
++    active, dormant = ('active',), ('dormant',)
++    contexts = {}
++    for scope in (active, dormant):
++        ctx = contextvars.copy_context()
++        ctx.run(current.set, scope)
++        contexts[scope] = ctx
++    monkeypatch.setattr(host, '_known', contexts)
++    monkeypatch.setattr(host, '_clock_deadlines', {})
++    monkeypatch.setattr(host, '_event_ready', set())
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), None))
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / scope[0])
++    ages = {active: 0, dormant: None}
++    monkeypatch.setattr(disk, 'demand_age', ages.get)
++    monkeypatch.setattr(ksa, '_origin_scope', current.get)
++    calls, replacements = [], []
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', calls.append)
++    events = SimpleNamespace(replace=lambda *a, **kw: replacements.append(kw), control_only=False)
++    host._event_refresh(events)
++    assert calls == [active]
++    events.control_only = True
++    for _ in range(10):
++        host._event_refresh(events)
++    assert calls == [active], 'dormant scope caused unchanged active inputs to be reread'
++    assert len(replacements) == 1, 'demand discarded queued native source events'
++    assert dormant not in host._event_ready, 'dormant is not a certified projection'
++    ages[dormant] = 0
++    host._event_refresh(events)
++    assert dormant in calls, 'first demand must activate the dormant scope'
++    assert dormant in host._event_ready
++
++
++def test_coverage_failure_does_not_starve_healthy_scope(monkeypatch, tmp_path):
++    current = contextvars.ContextVar('coverage-scope')
++    failed, healthy = ('failed-coverage',), ('healthy-coverage',)
++    contexts = {}
++    for scope in (failed, healthy):
++        ctx = contextvars.copy_context()
++        ctx.run(current.set, scope)
++        contexts[scope] = ctx
++    monkeypatch.setattr(host, '_known', contexts)
++    monkeypatch.setattr(host, '_clock_deadlines', {})
++    monkeypatch.setattr(host, '_event_ready', set())
++    broken = [True]
++    def paths(scope):
++        if scope == failed and broken[0]:
++            raise OSError('source discovery unavailable')
++        return [], []
++    monkeypatch.setattr(host, '_watch_paths', paths)
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), None))
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / scope[0])
++    monkeypatch.setattr(disk, 'demand_age', lambda scope: 0)
++    monkeypatch.setattr(ksa, '_origin_scope', current.get)
++    monkeypatch.setattr(host.time, 'time', lambda: 100.0)
++    calls = []
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', calls.append)
++    events = SimpleNamespace(replace=lambda *a, **kw: None, control_only=False)
++    assert host._event_refresh(events) == 102.0
++    assert calls == [healthy]
++    assert host._event_ready == {healthy}
++    events.control_only = True
++    assert host._event_refresh(events) == 102.0
++    assert calls == [healthy], 'demand bypassed coverage retry backoff'
++    broken[0] = False
++    monkeypatch.setattr(host.time, 'time', lambda: 103.0)
++    host._event_refresh(events)
++    assert failed in calls, 'coverage error never recovered without source write'
++    assert host._event_ready == {failed, healthy}
++
++
++@pytest.mark.parametrize('outcome', ['cached-clock', 'inactive', 'error', 'busy'])
++def test_scope_deadlines_preserve_cached_clocks_and_retry(monkeypatch, tmp_path, outcome):
++    scope = ('clock-test',)
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    monkeypatch.setattr(host, '_clock_deadlines', {scope: [10000.0]})
++    monkeypatch.setattr(host, '_event_ready', {scope})
++    monkeypatch.setattr(host.time, 'time', lambda: 100.0)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), None))
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / 'copy')
++    monkeypatch.setattr(disk, 'demand_age', lambda scope: None if outcome == 'inactive' else 0)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    calls = []
++    def refresh(scope):
++        calls.append(scope)
++        if outcome == 'error':
++            raise OSError('source unavailable')
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', refresh)
++    if outcome == 'busy':
++        monkeypatch.setattr(ksa, '_annotate_refresh_lock', SimpleNamespace(acquire=lambda **kw: False))
++    events = SimpleNamespace(replace=lambda *a, **kw: None, control_only=False)
++    due = host._event_refresh(events)
++    expected = [] if outcome == 'inactive' else [10000.0]
++    if outcome in ('error', 'busy'):
++        expected.insert(0, 102.0)
++    assert host._clock_deadlines.get(scope, []) == expected
++    assert due == (expected[0] if expected else None)
++    if outcome in ('error', 'busy'):
++        events.control_only = True
++        assert host._event_refresh(events) == 102.0
++        assert len(calls) == (1 if outcome == 'error' else 0), 'control wake bypassed retry backoff'
++    if outcome == 'cached-clock':
++        events.control_only = True
++        assert host._event_refresh(events) == 10000.0
++        assert calls == [scope]
++
++
++@pytest.mark.parametrize('complete,fresh', [(False, True), (True, False)])
++def test_degraded_board_read_schedules_recovery(monkeypatch, tmp_path, complete, fresh):
++    path = tmp_path / 'kanban.db'
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path])
++    monkeypatch.setattr(ksa, '_board_memo', {})
++    monkeypatch.setattr(ksa._revalidate, 'board_memo_key', lambda path: 'key')
++    reads = {'active': {}, 'blocked': {}, 'unseen': {}, 'pairs': set(),
++             'parked': ({}, {}), 'stall_rows': (set(), {}, {})}
++    monkeypatch.setattr(ksa._busy, 'board_reads', lambda *args: (reads, complete, fresh))
++    deadlines = []
++    monkeypatch.setattr(host, 'note_deadline', deadlines.append)
++    started = time.time()
++    ksa._read_local_boards({}, {}, {})
++    assert deadlines, 'degraded last-good display must retry without another source event'
++    assert started < min(deadlines) <= time.time() + host.HOLDER_INTERVAL_S
++
++
++def test_board_batch_closes_connection_before_return(tmp_path, monkeypatch):
++    path = tmp_path / 'kanban.db'
++    writer = helpers._board(path, [('t1', 'running', 's1')])
++    opened = []
++    original = ksa._open_ro
++    def open_one(path):
++        conn = original(path)
++        opened.append(conn)
++        return conn
++    monkeypatch.setattr(ksa, '_open_ro', open_one)
++    try:
++        reads, complete = ksa._read_board(path, parked=True, stalled=True)
++        assert reads['active'] == {'s1': 1}
++        assert complete
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++    finally:
++        writer.close()
++
++
++def test_board_execution_derives_after_connection_close(tmp_path, monkeypatch):
++    from hermes_cli import kanban_execution_source as source
++
++    path = tmp_path / 'kanban.db'
++    writer = helpers._board(path, [('t1', 'running', 's1')])
++    opened, derived = [], []
++    original_open, original_raw = ksa._open_ro, source.safe_raw
++
++    def open_one(path):
++        conn = original_open(path)
++        opened.append(conn)
++        return conn
++
++    def derive(task, inputs):
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++        derived.append(task['id'])
++        return original_raw(task, inputs)
++
++    monkeypatch.setattr(ksa, '_open_ro', open_one)
++    monkeypatch.setattr(source, 'safe_raw', derive)
++    try:
++        reads, complete = ksa._read_board(path, parked=True, stalled=True)
++        assert complete and reads['active'] == {'s1': 1}
++        assert derived == ['t1']
++    finally:
++        writer.close()
++
++
++@pytest.mark.parametrize('action', ['remove', 'read-error', 'deadline', 'links-clock', 'attention-window',
++                                   'done-source', 'done-clock', 'done-error', 'done-register', 'watch-loss', 'overflow'])
++def test_real_projection_removal_and_read_recovery(tmp_path, monkeypatch, action):
++    scope = ('native-recovery-test', 'default')
++    path = tmp_path / 'kanban.db'
++    writer = helpers._board(path, [('t1', 'running', 's1')])
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path] if path.exists() else [])
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(ksa, '_replica_paths', list)
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(ksa, '_done_checks', {})
++    monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(path)], []))
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    disk.touch_demand(scope)
++    ready, changed, failed, stop = (threading.Event() for _ in range(4))
++    fail_next = []
++    original_parts = ksa._read_annotation_parts
++    original_refresh = ksa._refresh_annotation_locked
++    outputs = []
++    boundary = []
++    if action.startswith('done-'):
++        monkeypatch.setattr(host, '_done_event_sources', {})
++        check_path = tmp_path / 'external-check.txt'
++        check_path.write_text('no')
++        attempts = []
++        monkeypatch.setattr(ksa._recent_done, 'memoized', lambda *args:
++            [('s1', {'id': 'done-card', 'completed_at': time.time() - 10})])
++        def check(card):
++            attempts.append(True)
++            if action == 'done-error' and len(attempts) == 1:
++                raise OSError('transient done input failure')
++            if action == 'done-clock':
++                if not boundary:
++                    boundary.append(time.time() + .5)
++                return time.time() >= boundary[0]
++            return action in ('done-error', 'done-register') or check_path.read_text() == 'yes'
++        def register_check():
++            return ksa.register_done_check('external-check', check,
++                watch_paths=lambda: [check_path],
++                next_deadline=lambda: boundary[0] if boundary and time.time() < boundary[0] else None)
++        if action != 'done-register':
++            register_check()
++    if action == 'attention-window':
++        monkeypatch.setattr(ksa, '_done_checks', {'clock-check': lambda card: True})
++        def recent(path, since, *args):
++            if not boundary:
++                boundary.append(time.time() + .5)
++            completed = boundary[0] - ksa.ATTENTION_WINDOW_S
++            return [('s1', {'id': 'done-card', 'completed_at': completed})] if completed >= since else []
++        monkeypatch.setattr(ksa._recent_done, 'memoized', recent)
++    if action == 'links-clock':
++        monkeypatch.setattr(host, '_event_sources', {})
++        monkeypatch.setattr(ksa, '_links_fingerprint', lambda: ('stable-source',))
++        def project_links():
++            if not boundary:
++                boundary.append(time.time() + .5)
++            host.note_deadline(boundary[0])
++            return [{'key': 'clock-card'}] if time.time() < boundary[0] else []
++        monkeypatch.setattr(ksa, '_project_remote_links', project_links)
++        def waiting_links():
++            cards = ksa._remote_links()
++            return {'s1': [card['key'] for card in cards]} if cards else {}
++        ksa.register_waiting_source('links-clock', waiting_links,
++            watch_paths=list, next_deadline=lambda: None)
++    if action == 'deadline':
++        monkeypatch.setattr(host, '_event_sources', {})
++        def waiting():
++            if not boundary:
++                boundary.append(time.time() + .5)
++            return {'s1': ['clock-card']} if time.time() < boundary[0] else {}
++        ksa.register_waiting_source('clock-provider', waiting, watch_paths=list,
++                                   next_deadline=lambda: boundary[0] if boundary and time.time() < boundary[0] else None)
++
++    def read_parts():
++        if fail_next:
++            fail_next.pop()
++            failed.set()
++            raise sqlite3.OperationalError('injected source read failure')
++        return original_parts()
++
++    def refresh(scope):
++        result = original_refresh(scope)
++        outputs.append(result)
++        ready.set()
++        if len(outputs) > 1:
++            changed.set()
++        return result
++
++    monkeypatch.setattr(ksa, '_read_annotation_parts', read_parts)
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', refresh)
++    with FileEvents() as events:
++        monkeypatch.setattr(host, '_native_events', [events])
++        thread = threading.Thread(target=run, args=(events, stop,
++            SimpleNamespace(held=lambda: True, beat=lambda: None), lambda: host._event_refresh(events)))
++        thread.start()
++        try:
++            assert ready.wait(5)
++            assert outputs[-1][0] == {'s1': 1}
++            if action.startswith('done-'):
++                assert outputs[-1][10] == {}
++                if action == 'done-source':
++                    check_path.write_text('yes')
++                elif action == 'done-register':
++                    dispose = register_check()
++                budget = host.HOLDER_INTERVAL_S + 1 if action == 'done-error' else 1
++                assert changed.wait(budget), 'done input transition did not update native projection'
++                assert outputs[-1][10] == {'s1': 1}
++                if action == 'done-register':
++                    changed.clear()
++                    dispose()
++                    assert changed.wait(1), 'unregister did not update native projection'
++                    assert outputs[-1][10] == {}
++            elif action == 'attention-window':
++                assert outputs[-1][10] == {'s1': 1}
++                assert changed.wait(1), 'attention window needed a source write'
++                assert outputs[-1][10] == {}
++                assert outputs[-1][0] == {'s1': 1}
++            elif action in ('deadline', 'links-clock'):
++                assert outputs[-1][9] == {'s1': frozenset({'clock-card'})}
++                assert changed.wait(1), 'declared clock needed a source write'
++                assert outputs[-1][9] == {}
++                assert outputs[-1][0] == {'s1': 1}
++            elif action in ('watch-loss', 'overflow'):
++                if action == 'watch-loss':
++                    # Real kernel IN_IGNORED, not a mocked refresh or wake result.
++                    assert events._lib.inotify_rm_watch(events._fd, next(iter(events._names))) == 0
++                else:
++                    # Inject the kernel's overflow packet at the read boundary;
++                    # retain real select, decoding, scheduling and projection.
++                    from hermes_cli import annotation_file_events as native
++                    original_read = native.os.read
++                    injected = []
++                    def overflow_read(fd, length):
++                        data = original_read(fd, length)
++                        if fd == events._fd and not injected:
++                            injected.append(True)
++                            return native._HEADER.pack(-1, native._OVERFLOW, 0, 0)
++                        return data
++                    monkeypatch.setattr(native.os, 'read', overflow_read)
++                    disk.touch_demand(scope)
++                assert changed.wait(1), 'notification loss did not invalidate the real projection'
++                assert outputs[-1][0] == {'s1': 1}
++                changed.clear()
++                writer.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++                assert changed.wait(1), 'coverage was not reinstalled after notification loss'
++                assert outputs[-1][0] == {}
++            elif action == 'remove':
++                writer.close()
++                path.unlink()
++                assert changed.wait(1), 'removed source did not clear projection'
++            else:
++                fail_next.append(True)
++                writer.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++                assert failed.wait(1)
++                assert changed.wait(host.HOLDER_INTERVAL_S + 1), 'read failure needed another source write'
++            if not action.startswith('done-') and action not in ('deadline', 'links-clock', 'attention-window'):
++                assert outputs[-1][0] == {}
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(5)
++            writer.close()
++            ksa._reset_cache_for_tests()
++    assert not thread.is_alive()
++
++
++def test_real_projection_idle_and_changed_source(tmp_path, monkeypatch):
++    scope = ('native-holder-test', 'default')
++    path = tmp_path / 'kanban.db'
++    conn = helpers._board(path, [('t1', 'running', 's1')])
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path])
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(ksa, '_replica_paths', list)
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, '_waiting_sources', {})
++    monkeypatch.setattr(ksa, '_done_checks', {})
++    monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(path)], []))
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(host, '_known', {
++        scope: contextvars.copy_context(),
++        ('native-dormant-test', 'default'): contextvars.copy_context(),
++    })
++    disk.touch_demand(scope)
++    ready, updated, stop = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    refresh = ksa._refresh_annotation_locked
++    def record(scope):
++        result = refresh(scope)
++        calls.append(result)
++        ready.set()
++        if len(calls) > 1:
++            updated.set()
++        return result
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
++    with FileEvents() as events:
++        usage = []
++        def worker():
++            before = resource.getrusage(resource.RUSAGE_THREAD)
++            started = time.monotonic()
++            run(events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
++                lambda: host._event_refresh(events))
++            after = resource.getrusage(resource.RUSAGE_THREAD)
++            usage.append((after.ru_nvcsw - before.ru_nvcsw) / (time.monotonic() - started))
++        thread = threading.Thread(target=worker, name='kanban-annotation-holder')
++        thread.start()
++        try:
++            assert ready.wait(5)
++            assert calls[0][0] == {'s1': 1}
++            idle_until = time.monotonic() + 61
++            while time.monotonic() < idle_until:
++                disk.touch_demand(scope)
++                disk.touch_demand(scope, strict=True)
++                assert not updated.wait(.1), 'demand-only notification reread source inputs'
++            # Renew demand before mutation; demand is intentionally not one of the
++            # overridden source paths, but actual host coverage still watches it.
++            disk.touch_demand(scope)
++            conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++            assert updated.wait(1)
++            assert calls[-1][0] == {}
++        finally:
++            stop.set()
++            events.wake()
++            thread.join(5)
++            conn.close()
++    assert not thread.is_alive()
++    assert usage[0] < 500
++    print(f'actual projection fixture voluntary cs/s with demand churn: {usage[0]:.3f}')
++    ksa._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_execution_receipt.py b/tests/hermes_cli/test_kanban_execution_receipt.py
+index a30df414e2..a10a228556 100644
+--- a/tests/hermes_cli/test_kanban_execution_receipt.py
++++ b/tests/hermes_cli/test_kanban_execution_receipt.py
+@@ -75,6 +75,34 @@ def observation(row):
+ 
+ # --- the canonical session-task entry path -------------------------------------------------------
+ 
++def test_done_count_derives_after_source_connection_close(board, monkeypatch):
++    from hermes_cli import kanban_execution_receipt as adapter
++
++    tid = finish(board, card(board))
++    opened, derived = [], []
++    original_open, original_raw = activity._open_ro, adapter.done_raw
++
++    def open_one(path):
++        conn = original_open(path)
++        opened.append(conn)
++        return conn
++
++    def derive(*args, **kwargs):
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++        result = original_raw(*args, **kwargs)
++        derived.append(result)
++        return result
++
++    monkeypatch.setattr(activity, '_open_ro', open_one)
++    monkeypatch.setattr(adapter, 'done_raw', derive)
++    reads, complete = activity._read_board(kb.kanban_db_path(board='default'), parked=True, stalled=True)
++    assert complete and derived
++    assert reads['done_execution'][tid]['state'] == 'done'
++    assert reads['done_pairs'] == [('session', tid)]
++
++
+ def test_real_delivered_completion_is_done_with_exact_run_and_receipt_ref(board):
+     tid = finish(board, card(board))
+     value = observation(done_listing(tid))
+diff --git a/tests/hermes_cli/test_kanban_primary_execution.py b/tests/hermes_cli/test_kanban_primary_execution.py
+index 5a35530761..79c7b33e81 100644
+--- a/tests/hermes_cli/test_kanban_primary_execution.py
++++ b/tests/hermes_cli/test_kanban_primary_execution.py
+@@ -63,10 +63,37 @@ def test_primary_adapter_failure_does_not_fallback_to_local_authority(primary, m
+     from hermes_cli import kanban_primary_execution
+     def fail(*args, **kwargs):
+         raise sqlite3.OperationalError('unreadable')
+-    monkeypatch.setattr(kanban_primary_execution, 'attach', fail)
++    monkeypatch.setattr(kanban_primary_execution, 'materialize', fail)
+     assert all(value['state'] == 'unknown' for value in read_all(primary))
+ 
+ 
++def test_primary_count_derivation_runs_after_close(primary, monkeypatch):
++    from hermes_cli import kanban_primary_execution as adapter
++
++    opened, derived = [], []
++    original_open, original_derive = activity._open_ro, adapter.attach_materialized
++
++    def open_one(path):
++        conn = original_open(path)
++        opened.append(conn)
++        return conn
++
++    def derive(values, rows, **scope):
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++        result = original_derive(values, rows, **scope)
++        derived.append(result)
++        return result
++
++    monkeypatch.setattr(activity, '_open_ro', open_one)
++    monkeypatch.setattr(adapter, 'attach_materialized', derive)
++    reads, complete = activity._read_board(primary, parked=True, stalled=True)
++    assert complete and derived
++    assert reads['execution']['card']['state'] == 'running'
++    assert reads['execution']['card']['observed_at'] == 990
++
++
+ def test_primary_current_run_projects_running_in_every_consumer(primary):
+     values = read_all(primary)
+     for value in values:
+-- 
+2.43.0
+

@@ -1,0 +1,176 @@
+From 4252b6008da1849e1e546e519bc9eb1f0c4784ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 06:52:02 +0000
+Subject: [PATCH] fix(desktop): keep default profile for connection-tagged rows
+ in archive preflight [daveey]
+
+Review of 41c9fdb0db found that the invocation's active profile was borrowed for
+every row with no resolvable profile, including a row that already carries its own
+remote connection_id. Such a row was safety-read and PATCHed under the window's
+active profile on another gateway (hermes-hub/work instead of hermes-hub/default).
+
+Cause (happened): captureArchiveOwner pins the registry primary onto an ownerless
+row, so archivePreflight could no longer tell a pinned connection from the row's
+own, and applied the fallback to both. Cause (not caught): tests covered only the
+unlisted ownerless case.
+
+- captureArchiveOwner records primary-pinned rows; archivePreflight uses the
+  invocation profile only for those, and 'default' for a row with its own connection.
+- The overall preflight timer trails the capped per-request timeout by 250ms, so the
+  last reconnect attempt's transport rejection wins the race and is restored with an
+  error instead of becoming a Task-status-unavailable override dialog. The trace text
+  now reports the real limit.
+- Tests: own-connection row stays on default under an active nondefault profile (RED
+  on 41c9fdb0db); profile switched while resolution is pending (kills the
+  read-after-await mutant); rejection 1ms and 30ms after the capped timeout.
+---
+ .../archive-linked-confirm.test.tsx           | 32 +++++++++++++++++++
+ .../archive-reconnect.test.ts                 | 17 +++++++++-
+ .../use-session-actions/archive-soft-hide.ts  | 14 ++++++--
+ .../refresh-archive-tasks.ts                  |  7 +++-
+ 4 files changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index ef61282fff..e88e944d17 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -580,6 +580,38 @@ describe('archive preflight follows the remote owner when Recents lacks it', ()
+     vi.mocked(getSession).mockReset()
+   })
+ 
++  it('captures the invocation profile before a pending profile resolution settles', async () => {
++    setRequestProfile('work')
++
++    let rejectSession: (error: Error) => void = () => {}
++    vi.mocked(getSession).mockImplementation(() => new Promise((_resolve, reject) => { rejectSession = reject }))
++    api.mockImplementation(async ({ path }: { path: string }) => path.includes('session-kanban-tasks') ? { tasks: [] } : { id: 'unlisted', archived: true })
++    const handle = await mountHarness()
++    let done: Promise<void> | undefined
++    act(() => { done = handle.archiveSession('unlisted') })
++    await waitFor(() => expect(getSession).toHaveBeenCalled())
++    setRequestProfile('other')
++    await act(async () => { rejectSession(new Error('socket hang up')); await done })
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local', profile: 'work' }))
++    expect(setSessionArchived).toHaveBeenCalledWith('unlisted', true, { connectionId: 'local', profile: 'work' }, expect.any(Function))
++    setRequestProfile(null)
++    vi.mocked(getSession).mockReset()
++  })
++
++  it('keeps default for a row that carries its own connection but no profile, whatever profile is active', async () => {
++    setRequestProfile('work')
++    vi.mocked(getSession).mockRejectedValue(new Error('socket hang up'))
++    $projectTree.set([{ previewSessions: [remoteRow({ profile: undefined })], repos: [] } as never])
++    api.mockImplementation(desktopApi('up'))
++    const handle = await mountHarness()
++    await act(() => handle.archiveSession('hub-1'))
++    expect(api.mock.calls.map(([request]) => request.profile)).not.toContain('work')
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'hermes-hub', profile: 'default' }))
++    expect(setSessionArchived).toHaveBeenCalledWith('hub-1', true, hub, expect.any(Function))
++    setRequestProfile(null)
++    vi.mocked(getSession).mockReset()
++  })
++
+   it('writes to the resolved nondefault profile, not default, for an ownerless/profileless row', async () => {
+     const selectedRow = remoteRow({ connection_id: undefined, profile: undefined, kanban_observed_at: Date.now() / 1000 })
+     setSessions([selectedRow])
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+index fd7f1a1152..96ba4320fb 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-reconnect.test.ts
+@@ -215,7 +215,8 @@ it('limits a preflight read to the reconnect window remaining budget', async ()
+   expect(api).toHaveBeenCalledWith(expect.objectContaining({
+     path: `/api/sessions/${row.id}`, timeoutMs: 125, connectionId: 'owner', profile: 'work'
+   }))
+-  await vi.advanceTimersByTimeAsync(124)
++  // The overall timer trails the capped request by a 250ms grace so a transport rejection wins.
++  await vi.advanceTimersByTimeAsync(374)
+   expect(finished).toBe(false)
+   await vi.advanceTimersByTimeAsync(1)
+   // Capture the deadline outcome before allowing the read to finish, so a
+@@ -259,6 +260,20 @@ it('keeps a timed-out preflight unknown when its successful task read arrives la
+   expect(result?.kanban_unknown).toBe(true)
+ })
+ 
++it.each([1, 30])('lets a transport rejection %sms after the capped request timeout beat the overall timer', async (lag: number) => {
++  const api = vi.fn(({ timeoutMs }: HermesApiRequest) => new Promise((_resolve, reject) => {
++    setTimeout(() => reject(new Error('Timed out connecting to Hermes backend after 5000ms')), (timeoutMs ?? 0) + lag)
++  }))
++
++  vi.stubGlobal('hermesDesktop', { api })
++
++  const outcome = refreshArchiveTasks(row.id, row, 'work', { retryTransport: true, budgetMs: 5_000 }).then(
++    () => 'resolved', () => 'rejected')
++
++  await vi.advanceTimersByTimeAsync(6_000)
++  expect(await outcome).toBe('rejected')
++})
++
+ it('pins an ownerless preflight to the initial primary across reconnect and a registry switch', async () => {
+   $connectionsRegistry.set({ version: 1, primary: 'initial-primary', connections: [], secureTokenStorage: true })
+   let disconnected = true
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+index 00ba8e0d60..28e7115591 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+@@ -20,13 +20,20 @@ import { archiveOwnerRow } from './archive-owner'
+ import { confirmLinkedArchive } from './confirm-linked-archive'
+ import { dropListedSession, type findListedSession, resolveSessionProfile, restoreListedSession } from './utils'
+ 
++// Rows whose connection came from the registry primary pin, not from the row itself.
++const primaryPinned = new WeakSet<object>()
++
+ export function captureArchiveOwner(storedSessionId: string, selectedRow: SessionInfo | undefined, listed: ReturnType<typeof findListedSession>): SessionInfo {
+   let row = sessionActionRow(storedSessionId, selectedRow) ?? listed?.session
+ 
+   // Explicit selection is authoritative; other entry paths resolve like resume.
+   if (!selectedRow) {row = archiveOwnerRow(storedSessionId, row)}
+ 
+-  return { ...row, connection_id: row?.connection_id || $connectionsRegistry.get()?.primary || undefined } as SessionInfo
++  const captured = { ...row, connection_id: row?.connection_id || $connectionsRegistry.get()?.primary || undefined } as SessionInfo
++
++  if (!row?.connection_id) {primaryPinned.add(captured)}
++
++  return captured
+ }
+ 
+ /**
+@@ -125,7 +132,10 @@ export async function archivePreflight(
+     return false
+   }
+ 
+-  const profile = resolvedProfile || fallbackProfile
++  // The invocation's profile only stands in for an ownerless row; a row that carries its own
++  // connection keeps the pre-existing 'default' for a missing profile.
++  const ownConnection = Boolean(archived?.connection_id) && !(archived && primaryPinned.has(archived))
++  const profile = resolvedProfile || (ownConnection ? 'default' : fallbackProfile)
+ 
+   try {
+     if (!(await confirmLinkedArchive(storedSessionId, archived, profile, copy, options?.skipLinkedConfirm, trace))) {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index fcaa7ebd23..887436e38f 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -10,6 +10,7 @@ import { hasFreshKanbanObservation } from '@/store/kanban-observation'
+  * inside an overall budget so the dialog never hangs. */
+ const READ_TIMEOUT_MS = 6_000
+ const OVERALL_BUDGET_MS = 14_000
++const TIMER_GRACE_MS = 250
+ 
+ const isTimeout = (error: unknown) => /timed out/i.test(String((error as Error)?.message ?? error))
+ 
+@@ -114,7 +115,11 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+ 
+   try {
+     return await Promise.race([read(), new Promise<SessionInfo>(resolve => {
+-      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${OVERALL_BUDGET_MS}ms (${stage})`)), Math.min(OVERALL_BUDGET_MS, options?.budgetMs ?? OVERALL_BUDGET_MS))
++      // The overall timer trails the capped per-request timeout, so a transport rejection of the last
++      // attempt wins the race and is queued/restored instead of becoming an override dialog.
++      const limit = Math.min(OVERALL_BUDGET_MS, options?.budgetMs === undefined ? OVERALL_BUDGET_MS : options.budgetMs + TIMER_GRACE_MS)
++
++      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${limit}ms (${stage})`)), limit)
+     })])
+   } catch (error) {
+     if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
+-- 
+2.43.0
+

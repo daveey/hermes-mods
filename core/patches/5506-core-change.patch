@@ -1,0 +1,1044 @@
+From b14c5d5422397f8f4a689624542af5a67815ae37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:02:01 +0000
+Subject: [PATCH] [daveey] bind integrity reuse to unchanged DB and WAL
+ generations
+
+Reject inode-only trust after writes/corruption. Sample generation before and after full probe; reject recovery/checkpoint changes and rollback journals, invalidate on explicit repair. Actual CLI canary/report create regressions time out on unchanged parent and pass after a quiescent generation is verified. Retain cold/hung and ambiguous-commit retry safety. This is metadata change detection, not a media-corruption certificate; active writers can eliminate all hits. Fairness historical eligibility remains unproven.
+---
+ hermes_cli/kanban_db_connect.py               |  72 ++-
+ tests/hermes_cli/enrollment_cli_child.py      | 118 +++++
+ .../hermes_cli/test_enrollment_cli_create.py  | 260 ++++++++++
+ .../test_kanban_integrity_generation.py       | 464 ++++++++++++++++++
+ .../test_kanban_connect_integrity_stamp.py    |  17 +-
+ 5 files changed, 912 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/enrollment_cli_child.py
+ create mode 100644 tests/hermes_cli/test_enrollment_cli_create.py
+ create mode 100644 tests/hermes_cli/test_kanban_integrity_generation.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 57bd2168ea..8cd4d85995 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -54,8 +54,10 @@ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
+ _INIT_LOCK_POLL_SECONDS = 0.05
+ # A clean full ``integrity_check`` is O(board size) (3.0 s at the hub's 700 MB) and ran once PER PROCESS, under the
+ # cross-process init lock, so N concurrent ``hermes kanban`` CLIs cost N serial scans (9-20 s each).
+-# A clean result is stamped next to the DB (``<db>.integrity-ok``: file identity + wall time); a fresh stamp for the
+-# same file lets later processes skip the scan. A TTL of 0 (module constant) always scans.
++# A clean result is stamped only for an unchanged DB+WAL metadata generation. Ordinary writes,
++# replacements and recovery/checkpoint side effects invalidate it; continuous writers may get no hits.
++# This is not a media-integrity certificate: unchanged metadata can conceal silent storage corruption.
++# The six-hour TTL bounds reuse even without a visible write. A TTL of 0 always scans.
+ _INTEGRITY_STAMP_SUFFIX = ".integrity-ok"
+ _INTEGRITY_STAMP_TTL_SECONDS = 6 * 3600.0
+ 
+@@ -680,31 +682,70 @@ def _integrity_stamp_path(resolved: Path) -> Path:
+     return resolved.with_name(resolved.name + _INTEGRITY_STAMP_SUFFIX)
+ 
+ 
++def _integrity_generation(resolved: Path) -> Optional[dict]:
++    """Conservative change detector, not a content hash or a media-integrity guarantee.
++
++    WAL contains committed pages absent from the main file. SHM contains coordination,
++    not persistent pages. A rollback journal may need recovery: never cache that case.
++    ctime also invalidates ordinary in-place writes that restore the old mtime.
++    """
++    try:
++        try:
++            Path(str(resolved) + "-journal").stat()
++        except FileNotFoundError:
++            pass
++        else:
++            return None
++        generation = {}
++        for suffix in ("", "-wal"):
++            try:
++                st = Path(str(resolved) + suffix).stat()
++            except FileNotFoundError:
++                if not suffix:
++                    return None
++                generation[suffix] = None
++            else:
++                generation[suffix] = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
++        return generation
++    except OSError:
++        return None
++
++
+ def _integrity_stamp_fresh(resolved: Path) -> bool:
+-    """True when a clean full check of THIS file (same device+inode) was recorded within the TTL. Any doubt
+-    (missing/unreadable/garbled stamp, replaced file, a clock step backwards) is False: the scan runs."""
++    """Reuse only a clean check of an unchanged DB/WAL generation within the TTL."""
+     ttl = _INTEGRITY_STAMP_TTL_SECONDS
+     if ttl <= 0:
+         return False
+     try:
+-        st = resolved.stat()
++        generation = _integrity_generation(resolved)
+         stamp = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
+         age = time.time() - float(stamp["verified_at"])
+-        return stamp["dev"] == st.st_dev and stamp["ino"] == st.st_ino and 0 <= age < ttl
++        return (generation is not None and stamp["version"] == 2
++                and stamp["generation"] == generation and 0 <= age < ttl)
+     except (OSError, ValueError, KeyError, TypeError):
+         return False
+ 
+ 
+-def _write_integrity_stamp(resolved: Path) -> None:
+-    """Best effort: a failed write only means the next process scans again."""
+-    if _INTEGRITY_STAMP_TTL_SECONDS <= 0:
++def _invalidate_integrity_stamp(resolved: Path) -> None:
++    with contextlib.suppress(OSError):
++        _integrity_stamp_path(resolved).unlink(missing_ok=True)
++
++
++def _write_integrity_stamp(resolved: Path, generation: Optional[dict]) -> None:
++    """Publish only the generation sampled BEFORE the check, if unchanged after close.
++
++    Probe recovery/checkpoint, schema writes and active WAL writers can prevent reuse.
++    A racing write after this comparison invalidates the captured generation on use.
++    """
++    if _INTEGRITY_STAMP_TTL_SECONDS <= 0 or generation is None:
+         return
+     target = _integrity_stamp_path(resolved)
+     tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+     try:
+-        st = resolved.stat()
+-        tmp.write_text(json.dumps({"dev": st.st_dev, "ino": st.st_ino, "verified_at": time.time(), "pid": os.getpid()}),
+-                       encoding="utf-8")
++        if generation != _integrity_generation(resolved):
++            return
++        tmp.write_text(json.dumps({"version": 2, "generation": generation,
++                                  "verified_at": time.time(), "pid": os.getpid()}), encoding="utf-8")
+         os.replace(tmp, target)
+     except OSError:
+         with contextlib.suppress(OSError):
+@@ -732,10 +773,12 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
+     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
+         return
+     if _integrity_stamp_fresh(resolved):
+-        return  # another process fully checked this very file within the TTL: no per-process O(board) scan
++        return
++    generation = _integrity_generation(resolved)
++    _invalidate_integrity_stamp(resolved)
+     messages, reason = _probe_for_corruption(resolved)
+     if reason is None:
+-        _write_integrity_stamp(resolved)
++        _write_integrity_stamp(resolved, generation)
+         return
+     # The probe ran in THIS process, whose view can be stale (deleted WAL/SHM
+     # generation after a sibling's close). Only an independently confirmed failure
+@@ -798,6 +841,7 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
+         return RepairResult(status="missing", db_path=resolved)
+ 
+     with _cross_process_init_lock(resolved):
++        _invalidate_integrity_stamp(resolved)
+         messages, reason = _probe_for_corruption(resolved)
+         if reason is not None:
+             messages, reason = _confirm_corruption(resolved, messages, reason)
+diff --git a/tests/hermes_cli/enrollment_cli_child.py b/tests/hermes_cli/enrollment_cli_child.py
+new file mode 100644
+index 0000000000..5e171fd8f8
+--- /dev/null
++++ b/tests/hermes_cli/enrollment_cli_child.py
+@@ -0,0 +1,118 @@
++"""Subprocess-only fault seams for test_enrollment_cli_create.py.
++
++The real main parser and create handler are never patched. Only external registry
++input, the full-integrity timing seam, and stdout's write boundary are controlled.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import sys
++import threading
++
++REPO = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(REPO))
++
++
++def main():
++    mode, marker, *argv = sys.argv[1:]
++    marker = Path(marker)
++
++    # Children do not inherit pytest's network fence. Refuse even loopback: this
++    # suite needs no network. An audit hook cannot be silently unpatched by imports.
++    def audit(event, args):
++        if event in {"socket.connect", "socket.getaddrinfo", "socket.gethostbyname"}:
++            marker.with_suffix(".forbidden").write_text(f"{event} {args!r}")
++            raise AssertionError(f"enrollment CLI attempted network: {event} {args!r}")
++        if event == "subprocess.Popen":
++            executable = str(args[0])
++            # The real entrypoint records core provenance using this read-only
++            # command. It must not be mistaken for a model/service subprocess.
++            git_head = (Path(executable).name == "git" and list(args[1])[1:] in [
++                ["-c", "gc.autoDetach=false", "-c", "maintenance.auto=false", "rev-parse", "HEAD"],
++                ["-C", str(REPO), "rev-parse", "HEAD"],
++                ["rev-parse", "HEAD"],
++            ])
++            if Path(executable).resolve() != Path(sys.executable).resolve() and not git_head:
++                marker.with_suffix(".forbidden").write_text(f"{event} {args!r}")
++                raise AssertionError(f"enrollment CLI attempted external command: {args!r}")
++    sys.addaudithook(audit)
++
++    from hermes_cli.worker_compute_capacity import policy_root
++    assert policy_root() == Path(os.environ["HERMES_TEST_POLICY_ROOT"]), "policy isolation refused"
++
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_worker_node as wn
++
++    # Registry service is the only remote dependency replaced. The pin guard,
++    # capability validator, SQL capture, parser, and create handler remain real.
++    wn.set_registry_fetch(lambda: {"me": "enrollment-cli-origin", "machines": [
++        {"name": "enrollment-cli-origin", "state": "active", "labels": ["linux"], "hold": False},
++        {"name": "enrollment-cli-worker", "state": "active", "labels": ["linux"],
++         "pickup": "all", "hold": False},
++    ]})
++
++    if mode == "seed":
++        from hermes_cli import kanban_db_sync as sync
++        with kbc.connect_closing() as conn:
++            sync.set_identity(conn, "default", "enrollment-cli-origin")
++            sync.set_mode(conn, "primary")
++        return
++
++    # Always run the real integrity check in this harness; a TTL stamp is NOT a
++    # correctness oracle and must not hide our injected slow/hung integrity seam.
++    if not mode.startswith("cached"):
++        kbc._INTEGRITY_STAMP_TTL_SECONDS = 0
++    real_check = kbc._run_integrity_check
++
++    if mode.startswith("cached") and hasattr(kbc, "_integrity_generation"):
++        # Observe the production detector without changing its answer, metadata,
++        # stamp, or connection lifecycle. Cache misses must name the generation
++        # mismatch rather than assume that a read-only command is byte-quiescent.
++        real_generation = kbc._integrity_generation
++
++        def observed_generation(path):
++            generation = real_generation(path)
++            try:
++                stamp = json.loads(kbc._integrity_stamp_path(path).read_text())
++            except (OSError, ValueError):
++                stamp = None
++            with marker.with_suffix(".generations").open("a") as log:
++                log.write(json.dumps({"generation": generation, "stamp": stamp}) + "\n")
++            return generation
++
++        kbc._integrity_generation = observed_generation
++
++    def checked(conn):
++        marker.with_suffix(".integrity-entered").write_text(str(os.getpid()))
++        if mode in {"integrity-gate", "cached-gate"}:
++            from tests.waiting import wait_until
++            assert wait_until(lambda: marker.with_suffix(".release").exists(), timeout=600)
++        result = real_check(conn)
++        marker.with_suffix(".integrity-done").write_text(json.dumps(result))
++        return result
++    kbc._run_integrity_check = checked
++
++    if mode == "output-hang":
++        real_stdout = sys.stdout
++
++        class BlockedOutput:
++            def write(self, value):
++                if value.lstrip().startswith("{"):
++                    marker.with_suffix(".output-blocked").write_text(str(os.getpid()))
++                    # health: allow HX013 -- a post-commit response hang is the fault under test; parent kills and reaps this owned child
++                    threading.Event().wait(600)
++                return real_stdout.write(value)
++
++            def __getattr__(self, name):
++                return getattr(real_stdout, name)
++        sys.stdout = BlockedOutput()
++
++    sys.argv = ["hermes", *argv]
++    from hermes_cli.main import main as cli_main
++    cli_main()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/hermes_cli/test_enrollment_cli_create.py b/tests/hermes_cli/test_enrollment_cli_create.py
+new file mode 100644
+index 0000000000..2f916b362c
+--- /dev/null
++++ b/tests/hermes_cli/test_enrollment_cli_create.py
+@@ -0,0 +1,260 @@
++"""Real main() CLI create regression harness for enrollment's ambiguous outcomes.
++
++Run: bash scripts/run_tests.sh tests/hermes_cli/test_enrollment_cli_create.py -v
++
++Scaler-equivalent canary/file_card argv (hermes_worker_scaler.HubCards), but all
++state is disposable and registry input is fixture-owned. No scaler lifecycle,
++service enrollment, Board HTTP synchronization, live board, or model is exercised.
++These tests prove timeout/retry semantics, NOT that PR3945's stamp is safe or
++that connect-only latency/count tests establish production create fairness.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import signal
++import sqlite3
++import subprocess
++import sys
++
++import pytest
++
++from tests.waiting import wait_until
++
++REPO = Path(__file__).resolve().parents[2]
++CHILD = Path(__file__).with_name("enrollment_cli_child.py")
++pytestmark = pytest.mark.platforms("posix")
++
++
++def create_argv(kind, key):
++    # Same argument ordering and options as scaler HubCards.canary/file_card.
++    # No model pin: this is its supported unpinned route (route=None).
++    argv = ["kanban", "--board", "default", "create", f"worker-scaler {kind}: isolated enrollment",
++            "--body", f"Isolated enrollment CLI regression ({kind}); no worker executes this card.",
++            "--assignee", "default"]
++    if kind == "canary":
++        argv += ["--runs-on", "machine:enrollment-cli-worker"]
++    argv += ["--requires", "terminal"]
++    if kind == "canary":
++        argv += ["--max-runtime", "600"]
++    return argv + ["--idempotency-key", key, "--json"]
++
++
++class Sandbox:
++    def __init__(self, root):
++        self.root = root
++        self.home = root / "home"
++        self.hermes = self.home / ".hermes"
++        self.hermes.mkdir(parents=True)
++        self.temp = root / "tmp"
++        self.temp.mkdir()
++        self.policy = self.temp / "policy"
++        self.policy.mkdir()
++        self.db = self.hermes / "kanban.db"
++        (self.hermes / "config.yaml").write_text(
++            "terminal:\n  backend: local\nplatform_toolsets:\n  cli: [terminal, file, kanban]\n"
++            "kanban:\n  sync:\n    enabled: true\n  capabilities:\n    builtin: false\n")
++        mail = self.home / ".config/hermes-mail"
++        mail.mkdir(parents=True)
++        (mail / "config.json").write_text(json.dumps({"gateway": "enrollment-cli-origin"}))
++        # Allowlist, not a blacklist: no agent, worker, hub, auth, proxy, network,
++        # terminal overlay, profile activation, or user plugin environment survives.
++        self.env = {"HOME": str(self.home), "HERMES_HOME": str(self.hermes),
++                    "HERMES_TEST_POLICY_ROOT": str(self.policy),
++                    # This is an already-provisioned CLI test, not an updater or
++                    # default-plugin installation test. Use production opt-outs:
++                    # do not sync tools/plugins or borrow the real account's PM store.
++                    "HERMES_DISABLE_LAZY_INSTALLS": "1", "HERMES_PM_ACCOUNT_SEED": "0",
++                    "XDG_CONFIG_HOME": str(self.home / ".config"),
++                    "XDG_CACHE_HOME": str(self.home / ".cache"),
++                    "XDG_STATE_HOME": str(self.home / ".local/state"),
++                    "TMPDIR": str(self.temp), "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
++                    "PYTHONPATH": str(REPO), "PYTHONDONTWRITEBYTECODE": "1",
++                    "PYTHONHASHSEED": "0", "LANG": "C.UTF-8", "TZ": "UTC"}
++        self.children = []
++        seed = self.start("seed", "seed", [])
++        try:
++            out, err = seed.communicate(timeout=30)
++        except BaseException:
++            self.stop(seed)
++            raise
++        assert seed.returncode == 0, (out, err)
++        # Seed is not the subject; make the first subject enter the real probe.
++        self.db.with_name(self.db.name + ".integrity-ok").unlink(missing_ok=True)
++
++    def start(self, mode, name, argv):
++        marker = self.root / name
++        p = subprocess.Popen([sys.executable, str(CHILD), mode, str(marker), *argv],
++                             cwd=REPO, env=self.env, stdin=subprocess.DEVNULL,
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++                             start_new_session=True)
++        self.children.append(p)
++        return p
++
++    def stop(self, p):
++        if p.poll() is None:
++            os.killpg(p.pid, signal.SIGKILL)
++        return p.communicate(timeout=10)
++
++    def rows(self):
++        with sqlite3.connect(f"file:{self.db}?mode=ro", uri=True) as conn:
++            conn.row_factory = sqlite3.Row
++            return [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id")]
++
++    def events(self):
++        with sqlite3.connect(f"file:{self.db}?mode=ro", uri=True) as conn:
++            return conn.execute("SELECT task_id, kind, payload FROM task_events ORDER BY id").fetchall()
++
++    def success(self, name, argv):
++        p = self.start("normal", name, argv)
++        out, err = p.communicate(timeout=30)
++        assert p.returncode == 0, (out, err)
++        result = json.loads(out)
++        assert result["id"], (out, err)
++        return result
++
++
++@pytest.fixture
++def sandbox(tmp_path):
++    # Use pytest-owned disposable scratch. The canonical runner relocates this
++    # to /var/tmp and home_io_guard forbids the real account's .hermes scratch.
++    box = Sandbox(tmp_path)
++    try:
++        yield box
++    finally:
++        for p in box.children:
++            box.stop(p)
++        assert all(p.poll() is not None for p in box.children)
++        forbidden = list(box.root.glob("*.forbidden"))
++        assert not forbidden, json.dumps({p.name: p.read_text() for p in forbidden}, indent=2)
++
++
++def await_marker(box, name, suffix, p):
++    marker = box.root / name
++    target = marker.with_suffix(suffix)
++    assert wait_until(lambda: target.exists() or p.poll() is not None, timeout=30)
++    if not target.exists():
++        out, err = p.communicate(timeout=5)
++        pytest.fail(f"CLI exited before {suffix}: rc={p.returncode}\n{out}\n{err}")
++    return marker
++
++
++def test_slow_integrity_completes_actual_cli_create_only_after_real_check(sandbox):
++    box = sandbox
++    argv = create_argv("canary", "worker-scaler:canary:i-isolated-slow")
++    p = box.start("integrity-gate", "slow", argv)
++    marker = await_marker(box, "slow", ".integrity-entered", p)
++    assert box.rows() == []
++    assert not marker.with_suffix(".integrity-done").exists()
++    marker.with_suffix(".release").touch()
++    out, err = p.communicate(timeout=30)
++    assert p.returncode == 0, (out, err)
++    assert json.loads(marker.with_suffix(".integrity-done").read_text()) == ["ok"]
++    card = json.loads(out)
++    rows = box.rows()
++    assert len(rows) == 1 and rows[0]["id"] == card["id"]
++    assert json.loads(rows[0]["runs_on"]) == ["machine:enrollment-cli-worker"]
++    assert rows[0]["max_runtime_seconds"] == 600
++
++
++def test_hung_integrity_timeout_has_no_commit_and_restart_retry_succeeds(sandbox):
++    box = sandbox
++    argv = create_argv("canary", "worker-scaler:canary:i-isolated-hung")
++    p = box.start("integrity-gate", "hung", argv)
++    await_marker(box, "hung", ".integrity-entered", p)
++    try:
++        with pytest.raises(subprocess.TimeoutExpired):
++            p.communicate(timeout=2)
++    finally:
++        out, _err = box.stop(p)
++    assert p.returncode < 0 and out == ""
++    assert box.rows() == []
++    card = box.success("hung-retry", argv)
++    assert [r["id"] for r in box.rows()] == [card["id"]]
++    assert box.success("hung-retry-again", argv)["id"] == card["id"]
++    assert len(box.rows()) == 1
++
++
++@pytest.mark.parametrize("kind,key", [
++    ("canary", "worker-scaler:canary:i-isolated-output"),
++    ("failure-report", "worker-scaler:stuck:enrollment-cli-worker:CANARY:i-isolated-output"),
++])
++def test_committed_create_blocked_output_timeout_restart_preserves_single_key(sandbox, kind, key):
++    box = sandbox
++    argv = create_argv(kind, key)
++    p = box.start("output-hang", "response", argv)
++    await_marker(box, "response", ".output-blocked", p)
++    before = box.rows()
++    events_before = box.events()
++    # Independent read proves commit before response; not inferred from a seam.
++    assert len(before) == 1 and before[0]["idempotency_key"] == key
++    assert before[0]["session_id"] is None
++    try:
++        with pytest.raises(subprocess.TimeoutExpired):
++            p.communicate(timeout=2)
++    finally:
++        out, _err = box.stop(p)
++    assert out == "" and p.returncode < 0
++    assert box.rows() == before
++    retry = box.success("response-retry", argv)
++    assert retry["id"] == before[0]["id"]
++    assert box.success("response-retry-again", argv)["id"] == retry["id"]
++    assert box.rows() == before  # immutable original card, not just equal count
++    assert box.events() == events_before  # no duplicate created/assignment events
++
++
++def test_concurrent_real_cli_same_create_key_returns_one_committed_card(sandbox):
++    box = sandbox
++    key = "worker-scaler:canary:i-isolated-concurrent"
++    argv = create_argv("canary", key)
++    children = [box.start("normal", f"parallel-{i}", argv) for i in range(4)]
++    ids = []
++    for child in children:
++        out, err = child.communicate(timeout=30)
++        assert child.returncode == 0, (out, err)
++        ids.append(json.loads(out)["id"])
++    assert len(set(ids)) == 1
++    rows = box.rows()
++    assert len(rows) == 1 and rows[0]["id"] == ids[0]
++    assert rows[0]["idempotency_key"] == key
++
++
++@pytest.mark.parametrize("kind", ["canary", "failure-report"])
++def test_actual_create_reuses_unchanged_verified_generation_within_budget(sandbox, kind):
++    """Old full CLI enters the blocked probe and times out; unchanged verified DB needs no second scan.
++
++    This is an injected scan-stall boundary on a quiescent board, not a large-DB
++    benchmark or an assertion that a continuously written board obtains cache hits.
++    """
++    box = sandbox
++    warm_argv = create_argv("canary", "worker-scaler:canary:i-warm")
++    # The first observer's real probe closes the last SQLite connection and
++    # checkpoints the warm create's WAL. That changes the main-file generation
++    # during verification, so production correctly refuses to publish its stamp.
++    # A second real observer verifies that now-quiescent generation. Do not fake
++    # a stamp, hold a reader open, or reset timestamps to manufacture a cache hit.
++    for i in range(3):  # create, checkpointing observer, verifying observer
++        p = box.start("cached", f"warm-{i}", warm_argv)
++        out, err = p.communicate(timeout=30)
++        assert p.returncode == 0, (out, err)
++        if i == 0:
++            warm_argv = ["kanban", "--board", "default", "show", json.loads(out)["id"], "--json"]
++    # Both observers must have exercised the real probe: the first cannot stamp
++    # a checkpoint-changing generation; the second establishes the cache premise.
++    assert (box.root / "warm-1.integrity-done").exists()
++    assert (box.root / "warm-2.integrity-done").exists()
++    argv = create_argv(kind, f"worker-scaler:{kind}:i-budget")
++    p = box.start("cached-gate", "budget", argv)
++    try:
++        out, err = p.communicate(timeout=10)
++    except subprocess.TimeoutExpired:
++        box.stop(p)
++        traces = {p.name: [json.loads(line) for line in p.read_text().splitlines()]
++                  for p in sorted(box.root.glob("*.generations"))}
++        pytest.fail("actual create repeated the full probe; generation/stamp observations:\n"
++                    + json.dumps(traces, indent=2))
++    assert p.returncode == 0, (out, err)
++    assert not (box.root / "budget.integrity-entered").exists()
++    assert json.loads(out)["id"] in {row["id"] for row in box.rows()}
++    assert len(box.rows()) == 2
+diff --git a/tests/hermes_cli/test_kanban_integrity_generation.py b/tests/hermes_cli/test_kanban_integrity_generation.py
+new file mode 100644
+index 0000000000..d9f571c82a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_integrity_generation.py
+@@ -0,0 +1,464 @@
++"""Generation-bound integrity stamp: a stamp may only skip the full scan for the exact DB/WAL generation it certified.
++
++Behavioral tests through the public ``connect`` entry point (full guard path), plus the stamp helpers where a race
++has to be injected deterministically.
++"""
++import json
++import os
++import shutil
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 6 * 3600.0)
++    path = home / "kanban.db"
++    kbc.init_db(path)
++    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++    yield path
++    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++
++
++@pytest.fixture
++def checks(monkeypatch):
++    """Count full integrity scans."""
++    calls = []
++    real = kbc._run_integrity_check
++
++    def counted(conn):
++        calls.append(1)
++        return real(conn)
++
++    monkeypatch.setattr(kbc, "_run_integrity_check", counted)
++    return calls
++
++
++def _forget(path):
++    kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++
++
++def _stamp(path):
++    return path.with_name(path.name + ".integrity-ok")
++
++
++def _stamped(path):
++    """Run a full connect that must scan and leave a stamp; return with the process cache cleared."""
++    _forget(path)
++    kbc._guard_existing_db_is_healthy(path)
++    _forget(path)
++    assert _stamp(path).exists(), "clean scan of a quiescent DB must stamp"
++    assert kbc._integrity_stamp_fresh(path.resolve())
++    return path
++
++
++def _fresh(path):
++    return kbc._integrity_stamp_fresh(path.resolve())
++
++
++def _connect_scans(path, checks):
++    _forget(path)
++    before = len(checks)
++    kbc.connect(path).close()
++    return len(checks) - before
++
++
++def test_valid_stamp_skips_scan_on_unchanged_db(board, checks):
++    _stamped(board)
++    assert _connect_scans(board, checks) == 0
++
++
++def test_same_inode_corruption_after_stamp_fails_closed(board, checks):
++    _stamped(board)
++    ino = board.stat().st_ino
++    # a real tasks-table page must be damaged: overwrite every non-header page
++    size = board.stat().st_size
++    assert size >= 8192
++    with open(board, "r+b") as f:
++        f.seek(4096)
++        f.write(b"\xff" * (size - 4096))
++    assert board.stat().st_ino == ino
++    _forget(board)
++    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
++        kbc.connect(board).close()
++
++
++def test_same_inode_corruption_with_restored_mtime_fails_closed(board, checks):
++    _stamped(board)
++    st = board.stat()
++    with open(board, "r+b") as f:
++        f.seek(4096)
++        f.write(b"\xff" * (st.st_size - 4096))
++        f.flush()
++        os.fsync(f.fileno())
++    os.utime(board, ns=(st.st_atime_ns, st.st_mtime_ns))
++    after = board.stat()
++    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (st.st_ino, st.st_size, st.st_mtime_ns)
++    assert not _fresh(board), "ctime must invalidate an in-place write that restored mtime"
++    _forget(board)
++    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
++        kbc.connect(board).close()
++
++
++def test_same_size_garbage_in_place_restored_mtime_not_fresh(board):
++    _stamped(board)
++    st = board.stat()
++    with open(board, "r+b") as f:
++        f.seek(st.st_size - 16)
++        f.write(b"\x00" * 16)
++    os.utime(board, ns=(st.st_atime_ns, st.st_mtime_ns))
++    assert not _fresh(board)
++
++
++def test_wal_only_ordinary_mutation_invalidates(board, checks):
++    _stamped(board)
++    holder = sqlite3.connect(board)
++    try:
++        holder.execute("PRAGMA journal_mode=WAL")
++        holder.execute("PRAGMA wal_autocheckpoint=0")
++        main_before = board.stat()
++        holder.execute("CREATE TABLE IF NOT EXISTS walmut (x)")
++        holder.execute("INSERT INTO walmut VALUES (1)")
++        holder.commit()
++        wal = Path(str(board) + "-wal")
++        assert wal.exists() and wal.stat().st_size > 0
++        assert board.stat().st_size == main_before.st_size  # change lives only in the WAL
++        assert not _fresh(board)
++        # and a later WAL-only write changes it again
++        stamped_gen = kbc._integrity_generation(board.resolve())
++        holder.execute("INSERT INTO walmut VALUES (2)")
++        holder.commit()
++        assert kbc._integrity_generation(board.resolve()) != stamped_gen
++    finally:
++        holder.close()
++
++
++def test_connect_after_wal_mutation_rescans(board, checks):
++    _stamped(board)
++    holder = sqlite3.connect(board)
++    try:
++        holder.execute("PRAGMA wal_autocheckpoint=0")
++        holder.execute("CREATE TABLE walmut2 (x)")
++        holder.commit()
++        assert _connect_scans(board, checks) >= 1
++    finally:
++        holder.close()
++
++
++def test_db_replacement_invalidates(board, tmp_path):
++    _stamped(board)
++    twin = tmp_path / "twin.db"
++    shutil.copyfile(board, twin)  # identical bytes, different inode
++    os.replace(twin, board)
++    assert not _fresh(board)
++
++
++def test_db_replacement_with_copystat_invalidates(board, tmp_path):
++    _stamped(board)
++    twin = tmp_path / "twin.db"
++    shutil.copy2(board, twin)
++    os.replace(twin, board)
++    assert not _fresh(board)
++
++
++def test_wal_creation_invalidates(board):
++    _stamped(board)
++    wal = Path(str(board) + "-wal")
++    assert not wal.exists()
++    wal.write_bytes(b"")
++    assert not _fresh(board)
++
++
++def test_wal_removal_invalidates(board):
++    # stamp while a WAL exists (a held-open WAL connection keeps it)
++    holder = sqlite3.connect(board)
++    try:
++        holder.execute("PRAGMA wal_autocheckpoint=0")
++        holder.execute("CREATE TABLE w (x)")
++        holder.commit()
++        wal = Path(str(board) + "-wal")
++        assert wal.exists()
++        resolved = board.resolve()
++        gen = kbc._integrity_generation(resolved)
++        assert gen is not None and gen["-wal"] is not None
++        kbc._write_integrity_stamp(resolved, gen)
++        assert _fresh(board)
++        holder.close()  # last close checkpoints and removes the WAL
++        if wal.exists():
++            wal.unlink()
++        assert not _fresh(board)
++    finally:
++        with pytest.raises(sqlite3.ProgrammingError):
++            holder.execute("select 1")
++
++
++def test_wal_truncation_invalidates(board):
++    holder = sqlite3.connect(board)
++    try:
++        holder.execute("PRAGMA wal_autocheckpoint=0")
++        holder.execute("CREATE TABLE w (x)")
++        holder.executemany("INSERT INTO w VALUES (?)", [(i,) for i in range(200)])
++        holder.commit()
++        wal = Path(str(board) + "-wal")
++        resolved = board.resolve()
++        gen = kbc._integrity_generation(resolved)
++        kbc._write_integrity_stamp(resolved, gen)
++        assert _fresh(board)
++        os.truncate(wal, wal.stat().st_size // 2)
++        assert not _fresh(board)
++    finally:
++        holder.close()
++
++
++def test_wal_replacement_invalidates(board, tmp_path):
++    holder = sqlite3.connect(board)
++    try:
++        holder.execute("PRAGMA wal_autocheckpoint=0")
++        holder.execute("CREATE TABLE w (x)")
++        holder.commit()
++        wal = Path(str(board) + "-wal")
++        resolved = board.resolve()
++        kbc._write_integrity_stamp(resolved, kbc._integrity_generation(resolved))
++        assert _fresh(board)
++        twin = tmp_path / "wal.copy"
++        shutil.copyfile(wal, twin)
++        os.replace(twin, wal)
++        assert not _fresh(board)
++    finally:
++        holder.close()
++
++
++def test_rollback_journal_disables_cache(board, checks):
++    _stamped(board)
++    journal = Path(str(board) + "-journal")
++    journal.write_bytes(b"")
++    assert kbc._integrity_generation(board.resolve()) is None
++    assert not _fresh(board)
++    # and a stamp cannot be written while a journal is present
++    _stamp(board).unlink()
++    kbc._write_integrity_stamp(board.resolve(), kbc._integrity_generation(board.resolve()))
++    assert not _stamp(board).exists()
++
++
++def test_mutation_during_probe_is_not_certified(board, monkeypatch):
++    real = kbc._probe_for_corruption
++
++    def racing(resolved):
++        out = real(resolved)
++        c = sqlite3.connect(resolved)
++        c.execute("PRAGMA wal_autocheckpoint=0")
++        c.execute("CREATE TABLE raced (x)")
++        c.commit()
++        c.close()
++        return out
++
++    monkeypatch.setattr(kbc, "_probe_for_corruption", racing)
++    _forget(board)
++    kbc._guard_existing_db_is_healthy(board)
++    assert not _stamp(board).exists()
++    assert not _fresh(board)
++
++
++def test_wal_mutation_during_probe_with_held_writer_is_not_certified(board, monkeypatch):
++    holder = sqlite3.connect(board)
++    holder.execute("PRAGMA wal_autocheckpoint=0")
++    real = kbc._probe_for_corruption
++
++    def racing(resolved):
++        out = real(resolved)
++        holder.execute("CREATE TABLE raced_wal (x)")
++        holder.commit()
++        return out
++
++    monkeypatch.setattr(kbc, "_probe_for_corruption", racing)
++    try:
++        _forget(board)
++        kbc._guard_existing_db_is_healthy(board)
++        assert not _stamp(board).exists()
++        assert not _fresh(board)
++    finally:
++        holder.close()
++
++
++def test_write_stamp_refuses_stale_before_generation(board):
++    resolved = board.resolve()
++    before = kbc._integrity_generation(resolved)
++    c = sqlite3.connect(board)
++    c.execute("CREATE TABLE changed (x)")
++    c.commit()
++    c.close()
++    assert kbc._integrity_generation(resolved) != before
++    kbc._write_integrity_stamp(resolved, before)
++    assert not _stamp(board).exists()
++
++
++def test_write_stamp_refuses_none_generation_and_zero_ttl(board, monkeypatch):
++    resolved = board.resolve()
++    kbc._write_integrity_stamp(resolved, None)
++    assert not _stamp(board).exists()
++    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 0)
++    kbc._write_integrity_stamp(resolved, kbc._integrity_generation(resolved))
++    assert not _stamp(board).exists()
++
++
++def _write_stamp(board, **over):
++    resolved = board.resolve()
++    doc = {"version": 2, "generation": kbc._integrity_generation(resolved),
++           "verified_at": time.time(), "pid": 1}
++    doc.update(over)
++    _stamp(board).write_text(json.dumps(doc), encoding="utf-8")
++
++
++def test_hand_built_good_stamp_is_fresh_control(board):
++    _write_stamp(board)
++    assert _fresh(board)
++
++
++@pytest.mark.parametrize("raw", [
++    "", "not json", "[]", "null", "{}", '{"version": 2}',
++    '{"version": 2, "verified_at": "x", "generation": {}}',
++    b"\xff\xfe\x00garbage",
++])
++def test_malformed_stamps_do_not_skip(board, raw):
++    if isinstance(raw, bytes):
++        _stamp(board).write_bytes(raw)
++    else:
++        _stamp(board).write_text(raw)
++    assert not _fresh(board)
++
++
++def test_legacy_v1_stamp_does_not_skip(board, checks):
++    st = board.stat()
++    _stamp(board).write_text(json.dumps({
++        "version": 1, "dev": st.st_dev, "ino": st.st_ino, "size": st.st_size,
++        "mtime_ns": st.st_mtime_ns, "verified_at": time.time(), "pid": 1}))
++    assert not _fresh(board)
++    assert _connect_scans(board, checks) >= 1
++
++
++def test_unversioned_legacy_stamp_does_not_skip(board):
++    st = board.stat()
++    _stamp(board).write_text(json.dumps({
++        "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "verified_at": time.time()}))
++    assert not _fresh(board)
++
++
++def test_wrong_version_does_not_skip(board):
++    for v in (0, 1, 3, "2", None):
++        _write_stamp(board, version=v)
++        assert not _fresh(board), v
++
++
++def test_future_stamp_does_not_skip(board):
++    _write_stamp(board, verified_at=time.time() + 3600)
++    assert not _fresh(board)
++
++
++def test_expired_stamp_does_not_skip(board):
++    _write_stamp(board, verified_at=time.time() - 6 * 3600.0 - 5)
++    assert not _fresh(board)
++
++
++def test_generation_mismatch_does_not_skip(board):
++    gen = kbc._integrity_generation(board.resolve())
++    assert gen is not None
++    gen[""][2] += 1
++    _write_stamp(board, generation=gen)
++    assert not _fresh(board)
++
++
++def test_ttl_zero_never_skips(board, monkeypatch):
++    _write_stamp(board)
++    monkeypatch.setattr(kbc, "_INTEGRITY_STAMP_TTL_SECONDS", 0)
++    assert not _fresh(board)
++
++
++def test_stat_failure_does_not_skip(board, monkeypatch):
++    _write_stamp(board)
++    assert _fresh(board)
++    real_stat = Path.stat
++
++    def boom(self, *a, **k):
++        if self.name.startswith("kanban.db") and not self.name.endswith(".integrity-ok"):
++            raise PermissionError("denied")
++        return real_stat(self, *a, **k)
++
++    monkeypatch.setattr(Path, "stat", boom)
++    assert kbc._integrity_generation(board.resolve()) is None
++    assert not _fresh(board)
++    kbc._write_integrity_stamp(board.resolve(), None)
++
++
++def test_missing_db_generation_is_none(tmp_path):
++    assert kbc._integrity_generation(tmp_path / "absent.db") is None
++
++
++def test_corrupt_db_with_forged_current_stamp_still_detected_after_write(board):
++    """A stamp forged for the pre-corruption generation cannot survive the corrupting write."""
++    _write_stamp(board)
++    assert _fresh(board)
++    size = board.stat().st_size
++    with open(board, "r+b") as f:
++        f.seek(4096)
++        f.write(b"\xff" * (size - 4096))
++    assert not _fresh(board)
++    _forget(board)
++    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
++        kbc.connect(board).close()
++
++
++def test_corrupt_db_is_never_stamped(board):
++    size = board.stat().st_size
++    with open(board, "r+b") as f:
++        f.seek(4096)
++        f.write(b"\xff" * (size - 4096))
++    _forget(board)
++    with pytest.raises((kbc.KanbanDbCorruptError, sqlite3.DatabaseError)):
++        kbc.connect(board).close()
++    assert not _stamp(board).exists()
++
++
++def test_connect_write_side_effects_invalidate(board, checks):
++    _stamped(board)
++    conn = kbc.connect(board)  # skip path: process-cached from here on
++    conn.close()
++    _forget(board)
++    c = sqlite3.connect(board)
++    c.execute("CREATE TABLE side_effect (x)")
++    c.execute("INSERT INTO side_effect VALUES (1)")
++    c.commit()
++    c.close()
++    assert not _fresh(board)
++    assert _connect_scans(board, checks) >= 1
++
++
++def test_schema_write_by_connect_not_certified_by_older_stamp(board, checks):
++    """A write performed under the stamped generation (e.g. a migration) changes it: the next process rescans."""
++    _stamped(board)
++    gen = kbc._integrity_generation(board.resolve())
++    conn = kbc.connect(board)
++    try:
++        conn.execute("CREATE TABLE IF NOT EXISTS migr (x)")
++        conn.commit()
++    finally:
++        conn.close()
++    _forget(board)
++    assert kbc._integrity_generation(board.resolve()) != gen
++    assert not _fresh(board)
++
++
++def test_explicit_repair_revokes_prior_shared_certificate(board):
++    _stamped(board)
++    assert kbc.repair_db(board).status == "ok"
++    assert not _stamp(board).exists()
+diff --git a/tests/tools/test_kanban_connect_integrity_stamp.py b/tests/tools/test_kanban_connect_integrity_stamp.py
+index 84eec64b34..dd8b86e9e6 100644
+--- a/tests/tools/test_kanban_connect_integrity_stamp.py
++++ b/tests/tools/test_kanban_connect_integrity_stamp.py
+@@ -37,7 +37,8 @@ def counted(conn):
+     return real(conn)
+ 
+ kbc._run_integrity_check = counted
+-kbc._INTEGRITY_STAMP_TTL_SECONDS = float(os.environ.get("CHECK_TTL_S", kbc._INTEGRITY_STAMP_TTL_SECONDS))
++if "CHECK_TTL_S" in os.environ:
++    kbc._INTEGRITY_STAMP_TTL_SECONDS = float(os.environ["CHECK_TTL_S"])
+ kbc.connect(Path(sys.argv[1])).close()
+ """
+ 
+@@ -68,9 +69,15 @@ def _spawn(tmp_path, board_path, n, **extra):
+     env = _env(tmp_path, board_path, **extra)
+     procs = [subprocess.Popen([sys.executable, "-c", CHILD, str(board_path)], env=env, cwd=REPO,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(n)]
+-    for p in procs:
+-        _out, err = p.communicate(timeout=120)
+-        assert p.returncode == 0, err[-2000:]
++    try:
++        for p in procs:
++            _out, err = p.communicate(timeout=120)
++            assert p.returncode == 0, err[-2000:]
++    finally:
++        for p in procs:
++            if p.poll() is None:
++                p.kill()
++            p.communicate(timeout=10)
+     log = tmp_path / "checks.log"
+     return log.read_text().split() if log.exists() else []
+ 
+@@ -98,7 +105,7 @@ def test_an_expired_stamp_forces_a_fresh_full_check(tmp_path, board):
+     stamp = json.loads(_stamp(board).read_text())
+     stamp["verified_at"] -= 7 * 3600
+     _stamp(board).write_text(json.dumps(stamp))
+-    assert len(_spawn(tmp_path, board, 1)) == 2
++    assert len(_spawn(tmp_path, board, 6, CHECK_SLEEP_S="0.4")) == 2
+ 
+ 
+ def test_a_stamp_for_a_replaced_file_is_ignored(tmp_path, board):
+-- 
+2.43.0
+

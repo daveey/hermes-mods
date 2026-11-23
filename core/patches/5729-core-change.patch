@@ -1,0 +1,93 @@
+From bc879c8afa02265da317c1645afd5e40e7699b31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 10:06:31 +0000
+Subject: [PATCH] fix(kanban): taint nullable pending identities by physical
+ row [daveey]
+
+---
+ docs/kanban-replay-capture-storage.md         |  4 +++
+ hermes_cli/kanban_sync_capture_storage.py     |  4 +--
+ .../test_kanban_sync_capture_storage.py       | 36 +++++++++++++++++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/docs/kanban-replay-capture-storage.md b/docs/kanban-replay-capture-storage.md
+index 15f96ab107..4fb1fa1c9e 100644
+--- a/docs/kanban-replay-capture-storage.md
++++ b/docs/kanban-replay-capture-storage.md
+@@ -29,6 +29,10 @@ SQLite guards in the caller's existing write transaction:
+   fields, base version, HLC, status origin or stored wire;
+ - taint synthetic-parent identity/wire changes.
+ 
++Taint targets the changed SQLite `rowid`, not key equality: ordinary TEXT primary
++keys here are nullable, and changing one to NULL must still taint exactly that row,
++without touching unrelated NULL-key custody.
++
+ Freezing a previously unfrozen outbox operation and ordinary attempts/error
+ bookkeeping do not taint it. Unexposed coalescing may change fields while
+ preserving the capture-time lower bound. `wire_json != NULL` is a conservative
+diff --git a/hermes_cli/kanban_sync_capture_storage.py b/hermes_cli/kanban_sync_capture_storage.py
+index 7c938e8f8c..a9c67a5d10 100644
+--- a/hermes_cli/kanban_sync_capture_storage.py
++++ b/hermes_cli/kanban_sync_capture_storage.py
+@@ -45,9 +45,9 @@ def install(conn: sqlite3.Connection) -> None:
+         WHEN NEW.identity_state IS NOT 'ambiguous' AND
+             (NEW.op_id IS NOT OLD.op_id OR NEW.created_at IS NOT OLD.created_at OR
+                 (OLD.wire_json IS NOT NULL AND ({changed})))
+-        BEGIN UPDATE kanban_sync_outbox SET identity_state='ambiguous' WHERE op_id=NEW.op_id; END""")
++        BEGIN UPDATE kanban_sync_outbox SET identity_state='ambiguous' WHERE rowid=NEW.rowid; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS replay_capture1_parent_taint
+         AFTER UPDATE ON kanban_sync_parent_envelopes
+         WHEN NEW.identity_state IS NOT 'ambiguous' AND
+             (NEW.task_id IS NOT OLD.task_id OR NEW.wire IS NOT OLD.wire)
+-        BEGIN UPDATE kanban_sync_parent_envelopes SET identity_state='ambiguous' WHERE task_id=NEW.task_id; END""")
++        BEGIN UPDATE kanban_sync_parent_envelopes SET identity_state='ambiguous' WHERE rowid=NEW.rowid; END""")
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_storage.py b/tests/hermes_cli/test_kanban_sync_capture_storage.py
+index d23c613669..55c420c4b2 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_storage.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_storage.py
+@@ -166,6 +166,42 @@ def test_parent_identity_change_taints_and_original_tuple_is_immutable(board):
+             board.execute(f"UPDATE kanban_sync_parent_envelopes SET {assignment}")
+ 
+ 
++@pytest.mark.parametrize("table,key", [("kanban_sync_outbox", "op_id"), ("kanban_sync_parent_envelopes", "task_id")])
++def test_null_identity_change_taints_exactly_the_changed_row(board, table, key):
++    if table == 'kanban_sync_outbox':
++        original(board, wire='{}')
++    else:
++        board.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire,capture_protocol,original_op_id,"
++                      "original_created_at,identity_state) VALUES ('t_parent','{}','capture1','parent-operation',123,'original')")
++    rowid = board.execute(f"SELECT rowid FROM {table}").fetchone()[0]
++    before = tuple(board.execute(f"SELECT {','.join(COLUMNS)} FROM {table}").fetchone())
++    if table == 'kanban_sync_outbox':
++        board.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                      "VALUES (NULL,'tasks','t_unrelated','upsert','{}','',123)")
++    else:
++        board.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES (NULL,'{}')")
++    other = board.execute(f"SELECT rowid FROM {table} WHERE {key} IS NULL").fetchone()[0]
++    board.execute(f"UPDATE {table} SET {key}=NULL WHERE rowid=?", (rowid,))
++    actual = tuple(board.execute(f"SELECT {','.join(COLUMNS)} FROM {table} WHERE rowid=?", (rowid,)).fetchone())
++    assert actual == (*before[:3], 'ambiguous')
++    assert tuple(board.execute(f"SELECT {','.join(COLUMNS)} FROM {table} WHERE rowid=?", (other,)).fetchone()) == (None, None, None, None)
++    with pytest.raises(sqlite3.IntegrityError, match='capture provenance is immutable'):
++        board.execute(f"UPDATE {table} SET identity_state='original' WHERE rowid=?", (rowid,))
++
++
++@pytest.mark.parametrize("table", ["kanban_sync_outbox", "kanban_sync_parent_envelopes"])
++@pytest.mark.parametrize("assignment", ["capture_protocol='capture1'", "original_op_id='retrofit'", "original_created_at=123"])
++def test_unknown_capture_tuple_cannot_be_retrofitted_without_state_change(board, table, assignment):
++    if table == 'kanban_sync_outbox':
++        board.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                      "VALUES ('unknown-operation','tasks','t_unknown','upsert','{}','',123)")
++    else:
++        board.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES ('t_unknown','{}')")
++    with pytest.raises(sqlite3.IntegrityError, match='capture provenance is immutable'):
++        board.execute(f"UPDATE {table} SET {assignment}")
++    assert tuple(board.execute(f"SELECT {','.join(COLUMNS)} FROM {table}").fetchone()) == (None, None, None, None)
++
++
+ def test_upgrade_preserves_historical_bytes_without_inventing_originality():
+     from hermes_cli.kanban_sync_capture_storage import install
+     conn = sqlite3.connect(':memory:')
+-- 
+2.43.0
+

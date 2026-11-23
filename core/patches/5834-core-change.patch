@@ -1,0 +1,1022 @@
+From e75617ea199ad84b2e290548fe7d2f915854edcd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:29:19 +0000
+Subject: [PATCH] [daveey] Acquire canonical listed-card sets on caller-owned
+ snapshots
+
+Extract the existing execution-authority/detail/wait enrichment into one
+connection-taking owner shared with the legacy session reader. Add complete
+per-session creator/subscriber membership via JSON scopes rather than a
+union-only or per-session query loop. Require captured gateway/profile scope
+so cold identity discovery cannot open a hidden reader inside acquisition.
+Borrow explicit parent replicas, including containment resolution; explicit
+None is local-only. Legacy omitted replica arguments retain their ownership.
+
+Size execution chunks for their double-bound IDs and details for their fixed
+bindings. JSON-bound containment scopes retain every authority above the SQLite
+999-variable cap. The new complete selector propagates operational subscriber
+errors rather than certifying partial coverage; legacy optional reads retain
+their existing failure boundary.
+
+Why: an independently opened canonical reader cannot share a caller's cursor
+snapshot; union dedup loses per-chat provenance; 500 twice-bound IDs exceed999.
+These are acquisition boundaries, not changes to authority or outcome policy.
+
+Proof: canonical RED/GREEN covers snapshot interleaving, physical SQLite open
+instrumentation, borrowed replica closure, 4097 lineage IDs under limit999,
+legacy/local/PRIMARY/unavailable and receipt differential controls, named owner
+scope, explicit clock/CI/deploy waits, containment and foreign parent custody.
+Focused suites and full scripts/check --base origin/main pass. Wider immutable
+snapshot and clause-mutation evidence follows before publication/review.
+
+No panel feed/store activation, reader DDL, persistent connections or claim of
+bounded history scans. Rollback is a normal revert of this acquisition change.
+---
+ hermes_cli/kanban_contained_wait.py           |  24 +--
+ hermes_cli/kanban_execution_source.py         |   7 +-
+ hermes_cli/kanban_session_acquisition.py      |  97 ++++++++++
+ hermes_cli/kanban_session_activity.py         |  44 +----
+ .../kanban_session_activity_card_details.py   |  32 +++-
+ hermes_cli/kanban_session_outcome_tasks.py    |  44 +++--
+ hermes_cli/kanban_session_wait_rows.py        |  19 +-
+ .../test_kanban_acquisition_boundaries.py     | 107 +++++++++++
+ .../test_kanban_acquisition_differential.py   | 167 ++++++++++++++++++
+ .../test_kanban_acquisition_parents.py        |  87 +++++++++
+ .../test_kanban_owned_acquisition.py          | 122 +++++++++++++
+ 11 files changed, 673 insertions(+), 77 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_acquisition.py
+ create mode 100644 tests/hermes_cli/test_kanban_acquisition_boundaries.py
+ create mode 100644 tests/hermes_cli/test_kanban_acquisition_differential.py
+ create mode 100644 tests/hermes_cli/test_kanban_acquisition_parents.py
+ create mode 100644 tests/hermes_cli/test_kanban_owned_acquisition.py
+
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+index cf77387bd4..5a32ae1c12 100644
+--- a/hermes_cli/kanban_contained_wait.py
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -33,11 +33,10 @@ def _json(raw: Any) -> dict:
+ def _local_status(conn: sqlite3.Connection, ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
+     """``{id: (status, finished_at)}`` using the terminal transition, never later comments."""
+     out: dict[str, tuple[str, Optional[float]]] = {}
+-    marks = ",".join("?" * len(ids))
+     for tid, status, done_at, last in conn.execute(
+-            f"SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
+-            f"WHERE e.task_id = t.id AND e.kind = CASE t.status WHEN 'archived' THEN 'archived' "
+-            f"ELSE 'completed' END) FROM tasks t WHERE t.id IN ({marks})", ids):
++            "SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
++            "WHERE e.task_id = t.id AND e.kind = CASE t.status WHEN 'archived' THEN 'archived' "
++            "ELSE 'completed' END) FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?))", (json.dumps(ids),)):
+         out[str(tid)] = (str(status), last if status == "archived" else done_at)
+     return out
+ 
+@@ -59,7 +58,7 @@ def _replica_status(ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
+     return out
+ 
+ 
+-def statuses(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str, tuple[str, Optional[float]]]:
++def statuses(conn: sqlite3.Connection, ids: Iterable[str], *, replica: Any = ...) -> dict[str, tuple[str, Optional[float]]]:
+     want = list(dict.fromkeys(ids))
+     if not want:
+         return {}
+@@ -70,7 +69,10 @@ def statuses(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str, tuple[st
+     missing = [i for i in want if i not in found]
+     if missing:
+         try:
+-            found.update(_replica_status(missing))
++            if replica is ...:
++                found.update(_replica_status(missing))
++            elif replica is not None:
++                found.update(_local_status(replica, missing))
+         except Exception:  # replica unreadable: unknown status counts as open
+             logger.debug("contained wait: replica status lookup failed", exc_info=True)
+     return found
+@@ -99,7 +101,7 @@ def _active_episode(conn: sqlite3.Connection, tid: str, marker: str) -> Optional
+     return next((e for e in events if e["kind"] == "contained" and e["uid"] == marker), None)
+ 
+ 
+-def read(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
++def read(conn: sqlite3.Connection, task_ids: Iterable[str], *, replica: Any = ...) -> dict[str, dict[str, Any]]:
+     """``{task_id: contained facts}`` for the held triage cards among ``task_ids``::
+ 
+         {episode, contained_at, authority: {id, status, at}, producer: {id, status, released} | None}
+@@ -111,9 +113,9 @@ def read(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[st
+     try:
+         if "containment_episode" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
+             return {}
+-        marks = ",".join("?" * len(ids))
+-        rows = conn.execute(f"SELECT id, containment_episode FROM tasks WHERE status = 'triage' "
+-                            f"AND containment_episode IS NOT NULL AND id IN ({marks})", ids).fetchall()
++        rows = conn.execute("SELECT id, containment_episode FROM tasks WHERE status = 'triage' "
++                            "AND containment_episode IS NOT NULL AND id IN (SELECT value FROM json_each(?))",
++                            (json.dumps(ids),)).fetchall()
+     except sqlite3.Error:
+         return {}
+     stops: dict[str, tuple[dict, dict]] = {}
+@@ -130,7 +132,7 @@ def read(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[st
+         stops[str(tid)] = (stop, spec)
+     need = [spec["authority"]["task_id"] for _, spec in stops.values()]
+     need += [spec["producer"]["task_id"] for _, spec in stops.values() if isinstance(spec.get("producer"), dict)]
+-    known = statuses(conn, need)
++    known = statuses(conn, need) if replica is ... else statuses(conn, need, replica=replica)
+     out: dict[str, dict[str, Any]] = {}
+     for tid, (stop, spec) in stops.items():
+         a_id = spec["authority"]["task_id"]
+diff --git a/hermes_cli/kanban_execution_source.py b/hermes_cli/kanban_execution_source.py
+index 8850dc6e5c..b475cae85e 100644
+--- a/hermes_cli/kanban_execution_source.py
++++ b/hermes_cli/kanban_execution_source.py
+@@ -121,8 +121,11 @@ def assemble(conn, ids, *, board, gateway, profile, observed_at):
+         return {}
+     schema = _schema(conn)
+     out = {}
+-    for start in range(0, len(ids), 500):
+-        chunk = ids[start:start + 500]
++    # The task/run join binds the same chunk twice. Respect the actual connection
++    # limit (older SQLite builds default to 999), not only the output batch size.
++    chunk_size = min(500, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // 2)
++    for start in range(0, len(ids), chunk_size):
++        chunk = ids[start:start + chunk_size]
+         marks = ','.join('?' for _ in chunk)
+         tasks, runs, current = _tasks_runs(conn, chunk, schema)
+         events = {}
+diff --git a/hermes_cli/kanban_session_acquisition.py b/hermes_cli/kanban_session_acquisition.py
+new file mode 100644
+index 0000000000..ace6582742
+--- /dev/null
++++ b/hermes_cli/kanban_session_acquisition.py
+@@ -0,0 +1,97 @@
++"""Canonical listed-card enrichment on caller-owned SQLite snapshots. [daveey]
++
++No connection, transaction, migration or persistent cache is owned here. Optional
++foreign-parent evidence must be captured by the caller; None means local only.
++Execution history/window scans and presentation history remain canonical, not a
++bounded-work guarantee. Membership pairs retain per-chat provenance before union
++creator precedence; consumers must apply that provenance to each chat separately.
++"""
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++from typing import Any, Iterable
++
++from hermes_cli.kanban_session_activity_card_details import LEGACY_REPLICA
++
++
++def enrich_session_tasks(conn: sqlite3.Connection, path: Path, found: dict[str, dict[str, Any]], *,
++                         observed_at: float, scope: tuple[str | None, str | None], replica: Any = None) -> None:
++    """Mutate selected cards using the single legacy authority/detail/wait policy.
++
++    ``LEGACY_REPLICA`` preserves legacy shadow acquisition and closure. An explicit
++    connection or None borrows only the supplied inputs, never opens or closes a
++    shadow. Caller supplies sqlite3.Row and owns all transaction lifetimes.
++    """
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli.kanban_execution_source import assemble
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
++    from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
++
++    board = activity._board_slug(path)
++    gateway, profile = scope
++    for info in found.values():
++        info['_execution_scope'] = {'gateway': gateway, 'profile': profile, 'board': board}
++    primary = False
++    try:
++        activity._require_local_execution_authority(conn)
++        authority = True
++    except PrimaryMirror:
++        authority, primary = False, True
++    except ADAPTER_ERRORS:
++        authority = False
++    try:
++        if primary:
++            attach(conn, found, board=board, gateway=gateway, profile=profile)
++            for info in found.values():
++                if '_replica_run' not in info:
++                    info['_execution_error'] = True
++        elif authority:
++            sources = assemble(conn, found, board=board, gateway=gateway, profile=profile,
++                               observed_at=observed_at)
++            for tid, source in sources.items():
++                found[tid]['_execution_source'] = source
++        else:
++            raise RuntimeError('local execution authority unavailable')
++    except ADAPTER_ERRORS:
++        activity._log.debug('kanban execution source failed for %s', path, exc_info=True)
++        for info in found.values():
++            info['_execution_error'] = True
++    if authority:
++        activity._receipts.attach_done(conn, found, board=board, gateway=gateway, profile=profile,
++                                      observed_at=observed_at)
++    if replica is LEGACY_REPLICA:
++        activity._add_card_details(conn, found)
++    else:
++        activity._add_card_details(conn, found, replica=replica)
++    try:
++        # Legacy age policy uses the current clock; owned captures freeze it.
++        waits = (activity._local_wait_info(conn, found) if replica is LEGACY_REPLICA
++                 else activity._local_wait_info(conn, found, now=observed_at, replica=replica))
++        for tid, info in waits.items():
++            found[tid]['wait'] = info
++    except Exception as exc:  # health: allow BLE001 -- Preserve the legacy optional wait boundary; listed cards remain on display failure.
++        activity._log.debug('kanban wait info read failed for %s: %s', path, exc)
++
++
++def read_session_task_set(conn: sqlite3.Connection, path: Path, session_ids: Iterable[str],
++                          statuses: tuple[str, ...], *, observed_at: float, scope: tuple[str | None, str | None],
++                          replica: sqlite3.Connection | None = None,
++                          ) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], str]]:
++    """Return enriched union cards and complete ``(session, task) -> via`` pairs.
++
++    Must run inside the caller's query-only transaction with sqlite3.Row. ``path``
++    is scope metadata only, never opened here. ``replica`` is optional captured
++    foreign-parent input, borrowed without closure; explicit None is local only.
++    Resolve ``scope`` with canonical ``card_scope(path)`` BEFORE entering capture:
++    cold gateway identity discovery can otherwise open an unrelated identity DB.
++    This does not attest that two supplied transactions share an atomic snapshot.
++    """
++    from hermes_cli.kanban_session_activity import _board_slug
++    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_task_set
++
++    found, pairs = select_listed_local_task_set(conn, session_ids, statuses)
++    enrich_session_tasks(conn, path, found, observed_at=observed_at, scope=scope, replica=replica)
++    for info in found.values():
++        info['board'] = _board_slug(path)
++    return found, pairs
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 6ec5bb8038..8c78110d02 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1600,47 +1600,9 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+             return []  # explicitly supported pre-session schema
+         from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
+         found = select_listed_local_tasks(conn, ids, statuses)
+-        from hermes_cli.kanban_execution_source import assemble
+-        from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_scope
+-        gateway, profile = card_scope(path)
+-        for info in found.values():  # board-root owner scope, kept for the failure path too (C9)
+-            info["_execution_scope"] = {"gateway": gateway, "profile": profile, "board": _board_slug(path)}
+-        from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
+-        primary = False
+-        try:
+-            _require_local_execution_authority(conn)
+-            authority = True
+-        except PrimaryMirror:
+-            authority, primary = False, True
+-        except ADAPTER_ERRORS:
+-            authority = False  # a pulled mirror attests neither open nor delivered cards
+-        try:
+-            if primary:
+-                attach(conn, found, board=_board_slug(path), gateway=gateway, profile=profile)
+-                for info in found.values():
+-                    if "_replica_run" not in info:
+-                        info["_execution_error"] = True
+-            elif authority:
+-                sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+-                                   observed_at=read_at)
+-                for tid, source in sources.items():
+-                    found[tid]["_execution_source"] = source
+-            else:
+-                raise RuntimeError("local execution authority unavailable")
+-        except ADAPTER_ERRORS:
+-            # Optional evidence: the task list and asks stay; each card becomes an explicit unknown.
+-            _log.debug("kanban execution source failed for %s", path, exc_info=True)
+-            for info in found.values():
+-                info["_execution_error"] = True
+-        if authority:  # receipts are independent of the open-card read, but not of owner authority
+-            _receipts.attach_done(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+-                                  observed_at=read_at)
+-        _add_card_details(conn, found)
+-        try:
+-            for tid, info in _local_wait_info(conn, found).items():
+-                found[tid]["wait"] = info
+-        except Exception as exc:  # display-only: never fails the task list
+-            _log.debug("kanban wait info read failed for %s: %s", path, exc)
++        from hermes_cli.kanban_session_acquisition import LEGACY_REPLICA, enrich_session_tasks
++        from hermes_cli.kanban_execution_observations import card_scope
++        enrich_session_tasks(conn, path, found, observed_at=read_at, scope=card_scope(path), replica=LEGACY_REPLICA)
+     board = _board_slug(path)
+     return [{**t, "board": board} for t in found.values()]
+ 
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index c5c5369342..71dc3f7020 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -15,6 +15,7 @@ from hermes_cli.kanban_run_model import add_run_models
+ 
+ _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+ _NOTE_CHARS = 200
++LEGACY_REPLICA = ...  # omitted legacy argument owns shadow acquisition/closure
+ 
+ 
+ def _first_line(text: Any) -> str:
+@@ -22,7 +23,26 @@ def _first_line(text: Any) -> str:
+     return line[:_NOTE_CHARS]
+ 
+ 
+-def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]], *, replica: Any = LEGACY_REPLICA) -> None:
++    """Canonical details in chunks sized for the largest query's fixed bindings."""
++    from hermes_cli.kanban_run_model import _KINDS
++
++    if not found:
++        return
++    size = min(500, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - len(_KINDS))
++    ids = list(found)
++    owned = replica is LEGACY_REPLICA
++    if owned:
++        replica = _replica_for(conn)
++    try:
++        for start in range(0, len(ids), size):
++            _add_card_details_chunk(conn, {tid: found[tid] for tid in ids[start:start + size]}, replica=replica)
++    finally:
++        if owned and replica is not None:
++            replica.close()
++
++
++def _add_card_details_chunk(conn: sqlite3.Connection, found: dict[str, dict[str, Any]], *, replica: Any = LEGACY_REPLICA) -> None:
+     """Per listed card, what the linked-card rows show: the latest event (``activity_kind``/``activity_at``), a
+     one-line ``note`` (the newest run summary or comment) and the newest GitHub PR ``pr_url`` found in its
+     comments, result or run summaries. One query per table for all listed cards; missing tables are skipped."""
+@@ -69,7 +89,7 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+         found[task_id]["pr_url"] = url
+     add_run_machines(conn, found)  # where each card runs: the strip's hub/worker mark
+     add_run_models(conn, found)  # which model its newest run uses (route class/pin, or attested models)
+-    _add_blocked_upstream(conn, found)
++    _add_blocked_upstream(conn, found, replica=replica)
+ 
+ 
+ def _replica_for(conn: sqlite3.Connection) -> sqlite3.Connection | None:
+@@ -206,11 +226,13 @@ def _walk(conn: sqlite3.Connection, task_id: str,
+     return None, nearest_open
+ 
+ 
+-def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, Any]], *, replica: Any = LEGACY_REPLICA) -> None:
+     """Optional presentation evidence; old schemas remain readable. Replica fills foreign parents."""
+     if not found:
+         return
+-    replica = _replica_for(conn)
++    owned = replica is LEGACY_REPLICA
++    if owned:
++        replica = _replica_for(conn)
+     try:
+         try:
+             root_parents = _root_parents(conn, replica, list(found))
+@@ -232,7 +254,7 @@ def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, A
+             elif upstream is not None:
+                 card["upstream"] = upstream
+     finally:
+-        if replica is not None:
++        if owned and replica is not None:
+             replica.close()
+ 
+ 
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index 6fde745f7d..334bfe849b 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -9,6 +9,7 @@ card details and ``add_cards``.
+ from __future__ import annotations
+ 
+ from contextlib import closing
++import json
+ import logging
+ import sqlite3
+ from pathlib import Path
+@@ -19,38 +20,57 @@ _log = logging.getLogger("hermes_cli.kanban_session_activity")
+ 
+ def select_listed_local_tasks(conn: sqlite3.Connection, ids: list[str], statuses: tuple[str, ...],
+                               ) -> dict[str, dict[str, Any]]:
+-    """Tasks on one board that any of ``ids`` created or tui-shepherds, in ``statuses``.
++    """Legacy union view: creator precedence across the supplied lineage."""
++    return select_listed_local_task_set(conn, ids, statuses, strict=False)[0]
+ 
+-    Creator rows win over subscriber rows (``setdefault``). Same pairs ``_read_counts`` counts.
++
++def select_listed_local_task_set(conn: sqlite3.Connection, ids: Iterable[str], statuses: tuple[str, ...], *, strict: bool = True,
++                                 ) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], str]]:
++    """Return canonical cards AND complete ``(session, task) -> via`` membership.
++
++    JSON scopes use two bindings regardless of lineage size. Creator precedence
++    applies per pair as well as to the legacy union. The caller owns row_factory
++    and transaction lifetime; this selector neither opens nor closes a connection.
++    Missing legacy subscriptions are supported; other subscriber SQL errors
++    propagate rather than certifying partial coverage. Only the historical union
++    wrapper opts into ``strict=False`` to retain its optional-read boundary.
+     """
+     from hermes_cli.kanban_session_activity import _TASK_FIELDS, _counted_sub_clause
+     from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+ 
+-    sid_ph = ",".join("?" for _ in ids)
+-    st_ph = ",".join("?" for _ in statuses)
++    args = (json.dumps(list(dict.fromkeys(ids))), json.dumps(statuses))
++    sid_ph = "SELECT value FROM json_each(?)"
++    st_ph = "SELECT value FROM json_each(?)"
+     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+     if "session_id" not in cols:
+-        return {}  # explicitly supported pre-session schema
++        return {}, {}  # explicitly supported pre-session schema
+     select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
+     run_start = "NULL"
+     if "current_run_id" in cols and conn.execute(
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone():
+         run_start = "(SELECT r.started_at FROM task_runs r WHERE r.id = t.current_run_id AND r.task_id = t.id)"
+     found: dict[str, dict[str, Any]] = {}
++    pairs: dict[tuple[str, str], str] = {}
+     watch = _not_watch(conn)
+     for row in conn.execute(
+             f"SELECT {select}, {run_start} AS current_run_started_at FROM tasks t "
+-            f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
++            f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", args):
+         found[row["id"]] = {**dict(row), "via": "created"}
++        pairs[(row["session_id"], row["id"])] = "created"
+     try:
+         for row in conn.execute(
+-                f"SELECT {select}, {run_start} AS current_run_started_at FROM kanban_notify_subs s "
+-                f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' AND {_counted_sub_clause(conn)} "
+-                f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
+-            found.setdefault(row["id"], {**dict(row), "via": "subscribed"})
++                f"SELECT {select}, {run_start} AS current_run_started_at, s.chat_id AS _member_session "
++                f"FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                f"WHERE s.platform = 'tui' AND {_counted_sub_clause(conn)} "
++                f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", args):
++            info = dict(row)
++            sid = info.pop("_member_session")
++            found.setdefault(row["id"], {**info, "via": "subscribed"})
++            pairs.setdefault((sid, row["id"]), "subscribed")
+     except sqlite3.Error:  # board predates notify subscriptions
+-        pass
+-    return found
++        if strict and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'").fetchone():
++            raise
++    return found, pairs
+ 
+ 
+ def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], statuses: tuple[str, ...],
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index 79db6b45f6..af52b6e891 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -25,12 +25,14 @@ def _stored_needs_human(value, kind) -> bool:
+     return needs_human(value, kind=kind)
+ 
+ 
+-def _local_wait_info(conn: sqlite3.Connection, task_ids: Iterable[str], now: float | None = None,
++def _local_wait_info(conn: sqlite3.Connection, task_ids: Iterable[str], now: float | None = None, *, replica: Any = ...,
+                      ) -> dict[str, dict[str, Any]]:
+     """[daveey] ``{task_id: wait info}`` (``kanban_wait_info.describe``) for the parked cards among ``task_ids``: what
+     each waits on, since when, and whether only an agent can end it. One query for the cards, one for their newest
+     park events. Missing columns/tables degrade to status-only info."""
+-    return _external_overlay(conn, _describe_waits(*_local_wait_rows(conn, task_ids), now=now), now)
++    rows = (_local_wait_rows(conn, task_ids) if replica is ...
++            else _local_wait_rows(conn, task_ids, replica=replica))
++    return _external_overlay(conn, _describe_waits(*rows, now=now), now)
+ 
+ 
+ def _external_overlay(conn, info, now):
+@@ -39,7 +41,7 @@ def _external_overlay(conn, info, now):
+     return info
+ 
+ 
+-def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str]) -> tuple[dict[str, tuple], dict[str, tuple]]:
++def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str], *, replica: Any = ...) -> tuple[dict[str, tuple], dict[str, tuple]]:
+     """``(parked, events)``: the stored rows ``_describe_waits`` turns into wait info. Separate so a board memo can
+     keep the rows and re-judge their age at each read (the stall cut-off moves with the clock, the rows do not)."""
+     from hermes_cli import kanban_wait_info as kwi
+@@ -74,18 +76,23 @@ def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str]) -> tuple
+                 events[str(tid)] = (kind, payload, at)
+         except sqlite3.Error:  # board predates task_events
+             break
+-    _overlay_contained(conn, parked, events)
++    if replica is ...:
++        _overlay_contained(conn, parked, events)
++    else:
++        _overlay_contained(conn, parked, events, replica=replica)
+     return parked, events
+ 
+ 
+-def _overlay_contained(conn: sqlite3.Connection, parked: dict[str, tuple], events: dict[str, tuple]) -> None:
++def _overlay_contained(conn: sqlite3.Connection, parked: dict[str, tuple], events: dict[str, tuple], *, replica: Any = ...) -> None:
+     """A held triage card is described from its ``contained`` episode, not from an older park event. [daveey]"""
+     triage = [t for t, row in parked.items() if row[0] == "triage"]
+     if not triage:
+         return
+     try:
+         from hermes_cli import kanban_contained_wait
+-        for tid, info in kanban_contained_wait.read(conn, triage).items():
++        rows = (kanban_contained_wait.read(conn, triage) if replica is ...
++                else kanban_contained_wait.read(conn, triage, replica=replica))
++        for tid, info in rows.items():
+             events[tid] = ("contained", {"contained": info}, info.get("contained_at"))
+     except Exception:  # display-only: the card keeps its ordinary triage description
+         logging.getLogger(__name__).debug("contained wait read failed", exc_info=True)
+diff --git a/tests/hermes_cli/test_kanban_acquisition_boundaries.py b/tests/hermes_cli/test_kanban_acquisition_boundaries.py
+new file mode 100644
+index 0000000000..a358db7951
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_acquisition_boundaries.py
+@@ -0,0 +1,107 @@
++"""Additional acquisition refusal/custody controls discovered by seam inspection."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_contained_wait as contained
++from hermes_cli import kanban_session_outcome_tasks as selection
++from tests.hermes_cli import test_kanban_session_outcome_tasks as fixtures
++
++
++def test_complete_membership_does_not_swallow_subscription_operational_errors(tmp_path):
++    with fixtures._connect(tmp_path / 'board.db') as conn:
++        conn.row_factory = sqlite3.Row
++        fixtures._insert_task(conn, 'created', 'ready', 'scope')
++        fixtures._insert_task(conn, 'subscribed', 'ready', 'elsewhere')
++        fixtures._sub(conn, 'subscribed', 'scope', None)
++
++        def deny_reads(action, table, column, db, trigger):
++            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == 'kanban_notify_subs' else sqlite3.SQLITE_OK
++
++        conn.set_authorizer(deny_reads)
++        with pytest.raises(sqlite3.DatabaseError, match='prohibited'):
++            selection.select_listed_local_task_set(conn, ['scope'], ('ready',))
++        # Historical callers keep their existing optional-read behavior.
++        assert set(selection.select_listed_local_tasks(conn, ['scope'], ('ready',))) == {'created'}
++        conn.set_authorizer(None)
++
++
++def test_explicit_scope_avoids_identity_store_connection_acquisition(tmp_path, monkeypatch):
++    from hermes_cli import kanban_execution_observations as observations
++    from hermes_cli import kanban_session_acquisition as acquisition
++
++    path = tmp_path / 'board.db'
++    with fixtures._connect(path) as conn:
++        conn.row_factory = sqlite3.Row
++        fixtures._insert_task(conn, 'created', 'ready', 'scope')
++        monkeypatch.setattr(observations, 'card_scope', lambda *a: pytest.fail('scope resolved during capture'))
++        cards, _ = acquisition.read_session_task_set(conn, path, ['scope'], ('ready',),
++                                                      observed_at=100, scope=('owner-gateway', 'owner-profile'))
++        assert cards['created']['_execution_scope'] == {
++            'gateway': 'owner-gateway', 'profile': 'owner-profile', 'board': 'default'}
++
++
++def test_legacy_details_owns_one_replica_for_all_chunks(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_activity_card_details as details
++
++    with fixtures._connect(tmp_path / 'board.db') as conn:
++        conn.row_factory = sqlite3.Row
++        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
++        opened = []
++
++        def open_replica(_conn):
++            replica = sqlite3.connect(':memory:')
++            opened.append(replica)
++            return replica
++
++        monkeypatch.setattr(details, '_replica_for', open_replica)
++        details._add_card_details(conn, {})
++        assert not opened
++        details._add_card_details(conn, {f'card-{n}': {'status': 'done'} for n in range(1100)})
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++
++
++def test_json_membership_keeps_watch_and_counted_subscription_policy(tmp_path):
++    with fixtures._connect(tmp_path / 'board.db') as conn:
++        conn.row_factory = sqlite3.Row
++        for tid, status, owner in [('watch', 'scheduled', 'scope'), ('touch', 'ready', 'elsewhere'),
++                                    ('shepherd', 'ready', 'elsewhere'), ('creator', 'ready', 'scope')]:
++            fixtures._insert_task(conn, tid, status, owner)
++        fixtures._sub(conn, 'watch', 'scope', 'shepherd')
++        fixtures._sub(conn, 'touch', 'scope', 'touch')
++        fixtures._sub(conn, 'shepherd', 'scope', 'shepherd')
++        fixtures._sub(conn, 'creator', 'scope', 'touch')
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('watch','scheduled',?,99)",
++                      ('{"watch":true}',))
++        cards, pairs = selection.select_listed_local_task_set(conn, ['scope'], ('ready', 'scheduled'))
++        assert set(cards) == {'creator', 'shepherd'}
++        assert pairs == {('scope', 'creator'): 'created', ('scope', 'shepherd'): 'subscribed'}
++        conn.execute("UPDATE tasks SET status='running' WHERE id='watch'")
++        cards, pairs = selection.select_listed_local_task_set(conn, ['scope'], ('running',))
++        assert set(cards) == {'watch'} and pairs == {('scope', 'watch'): 'created'}
++
++
++def test_missing_optional_subscriptions_and_pre_session_schema_are_explicit(tmp_path):
++    with fixtures._connect(tmp_path / 'board.db') as conn:
++        conn.row_factory = sqlite3.Row
++        fixtures._insert_task(conn, 'created', 'ready', 'scope')
++        conn.execute('DROP TABLE kanban_notify_subs')
++        cards, pairs = selection.select_listed_local_task_set(conn, ['scope'], ('ready',))
++        assert set(cards) == {'created'} and pairs == {('scope', 'created'): 'created'}
++        assert selection.select_listed_local_task_set(conn, [], ()) == ({}, {})
++    with sqlite3.connect(':memory:') as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY)')
++        assert selection.select_listed_local_task_set(conn, ['scope'], ('ready',)) == ({}, {})
++
++
++def test_contained_status_scopes_fit_999_without_silent_unknowns(tmp_path):
++    with fixtures._connect(tmp_path / 'local.db') as conn, fixtures._connect(tmp_path / 'replica.db') as replica:
++        for db in (conn, replica):
++            db.execute('ALTER TABLE tasks ADD COLUMN completed_at REAL')
++            db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
++        ids = [f'authority-{n}' for n in range(1200)]
++        for tid in ids:
++            fixtures._insert_task(replica, tid, 'done', 'scope', completed_at=99)
++        assert contained.statuses(conn, ids, replica=replica) == {tid: ('done', 99) for tid in ids}
+diff --git a/tests/hermes_cli/test_kanban_acquisition_differential.py b/tests/hermes_cli/test_kanban_acquisition_differential.py
+new file mode 100644
+index 0000000000..37c26cc526
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_acquisition_differential.py
+@@ -0,0 +1,167 @@
++"""Migrated-core differential and authority gates for the owned snapshot seam."""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_execution_observations as observations
++from hermes_cli import kanban_session_acquisition as acquisition
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_session_activity_card_details as details
++from tests.hermes_cli import test_kanban_execution_receipt as receipt_fixtures
++
++board = receipt_fixtures.board
++NOW = 2_000_000_000
++
++
++def _path(conn):
++    from pathlib import Path
++    return Path(next(row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main'))
++
++
++def _compare(conn, monkeypatch, statuses, ids=('session',)):
++    path = _path(conn)
++    monkeypatch.setattr(activity.time, 'time', lambda: NOW)
++    monkeypatch.setattr(details, '_replica_for', lambda *a: None)
++    legacy = {row['id']: row for row in activity._read_session_tasks(path, list(ids), statuses)}
++    with closing(activity._open_ro(path, timeout=0.5)) as captured:
++        captured.row_factory = sqlite3.Row
++        captured.execute('BEGIN')
++        statements = []
++        captured.set_trace_callback(statements.append)
++        owned, pairs = acquisition.read_session_task_set(captured, path, ids, statuses, observed_at=NOW,
++                                                         scope=observations.card_scope(path))
++        assert captured.in_transaction
++        assert not any(sql.lstrip().upper().startswith(('CREATE ', 'ALTER ', 'INSERT ', 'UPDATE ', 'DELETE ',
++                                                      'COMMIT', 'ROLLBACK')) for sql in statements)
++    assert owned == legacy
++    return owned, pairs
++
++
++@pytest.mark.parametrize('mode', ['local', 'primary', 'unavailable'])
++@pytest.mark.parametrize('disposition', ['delivered', 'rejected', None])
++def test_migrated_done_authority_and_receipt_differential(board, monkeypatch, mode, disposition):
++    tid = receipt_fixtures.finish(board, receipt_fixtures.card(board), disposition)
++    if mode != 'local':
++        board.execute('CREATE TABLE IF NOT EXISTS kanban_sync_state (mode TEXT)')
++        board.execute('DELETE FROM kanban_sync_state')
++        board.execute('INSERT INTO kanban_sync_state(mode) VALUES (?)',
++                      ('primary' if mode == 'primary' else 'unavailable',))
++    rows, pairs = _compare(board, monkeypatch, ('done',))
++    card = rows[tid]
++    assert pairs == {('session', tid): 'created'}
++    assert card['_execution_scope'] == {'gateway': receipt_fixtures.GATEWAY, 'profile': 'default', 'board': 'default'}
++    assert ('_execution_done' in card) == (mode == 'local' and disposition == 'delivered')
++    assert ('_execution_source' in card) == (mode == 'local')
++    assert card.get('_execution_error', False) == (mode != 'local')
++    if '_execution_done' in card:
++        assert card['_execution_done']['delivery_receipt']['verified'] is True
++
++
++@pytest.mark.parametrize('mode', ['local', 'primary', 'unavailable'])
++def test_current_run_source_scope_and_primary_owner_evidence(board, monkeypatch, mode):
++    tid = receipt_fixtures.card(board)
++    assert kb.claim_task(board, tid)
++    rid = kb.get_task(board, tid).current_run_id
++    for table in ('task_runs', 'task_events'):
++        if 'uid' not in {r[1] for r in board.execute(f'PRAGMA table_info({table})')}:
++            board.execute(f'ALTER TABLE {table} ADD COLUMN uid TEXT')
++    board.execute('UPDATE task_runs SET uid=?,last_heartbeat_at=? WHERE id=?', ('run-uid', NOW - 10, rid))
++    board.execute('INSERT INTO task_events(task_id,run_id,kind,created_at,payload,uid) VALUES (?,?,?,?,?,?)',
++                  (tid, rid, 'heartbeat', NOW - 10, '{}', 'beat-uid'))
++    if mode != 'local':
++        board.execute('CREATE TABLE IF NOT EXISTS kanban_sync_state (mode TEXT)')
++        board.execute('DELETE FROM kanban_sync_state')
++        board.execute('INSERT INTO kanban_sync_state(mode) VALUES (?)',
++                      ('primary' if mode == 'primary' else 'unavailable',))
++    rows, _ = _compare(board, monkeypatch, ('running',))
++    card = rows[tid]
++    if mode == 'primary':
++        assert card['_replica_run']['run_id'] == 'run-uid'
++        assert '_execution_source' not in card and '_execution_error' not in card
++    elif mode == 'local':
++        assert card['_execution_source']['observed_at'] == NOW
++        assert card['current_run_started_at'] == kb.get_task(board, tid).started_at
++    else:
++        assert card['_execution_error'] is True and '_replica_run' not in card
++
++
++@pytest.mark.parametrize('producer', ['clock', 'ci', 'deploy'])
++def test_explicit_producer_wait_differential(board, monkeypatch, producer):
++    tid = receipt_fixtures.card(board)
++    payload = {'wake_at': NOW + 60, 'clock_only': True} if producer == 'clock' else {
++        'awaiting': {'kind': producer, 'ref': 'fixture-ref', 'why': 'fixture wait'}, 'wake_at': NOW + 60}
++    board.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++    kb._append_event(board, tid, 'scheduled', payload)
++    rows, _ = _compare(board, monkeypatch, ('scheduled',))
++    assert rows[tid]['wait']['waiting_on']
++    assert rows[tid]['wait'] == activity._local_wait_info(board, [tid], now=NOW)[tid]
++
++
++@pytest.mark.parametrize('failure', ['source', 'wait'])
++def test_optional_failures_preserve_rows_and_scope(board, monkeypatch, failure):
++    from hermes_cli import kanban_execution_source
++    tid = receipt_fixtures.card(board)
++
++    def refused(*args, **kwargs):
++        raise sqlite3.OperationalError('controlled optional read failure')
++
++    if failure == 'source':
++        monkeypatch.setattr(kanban_execution_source, 'assemble', refused)
++    else:
++        monkeypatch.setattr(activity, '_local_wait_info', refused)
++    rows, _ = _compare(board, monkeypatch, ('ready',))
++    assert tid in rows and rows[tid]['_execution_scope']['gateway'] == receipt_fixtures.GATEWAY
++    assert rows[tid].get('_execution_error', False) == (failure == 'source')
++
++
++def test_migrated_change_cursor_and_rows_share_one_physical_snapshot(board, monkeypatch):
++    import sys
++    from hermes_cli import kanban_task_change as changes
++
++    tid = receipt_fixtures.card(board)
++    path = _path(board)
++    scope = observations.card_scope(path)
++    opened = []
++    auditing = [True]
++
++    def record(event, args):
++        if auditing[0] and event == 'sqlite3.connect':
++            opened.append(args[0])
++
++    sys.addaudithook(record)
++    try:
++        with closing(activity._open_ro(path, timeout=0.5)) as captured:
++            assert len(opened) == 1
++            captured.row_factory = sqlite3.Row
++            captured.execute('BEGIN')
++            _, cursor = changes.changed_since(captured, None)
++            assert captured.execute('SELECT title FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'Bounded work'
++            board.execute("UPDATE tasks SET title='committed after cursor' WHERE id=?", (tid,))
++            # Every underlying SQLite constructor emits the audit event, including
++            # imported aliases: no monkeypatched connect facade can mask an open.
++            cards, _ = acquisition.read_session_task_set(captured, path, ['session'], ('ready',),
++                                                         observed_at=NOW, scope=scope)
++            assert cards[tid]['title'] == 'Bounded work'
++            assert changes.changed_since(captured, None)[1] == cursor
++            assert captured.in_transaction and len(opened) == 1
++            with pytest.raises(sqlite3.OperationalError, match='readonly'):
++                captured.execute("UPDATE tasks SET title='forbidden' WHERE id=?", (tid,))
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            captured.execute('SELECT 1')
++    finally:
++        auditing[0] = False
++    assert board.execute('SELECT title FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'committed after cursor'
++
++
++def test_named_board_profile_scope_comes_from_path_not_observing_profile(board, monkeypatch, tmp_path):
++    tid = receipt_fixtures.card(board)
++    monkeypatch.setattr(observations, 'local_scope', lambda: ('observer', 'unrelated'))
++    path = tmp_path / 'profiles' / 'owner' / 'kanban' / 'boards' / 'work' / 'kanban.db'
++    # card_scope consumes metadata only: no DB exists at this path.
++    rows, _ = acquisition.read_session_task_set(board, path, ['session'], ('ready',), observed_at=NOW,
++                                                 scope=observations.card_scope(path))
++    assert rows[tid]['_execution_scope'] == {
++        'gateway': 'observer', 'profile': 'owner', 'board': 'work'}
++    assert rows[tid]['board'] == 'work'
+diff --git a/tests/hermes_cli/test_kanban_acquisition_parents.py b/tests/hermes_cli/test_kanban_acquisition_parents.py
+new file mode 100644
+index 0000000000..fa336c64ce
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_acquisition_parents.py
+@@ -0,0 +1,87 @@
++"""Captured parent graph custody, containment and local-empty precedence."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_contained_wait as contained
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_session_acquisition as acquisition
++from hermes_cli import kanban_session_activity_card_details as details
++from tests.hermes_cli import test_kanban_contained_strand as containment_fixtures
++from tests.hermes_cli import test_kanban_session_outcome_tasks as selection_fixtures
++
++board = containment_fixtures.board
++
++
++def test_owned_containment_wait_never_discovers_an_external_reader(board, monkeypatch, tmp_path):
++    relay, authority, _ = containment_fixtures._contained(board)
++    board.execute("UPDATE tasks SET session_id='scope' WHERE id=?", (relay,))
++    # Move the authority facts into a separately captured replica so the old
++    # implicit status fallback would really be required, not vacuously skipped.
++    with selection_fixtures._connect(tmp_path / 'replica.db') as replica:
++        replica.execute('ALTER TABLE tasks ADD COLUMN completed_at REAL')
++        selection_fixtures._insert_task(replica, authority, 'done', 'other',
++                                        completed_at=containment_fixtures.NOW - 3600)
++        # Parent lookup uses the missing local ID; containment events remain intact.
++        board.execute('UPDATE tasks SET id=? WHERE id=?', ('moved-authority', authority))
++        monkeypatch.setattr(contained, '_replica_status', lambda *a: pytest.fail('implicit status reader'))
++        monkeypatch.setattr(details, '_replica_for', lambda *a: pytest.fail('implicit graph reader'))
++        from pathlib import Path
++        path = Path(next(row[2] for row in board.execute('PRAGMA database_list') if row[1] == 'main'))
++        rows, _ = acquisition.read_session_task_set(board, path, ['scope'], ('triage',),
++                                                     observed_at=containment_fixtures.NOW, scope=('fixture', 'default'))
++        assert rows[relay]['wait']['contained']['authority']['status'] == 'unknown'
++        rows, _ = acquisition.read_session_task_set(board, path, ['scope'], ('triage',),
++                                                     observed_at=containment_fixtures.NOW, scope=('fixture', 'default'), replica=replica)
++        assert rows[relay]['wait']['contained']['authority']['status'] == 'done'
++        assert rows[relay]['wait']['agent_owned'] is True
++        assert replica.execute('SELECT 1').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('depth', [1, 3])
++@pytest.mark.parametrize('local_empty', [False, True])
++def test_explicit_graph_matches_legacy_with_foreign_multihop_and_local_empty(tmp_path, monkeypatch, depth, local_empty):
++    with selection_fixtures._connect(tmp_path / 'local.db') as conn, selection_fixtures._connect(tmp_path / 'replica.db') as replica:
++        conn.row_factory = replica.row_factory = sqlite3.Row
++        for db in (conn, replica):
++            db.execute('CREATE TABLE task_links (parent_id TEXT, child_id TEXT)')
++            db.execute('ALTER TABLE tasks ADD COLUMN containment_episode TEXT')
++            db.execute('ALTER TABLE task_events ADD COLUMN uid TEXT')
++        selection_fixtures._insert_task(conn, 'child', 'todo', 'scope')
++        for n in range(depth):
++            child = 'child' if n == 0 else f'parent-{n - 1}'
++            parent = f'parent-{n}'
++            selection_fixtures._insert_task(replica, parent, 'triage' if n == depth - 1 else 'todo', 'other')
++            replica.execute('INSERT INTO task_links VALUES (?,?)', (parent, child))
++        if not local_empty:
++            conn.execute("INSERT INTO task_links VALUES ('parent-0','child')")
++        replica.execute('UPDATE tasks SET containment_episode=? WHERE id=?', ('ep', f'parent-{depth - 1}'))
++        replica.execute('INSERT INTO task_events(task_id,kind,payload,created_at,uid) VALUES (?,?,?,?,?)',
++                        (f'parent-{depth - 1}', 'contained', '{"policy":{"authority":{"task_id":"auth"}}}', 99, 'ep'))
++        selection_fixtures._insert_task(replica, 'auth', 'running', 'other')
++        # Legacy owns/ closes a second real handle, explicit input stays borrowed.
++        replica.commit()
++        opened = []
++
++        def legacy_replica(_conn):
++            reader = sqlite3.connect(tmp_path / 'replica.db')
++            reader.row_factory = sqlite3.Row
++            opened.append(reader)
++            return reader
++
++        monkeypatch.setattr(details, '_replica_for', legacy_replica)
++        legacy = {'child': {'status': 'todo'}}
++        details._add_blocked_upstream(conn, legacy)
++        explicit = {'child': {'status': 'todo'}}
++        details._add_blocked_upstream(conn, explicit, replica=replica)
++        assert explicit == legacy
++        if local_empty:
++            assert 'blocked_upstream' not in explicit['child']
++        else:
++            assert explicit['child']['blocked_upstream'] == {
++                'id': f'parent-{depth - 1}', 'status': 'triage',
++                'contained': {'episode': 'ep', 'authority': {'id': 'auth', 'status': 'running'}}}
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++        assert replica.execute('SELECT 1').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_owned_acquisition.py b/tests/hermes_cli/test_kanban_owned_acquisition.py
+new file mode 100644
+index 0000000000..99ccc124d6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owned_acquisition.py
+@@ -0,0 +1,122 @@
++"""Connection-owned acquisition: real SQLite scopes, snapshots and legacy parity."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_execution_source as source
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_session_activity_card_details as details
++from hermes_cli import kanban_session_outcome_tasks as selection
++from tests.hermes_cli import test_kanban_session_outcome_tasks as fixtures
++
++
++@pytest.mark.parametrize('size', [1, 8, 64, 4097])
++def test_complete_membership_pairs_fit_json_scope(tmp_path, size):
++    with fixtures._connect(tmp_path / 'board.db') as conn:
++        conn.row_factory = sqlite3.Row
++        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
++        ids = [f's-{n}' for n in range(size)]
++        for sid in ids:
++            fixtures._insert_task(conn, f't-{sid}', 'running', sid)
++            fixtures._sub(conn, f't-{sid}', sid, None)
++        fixtures._insert_task(conn, 'shared', 'running', ids[0])
++        for sid in ids:
++            fixtures._sub(conn, 'shared', sid, None)
++        fixtures._insert_task(conn, 'uncounted', 'running', 'elsewhere')
++        fixtures._sub(conn, 'uncounted', ids[0], 'touch')
++        found, pairs = selection.select_listed_local_task_set(conn, ids, ('running',))
++        assert len(found) == size + 1
++        assert len(pairs) == size * 2
++        assert pairs[(ids[0], 'shared')] == 'created'
++        assert all(pairs[(sid, 'shared')] == 'subscribed' for sid in ids[1:])
++        assert all(pairs[(sid, f't-{sid}')] == 'created' for sid in ids)
++        assert selection.select_listed_local_tasks(conn, ids, ('running',)) == found
++
++
++def test_owned_set_reuses_cursor_snapshot_without_any_implicit_open(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_acquisition as acquisition
++
++    path = tmp_path / 'board.db'
++    with fixtures._connect(path) as writer:
++        writer.execute('PRAGMA journal_mode=WAL')
++        fixtures._insert_task(writer, 'card', 'running', 'scope', title='before cursor')
++        writer.commit()
++        with sqlite3.connect(path) as captured:
++            captured.row_factory = sqlite3.Row
++            captured.execute('PRAGMA query_only=ON')
++            captured.execute('BEGIN')
++            assert captured.execute('SELECT title FROM tasks').fetchone()[0] == 'before cursor'
++            writer.execute("UPDATE tasks SET title='after cursor'")
++            writer.commit()
++            monkeypatch.setattr(details, '_replica_for', lambda *a: pytest.fail('implicit shadow open'))
++            monkeypatch.setattr(activity, 'cached_ro', lambda *a: pytest.fail('implicit local open'))
++            cards, pairs = acquisition.read_session_task_set(captured, path, ['scope'], ('running',),
++                                                             observed_at=100, scope=('fixture', 'default'))
++            assert cards['card']['title'] == 'before cursor'
++            assert pairs == {('scope', 'card'): 'created'}
++            assert captured.in_transaction
++            assert captured.execute('SELECT title FROM tasks').fetchone()[0] == 'before cursor'
++            assert cards['card']['_execution_source']['observed_at'] == 100
++
++
++def test_explicit_replica_is_borrowed_and_none_never_opens(tmp_path, monkeypatch):
++    with fixtures._connect(tmp_path / 'local.db') as conn, fixtures._connect(tmp_path / 'replica.db') as replica:
++        conn.row_factory = replica.row_factory = sqlite3.Row
++        conn.execute('CREATE TABLE task_links (parent_id TEXT, child_id TEXT)')
++        replica.execute('CREATE TABLE task_links (parent_id TEXT, child_id TEXT)')
++        fixtures._insert_task(conn, 'child', 'todo', 's')
++        conn.execute("INSERT INTO task_links VALUES ('foreign', 'child')")
++        fixtures._insert_task(replica, 'foreign', 'blocked', 's')
++        monkeypatch.setattr(details, '_replica_for', lambda *a: pytest.fail('implicit shadow open'))
++        found = {'child': {'status': 'todo'}}
++        details._add_blocked_upstream(conn, found, replica=None)
++        assert 'blocked_upstream' not in found['child']
++        details._add_blocked_upstream(conn, found, replica=replica)
++        assert found['child']['blocked_upstream'] == {'id': 'foreign', 'status': 'blocked'}
++        assert replica.execute('SELECT 1').fetchone()[0] == 1
++
++
++def test_contained_statuses_use_only_explicit_parent_input(tmp_path, monkeypatch):
++    from hermes_cli import kanban_contained_wait as contained
++
++    with fixtures._connect(tmp_path / 'local.db') as conn, fixtures._connect(tmp_path / 'replica.db') as replica:
++        for db in (conn, replica):
++            db.execute('ALTER TABLE tasks ADD COLUMN completed_at REAL')
++        fixtures._insert_task(replica, 'authority', 'done', 's', completed_at=99)
++        monkeypatch.setattr(contained, '_replica_status', lambda *a: pytest.fail('implicit replica acquisition'))
++        assert contained.statuses(conn, ['authority'], replica=None) == {}
++        assert contained.statuses(conn, ['authority'], replica=replica) == {'authority': ('done', 99)}
++        assert replica.execute('SELECT 1').fetchone()[0] == 1
++
++
++def test_large_owned_set_keeps_optional_details_under_999_limit(tmp_path):
++    from hermes_cli import kanban_session_acquisition as acquisition
++
++    path = tmp_path / 'board.db'
++    with fixtures._connect(path) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute('ALTER TABLE task_events ADD COLUMN run_id INTEGER')
++        conn.execute('ALTER TABLE task_runs ADD COLUMN ended_at REAL')
++        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
++        for n in range(1001):
++            tid = f't-{n}'
++            fixtures._insert_task(conn, tid, 'running', 'scope')
++            conn.execute('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?, ?, ?, ?)',
++                         (tid, 'comment', '{}', 99))
++            conn.execute('INSERT INTO task_runs(task_id,started_at,summary) VALUES (?, ?, ?)',
++                         (tid, 98, 'kept note'))
++        cards, _ = acquisition.read_session_task_set(conn, path, ['scope'], ('running',),
++                                                     observed_at=100, scope=('fixture', 'default'))
++        assert len(cards) == 1001
++        assert all(card.get('note') == 'kept note' for card in cards.values())
++        assert all(card.get('activity_kind') == 'comment' for card in cards.values())
++        assert all('_execution_source' in card for card in cards.values())
++
++
++def test_execution_chunk_respects_double_bound_variable_limit():
++    with sqlite3.connect(':memory:') as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY)')
++        conn.execute('CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT)')
++        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
++        assert source.assemble(conn, [f'absent-{n}' for n in range(500)],
++                               board='default', gateway='fixture', profile='default', observed_at=100) == {}
+-- 
+2.43.0
+

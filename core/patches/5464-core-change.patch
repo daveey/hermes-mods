@@ -1,0 +1,261 @@
+From 9810dd16e2ddae477b93f9d6e14598a08de58a80 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:21:58 +0000
+Subject: [PATCH] [daveey] Fail a quota-walled Desktop turn over to the next
+ route in its class, whatever the wall's length
+
+A Desktop chat: three turns failed before the agent was built
+(SubscriptionQuotaUnavailable anthropic/claude-fable-5-2, resets later that day) and the user saw only "Your request was not
+processed", while claude-opus-5-5 in the same deep class ran the same chat fine. The earlier automated
+deliveries to this chat hit the same wall.
+
+Five whys: the turn refused -> the build raised the wall -> may_reroute() held any wall resetting under 6 h
+(WALL_REROUTE_MIN_SECONDS, "waiting beats a provider switch") -> that rule was written for 33 h Codex walls and
+priced a refusal at nothing -> a turn refused for an hour is a lost turn for a person and a lost notice for an
+automation, and the router-picked pin is not the user's choice anyway.
+
+Fix: may_reroute() drops the 6 h floor. A non-explicit pin whose wall has a known future reset moves within its
+class (same-class-failover with walled_from, one chat notice naming the reset) at any length. Explicit pins
+(a switch, a named model) and Kanban card pins still hold, as do key/endpoint overrides and sessionless builds.
+Desktop turns, the messaging gateway and automated wakes share the one resolver, so all three take it. A held
+wall still closes as the route_refused card naming the reset in PT; Desktop now also hands the refused words back
+to the composer for route_refused (refused-sends), like a busy-chat refusal.
+
+RED: six tests in tests/agent/test_walled_default_pin.py fail on main (short wall, half-pool short wall, Desktop
+build, launch-key log) and pass here; 52 routing/wall test files (959 tests) green.
+---
+ agent/model_routing_walls.py                  | 26 +++++----
+ .../src/lib/session-busy-refusal.test.ts      | 21 +++++++
+ apps/desktop/src/lib/session-busy-refusal.ts  |  6 +-
+ gateway/session_wall_replay.py                |  2 +-
+ tests/agent/test_walled_default_pin.py        | 55 ++++++++++++-------
+ 5 files changed, 77 insertions(+), 33 deletions(-)
+ create mode 100644 apps/desktop/src/lib/session-busy-refusal.test.ts
+
+diff --git a/agent/model_routing_walls.py b/agent/model_routing_walls.py
+index 25def5e529..a77689a411 100644
+--- a/agent/model_routing_walls.py
++++ b/agent/model_routing_walls.py
+@@ -6,11 +6,11 @@ Codex wall then refused every turn although claude-opus-5-5 in the same class wa
+ 
+ Policy (one place, read by the managed resolver and the gateway's pre-build lookup):
+ - ``explicit`` pins (an honoured switch, a model David named, a Kanban card's pin) never move;
+-- a ``default`` pin (router pick, config default, an echo of either) whose subscription wall resets
+-  ``WALL_REROUTE_MIN_SECONDS`` or more away is re-selected in its class (``same-class-failover`` with
+-  ``walled_from``); a shorter wall still holds, since waiting beats a provider switch. "Resets" is when
+-  at least half the pool's accounts can serve again (``decision_reset``), not the nearest account: one
+-  account on a 5 h window does not make a week-long wall short;
++- a ``default`` pin (router pick, config default, an echo of either) whose subscription wall has a known
++  future reset is re-selected in its class (``same-class-failover`` with ``walled_from``), however short
++  the wall: a turn refused until the reset is worse than one served by the next eligible route (hub Desktop
++  chat 20000101_000000_e23a59: a ~1 h fable wall failed three turns while opus was free). The
++  reset in the notice is when at least half the pool's accounts can serve again (``decision_reset``);
+ - once rerouted, the session follows the reroute even while its stored model still names the walled one.
+ """
+ from __future__ import annotations
+@@ -21,8 +21,6 @@ import time
+ 
+ logger = logging.getLogger(__name__)
+ 
+-WALL_REROUTE_MIN_SECONDS = 6 * 3600
+-
+ 
+ def _state_path():
+     from hermes_constants import get_hermes_home
+@@ -72,12 +70,16 @@ def decision_reset(wall):
+ 
+ 
+ def may_reroute(wall, row, source, now=None):
+-    """True when the quota *wall* on a pin with standing *row* / request *source* should move it."""
++    """True when the quota *wall* on a pin with standing *row* / request *source* should move it.
++
++    Any wall with a known future reset moves a non-explicit pin: a turn that fails until the reset is worse
++    than one served by the next eligible route of the pin's class (hub Desktop chat 20000101_000000_e23a59,
++    11-21: fable's wall resets in ~1 h, every turn refused, opus free)."""
+     from agent.model_routing_state import is_explicit_pin
+     if os.environ.get("HERMES_KANBAN_TASK"):
+         return False  # card pins: t_01a19990897b9d9b (David's D1) owns their policy
+     reset = decision_reset(wall)
+-    if not isinstance(reset, (int, float)) or reset - (time.time() if now is None else now) < WALL_REROUTE_MIN_SECONDS:
++    if not isinstance(reset, (int, float)) or reset <= (time.time() if now is None else now):
+         return False
+     if row is not None:
+         return not is_explicit_pin(row)
+@@ -165,11 +167,11 @@ _NOT_DEFERRED_SEEN: set = set()
+ def log_not_deferred(wall, reason):
+     """One WARNING per wall episode and reason when the pre-build lookup keeps a far wall's refusal.
+ 
+-    A wall under ``WALL_REROUTE_MIN_SECONDS`` is meant to hold, so it stays quiet; a far one that
+-    refuses every turn names why (``key``, ``endpoint``, ``explicit``, ``no-target``, ``no-session``)."""
++    A wall with no known future reset stays quiet; any other one that refuses every turn names why (``key``,
++    ``endpoint``, ``explicit``, ``no-target``, ``no-session``)."""
+     reset, held_until = getattr(wall, "resets_at", None), decision_reset(wall)
+     if (not isinstance(reset, (int, float)) or not isinstance(held_until, (int, float))
+-            or held_until - time.time() < WALL_REROUTE_MIN_SECONDS):
++            or held_until <= time.time()):
+         return
+     episode = (getattr(wall, "provider", None), getattr(wall, "model", None), int(reset), reason)
+     if episode in _NOT_DEFERRED_SEEN:
+diff --git a/apps/desktop/src/lib/session-busy-refusal.test.ts b/apps/desktop/src/lib/session-busy-refusal.test.ts
+new file mode 100644
+index 0000000000..fd144839c8
+--- /dev/null
++++ b/apps/desktop/src/lib/session-busy-refusal.test.ts
+@@ -0,0 +1,21 @@
++import { describe, expect, it } from 'vitest'
++
++import { isSessionBusyRefusal } from './session-busy-refusal'
++
++describe('isSessionBusyRefusal', () => {
++  it('treats a busy chat as a refused send', () => {
++    expect(isSessionBusyRefusal({ failureReason: 'session_busy' })).toBe(true)
++    expect(isSessionBusyRefusal({ error: 'session_turn_lease_timeout:abc' })).toBe(true)
++  })
++
++  // A route behind a subscription quota wall refuses the turn before the agent is built: the message never
++  // ran, so the composer offers it back (hub chat 20000101_000000_e23a59).
++  it('treats a quota-walled route refusal as a refused send', () => {
++    expect(isSessionBusyRefusal({ surfaceCode: 'route_refused' })).toBe(true)
++  })
++
++  it('leaves other failures alone', () => {
++    expect(isSessionBusyRefusal({ surfaceCode: 'agent_init_failed' })).toBe(false)
++    expect(isSessionBusyRefusal({})).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/lib/session-busy-refusal.ts b/apps/desktop/src/lib/session-busy-refusal.ts
+index 4000519b21..be8ee7540a 100644
+--- a/apps/desktop/src/lib/session-busy-refusal.ts
++++ b/apps/desktop/src/lib/session-busy-refusal.ts
+@@ -13,11 +13,15 @@ export interface RefusalSignals {
+   surfaceCode?: unknown
+ }
+ 
+-/** Whether a failed turn is a busy-chat refusal that never processed the user's message. */
++/** The surface code of a turn refused because its pinned route's subscription quota is out (agent/error_surface.py). */
++export const ROUTE_REFUSED_CODE = 'route_refused'
++
++/** Whether a failed turn never processed the user's message: a busy chat, or a route behind a quota wall. */
+ export function isSessionBusyRefusal({ error, failureReason, surfaceCode }: RefusalSignals): boolean {
+   return (
+     failureReason === SESSION_BUSY_FAILURE ||
+     surfaceCode === SESSION_BUSY_FAILURE ||
++    surfaceCode === ROUTE_REFUSED_CODE ||
+     (typeof error === 'string' && error.trim().startsWith(LEASE_TIMEOUT_ERROR_PREFIX))
+   )
+ }
+diff --git a/gateway/session_wall_replay.py b/gateway/session_wall_replay.py
+index 0adf05a340..7f75fde38b 100644
+--- a/gateway/session_wall_replay.py
++++ b/gateway/session_wall_replay.py
+@@ -2,7 +2,7 @@
+ 
+ A Kanban notifier (or other producer) wake is committed to the session FIFO (``admit_route_wake``), and the
+ producer takes that receipt as final: it never resends. When the chat is pinned to a route whose subscription
+-wall *holds* (an explicit pin, or a wall under ``model_routing_walls.WALL_REROUTE_MIN_SECONDS``), the turn is
++wall *holds* (an explicit pin: ``model_routing_walls.may_reroute``), the turn is
+ refused before the agent is built (``SubscriptionQuotaUnavailable``) and the reply tells a person to "resend
+ after the reset". Nobody resends an automated notice, so it was lost until some other event woke the chat
+ (hub chat local-be7f1ded…, 2026-11-14: three notifier wakes refused, none redelivered).
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+index c10699d53b..0800212699 100644
+--- a/tests/agent/test_walled_default_pin.py
++++ b/tests/agent/test_walled_default_pin.py
+@@ -179,13 +179,14 @@ def test_walled_config_default_on_a_new_session_moves(home):
+     assert _state(home).peek('default-opus', 'deep')['walled_from']['model'] == OPUS
+ 
+ 
+-def test_wall_under_six_hours_still_holds(home):
+-    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++def test_wall_under_six_hours_moves_a_default_pin_too(home):
++    """Hub Desktop chat 20000101_000000_e23a59: fable's wall resets in ~1 h; holding it for the reset
++    failed every turn with "Your request was not processed" although opus sat free in the same class."""
+     _legacy_row(home, LEGACY_ECHO)
+-    _wall(home, 'openai-codex', ASTRA, 2)
+-    with pytest.raises(SubscriptionQuotaUnavailable):
+-        _resolve(ASTRA, 'openai-codex')
+-    assert _state(home).peek(SID, 'deep') == LEGACY_ECHO
++    reset = _wall(home, 'openai-codex', ASTRA, 2)
++    moved = _resolve(ASTRA, 'openai-codex')
++    assert (moved['provider'], moved['model']) == ('anthropic', OPUS)
++    assert _state(home).peek(SID, 'deep')['walled_from']['resets_at'] == pytest.approx(reset, abs=1)
+ 
+ 
+ def test_kanban_card_pins_are_not_moved(home, monkeypatch):
+@@ -367,9 +368,13 @@ def test_walled_pin_with_nothing_else_in_its_class_logs_no_target(home, monkeypa
+     assert len(skipped) == 1 and 'reason=no-target' in skipped[0], skipped
+ 
+ 
+-@pytest.mark.parametrize('hours', [1, None], ids=['short-wall', 'unknown-reset'])
+-def test_a_short_or_unknown_wall_refuses_quietly(home, monkeypatch, caplog, hours):
+-    assert _injected_wall_refusal(home, monkeypatch, caplog, key='***', hours=hours) == []
++def test_an_unknown_wall_refuses_quietly(home, monkeypatch, caplog):
++    assert _injected_wall_refusal(home, monkeypatch, caplog, key='***', hours=None) == []
++
++
++def test_a_short_wall_held_by_a_launch_key_names_why(home, monkeypatch, caplog):
++    skipped = _injected_wall_refusal(home, monkeypatch, caplog, key='***', hours=1)
++    assert len(skipped) == 1 and 'reason=key' in skipped[0], skipped
+ 
+ 
+ # --- Desktop/TUI gateway (tui_gateway.agent_factory): the same reroute, on its own agent-build path -------------
+@@ -433,10 +438,24 @@ def test_desktop_row_with_its_providers_native_endpoint_still_moves_off_the_wall
+     assert agent.model_routing['walled_from']['model'] == ASTRA
+ 
+ 
+-@pytest.mark.parametrize('case', ['explicit switch', 'short wall', 'no session id', 'own endpoint',
++def test_desktop_session_behind_a_short_wall_builds_on_the_next_route_in_its_class(home):
++    """The incident on the Desktop path: a router-picked pin whose wall resets within hours is moved
++    for the turn (and the chat follows it), not refused until the reset."""
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 1)
++    model, runtime = _resolve_agent_model_runtime(DESKTOP_ROW, None, SID)
++    notice = runtime.pop('_fallback_notice')
++    assert 'quota is out until' in notice and OPUS in notice, notice
++    agent = _desktop_agent(model, runtime)
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++    assert agent.model_routing['walled_from']['model'] == ASTRA
++
++
++@pytest.mark.parametrize('case', ['explicit switch', 'no session id', 'own endpoint',
+                                   'other provider endpoint', 'own key'])
+ def test_desktop_wall_still_refuses_when_the_pin_must_not_move(home, monkeypatch, case):
+-    """Controls: David's own switch, a wall under the reroute threshold, a build with no session identity
++    """Controls: the user's own switch, a build with no session identity
+     (the readiness probe) and a session that overrides its endpoint or key all keep the refusal. A KNOWN
+     other provider's stock endpoint (Anthropic's URL on a Codex row) is an override too, not only an unknown
+     host. A refusal the session's own key or endpoint holds is logged with that reason, as the gateway does."""
+@@ -447,7 +466,7 @@ def test_desktop_wall_still_refuses_when_the_pin_must_not_move(home, monkeypatch
+     logged = []
+     monkeypatch.setattr('agent.model_routing_walls.log_not_deferred', lambda wall, reason: logged.append(reason))
+     _legacy_row(home, dict(LEGACY_ECHO, reason='explicit-switch') if case == 'explicit switch' else LEGACY_ECHO)
+-    _wall(home, 'openai-codex', ASTRA, 2 if case == 'short wall' else 33)
++    _wall(home, 'openai-codex', ASTRA, 33)
+     overrides = {'own endpoint': {'base_url': 'https://proxy.example/v1'},
+                  'other provider endpoint': {'base_url': 'https://api.anthropic.com'},
+                  'own key': {'base_url': DEFAULT_CODEX_BASE_URL, 'api_key': '***'}}.get(case, {})
+@@ -581,15 +600,13 @@ def test_gateway_default_turn_moves_when_only_one_account_returns_soon(home, mon
+ 
+ @pytest.mark.parametrize('hours', [(1.5, 2, 3, 4, 57.5, 70.5, 87.5), (1.5, 5.5), (2,)],
+                          ids=['four-of-seven-soon', 'one-of-two-soon', 'sole-account'])
+-def test_wall_still_holds_when_half_the_pool_returns_inside_six_hours(home, hours):
+-    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++def test_default_pin_moves_when_half_the_pool_returns_inside_six_hours(home, hours):
+     from tui_gateway.server import _resolve_agent_model_runtime
+     _write_anthropic_pool(home, hours)
+-    with pytest.raises(SubscriptionQuotaUnavailable):
+-        _resolve(OPUS, 'anthropic', session='default-opus')
+-    with pytest.raises(SubscriptionQuotaUnavailable):
+-        _resolve_agent_model_runtime(OPUS_ROW, None, SID)
+-    assert _state(home).peek('default-opus', 'deep') is None
++    moved = _resolve(OPUS, 'anthropic', session='default-opus')
++    assert (moved['provider'], moved['model']) == ('openai-codex', ASTRA)
++    model, runtime = _resolve_agent_model_runtime(OPUS_ROW, None, SID)
++    assert model == OPUS and runtime['provider'] == 'auto' and 'quota is out until' in runtime['_fallback_notice']
+ 
+ 
+ def test_explicit_pin_still_holds_when_only_one_account_returns_soon(home):
+-- 
+2.43.0
+

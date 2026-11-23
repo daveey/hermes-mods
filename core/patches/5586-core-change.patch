@@ -1,0 +1,203 @@
+From aac73b315794565013e8774ab4c312459b301085 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:08:38 +0000
+Subject: [PATCH] test(kanban): retain remote custody with neutral ingress and
+ real profile routing [daveey]
+
+---
+ ...test_kanban_remote_assignee_entry_paths.py | 38 ++++----
+ .../test_kanban_runs_on_remote_assignee.py    | 89 +++++++++++--------
+ 2 files changed, 68 insertions(+), 59 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+index cd1a9d868a..4f7ec2b727 100644
+--- a/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
++++ b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+@@ -83,31 +83,27 @@ def test_cli_runs_on_remote_only_assignee(gws, monkeypatch, capsys, remote):
+ 
+ @pytest.mark.parametrize("remote", [True, False])
+ def test_set_model_override_uses_execution_host_policy(gws, monkeypatch, remote):
+-    from hermes_cli.kanban_model_assignment import ModelPinNotInRegistryError, ModelProviderMismatchError
+-    from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
+-    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
+     hub, _ = gws
+-    with open(hub.home / "config.yaml", "a") as fh:
+-        fh.write("model:\n  default: claude-sonnet-5-5\n  provider: anthropic\n" + _managed_yaml())
++    # Gateway already supplies a real registry. Do not append duplicate YAML keys:
++    # strict readers would drop the sync/capability policy before reaching ingress.
++    from hermes_cli.config_effective import load_profile_config_effective
++    policy = load_profile_config_effective(hub.home / "config.yaml", fail_closed=True)
++    assert policy["kanban"]["sync"]["enabled"] and policy["model_routing"]["enabled"]
+     hub.enter()
+     _publish(monkeypatch, {WORKER: {"default": set(NEEDS)}})
+     tid = kb.create_task(hub.conn, title="repin", assignee="default", requires=NEEDS,
+                          runs_on=[f"machine:{WORKER if remote else HUB}"])
+-    if not remote:
+-        with pytest.raises(ModelPinNotInRegistryError):
+-            kb.set_model_override(hub.conn, tid, "claude-sonnet-4-5", "anthropic")
+-        assert kb.get_task(hub.conn, tid).model_override is None
+-        return
+-    assert kb.set_model_override(hub.conn, tid, "claude-sonnet-4-5", "anthropic")
+-    task = kb.get_task(hub.conn, tid)
+-    assert (task.model_override, task.provider_override) == ("claude-sonnet-4-5", "anthropic")
+-    with pytest.raises(ModelProviderMismatchError):
+-        kb.set_model_override(hub.conn, tid, "gpt-5", "anthropic")
+-    monkeypatch.setattr("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "anthropic")
+-    with pytest.raises(PinProviderUnresolvedError):
+-        kb.set_model_override(hub.conn, tid, "claude-opus-5-5")
+-    assert kb.get_task(hub.conn, tid).model_override == "claude-sonnet-4-5"
++    before = tuple(hub.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    events = [tuple(row) for row in hub.conn.execute("SELECT * FROM task_events ORDER BY id")]
++    for model, provider in [("claude-sonnet-4-5", "anthropic"), ("gpt-5", "anthropic"),
++                            ("claude-opus-5-5", None)]:
++        with pytest.raises(ValueError, match="model-neutral"):
++            kb.set_model_override(hub.conn, tid, model, provider)
++        assert tuple(hub.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++        assert [tuple(row) for row in hub.conn.execute("SELECT * FROM task_events ORDER BY id")] == events
+     assert kb.set_model_override(hub.conn, tid, "class:deep")
+-    assert kb.get_task(hub.conn, tid).provider_override is None
++    task = kb.get_task(hub.conn, tid)
++    assert (task.model_override, task.provider_override) == ("class:deep", "auto")
+     assert kb.set_model_override(hub.conn, tid, None)
+-    assert kb.get_task(hub.conn, tid).model_override is None
++    task = kb.get_task(hub.conn, tid)
++    assert (task.model_override, task.provider_override) == (None, None)
+diff --git a/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py b/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
+index cee5f6359b..8b1dc2ed00 100644
+--- a/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
++++ b/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
+@@ -36,6 +36,17 @@ def _profile(home, name=PROFILE, config=WITH_KANBAN):
+     return target
+ 
+ 
++def _enable_profile_routing(home):
++    """Supply the actual isolated executing profile's eligible subscription registry."""
++    from hermes_cli.config_effective import load_profile_config_effective
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    path = home / "profiles" / PROFILE / "config.yaml"
++    config = load_profile_config_effective(path, fail_closed=True)
++    config["model_routing"] = load_profile_config_effective(home / "config.yaml", fail_closed=True)["model_routing"]
++    path.write_text(json.dumps(config))
++    assert _assignee_config(PROFILE)["model_routing"] == config["model_routing"]
++
++
+ def _count(conn):
+     return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+ 
+@@ -86,6 +97,12 @@ def test_remote_tools_unknown_creates_and_claim_gate_still_refuses(gws, svc, mon
+     # Control: once worker-1 has the profile, it takes the card.
+     _profile(worker.home)
+     worker.round()
++    assert kb.get_task(worker.conn, tid) is None  # pickup refuses before importing an unroutable profile
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_model_tier import class_unroutable_reason
++    config = _assignee_config(PROFILE)
++    assert class_unroutable_reason("class:standard", config) == "routing_disabled"
++    _enable_profile_routing(worker.home)
+     worker.tick()
+     assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
+ 
+@@ -131,6 +148,12 @@ def test_remote_card_skill_check_does_not_read_the_local_profile(gws, svc, monke
+     _profile(worker.home)
+     hub.round()
+     worker.round()
++    assert kb.get_task(worker.conn, tid) is None  # pickup refuses before importing an unroutable profile
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_model_tier import class_unroutable_reason
++    config = _assignee_config(PROFILE)
++    assert class_unroutable_reason("class:standard", config) == "routing_disabled"
++    _enable_profile_routing(worker.home)
+     worker.tick()
+     assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
+ 
+@@ -138,51 +161,41 @@ def test_remote_card_skill_check_does_not_read_the_local_profile(gws, svc, monke
+ # --- 5b. model pin -------------------------------------------------------------------------------------------
+ 
+ def test_remote_card_model_pin_is_not_checked_against_the_local_profile(gws, monkeypatch):
+-    from hermes_cli.kanban_model_assignment import ModelPinNotInRegistryError, ModelProviderMismatchError
+-    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    """Neutral policy is global; placement cannot turn a named model into valid policy."""
++    from hermes_cli.config_effective import load_profile_config_effective
+     hub, _ = gws
+     _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
+-    # THIS machine's default profile runs a managed registry that does not list claude-sonnet-4-5.
+-    with open(hub.home / "config.yaml", "a") as fh:
+-        fh.write("model:\n  default: claude-sonnet-5-5\n  provider: anthropic\n" + _managed_yaml())
+-    hub.enter()
+-    with pytest.raises(ModelPinNotInRegistryError):  # control: a card that runs here
+-        kb.create_task(hub.conn, title="here", assignee="default", requires=NEEDS,
+-                       model_override="claude-sonnet-4-5", provider_override="anthropic")
+-    tid = kb.create_task(hub.conn, title="there", assignee="default", requires=NEEDS, runs_on=[f"machine:{WORKER}"],
+-                         model_override="claude-sonnet-4-5", provider_override="anthropic")
+-    task = kb.get_task(hub.conn, tid)
+-    assert (task.model_override, task.provider_override) == ("claude-sonnet-4-5", "anthropic")
+-    # A provider/vendor family mismatch is the same on every machine: still refused.
+-    with pytest.raises(ModelProviderMismatchError):
+-        kb.create_task(hub.conn, title="bad", assignee="default", requires=NEEDS, runs_on=[f"machine:{WORKER}"],
+-                       model_override="gpt-5", provider_override="anthropic")
++    policy = load_profile_config_effective(hub.home / "config.yaml", fail_closed=True)
++    assert policy["kanban"]["sync"]["enabled"] and policy["model_routing"]["enabled"]
++    for runs_on in (None, [f"machine:{WORKER}"]):
++        before = _count(hub.conn)
++        for model, provider in [("claude-sonnet-4-5", "anthropic"), ("gpt-5", "anthropic")]:
++            with pytest.raises(ValueError, match="model-neutral"):
++                kb.create_task(hub.conn, title="bad", assignee="default", requires=NEEDS,
++                               runs_on=runs_on, model_override=model, provider_override=provider)
++            assert _count(hub.conn) == before
++        tid = kb.create_task(hub.conn, title="class route", assignee="default", requires=NEEDS,
++                             runs_on=runs_on, model_override="class:deep")
++        task = kb.get_task(hub.conn, tid)
++        assert (task.model_override, task.provider_override) == ("class:deep", "auto")
+ 
+ 
+ def test_remote_card_provider_less_pin_is_refused_naming_the_provider(gws, monkeypatch):
+-    from hermes_cli import kanban_pin_provider as kpp
+     hub, _ = gws
+     _publish(monkeypatch, {WORKER: {PROFILE: {"terminal", "file", "git"}}})
+-    # THIS machine has anthropic credentials, but they say nothing about the landing machine's.
++    # Local credentials cannot authorize a concrete selector, here or remotely.
+     monkeypatch.setattr("hermes_cli.models_detect.provider_has_credentials", lambda provider: provider == "anthropic")
+-    # Control: a card that runs here binds the pin against this machine's credentials.
+-    here = kb.create_task(hub.conn, title="here", assignee="default", requires=NEEDS, model_override="claude-opus-5-5")
+-    assert kb.get_task(hub.conn, here).provider_override == "anthropic"
+-    before = _count(hub.conn)
+-    # A remote card's pin is never bound here nor left for the landing dispatcher to late-bind: refused with
+-    # the providers to pass, not with the local-profile error.
+-    with pytest.raises(kpp.PinProviderUnresolvedError) as caught:
+-        kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
+-                       model_override="claude-opus-5-5")
+-    assert "anthropic" in str(caught.value) and "does not exist" not in str(caught.value)
+-    assert _count(hub.conn) == before
+-    # With the provider named, or a class selector (provider auto by design), it is created.
+-    tid = kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
+-                         model_override="claude-opus-5-5", provider_override="anthropic")
+-    assert kb.get_task(hub.conn, tid).provider_override == "anthropic"
+-    tid = kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
+-                         model_override="class:deep")
+-    assert kb.get_task(hub.conn, tid).provider_override is None
++    for assignee, runs_on in (("default", None), (PROFILE, [f"machine:{WORKER}"])):
++        before = _count(hub.conn)
++        for provider in (None, "anthropic"):
++            with pytest.raises(ValueError, match="model-neutral"):
++                kb.create_task(hub.conn, title="bad", assignee=assignee, requires=NEEDS,
++                               runs_on=runs_on, model_override="claude-opus-5-5", provider_override=provider)
++            assert _count(hub.conn) == before
++        tid = kb.create_task(hub.conn, title="class route", assignee=assignee, requires=NEEDS,
++                             runs_on=runs_on, model_override="class:deep")
++        task = kb.get_task(hub.conn, tid)
++        assert (task.model_override, task.provider_override) == ("class:deep", "auto")
+ 
+ 
+ # --- 6. the tool entry path ----------------------------------------------------------------------------------
+@@ -201,7 +214,7 @@ def test_tool_create_with_placement_on_an_enrolled_machine_creates_the_card(tmp_
+         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+         out = json.loads(kt._handle_create({
+             "title": "design CI capacity", "assignee": PROFILE, "placement": HUB, "requires": NEEDS,
+-            "model": "claude-opus-5-5", "provider": "anthropic"}))
++            "model": "class:deep", "provider": "auto"}))
+         assert not out.get("error"), out
+         tid = out["task_id"]
+         assert out.get("runs_on") == [f"machine:{HUB}"], out
+-- 
+2.43.0
+

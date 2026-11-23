@@ -1,0 +1,1537 @@
+From 6ce3864c072815c1e756280f710de3cfc0aabc89 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 00:31:05 +0000
+Subject: [PATCH] [daveey] Canonical session status envelope: backend reducer,
+ strict readers, fenced publication (slice L2a)
+
+Backend half of the approved single-status plan (card t_7a017359ecef3767, approved plan dispositions
+14/15/15a/16). Cut from fresh main as a minimal slice; replaces the omnibus branch of PR #3852.
+The Desktop half (paint only this envelope, committed-paint reports, drift) is the next commit (L2b).
+
+Why
+- The sidebar flapped done/grey because a Desktop-local fetch-completeness veto overrode the backend
+  outcome, and the backend chose its status from a prose heuristic after informational notice rows
+  invalidated declarations. There was no single revisioned status the surfaces could agree on.
+
+What
+- hermes_state_session_status.py (new, pure): reduce one qualified snapshot to
+  {status_version=1, identity, generation, revision, source_revisions, coverage, failures, kind,
+  presentation{stripe, reason_codes}}. Precedence: mute; genuine human ask; own active turn; open
+  linked work; unknown/failed/lost evidence (never green); settled owning turn + all work terminal =
+  done; never-started draft = no stripe. A failure persists until a later generation's own successful
+  completion.
+- hermes_state_session_status_snapshot.py (new): collects that snapshot over the EXISTING readers
+  (cards, registered control providers, turn lease/marker/routing tokens, subagents, goals) and the
+  strict process inventory, each read strictly: a reader that raises is unknown coverage for that
+  source (reason code <source>_read_failed:<Error>), never an empty list. refresh_outcome stores the
+  envelope under outcome_json["status"]; sessions.outcome_json stays the single persisted status, no
+  new table, column, poller or trigger.
+- No prose heuristic, summary judge or declaration selects the envelope. A declaration keeps the
+  stored envelope instead of resetting it (revision stays monotonic) and is explanation only.
+- Generation = newest genuine user request. Provenance-validated informational notices and completion
+  notes (existing settled_notice / outcome_informational / completion_note proof) do not start one and
+  do not reopen a done session; any other user row (typed, steered, folded, unproven) does.
+- Turn settlement (disposition 15/15a): a turn observed with ownership tokens settles only on a
+  turn_end naming one of them; otherwise unknown(turn_unsettled), never green. The newest admission
+  decides. A generation never observed with tokens keeps main's transcript reading (no schema, no
+  request/response receipt).
+- tools/process_registry{,_results}.py: opt-in strict, session-qualified load_completed_results /
+  list_sessions(include_retained=True): enumeration, decode, owner-scope and missing-exit errors
+  propagate instead of being swallowed; nothing is pruned on a strict read. Default tool/display
+  behaviour is unchanged.
+- Publication is compare-and-set on the stored outcome text and the newest user row, with bounded
+  retries: a stale collector re-collects against its successor and never overwrites it. A failed read
+  is published as a source_unknown revision; the next successful refresh recovers.
+
+Existing tests touched (3 assertions lines added, no expected value of an existing field changed):
+- tests/hermes_state/test_session_outcome.py::test_5_declared_done_holds_until_a_newer_user_row,
+  ::test_busy_card_read_cannot_derive_done, tests/hermes_state/test_session_outcome_subagent_lost.py::
+  test_a_declared_done_after_its_last_activity_accounts_for_it compared the whole returned dict; they
+  now pop the additive "status" key first (and assert it: unread board = unknown, plan line 24;
+  declared content unchanged, plan line 20).
+
+Proof (canonical runner, HERMES_TEST_FILE_RETRIES=0)
+- RED first: tests/hermes_state/test_session_status_refresh.py 0 passed / 25 failed before the code.
+- GREEN: 65 files, 1338 passed, 0 failed: the new real-entry-point file (25), reducer (76), strict
+  process reader (14) and every test file referencing hermes_state_outcome / refresh_outcome /
+  outcome_json / turn_outcome / process_registry_results.
+
+Known limits
+- The surrounding outcome's legacy top-level kind/summary is still derived as before for non-Desktop
+  consumers (cron release, CLI text); only the envelope is canonical. Desktop moves to it in L2b.
+- A revision certifies one pass over the readers, not cross-source atomicity.
+- Processes that predate the registry's retention window are not counted (not a claim of success).
+  Live processes are read from this interpreter's registry plus retained receipts; exhaustive
+  cross-interpreter checkpoint recovery is not claimed. Hosted sandbox scopes read as unknown.
+- Tokenless legacy turns keep main's transcript reading: no regression vs main, no new attribution.
+- Ended delegate children are not enumerated as affirmative successes (as on main).
+- If every bounded publication attempt meets a successor's write, the successor's value stands and a
+  warning is logged; that refresh publishes nothing.
+- Not yet proven here: installed Desktop parity rows 1-6 (needs L2b, ship and install).
+- Read-only replay of the envelope over a copy of this host's real state.db (60 newest sessions, 0
+  errors) found one real race before this commit: a receipt pruned by another producer between
+  enumeration and read raised FileNotFoundError and read as unknown. A vanished receipt is now expiry
+  in strict reads too (2 RED-first tests); other read errors still propagate.
+- A non-zero or killed process exit reads as attention until the next request completes (disposition
+  15), including exits the agent caused itself.
+---
+ hermes_state_outcome.py                       |  22 +-
+ hermes_state_session_status.py                | 135 ++++++
+ hermes_state_session_status_snapshot.py       | 303 ++++++++++++++
+ tests/hermes_state/test_session_outcome.py    |   7 +-
+ .../test_session_outcome_subagent_lost.py     |   1 +
+ tests/hermes_state/test_session_status.py     | 181 ++++++++
+ .../test_session_status_refresh.py            | 393 ++++++++++++++++++
+ tests/tools/test_process_results_strict.py    | 122 ++++++
+ tools/process_registry.py                     |  16 +-
+ tools/process_registry_results.py             |  80 +++-
+ 10 files changed, 1226 insertions(+), 34 deletions(-)
+ create mode 100644 hermes_state_session_status.py
+ create mode 100644 hermes_state_session_status_snapshot.py
+ create mode 100644 tests/hermes_state/test_session_status.py
+ create mode 100644 tests/hermes_state/test_session_status_refresh.py
+ create mode 100644 tests/tools/test_process_results_strict.py
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index c330212a2e..7046095d5b 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -463,8 +463,8 @@ def _guarded(label: str, sid: str, fn: Callable[[], Any], empty: Any) -> Any:
+ def _declared(stored: Optional[dict]) -> Optional[dict]:
+     if not stored:
+         return None
+-    if stored.get("source") == "declared":
+-        return stored
++    if stored.get("source") == "declared":  # [daveey] the canonical envelope is not part of what was declared
++        return {k: v for k, v in stored.items() if k != "status"} if "status" in stored else stored
+     nested = stored.get("declared")
+     return nested if isinstance(nested, dict) and nested.get("source") == "declared" else None
+ 
+@@ -846,6 +846,8 @@ def declare_outcome(sid: str, outcome: dict, *, db: Any = None) -> dict[str, Any
+             declared.update(historical_fields(_parse((_row(handle, tip) or {}).get("outcome_json"))))
+         # Persist intent before touching the separate cron store. A failed DB
+         # write must never release ownership without a completion receipt.
++        status = (_parse((_row(handle, tip) or {}).get("outcome_json")) or {}).get("status")
++        declared.update({"status": status} if status else {})  # [daveey] a declaration never resets the envelope
+         _write(handle, tip, declared)
+         if declared["kind"] == "done":
+             from cron.session_ownership import release_for_database
+@@ -904,18 +906,10 @@ def refresh_outcome(sid: str, trigger: str, *, db: Any = None,
+     evidence is not a live turn; any other live turn derives ``running``."""
+     if trigger not in TRIGGERS:
+         raise ValueError(f"unknown outcome trigger {trigger!r}")
+-    with _db_scope(db) as handle:
+-        tip = _tip(handle, sid)
+-        row = _row(handle, tip)
+-        derived = _derive(handle, tip, concluding=frozenset(concluding_turn or ()))
+-        if row is None:
+-            return derived
+-        stored = _parse(row.get("outcome_json"))
+-        if _same(stored, derived):
+-            return stored
+-        _write(handle, tip, derived)
+-        logger.debug("session outcome %s -> %s (%s)", tip, derived.get("kind"), trigger)
+-        return derived
++    from hermes_state_session_status_snapshot import refresh
++
++    with _db_scope(db) as handle:  # [daveey] also reduces and fence-publishes the canonical ``status`` envelope
++        return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
+ 
+ 
+ def get_outcome(sid: str, *, db: Any = None) -> Optional[dict[str, Any]]:
+diff --git a/hermes_state_session_status.py b/hermes_state_session_status.py
+new file mode 100644
+index 0000000000..619c6e66a0
+--- /dev/null
++++ b/hermes_state_session_status.py
+@@ -0,0 +1,135 @@
++"""Pure canonical session-status reducer; no transcript, filesystem, clock or UI inputs.
++
++Adapters collect qualified observations. A revision certifies exactly those observations,
++not cross-source atomicity. Unknown/expired or epoch-inconsistent evidence cannot certify
++completion. Persistence must CAS the captured owner/generation before publishing this value.
++"""
++from __future__ import annotations
++
++from copy import deepcopy
++from typing import Any
++
++STATUS_VERSION = 1
++REQUIRED_SOURCES = frozenset({"cards", "controls", "turn", "subagents", "processes", "goals"})
++_IDENTITY_KEYS = ("gateway", "profile", "session_id", "owner_epoch")
++_SUCCESS = frozenset({"succeeded", "done", "completed"})
++_TURN_REASONS = frozenset({"notice_tail", "turn_unsettled", "subagent_killed"})
++_OPEN = frozenset({"ready", "todo", "running", "waiting", "blocked", "scheduled", "review", "triage",
++                   "external_running", "pending", "queued"})
++
++
++def _identity(value: Any) -> dict[str, str]:
++    if not isinstance(value, dict) or any(not isinstance(value.get(k), str) or not value[k] for k in _IDENTITY_KEYS):
++        raise ValueError("qualified identity requires gateway/profile/session_id/owner_epoch")
++    return {key: value[key] for key in _IDENTITY_KEYS}
++
++
++def _generation(value: Any) -> int:
++    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++        raise ValueError("generation must be a nonnegative integer")
++    return value
++
++
++def _coverage(snapshot: dict, identity: dict, generation: int) -> tuple[dict, dict]:
++    sources = snapshot.get("sources") or {}
++    required = REQUIRED_SOURCES | set(snapshot.get("required_sources") or ())
++    reasons, revisions = [], {}
++    for name in sorted(required):
++        reading = sources.get(name)
++        if not isinstance(reading, dict):
++            reasons.append(f"{name}:missing")
++            continue
++        revision = reading.get("revision")
++        revisions[name] = revision
++        if reading.get("identity") != identity:
++            reasons.append(f"{name}:owner_mismatch")
++        if reading.get("generation") != generation:
++            reasons.append(f"{name}:generation_mismatch")
++        if reading.get("coverage") != "complete" or reading.get("expired"):
++            reasons.append(f"{name}:{reading.get('reason') or 'unknown'}")
++        if revision is None or reading.get("current_revision") != revision:
++            reasons.append(f"{name}:inconsistent_revision")
++    return {"state": "unknown" if reasons else "complete", "reasons": reasons}, revisions
++
++
++def _failures(snapshot: dict, previous: dict, generation: int, coverage: dict) -> list[dict]:
++    """Lost execution evidence survives inventory removal and pending successor requests."""
++    turn = snapshot.get("turn") or {}
++    work = snapshot.get("work") or []
++    retained = previous.get("failures") or []
++    successful_successor = (
++        turn.get("generation") == generation and turn.get("state") in _SUCCESS
++        and all(generation > failure["generation"] for failure in retained)
++        and coverage["state"] == "complete"
++        and all(item.get("state") in _SUCCESS or (
++            item.get("passive") is True and item.get("state") in {"watching", "scheduled"}) for item in work)
++    )
++    if successful_successor:
++        retained = []
++    current = [{"id": str(item.get("id") or "unknown"), "generation": generation, "state": item["state"]}
++               for item in work if item.get("state") in {"failed", "lost", "cancelled"}]
++    if turn.get("state") == "failed":
++        current.append({"id": "own_turn", "generation": generation, "state": "failed"})
++    by_key = {(item["id"], item["generation"]): deepcopy(item) for item in [*retained, *current]}
++    return sorted(by_key.values(), key=lambda item: (item["generation"], item["id"]))
++
++
++def _verdict(snapshot: dict, coverage: dict, generation: int, failures: list[dict]) -> dict:
++    turn = snapshot.get("turn") or {}
++    own_turn = turn.get("generation") == generation
++    asks = snapshot.get("asks") or []
++    if snapshot.get("muted"):
++        return {"kind": "muted", "presentation": {"stripe": "blocked", "reason_codes": ["muted"]}}
++    if asks:
++        return {"kind": "decision", "items": deepcopy(asks),
++                "presentation": {"stripe": "stuck", "reason_codes": ["human_ask"]}}
++    if own_turn and turn.get("state") == "running":
++        return {"kind": "running", "presentation": {"stripe": "waiting", "reason_codes": ["own_turn_active"]}}
++    work = [item for item in snapshot.get("work") or () if not (
++        item.get("passive") is True and item.get("state") in {"watching", "scheduled"})]
++    open_work = [item for item in work if item.get("state") in _OPEN]
++    if open_work:
++        return {"kind": "waiting", "on": deepcopy(open_work),
++                "presentation": {"stripe": "waiting", "reason_codes": ["linked_work_open"]}}
++    reason = None
++    if coverage["state"] != "complete":
++        reason = "source_unknown"
++    elif failures or any(item.get("state") not in _SUCCESS for item in work):
++        linked = (any(item["id"] != "own_turn" for item in failures)
++                  or any(item.get("state") not in _SUCCESS for item in work))
++        reason = "linked_work_unsuccessful" if linked else "turn_failed"
++    elif not snapshot.get("started") and turn.get("state") == "never_started":
++        return {"kind": "unresolved", "reason": "empty",
++                "presentation": {"stripe": "none", "reason_codes": ["never_started"]}}
++    elif not own_turn:
++        reason = "turn_generation_mismatch"
++    elif turn.get("state") not in _SUCCESS:
++        reason = "turn_failed" if turn.get("state") == "failed" else (
++            turn["reason"] if turn.get("reason") in _TURN_REASONS else "interrupted")
++    if reason:
++        return {"kind": "unresolved", "reason": reason,
++                "presentation": {"stripe": "attention", "reason_codes": [reason]}}
++    return {"kind": "done", "presentation": {"stripe": "done", "reason_codes": ["work_settled"]}}
++
++
++def reduce_status(snapshot: dict[str, Any], *, previous: dict | None = None) -> dict[str, Any]:
++    """Reduce one qualified snapshot. Equal evidence is idempotent; revisions never regress.
++
++    A previous value is the CAS base supplied by the persistence adapter, not a result
++    another collector happened to publish while this collector was running.
++    """
++    identity = _identity(snapshot.get("identity"))
++    generation = _generation(snapshot.get("generation"))
++    prior = previous if previous and previous.get("status_version") == STATUS_VERSION else {}
++    if prior.get("identity") == identity and generation < prior.get("generation", 0):
++        raise ValueError("stale generation")
++    coverage, revisions = _coverage(snapshot, identity, generation)
++    failures = _failures(snapshot, prior, generation, coverage)
++    value = {"status_version": STATUS_VERSION, "identity": identity, "generation": generation,
++             "source_revisions": revisions, "coverage": coverage, "failures": failures,
++             **_verdict(snapshot, coverage, generation, failures)}
++    old = {key: prior.get(key) for key in value}
++    # An owner change is itself evidence even if the presentation is unchanged.
++    revision = int(prior.get("revision", 0))
++    value["revision"] = revision if value == old else revision + 1
++    return value
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+new file mode 100644
+index 0000000000..75dbb0a995
+--- /dev/null
++++ b/hermes_state_session_status_snapshot.py
+@@ -0,0 +1,303 @@
++"""Canonical session-status snapshot over the existing outcome readers, and its fenced publication. [daveey]
++
++``refresh_outcome`` stores one envelope under ``outcome_json["status"]`` (``hermes_state_session_status``):
++qualified identity, request generation, per-source coverage, a monotonic revision and
++``presentation.stripe``. It is computed from work evidence only: no summary judge, no prose heuristic
++and no declaration can select it; those stay explanation on the surrounding outcome.
++
++Every required source is read strictly here. A reader that raises is *unknown coverage* for this
++snapshot (never an empty list), which the reducer turns into a non-green ``source_unknown`` revision;
++the next successful refresh recovers. Publication compares the stored value and the newest user row
++it was collected against, so a stale collector retries instead of overwriting its successor.
++
++Known limits (stated, not hidden): a revision certifies one pass over these readers, not cross-source
++atomicity; a process no longer inside the registry's retention window is not counted (not a claim it
++succeeded); a turn that was never observed with ownership tokens keeps the transcript reading.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import logging
++import time
++from copy import deepcopy
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++from hermes_state_session_status import _OPEN, STATUS_VERSION, reduce_status
++
++logger = logging.getLogger(__name__)
++
++CAS_ATTEMPTS = 3
++_GENERATION_SCAN_ROWS = 200
++_SINGULAR = {"cards": "card", "controls": "control", "subagents": "subagent", "processes": "process",
++             "goals": "goal"}
++
++
++def _so():
++    import hermes_state_outcome
++
++    return hermes_state_outcome
++
++
++def _digest(items: Any) -> str:
++    text = json.dumps(items, sort_keys=True, default=str, separators=(",", ":"))
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
++
++
++def _identity(db: Any, tip: str, ids: list[str]) -> dict[str, str]:
++    home = Path(db.db_path).parent
++    gateway = ""
++    with contextlib.suppress(ImportError, OSError, ValueError):
++        from hermes_cli.kanban_origin import gateway_names
++
++        gateway = gateway_names()[0] or ""
++    marks = ",".join("?" * len(ids))
++    root = db._read_one(f"SELECT id FROM sessions WHERE id IN ({marks}) ORDER BY started_at ASC, id ASC LIMIT 1",
++                        tuple(ids))
++    return {"gateway": gateway or "local",
++            "profile": home.name if home.parent.name == "profiles" else "default",
++            "session_id": tip, "owner_epoch": f"lineage:{root['id'] if root is not None else tip}"}
++
++
++def _generation(db: Any, tip: str) -> tuple[int, float]:
++    """(id, timestamp) of the newest genuine user request. A provenance-validated informational notice or
++    completion note is not a request; any other user row (typed, steered, folded or unproven) is."""
++    so = _so()
++    rows = db._read_all(
++        "SELECT id, role, content, display_kind, display_metadata, timestamp FROM messages"
++        " WHERE session_id = ? AND active = 1 AND role = 'user' ORDER BY id DESC LIMIT ?",
++        (tip, _GENERATION_SCAN_ROWS))
++    for row in map(dict, rows):
++        if so._completion_note(row) is None:
++            return int(row["id"]), float(row.get("timestamp") or 0)
++    return 0, 0.0
++
++
++def _user_fence(db: Any, tip: str) -> int:
++    row = db._read_one("SELECT COALESCE(MAX(id), 0) AS top FROM messages WHERE session_id = ? AND role = 'user'",
++                       (tip,))
++    return int(row["top"]) if row is not None else 0
++
++
++def _live_tokens(db: Any, tip: str) -> set[str]:
++    """``_live_turn_tokens`` without its swallowed fallbacks: an unreadable lease or routing store raises."""
++    from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_REASON, marker_writer_state, read_turn_marker
++
++    so = _so()
++    tokens = set()
++    marker = read_turn_marker(Path(db.db_path).parent, tip)
++    if marker and marker.get("reason") != UPDATE_HOLD_QUEUE_REASON and marker_writer_state(marker) == "alive":
++        tokens.add(so.marker_identity(marker))
++    owner = so._durable_turn_owner(db, tip)
++    if owner is not None:
++        tokens.add(f"lease:{owner['holder']}")
++    tokens.update(so._gateway_turn_tokens(db, tip))
++    return tokens
++
++
++def _transcript_turn(tail: list[dict]) -> dict[str, str]:
++    """Main's transcript reading of the owning turn, minus the summary judge and prose heuristic."""
++    so = _so()
++    if not tail:
++        return {"state": "never_started"}
++    lost = so._lost_request(tail)
++    if lost:
++        return {"state": "failed" if lost == "turn_failed" else "interrupted", "reason": lost}
++    reason = so._tail_reason(tail)
++    if reason:
++        return {"state": "failed" if reason == "turn_failed" else "interrupted", "reason": reason}
++    return {"state": "completed"}
++
++
++def _turn(tail: list[dict], live: set[str], concluding: frozenset[str], trigger: str, evidence: dict,
++          generation: int) -> tuple[dict, dict]:
++    """The owning turn for this generation, and the token evidence to keep.
++
++    A turn observed with ownership tokens settles only on a ``turn_end`` naming one of them; the newest
++    admission decides (a new genuine request, or a live turn sharing no token, replaces the older one). A
++    generation never observed with tokens keeps the transcript reading unchanged."""
++    same = evidence.get("generation") == generation
++    admitted = set(evidence.get("admitted") or ()) if same else set()
++    settled = set(evidence.get("settled") or ()) if same else set()
++    if live:
++        admitted, settled = (admitted | live, settled) if admitted & live else (set(live), set())
++        turn = {"state": "running"}
++    else:
++        if trigger == "turn_end" and concluding and (not admitted or admitted & concluding):
++            admitted |= concluding
++            settled |= concluding
++        turn = ({"state": "unsettled", "reason": "turn_unsettled"} if admitted and not settled & admitted
++                else _transcript_turn(tail))
++    kept = {"generation": generation, "admitted": sorted(admitted), "settled": sorted(settled)} if admitted else {}
++    return {**turn, "generation": generation}, kept
++
++
++def _open_state(state: Any) -> str:
++    return state if state in _OPEN else "waiting"
++
++
++def _control_items(sid: str) -> tuple[list[dict], list[dict]]:
++    """Registered providers, strictly: a raising provider is unknown controls, never 'no open ask'."""
++    so = _so()
++    decisions, waits = [], []
++    for _name, fn in list(so._providers.items()):
++        result = fn(sid)
++        if not isinstance(result, dict):
++            continue
++        decisions += [i for i in map(so._decision_item, result.get("decision_items") or ()) if i]
++        waits += [i for i in map(so._wait_item, result.get("waiting_on") or ()) if i]
++    return decisions, waits
++
++
++def _process_items(db: Any, tip: str) -> list[dict]:
++    """Live and retained processes of this chat from the registry's strict qualified inventory."""
++    from tools.process_registry import process_registry
++
++    with _so()._owner_scope(db):
++        rows = process_registry.list_sessions(include_retained=True, strict=True, owner_session_id=tip)
++    items = []
++    for row in rows:
++        if row.get("status") != "exited":
++            state = "running"
++        else:
++            state = "succeeded" if row.get("exit_code") == 0 else "failed"
++        items.append({"kind": "process", "id": f"process:{row['session_id']}", "state": state,
++                      "at": float(row.get("exited_at") or 0)})
++    return items
++
++
++def _goal_items(db: Any, ids: list[str]) -> list[dict]:
++    """The exact owned ``goal:<sid>`` records; a malformed record raises (unknown), it is not 'no goal'."""
++    items = []
++    for sid in ids:
++        row = db._read_one("SELECT value FROM state_meta WHERE key = ?", (f"goal:{sid}",))
++        if row is None or row["value"] in (None, ""):
++            continue
++        data = json.loads(row["value"])
++        if not isinstance(data, dict):
++            raise ValueError("malformed goal record")
++        if data.get("status") == "active" and str(data.get("goal") or "").strip():
++            items.append({"kind": "goal", "id": f"goal:{sid}", "state": "running"})
++    return items
++
++
++def _subagent_items(db: Any, ids: list[str], since: float) -> tuple[list[dict], list[dict]]:
++    """(running + lost during this generation, lost before it)."""
++    so = _so()
++    every = so._lost_subagent_items(db, ids, None)
++    current = {item["id"] for item in (so._lost_subagent_items(db, ids, since) if since else every)}
++
++    def tagged(items: list[dict]) -> list[dict]:
++        return [{"id": f"subagent:{item['id']}", "state": item["state"]} for item in items]
++
++    return (tagged(so._subagent_items(db, ids)) + tagged([i for i in every if i["id"] in current]),
++            tagged([i for i in every if i["id"] not in current]))
++
++
++def canonical_status(db: Any, tip: str, stored: Optional[dict], *, trigger: str,
++                     concluding: frozenset[str] = frozenset()) -> dict[str, Any]:
++    """Collect one qualified snapshot for ``tip`` and reduce it against the stored envelope."""
++    so = _so()
++    prior = stored.get("status") if isinstance(stored, dict) else None
++    prior = prior if isinstance(prior, dict) and prior.get("status_version") == STATUS_VERSION else None
++    ids = so._lineage_ids(db, tip)
++    identity = _identity(db, tip, ids)
++    same_owner = prior is not None and prior.get("identity") == identity
++    generation, since = _generation(db, tip)
++    if same_owner:  # a rewound transcript never regresses the generation it already published
++        generation = max(generation, int(prior.get("generation") or 0))
++    errors: dict[str, str] = {}
++
++    def read(name: str, fn: Callable[[], Any], empty: Any) -> Any:
++        try:
++            return fn()
++        except Exception as exc:  # health: allow BLE001 -- any reader failure is unknown coverage, never empty
++            logger.warning("session status: %s unreadable for %s", name, tip, exc_info=True)
++            errors[name] = f"{_SINGULAR.get(name, name)}_read_failed:{type(exc).__name__}"
++            return empty
++
++    row = so._row(db, tip) or {}
++    tail = so._without_finished_notes(so._tail(db, tip))
++    live = read("turn", lambda: _live_tokens(db, tip) - concluding, set())
++    kept = (prior.get("turn_evidence") or {}) if same_owner else {}
++    turn, evidence = _turn(tail, live, concluding, trigger, kept, generation)
++    card_asks, card_waits = read("cards", lambda: so._card_items(ids), ([], []))
++    control_asks, control_waits = read("controls", lambda: _control_items(tip), ([], []))
++    subagents, lost_before = read("subagents", lambda: _subagent_items(db, ids, since), ([], []))
++    processes = read("processes", lambda: _process_items(db, tip), [])
++    goals = read("goals", lambda: _goal_items(db, ids), [])
++    # Work that failed before this generation's request is retained failure, cleared only by this
++    # generation's own successful completion; it is not this generation's linked work.
++    earlier = [p for p in processes if p["state"] == "failed" and 0 < p["at"] < since]
++    work = ([{"kind": "card", "id": f"card:{w['id']}", "state": _open_state(w.get("state"))} for w in card_waits]
++            + [{"kind": w["kind"], "id": f"control:{w['id']}", "state": _open_state(w.get("state"))}
++               for w in control_waits]
++            + [{"kind": "subagent", "id": s["id"], "state": s["state"]} for s in subagents]
++            + [{"kind": "process", "id": p["id"], "state": p["state"]} for p in processes if p not in earlier]
++            + goals)
++    asks = control_asks + card_asks
++    readings = {"cards": [card_asks, card_waits], "controls": [control_asks, control_waits],
++                "turn": [turn, sorted(live)], "subagents": [subagents, lost_before],
++                "processes": processes, "goals": goals}
++    sources = {}
++    for name, items in readings.items():
++        revision = _digest(items)
++        sources[name] = {"identity": identity, "generation": generation, "revision": revision,
++                         "current_revision": revision,
++                         **({"coverage": "unknown", "reason": errors[name]} if name in errors
++                            else {"coverage": "complete"})}
++    base = deepcopy(prior) if prior is not None else {"status_version": STATUS_VERSION}
++    known = {failure.get("id") for failure in base.get("failures") or ()}
++    base["failures"] = list(base.get("failures") or ()) + [
++        {"id": item["id"], "generation": max(0, generation - 1), "state": item["state"]}
++        for item in [*earlier, *lost_before] if item["id"] not in known]
++    status = reduce_status({"identity": identity, "generation": generation, "started": bool(tail), "turn": turn,
++                            "sources": sources, "work": work, "asks": asks, "muted": bool(row.get("muted"))},
++                           previous=base)
++    # The revision is counted against what was actually published, not the failure-seeded reducer base.
++    semantic = {key: value for key, value in status.items() if key != "revision"}
++    unchanged = prior is not None and all(prior.get(key) == value for key, value in semantic.items())
++    status["revision"] = int((prior or {}).get("revision") or 0) + (0 if unchanged else 1)
++    if evidence:
++        status["turn_evidence"] = evidence
++    return status
++
++
++def _publish(db: Any, tip: str, raw: Any, fence: int, outcome: dict) -> bool:
++    """Write only if the stored outcome and the newest user row are still the ones collected against."""
++    payload = json.dumps(outcome, ensure_ascii=False, separators=(",", ":"))
++    return db._write_rowcount(
++        "UPDATE sessions SET outcome_json = ?, outcome_at = ? WHERE id = ? AND outcome_json IS ?"
++        " AND (SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ? AND role = 'user') = ?",
++        (payload, time.time(), tip, raw, tip, fence)) > 0
++
++
++def refresh(db: Any, sid: str, trigger: str, concluding: frozenset[str]) -> dict[str, Any]:
++    """``refresh_outcome``'s body: derive the explanation, reduce the canonical status, publish fenced."""
++    so = _so()
++    tip = so._tip(db, sid)
++    for _attempt in range(CAS_ATTEMPTS):
++        tip = so._tip(db, sid)
++        row = so._row(db, tip)
++        derived = so._derive(db, tip, concluding=concluding)
++        if row is None:
++            return derived
++        raw, fence = row.get("outcome_json"), _user_fence(db, tip)
++        stored = so._parse(raw)
++        derived = {**derived, "status": canonical_status(db, tip, stored, trigger=trigger, concluding=concluding)}
++        if so._same(stored, derived):
++            # Unchanged is only an answer while it is still what is stored for the same newest request.
++            if (so._row(db, tip) or {}).get("outcome_json") == raw and _user_fence(db, tip) == fence:
++                return stored
++            continue
++        if _publish(db, tip, raw, fence, derived):
++            logger.debug("session outcome %s -> %s/%s (%s)", tip, derived.get("kind"),
++                         derived["status"].get("kind"), trigger)
++            return derived
++    # Every attempt met a successor's write or a newer request: theirs stands, and their own refresh follows.
++    logger.warning("session outcome refresh (%s) for %s lost %d publication races; successor kept",
++                   trigger, tip, CAS_ATTEMPTS)
++    return so._parse((so._row(db, tip) or {}).get("outcome_json")) or derived
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 98f22fa165..e87ea8694a 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -270,10 +270,12 @@ def test_5_declared_done_holds_until_a_newer_user_row(db):
+     say(db, "tool", "ok", tool_name="session_outcome", tool_call_id="c1")
+     say(db, "assistant", "ok?")  # would be no_summary without the declaration
+     out = so.refresh_outcome("chat", "turn_end", db=db)
++    out.pop("status")  # [daveey] the canonical envelope rides beside what was declared (additive key)
+     assert out == declared and out["source"] == "declared"
+     say(db, "user", "one more thing", timestamp=time.time() + 1)
+-    assert so.refresh_outcome("chat", "turn_end", db=db) == {**so.derive_outcome("chat", db=db),
+-                                                              "at": so.get_outcome("chat", db=db)["at"]}
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert out.pop("status")["reason"] == "interrupted"  # [daveey] additive envelope agrees
++    assert out == {**so.derive_outcome("chat", db=db), "at": so.get_outcome("chat", db=db)["at"]}
+     assert so.get_outcome("chat", db=db)["reason"] == "interrupted"
+ 
+ 
+@@ -703,6 +705,7 @@ def test_busy_card_read_cannot_derive_done(db, board, monkeypatch, verdict, prio
+     so.register_outcome_judge(lambda sid, text: verdict)
+     out = so.refresh_outcome("chat", "turn_end", db=db)
+     if prior_kind in ("waiting", "decision"):
++        assert out.pop("status")["coverage"]["state"] == "unknown"  # [daveey] additive envelope: unread = unknown
+         assert out == prior
+     else:
+         assert (out["kind"], out["reason"]) == ("unresolved", "card_read_failed")
+diff --git a/tests/hermes_state/test_session_outcome_subagent_lost.py b/tests/hermes_state/test_session_outcome_subagent_lost.py
+index a7e686911c..57131a7d19 100644
+--- a/tests/hermes_state/test_session_outcome_subagent_lost.py
++++ b/tests/hermes_state/test_session_outcome_subagent_lost.py
+@@ -116,6 +116,7 @@ def test_a_declared_done_after_its_last_activity_accounts_for_it(db):
+     reply(db, at=time.time() - 10)
+     declared = declare(db, {"kind": "done", "summary": "Gate F verified; the stuck subagent was replaced."})
+     out = so.refresh_outcome("chat", "turn_end", db=db)
++    out.pop("status")  # [daveey] the canonical envelope rides beside what was declared (additive key)
+     assert out == declared and out["kind"] == "done"
+ 
+ 
+diff --git a/tests/hermes_state/test_session_status.py b/tests/hermes_state/test_session_status.py
+new file mode 100644
+index 0000000000..c372d427ac
+--- /dev/null
++++ b/tests/hermes_state/test_session_status.py
+@@ -0,0 +1,181 @@
++"""Canonical status is work evidence, never prose or UI-fetch state."""
++from copy import deepcopy
++import importlib.util
++
++import pytest
++
++
++IDENTITY = {"gateway": "gateway-a", "profile": "default", "session_id": "chat", "owner_epoch": "owner-1"}
++REQUIRED = ("cards", "controls", "turn", "subagents", "processes", "goals")
++
++
++def snapshot(**changes):
++    value = {
++        "identity": dict(IDENTITY), "generation": 7, "started": True,
++        "turn": {"state": "succeeded", "generation": 7},
++        "required_sources": list(REQUIRED),
++        "sources": {name: {"identity": dict(IDENTITY), "generation": 7,
++                           "revision": 3, "current_revision": 3, "coverage": "complete"}
++                    for name in REQUIRED},
++        "work": [], "asks": [], "muted": False,
++    }
++    value.update(changes)
++    return value
++
++
++def reduce(value, previous=None):
++    # A missing reducer is an assertion failure at RED, not a collection/import error.
++    spec = importlib.util.find_spec("hermes_state_session_status")
++    assert spec is not None, "canonical backend reducer has not been implemented"
++    return importlib.import_module("hermes_state_session_status").reduce_status(value, previous=previous)
++
++
++@pytest.mark.parametrize("changes,kind,stripe", [
++    ({}, "done", "done"),
++    ({"muted": True, "asks": [{"id": "ask"}]}, "muted", "blocked"),
++    ({"asks": [{"id": "ask"}], "turn": {"state": "running", "generation": 7}}, "decision", "stuck"),
++    ({"turn": {"state": "running", "generation": 7}}, "running", "waiting"),
++    ({"work": [{"id": "card", "state": "ready"}]}, "waiting", "waiting"),
++    ({"work": [{"id": "child", "state": "running"}]}, "waiting", "waiting"),
++    ({"work": [{"id": "child", "state": "failed"}]}, "unresolved", "attention"),
++    ({"work": [{"id": "child", "state": "lost"}]}, "unresolved", "attention"),
++    ({"work": [{"id": "child", "state": "cancelled"}]}, "unresolved", "attention"),
++    ({"work": [{"id": "child", "state": "invented-success"}]}, "unresolved", "attention"),
++    ({"work": [{"id": "child", "state": "succeeded"}]}, "done", "done"),
++    ({"work": [{"id": "watch", "state": "watching", "passive": True}]}, "done", "done"),
++    ({"work": [{"id": "cron", "state": "scheduled", "passive": True}]}, "done", "done"),
++    ({"started": False, "turn": {"state": "never_started", "generation": 7}}, "unresolved", "none"),
++    ({"turn": {"state": "failed", "generation": 7}}, "unresolved", "attention"),
++    ({"turn": {"state": "pending", "generation": 7}}, "unresolved", "attention"),
++])
++def test_precedence(changes, kind, stripe):
++    out = reduce(snapshot(**changes))
++    assert (out["kind"], out["presentation"]["stripe"]) == (kind, stripe)
++    assert out["status_version"] == 1
++    assert out["identity"] == IDENTITY
++    assert out["generation"] == 7
++    assert out["revision"] == 1
++
++
++@pytest.mark.parametrize("defect", ["missing", "unknown", "epoch", "generation", "inconsistent", "expired"])
++@pytest.mark.parametrize("source", REQUIRED)
++def test_incomplete_or_foreign_source_never_green(source, defect):
++    value = snapshot()
++    reading = value["sources"][source]
++    defects = {
++        "missing": lambda: value["sources"].pop(source),
++        "unknown": lambda: reading.update(coverage="unknown"),
++        "epoch": lambda: reading["identity"].update(owner_epoch="previous-owner"),
++        "generation": lambda: reading.update(generation=6),
++        "inconsistent": lambda: reading.update(current_revision=4),
++        "expired": lambda: reading.update(expired=True),
++    }
++    defects[defect]()
++    out = reduce(value)
++    assert out["kind"] == "unresolved"
++    assert out["presentation"]["stripe"] != "done"
++    assert out["coverage"]["state"] == "unknown"
++    assert any(source in reason for reason in out["coverage"]["reasons"])
++
++
++def test_revision_only_changes_when_canonical_evidence_changes():
++    value = snapshot()
++    first = reduce(value)
++    assert reduce(value, first) == first
++    changed = deepcopy(value)
++    changed["sources"]["cards"]["revision"] = 4
++    changed["sources"]["cards"]["current_revision"] = 4
++    second = reduce(changed, first)
++    assert second["revision"] == 2
++    assert second["source_revisions"]["cards"] == 4
++
++
++@pytest.mark.parametrize("wording", ["Done.", "I will do it", "Are you sure?", "", "Everything failed."])
++def test_wording_and_declaration_are_not_status_authority(wording):
++    value = snapshot(summary=wording, declared={"kind": "decision", "summary": wording})
++    assert reduce(value)["kind"] == "done"
++    value["turn"]["state"] = "failed"
++    value["declared"]["kind"] = "done"
++    assert reduce(value)["kind"] == "unresolved"
++
++
++def test_new_generation_cannot_inherit_success_or_erase_failure_without_successor():
++    first = reduce(snapshot(turn={"state": "failed", "generation": 7}))
++    pending = snapshot(generation=8, turn={"state": "pending", "generation": 8})
++    for reading in pending["sources"].values():
++        reading["generation"] = 8
++    assert reduce(pending, first)["kind"] == "unresolved"
++    pending["turn"] = {"state": "succeeded", "generation": 7}
++    assert reduce(pending, first)["kind"] == "unresolved"
++    pending["turn"]["generation"] = 8
++    assert reduce(pending, first)["kind"] == "done"
++
++
++def test_late_generation_is_rejected_without_overwriting_current_status():
++    current = reduce(snapshot(generation=8, turn={"state": "running", "generation": 8}))
++    with pytest.raises(ValueError, match="stale generation"):
++        reduce(snapshot(), current)
++
++
++def test_owner_change_requires_a_new_qualified_snapshot():
++    current = reduce(snapshot())
++    value = snapshot()
++    value["identity"]["owner_epoch"] = "owner-2"
++    out = reduce(value, current)
++    assert out["kind"] == "unresolved"
++    assert out["revision"] == current["revision"] + 1
++
++
++def test_known_ask_and_own_running_precede_unknown_coverage():
++    value = snapshot(sources={}, asks=[{"id": "ask"}])
++    assert reduce(value)["kind"] == "decision"
++    value["asks"] = []
++    value["turn"] = {"state": "running", "generation": 7}
++    assert reduce(value)["kind"] == "running"
++    assert reduce(value)["coverage"]["state"] == "unknown"
++
++
++@pytest.mark.parametrize("state", ["failed", "lost", "cancelled"])
++def test_disappearing_failed_work_does_not_become_empty_success(state):
++    failed = reduce(snapshot(work=[{"id": "child-1", "state": state}]))
++    clean = snapshot()
++    again = reduce(clean, failed)
++    assert again["kind"] == "unresolved"
++    assert again["failures"] == failed["failures"]
++    clean["generation"] = 8
++    clean["turn"] = {"state": "pending", "generation": 8}
++    for reading in clean["sources"].values():
++        reading["generation"] = 8
++    pending_out = reduce(clean, failed)
++    assert pending_out["kind"] == "unresolved"
++    clean["turn"]["state"] = "succeeded"
++    assert reduce(clean, pending_out)["kind"] == "done"
++
++
++def test_same_generation_success_does_not_erase_failed_turn():
++    failed = reduce(snapshot(turn={"state": "failed", "generation": 7}))
++    assert reduce(snapshot(), failed)["kind"] == "unresolved"
++
++
++def test_unknown_work_state_is_not_latched_as_an_execution_failure():
++    unknown = reduce(snapshot(work=[{"id": "child-1", "state": "unknown"}]))
++    assert unknown["kind"] == "unresolved"
++    assert reduce(snapshot(work=[{"id": "child-1", "state": "succeeded"}]), unknown)["kind"] == "done"
++
++
++@pytest.mark.parametrize("field", ["gateway", "profile", "session_id", "owner_epoch"])
++def test_unqualified_identity_refused(field):
++    value = snapshot()
++    del value["identity"][field]
++    with pytest.raises(ValueError, match="qualified identity"):
++        reduce(value)
++
++
++@pytest.mark.parametrize("generation", [True, -1, "7", None])
++def test_invalid_generation_refused(generation):
++    with pytest.raises(ValueError, match="generation"):
++        reduce(snapshot(generation=generation))
++
++
++def test_omitting_required_source_list_cannot_certify_empty_reads():
++    assert reduce(snapshot(required_sources=[], sources={}))["kind"] == "unresolved"
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+new file mode 100644
+index 0000000000..b2a4edd917
+--- /dev/null
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -0,0 +1,393 @@
++"""Canonical status through the real ``refresh_outcome`` entry point: existing readers, strict process
++inventory, tokened turn settlement, notice transparency and the fenced publication. [daveey]"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++from tools import process_registry as registry_module
++from tools import process_registry_results as results
++from tools.process_registry import ProcessSession
++from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start
++
++HUMAN_REQUEST = {
++    "action": "Approve the production deploy?", "why_human": "Only the operator can approve a deploy.",
++    "interaction": "approval", "scope": "deploy", "evidence": "CI is green.",
++    "choices": [{"label": "Ship it", "value": "yes"}, {"label": "Hold", "value": "no"}],
++}
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    path = tmp_path / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, session_id TEXT,"
++                     " block_kind TEXT, human_request TEXT)")
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [path])
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    yield path
++    ksa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def receipts(tmp_path, monkeypatch):
++    """The real retained-result directory and registry, scoped to this test's home."""
++    monkeypatch.setattr(results, "get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(results, "_owns_result", lambda owner, parent: owner == parent)
++    registry = registry_module.process_registry
++    monkeypatch.setattr(registry, "_running", {})
++    monkeypatch.setattr(registry, "_finished", {})
++    directory = tmp_path / "logs" / "process-results"
++    directory.mkdir(parents=True)
++    return directory
++
++
++@pytest.fixture
++def db(tmp_path, board, receipts):
++    so._reset_hooks_for_tests()
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    handle.create_session("chat", source="desktop")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++
++
++def add_card(path, tid, status, request=None):
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
++                     (tid, "a card", status, "chat", "needs_input" if request else None,
++                      json.dumps(request) if request else None))
++    ksa._reset_cache_for_tests()
++
++
++def set_card(path, tid, status):
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE tasks SET status = ?, block_kind = NULL, human_request = NULL WHERE id = ?", (status, tid))
++    ksa._reset_cache_for_tests()
++
++
++def say(db, role, content, **kw):
++    db.append_message("chat", role=role, content=content, **kw)
++
++
++def turn(db, reply="ok"):
++    say(db, "user", "please fix the flaky test")
++    say(db, "assistant", reply)
++
++
++def receipt(directory, exit_code=0, pid="proc_example", at=None):
++    data = dict(id=pid, command="true", cwd="/", task_id="task", owner_task_id="task", session_key="",
++                parent_session_id="chat", started_at=time.time(), exit_code=exit_code,
++                completion_reason="exited", termination_source="", notify_on_complete=False, output="")
++    path = directory / f"{pid}.json"
++    path.write_text(json.dumps(data))
++    if at is not None:
++        import os
++        os.utime(path, (at, at))
++    return path
++
++
++def refresh(db, trigger="turn_end", **kw):
++    return so.refresh_outcome("chat", trigger, db=db, **kw)["status"]
++
++
++def assert_done(status):
++    assert (status["kind"], status["presentation"]["stripe"], status["coverage"]["state"]) == ("done", "done", "complete")
++
++
++# ── row 1: all work terminal and the owning turn settled is green, whatever the reply says ────────
++
++
++@pytest.mark.parametrize("reply", ["ok", "Let me look into that next?", "Fixed it; all 12 tests pass now."])
++def test_all_terminal_work_is_done_complete_regardless_of_wording(db, board, receipts, reply):
++    add_card(board, "t_done", "done")
++    receipt(receipts, 0)
++    turn(db, reply)
++    status = refresh(db)
++    assert_done(status)
++    assert status["status_version"] == 1 and status["revision"] == 1
++    assert status["identity"]["session_id"] == "chat"
++    assert set(status["source_revisions"]) == {"cards", "controls", "turn", "subagents", "processes", "goals"}
++
++
++def test_repeated_refresh_and_reads_never_change_revision_or_paint(db):
++    turn(db)
++    first = refresh(db)
++    for trigger in ("manual", "notice", "card_change", "reap", "manual"):
++        assert refresh(db, trigger) == first
++    assert so.get_outcome("chat", db=db)["status"] == first
++    rows = so.stamp_outcome_rows([dict(db._read_one("SELECT id, outcome_json, muted FROM sessions WHERE id='chat'"))])
++    assert rows[0]["outcome"]["status"] == first
++
++
++def test_declaration_keeps_the_envelope_and_has_no_status_authority(db, board):
++    add_card(board, "t_open", "running")
++    turn(db)
++    assert refresh(db)["kind"] == "waiting"
++    declared = so.declare_outcome("chat", {"kind": "done", "summary": "all finished"}, db=db)
++    assert declared["kind"] == "done"
++    stored = so.get_outcome("chat", db=db)
++    assert stored["status"]["kind"] == "waiting" and stored["status"]["revision"] == 1
++    status = refresh(db, "manual")
++    assert (status["kind"], status["revision"]) == ("waiting", 1)
++    set_card(board, "t_open", "done")
++    status = refresh(db, "card_change")
++    assert_done(status)
++    assert status["revision"] == 2
++
++
++# ── notices are transparent; a genuine request starts a generation ─────────────────────────────
++
++
++def test_informational_notice_does_not_reopen_a_done_session(db):
++    turn(db)
++    done = refresh(db)
++    assert_done(done)
++    say(db, "user", "[kanban] card t_x finished", display_kind="kanban_notice",
++        display_metadata={"outcome_informational": True})
++    assert refresh(db, "notice") == done
++    say(db, "user", "[ASYNC DELEGATION BATCH COMPLETE — d1] ...", display_kind="async_delegation_complete",
++        display_metadata={"completion_note": ['["async_delegation","d1",""]'], "display_text": "finished"})
++    assert refresh(db, "notice") == done
++
++
++def test_genuine_or_unproven_user_text_starts_a_new_generation(db):
++    turn(db)
++    done = refresh(db)
++    say(db, "user", "[kanban] card t_x finished\n\nalso please rerun the suite", display_kind="kanban_notice",
++        display_metadata={})  # folded/unproven: not a provably informational notice
++    status = refresh(db, "notice")
++    assert status["generation"] > done["generation"]
++    assert status["presentation"]["stripe"] == "attention" and status["kind"] == "unresolved"
++    say(db, "user", "one more thing")
++    newer = refresh(db, "manual")
++    assert newer["generation"] > status["generation"] and newer["kind"] == "unresolved"
++    say(db, "assistant", "done")
++    assert_done(refresh(db))
++
++
++# ── row 4: a failed authoritative read is unknown (never the old green); recovery is green ─────────
++
++
++def test_unreadable_process_inventory_is_unknown_then_recovers(db, receipts):
++    turn(db)
++    done = refresh(db)
++    assert_done(done)
++    bad = receipts / "proc_bad.json"
++    bad.write_text("{")
++    unknown = refresh(db, "manual")
++    assert (unknown["kind"], unknown["reason"], unknown["presentation"]["stripe"]) == (
++        "unresolved", "source_unknown", "attention")
++    assert unknown["coverage"]["state"] == "unknown"
++    assert any(reason.startswith("processes:process_read_failed") for reason in unknown["coverage"]["reasons"])
++    assert unknown["revision"] == done["revision"] + 1
++    assert so.get_outcome("chat", db=db)["status"] == unknown  # published, not only returned
++    bad.unlink()
++    recovered = refresh(db, "manual")
++    assert_done(recovered)
++    assert recovered["revision"] == unknown["revision"] + 1
++
++
++def test_inventory_enumeration_failure_is_unknown(db, receipts, monkeypatch):
++    turn(db)
++    assert_done(refresh(db))
++
++    def fail(self):
++        raise PermissionError("cannot enumerate")
++    monkeypatch.setattr(type(receipts), "iterdir", fail)
++    assert refresh(db, "manual")["reason"] == "source_unknown"
++
++
++@pytest.mark.parametrize("source,patch", [("cards", "_card_items"), ("subagents", "_subagent_items")])
++def test_a_failed_reader_is_unknown_not_empty(db, monkeypatch, source, patch):
++    turn(db)
++    assert_done(refresh(db))
++
++    def fail(*args, **kwargs):
++        raise sqlite3.OperationalError("unreadable")
++    monkeypatch.setattr(so, patch, fail)
++    status = refresh(db, "manual")
++    assert status["reason"] == "source_unknown"
++    assert any(reason.startswith(f"{source}:") for reason in status["coverage"]["reasons"])
++
++
++def test_a_raising_control_provider_is_unknown(db):
++    turn(db)
++
++    def provider(sid):
++        raise RuntimeError("vault unreadable")
++    so.register_outcome_provider("vault", provider)
++    status = refresh(db)
++    assert status["reason"] == "source_unknown"
++    assert any(reason.startswith("controls:") for reason in status["coverage"]["reasons"])
++
++
++def test_malformed_goal_record_is_unknown(db):
++    turn(db)
++    db._write_rowcount("INSERT INTO state_meta (key, value) VALUES ('goal:chat', '{')")
++    assert refresh(db)["reason"] == "source_unknown"
++
++
++# ── row 6: open, failed, lost or unreadable work can never be green ──────────────────────────────
++
++
++def test_open_card_waits_and_human_ask_is_a_decision(db, board):
++    add_card(board, "t_open", "blocked")
++    turn(db)
++    assert (refresh(db)["kind"], refresh(db)["presentation"]["stripe"]) == ("waiting", "waiting")
++    add_card(board, "t_ask", "blocked", HUMAN_REQUEST)
++    status = refresh(db, "card_change")
++    assert (status["kind"], status["presentation"]["stripe"]) == ("decision", "stuck")
++
++
++def test_live_process_waits_failed_exit_is_attention_until_a_successful_successor(db, receipts):
++    live = ProcessSession(id="proc_live", command="sleep 60", cwd="/", task_id="task", parent_session_id="chat")
++    registry = registry_module.process_registry
++    registry._running[live.id] = live
++    turn(db)
++    assert refresh(db)["kind"] == "waiting"
++    del registry._running[live.id]
++    receipt(receipts, 7, pid="proc_live")
++    failed = refresh(db, "manual")
++    assert (failed["kind"], failed["reason"], failed["presentation"]["stripe"]) == (
++        "unresolved", "linked_work_unsuccessful", "attention")
++    assert refresh(db, "notice") == failed  # wording, notices and time do not clear it
++    # The failure predates the next genuine request; only that request's successful completion clears it.
++    past = time.time() - 30
++    receipt(receipts, 7, pid="proc_live", at=past)
++    say(db, "user", "try again")
++    assert refresh(db, "manual")["kind"] == "unresolved"
++    say(db, "assistant", "ok")
++    assert_done(refresh(db))
++
++
++def test_current_process_without_exit_evidence_is_unknown(db, receipts):
++    turn(db)
++    receipt(receipts, None)
++    assert refresh(db)["reason"] == "source_unknown"
++
++
++def test_running_and_lost_subagents_are_never_green(db):
++    db.create_session("child", source="subagent", parent_session_id="chat")
++    turn(db)
++    assert refresh(db)["kind"] == "waiting"
++    silent = time.time() - so.SUBAGENT_LIVE_WINDOW_S - 60
++    db._write_rowcount("UPDATE sessions SET started_at = ?, last_activity_at = ? WHERE id = 'child'", (silent, silent))
++    db._write_rowcount("UPDATE messages SET timestamp = ? WHERE session_id = 'chat'", (silent - 60,))
++    lost = refresh(db, "reap")
++    assert (lost["kind"], lost["reason"]) == ("unresolved", "linked_work_unsuccessful")
++    so.declare_outcome("chat", {"kind": "done", "summary": "everything is finished"}, db=db)
++    assert refresh(db, "manual")["kind"] == "unresolved"
++
++
++def test_failed_turn_is_attention_and_muted_wins(db):
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
++    say(db, "user", "do it")
++    say(db, "assistant", FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND)
++    status = refresh(db)
++    assert (status["kind"], status["reason"]) == ("unresolved", "turn_failed")
++    assert so.set_muted("chat", True, db=db)["status"]["kind"] == "muted"
++
++
++def test_never_started_draft_has_no_stripe(db):
++    status = refresh(db, "manual")
++    assert (status["kind"], status["presentation"]["stripe"]) == ("unresolved", "none")
++
++
++# ── tokened turn settlement (newest admission decides; tokenless keeps the transcript reading) ───────
++
++
++def admitted_turn(db):
++    home = db.db_path.parent
++    turn(db)
++    record_turn_start(home, "chat", "keep going")
++    marker = read_turn_marker(home, "chat")
++    assert refresh(db, "notice")["kind"] == "running"
++    clear_turn_marker(home, "chat")
++    return so.turn_identity(marker=marker)
++
++
++def test_tokened_turn_settles_only_on_its_own_turn_end(db):
++    own = admitted_turn(db)
++    unsettled = refresh(db, "notice")
++    assert (unsettled["kind"], unsettled["reason"]) == ("unresolved", "turn_unsettled")
++    mismatched = refresh(db, "turn_end", concluding_turn=so.turn_identity(lease_holder="someone-else"))
++    assert mismatched["reason"] == "turn_unsettled"
++    assert refresh(db, "turn_end")["reason"] == "turn_unsettled"  # a token-less turn end is not its record
++    assert_done(refresh(db, "turn_end", concluding_turn=own))
++    assert_done(refresh(db, "notice"))
++
++
++def test_tokened_turn_failure_is_attention(db):
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
++    own = admitted_turn(db)
++    say(db, "user", "again")
++    say(db, "assistant", FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND)
++    status = refresh(db, "turn_end", concluding_turn=own)
++    assert (status["kind"], status["reason"]) == ("unresolved", "turn_failed")
++
++
++def test_newest_admission_decides_over_an_older_unsettled_turn(db):
++    admitted_turn(db)
++    assert refresh(db, "notice")["reason"] == "turn_unsettled"
++    say(db, "user", "start over")
++    say(db, "assistant", "ok")
++    assert_done(refresh(db, "turn_end", concluding_turn=so.turn_identity(lease_holder="newer-turn")))
++
++
++def test_tokenless_legacy_turn_keeps_the_transcript_reading(db):
++    turn(db)
++    assert_done(refresh(db, "turn_end"))
++    say(db, "user", "and then?")
++    assert refresh(db, "manual")["reason"] == "interrupted"
++
++
++# ── fenced publication: a stale collector never overwrites its successor ─────────────────────────
++
++
++def test_stale_collector_retries_against_the_successor(db, monkeypatch):
++    import hermes_state_session_status_snapshot as snapshot
++
++    turn(db)
++    assert_done(refresh(db))
++    real, calls = snapshot.canonical_status, []
++
++    def racing(handle, tip, stored, **kw):
++        status = real(handle, tip, stored, **kw)
++        if not calls:
++            so.declare_outcome("chat", {"kind": "done", "summary": "declared meanwhile"}, db=handle)
++            say(handle, "user", "a newer request")
++        calls.append(status["generation"])
++        return status
++    monkeypatch.setattr(snapshot, "canonical_status", racing)
++    out = so.refresh_outcome("chat", "manual", db=db)
++    assert len(calls) == 2 and calls[1] > calls[0]
++    assert out["status"]["generation"] == calls[1] and out["status"]["kind"] == "unresolved"
++    assert so.get_outcome("chat", db=db) == out
++
++
++def test_exhausted_fence_leaves_the_successor_in_place(db, monkeypatch):
++    import hermes_state_session_status_snapshot as snapshot
++
++    turn(db)
++    assert_done(refresh(db))
++    real, count = snapshot.canonical_status, [0]
++
++    def always_racing(handle, tip, stored, **kw):
++        status = real(handle, tip, stored, **kw)
++        count[0] += 1
++        say(handle, "user", f"request {count[0]}")
++        return status
++    monkeypatch.setattr(snapshot, "canonical_status", always_racing)
++    before = so.get_outcome("chat", db=db)
++    out = so.refresh_outcome("chat", "manual", db=db)
++    assert count[0] == snapshot.CAS_ATTEMPTS
++    assert out == before == so.get_outcome("chat", db=db)
+diff --git a/tests/tools/test_process_results_strict.py b/tests/tools/test_process_results_strict.py
+new file mode 100644
+index 0000000000..b23e758178
+--- /dev/null
++++ b/tests/tools/test_process_results_strict.py
+@@ -0,0 +1,122 @@
++"""Status reads must distinguish expiry from unavailable current evidence."""
++import json
++import os
++import time
++
++import pytest
++
++from tools import process_registry_results as results
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++
++@pytest.fixture
++def receipts(tmp_path, monkeypatch):
++    monkeypatch.setattr(results, "get_hermes_home", lambda: tmp_path)
++    directory = tmp_path / "logs" / "process-results"
++    directory.mkdir(parents=True)
++    return directory
++
++
++def record(directory, exit_code=0):
++    data = dict(id="proc_example", command="true", cwd="/", task_id="task",
++                owner_task_id="task", session_key="", parent_session_id="owner",
++                started_at=time.time(), exit_code=exit_code, completion_reason="exited",
++                termination_source="", notify_on_complete=False, output="")
++    path = directory / "proc_example.json"
++    path.write_text(json.dumps(data))
++    return path
++
++
++def test_enumeration_failure(receipts, monkeypatch):
++    def fail(*args, **kwargs):
++        raise OSError("inventory unavailable")
++    monkeypatch.setattr(results, "_result_paths", fail)
++    with pytest.raises(OSError):
++        results.load_completed_results(strict=True, owner_session_id="owner")
++
++
++def test_malformed_retained_record(receipts):
++    (receipts / "proc_bad.json").write_text("{")
++    with pytest.raises(ValueError):
++        results.load_completed_results(strict=True, owner_session_id="owner")
++
++
++def test_current_missing_exit_evidence(receipts):
++    record(receipts, None)
++    with pytest.raises(ValueError):
++        results.load_completed_results(strict=True, owner_session_id="owner")
++
++
++@pytest.mark.parametrize("exit_code", [0, 7])
++def test_retained_terminal_evidence(receipts, exit_code):
++    record(receipts, exit_code)
++    loaded = results.load_completed_results(strict=True, owner_session_id="owner")
++    assert loaded["proc_example"].exit_code == exit_code
++    assert loaded["proc_example"].exited
++
++
++def test_genuine_expiry(receipts):
++    path = record(receipts, 7)
++    expired = time.time() - results.RESULT_RETENTION_SECONDS - 60
++    os.utime(path, (expired, expired))
++    assert results.load_completed_results(strict=True, owner_session_id="owner") == {}
++
++
++def test_strict_requires_explicit_owner(receipts):
++    with pytest.raises(ValueError):
++        results.load_completed_results(strict=True)
++
++
++@pytest.mark.parametrize("exited,exit_code", [(False, None), (True, 0), (True, 7)])
++def test_qualified_registry_list(receipts, monkeypatch, exited, exit_code):
++    registry = ProcessRegistry()
++    own = ProcessSession(id="proc_owned", command="true", cwd="/", task_id="task",
++                         parent_session_id="owner", exited=exited, exit_code=exit_code)
++    foreign = ProcessSession(id="proc_foreign", command="true", cwd="/", task_id="other",
++                             parent_session_id="foreign", exited=True, exit_code=None)
++    registry._running = {own.id: own, foreign.id: foreign}
++    monkeypatch.setattr(results, "_owns_result", lambda owner, parent: owner == parent)
++    monkeypatch.setattr(registry, "_refresh_detached_session", lambda s: s)
++    monkeypatch.setattr(registry, "_reconcile_local_exit", lambda s: None)
++    rows = registry.list_sessions(include_retained=True, strict=True, owner_session_id="owner")
++    assert [row["session_id"] for row in rows] == [own.id]
++    assert rows[0]["status"] == ("exited" if exited else "running")
++    if exited:
++        assert rows[0]["exit_code"] == exit_code
++
++
++def test_hidden_uncollected_record_is_unknown(receipts, monkeypatch):
++    registry = ProcessRegistry()
++    own = ProcessSession(id="proc_owned", command="true", cwd="/", task_id="task",
++                         parent_session_id="owner", exited=True, exit_code=None)
++    registry._finished = {own.id: own}
++    monkeypatch.setattr(registry, "_refresh_detached_session", lambda s: s)
++    monkeypatch.setattr(registry, "_uncollected_gone", lambda s: True)
++    with pytest.raises(ValueError, match="exit evidence"):
++        registry.list_sessions(include_retained=True, strict=True, owner_session_id="owner")
++
++
++def test_real_enumeration_error_propagates(receipts, monkeypatch):
++    def fail(self):
++        raise PermissionError("cannot enumerate")
++    monkeypatch.setattr(type(receipts), "iterdir", fail)
++    with pytest.raises(PermissionError):
++        results.load_completed_results(strict=True, owner_session_id="owner")
++
++
++def test_record_pruned_between_enumeration_and_read_is_expiry(receipts, monkeypatch):
++    """Another producer's prune (retention or cap) can remove a receipt after it was listed: that is
++    expiry under the existing retention rule, not unreadable current evidence."""
++    kept = record(receipts, 7)
++    gone = receipts / "proc_gone.json"
++    monkeypatch.setattr(results, "_result_paths", lambda **kw: [gone, kept])
++    loaded = results.load_completed_results(strict=True, owner_session_id="owner")
++    assert set(loaded) == {"proc_example"}
++
++
++def test_record_pruned_during_enumeration_is_expiry(receipts, monkeypatch):
++    kept = record(receipts, 0)
++    real = type(receipts).iterdir
++    monkeypatch.setattr(type(receipts), "iterdir",
++                        lambda self: [*real(self), self / "proc_gone.json"] if self == receipts else real(self))
++    assert results._result_paths(strict=True) == [kept]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 9558d18d07..ccf6269c16 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2311,7 +2311,8 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         """O(1) running count for status-bar polling; dict ``len()`` is atomic, no lock."""
+         return len(self._running)
+ 
+-    def list_sessions(self, task_id: str | None = None, session_key: str | None = None, *, include_retained: bool = False) -> list:
++    def list_sessions(self, task_id: str | None = None, session_key: str | None = None, *, include_retained: bool = False,
++                      strict: bool = False, owner_session_id: str | None = None) -> list:
+         """Running and recently-finished processes for ``task_id`` and/or ``session_key``;
+         cross-task entries sharing the gateway session (a forgotten preview server
+         blocking session reset) are flagged ``"session_scoped": true``.
+@@ -2321,14 +2322,11 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         under that gateway session are surfaced too, even if they belong to a different task — so the agent
+         can discover a forgotten preview server that is blocking session reset (#29177).
+         """
+-        # Only an explicit tool query reads historical receipts. Status bars and
+-        # gateway liveness scans call this frequently and need the live registry.
+-        sessions = load_completed_results() if include_retained else {}
+-        with self._lock:
+-            sessions.update(self._finished)
+-            sessions.update(self._running)
++        # Retained reads are opt-in; routine status bars use the live registry.
++        from tools.process_registry_results import registry_sessions
++        sessions = registry_sessions(self, include_retained, strict, owner_session_id, load_completed_results)
+         from tools.environments.sandbox_scope import sandbox_visible
+-        all_sessions = [
++        all_sessions = list(sessions.values()) if strict else [
+             refreshed for refreshed in (
+                 self._refresh_detached_session(s) for s in sessions.values() if sandbox_visible(s.sandbox_key)
+             ) if refreshed is not None and not self._uncollected_gone(refreshed)
+@@ -2344,6 +2342,8 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             # List-only refreshes must observe child exit even while descendants
+             # keep the capture pipe open; retain the existing completion owner.
+             self._reconcile_local_exit(s)
++            if strict and s.exited and type(s.exit_code) is not int:
++                raise ValueError("current process missing exit evidence")
+             entry = {
+                 "session_id": s.id,
+                 "command": s.command[:200],
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index 278ff6db5d..ba15564711 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -26,34 +26,48 @@ _RESULT_FIELDS = (
+ )
+ 
+ 
+-def _result_paths():
++def _result_paths(*, strict: bool = False):
+     """Prune by completion time, not start time (jobs can take days)."""
+     directory = get_hermes_home() / "logs" / "process-results"
+     cutoff = time.time() - RESULT_RETENTION_SECONDS
+     retained = []
+-    for path in directory.glob("proc_*.json"):
++    if strict:
++        # Path.glob may suppress enumeration errors. An absent results directory
++        # is normal before the first completion; other errors are not absence.
++        try:
++            paths = [p for p in directory.iterdir() if p.name.startswith("proc_") and p.suffix == ".json"]
++        except FileNotFoundError:
++            paths = []
++    else:
++        paths = directory.glob("proc_*.json")
++    for path in paths:
+         try:
+             modified = path.stat().st_mtime
+             if modified < cutoff:
+-                path.unlink(missing_ok=True)
++                if not strict:
++                    path.unlink(missing_ok=True)
+             else:
+                 retained.append((modified, path))
+         except FileNotFoundError:
+-            continue  # Another producer pruned it.
++            continue  # Another producer pruned it: expiry, in strict reads too.
+     retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+     visible = [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+     for _, path in retained[MAX_RETAINED_RESULTS:]:
+-        if _owed(path):  # retained custody must also remain retrievable [daveey]
++        if _owed(path, strict=strict):  # retained custody must also remain retrievable [daveey]
+             visible.append(path)
+-        else:
++        elif not strict:
+             path.unlink(missing_ok=True)
+     return visible
+ 
+ 
+-def _owed(path) -> bool:
++def _owed(path, *, strict: bool = False) -> bool:
+     try:
+         record = json.loads(path.read_text(encoding="utf-8-sig"))
++    except FileNotFoundError:
++        return False  # pruned since it was listed
+     except (OSError, ValueError):
++        if strict:
++            raise
+         return False
+     return isinstance(record, dict) and isinstance(record.get("delivery_obligation"), dict)
+ 
+@@ -102,21 +116,55 @@ def _owns_result(owner: str, parent: str | None) -> bool:
+         db.close()
+ 
+ 
+-def load_completed_results(prefix: str = "") -> dict:
++def registry_sessions(registry, include_retained, strict, owner_session_id, loader) -> dict:
++    """Opt-in qualified status view; preserve the default tool/display inventory."""
++    from tools.environments.sandbox_scope import sandbox_visible
++
++    if strict and (not include_retained or not owner_session_id):
++        raise ValueError("strict process inventory requires retained results and explicit owner")
++    sessions = (loader(strict=True, owner_session_id=owner_session_id) if strict
++                else loader()) if include_retained else {}
++    with registry._lock:
++        sessions.update(registry._finished)
++        sessions.update(registry._running)
++    if not strict:
++        return sessions
++    selected = {}
++    for key, session in sessions.items():
++        if not session.parent_session_id:
++            raise ValueError("process owner scope unavailable")
++        if not _owns_result(owner_session_id, session.parent_session_id):
++            continue
++        if not sandbox_visible(session.sandbox_key):
++            raise ValueError("process owner scope unavailable")
++        refreshed = registry._refresh_detached_session(session)
++        if refreshed is None or registry._uncollected_gone(refreshed):
++            raise ValueError("current process missing exit evidence")
++        if refreshed.exited and type(refreshed.exit_code) is not int:
++            raise ValueError("current process missing exit evidence")
++        selected[key] = refreshed
++    return selected
++
++
++def load_completed_results(prefix: str = "", *, strict: bool = False, owner_session_id: str | None = None) -> dict:
+     """Restore read-only snapshots; no process handles, watchers, or queue events."""
+     from tools.process_registry import ProcessSession
+ 
+     from gateway.session_context import get_session_env
+     from tools.environments.sandbox_scope import hosted_scope
+ 
+-    owner = get_session_env("HERMES_SESSION_ID", "")
++    owner = owner_session_id if owner_session_id is not None else get_session_env("HERMES_SESSION_ID", "")
++    if strict and (not owner_session_id or hosted_scope() is not None):
++        raise ValueError("process owner scope unavailable")
+     # A hosted agent's processes leave no receipt here and it sees no local one: never read or prune them.
+     if not owner or hosted_scope() is not None:
+         return {}
+     results = {}
+     try:
+-        paths = _result_paths()
++        paths = _result_paths(strict=True) if strict else _result_paths()
+     except OSError:
++        if strict:
++            raise
+         logger.warning("Could not read retained process results", exc_info=True)
+         return results
+     for path in paths:
+@@ -125,16 +173,28 @@ def load_completed_results(prefix: str = "") -> dict:
+         try:
+             record = json.loads(path.read_text(encoding="utf-8-sig"))
+             if record["id"] != path.stem or not re.fullmatch(r"proc_[\w]+", record["id"]):
++                if strict:
++                    raise ValueError("malformed process identity")
+                 continue
++            if strict and not isinstance(record.get("parent_session_id"), str):
++                raise ValueError("process owner scope unavailable")
+             if not _owns_result(owner, record.get("parent_session_id")):
+                 continue
++            if strict and type(record.get("exit_code")) is not int:
++                raise ValueError("current process missing exit evidence")
+             session = ProcessSession(
+                 **{key: record[key] for key in _RESULT_FIELDS},
+                 # Receipts written before processes carried a sandbox are a local activity's.
+                 sandbox_key=record.get("sandbox_key", ""), exited=True, output_buffer=record["output"],
+             )
++            if strict:  # receipts carry no exit time; their mtime is the completion time pruning already uses
++                session.exited_at = path.stat().st_mtime
+             session._completion_event.set()
+             results[session.id] = session
++        except FileNotFoundError:
++            continue  # pruned by another producer after it was listed: expiry, not unreadable evidence
+         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
++            if strict:
++                raise
+             logger.debug("Skipping unreadable process result %s", path.name, exc_info=True)
+     return results
+-- 
+2.43.0
+

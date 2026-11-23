@@ -1,0 +1,250 @@
+From 064dc5d5ea2d3af35da71bd8fd19215b8d5bcd79 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:59:22 +0000
+Subject: [PATCH] perf(sessions): reuse source-policy config reads within
+ classification [daveey]
+
+Five whys: sessions/tree routes stamp automated policy on every refresh;
+classification separately loaded expanded config for automated, interactive
+and root sidebar lists; default-home calls loaded the same revision three
+times; existing readonly loads still validate/expand backend state; those
+redundant validations need not run for every key of one classification.
+
+Project the narrow lists together from one readonly snapshot per distinct
+home, returning fresh list objects. Retain the existing loader's file/env/
+managed/backend invalidation and outage behavior. Do not add a TTL, retain
+whole config across calls, or change delta transport or F/G1/H3.
+
+Proof: RED same-payload test expected 1 load and observed 3. GREEN one load.
+HTTP sessions/tree include+exclude compare complete response bytes against
+the pre-reuse policy algorithm. File/env/root edits and mutation isolation
+are covered; typed backend outage still propagates and restores home.
+13 focused consumer files pass. Full check's only remaining failure before
+rebase is unrelated moved-base sidebar health; canonical ship re-gates.
+
+Hermes-Card: t_945ae1e3b9c0a357
+---
+ hermes_cli/session_listing.py                 | 33 ++++----
+ .../test_session_source_policy_http.py        | 54 ++++++++++++
+ .../test_session_source_policy_reuse.py       | 84 +++++++++++++++++++
+ 3 files changed, 157 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_session_source_policy_http.py
+ create mode 100644 tests/hermes_cli/test_session_source_policy_reuse.py
+
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index 7b5427e8f2..9c93685d82 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -57,9 +57,10 @@ def sidebar_excluded_sources(hermes_home: str | Path) -> list[str]:
+ AUTOMATED_ALL_SOURCES = "*"
+ 
+ 
+-def _sessions_source_list(hermes_home: str | Path, key: str) -> list[str]:
+-    """Lower-cased ``sessions.<key>`` source list from *hermes_home*'s own config.yaml [daveey];
+-    ``[]`` when unset or unreadable (a comma string is accepted too)."""
++def _sessions_source_list(
++    hermes_home: str | Path, key: str | tuple[str, ...],
++) -> list[str] | tuple[list[str], ...]:
++    """Project one or several source lists from one readonly config revision; retain no config."""
+     from hermes_cli.config import load_config_readonly
+     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+ 
+@@ -67,15 +68,18 @@ def _sessions_source_list(hermes_home: str | Path, key: str) -> list[str]:
+     try:
+         sessions_cfg = load_config_readonly().get("sessions") or {}
+     except Exception:
+-        return []
++        sessions_cfg = {}
+     finally:
+         reset_hermes_home_override(token)
+-    raw = sessions_cfg.get(key) if isinstance(sessions_cfg, dict) else None
+-    if isinstance(raw, str):
+-        raw = raw.split(",")
+-    if not isinstance(raw, (list, tuple)):
+-        return []
+-    return [str(s).strip().lower() for s in raw if str(s).strip()]
++    result = []
++    keys = (key,) if isinstance(key, str) else key
++    for source_key in keys:
++        raw = sessions_cfg.get(source_key) if isinstance(sessions_cfg, dict) else None
++        if isinstance(raw, str):
++            raw = raw.split(",")
++        result.append([str(s).strip().lower() for s in raw if str(s).strip()]
++                      if isinstance(raw, (list, tuple)) else [])
++    return result[0] if isinstance(key, str) else tuple(result)
+ 
+ 
+ class AutomatedSourcePolicy(list):
+@@ -166,14 +170,15 @@ def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
+     profile NOT listed behaves as ``automated_sources: ["*"]`` unless its own config.yaml sets
+     ``automated_sources`` or ``interactive_sources`` explicitly, so a new bot profile starts hidden.
+     Empty policy when unset or unreadable."""
+-    policy = AutomatedSourcePolicy(
+-        _sessions_source_list(hermes_home, "automated_sources"),
+-        _sessions_source_list(hermes_home, "interactive_sources"))
++    automated, interactive, sidebar_profiles = _sessions_source_list(
++        hermes_home, ("automated_sources", "interactive_sources", "sidebar_profiles"))
++    policy = AutomatedSourcePolicy(automated, interactive)
+     try:
+         profile, root = _store_profile_and_root(hermes_home)
+     except Exception:
+         return policy
+-    sidebar_profiles = _sessions_source_list(root, "sidebar_profiles")
++    if root != Path(hermes_home):
++        sidebar_profiles = _sessions_source_list(root, "sidebar_profiles")
+     if (sidebar_profiles and profile.lower() not in sidebar_profiles
+             and not _profile_sets_source_policy(hermes_home)):
+         return AutomatedSourcePolicy([AUTOMATED_ALL_SOURCES])
+diff --git a/tests/hermes_cli/test_session_source_policy_http.py b/tests/hermes_cli/test_session_source_policy_http.py
+new file mode 100644
+index 0000000000..2486adb682
+--- /dev/null
++++ b/tests/hermes_cli/test_session_source_policy_http.py
+@@ -0,0 +1,54 @@
++"""HTTP payload differential against the pre-reuse source-policy algorithm."""
++
++import pytest
++
++from hermes_cli import session_listing as listing
++from tests.hermes_cli import test_profiles_sidebar_scope as fixtures
++
++_uncached_sidebar_endpoints = fixtures._uncached_sidebar_endpoints
++client = fixtures.client
++profiles_on_disk = fixtures.profiles_on_disk
++_seed_session = fixtures._seed_session
++
++
++def _legacy_policy(home):
++    policy = listing.AutomatedSourcePolicy(
++        listing._sessions_source_list(home, "automated_sources"),
++        listing._sessions_source_list(home, "interactive_sources"))
++    profile, root = listing._store_profile_and_root(home)
++    sidebar_profiles = listing._sessions_source_list(root, "sidebar_profiles")
++    if (sidebar_profiles and profile.lower() not in sidebar_profiles
++            and not listing._profile_sets_source_policy(home)):
++        return listing.AutomatedSourcePolicy(["*"])
++    return policy
++
++
++@pytest.mark.parametrize("route", ["/api/profiles/sessions", "/api/profiles/projects/tree"])
++@pytest.mark.parametrize("automated", ["include", "exclude"])
++def test_http_payload_identical_to_legacy(client, profiles_on_disk, monkeypatch, route, automated):
++    from hermes_cli.web_routers import profiles as routes
++    from hermes_cli import kanban_session_activity as activity
++    from unittest.mock import Mock
++    import time
++
++    # Keep the observation producer's clock identical, not a stripped/normalized payload.
++    clock = Mock(wraps=time)
++    clock.time.return_value = time.time() - 60
++    monkeypatch.setattr(activity, "time", clock)
++
++    for name, home in profiles_on_disk.items():
++        (home / "config.yaml").write_text(
++            "sessions:\n  interactive_sources: [desktop, cli]\n")
++        _seed_session(home, f"{name}-human", source="cli")
++        _seed_session(home, f"{name}-bot", source="eval")
++    modern = listing.automated_session_sources
++    with monkeypatch.context() as patch:
++        patch.setattr(listing, "automated_session_sources", _legacy_policy)
++        patch.setattr(routes, "automated_session_sources", _legacy_policy)
++        expected = client.get(route, params={"automated": automated})
++    monkeypatch.setattr(routes, "automated_session_sources", modern)
++    actual = client.get(route, params={"automated": automated})
++    assert expected.status_code == actual.status_code == 200
++    assert expected.json()["errors"] == []
++    assert actual.json() == expected.json()
++    assert actual.content == expected.content
+diff --git a/tests/hermes_cli/test_session_source_policy_reuse.py b/tests/hermes_cli/test_session_source_policy_reuse.py
+new file mode 100644
+index 0000000000..aa0f5195c3
+--- /dev/null
++++ b/tests/hermes_cli/test_session_source_policy_reuse.py
+@@ -0,0 +1,84 @@
++"""Source-policy reuse retains payloads without retaining config across calls."""
++
++import copy
++
++import pytest
++
++from hermes_cli import config, session_listing as listing
++from hermes_constants import get_hermes_home
++
++
++def test_policy_reads_each_home_once_and_preserves_stamped_payload(monkeypatch, tmp_path):
++    root = tmp_path / "home"
++    root.mkdir()
++    (root / "config.yaml").write_text(
++        "sessions:\n  automated_sources: ' EVAL, cron '\n"
++        "  interactive_sources: [desktop, CLI]\n  sidebar_profiles: [default]\n"
++    )
++    original = config.load_config_readonly
++    calls = []
++
++    def counted():
++        calls.append(str(get_hermes_home()))
++        return original()
++
++    monkeypatch.setattr(config, "load_config_readonly", counted)
++    rows = [
++        {"id": "human", "source": "local", "created_source": "desktop"},
++        {"id": "bot", "source": "eval"},
++        {"id": "unknown", "source": "new-bot"},
++        {"id": "legacy", "source": None},
++    ]
++    expected = listing.stamp_automated(
++        copy.deepcopy(rows), automated_sources=listing.AutomatedSourcePolicy(
++            ["eval", "cron"], ["desktop", "cli"]
++        )
++    )
++    assert listing.stamp_automated(copy.deepcopy(rows), root) == expected
++    assert calls == [str(root)]
++
++
++def test_fresh_policies_observe_file_env_and_root_edits(monkeypatch, tmp_path):
++    root = tmp_path / "home"
++    named = root / "profiles" / "bot"
++    named.mkdir(parents=True)
++    (root / "config.yaml").write_text("sessions:\n  sidebar_profiles: [default]\n")
++    path = named / "config.yaml"
++    path.write_text("sessions:\n  interactive_sources: '${D2_HUMAN_SOURCES}'\n")
++    monkeypatch.setenv("D2_HUMAN_SOURCES", "desktop,cli")
++    first = listing.automated_session_sources(named)
++    assert first.interactive == ["desktop", "cli"]
++    first.interactive.append("eval")
++    first.append("*")
++    second = listing.automated_session_sources(named)
++    assert not list(second)
++    assert second.interactive == ["desktop", "cli"]
++    monkeypatch.setenv("D2_HUMAN_SOURCES", "cli")
++    assert listing.automated_session_sources(named).interactive == ["cli"]
++    path.write_text("{}\n")
++    assert listing.automated_session_sources(named) == ["*"]
++    (root / "config.yaml").write_text("sessions:\n  sidebar_profiles: [default, bot]\n")
++    assert not listing.automated_session_sources(named)
++    path.unlink()
++    assert not listing.automated_session_sources(named)
++
++
++def test_errors_restore_home_and_do_not_memoize_fallback(monkeypatch, tmp_path):
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    prior_home = get_hermes_home()
++    home = tmp_path / "profile"
++    with monkeypatch.context() as patch:
++        def unavailable():
++            raise ConfigBackendUnavailable("D2 synthetic unavailable")
++        patch.setattr(config, "load_config_readonly", unavailable)
++        with pytest.raises(ConfigBackendUnavailable, match="D2 synthetic unavailable"):
++            listing.automated_session_sources(home)
++    assert get_hermes_home() == prior_home
++    with monkeypatch.context() as patch:
++        patch.setattr(config, "load_config_readonly", lambda: {"sessions": None})
++        assert not listing.automated_session_sources(home)
++    with monkeypatch.context() as patch:
++        patch.setattr(config, "load_config_readonly", lambda: {"sessions": {"automated_sources": ["EVAL"]}})
++        assert listing.automated_session_sources(home) == ["eval"]
++    assert get_hermes_home() == prior_home
+-- 
+2.43.0
+

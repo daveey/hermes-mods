@@ -1,0 +1,338 @@
+From e77d5774d8e4f3b8c5b9f005bb7703cec1d4b0a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:16:55 +0000
+Subject: [PATCH] fix(kanban): retain retired pin author diagnostics and
+ consumer contracts [daveey]
+
+Retirement keeps prior policy evidence in its audit rather than task columns. Read that evidence only under the existing conservative first-epoch rules; class policy, downstream-review exclusions and later concrete implementation epochs retain their previous behavior. Keep routing/admission/custody assertions while replacing superseded storage expectations.
+
+Proof: full pre-fix consumer suite 22570 passed/28 failed; new provenance suite RED 3 failures then GREEN 14 cases; eight exact-anchor provenance mutations killed. Revised 15-file consumer suite green; importer/history suites green; scripts/check --base origin/main green. Independent exact-head review and required CI remain canonical ship gates.
+---
+ hermes_cli/kanban_review_model.py             | 21 +++++-
+ tests/hermes_cli/test_kanban_goal_recovery.py |  2 +-
+ .../test_kanban_managed_pin_policy.py         |  2 +-
+ .../test_kanban_model_assignment.py           |  2 +-
+ .../test_kanban_model_neutral_review61.py     |  2 +-
+ .../test_kanban_model_tier_paced_reroute.py   |  2 +-
+ tests/hermes_cli/test_kanban_pin_reroute.py   |  4 +-
+ tests/hermes_cli/test_kanban_profile_pace.py  |  3 +-
+ .../hermes_cli/test_kanban_provider_walls.py  | 12 ++--
+ .../test_kanban_refused_pin_clear.py          | 13 +++-
+ .../test_kanban_retired_author_provenance.py  | 70 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_review_model.py  |  2 +-
+ .../test_kanban_review_paced_reroute.py       |  2 +-
+ .../test_kanban_review_tier_fallback.py       |  2 +-
+ 14 files changed, 118 insertions(+), 21 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_retired_author_provenance.py
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 92e1fae83e..8a7f708209 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -90,7 +90,7 @@ def implementer_models(conn, task) -> set[str]:
+         stored = kb.get_task(conn, card.id)
+         skilled = "sdlc-review" in (getattr(stored, "skills", None) or [])
+         models = set()
+-        pin = str(getattr(card, "model_override", None) or "").strip()
++        pin = _conservative_pin(conn, card)
+         boundary = False
+         if not downstream and not skilled:
+             models, boundary = _current_authors(conn, card.id, bounded)
+@@ -117,6 +117,25 @@ def implementer_models(conn, task) -> set[str]:
+         return collect(conn, task)
+ 
+ 
++def _conservative_pin(conn, card):
++    """Retired policy remains diagnostic evidence, under the same epoch rules.
++
++    A subsequent explicit class policy supersedes this fallback. Only the latest
++    clear is relevant, just as replacing a stored pin never accumulated authors.
++    """
++    pin = str(getattr(card, "model_override", None) or "").strip()
++    if pin:
++        return pin
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='model_override_cleared' "
++                       "ORDER BY id DESC LIMIT 1", (card.id,)).fetchone()
++    payload = _payload(row[0] if row else None)
++    previous = payload.get("previous")
++    if payload.get("reason") != "model_policy_no_pins" or not isinstance(previous, dict):
++        return ""
++    value = previous.get("model_override")
++    return value.strip() if isinstance(value, str) else ""
++
++
+ def _current_authors(conn, task_id, bounded=True):
+     from hermes_cli.kanban_review_artifacts import artifact_author_runs
+     delivered = artifact_author_runs(conn, task_id) if bounded else None
+diff --git a/tests/hermes_cli/test_kanban_goal_recovery.py b/tests/hermes_cli/test_kanban_goal_recovery.py
+index f46f6e58af..8b0267c4b7 100644
+--- a/tests/hermes_cli/test_kanban_goal_recovery.py
++++ b/tests/hermes_cli/test_kanban_goal_recovery.py
+@@ -105,7 +105,7 @@ def test_goal_recovery_neutral_child_preserves_source_and_no_cycle_after_two_res
+         rec = kb.get_task(conn, cards[0])
+         assert (rec.model_override, rec.provider_override, rec.model_pin_mandatory) == (None, None, None)
+         source = kb.get_task(conn, tid)
+-        assert (source.model_override, source.provider_override) == ('gpt-5', 'openai-codex')
++        assert (source.model_override, source.provider_override) == (('gpt-5', 'openai-codex') if attempt == 0 else (None, None))
+         assert source.body == task.body
+         created = next(e for e in kb.list_events(conn, rec.id) if e.kind == 'created')
+         assert created.payload['creator_task_id'] == tid
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index 2e6b6d58bf..7b6a5e37f3 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -133,7 +133,7 @@ def test_dispatch_ignores_legacy_pin_without_rewriting_author_evidence(board, la
+     spawned = []
+     dispatch_once(conn, spawn_fn=lambda item, *args: spawned.append(item.model_override), max_spawn=1)
+     assert spawned == (['class:standard'] if lane == 'ready' else ['claude-opus-5-5'])
+-    assert kb.get_task(conn, tid).model_override == 'claude-sonnet-4-5'
++    assert kb.get_task(conn, tid).model_override is None  # provenance lives in retirement audit
+     event = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]
+     if lane == 'review':
+         assert event['review_independence'] == 'separate_execution'
+diff --git a/tests/hermes_cli/test_kanban_model_assignment.py b/tests/hermes_cli/test_kanban_model_assignment.py
+index a43da7e6c0..a81f05bab0 100644
+--- a/tests/hermes_cli/test_kanban_model_assignment.py
++++ b/tests/hermes_cli/test_kanban_model_assignment.py
+@@ -101,7 +101,7 @@ def test_dispatch_routes_legacy_incompatible_pin_without_spawning(board, monkeyp
+         assert spawned == [(tid, 'class:standard', 'auto')], repr(result)
+     task = kb.get_task(conn, tid)
+     assert task.status == 'running' and task.assignee == 'worker' and task.block_kind is None
+-    assert task.model_override == 'claude-opus-5-5'  # never rewrite historical row
++    assert task.model_override is None  # stored restriction retired; author evidence retained below
+     assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+     assert conn.execute('SELECT count(*) FROM task_links').fetchone()[0] == 0
+     if lane == 'review':
+diff --git a/tests/hermes_cli/test_kanban_model_neutral_review61.py b/tests/hermes_cli/test_kanban_model_neutral_review61.py
+index 86db95782a..32da09840d 100644
+--- a/tests/hermes_cli/test_kanban_model_neutral_review61.py
++++ b/tests/hermes_cli/test_kanban_model_neutral_review61.py
+@@ -63,7 +63,7 @@ def test_episode_live_recovery_preserves_structural_gate(board, monkeypatch, all
+             assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == runs
+             assert any('model_unroutable' in why for _, why in result.skipped_ineligible)
+             assert episode(conn, tid) == state
+-        assert (current.model_override, current.provider_override) == ('claude-opus-5-5', 'anthropic')
++        assert (current.model_override, current.provider_override, current.model_pin_mandatory) == (None, None, None)
+ 
+ 
+ @pytest.mark.parametrize('mode', ['disabled', 'empty', 'providers_off', 'capabilities'])
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+index 29044be6c3..426f2f40e1 100644
+--- a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -155,7 +155,7 @@ def test_legacy_pin_on_a_held_provider_is_ignored_and_the_card_starts_on_its_cla
+         assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'default+paced:openai-codex'
+         task = kb.get_task(conn, tid)
+         assert task is not None
+-        assert (task.model_override, task.provider_override) == PIN  # the author's historical pin is retained
++        assert (task.model_override, task.provider_override) == (None, None)  # provenance retained in audit
+ 
+ 
+ @pytest.mark.parametrize('why', ['flag', 'marker'])
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+index 49d044f529..fb1f37f77f 100644
+--- a/tests/hermes_cli/test_kanban_pin_reroute.py
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -190,8 +190,8 @@ def test_preview_matches_admission_and_preserves_concrete_row(board, monkeypatch
+         assert preview[:2] == ('class:standard', None)  # preview has no concrete provider yet
+         assert _tick(conn) == [(preview[0], preview[1] or 'auto')] == [('class:standard', 'auto')]
+         stored = kb.get_task(conn, tid)
+-        assert (stored.model_override, stored.provider_override) == PIN
+-        assert stored.model_pin_mandatory == 1
++        assert (stored.model_override, stored.provider_override) == (None, None)
++        assert stored.model_pin_mandatory is None
+         assert tier.owner_model_pin(conn, stored) == ('class:standard', 'auto')
+         route = _events(conn, tid, 'run_route')[-1]
+         assert route['model'] == 'class:standard' and route['tier_reason'] == 'default'
+diff --git a/tests/hermes_cli/test_kanban_profile_pace.py b/tests/hermes_cli/test_kanban_profile_pace.py
+index 3659cab9d2..d2685876e0 100644
+--- a/tests/hermes_cli/test_kanban_profile_pace.py
++++ b/tests/hermes_cli/test_kanban_profile_pace.py
+@@ -70,7 +70,8 @@ def test_legacy_profile_pins_are_ignored_and_the_card_escapes_the_held_pool(coac
+         conn.commit()
+         seen, result = _dispatch(conn)
+         assert seen == [(tid, 'claude-sonnet-5-5', 'anthropic')] and tid not in result.clock_held
+-        assert kb.get_task(conn, tid).model_override == pin['model_override']  # author provenance retained
++        expected = pin['model_override'] if pin['model_override'].startswith('class:') else None
++        assert kb.get_task(conn, tid).model_override == expected  # concrete provenance retained in audit
+ 
+ 
+ def test_no_usable_profile_peer_keeps_hold(coach):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index c89049b02c..836bbf77a6 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -77,9 +77,10 @@ def test_legacy_pinned_card_on_walled_provider_is_routed_by_class_not_its_pin(bo
+     # preserve deferred class allocation, never concretize the legacy pin.
+     assert seen[a][:2] == ("class:standard", "auto")
+     assert seen[b][:2] == ("class:standard", "auto")
+-    # Author provenance is retained untouched.
+-    assert (kb.get_task(conn, a).model_override, kb.get_task(conn, a).provider_override) == ("gpt-6-astra", CODEX)
+-    assert "require_model: true" in kb.get_task(conn, b).body
++    # Author provenance and superseded body mandates remain historical evidence.
++    assert (kb.get_task(conn, a).model_override, kb.get_task(conn, a).provider_override) == (None, None)
++    from hermes_cli.kanban_model_retirement import retired_body
++    assert kb.get_task(conn, b).body == retired_body("must stay on astra\nrequire_model: true")
+ 
+ 
+ def test_no_wall_no_change(board, monkeypatch):
+@@ -237,11 +238,10 @@ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch)
+     _legacy(conn, pinned, "gpt-6-astra", CODEX)
+     seen = _dispatch(conn)
+     assert seen[tid][:2] in ((OPUS, "anthropic"), ("class:standard", "auto"))
+-    # A legacy concrete pin is ignored (no hold on the live wall, no crash) and its author row is untouched.
++    # A legacy concrete pin is retired (no hold on the live wall, no crash).
+     assert pinned in seen, [tuple(r) for r in conn.execute("SELECT kind, payload FROM task_events WHERE task_id=?", (pinned,))]
+     assert seen[pinned][:2] == seen[tid][:2]
+-    assert (kb.get_task(conn, pinned).model_override, kb.get_task(conn, pinned).provider_override) == (
+-        "gpt-6-astra", CODEX)
++    assert (kb.get_task(conn, pinned).model_override, kb.get_task(conn, pinned).provider_override) == (None, None)
+ 
+ 
+ def test_every_fallback_exhausted_leaves_task_on_its_class_route(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_refused_pin_clear.py b/tests/hermes_cli/test_kanban_refused_pin_clear.py
+index 4b2c8acf3b..e21f7d0cb4 100644
+--- a/tests/hermes_cli/test_kanban_refused_pin_clear.py
++++ b/tests/hermes_cli/test_kanban_refused_pin_clear.py
+@@ -69,13 +69,20 @@ def test_legacy_selector_is_projected_and_dispatched_without_supervisor_or_histo
+ 
+     task = kb.get_task(conn, tid)
+     assert task.status == 'running' and task.block_kind is None
+-    assert (task.model_override, task.provider_override) == (model, provider)
++    assert (task.model_override, task.provider_override) == (None, None)
+     assert [t.id for t in spawned] == [tid]
+     assert (spawned[0].model_override, spawned[0].provider_override) == ('class:standard', 'auto')
+     assert not result.respawn_guarded
+-    assert not _events(conn, tid, 'model_override_cleared')
++    cleared = _events(conn, tid, 'model_override_cleared')
++    assert len(cleared) == 1
++    assert cleared[0]['reason'] == 'model_policy_no_pins'
++    assert cleared[0]['previous']['model_override'] == model
++    assert cleared[0]['previous']['provider_override'] == provider
+     assert [(e.id, e.kind, e.payload) for e in kb.list_events(conn, tid)][:len(original_events)] == original_events
+-    assert kb.list_comments(conn, tid) == original_comments
++    comments = kb.list_comments(conn, tid)
++    assert comments[:len(original_comments)] == original_comments
++    assert len(comments) == len(original_comments) + 1
++    assert comments[-1].author == 'kanban-dispatcher'
+     runs = conn.execute('SELECT id, worker_pid FROM task_runs WHERE task_id=?', (tid,)).fetchall()
+     assert [(r['id'], r['worker_pid']) for r in runs] == [(task.current_run_id, 4242)]
+ 
+diff --git a/tests/hermes_cli/test_kanban_retired_author_provenance.py b/tests/hermes_cli/test_kanban_retired_author_provenance.py
+new file mode 100644
+index 0000000000..0528baecb9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_retired_author_provenance.py
+@@ -0,0 +1,70 @@
++"""Retiring policy must preserve, not broaden, conservative author diagnostics."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_review_model as review
++from tests.hermes_cli import test_kanban_model_retirement as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize('boundary,models,expected', [
++    (False, set(), {'grok-4.6'}),
++    (False, {'actual-author'}, {'actual-author', 'grok-4.6'}),
++    (True, {'new-author'}, {'new-author'}),
++    (True, set(), {'grok-4.6'}),
++])
++def test_retirement_preserves_existing_epoch_rules(board, monkeypatch, boundary, models, expected):
++    monkeypatch.setattr(review, '_current_authors', lambda *_: (set(models), boundary))
++    with kbc.connect() as conn:
++        tid = fixtures.seed(conn)
++        before = review.implementer_models(conn, kb.get_task(conn, tid))
++        assert before == expected
++        fixtures.sweep(conn)
++        assert kb.get_task(conn, tid).model_override is None
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == before
++
++
++@pytest.mark.parametrize('pin', ['class:deep', None])
++def test_nonconcrete_retirement_adds_no_author(board, pin):
++    with kbc.connect() as conn:
++        tid = fixtures.seed(conn, model=pin)
++        fixtures.sweep(conn)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == set()
++
++
++def test_downstream_pin_never_becomes_implementer(board):
++    with kbc.connect() as conn:
++        tid = fixtures.seed(conn)
++        conn.execute("UPDATE tasks SET title='Independent exact-head review fixture' WHERE id=?", (tid,))
++        fixtures.sweep(conn)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == set()
++
++
++@pytest.mark.parametrize('payload', [
++    {}, {'reason': 'other', 'previous': {'model_override': 'grok-4.6'}},
++    {'reason': 'model_policy_no_pins', 'previous': []},
++    {'reason': 'model_policy_no_pins', 'previous': {'model_override': 12}},
++    {'reason': 'model_policy_no_pins', 'previous': {'model_override': 'class:deep'}},
++])
++def test_unrelated_or_malformed_clear_is_not_retired_pin(board, payload):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='ordinary', assignee='default')
++        kb._append_event(conn, tid, 'model_override_cleared', payload)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == set()
++
++
++def test_new_class_policy_supersedes_conservative_pin(board):
++    with kbc.connect() as conn:
++        tid = fixtures.seed(conn)
++        fixtures.sweep(conn)
++        kb.set_model_override(conn, tid, 'class:deep', 'auto')
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == set()
++
++
++def test_latest_retirement_does_not_accumulate_old_pins(board):
++    with kbc.connect() as conn:
++        tid = fixtures.seed(conn)
++        fixtures.sweep(conn)
++        conn.execute("UPDATE tasks SET model_override='  newer-author  ' WHERE id=?", (tid,))
++        fixtures.sweep(conn)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {'newer-author'}
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index 5fdf600a09..392a9313af 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -84,7 +84,7 @@ def test_dispatch_receipt_and_owner_use_review_model_without_changing_row(board)
+         stored = kb.get_task(conn, t.id)
+         events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == "model_tier"]
+         assert seen["model"] == OPUS
+-        assert stored.model_override == SONNET
++        assert stored.model_override is None  # original selector retained in retirement audit
+         assert tier.owner_model_pin(conn, stored) == (OPUS, "anthropic")
+         assert events[-1] == {"model": OPUS, "provider": "anthropic", "reason": "review_unpinned",
+                               "lane": "review", "review_independence": "separate_execution"}
+diff --git a/tests/hermes_cli/test_kanban_review_paced_reroute.py b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+index 57ac70314d..4baca35b9b 100644
+--- a/tests/hermes_cli/test_kanban_review_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_review_paced_reroute.py
+@@ -158,7 +158,7 @@ def test_a_held_review_override_is_not_taken_by_the_fast_return(board, clock, mo
+     assert (reason, route) == ('review_unpinned', GROK)
+     assert 'paced' not in tier_event
+     assert route_event['tier_reason'] == 'review_unpinned'
+-    assert (stored.model_override, stored.provider_override) == PEER  # the row never moves
++    assert (stored.model_override, stored.provider_override) == (None, None)  # policy retired, route still paced
+ 
+ 
+ @pytest.mark.parametrize('entry', ENTRIES)
+diff --git a/tests/hermes_cli/test_kanban_review_tier_fallback.py b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+index 021611362f..1f21b3fe7c 100644
+--- a/tests/hermes_cli/test_kanban_review_tier_fallback.py
++++ b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+@@ -139,7 +139,7 @@ def test_dispatch_records_fallback_in_both_route_receipts(board, monkeypatch):
+                                spawn_fn=lambda item, ws: seen.append(item.model_override))
+         stored = kb.get_task(conn, t.id)
+         assert seen == [STANDARD]
+-        assert stored.model_override == DEEP[0]
++        assert stored.model_override is None  # original selector retained in retirement audit
+         assert tier.owner_model_pin(conn, stored) == (STANDARD, "openai-codex")
+         events = {e.kind: e.payload for e in kb.list_events(conn, t.id)
+                   if e.run_id == stored.current_run_id and e.kind in ("model_tier", "run_route")}
+-- 
+2.43.0
+

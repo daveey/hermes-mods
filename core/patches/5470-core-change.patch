@@ -1,0 +1,335 @@
+From 53d476c0f1ead618b15288f1cd78b69e2a1c4d67 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:15:54 +0000
+Subject: [PATCH] [daveey] name residual sync-round steps and pin empty-probe
+ boundaries
+
+The perpetual sync worker now books round residuals, but the historical
+13.39065ms non-board overhead cannot be allocated from its aggregate counters.
+Name completed discovery, sweep, selection, deferred/backlog, after-round,
+report and wait work using existing residual scoped_call accounting. Nested
+board CPU stays accounted once; disabled scopes preserve the direct call.
+
+Extend the empty-outbox cut's controls for rejected-to-pending transitions,
+closed observers, and fresh awake verdicts. Main-file mtime/size changes reopen
+the observer to prevent equal-header restore reuse. This deliberately also
+invalidates generations on checkpoint; ordinary WAL commits retain generation.
+Trace replacement DELETE-mode handles and isolate the existing burst-write
+window test from autocheckpoint, retaining all deadline assertions and adding
+an explicit checkpoint invalidation control.
+
+Proof: behavioral RED missing step names; GREEN 109 tests in 8 focused files.
+Six exact-anchor mutants killed with named tests. Full 210-file consumer run
+exposed the two checkpoint/trace fixture assumptions; both corrected without
+weakening deadline/output assertions, final focused suites and full check pass.
+Collector synthetic controls separately cover observation brackets, stale/busy
+reads, PID/code mismatch, ancestry binding and negative-residual rejection.
+No Mac performance acceptance claimed; independent exact-head CI/review and
+one naturally deployed mature-idle measurement remain mandatory.
+---
+ hermes_cli/kanban_sync_client.py              | 16 +++---
+ hermes_cli/kanban_sync_cpu.py                 |  7 +++
+ .../test_kanban_sync_empty_outbox.py          | 35 ++++++++++++
+ .../test_kanban_sync_repair_window.py         |  9 +++
+ .../test_kanban_sync_step_accounting.py       | 57 +++++++++++++++++++
+ .../test_kanban_sync_targeted_rounds.py       | 40 +++++++++++--
+ .../test_loop_accounting_sync_round.py        | 18 ++++++
+ 7 files changed, 170 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_step_accounting.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a70e3fdbf4..c14ec3fe75 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1521,17 +1521,17 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     try:
+         with sync_cpu.iterations(keep_running) as rounds:
+             for _round in rounds:
+-                boards = board_paths()
+-                sweep_gone_board_handles()  # a removed board is never read again: close what it pins (2026-11-13)
++                boards = sync_cpu.step(board_paths)
++                sync_cpu.step(sweep_gone_board_handles)  # close handles a removed board pins
+                 for slug, _path in boards:
+                     if slug not in watchers or not watchers[slug].is_alive():
+                         watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
+                                               on_state=work.feed_state)
+                         watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+                         watchers[slug].start()
+-                selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+-                selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+-                selected += [b for b in backlog.due(boards) if b not in selected]  # a pull backlog drains round by round
++                selected = sync_cpu.step(sync_timing.select, work.select, boards, time.monotonic(), outbox_pending)
++                selected += [b for b in sync_cpu.step(deferred_repairs_due, boards, _repair_clock()) if b not in selected]
++                selected += [b for b in sync_cpu.step(backlog.due, boards) if b not in selected]
+                 picked = time.monotonic()  # a board backing off a failed round waits for it, whatever else is due
+                 selected = [b for b in selected if not work.backing_off(b[0], picked)]
+                 selected = refusal.runnable(selected)  # a refused board waits out its own backoff, no busy retry
+@@ -1553,10 +1553,10 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                         _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                                   r.push.sent, r.push.rejected)
+                 # WARNING: an unsent edit older than 10 min after a good round (a skipped round judges nothing)
+-                outbox_age.after_round([r for r in results if not r.skipped], boards)
++                sync_cpu.step(outbox_age.after_round, [r for r in results if not r.skipped], boards)
+                 if time.monotonic() >= next_links and links.request(boards):  # busy: ask again next iteration
+                     next_links = time.monotonic() + LINKS_EVERY_S
+-                sync_timing.report(sender.loop_report)
++                sync_cpu.step(sync_timing.report, sender.loop_report)
+                 # From this round's results: a board that stopped behind the head reruns at once; one a tick held is
+                 # retried shortly (a skipped board's stale behind flag would otherwise spin with zero wait).
+                 remaining = 0.0 if any(r.behind for r in results) else max(0.0, work.deadline - time.monotonic())
+@@ -1571,7 +1571,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 retry_in = work.next_retry(now)
+                 if retry_in is not None:
+                     remaining = min(remaining, retry_in)
+-                sync_timing.wait(wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
++                sync_cpu.step(sync_timing.wait, wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
+     finally:
+         links.stop()
+         _LINKS_RUNNER = None  # no stale runner for the next loop's tests to wait on
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index 9ea5a557bc..10946132b4 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -20,6 +20,13 @@ from hermes_cli import loop_accounting
+ _local = threading.local()
+ 
+ 
++def step(fn, *args, **kwargs):
++    """Name a completed loop step; nested scopes book only their residual CPU."""
++    if not loop_accounting.scopes_enabled():
++        return fn(*args, **kwargs)
++    return loop_accounting.scoped_call("sync.step", fn)(*args, **kwargs)
++
++
+ @contextmanager
+ def service(name):
+     """Publish one completed service, including exceptional exits, on this thread."""
+diff --git a/tests/hermes_cli/test_kanban_sync_empty_outbox.py b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+index 1cc6d8d80f..c775803e72 100644
+--- a/tests/hermes_cli/test_kanban_sync_empty_outbox.py
++++ b/tests/hermes_cli/test_kanban_sync_empty_outbox.py
+@@ -83,6 +83,41 @@ def test_pending_answers_are_never_used_as_empty_deadline_proof(board, monkeypat
+     assert sendable.call_count == 2
+ 
+ 
++def test_rejected_to_pending_invalidates_empty_proof(board, monkeypatch):
++    path, conn = board
++    _insert(conn)
++    conn.execute("UPDATE kanban_sync_outbox SET state='rejected'")
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    assert age._sample(path) is None
++    conn.execute("UPDATE kanban_sync_outbox SET state='pending'")
++    assert age._sample(path)[0] == "op"
++
++
++def test_closed_watch_handle_falls_back_then_recovers(board, monkeypatch):
++    path, conn = board
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    assert age._sample(path) is None
++    # Keep the writer open: losing the watcher must not be masked by last-close
++    # sidecar deletion or a main-file checkpoint.
++    client._WATCH._conns[os.path.realpath(path)][1].close()
++    _insert(conn)
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    assert age._sample(path)[0] == "op"
++    assert opened.call_count == 1
++    assert age._sample(path)[0] == "op"
++
++
++def test_empty_after_round_still_reads_fresh_awake_state(board, monkeypatch):
++    path, _conn = board
++    awake = Mock(side_effect=[True, False, True])
++    monkeypatch.setattr(age.replica_age, "note_round", lambda *a, **kw: None)
++    result = client.RoundResult(board="default", mode="primary")
++    for _ in range(3):
++        assert age.after_round([result], [("default", path)], awake_fn=awake) == []
++    assert awake.call_count == 3
++
++
+ def test_same_inode_restore_cannot_reuse_empty_proof(board, monkeypatch):
+     source, conn = board
+     path = source.with_name("closed-empty.db")
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_window.py b/tests/hermes_cli/test_kanban_sync_repair_window.py
+index ba6dd3f6bf..31e45edd13 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_window.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_window.py
+@@ -158,6 +158,15 @@ def test_a_local_write_after_its_window_repairs_at_once(live, svc, kanban_home,
+ def test_a_burst_of_local_writes_runs_one_repair_pass_per_window(live, svc, kanban_home, monkeypatch, clock, mode):
+     """Hub 2026-11-13: writes by other processes ran 80 full passes in 601 s on a 5,428-card board."""
+     monkeypatch.setattr(win, "LOCAL_WRITE_REPAIR_MIN_S", 10.0)  # shorter than the feed window: told apart below
++    # This case isolates WAL commits from main-file replacement/checkpoint
++    # invalidation. Observe every opener, not only the fixture's writer.
++    live.execute("PRAGMA wal_autocheckpoint=0")
++    connect = kbc.connect
++    def without_checkpoint(*args, **kwargs):
++        conn = connect(*args, **kwargs)
++        conn.execute("PRAGMA wal_autocheckpoint=0")
++        return conn
++    monkeypatch.setattr(kbc, "connect", without_checkpoint)
+     parent, _ = _settle(live, svc, kanban_home, mode)
+     clock[0] += 60
+     calls = _spy(monkeypatch, HEAVY)
+diff --git a/tests/hermes_cli/test_kanban_sync_step_accounting.py b/tests/hermes_cli/test_kanban_sync_step_accounting.py
+new file mode 100644
+index 0000000000..721f41cdc5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_step_accounting.py
+@@ -0,0 +1,57 @@
++"""Residual step scopes name ongoing loop work without adding board CPU twice."""
++from functools import wraps
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import loop_accounting as la
++
++
++@pytest.mark.parametrize("enabled", [True, False])
++def test_real_loop_publishes_step_names(monkeypatch, enabled):
++    from hermes_cli import kanban_sync_links_pass, machine_metrics
++    from hermes_cli import machine_cpu_sampler, machine_metrics_sender
++    from hermes_cli import kanban_sync_schema_alert
++    la.stop()
++    la.reset()
++    monkeypatch.setattr(la, "scopes_enabled", lambda: enabled)
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="test", url="unused"))
++    monkeypatch.setattr(client, "Hub", lambda ident: Mock())
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(client, "_schema_ahead_boards", lambda boards: [])
++    monkeypatch.setattr(kanban_sync_schema_alert, "note_start", lambda: None)
++    monkeypatch.setattr(kanban_sync_links_pass, "LinksPass", lambda gateway: Mock())
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *a: Mock())
++    monkeypatch.setattr(machine_cpu_sampler, "AdvisorySampler", Mock)
++    monkeypatch.setattr(machine_metrics_sender, "MetricsSender", lambda *a: Mock())
++    monkeypatch.setattr(machine_metrics_sender, "board_post", lambda ident: None)
++    wanted = []
++    def stub(owner, name, result):
++        original = getattr(owner, name)
++        @wraps(original)
++        def replacement(*args, **kwargs):
++            return result
++        monkeypatch.setattr(owner, name, replacement)
++        wanted.append("sync.step/" + la._callable_name(replacement))
++    stub(client, "board_paths", [])
++    stub(client, "sweep_gone_board_handles", None)
++    stub(client.sync_timing, "select", [])
++    stub(client, "deferred_repairs_due", [])
++    stub(client.backlog, "due", [])
++    stub(client.outbox_age, "after_round", [])
++    stub(client.sync_timing, "report", None)
++    stub(client.sync_timing, "wait", None)
++    monkeypatch.setattr(client.outbox_age, "round_started", lambda: None)
++    monkeypatch.setattr(client, "next_deferred_repair", lambda boards: None)
++    monkeypatch.setattr(client, "sync_all_once", lambda *a, **kw: [])
++    calls = iter([True, False])
++    try:
++        client._run_forever(lambda: next(calls), 1, Mock())
++        rows = la.counters()
++        assert {name for name in rows if name.startswith("sync.step/")} == (set(wanted) if enabled else set())
++        if enabled:
++            assert all(rows[name]["runs"] == 1 for name in wanted)
++    finally:
++        la.reset()
+diff --git a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+index 9a524b93e8..3802762e4e 100644
+--- a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
++++ b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+@@ -86,7 +86,7 @@ def test_events_during_io_and_periodic_recovery_are_not_lost():
+ 
+ 
+ @pytest.mark.parametrize('journal', ['DELETE', 'WAL'])
+-def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path, journal):
++def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path, journal, monkeypatch):
+     import sqlite3
+     path = tmp_path / 'board.db'
+     writer = sqlite3.connect(path)
+@@ -94,12 +94,18 @@ def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path,
+     writer.execute('CREATE TABLE kanban_sync_outbox (state TEXT)')
+     writer.commit()
+     watch = client._BoardWatch()
++    from hermes_cli import kanban_sync_board_watch as watcher
++    traced = []
++    connect = watcher._kanban_lockguard.connect
++    def traced_connect(*args, **kwargs):
++        conn = connect(*args, **kwargs)
++        conn.set_trace_callback(traced.append)
++        return conn
++    monkeypatch.setattr(watcher._kanban_lockguard, 'connect', traced_connect)
+     sql = "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1"
+     try:
+         assert watch.query(path, sql, unchanged_ok=True)[1] is None
+-        conn = next(iter(watch._conns.values()))[1]
+-        traced = []
+-        conn.set_trace_callback(traced.append)
++        traced.clear()  # include replacement handles when DELETE commits move the main file
+         assert watch.query(path, sql, unchanged_ok=True)[1] is None
+         assert traced == ['PRAGMA data_version']
+         writer.execute("INSERT INTO kanban_sync_outbox VALUES ('pending')")
+@@ -111,6 +117,32 @@ def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path,
+         writer.close()
+ 
+ 
++def test_checkpoint_reopens_watcher_generation(tmp_path):
++    import sqlite3
++    path = tmp_path / 'checkpoint.db'
++    writer = sqlite3.connect(path)
++    writer.execute('PRAGMA journal_mode=WAL')
++    writer.execute('PRAGMA wal_autocheckpoint=0')
++    writer.execute('CREATE TABLE probe (value INTEGER)')
++    writer.execute('INSERT INTO probe VALUES (1)')
++    writer.commit()
++    watch = client._BoardWatch()
++    try:
++        first = watch.query(path, 'SELECT value FROM probe', unchanged_ok=True)
++        writer.execute('UPDATE probe SET value=2')
++        writer.commit()
++        changed = watch.query(path, 'SELECT value FROM probe', unchanged_ok=True)
++        assert changed == (first[0], (2,))  # a WAL commit keeps the reader generation
++        result = writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
++        assert result[0] == 0
++        checkpointed = watch.query(path, 'SELECT value FROM probe', unchanged_ok=True)
++        assert checkpointed[1] == (2,)
++        assert checkpointed[0] != first[0]  # a main-image change cannot certify old history
++    finally:
++        watch.reset()
++        writer.close()
++
++
+ def test_outbox_cache_reopens_replaced_file_and_retries_query_errors(tmp_path):
+     import sqlite3
+     path = tmp_path / 'board.db'
+diff --git a/tests/hermes_cli/test_loop_accounting_sync_round.py b/tests/hermes_cli/test_loop_accounting_sync_round.py
+index 170b90fc04..99d82dd957 100644
+--- a/tests/hermes_cli/test_loop_accounting_sync_round.py
++++ b/tests/hermes_cli/test_loop_accounting_sync_round.py
+@@ -79,6 +79,24 @@ def test_running_executor_publishes_round_residual_once(monkeypatch, board_kind)
+     assert rows['executor_item/' + name]['cpu_s'] < 0.015
+ 
+ 
++def test_step_cpu_is_residual_not_double_counted():
++    def operation():
++        burn(0.02)
++        with la.Scope('sync.board/nested'):
++            burn(0.02)
++        return 42
++    with cpu.iterations(lambda: True) as rounds:
++        next(rounds)
++        assert cpu.step(operation) == 42
++    rows = la.counters()
++    step = rows['sync.step/' + la._callable_name(operation)]
++    assert 0.018 <= step['cpu_s'] < 0.035
++    assert 0.018 <= rows['sync.board/nested']['cpu_s'] < 0.035
++    assert rows['sync.round/loop']['cpu_s'] < 0.015
++    assert la.snapshot()['process']['accounted_cpu_s'] == pytest.approx(
++        step['cpu_s'] + rows['sync.board/nested']['cpu_s'] + rows['sync.round/loop']['cpu_s'], abs=0.005)
++
++
+ def test_success_in_ambient_except_does_not_book_error():
+     def job():
+         return 42
+-- 
+2.43.0
+

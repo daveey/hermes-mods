@@ -1,0 +1,348 @@
+From 51a35cd05c6ea25875451011018b28f7dbe4548c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:15:58 +0000
+Subject: [PATCH] fix(kanban): add non-releasing canonical classification CAS
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          |   5 +
+ hermes_cli/kanban_human_request_migration.py  |  52 +++++
+ hermes_cli/kanban_parser.py                   |   2 +
+ .../test_kanban_classification_cas.py         | 182 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  42 ++++
+ 5 files changed, 283 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_classification_cas.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 71370cfd12..0b75455e62 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1398,6 +1398,11 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_block(args: argparse.Namespace) -> int:
++    if getattr(args, "classification_cas", None) is not None:
++        if not getattr(args, "metadata_only", False):
++            return _err("classification CAS requires --metadata-only", 2)
++        from hermes_cli.kanban_human_request_migration import reclassify_cli_request
++        return reclassify_cli_request(args, _joined_words(args.reason))
+     from hermes_cli.kanban_cli_actor import cli_actor
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
+diff --git a/hermes_cli/kanban_human_request_migration.py b/hermes_cli/kanban_human_request_migration.py
+index 683beb0f46..b5caf81259 100644
+--- a/hermes_cli/kanban_human_request_migration.py
++++ b/hermes_cli/kanban_human_request_migration.py
+@@ -58,3 +58,55 @@ def classify_cli_request(args, request, reason):
+                                                actor=cli_actor(), reason=reason),
+             lambda tid: f"Classified {tid} (metadata only; remains parked)",
+             lambda tid: f"cannot classify {tid} (requires parked card without a current run)")
++
++
++def reclassify_cli_request(args, reason):
++    """Authenticated home-gateway CAS, not a worker or synthetic human answer.
++
++    The supported hub-admin operator transport records the initiating card. The
++    enrolled home gateway key authenticates canonical ingress; actor strings and
++    null request metadata are not credentials. Never perform a local rekind.
++    """
++    if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK"):
++        raise PermissionError("classification CAS requires the owner operator surface")
++    op = args.classification_cas
++    if (not args.metadata_only or args.kind != "dependency" or getattr(args, "human_request", object()) is not None
++            or args.ids or args.wake_check or args.check_every is not None or args.clock_only
++            or any(getattr(args, name, None) for name in ("needs", "awaiting", "awaiting_why"))
++            or not isinstance(op, dict) or op.get("op") != "reclassify_parked"
++            or op.get("task") != args.task_id or op.get("reason") != reason):
++        raise ValueError("classification CAS requires one exact task, dependency kind, null request and matching reason")
++    from hermes_cli import kanban as cli
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_pending import pending_task_fields
++
++    ident = client.load_identity()
++    hub = client.Hub(ident)
++    with cli.kbc.connect_closing() as conn:
++        state = sync.sync_state(conn) or {}
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (args.task_id,)).fetchone()
++        if (state.get("mode") != "primary" or state.get("gateway_id") != ident.gateway
++                or row is None or row["created_on"] != ident.gateway):
++            raise PermissionError("classification CAS requires the authenticated primary owner")
++        if (row["current_run_id"] is not None or row["claim_lock"] is not None or row["worker_pid"] is not None
++                or args.task_id in pending_task_fields(conn)):
++            raise ValueError("classification CAS refuses active or locally pending task state")
++        board = state["board_id"]
++        result = hub.ops(board, [op])
++        outcomes = result.get("results")
++        if not isinstance(outcomes, list) or len(outcomes) != 1 or outcomes[0].get("status") != "applied":
++            raise ValueError(f"classification CAS not applied: {outcomes!r}; preserve the exact request for recovery")
++        # Use the ordinary certified feed, not a handwritten local correction.
++        client.pull(conn, hub, board, observers=True, partition=ident.gateway)
++        canonical = hub.row_evidence(board, "tasks", args.task_id).get("row")
++        current = conn.execute("SELECT status,block_kind,human_request,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?",
++                               (args.task_id,)).fetchone()
++        expected = {"status": "blocked", "block_kind": "dependency", "human_request": None}
++        if (not isinstance(canonical, dict) or any(canonical.get(k) != v for k, v in expected.items())
++                or canonical.get("current_run_uid") is not None or canonical.get("lease_holder") is not None
++                or current is None or any(current[k] != v for k, v in expected.items())
++                or any(current[k] is not None for k in ("current_run_id", "claim_lock", "worker_pid"))):
++            raise ValueError("classification receipt recorded but current owner/canonical convergence is unconfirmed; do not resubmit with a new identity")
++    print(f"Classified {args.task_id} as dependency (canonical CAS; remains blocked; no execution release)")
++    return 0
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 80565aec7a..272c81d87a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -577,6 +577,8 @@ _SPECS = [
+         _HUMAN_REQUEST,
+         _arg("--metadata-only", action="store_true",
+              help="Audit parked legacy classification only; requires reason and --human-request (null clears); never unblocks"),
++        _arg("--classification-cas", type=json.loads, metavar="JSON",
++             help="Explicit canonical reclassify_parked operation; requires metadata-only, kind dependency and null request"),
+         _TASK_ID,
+         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+         _bulk_ids("block"),
+diff --git a/tests/hermes_cli/test_kanban_classification_cas.py b/tests/hermes_cli/test_kanban_classification_cas.py
+new file mode 100644
+index 0000000000..4a4072592a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_classification_cas.py
+@@ -0,0 +1,182 @@
++"""The existing metadata-only CLI must use canonical CAS, never a local rekind."""
++import argparse
++import json
++from contextlib import contextmanager
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban, kanban_db as db
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli.kanban_parser import build_parser
++
++
++def args(tid, cas):
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return parser.parse_args(["kanban", "block", tid, "Keep parked", "--metadata-only",
++                              "--human-request", "null", "--kind", "dependency",
++                              "--classification-cas", json.dumps(cas)])
++
++
++def request(tid):
++    return dict(client_op_id="correction-1", op="reclassify_parked", task=tid, expected_revision=1,
++                expected_event_uid="withdrawn-ask", expected_spend_episode="unchanged-stop",
++                expected_parents=["parent"], expected_parent_links=[dict(uid="parent>task", version=1)],
++                disposition_comment_uid="owner-disposition", reason="Keep parked")
++
++
++def parked():
++    with connect_closing() as conn:
++        return db.create_task(conn, title="Unfinished acceptance", assignee="default",
++                              initial_status="blocked", lint_blocked=False)
++
++
++def test_metadata_only_cas_flag_routes_exact_request(monkeypatch):
++    from hermes_cli import kanban_human_request_migration as migration
++    tid = parked()
++    op = request(tid)
++    calls = []
++    monkeypatch.setattr(kanban, "_cli_route_needs", lambda *_a, **_kw: pytest.fail("metadata CAS entered capability/lifecycle routing"))
++    monkeypatch.setattr(migration, "reclassify_cli_request", lambda parsed, reason: calls.append((parsed.classification_cas, reason)) or 0,
++                        raising=False)
++    assert kanban.kanban_command(args(tid, op)) == 0
++    assert calls == [(op, "Keep parked")]
++
++
++def test_cas_without_metadata_only_cannot_fall_through_to_block(capsys):
++    tid = parked()
++    parsed = args(tid, request(tid))
++    parsed.metadata_only = False
++    with connect_closing() as conn:
++        before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert kanban.kanban_command(parsed) != 0
++    captured = capsys.readouterr()
++    assert "classification CAS requires --metadata-only" in captured.err + captured.out
++    with connect_closing() as conn:
++        assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++
++
++@pytest.mark.parametrize("marker", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_worker_cannot_initiate_classification_cas(monkeypatch, marker):
++    from hermes_cli import kanban_human_request_migration as migration
++    tid = parked()
++    before = None
++    with connect_closing() as conn:
++        before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    parsed = args(tid, request(tid))
++    monkeypatch.setenv(marker, "some-worker")
++    with pytest.raises(PermissionError, match="operator"):
++        migration.reclassify_cli_request(parsed, "Keep parked")
++    with connect_closing() as conn:
++        assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++
++
++@pytest.fixture
++def adapter(tmp_path, monkeypatch):
++    """Real isolated owner SQLite/feed adapter; only the external Hub transport is fake.
++
++    Applied-result shape is the canonical /ops result exercised in the Board HTTP
++    regression. This is client glue coverage, not a claim to exercise Board CAS.
++    """
++    from hermes_cli import kanban_db_sync as sync, kanban_sync_client as client
++    from tests.hermes_cli import kanban_sync_support as support
++    root = tmp_path / "owner"
++    root.mkdir()
++    home = support.kanban_home(root, monkeypatch)
++    for conn in support.synced_conn(home):
++        sync.set_mode(conn, "primary")
++        sync.set_identity(conn, "fixture", "owner")
++        tid = db.create_task(conn, title="Unfinished acceptance", assignee="default",
++                             initial_status="blocked", lint_blocked=False)
++        with db.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on='owner',block_kind='needs_input' WHERE id=?", (tid,))
++            conn.execute("DELETE FROM kanban_sync_outbox")
++        calls = []
++        canonical = dict(status="blocked", block_kind="dependency", human_request=None,
++                         current_run_uid=None, lease_holder=None)
++        result = {"results": [{"client_op_id": "correction-1", "status": "applied"}]}
++
++        class Hub:
++            def ops(self, board, ops):
++                calls.append((board, ops))
++                return result
++
++            def row_evidence(self, board, table, uid):
++                assert (board, table, uid) == ("fixture", "tasks", tid)
++                return {"row": canonical}
++
++        @contextmanager
++        def connect():
++            yield conn
++
++        def pull(target, hub, board, **kw):
++            assert target is conn and board == "fixture" and kw == {"observers": True, "partition": "owner"}
++            sync.apply_remote_changes(conn, [sync.RemoteChange(
++                2, "tasks", tid, "upsert", {"block_kind": "dependency"}, 2, "", "owner")], new_cursor=2)
++
++        monkeypatch.setattr(kanban.kbc, "connect_closing", connect)
++        monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="owner"))
++        monkeypatch.setattr(client, "Hub", lambda _ident: Hub())
++        monkeypatch.setattr(client, "pull", pull)
++        yield SimpleNamespace(conn=conn, tid=tid, calls=calls, canonical=canonical, result=result)
++
++
++def test_owner_adapter_uses_exact_op_and_certified_remote_apply(adapter):
++    from hermes_cli import kanban_human_request_migration as migration
++    parsed = args(adapter.tid, request(adapter.tid))
++    before = dict(adapter.conn.execute("SELECT * FROM tasks WHERE id=?", (adapter.tid,)).fetchone())
++    assert migration.reclassify_cli_request(parsed, "Keep parked") == 0
++    assert adapter.calls == [("fixture", [request(adapter.tid)])]
++    after = dict(adapter.conn.execute("SELECT * FROM tasks WHERE id=?", (adapter.tid,)).fetchone())
++    assert after["status"] == "blocked" and after["block_kind"] == "dependency"
++    assert all(after[k] == before[k] for k in before if k not in {"block_kind", "sync_version", "sync_hlc"})
++
++
++@pytest.mark.parametrize("fault", ["replica", "foreign", "run", "claim", "worker", "pending"])
++def test_owner_adapter_refuses_before_network_or_mutation(adapter, fault):
++    from hermes_cli import kanban_human_request_migration as migration, kanban_db_sync as sync
++    conn = adapter.conn
++    if fault == "replica":
++        sync.set_mode(conn, "shadow")
++    else:
++        columns = {"foreign": ("created_on", "other"), "run": ("current_run_id", 99),
++                   "claim": ("claim_lock", "active"), "worker": ("worker_pid", 99), "pending": ("title", "pending change")}
++        column, value = columns[fault]
++        with db.write_txn(conn):
++            conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, adapter.tid))
++            if fault != "pending":
++                conn.execute("DELETE FROM kanban_sync_outbox")
++    before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (adapter.tid,)).fetchone())
++    with pytest.raises((PermissionError, ValueError), match="primary owner|active or locally pending"):
++        migration.reclassify_cli_request(args(adapter.tid, request(adapter.tid)), "Keep parked")
++    assert adapter.calls == []
++    assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (adapter.tid,)).fetchone()) == before
++
++
++@pytest.mark.parametrize("field,value", [("needs", ["test:capability"]), ("awaiting", "clock"),
++    ("human_request", {"action": "new ask"}), ("wake_check", "true"), ("kind", "time"), ("ids", ["other"])])
++def test_cas_rejects_mixed_lifecycle_arguments_before_submission(adapter, field, value):
++    from hermes_cli import kanban_human_request_migration as migration
++    parsed = args(adapter.tid, request(adapter.tid))
++    setattr(parsed, field, value)
++    with pytest.raises(ValueError, match="one exact task"):
++        migration.reclassify_cli_request(parsed, "Keep parked")
++    assert adapter.calls == []
++
++
++def test_canonical_rejection_never_performs_local_reclassification(adapter):
++    from hermes_cli import kanban_human_request_migration as migration
++    adapter.result["results"] = [{"status": "rejected", "reason": "revision_conflict"}]
++    with pytest.raises(ValueError, match="preserve the exact request"):
++        migration.reclassify_cli_request(args(adapter.tid, request(adapter.tid)), "Keep parked")
++    assert adapter.conn.execute("SELECT block_kind FROM tasks WHERE id=?", (adapter.tid,)).fetchone()[0] == "needs_input"
++
++
++def test_replay_with_successor_ask_reports_unconfirmed_without_retry(adapter):
++    from hermes_cli import kanban_human_request_migration as migration
++    adapter.canonical["human_request"] = '{"action":"new ask"}'
++    with pytest.raises(ValueError, match="do not resubmit with a new identity"):
++        migration.reclassify_cli_request(args(adapter.tid, request(adapter.tid)), "Keep parked")
++    assert len(adapter.calls) == 1
++
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 9d5469cbac..70b6e2810c 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -519,6 +519,48 @@ Relaying execution to another gateway does not change the logical probe. The
+ store identity is local: cloning a live database for concurrent operation is not
+ a supported way to enroll another gateway.
+ 
++### Non-releasing correction of withdrawn legacy asks
++
++Ordinary `block --metadata-only --human-request null` withdraws ask payload/probe
++metadata but deliberately retains the existing block kind. It is not an execution
++release, so a legacy `blocked/needs_input` card can still have no live human ask.
++Null request metadata alone never authorizes a replacement classification.
++
++On a synced PRIMARY owner, an explicitly authorized operator can request the
++narrow canonical correction through the existing classification surface:
++
++```text
++hermes kanban --board <board> block <task> '<reason>' --metadata-only \
++  --human-request null --kind dependency --classification-cas '<operation JSON>'
++```
++
++The operation is `reclassify_parked`, with an explicit retained `client_op_id`,
++`task`, `reason` matching the CLI reason, `expected_revision`,
++`expected_event_uid` (the latest withdrawn metadata-only ask classification),
++`expected_spend_episode` (the current pending stop UID or null), sorted
++`expected_parents`, `expected_parent_links` (matching ordered `{uid,version}`
++link snapshots), and `disposition_comment_uid` (the home-authored disposition
++already recorded on this exact task). The enrolled home gateway authenticates
++canonical ingress; free-form actor labels are not credentials. Worker entry is
++refused; use the authorized, audited owner operator transport, never stripped
++worker identity or direct SQLite edits.
++
++The canonical transaction rejects stale revisions/events, a live/new ask,
++active run/lease, changed parent identities/link revisions, a changed spend
++stop or missing disposition. It changes only `block_kind` and synchronization
++metadata and appends `block_classification_corrected`; status remains **blocked**.
++Body, acceptance, dependencies, execution selectors, counters and spending or
++containment evidence are not renewed. Parent completion cannot release this
++blocked card. There is no unblock, promotion, synthetic human answer or budget
++reset. An independent release decision is still necessary for execution.
++
++The CLI confirms through the ordinary partitioned owner feed and canonical row
++readback. If delivery/readback is unknown, retain and recover the **same exact
++request**; never mint a new operation identity to retry. The Board's private
++receipt makes identical replay inert even after the ordinary op cache expires.
++Deploy the matching Board operation before using the client entry. Neither a
++local unit test nor an HTTP ACK alone proves installed owner/renderer convergence.
++
+ Human asks that resolve outside Hermes: a blocked card's `human_request` may
+ carry `resolved_check` (a shell command) and `resolved_check_every` (seconds,
+ default 900, 120–21600). Use it when David's step leaves a readable trace, so
+-- 
+2.43.0
+

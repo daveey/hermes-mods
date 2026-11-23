@@ -1,0 +1,377 @@
+From 3800ea1820ebcbaa007d7359e09364b4a45d9008 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:12:14 +0000
+Subject: [PATCH] fix(kanban): contain capability faults and preserve refusal
+ contracts [daveey]
+
+---
+ hermes_cli/kanban_class_walls.py              |  9 ++-
+ hermes_cli/kanban_model_neutral.py            | 19 +++--
+ hermes_cli/kanban_model_tier.py               |  3 +-
+ hermes_cli/kanban_review_model.py             |  7 +-
+ tests/hermes_cli/test_kanban_class_routing.py |  6 +-
+ .../hermes_cli/test_kanban_config_review56.py | 73 +++++++++++++++++++
+ .../test_kanban_dispatch_review56.py          | 24 ++++++
+ .../test_kanban_ingress_review56.py           | 58 +++++++++++++++
+ tests/hermes_cli/test_kanban_no_model_pins.py | 14 ++--
+ .../test_kanban_review_handoff_validation.py  |  4 +-
+ tests/hermes_cli/test_kanban_review_model.py  |  4 +-
+ .../test_kanban_review_model_retirement.py    |  5 +-
+ 12 files changed, 201 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_config_review56.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_review56.py
+ create mode 100644 tests/hermes_cli/test_kanban_ingress_review56.py
+
+diff --git a/hermes_cli/kanban_class_walls.py b/hermes_cli/kanban_class_walls.py
+index 74f7bd3162..472bd8294e 100644
+--- a/hermes_cli/kanban_class_walls.py
++++ b/hermes_cli/kanban_class_walls.py
+@@ -41,7 +41,14 @@ def _unroutable_class(conn, task_id, *, lane):
+         # A disabled host policy is never permission to use the profile model.
+         policy = config.get('model_routing') or {}
+         validate_policy(policy)
+-        return None if policy.get('enabled') else 'routing_disabled'
++        if not policy.get('enabled'):
++            return 'routing_disabled'
++        # Exercise the exact construction capability filter inside the per-card
++        # boundary; the review owner still judges candidates, walls and fallback.
++        for level in ('deep', 'standard'):
++            eligible_routes(policy, level, class_requirements(config),
++                            eligible=lambda r: is_provider_enabled(providers.get(r['provider'], {})))
++        return None
+     model, _, _ = resolve_model_tier(conn, routing_view(task), lane=lane)
+     if not is_class_selector(model):
+         return None
+diff --git a/hermes_cli/kanban_model_neutral.py b/hermes_cli/kanban_model_neutral.py
+index b0cbb696a0..a011189533 100644
+--- a/hermes_cli/kanban_model_neutral.py
++++ b/hermes_cli/kanban_model_neutral.py
+@@ -66,6 +66,8 @@ def _active_text(line):
+ 
+ def validate_selector(model=None, provider=None, *, mandatory=False):
+     """Validate newly supplied selectors without consulting quota or credentials."""
++    if any(value is not None and not isinstance(value, str) for value in (model, provider)):
++        raise ValueError(ERROR)
+     model = (model or '').strip() or None
+     provider = (provider or '').strip() or None
+     if mandatory or (model and not is_class_selector(model)) or (provider and provider != 'auto'):
+@@ -97,14 +99,15 @@ def validate_text(*values):
+                                 'Observed unavailable route', clause, flags=re.IGNORECASE)
+                 if not _MODEL.search(clause):
+                     continue
+-                # Negation applies to the directive, not any unrelated safety
+-                # sentence elsewhere on the same line.
+-                if re.search(r'\b(?:never|do not|must not)\s+(?:pin|require|restrict)', clause, re.IGNORECASE):
+-                    continue
+-                if re.search(r'\b(?:implementer models|forbidden overlaps|excluded models|exclude)\s*:', clause, re.IGNORECASE):
+-                    continue
+-                if re.search(r'\b(?:differ from|not be reviewed by|other than|distinct from|not (?:the )?same as)\b', clause, re.IGNORECASE):
+-                    continue
++                # Mask only negative/exclusion wording up to a new positive
++                # obligation, never the rest of a clause containing that mandate.
++                clause = re.sub(
++                    r'\b(?:(?:never|do not|must not)\s+(?:pin|require|restrict)'
++                    r'|(?:implementer models|forbidden overlaps|excluded models|exclude)\s*:'
++                    r'|differ from|not be reviewed by|other than|distinct from|not (?:the )?same as)'
++                    r'.*?(?=\b(?:must(?!\s+not)|requires?|required|mandatory|'
++                    r'no fallback for|(?:use|select|choose|pin|restrict)\s+(?:only\s+)?)\b|$)',
++                    ' ', clause, flags=re.IGNORECASE)
+                 if re.fullmatch(
+                     r'\s*(?:the )?(?:old|legacy|previous|historical) '
+                     r'(?:configuration|policy|instruction|card|review|run|session) '
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 50196310a8..6aeef82b69 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -185,7 +185,8 @@ def class_unroutable_reason(model: str, config: Optional[dict[str, Any]] = None)
+         block = providers.get(route["provider"], {}) if isinstance(providers, dict) else {}
+         return is_provider_enabled(block if isinstance(block, dict) else {})
+ 
+-    if not eligible_routes(policy, level, eligible=enabled):
++    from agent.model_routing_agent import class_requirements
++    if not eligible_routes(policy, level, class_requirements(config), eligible=enabled):
+         return "no_eligible_routes"
+     return None
+ 
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index b0f956cdc6..92e1fae83e 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -264,7 +264,12 @@ def _override(conn, task):
+ def validate_review_override(metadata):
+     """Validate new review routing requirements before ending the author run."""
+     from hermes_cli.kanban_model_neutral import validate_review
+-    return validate_review(metadata)
++    if not isinstance(metadata, dict):
++        raise ReviewModelUnavailable('Review handoff metadata must be a mapping')
++    try:
++        return validate_review(metadata)
++    except ValueError as exc:
++        raise ReviewModelUnavailable(str(exc)) from exc
+ 
+ 
+ def registry_refusal(model, provider, assignee):
+diff --git a/tests/hermes_cli/test_kanban_class_routing.py b/tests/hermes_cli/test_kanban_class_routing.py
+index 06b7d9bbf2..66060d6d40 100644
+--- a/tests/hermes_cli/test_kanban_class_routing.py
++++ b/tests/hermes_cli/test_kanban_class_routing.py
+@@ -118,9 +118,9 @@ def test_legacy_concrete_lane_pin_is_ignored_for_class_default(board, monkeypatc
+         task = kb.get_task(conn, tid)
+         if lane == "review":
+             kb.claim_task(conn, task.id)
+-            with pytest.raises(ValueError):
+-                kb.request_review(conn, task.id, metadata={"review_model": "unknown-exact-model",
+-                                                           "review_provider": "custom"})
++            ok, reason = kb.request_review(conn, task.id, metadata={
++                "review_model": "unknown-exact-model", "review_provider": "custom"}, with_reason=True)
++            assert not ok and 'model-neutral' in reason
+             kb.request_review(conn, task.id, metadata={"review_model": "class:deep"})
+             task = kb.claim_review_task(conn, task.id)
+         tier.apply_model_tier(conn, task, lane=lane, cfg={"default_model": "class:standard"})
+diff --git a/tests/hermes_cli/test_kanban_config_review56.py b/tests/hermes_cli/test_kanban_config_review56.py
+new file mode 100644
+index 0000000000..e4015d01c3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_config_review56.py
+@@ -0,0 +1,73 @@
++"""Malformed construction capabilities refuse only their own card before claim."""
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_dispatch import dispatch_once
++from tests.hermes_cli import test_kanban_managed_pin_policy as support
++
++board = support.board
++
++
++@pytest.mark.parametrize('context', ['invalid', '1048576'])
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_context_type_failure_preclaim(board, lane, context):
++    conn, _ = board
++    home = Path(os.environ['HERMES_HOME'])
++    profile = home / 'profiles' / 'broken'
++    profile.mkdir(parents=True)
++    source = home / 'profiles' / 'worker' / 'config.yaml'
++    profile.joinpath('config.yaml').write_text(source.read_text().replace(
++        '  default:', f'  context_length: {context}\n  default:'))
++    bad = kb.create_task(conn, title='Bad context type', assignee='broken', priority=100)
++    peer = kb.create_task(conn, title='Healthy peer', assignee='worker', priority=1)
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (lane, bad))
++    spawned = []
++    dispatch_once(conn, spawn_fn=lambda task, *a: spawned.append(task.id))
++    assert peer in spawned
++    assert bad not in spawned
++    assert kb.list_runs(conn, bad) == []
++    assert kb.get_task(conn, bad).claim_lock is None
++    expected = 'triage' if lane == 'review' and context == '1048576' else lane
++    assert kb.get_task(conn, bad).status == expected
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_malformed_context_pickup_zero_imports_and_recovery(gws, imports, lane):
++    from hermes_cli import kanban_worker_node as wn
++    from tests.hermes_cli import test_kanban_worker_node as gateway
++    from tests.hermes_cli import test_kanban_unroutable_pickup_review46 as eligibility
++    hub, worker = eligibility._setup(gws, support._managed_yaml())
++    bad = gateway._hub_card(hub, title='Malformed profile', priority=100, runs_on=eligibility.PIN)
++    hub.enter()
++    with kb.write_txn(hub.conn):
++        hub.conn.execute('UPDATE tasks SET assignee=?, status=? WHERE id=?', ('broken', lane, bad))
++    hub.round()
++    peer = gateway._hub_card(hub, title='Healthy pickup', priority=1, runs_on=eligibility.PIN)
++    broken = worker.home / 'profiles' / 'broken'
++    broken.mkdir(parents=True)
++    broken.joinpath('config.yaml').write_text('model:\n  context_length: invalid\n' + support._managed_yaml())
++    worker.round()
++    worker.enter()
++    for _ in range(4):
++        worker.tick(max_spawn=2)
++        worker.round()
++    assert imports.count(bad) == 0
++    assert imports.count(peer) == 1
++    assert len(kb.list_runs(worker.conn, peer)) == 1
++    assert kb.list_runs(worker.conn, bad) == []
++    assert kb.get_task(hub.conn, bad).status == lane
++    broken.joinpath('config.yaml').write_text(support._managed_yaml())
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=2) == [bad]
++    assert imports.count(bad) == 1
++
++
++from tests.hermes_cli import test_kanban_unroutable_pickup_review46 as pickup_support
++
++svc = pickup_support.svc
++gws = pickup_support.gws
++imports = pickup_support.imports
+diff --git a/tests/hermes_cli/test_kanban_dispatch_review56.py b/tests/hermes_cli/test_kanban_dispatch_review56.py
+new file mode 100644
+index 0000000000..2037495efb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_review56.py
+@@ -0,0 +1,24 @@
++from pathlib import Path
++import os
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_dispatch import dispatch_once
++from tests.hermes_cli import test_kanban_managed_pin_policy as support
++
++board = support.board
++
++@pytest.mark.parametrize('invalid_context', [False, True])
++def test_one_profile_cannot_abort_healthy_sibling(board, invalid_context):
++    conn, _ = board
++    home = Path(os.environ['HERMES_HOME'])
++    profile = home / 'profiles' / 'broken'
++    profile.mkdir(parents=True)
++    config = (home / 'profiles' / 'worker' / 'config.yaml').read_text()
++    if invalid_context:
++        config = config.replace('  default:', '  context_length: invalid\n  default:')
++    (profile / 'config.yaml').write_text(config)
++    kb.create_task(conn, title='First profile card', assignee='broken', priority=100)
++    peer = kb.create_task(conn, title='Healthy peer', assignee='worker', priority=1)
++    spawned = []
++    dispatch_once(conn, spawn_fn=lambda task, *a: spawned.append(task.id))
++    assert peer in spawned
+diff --git a/tests/hermes_cli/test_kanban_ingress_review56.py b/tests/hermes_cli/test_kanban_ingress_review56.py
+new file mode 100644
+index 0000000000..ccb78056e4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ingress_review56.py
+@@ -0,0 +1,58 @@
++"""Structured review refusals and phrase-scoped text policy."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_managed_pin_policy as support
++
++board = support.board
++
++
++@pytest.mark.parametrize('metadata', [
++    {'review_model': 'class:deep', 'review_provider': 'anthropic'},
++    {'review_model': ['class:deep']},
++    {'review_model': {}},
++    {'review_model': False},
++    {'review_model': 'class:deep', 'review_provider': []},
++])
++def test_review_refusal_is_structured(board, metadata):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Review contract', assignee='worker')
++    kb.claim_task(conn, tid)
++    before = kb.get_task(conn, tid)
++    events = kb.list_events(conn, tid)
++    ok, reason = kb.request_review(conn, tid, metadata=metadata, with_reason=True)
++    assert not ok and 'model-neutral' in reason
++    after = kb.get_task(conn, tid)
++    assert (before.status, before.current_run_id, before.claim_lock) == (
++        after.status, after.current_run_id, after.claim_lock)
++    assert kb.list_events(conn, tid) == events
++    assert conn.execute('SELECT outcome FROM task_runs WHERE id=?',
++                        (before.current_run_id,)).fetchone()[0] is None
++
++
++@pytest.mark.parametrize('body', [
++    'Must use opus',
++    'Do not pin providers, but must use opus',
++    'Exclude: sonnet, but must use opus',
++    'Never require sonnet but must use opus',
++    'Reviewer must differ from sonnet but must use opus',
++    'Excluded models: sonnet; must use opus',
++    'Must not pin sonnet and mandatory opus',
++])
++def test_active_obligation_refused(board, body):
++    conn, _ = board
++    before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++    with pytest.raises(ValueError, match='model-neutral'):
++        kb.create_task(conn, title='Review implementation', body=body, assignee='worker')
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
++
++
++@pytest.mark.parametrize('body', [
++    'Do not pin providers', 'Exclude: sonnet', 'Never require opus',
++    'Reviewer must differ from sonnet', 'Must not pin opus only',
++    'Historical run instruction (superseded and not active): "Must use opus"',
++])
++def test_negative_and_historical_controls_create_unchanged(board, body):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Review implementation', body=body, assignee='worker')
++    assert kb.get_task(conn, tid).body == body
+diff --git a/tests/hermes_cli/test_kanban_no_model_pins.py b/tests/hermes_cli/test_kanban_no_model_pins.py
+index 045ed5df47..bc0dffd03e 100644
+--- a/tests/hermes_cli/test_kanban_no_model_pins.py
++++ b/tests/hermes_cli/test_kanban_no_model_pins.py
+@@ -31,11 +31,15 @@ def test_mutations_refuse_atomically(board, entry):
+         if entry=='review': kb.claim_task(conn,tid)
+         before=tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
+         events=conn.execute('SELECT count(*) FROM task_events').fetchone()[0]
+-        with pytest.raises(ValueError,match='model-neutral'):
+-            if entry=='set-model': kb.set_model_override(conn,tid,'gpt-6.1-sol',provider='openai-codex')
+-            elif entry=='mandatory': pins.set_pin_mandatory(conn,tid,True)
+-            elif entry=='edit': kb.edit_task(conn,tid,body='require_model: true',priority=1)
+-            else: kb.request_review(conn,tid,summary='review',metadata={'review_model':'gpt-6.1-sol','review_provider':'openai-codex'})
++        if entry == 'review':
++            ok, reason = kb.request_review(conn,tid,summary='review',metadata={
++                'review_model':'gpt-6.1-sol','review_provider':'openai-codex'}, with_reason=True)
++            assert not ok and 'model-neutral' in reason
++        else:
++            with pytest.raises(ValueError,match='model-neutral'):
++                if entry=='set-model': kb.set_model_override(conn,tid,'gpt-6.1-sol',provider='openai-codex')
++                elif entry=='mandatory': pins.set_pin_mandatory(conn,tid,True)
++                elif entry=='edit': kb.edit_task(conn,tid,body='require_model: true',priority=1)
+         assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())==before
+         assert conn.execute('SELECT count(*) FROM task_events').fetchone()[0]==events
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_handoff_validation.py b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+index 618155d159..4f74c36a88 100644
+--- a/tests/hermes_cli/test_kanban_review_handoff_validation.py
++++ b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+@@ -53,8 +53,8 @@ def test_invalid_handoff_refused_without_transition(board, metadata):
+         kb.claim_task(conn, task.id)
+         before = kb.get_task(conn, task.id)
+         events = kb.list_events(conn, task.id)
+-        with pytest.raises((ValueError, AttributeError)):
+-            kb.request_review(conn, task.id, metadata=metadata, with_reason=True)
++        ok, reason = kb.request_review(conn, task.id, metadata=metadata, with_reason=True)
++        assert not ok and 'model-neutral' in reason
+         after = kb.get_task(conn, task.id)
+         assert (after.status, after.current_run_id, after.claim_lock) == (
+             before.status, before.current_run_id, before.claim_lock)
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index 786b5c523a..5fdf600a09 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -218,8 +218,8 @@ def test_concrete_or_mandatory_override_is_rejected_before_handoff(board, metada
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        with pytest.raises(ValueError, match="model-neutral"):
+-            kb.request_review(conn, t.id, metadata=metadata)
++        ok, reason = kb.request_review(conn, t.id, metadata=metadata, with_reason=True)
++        assert not ok and 'model-neutral' in reason
+         assert kb.get_task(conn, t.id).status == "running"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_model_retirement.py b/tests/hermes_cli/test_kanban_review_model_retirement.py
+index e157dea1c0..1bf2189586 100644
+--- a/tests/hermes_cli/test_kanban_review_model_retirement.py
++++ b/tests/hermes_cli/test_kanban_review_model_retirement.py
+@@ -31,8 +31,9 @@ def test_class_handoff_allows_same_model_but_concrete_override_is_rejected(board
+     with kbc.connect() as conn:
+         task = helpers.task(conn, helpers.OPUS)
+         kb.claim_task(conn, task.id)
+-        with pytest.raises(ValueError, match='model-neutral'):
+-            kb.request_review(conn, task.id, metadata={'review_model': helpers.OPUS, 'review_provider': 'anthropic'})
++        ok, reason = kb.request_review(conn, task.id, metadata={
++            'review_model': helpers.OPUS, 'review_provider': 'anthropic'}, with_reason=True)
++        assert not ok and 'model-neutral' in reason
+         assert kb.get_task(conn, task.id).status == 'running'
+         kb.request_review(conn, task.id, metadata={'review_model': 'class:deep', 'review_provider': 'auto'})
+         assert review.resolve_review_model(conn, kb.get_task(conn, task.id), cfg) == (
+-- 
+2.43.0
+

@@ -1,0 +1,134 @@
+From b73d0a3add799e8be2c7d19d77e61cae694eb0f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:21:33 +0000
+Subject: [PATCH] fix(outcome): isolate card reads from sidebar borrowers
+ [daveey]
+
+Why: bounded shared-reader admission exposed ordinary sidebar enrichment contention as card_read_failed. Outcome evidence used the same retained connection, and the Python borrow failure lacked SQLITE_BUSY so existing retry/last-good handling did not recognize it.
+
+Own the short lean read transaction through the existing generation-safe opener and close it deterministically. Keep the 500ms SQLite/lifecycle budget and shared per-request retry deadline. Classify remaining cached-borrow exhaustion as typed busy; no timeout increases or stale-as-confirmed outcome changes.
+
+Proof: held real sidebar borrower through hermes_state_outcome._live_work fails for running and human-blocked cards on parent, passes after independent read. Zero-budget borrow error classifier fails on parent and passes as typed busy. Focused outcome/parity/contention suites and full scripts/check pass. Broad consumers retained separately.
+---
+ hermes_cli/kanban_reader_lifecycle.py         |  4 +--
+ hermes_cli/kanban_session_outcome_tasks.py    |  8 ++++--
+ .../test_kanban_content_key_busy_budget.py    | 13 +++++++++
+ .../test_kanban_session_outcome_tasks.py      | 28 +++++++++++++++++++
+ 4 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index e985edc054..cb1f716a26 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -4,7 +4,7 @@ import os
+ import sqlite3
+ import threading
+ 
+-from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access, retry_open
++from hermes_cli.kanban_generation import BoardLifecycleBusy, DeletedWalGenerationError, lifecycle_access, retry_open
+ 
+ 
+ def try_borrow(lock, budget) -> bool:
+@@ -16,7 +16,7 @@ def try_borrow(lock, budget) -> bool:
+ def borrow_lock(lock, budget):
+     """Python coordination is part of the reader budget, not an unbounded prelude."""
+     if not try_borrow(lock, budget):
+-        raise sqlite3.OperationalError("database is locked: cached reader is borrowed")
++        raise BoardLifecycleBusy("database is locked: cached reader is borrowed")
+     try:
+         yield
+     finally:
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index c746ee69a4..2fdd257822 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -8,6 +8,7 @@ card details and ``add_cards``.
+ 
+ from __future__ import annotations
+ 
++from contextlib import closing
+ import logging
+ import sqlite3
+ from pathlib import Path
+@@ -77,10 +78,13 @@ def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], status
+ 
+ 
+ def _read_lean_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+-    from hermes_cli.kanban_session_activity import _board_slug, _execution_transaction, cached_ro
++    from hermes_cli.kanban_session_activity import _board_slug, _execution_transaction, _open_ro
+     from hermes_cli.kanban_session_wait_rows import _local_wait_info
+ 
+-    with cached_ro(path) as conn, _execution_transaction(conn):
++    # Outcome evidence must not queue behind sidebar enrichment on the shared
++    # reader. Own this short transaction and close through the generation guard;
++    # real SQLite/lifecycle contention still uses the existing bounded retry.
++    with closing(_open_ro(path, timeout=0.5)) as conn, _execution_transaction(conn):
+         conn.row_factory = sqlite3.Row
+         found = select_listed_local_tasks(conn, ids, statuses)
+         try:
+diff --git a/tests/hermes_cli/test_kanban_content_key_busy_budget.py b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+index c7877885a5..44cecdfa4d 100644
+--- a/tests/hermes_cli/test_kanban_content_key_busy_budget.py
++++ b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+@@ -125,6 +125,19 @@ def test_content_key_does_not_queue_behind_probe_lock(busy_board):
+     assert activity._board_content_key(board)  # retry after contention still works
+ 
+ 
++def test_cached_reader_borrow_exhaustion_is_retryable_busy(busy_board):
++    from hermes_cli.kanban_generation import is_busy
++
++    board, _ = busy_board
++    _key, entry = lifecycle.cached_entry(board)
++    with entry[2], pytest.raises(sqlite3.OperationalError) as raised:
++        with activity.cached_ro(board, busy_budget=0):
++            pytest.fail("borrowed reader was used concurrently")
++    assert is_busy(raised.value), "Python lock exhaustion bypasses busy retry/last-good fallback"
++    with activity.cached_ro(board) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM marker").fetchone()[0] == 0
++
++
+ def test_zero_budget_content_key_does_not_queue_behind_borrowed_reader(busy_board):
+     board, _ = busy_board
+     with activity.cached_ro(board):
+diff --git a/tests/hermes_cli/test_kanban_session_outcome_tasks.py b/tests/hermes_cli/test_kanban_session_outcome_tasks.py
+index ffc64ac64f..9b4465bcfe 100644
+--- a/tests/hermes_cli/test_kanban_session_outcome_tasks.py
++++ b/tests/hermes_cli/test_kanban_session_outcome_tasks.py
+@@ -79,6 +79,34 @@ def _items(ids):
+     return so._card_items(list(ids))
+ 
+ 
++@pytest.mark.parametrize("status", ["running", "blocked"])
++def test_outcome_reads_current_cards_while_sidebar_reader_is_borrowed(kanban_root, monkeypatch, status):
++    from hermes_cli.kanban_reader_lifecycle import cached_entry
++
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_live", status, "s1", block_kind="needs_input" if status == "blocked" else None,
++                 request=HUMAN_REQUEST if status == "blocked" else None)
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [path])
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    monkeypatch.setattr(so, "_provider_items", lambda sid: ([], []))
++    monkeypatch.setattr(so, "_process_items", lambda *a: [])
++    monkeypatch.setattr(so, "_subagent_items", lambda *a: [])
++    monkeypatch.setattr(so, "_goal_items", lambda *a: [])
++    _key, entry = cached_entry(path)
++    # Hold the real sidebar borrower through the entire outcome read. No timer
++    # releases it; successful decisions/waits must come from an independent reader.
++    with entry[2]:
++        decisions, waits, failed = so._live_work(None, "s1", ["s1"])
++    assert not failed, "ordinary shared-reader contention became card_read_failed"
++    if status == "blocked":
++        assert [d["card_id"] for d in decisions] == ["t_live"]
++    else:
++        assert [w["id"] for w in waits] == ["t_live"]
++
++
+ def test_outcome_reader_is_not_the_sidebar_session_tasks():
+     assert getattr(ksa, "session_outcome_tasks", ksa.session_tasks) is not ksa.session_tasks
+ 
+-- 
+2.43.0
+

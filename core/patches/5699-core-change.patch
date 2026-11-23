@@ -1,0 +1,356 @@
+From 806f43cbc08d88f53be284d51b577e2af64b22ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 07:17:06 +0000
+Subject: [PATCH] fix(desktop): classify draft rows with live sidebar placement
+ inputs [daveey]
+
+Draft rows used only cwd and explicit projects while real sidebar rows also
+used backend project owners and known tree repo/lane roots. That mismatch hid
+fresh drafts in repo subfolders, worktrees, sibling lanes and unclaimed folders.
+Use the identical owners and known-project inputs for draft bucketing/filtering;
+leave the existing first-send cwd and optimistic insertion untouched.
+
+Proof: six reviewer placement probes on 43116949 give five failures and one root
+control; final focused 47 tests and sidebar 81 files/1101 tests pass. Correct
+invariant oracles to use all four bucket inputs. Independently remove each active
+profile/connection/project-scope subscription: each targeted reactive test fails
+Home->p1, while the final source passes. Hook-only probes prevent incidental i18n
+renders masking missing subscriptions; actual mounted row transitions also pass.
+Full TypeScript and all repository check gates pass.
+---
+ .../src/app/chat/sidebar/draft-rows.test.tsx  | 55 ++++++++++-
+ .../src/app/chat/sidebar/draft-rows.tsx       | 14 ++-
+ .../session/hooks/new-session-target.test.tsx | 97 +++++++++++++++++--
+ 3 files changed, 153 insertions(+), 13 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
+index 52a87483a9..e6b88cde48 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
+@@ -26,10 +26,22 @@ vi.mock('@/store/composer', () => ({
+   $freshDraftKey: atom('__new__:test'),
+   takeSessionDraft: () => ({ text: '', attachments: [] })
+ }))
+-vi.mock('@/store/projects', () => ({ $projectTree: atom([]), $projects: atom([]), resolveNewSessionCwd: () => '' }))
++vi.mock('@/store/projects', async () => {
++  const { computed } = await import('nanostores')
++  const { projectOwnerBySessionId } = await import('./projects/workspace-groups')
++  const $projectTree = atom([])
++
++  return {
++    $projectTree,
++    $projects: atom([]),
++    $projectOwnerBySessionId: computed($projectTree, projectOwnerBySessionId),
++    resolveNewSessionCwd: () => ''
++  }
++})
+ vi.mock('react-router', () => ({ useLocation: () => ({ pathname: '/' }) }))
+ 
+ import { $draftTitles } from '@/store/composer'
++import { $projects, $projectTree } from '@/store/projects'
+ import { $currentCwd } from '@/store/session'
+ import {
+   $activeSessionId,
+@@ -61,6 +73,8 @@ beforeEach(() => {
+   focusedId.set(null)
+   focusedTile.set(false)
+   $currentCwd.set('')
++  $projects.set([])
++  $projectTree.set([])
+ 
+   $sessions.set([])
+   $unlistedSessionOwnerRows.set([])
+@@ -71,7 +85,45 @@ beforeEach(() => {
+ afterEach(cleanup)
+ 
+ describe('client-only sidebar drafts', () => {
++  it.each([
++    { name: 'repo subfolder', cwd: '/repo/src', bucket: '/repo' },
++    { name: 'in-tree worktree', cwd: '/repo/.worktrees/task', bucket: '/repo' },
++    { name: 'sibling lane', cwd: '/lane-task', bucket: '/repo' },
++    { name: 'root control', cwd: '/repo', bucket: '/repo' },
++    { name: 'unclaimed folder', cwd: '/unclaimed', bucket: '__no_project__' },
++    { name: 'explicit p1 sibling lane', cwd: '/lane-task', bucket: 'p1', explicit: true }
++  ])('uses real sidebar placement inputs for $name', ({ cwd, bucket, explicit }) => {
++    $freshDraftReady.set(true)
++    $currentCwd.set(cwd)
++
++    if (explicit) {
++      $projects.set([{ id: 'p1', name: 'Project', folders: [{ path: '/repo' }] }] as never)
++    }
++
++    $projectTree.set([
++      {
++        id: explicit ? 'p1' : '/repo',
++        label: 'Repo',
++        path: '/repo',
++        sessionCount: 0,
++        repos: [
++          {
++            id: '/repo',
++            label: 'Repo',
++            path: '/repo',
++            sessionCount: 0,
++            groups: [{ id: 'lane', label: 'Lane', path: '/lane-task', sessions: [] }]
++          }
++        ]
++      }
++    ])
++    render(view({ projectId: bucket, filter: [bucket] }))
++    expect(rows()).toHaveLength(2)
++    expect(rows()[0].getAttribute('data-sidebar-draft-project')).toBe(bucket)
++  })
++
+   it('moves the main draft with the live send target when a tile publishes cwd', () => {
++    $projects.set([{ id: '/other-project', name: 'Other', folders: [{ path: '/other-project' }] }] as never)
+     $freshDraftReady.set(true)
+     const { rerender } = render(view({ projectId: '__no_project__' }))
+     expect(rows()).toHaveLength(2)
+@@ -179,6 +231,7 @@ describe('client-only sidebar drafts', () => {
+   })
+ 
+   it('places detached drafts only in Home and project drafts only in that project', () => {
++    $projects.set([{ id: '/repo', name: 'Repo', folders: [{ path: '/repo' }] }] as never)
+     $freshDraftReady.set(true)
+     const { rerender } = render(view({ projectId: '/repo' }))
+     expect(rows()).toHaveLength(1)
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+index 1116b7bae6..6a0755d136 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+@@ -1,4 +1,5 @@
+ import { useStore } from '@nanostores/react'
++import { useMemo } from 'react'
+ import { useLocation } from 'react-router'
+ 
+ import { NEW_CHAT_ROUTE } from '@/app/routes'
+@@ -8,7 +9,7 @@ import type { SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { cn } from '@/lib/utils'
+ import { $draftTitles, $freshDraftKey, takeSessionDraft } from '@/store/composer'
+-import { $projects } from '@/store/projects'
++import { $projectOwnerBySessionId, $projects, $projectTree } from '@/store/projects'
+ import {
+   $activeSessionId,
+   $freshDraftReady,
+@@ -19,7 +20,7 @@ import {
+ import { $focusedSessionIsTile, $focusedStoredSessionId } from '@/store/session-focus'
+ import { $sessionTiles, focusOpenSession } from '@/store/session-states'
+ 
+-import { sessionBucketId, sessionMatchesProjectFilter } from './projects/workspace-groups'
++import { knownProjectsOf, sessionBucketId, sessionMatchesProjectFilter } from './projects/workspace-groups'
+ 
+ interface DraftRow {
+   id: string
+@@ -53,6 +54,9 @@ export function SidebarDraftRows({
+   const stubs = useStore($unlistedSessionOwnerRows)
+   const tiles = useStore($sessionTiles)
+   const projects = useStore($projects)
++  const projectTree = useStore($projectTree)
++  const projectOwners = useStore($projectOwnerBySessionId)
++  const knownProjects = useMemo(() => knownProjectsOf(projectTree), [projectTree])
+   const rows = new Map<string, DraftRow>()
+ 
+   if (ready && !runtime && !selected && pathname === NEW_CHAT_ROUTE) {
+@@ -90,8 +94,8 @@ export function SidebarDraftRows({
+     const placement = { cwd: row.cwd, git_repo_root: row.git_repo_root, id: row.id } as SessionInfo
+ 
+     if (
+-      (projectId && sessionBucketId(placement, projects) !== projectId) ||
+-      !sessionMatchesProjectFilter(placement, filter, projects)
++      (projectId && sessionBucketId(placement, projects, projectOwners, knownProjects) !== projectId) ||
++      !sessionMatchesProjectFilter(placement, filter, projects, projectOwners, knownProjects)
+     ) {
+       return null
+     }
+@@ -104,7 +108,7 @@ export function SidebarDraftRows({
+           row.selected && 'bg-sidebar-accent text-sidebar-accent-foreground'
+         )}
+         data-sidebar-draft-id={row.id}
+-        data-sidebar-draft-project={sessionBucketId(placement, projects) ?? undefined}
++        data-sidebar-draft-project={sessionBucketId(placement, projects, projectOwners, knownProjects) ?? undefined}
+         key={row.id}
+         onClick={() => {
+           if (row.main) {
+diff --git a/apps/desktop/src/app/session/hooks/new-session-target.test.tsx b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+index e1e13034d1..b65d2ef66a 100644
+--- a/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
++++ b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { SidebarDraftRows } from '@/app/chat/sidebar/draft-rows'
+ import {
++  knownProjectsOf,
+   NO_PROJECT_ID,
+   overlayLiveLanes,
+   overlayLivePreviews,
+@@ -12,6 +13,7 @@ import {
+   sessionMatchesProjectFilter,
+   type SidebarProjectTree
+ } from '@/app/chat/sidebar/projects/workspace-groups'
++import { useMainSidebarDisplayCwd } from '@/app/session/new-session-cwd'
+ import { notifyNewSessionTargetUnreachable, prepareDefaultNewSession } from '@/app/session/new-session-route'
+ import { group } from '@/components/pane-shell/tree/model'
+ import { $activeTreeGroup, $layoutTree } from '@/components/pane-shell/tree/store'
+@@ -31,8 +33,15 @@ import {
+   ensureGatewayAgent
+ } from '@/store/profile'
+ import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+-import { $projects, followEnteredProjectCwd, resolveNewSessionCwd } from '@/store/projects'
+ import {
++  $projectOwnerBySessionId,
++  $projects,
++  $projectTree,
++  followEnteredProjectCwd,
++  resolveNewSessionCwd
++} from '@/store/projects'
++import {
++  $connection,
+   $currentCwd,
+   $freshDraftKey,
+   $newChatWorkspaceTarget,
+@@ -87,6 +96,10 @@ function prePrSendCwd() {
+       : $currentCwd.get().trim() || resolveNewSessionCwd()
+ }
+ 
++function sidebarBucket(row: Parameters<typeof sessionBucketId>[0], projects: Parameters<typeof sessionBucketId>[1]) {
++  return sessionBucketId(row, projects, $projectOwnerBySessionId.get(), knownProjectsOf($projectTree.get()))
++}
++
+ function mountActions() {
+   const ref = <T,>(current: T) => ({ current })
+   const state = createClientSessionState()
+@@ -121,6 +134,8 @@ beforeEach(() => {
+   $newChatProfile.set(null)
+   $activeGatewayProfile.set('default')
+   $projectScope.set(ALL_PROJECTS)
++  $projectTree.set([])
++  $projects.set([])
+   $connectionsRegistry.set({
+     connections: [
+       { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+@@ -174,6 +189,74 @@ afterEach(() => {
+ })
+ 
+ describe('new-session gateway target', () => {
++  it.each(['active profile', 'connection', 'scope'])(
++    'reacts to only the %s input without incidental UI subscriptions',
++    async input => {
++      const { browserDefaultProjectDirKey, browserFolderBasePath } = await import('@/lib/browser-settings')
++      $currentCwd.set('')
++      $newChatWorkspaceTarget.set(undefined)
++      $newChatProfile.set(null)
++      $projectScope.set(ALL_PROJECTS)
++      $projects.set([{ id: 'p1', name: 'Project', folders: [{ path: '/repo' }] }] as never)
++      $projectTree.set([{ id: 'p1', label: 'Project', path: '/repo', repos: [], sessionCount: 0 }])
++      document.documentElement.dataset.hermesDesktopHost = 'browser'
++      const connection = $connection.get()!
++
++      const key = browserDefaultProjectDirKey(
++        browserFolderBasePath(input === 'connection' ? 'hermes-hub' : 'local'),
++        input === 'active profile' ? 'beta' : 'default'
++      )
++
++      localStorage.setItem(key, '/repo')
++
++      if (input === 'scope') {
++        localStorage.removeItem(key)
++      }
++
++      // Isolate the production hook: i18n/profile consumers in the whole sidebar can
++      // otherwise mask a missing subscription by incidentally causing another render.
++      const probe = renderHook(() =>
++        sidebarBucket(makeSessionInfo({ cwd: useMainSidebarDisplayCwd() }), $projects.get())
++      )
++
++      setSelectedStoredSessionId(null)
++      setFreshDraftReady(true)
++
++      const view = render(
++        <MemoryRouter>
++          <SidebarDraftRows projectId="p1" />
++          <SidebarDraftRows projectId={NO_PROJECT_ID} />
++        </MemoryRouter>
++      )
++
++      const paintedBucket = () =>
++        view.container.querySelector('[data-sidebar-draft-project]')?.getAttribute('data-sidebar-draft-project')
++
++      try {
++        expect(probe.result.current).toBe(NO_PROJECT_ID)
++        expect(paintedBucket()).toBe(NO_PROJECT_ID)
++        act(() => {
++          if (input === 'active profile') {
++            $activeGatewayProfile.set('beta')
++          } else if (input === 'connection') {
++            $connection.set({ ...connection, connectionId: 'hermes-hub' })
++          } else {
++            $projectScope.set('p1')
++          }
++        })
++        expect(probe.result.current).toBe('p1')
++        expect(paintedBucket()).toBe('p1')
++        expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(1)
++        expect(prePrSendCwd()).toBe('/repo')
++      } finally {
++        view.unmount()
++        probe.unmount()
++        localStorage.removeItem(key)
++        delete document.documentElement.dataset.hermesDesktopHost
++      }
++    }
++  )
++
+   it.each([
+     { dir: 'right' as const, cwd: '/repo' },
+     { dir: 'center' as const, cwd: null }
+@@ -384,7 +467,7 @@ describe('new-session gateway target', () => {
+     const call = vi.mocked(requestGatewayForAgent).mock.calls.findLast(call => call[2] === 'session.create')!
+     expect(call[3]?.cwd).toBe(expectedCwd)
+     expect(call[3]?.cwd || '').toBe(beforeSendCwd)
+-    expect(sessionBucketId($sessions.get()[0], $projects.get())).toBe(expectedBucket)
++    expect(sidebarBucket($sessions.get()[0], $projects.get())).toBe(expectedBucket)
+     expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
+     act(() => {
+       $projects.set([])
+@@ -482,7 +565,7 @@ describe('new-session gateway target', () => {
+ 
+     // Display follows the same fresh inputs as send, including ambient tile cwd.
+     const expectedCwd = prePrSendCwd()
+-    const expectedBucket = sessionBucketId(makeSessionInfo({ cwd: expectedCwd }), $projects.get())
++    const expectedBucket = sidebarBucket(makeSessionInfo({ cwd: expectedCwd }), $projects.get())
+     expect(placement()).toBe(expectedBucket)
+     expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(1)
+     const beforeSendCwd = prePrSendCwd()
+@@ -491,8 +574,8 @@ describe('new-session gateway target', () => {
+     expect(createCall[3]?.cwd || '').toBe(beforeSendCwd)
+     expect(beforeSendCwd).toBe(operation === 'tile workspace' ? '/other-project' : expectedCwd)
+     expect($sessions.get()).toHaveLength(1)
+-    expect(sessionBucketId($sessions.get()[0], $projects.get())).toBe(
+-      sessionBucketId(makeSessionInfo({ cwd: beforeSendCwd }), $projects.get())
++    expect(sidebarBucket($sessions.get()[0], $projects.get())).toBe(
++      sidebarBucket(makeSessionInfo({ cwd: beforeSendCwd }), $projects.get())
+     )
+     expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
+     act(() => {
+@@ -549,7 +632,7 @@ describe('new-session gateway target', () => {
+       if (operation !== 'switch gateway') {
+         await act(() => result.current.createBackendSessionForSend('First send'))
+         const row = $sessions.get().find(row => row.id === 'created-stored')!
+-        expect(sessionBucketId(row, $projects.get())).toBe('p1')
++        expect(sidebarBucket(row, $projects.get())).toBe('p1')
+         expect(row.cwd).toBe(operation === 'pick folder' ? '/repo/normalized' : '/repo')
+         expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
+       }
+@@ -663,7 +746,7 @@ describe('new-session gateway target', () => {
+       const row = $sessions.get()[0]
+       expect(row.connection_id).toBe(HUB.connectionId)
+       expect(row.cwd || null).toBeNull()
+-      expect(sessionBucketId(row, [])).toBe(NO_PROJECT_ID)
++      expect(sidebarBucket(row, [])).toBe(NO_PROJECT_ID)
+       expect(sessionMatchesProjectFilter(row, [NO_PROJECT_ID], [])).toBe(true)
+       expect(overlayLiveLanes(home, $sessions.get()).repos[0].groups[0].sessions.map(s => s.id)).toEqual([
+         'created-stored',
+-- 
+2.43.0
+

@@ -1,0 +1,309 @@
+From 3db7103ae752a65e5068b015ba842a1ed3f6ed95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 11:09:10 +0000
+Subject: [PATCH] [daveey] Gate unissued diagnostic commands on canonical
+ prerequisites
+
+Why: frozen administrative phases cannot rotate identity after a transient refusal. A premature escalation or unavailable deployment could stall unrelated sync behind the diagnostic. Classify server clock and exact canonical root as pre-issuance prerequisites; preserve original bytes and deadlines and allow unrelated pending work to proceed.
+
+Bound root eligibility probes to 32 per selection with durable rotation across restart, including quarantined candidates. Memoize capability outages per selection, gate contract capability too, and keep network work outside writer transactions. Do not change issued stream custody; this Core sender uses legacy operations and has no STRICT issuer.
+
+Proof: early diagnostic producer regression RED then GREEN; contract unsupported/capability outage RED then GREEN. Real SQLite->local Board55354df HTTP/DO->replica/restart and unrelated progress composed proof passes for both early clock and missing root. Full sync/retain consumers and scripts/check run separately. Board missing-root/early settlement and immutable conflict proofs live in paired PR205. No producer activation or original incident mutation; no execution/release authority.
+---
+ hermes_cli/kanban_actionability_transport.py  | 80 +++++++++++++++-
+ hermes_cli/kanban_sync_parent_order.py        |  3 +-
+ .../test_kanban_actionability_board.py        | 32 +++++--
+ .../test_kanban_actionability_transport.py    | 94 +++++++++++++++++++
+ 4 files changed, 197 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_actionability_transport.py b/hermes_cli/kanban_actionability_transport.py
+index 4c384af0c6..d6896eb49a 100644
+--- a/hermes_cli/kanban_actionability_transport.py
++++ b/hermes_cli/kanban_actionability_transport.py
+@@ -29,7 +29,10 @@ def ensure_schema(conn) -> None:
+     conn.execute('CREATE TABLE IF NOT EXISTS kanban_actionability_commands ('
+                  'op_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, contract_key TEXT NOT NULL, phase TEXT NOT NULL, '
+                  'request_json TEXT NOT NULL, request_sha256 TEXT NOT NULL, delivery_state TEXT NOT NULL, '
+-                 'canonical_receipt_json TEXT, UNIQUE(task_id,contract_key,phase))')
++                 'canonical_receipt_json TEXT, eligibility_checked_at INTEGER, UNIQUE(task_id,contract_key,phase))')
++    columns = {r[1] for r in conn.execute('PRAGMA table_info(kanban_actionability_commands)')}
++    if 'eligibility_checked_at' not in columns:
++        conn.execute('ALTER TABLE kanban_actionability_commands ADD COLUMN eligibility_checked_at INTEGER')
+ 
+ 
+ def envelope(task_id: str, payload: dict, phase: str = 'contract') -> dict:
+@@ -118,13 +121,80 @@ def own_batch(rows: list[dict]) -> list[dict]:
+     return rows
+ 
+ 
++def escalation_ready(hub, board: str, wire: dict, cap: dict) -> None:
++    """Eligibility before issuance; only the canonical clock/root can admit it."""
++    if int(cap['hlc'][:13]) // 1000 < wire['payload']['deadline_at']:
++        raise ValueError('actionability_not_due: wait for original canonical deadline')
++    _, root = _evidence(hub, board, wire['contract_uid'], wire['task'], 'actionability_contract', hub.ident.gateway)
++    expected = envelope(wire['task'], wire['payload'], 'contract')
++    if (root.get('contract') != wire['payload'] or root.get('home_gateway') != hub.ident.gateway
++            or root.get('request_uid') != expected['client_op_id']
++            or root.get('request_sha256') != digest(canonical(expected))):
++        raise ValueError('actionability root prerequisite does not attest frozen contract')
++
++
++def _eligibility_capability(hub, board):
++    """Memoize a failed read for this selection too; outages cannot fan out probes."""
++    from hermes_cli.kanban_sync_client import HubError
++    try:
++        return capability(hub, board)
++    except (ValueError, KeyError, TypeError, OSError, HubError) as exc:
++        return exc
++
++
++def eligible_pending(conn, rows, hub, board):
++    """Filter UNISSUED diagnostics before batch limits; preserve their exact custody.
++
++    A raw STRICT sender must call this before assigning any stream sequence. Core
++    currently uses legacy ops, so no already-issued stream slot is reordered here.
++    """
++    from hermes_cli.kanban_sync_client import HubError
++    from hermes_cli.kanban_db_connect import write_txn
++    cap, candidates = None, set()
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_actionability_commands'").fetchone():
++        with write_txn(conn):
++            ensure_schema(conn)
++        candidates = {r[0] for r in conn.execute(
++            'SELECT c.op_id FROM kanban_actionability_commands c JOIN kanban_sync_outbox o ON o.op_id=c.op_id '
++            "WHERE c.phase='escalation' AND o.state='pending' "
++            "AND (o.retry_after IS NULL OR o.retry_after<=CAST(strftime('%s','now') AS INTEGER)) "
++            'ORDER BY COALESCE(c.eligibility_checked_at,0),c.op_id LIMIT 32')}
++        # Rotate the whole chosen window, including quarantined rows filtered upstream.
++        # A blocked/unsendable prefix therefore cannot monopolize the probe budget.
++        with write_txn(conn):
++            conn.executemany(f'UPDATE kanban_actionability_commands SET eligibility_checked_at={sync._NOW_MS_SQL} '
++                             'WHERE op_id=?', [(op_id,) for op_id in candidates])
++    for row in rows:
++        if row['op'] != KIND:
++            yield row
++            continue
++        try:
++            wire = outbound(conn, row)
++            if wire['phase'] == 'escalation' and row['op_id'] not in candidates:
++                continue
++            cap = cap or _eligibility_capability(hub, board)
++            if isinstance(cap, Exception):
++                raise cap
++            if wire['phase'] == 'escalation':
++                escalation_ready(hub, board, wire, cap)
++        except (ValueError, KeyError, TypeError, OSError, HubError) as exc:
++            error = ('diagnostic prerequisite pending; preserve frozen request: ' + str(exc))[:500]
++            with write_txn(conn):
++                conn.execute('UPDATE kanban_sync_outbox SET last_error=? WHERE op_id=? AND '
++                             "state='pending' AND COALESCE(last_error,'')!=?", (error, row['op_id'], error))
++            continue
++        yield row
++
++
+ def before_send(conn, rows, hub, board) -> None:
+     retain.before_send(conn, rows, hub, board)
+     if any(row['op'] == KIND for row in rows):
+-        capability(hub, board)
++        cap = capability(hub, board)
+         for row in rows:
+             if row['op'] == KIND:
+-                outbound(conn, row)
++                wire = outbound(conn, row)
++                if wire['phase'] == 'escalation':
++                    escalation_ready(hub, board, wire, cap)
+ 
+ 
+ def record_result(conn, row: dict, result: dict) -> str:
+@@ -173,7 +243,9 @@ def confirm(conn, hub, board: str, op_id: str) -> dict:
+     if not old or old['delivery_state'] == 'rejected':
+         raise ValueError('actionability frozen custody unavailable or rejected')
+     wire = outbound(conn, {'op': KIND, 'op_id': op_id, 'row_uid': old['task_id'], 'fields': old['request_json']})
+-    capability(hub, board)
++    cap = capability(hub, board)
++    if wire['phase'] == 'escalation':
++        escalation_ready(hub, board, wire, cap)
+     reply = hub.ops(board, [wire])
+     results = reply.get('results', []) if isinstance(reply, dict) else []
+     if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
+diff --git a/hermes_cli/kanban_sync_parent_order.py b/hermes_cli/kanban_sync_parent_order.py
+index 3d3e4dd643..2d12b6c3a7 100644
+--- a/hermes_cli/kanban_sync_parent_order.py
++++ b/hermes_cli/kanban_sync_parent_order.py
+@@ -9,7 +9,8 @@ def select_pending(conn, hub, board, seen, *, now: int, limit: int, before_head:
+     from hermes_cli import kanban_sync_backlog as backlog
+     from hermes_cli.kanban_sync_quarantine import pending_rows
+ 
+-    rows = selected = parent_first(conn, pending_rows(conn, now), now, limit)
++    from hermes_cli.kanban_actionability_transport import eligible_pending
++    rows = selected = parent_first(conn, eligible_pending(conn, pending_rows(conn, now), hub, board), now, limit)
+     stopped = False
+     if before_head:
+         rows, stopped = backlog.sendable_before_head(conn, hub, board, rows, seen)
+diff --git a/tests/hermes_cli/test_kanban_actionability_board.py b/tests/hermes_cli/test_kanban_actionability_board.py
+index 592c95db16..8f4b7be73e 100644
+--- a/tests/hermes_cli/test_kanban_actionability_board.py
++++ b/tests/hermes_cli/test_kanban_actionability_board.py
+@@ -20,7 +20,8 @@ from tests.hermes_cli import kanban_sync_support as support
+ 
+ 
+ @pytest.mark.skipif(not os.environ.get('B2_M1_LOCAL_BOARD_URL'), reason='requires isolated local wrangler Board')
+-def test_frozen_root_board_replica_deadline_escalation(tmp_path, monkeypatch):
++@pytest.mark.parametrize('prerequisite', ['deadline', 'root'])
++def test_frozen_root_board_replica_deadline_escalation(tmp_path, monkeypatch, prerequisite):
+     url = os.environ['B2_M1_LOCAL_BOARD_URL']
+     assert url.startswith('http://127.0.0.1:')
+     home = support.kanban_home(tmp_path, monkeypatch)
+@@ -55,7 +56,25 @@ def test_frozen_root_board_replica_deadline_escalation(tmp_path, monkeypatch):
+                    'owner': {'kind': 'unavailable', 'refs': []},
+                    'blocker': {'prerequisite': 'explicit administrative disposition', 'trigger': 'supported owner decision', 'evidence': [source['uid']]},
+                    'action': 'repair_lifecycle_contract', 'instruction': 'Record diagnostic custody only; never run original scope',
+-                   'first_observed': source['created_at'], 'deadline_at': source['created_at'] + 1, 'legacy': False}
++                   'first_observed': source['created_at'], 'deadline_at': source['created_at'] + (5 if prerequisite == 'deadline' else 1), 'legacy': False}
++        import time
++        from tests.waiting import wait_until
++        with kbc.write_txn(conn):
++            pending = act.reserve(conn, tid, payload, phase='escalation')
++        if prerequisite == 'deadline':
++            with kbc.write_txn(conn):
++                root = act.reserve(conn, tid, payload)
++            assert act.confirm(conn, hub, board, root['op_id'])['delivery_state'] == 'confirmed'
++        else:
++            wait_until(lambda: time.time() >= payload['deadline_at'], timeout=3)
++        unrelated = kb.create_task(conn, title='unrelated real HTTP progress', assignee='default')
++        progress = client.push(conn, hub, board, gateway, primary=True)
++        assert progress.applied > 0 and progress.rejected == 0
++        assert hub.row_evidence(board, 'tasks', unrelated)['state'] == 'live'
++        queued = [r for r in sync.outbox(conn) if r['op_id'] == pending['op_id']]
++        assert len(queued) == 1 and queued[0]['attempts'] == 0
++        assert 'prerequisite pending' in queued[0]['last_error']
++        assert act.command(conn, pending['op_id'])['request_json'] == pending['request_json']
+         with kbc.write_txn(conn):
+             root = act.reserve(conn, tid, payload)
+         # Send canonical op but lose its reply before local ACK. Restart keeps exact bytes.
+@@ -64,13 +83,12 @@ def test_frozen_root_board_replica_deadline_escalation(tmp_path, monkeypatch):
+         conn = kbc.connect(home / 'kanban.db')
+         assert act.command(conn, root['op_id'])['request_json'] == root['request_json']
+         assert act.confirm(conn, hub, board, root['op_id'])['delivery_state'] == 'confirmed'
+-        # No sleeps: move only the isolated producer timestamp before initial publication
+-        # is not allowed. A one-second deadline can naturally pass during root roundtrip.
+-        import time
+-        from tests.waiting import wait_until
+-        wait_until(lambda: time.time() >= payload['deadline_at'], timeout=3)
++        # Retain the original deadline; eligibility is not deadline renewal.
++        wait_until(lambda: time.time() >= payload['deadline_at'], timeout=8)
+         with kbc.write_txn(conn):
+             due = act.reserve(conn, tid, payload, phase='escalation')
++        assert due['request_json'] == pending['request_json']
++        assert client.push(conn, hub, board, gateway, primary=True).rejected == 0
+         result = act.confirm(conn, hub, board, due['op_id'])
+         assert result['outcome'] == 'route_unavailable' and result['execution_authority'] is False
+         assert act.confirm(conn, hub, board, due['op_id']) == result
+diff --git a/tests/hermes_cli/test_kanban_actionability_transport.py b/tests/hermes_cli/test_kanban_actionability_transport.py
+index 4564f5c043..b25bd37274 100644
+--- a/tests/hermes_cli/test_kanban_actionability_transport.py
++++ b/tests/hermes_cli/test_kanban_actionability_transport.py
+@@ -96,6 +96,100 @@ def test_deleted_disposable_indexes_do_not_renew_contract_deadline(live):
+         reserve(live, tid, {**payload, 'first_observed': 10, 'deadline_at': 11})
+ 
+ 
++def test_early_escalation_does_not_block_unrelated_unissued_work(live):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    payload['deadline_at'] = 100
++    pending = reserve(live, tid, payload, 'escalation')
++    other = kb.create_task(live, title='unrelated executable sync progress', assignee='default')
++    class Hub:
++        def actionability_capability(self, board):
++            return {'actionability_record': 1, 'frozen_replay': 1, 'diagnostic_only': True,
++                    'hlc': '0000000001000-0000-server'}
++        def ops(self, board, sent):
++            assert all(op['op'] != act.KIND for op in sent), 'early escalation reached outbound/stream issuance'
++            return {'results': [{'client_op_id': op['client_op_id'], 'status': 'applied'} for op in sent]}
++    result = client.push(live, Hub(), 'default', 'fixture', primary=True)
++    assert result.applied > 0
++    assert act.command(live, pending['op_id'])['request_json'] == pending['request_json']
++    assert [r['op_id'] for r in sync.outbox(live)] == [pending['op_id']]
++    assert live.execute('SELECT status FROM tasks WHERE id=?', (other,)).fetchone()[0] == 'ready'
++
++
++@pytest.mark.parametrize('unsupported', [True, False])
++def test_contract_capability_prerequisite_does_not_block_unrelated_work(live, unsupported):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    pending = reserve(live, tid, payload)
++    second = reserve(live, tid, {**payload, 'blocker': {**payload['blocker'], 'trigger': 'another diagnostic prerequisite'}})
++    kb.create_task(live, title='unrelated while diagnostic capability unavailable', assignee='default')
++    class Hub:
++        probes = 0
++        def actionability_capability(self, board):
++            self.probes += 1
++            if unsupported:
++                return {}
++            raise OSError('isolated capability transport outage')
++        def ops(self, board, sent):
++            assert all(op['op'] != act.KIND for op in sent)
++            return {'results': [{'client_op_id': op['client_op_id'], 'status': 'applied'} for op in sent]}
++    hub = Hub()
++    assert client.push(live, hub, 'default', 'fixture', primary=True).applied > 0
++    assert hub.probes == 1
++    assert {r['op_id'] for r in sync.outbox(live)} == {pending['op_id'], second['op_id']}
++    assert act.command(live, pending['op_id'])['request_json'] == pending['request_json']
++    assert act.command(live, second['op_id'])['request_json'] == second['request_json']
++
++
++def test_bounded_eligibility_rotates_across_restart_without_starving_later_diagnostics(live):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    owned = []
++    for index in range(33):
++        p = {**payload, 'blocker': {**payload['blocker'], 'trigger': f'isolated prerequisite {index}'}}
++        owned.append(reserve(live, tid, p, 'escalation'))
++    class Hub:
++        ident = SimpleNamespace(gateway='fixture')
++        probes = []
++        def actionability_capability(self, board):
++            assert not live.in_transaction
++            return {'actionability_record': 1, 'frozen_replay': 1, 'diagnostic_only': True,
++                    'hlc': '9999999999999-0000-server'}
++        def row_evidence(self, board, table, uid):
++            self.probes.append(uid)
++            return {'state': 'absent'}
++    hub = Hub()
++    assert list(act.eligible_pending(live, sync.outbox(live), hub, 'default')) == []
++    assert len(hub.probes) == 32
++    from pathlib import Path
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    with kbc.connect(path) as reopened:
++        assert list(act.eligible_pending(reopened, sync.outbox(reopened), hub, 'default')) == []
++    assert len(set(hub.probes)) == 33
++    assert len(hub.probes) <= 64
++    for row in owned:
++        assert act.command(live, row['op_id'])['request_json'] == row['request_json']
++    assert all(row['attempts'] == 0 for row in sync.outbox(live))
++
++
++def test_malformed_diagnostic_isolated_before_unrelated_batch_selection(live):
++    from hermes_cli import kanban_actionability_transport as act
++    tid, payload = contract(live)
++    owned = reserve(live, tid, payload)
++    other = kb.create_task(live, title='unrelated valid outbox', assignee='default')
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=?', ('{', owned['op_id']))
++    class Hub:
++        def ops(self, board, sent):
++            assert all(op['op'] != act.KIND for op in sent)
++            return {'results': [{'client_op_id': op['client_op_id'], 'status': 'applied'} for op in sent]}
++    assert client.push(live, Hub(), 'default', 'fixture', primary=True).applied > 0
++    assert [r[0] for r in live.execute('SELECT op_id FROM kanban_sync_outbox')] == [owned['op_id']]
++    assert act.command(live, owned['op_id'])['request_json'] == owned['request_json']
++    assert live.execute('SELECT status FROM tasks WHERE id=?', (other,)).fetchone()[0] == 'ready'
++
++
+ def test_administrative_notice_does_not_promise_comment_release():
+     from hermes_cli.kanban_decision_ask import notice_text
+     text = notice_text({'why': 'scope authority unavailable', 'actionability': {'kind': 'administrative_only'}})
+-- 
+2.43.0
+

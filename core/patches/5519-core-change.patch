@@ -1,0 +1,185 @@
+From 83a5d885d574662fd5cff0493fb702f8203e4405 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:14:33 +0000
+Subject: [PATCH] test(kanban): snapshot synced backfill homes per module
+ [daveey]
+
+Why: the original 168-case file spends most of its time rebuilding real
+SessionDB and synced Kanban schemas. Eleven representative cases spent
+11.110s in make_home versus 0.268s in test calls. Under the frozen G39
+1818-file/16-worker load, unchanged main bb4d3d72 took 396.8s (168 pass).
+The independently landed empty-session-schema optimization at 192d1786
+still took 309.6s (170 pass), exceeding the unchanged 300s acceptance.
+
+Build the real synced home once and snapshot each SQLite database using
+backup, including committed WAL pages. Deep-copy the complete fixture
+per case and reapply the original home/worker isolation. Backfill still
+runs against real independent on-disk schemas. Keep all original test
+functions/decorators/assertions, including the landed empty-session
+isolation checks. Add fresh-make_home schema parity and independent
+session/board mutation controls. No production, selection, retries or
+watchdog changes; no skip, xfail, move or split.
+
+Proof: canonical serial run: 171 passed in 73.3s, retries 0.
+Hardlink-copy mutant: baseline 3 passed; mutant 2 failed/1 passed.
+All 53 pre-optimization tests AST-identical; scripts/check passes.
+Matched frozen1818/j16/retries0 proof is tracked on the implementation
+card and must be under300 before completion.
+
+Implementation: t_a67f352e2a028f7a
+---
+ .../test_kanban_backfill_empty_events.py      | 122 ++++++++++++++----
+ 1 file changed, 99 insertions(+), 23 deletions(-)
+
+diff --git a/tests/tools/test_kanban_backfill_empty_events.py b/tests/tools/test_kanban_backfill_empty_events.py
+index 56e8e38a13..5c5dca7e27 100644
+--- a/tests/tools/test_kanban_backfill_empty_events.py
++++ b/tests/tools/test_kanban_backfill_empty_events.py
+@@ -1,6 +1,8 @@
+ """Incremental empty-creator classification retains Python semantics and retries."""
+ import json
++import shutil
+ import sqlite3
++from contextlib import closing
+ from pathlib import Path
+ 
+ import pytest
+@@ -28,31 +30,63 @@ def session_schema_template(tmp_path_factory):
+     return tmp_path_factory.mktemp('backfill-session-schema') / 'empty.db'
+ 
+ 
+-@pytest.fixture
+-def board(tmp_path, monkeypatch, session_schema_template):
+-    # These exercise creator backfill, not SessionDB's cold migrations. Reuse only
+-    # the empty migrated session schema; every case still constructs its real
+-    # SessionDB and gets fresh worker/human rows in its own home and board.
+-    import shutil
+-    import hermes_state
+-
+-    session_db = hermes_state.SessionDB
+-
+-    def with_empty_schema(*args, **kwargs):
+-        path = kwargs['db_path']
+-        if session_schema_template.exists():
+-            assert not path.exists(), 'template must never overwrite a populated session DB'
+-            shutil.copyfile(session_schema_template, path)
+-        db = session_db(*args, **kwargs)
+-        if not session_schema_template.exists():
+-            from contextlib import closing
+-            with closing(sqlite3.connect(path)) as source, closing(sqlite3.connect(session_schema_template)) as target:
++@pytest.fixture(scope='module')
++def home_template(tmp_path_factory, session_schema_template):
++    """Snapshot a real synced home once, including committed SQLite WAL pages.
++
++    Schema/identity setup dominates this backfill matrix. Copies keep real on-disk
++    databases and all production backfill operations, but don't repeat migrations.
++    The fresh-home parity control below still exercises the original constructor.
++    """
++    root = tmp_path_factory.mktemp('backfill-home-template')
++    with pytest.MonkeyPatch.context() as patch:
++        import hermes_state
++
++        session_db = hermes_state.SessionDB
++
++        def with_empty_schema(*args, **kwargs):
++            db = session_db(*args, **kwargs)
++            with closing(sqlite3.connect(kwargs['db_path'])) as source, \
++                    closing(sqlite3.connect(session_schema_template)) as target:
+                 source.backup(target)
+-        return db
++            return db
++
++        patch.setattr(hermes_state, 'SessionDB', with_empty_schema)
++        home = make_home(root, patch)
++        snapshot = root / 'snapshot'
++        shutil.copytree(home, snapshot)
++        for source in home.rglob('*.db'):
++            target = snapshot / source.relative_to(home)
++            target.unlink()
++            with closing(sqlite3.connect(source)) as src, closing(sqlite3.connect(target)) as dst:
++                src.backup(dst)
++        for suffix in ('*-wal', '*-shm'):
++            for sidecar in snapshot.rglob(suffix):
++                sidecar.unlink()
++    return snapshot
++
++
++def copy_home(tmp_path, monkeypatch, home_template):
++    home = tmp_path / '.hermes'
++    shutil.copytree(home_template, home)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'hub'))
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_ORIGIN_SESSION',
++                'HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_KANBAN_RUN_ID'):
++        monkeypatch.delenv(key, raising=False)
++    from hermes_cli import kanban_capability_registry as registry
++    from tools import kanban_tools as tools
++    from agent import delegation_context
++    monkeypatch.setattr(registry, 'self_gateway', lambda: 'here')
++    monkeypatch.setattr(tools, '_is_dispatcher_owned_worker', lambda: True)
++    monkeypatch.setattr(delegation_context, 'is_dispatcher_owned_worker_context', lambda: True)
++    return home
+ 
+-    monkeypatch.setattr(hermes_state, 'SessionDB', with_empty_schema)
+-    make_home(tmp_path, monkeypatch)
+-    monkeypatch.setattr(hermes_state, 'SessionDB', session_db)
++
++@pytest.fixture
++def board(tmp_path, monkeypatch, home_template):
++    copy_home(tmp_path, monkeypatch, home_template)
+     with kbc.connect_closing() as conn:
+         yield conn
+ 
+@@ -83,6 +117,48 @@ def seed(conn, payload, event_id=123):
+     conn.commit()
+ 
+ 
++def test_home_template_preserves_real_schema_and_isolates_writes(tmp_path, home_template):
++    """Copies retain the real synced schema/session data without sharing mutations."""
++    roots = [tmp_path / name for name in ('fresh', 'first', 'second')]
++    for root in roots:
++        root.mkdir()
++    with pytest.MonkeyPatch.context() as patch:
++        fresh = make_home(roots[0], patch)  # retain a fresh-schema integration control
++    with pytest.MonkeyPatch.context() as patch:
++        first = copy_home(roots[1], patch, home_template)
++        with kbc.connect_closing() as conn:
++            seed(conn, '{}')
++            assert creator.backfill(conn) == {'attempted': [], 'unresolved': []}
++            assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++    with pytest.MonkeyPatch.context() as patch:
++        second = copy_home(roots[2], patch, home_template)
++        with kbc.connect_closing() as conn:
++            assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++            from hermes_cli import kanban_sync_client as sync
++            identity = sync.ensure_identity(conn, 'default', 'here')
++            assert identity['board_id'] == 'default' and identity['gateway_id'] == 'here'
++    databases = sorted(path.relative_to(home_template) for path in home_template.rglob('*.db'))
++    assert Path('state.db') in databases and len(databases) >= 2
++    for relative in databases:
++        with closing(sqlite3.connect(home_template / relative)) as template, \
++                closing(sqlite3.connect(second / relative)) as copied, \
++                closing(sqlite3.connect(fresh / relative)) as original:
++            schema = 'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name'
++            assert copied.execute(schema).fetchall() == original.execute(schema).fetchall()
++            assert list(copied.iterdump()) == list(template.iterdump())
++            assert (second / relative).stat().st_ino != (home_template / relative).stat().st_ino
++    with closing(sqlite3.connect(second / 'state.db')) as sessions:
++        from tests.tools.test_kanban_worker_created_chats import CHAT, WORKER
++        assert {row[0] for row in sessions.execute('SELECT id FROM sessions')} == {CHAT, WORKER}
++    with closing(sqlite3.connect(first / 'state.db')) as changed:
++        changed.execute('CREATE TABLE copy_only (value TEXT)')
++        changed.execute("INSERT INTO copy_only VALUES ('mutated')")
++        changed.commit()
++    for home in (home_template, second):
++        with closing(sqlite3.connect(home / 'state.db')) as untouched:
++            assert untouched.execute("SELECT name FROM sqlite_master WHERE name='copy_only'").fetchall() == []
++
++
+ def decoded(monkeypatch, payload):
+     original = json.loads
+     calls = []
+-- 
+2.43.0
+

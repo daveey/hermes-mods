@@ -1,0 +1,400 @@
+From 0988e814d55a24672109462a20feb42b3cdd29b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:11:03 +0000
+Subject: [PATCH] feat(plugins): add atomic empty-only path disposal [daveey]
+
+Consumer: disk-cleanup `_sweep_empty_dirs` needs a nonrecursive kernel rmdir
+through the shared executor. Checking emptiness then recursively deleting would
+remove files arriving after observation. Keep the existing default, scope checks,
+write denial, final-link handling and future custody veto in the same seam.
+
+Add keyword-only empty_only=False to PluginContext.dispose_path and the executor.
+True uses lstat then one os.rmdir, refuses non-directories and ENOTEMPTY/EEXIST,
+and never falls back. Preserve host crossing and log the chosen mode.
+
+This is the prerequisite seam-only PR for @task:hermes@hermes-hub/t_5885a5694e360983
+(durable unpushed-source custody):
+https://github.com/example-org/hermes/pull/3366
+Original disposal seam:
+https://github.com/example-org/hermes/pull/3951
+The integration owner alone migrates disk-cleanup and adds custody policy.
+
+Proof:
+- scripts/run_tests.sh: disposal/context/host/disk-cleanup/boundary suites:
+  103 passed, 1 macOS-only skip; final expanded disposal suite: 40 passed.
+- scripts/hermes-python scripts/check --base origin/main: passed.
+- Original 19 disposal cases and helpers unchanged (AST comparison); plugin API
+  manifest, boundary baseline and disk-cleanup sources unchanged.
+- RED/GREEN: removing the empty_only branch (fallthrough to existing rmtree /
+  unlink) produced 3 failures: nonempty, arrival[True], symlink. The False arrival
+  control passed. Restoring the branch passed all 4 selected cases. Canonical
+  runner with file retries disabled; no fabricated outputs.
+- Additional coverage: EEXIST/ENOTEMPTY, PermissionError/EBUSY/ENOTDIR, strict bool,
+  write-denied and root refusals, host equality, logging, and arrival immediately
+  before the sole real kernel rmdir with target-scan/recursive/unlink tripwires.
+
+Hermes-Card: t_038e830f612cc1b7
+---
+ hermes_cli/path_disposal.py                  |  20 +-
+ hermes_cli/plugins_context.py                |   4 +-
+ tests/hermes_cli/test_plugin_dispose_path.py | 204 +++++++++++++++++++
+ website/docs/user-guide/features/plugins.md  |  38 +++-
+ 4 files changed, 251 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/path_disposal.py b/hermes_cli/path_disposal.py
+index d0c87d0c64..51134f088a 100644
+--- a/hermes_cli/path_disposal.py
++++ b/hermes_cli/path_disposal.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import errno
+ import logging
+ import os
+ import shutil
+@@ -14,7 +15,7 @@ from hermes_constants import get_hermes_home
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def dispose_path(path: str, *, actor: str, reason: str) -> dict:
++def dispose_path(path: str, *, actor: str, reason: str, empty_only: bool = False) -> dict:
+     """Dispose of one scoped path without following its final symlink.
+ 
+     Return JSON data with path, outcome (disposed/missing/refused/error), and detail.
+@@ -30,14 +31,16 @@ def dispose_path(path: str, *, actor: str, reason: str) -> dict:
+         raise ValueError("reason must not be empty or blank")
+     if not isinstance(actor, str):
+         raise TypeError("actor must be a string")
++    if not isinstance(empty_only, bool):
++        raise TypeError("empty_only must be a bool")
+     if not path or "\x00" in path:
+         raise ValueError("path must not be empty or contain NUL")
+ 
+     checked = os.path.abspath(path)
+ 
+     def result(outcome: str, detail: str = "") -> dict:
+-        logger.info("Path disposal actor=%r reason=%r path=%r outcome=%s detail=%r",
+-                    actor, reason, checked, outcome, detail)
++        logger.info("Path disposal actor=%r reason=%r path=%r outcome=%s detail=%r empty_only=%s",
++                    actor, reason, checked, outcome, detail, empty_only)
+         return {"path": checked, "outcome": outcome, "detail": detail}
+ 
+     try:
+@@ -59,7 +62,16 @@ def dispose_path(path: str, *, actor: str, reason: str) -> dict:
+             mode = target.lstat().st_mode
+         except FileNotFoundError as exc:
+             return result("missing", str(exc))
+-        if stat.S_ISDIR(mode):
++        if empty_only:
++            if not stat.S_ISDIR(mode):
++                return result("refused", "empty_only: path is not a directory")
++            try:
++                os.rmdir(target)
++            except OSError as exc:
++                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
++                    return result("refused", "empty_only: directory is not empty")
++                raise
++        elif stat.S_ISDIR(mode):
+             shutil.rmtree(target)
+         else:
+             target.unlink()
+diff --git a/hermes_cli/plugins_context.py b/hermes_cli/plugins_context.py
+index 7c9b3c969e..195ac7d534 100644
+--- a/hermes_cli/plugins_context.py
++++ b/hermes_cli/plugins_context.py
+@@ -56,14 +56,14 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
+         """Return the effective registry id used for this plugin's namespaces."""
+         return _facade().manifest_key(self.manifest)
+ 
+-    def dispose_path(self, path: str, *, reason: str) -> dict:
++    def dispose_path(self, path: str, *, reason: str, empty_only: bool = False) -> dict:
+         """Dispose of one path through the host's scoped disposal executor.
+ 
+         Returns JSON path/outcome/detail data; refused is final. Callers must
+         not fall back to their own deletion, including an rm fallback.
+         """
+         from hermes_cli.path_disposal import dispose_path
+-        return dispose_path(path, actor=f"plugin:{self.manifest.name}", reason=reason)
++        return dispose_path(path, actor=f"plugin:{self.manifest.name}", reason=reason, empty_only=empty_only)
+ 
+     def has_plugin(self, plugin_id: str) -> bool:
+         """Return True when another plugin is loaded and enabled (runtime probe for advisory
+diff --git a/tests/hermes_cli/test_plugin_dispose_path.py b/tests/hermes_cli/test_plugin_dispose_path.py
+index 776e1c9c13..5abbca6b70 100644
+--- a/tests/hermes_cli/test_plugin_dispose_path.py
++++ b/tests/hermes_cli/test_plugin_dispose_path.py
+@@ -1,5 +1,6 @@
+ """Disposal policy and the real out-of-process ctx round trip."""
+ 
++import errno
+ import json
+ import logging
+ import os
+@@ -184,3 +185,206 @@ def test_host_crossing(tmp_path, monkeypatch, caplog):
+     finally:
+         manager.unload()
+         manager._plugin_host().shutdown()
++
++
++# Keep the original frozen host probe and its default-mode tests unchanged.
++HOST_EMPTY_PLUGIN = HOST_PLUGIN.replace(
++    'reason="expired via host")',
++    'reason="expired via host", empty_only=args["empty_only"])',
++)
++
++
++def empty_dispose(path):
++    return path_disposal.dispose_path(
++        str(path), actor="plugin:probe", reason="empty sweep", empty_only=True)
++
++
++def test_empty_only_directory(home, caplog):
++    path = home / "empty-dir"
++    path.mkdir()
++    ctx = PluginContext(SimpleNamespace(name="probe"), SimpleNamespace())
++    with caplog.at_level(logging.INFO, logger=path_disposal.__name__):
++        result = ctx.dispose_path(str(path), reason="empty sweep", empty_only=True)
++    assert result == {"path": str(path), "outcome": "disposed", "detail": ""}
++    assert not path.exists()
++    assert "empty_only=True" in caplog.text
++
++
++def test_empty_only_nonempty(home):
++    path = home / "nonempty"
++    path.mkdir()
++    (path / "keep").write_text("keep")
++    assert empty_dispose(path) == {
++        "path": str(path), "outcome": "refused", "detail": "empty_only: directory is not empty"}
++    assert (path / "keep").read_text() == "keep"
++
++
++@pytest.mark.parametrize("empty_only", [True, False])
++def test_empty_only_arrival(home, empty_only):
++    path = home / "observed-empty"
++    path.mkdir()
++    assert not any(path.iterdir())
++    (path / "arrival").write_text("arrived after observation")
++    result = path_disposal.dispose_path(
++        str(path), actor="plugin:probe", reason="sweep", empty_only=empty_only)
++    if empty_only:
++        assert result == {"path": str(path), "outcome": "refused",
++                          "detail": "empty_only: directory is not empty"}
++        assert (path / "arrival").read_text() == "arrived after observation"
++    else:
++        assert result == {"path": str(path), "outcome": "disposed", "detail": ""}
++        assert not path.exists()
++
++
++def test_empty_only_symlink(home):
++    target = home / "target-dir"
++    target.mkdir()
++    (target / "keep").write_text("keep")
++    link = home / "directory-link"
++    link.symlink_to(target, target_is_directory=True)
++    assert empty_dispose(link) == {
++        "path": str(link), "outcome": "refused", "detail": "empty_only: path is not a directory"}
++    assert link.is_symlink()
++    assert (target / "keep").read_text() == "keep"
++
++
++def test_empty_only_file(home):
++    path = home / "regular-file"
++    path.write_text("keep")
++    assert empty_dispose(path) == {
++        "path": str(path), "outcome": "refused", "detail": "empty_only: path is not a directory"}
++    assert path.read_text() == "keep"
++
++
++def test_empty_only_missing(home):
++    assert empty_dispose(home / "absent")["outcome"] == "missing"
++
++
++def test_empty_only_scope(home, tmp_path):
++    outside = tmp_path / "outside-empty"
++    outside.mkdir()
++    assert empty_dispose(outside)["outcome"] == "refused"
++    assert outside.is_dir()
++    assert empty_dispose(home)["outcome"] == "refused"
++    assert home.is_dir()
++
++
++@pytest.mark.parametrize("value", [1, "true", None])
++def test_empty_only_nonbool(home, value):
++    with pytest.raises(TypeError, match="empty_only"):
++        path_disposal.dispose_path(str(home / "absent"), actor="probe", reason="sweep", empty_only=value)
++
++
++@pytest.mark.parametrize("error", [PermissionError("controlled permission error"),
++                                  OSError(errno.EBUSY, "controlled busy error"),
++                                  OSError(errno.ENOTDIR, "controlled swapped-path error")])
++def test_empty_only_oserror(home, monkeypatch, error):
++    path = home / "busy"
++    path.mkdir()
++    calls = []
++    def fail(target):
++        calls.append(target)
++        raise error
++    with monkeypatch.context() as patcher:
++        patcher.setattr(os, "rmdir", fail)
++        result = empty_dispose(path)
++    assert result == {"path": str(path), "outcome": "error", "detail": str(error)}
++    assert calls == [path]
++    assert path.is_dir()
++
++
++@pytest.mark.parametrize("error_number", [errno.EEXIST, errno.ENOTEMPTY])
++def test_empty_only_notempty_errno(home, monkeypatch, error_number):
++    path = home / "notempty-error"
++    path.mkdir()
++    calls = []
++    def fail(target):
++        calls.append(target)
++        raise OSError(error_number, "controlled notempty error")
++    with monkeypatch.context() as patcher:
++        patcher.setattr(os, "rmdir", fail)
++        result = empty_dispose(path)
++    assert result == {"path": str(path), "outcome": "refused",
++                      "detail": "empty_only: directory is not empty"}
++    assert calls == [path]
++    assert path.is_dir()
++
++
++def test_empty_only_write_denied(home):
++    path = home / "state.db"
++    path.mkdir()
++    assert empty_dispose(path) == {
++        "path": str(path), "outcome": "refused", "detail": "path is write-denied"}
++    assert path.is_dir()
++
++
++def test_empty_only_tmp_root(home):
++    with tempfile.TemporaryDirectory(prefix="hermes-disposal-", dir="/tmp") as root:  # no-tmp: ok — policy fixture
++        assert empty_dispose(root)["outcome"] == "refused"
++        child = Path(root) / "empty"
++        child.mkdir()
++        assert empty_dispose(child) == {"path": str(child.resolve()), "outcome": "disposed", "detail": ""}
++        assert not child.exists()
++
++
++def test_empty_only_single_atomic_attempt(home, monkeypatch):
++    path = home / "atomic-empty"
++    path.mkdir()
++    calls = []
++    real_rmdir = os.rmdir
++    def remove(target):
++        calls.append(target)
++        # Simulate an arrival after lstat, immediately before the kernel operation.
++        (path / "arrival").write_text("keep")
++        return real_rmdir(target)
++    real_iterdir = Path.iterdir
++    def no_target_scan(target):
++        if target == path:
++            pytest.fail("empty_only must not pre-check emptiness")
++        return real_iterdir(target)
++    def forbidden(*args, **kwargs):
++        pytest.fail("empty_only must not recurse or unlink")
++    with monkeypatch.context() as patcher:
++        patcher.setattr(os, "rmdir", remove)
++        patcher.setattr(Path, "iterdir", no_target_scan)
++        patcher.setattr(path_disposal.shutil, "rmtree", forbidden)
++        patcher.setattr(Path, "unlink", forbidden)
++        result = empty_dispose(path)
++    assert result == {"path": str(path), "outcome": "refused",
++                      "detail": "empty_only: directory is not empty"}
++    assert calls == [path]
++    assert (path / "arrival").read_text() == "keep"
++
++
++@pytest.mark.parametrize("nonempty", [False, True])
++def test_host_crossing_empty_only(tmp_path, monkeypatch, nonempty):
++    from tools.registry import registry
++    home = _home_with_plugins(tmp_path, monkeypatch, {"disposal-probe": HOST_EMPTY_PLUGIN})
++    path = home / "host-directory"
++    path.mkdir()
++    if nonempty:
++        (path / "keep").write_text("keep")
++    manager = PluginManager()
++    manager.discover_and_load()
++    try:
++        assert manager._plugins["disposal-probe"].error is None
++        reply = json.loads(registry.dispatch(
++            "disposal_probe", {"path": str(path), "empty_only": True}, scope=manager.scope_key))
++        assert reply["pid"] != os.getpid()
++        ctx = PluginContext(SimpleNamespace(name="disposal-probe"), SimpleNamespace())
++        if nonempty:
++            assert (path / "keep").read_text() == "keep"
++        else:
++            assert not path.exists()
++            path.mkdir()
++        assert reply["result"] == ctx.dispose_path(
++            str(path), reason="expired via host", empty_only=True)
++        assert reply["result"]["outcome"] == ("refused" if nonempty else "disposed")
++        if nonempty:
++            assert reply["result"]["detail"] == "empty_only: directory is not empty"
++            assert (path / "keep").read_text() == "keep"
++        else:
++            assert not path.exists()
++    finally:
++        manager.unload()
++        manager._plugin_host().shutdown()
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index 85e413e44c..0d33a6ca9f 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -145,9 +145,10 @@ See [Register slash commands](../../developer-guide/plugins/index.md#register-sl
+ 
+ ## Guarded path disposal
+ 
+-`ctx.dispose_path(path: str, *, reason: str) -> dict` performs a one-shot,
+-host-owned disposal, including when the plugin runs out of process. **disk-cleanup
+-is the first intended consumer**; its migration to this seam is a separate change.
++`ctx.dispose_path(path: str, *, reason: str, empty_only: bool = False) -> dict`
++performs a one-shot, host-owned disposal, including when the plugin runs out of
++process. **disk-cleanup is the first intended consumer**: `_sweep_empty_dirs` uses
++`empty_only=True` in its separate migration to this seam.
+ 
+ The JSON result is `{"path": "<absolute checked path>", "outcome": "disposed",
+ "detail": ""}`. Outcomes are `disposed`, `missing`, `refused`, or `error`; the latter
+@@ -159,13 +160,32 @@ raise `TypeError` or `ValueError`.
+ Only paths strictly inside the active `HERMES_HOME` or a top-level `/tmp/hermes-*`
+ directory are eligible (including macOS's `/private/tmp` alias). Those roots
+ themselves and write-denied paths are refused. Parents are resolved before the
+-scope check, but the final symlink is not followed: disposal unlinks that link,
+-unlinks a file, or removes a directory tree. Every outcome logs the plugin actor,
+-reason and checked path, never file contents.
++scope check, but the final symlink is not followed. With `empty_only=False` (the
++unchanged default), disposal unlinks that link, unlinks a file, or removes a
++directory tree. Every outcome logs the plugin actor, reason, checked path and
++`empty_only=True` or `empty_only=False`, never file contents.
+ 
+-**A `refused` result is final. Never fall back to a plugin's own deletion or `rm`.**
+-The shared host executor is `hermes_cli.path_disposal.dispose_path(path, *, actor,
+-reason)`; this is where host custody policy can veto removal.
++With `empty_only=True`, the same scope and write-denied checks run first, then
++`lstat` inspects the final path without following symlinks:
++
++| Condition | Outcome | Detail |
++|---|---|---|
++| Missing at `lstat` | `missing` | OS error text |
++| Not a directory, including any symlink | `refused` | `empty_only: path is not a directory` |
++| Empty directory removed | `disposed` | Empty string |
++| `rmdir` reports `ENOTEMPTY` or `EEXIST` | `refused` | `empty_only: directory is not empty` |
++| Other OS error, including `ENOTDIR` after a path swap | `error` | OS error text |
++
++Removal calls `os.rmdir` exactly once: it is atomic and nonrecursive, with no
++emptiness pre-check, retry or recursive fallback. A file arriving after an earlier
++observation of emptiness is preserved. `empty_only` must be a real bool; integers,
++strings and `None` raise `TypeError`.
++
++**A `refused` result is final. Never fall back to a plugin's own deletion or `rm`.
++In particular, a refused non-empty directory must not be removed another way.**
++The shared host executor is
++`hermes_cli.path_disposal.dispose_path(path: str, *, actor: str, reason: str, empty_only: bool = False) -> dict`;
++this is where host custody policy can veto both removal modes.
+ 
+ ## Plugin discovery
+ 
+-- 
+2.43.0
+

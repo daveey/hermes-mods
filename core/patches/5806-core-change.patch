@@ -1,0 +1,172 @@
+From 7f5c035b71f5d16449f7c5fb6a5e7ca5fb31abc2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:47:51 +0000
+Subject: [PATCH] [daveey] Isolate annotation scheduler idle proof from
+ ancestor metadata
+
+Problem: native idle test refreshed before its intentional source unlink.
+Why: production watches ancestor names and an ancestor IN_ATTRIB is a source
+invalidation, even when source contents have not changed. Controlled utime
+reproduces the original updated.wait(61) assertion failure in 1.08 seconds;
+chmod emits the same native masks and must remain an invalidation.
+Root (happened): the scheduler-only idle fixture included shared ancestor
+metadata outside its owned input, so another actor could legitimately wake it.
+Historical attribution remains unknown: the CI log has no inotify provenance.
+Root (not caught): prior quiet-host retries did not inject ancestor metadata.
+Recurrence: existing event-loop test never isolated this subscription boundary.
+
+Keep production unchanged. Scope only the long scheduler fixture to its private
+source parent, retaining native descriptors, parsing, wait and removal delivery.
+Inject owned ancestor utime into the original test. Preserve all original61s,
+lease beat, exact read, <1s removal and <500cs/s assertions. Independently test
+production ancestor utime/chmod invalidation and unrelated sibling exclusion.
+
+Proof: historical a729187 and base c9d83070 versions of event loop, native watcher
+and original test are byte-identical. HERMES_TEST_FILE_RETRIES=0 canonical runs:
+baseline file4pass; baseline ID1pass; controlled pre-isolation ID fails at original
+idle assertion; fixed native/event suites27pass; fixed isolated ID1pass with
+61.01s idle case. Full scripts/check --base origin/main passes.
+---
+ tests/hermes_cli/annotation_idle_fixture.py   | 36 +++++++++++++++++++
+ .../hermes_cli/test_annotation_event_loop.py  | 13 +++++--
+ .../hermes_cli/test_annotation_file_events.py | 36 +++++++++++++++++++
+ 3 files changed, 83 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/annotation_idle_fixture.py
+
+diff --git a/tests/hermes_cli/annotation_idle_fixture.py b/tests/hermes_cli/annotation_idle_fixture.py
+new file mode 100644
+index 0000000000..c279be4cf6
+--- /dev/null
++++ b/tests/hermes_cli/annotation_idle_fixture.py
+@@ -0,0 +1,36 @@
++"""Private-root native adapter for the event-loop scheduler's idle proof only."""
++import os
++from pathlib import Path
++
++from hermes_cli.annotation_file_events import FileEvents
++
++
++class PrivateInputEvents(FileEvents):
++    """Keep real native waiting, but exclude shared ancestor subscriptions.
++
++    Production deliberately watches all ancestors, including access metadata.
++    Such a subscription cannot promise silence when another test changes a
++    shared ancestor. Its coverage is tested separately with ordinary FileEvents.
++    This fixture accepts just one existing private parent, with no discovery,
++    alias, or control semantics; it is not a substitute production adapter.
++    """
++
++    def __init__(self, source):
++        super().__init__()
++        self.source = source
++
++    def replace(self, files, *, directories=(), controls=()):
++        assert list(files) == [self.source]
++        assert not directories and not controls
++        assert self.source.parent.is_dir()
++        assert self.source == Path(os.path.realpath(self.source))
++        fd = self._open()
++        try:
++            wd = self._install(fd, self.source.parent)
++            assert wd is not None
++        except BaseException:
++            os.close(fd)
++            raise
++        old, self._fd = self._fd, fd
++        self._names = {wd: {self.source.name}}
++        os.close(old)
+diff --git a/tests/hermes_cli/test_annotation_event_loop.py b/tests/hermes_cli/test_annotation_event_loop.py
+index 65509bf39a..794ef6b8b8 100644
+--- a/tests/hermes_cli/test_annotation_event_loop.py
++++ b/tests/hermes_cli/test_annotation_event_loop.py
+@@ -1,5 +1,6 @@
+ """Real native waits with independent lease maintenance."""
+ import itertools
++import os
+ import resource
+ import threading
+ import time
+@@ -7,16 +8,20 @@ from types import SimpleNamespace
+ 
+ from hermes_cli.annotation_event_loop import run
+ from hermes_cli.annotation_file_events import FileEvents
++from tests.hermes_cli.annotation_idle_fixture import PrivateInputEvents
+ 
+ 
+ def test_idle_beats_do_not_read_inputs_and_change_wakes(tmp_path):
+-    source = tmp_path / 'source'
++    shared = tmp_path / 'shared'
++    private = shared / 'private'
++    private.mkdir(parents=True)
++    source = private / 'source'
+     source.write_text('one')
+     stop = threading.Event()
+     ready = threading.Event()
+     updated = threading.Event()
+     reads, beats = [], []
+-    with FileEvents() as events:
++    with PrivateInputEvents(source) as events:
+         def refresh():
+             events.replace([source])
+             reads.append(source.read_text() if source.exists() else None)
+@@ -35,6 +40,10 @@ def test_idle_beats_do_not_read_inputs_and_change_wakes(tmp_path):
+         thread.start()
+         try:
+             assert ready.wait(1)
++            # Controlled ambient metadata activity outside the private input root.
++            # Production must observe this (utime and chmod both emit IN_ATTRIB),
++            # but it is not part of this scheduler-only fixture's input contract.
++            os.utime(shared, None)
+             assert not updated.wait(61)
+             assert len(beats) >= 3
+             started = time.monotonic()
+diff --git a/tests/hermes_cli/test_annotation_file_events.py b/tests/hermes_cli/test_annotation_file_events.py
+index defef96680..39cfc27435 100644
+--- a/tests/hermes_cli/test_annotation_file_events.py
++++ b/tests/hermes_cli/test_annotation_file_events.py
+@@ -74,6 +74,42 @@ def test_file_write_wakes_without_input_polling(tmp_path):
+         assert not events.wait(0)
+ 
+ 
++@pytest.mark.parametrize('operation', ['utime', 'chmod'])
++def test_ancestor_attributes_invalidate_without_source_mutation(tmp_path, operation):
++    # Both metadata operations emit IN_ATTRIB. Suppressing the harmless utime
++    # packet would also suppress a real access change; keep production coverage.
++    ancestor = tmp_path / 'ancestor'
++    source = ancestor / 'private' / 'input'
++    source.parent.mkdir(parents=True)
++    source.write_text('unchanged')
++    with FileEvents() as events:
++        events.replace([source])
++        assert not events.wait(0)
++        if operation == 'utime':
++            os.utime(ancestor, None)
++        else:
++            ancestor.chmod(0o700)
++        assert events.wait(.8)
++        assert not events.control_only
++        assert source.read_text() == 'unchanged'
++
++
++def test_unrelated_sibling_activity_does_not_invalidate(tmp_path):
++    ancestor = tmp_path / 'ancestor'
++    source = ancestor / 'private' / 'input'
++    source.parent.mkdir(parents=True)
++    source.write_text('unchanged')
++    with FileEvents() as events:
++        events.replace([source])
++        sibling = ancestor / 'sibling'
++        sibling.mkdir()
++        (sibling / 'other').write_text('unrelated')
++        (ancestor / 'other').write_text('unrelated')
++        assert not events.wait(.1)
++        source.unlink()
++        assert events.wait(.8)
++
++
+ def test_high_descriptors_deliver_source_and_explicit_wake(tmp_path):
+     import fcntl
+     import resource
+-- 
+2.43.0
+

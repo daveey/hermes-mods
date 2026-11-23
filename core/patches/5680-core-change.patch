@@ -1,0 +1,203 @@
+From cb5a3d332444fb36e010a96b179913657bc9412f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:47:02 +0000
+Subject: [PATCH] [daveey] authenticate receipt-derived restrictions during
+ safety supersession
+
+Replay a capability-unavailable retain superseded by safety through actual feed apply; preserve monotone safety/accounting even when the separate canonical restriction annotation lags. Only an independently confirmed owned command and byte-equal event can bridge the feed; reserved historical or ACK-only lookalikes never attest themselves.
+
+Proof: receipt feed regression RED2 before correction; expanded retain/spend/refusal integration GREEN. No new hold ledger, release grant or provider execution.
+---
+ hermes_cli/kanban_refusal_receipt.py          |  3 +-
+ hermes_cli/kanban_spend_decision.py           | 43 ++++++++++++++++---
+ .../test_kanban_retain_attestation.py         | 29 +++++++++++++
+ tests/hermes_cli/test_kanban_retain_feed.py   | 14 ++++--
+ .../hermes_cli/test_kanban_retain_receipt.py  |  4 +-
+ 5 files changed, 80 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_retain_attestation.py
+
+diff --git a/hermes_cli/kanban_refusal_receipt.py b/hermes_cli/kanban_refusal_receipt.py
+index 56622f82e8..95b5ddaceb 100644
+--- a/hermes_cli/kanban_refusal_receipt.py
++++ b/hermes_cli/kanban_refusal_receipt.py
+@@ -24,11 +24,12 @@ def refusal_fields(result) -> dict:
+ 
+ def restricted(conn, task_id: str) -> bool:
+     """A safety restriction cannot be cleared by ordinary budget promotion/archive."""
++    from hermes_cli.kanban_spend_decision import receipt_restrictions
+     return conn.execute(
+         "SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
+         "('spend_budget_triaged','decision_hold_restricted') AND json_valid(payload) "
+         "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.cause') END='safety_refusal' "
+-        "LIMIT 1", (task_id,)).fetchone() is not None
++        "LIMIT 1", (task_id,)).fetchone() is not None or bool(receipt_restrictions(conn, task_id, safety_only=True))
+ 
+ 
+ def reclaim_admission(conn, row, *, failed_results_only=False):
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index cf1e9ebb2d..a8d2761dc8 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -50,13 +50,14 @@ def pending_episode(conn, task_id: str):
+         "SELECT * FROM task_events WHERE task_id=? AND kind IN "
+         "('spend_budget_triaged','decision_hold_restricted','decision_retained','promoted_manual','archived')", (task_id,))]
+     events.sort(key=_event_order, reverse=True)
++    receipts = {e['id'] for e in receipt_restrictions(conn, task_id)}
+     for event in events:
+         try:
+             payload = json.loads(event['payload'] or '{}')
+         except (TypeError, ValueError):
+             continue
+-        disposition = payload.get('disposition') if isinstance(payload, dict) else None
+-        if event['kind'] == 'decision_retained' and isinstance(disposition, dict) and disposition.get('reason') == 'scope_stopped':
++
++        if event['id'] in receipts:
+             return next((e for e in events if e['kind'] == EVENT and (e.get('uid') or str(e['id'])) == payload.get('episode_uid')), event)
+         if (isinstance(payload, dict) and payload.get('cause') in {'safety_refusal', 'scope_stopped'}
+                 and event['kind'] in (EVENT, 'decision_hold_restricted')):
+@@ -78,13 +79,41 @@ def execution_restricted(conn, task_id: str) -> bool:
+ 
+ def restricted_since(conn, task_id: str) -> int | None:
+     """One monotone restriction predicate for release fencing and accounting."""
+-    row = conn.execute("SELECT MIN(COALESCE(created_at,0)) FROM (SELECT created_at FROM task_events WHERE task_id=? AND kind IN "
++    row = conn.execute("SELECT MIN(COALESCE(created_at,0)) FROM task_events WHERE task_id=? AND kind IN "
+                         "('spend_budget_triaged','decision_hold_restricted') AND json_valid(payload) "
+                         "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.cause') END "
+-                        "IN ('safety_refusal','scope_stopped') UNION ALL SELECT created_at FROM task_events WHERE task_id=? "
+-                        "AND kind='decision_retained' AND json_valid(payload) AND CASE WHEN json_valid(payload) "
+-                        "THEN json_extract(payload,'$.disposition.reason') END='scope_stopped')", (task_id, task_id)).fetchone()
+-    return row[0]
++                        "IN ('safety_refusal','scope_stopped')", (task_id,)).fetchone()
++    times = [e['created_at'] or 0 for e in receipt_restrictions(conn, task_id)]
++    if row[0] is not None:
++        times.append(row[0])
++    return min(times) if times else None
++
++
++def receipt_restrictions(conn, task_id: str, *, safety_only: bool = False) -> list[dict]:
++    """Only locally independently confirmed receipts bridge a lagging restriction feed.
++
++    Historical reserved-kind lookalikes are not retroactively attested. Foreign
++    pickup relies on canonical STOP/RESTRICT rows, not locally invented custody.
++    """
++    import json
++    from hermes_cli.kanban_retain_transport import command, confirmed_command
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_failure_commands'").fetchone():
++        return []
++    out = []
++    for row in conn.execute("SELECT e.*,r.uid AS bound_run_uid FROM task_events e LEFT JOIN task_runs r ON r.id=e.run_id "
++                            "WHERE e.task_id=? AND e.kind='decision_retained'", (task_id,)):
++        event = dict(row)
++        run_uid = event['bound_run_uid']
++        owned = command(conn, run_uid)
++        if not owned or not confirmed_command(conn, task_id, run_uid) or owned.get('operation_kind') != 'retain':
++            continue
++        receipt = json.loads(owned['canonical_receipt_json'])
++        if event.get('uid') != owned['event_uid'] or json.loads(event['payload']) != receipt:
++            continue
++        safety = receipt.get('superseded_by_safety_stop') is True
++        if safety or not safety_only and receipt.get('disposition', {}).get('reason') == 'scope_stopped':
++            out.append(event)
++    return out
+ 
+ 
+ def unblock_refusal(conn, task_id: str) -> str | None:
+diff --git a/tests/hermes_cli/test_kanban_retain_attestation.py b/tests/hermes_cli/test_kanban_retain_attestation.py
+new file mode 100644
+index 0000000000..d8242490b7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_retain_attestation.py
+@@ -0,0 +1,29 @@
++"""A reserved event name is not attestation of historical or ACK-only evidence."""
++import json
++
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_refusal_receipt as refusal
++from tests.hermes_cli import test_kanban_retain_receipt as support
++
++live = support.live
++
++
++@pytest.mark.parametrize('state', ['unknown', 'acknowledged', 'confirmed_bad_uid', 'confirmed_bad_payload'])
++def test_receipt_restriction_requires_exact_independently_confirmed_custody(live, state):
++    owned, receipt, _, _hub = support.fixture(live)
++    receipt['superseded_by_safety_stop'] = True
++    rid = live.execute('SELECT id FROM task_runs WHERE uid=?', (owned['run_uid'],)).fetchone()[0]
++    with kb.write_txn(live):
++        kb._append_event(live, owned['task_id'], 'decision_retained', receipt, run_id=rid)
++        live.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='decision_retained'", (owned['event_uid'], owned['task_id']))
++        live.execute('UPDATE kanban_failure_commands SET delivery_state=?,canonical_receipt_json=? WHERE run_uid=?',
++                     ('confirmed' if state.startswith('confirmed') else state,json.dumps(receipt),owned['run_uid']))
++        if state == 'confirmed_bad_uid':
++            live.execute("UPDATE task_events SET uid='historical-lookalike' WHERE kind='decision_retained'")
++        if state == 'confirmed_bad_payload':
++            live.execute("UPDATE task_events SET payload='{}' WHERE kind='decision_retained'")
++    assert not decision.execution_restricted(live, owned['task_id'])
++    assert not refusal.restricted(live, owned['task_id'])
++    assert not decision.pending(live, owned['task_id'])
+diff --git a/tests/hermes_cli/test_kanban_retain_feed.py b/tests/hermes_cli/test_kanban_retain_feed.py
+index 5f3c5f6338..425f38b3a5 100644
+--- a/tests/hermes_cli/test_kanban_retain_feed.py
++++ b/tests/hermes_cli/test_kanban_retain_feed.py
+@@ -29,10 +29,11 @@ def test_feed_retained_claim_release_requires_exact_confirmed_command(live, conf
+ 
+ 
+ @pytest.mark.parametrize('feed_before_confirmation', [False, True])
+-def test_confirmed_projection_settles_ended_run_and_live_claim_atomically(live, feed_before_confirmation):
++@pytest.mark.parametrize('safety_superseded', [False, True])
++def test_confirmed_projection_settles_ended_run_and_live_claim_atomically(live, feed_before_confirmation, safety_superseded):
+     from hermes_cli import kanban_retain_transport as transport
+     from hermes_cli import kanban_db_sync as sync
+-    owned, receipt, rows, hub = support.fixture(live)
++    owned, receipt, rows, hub = support.fixture(live, reason='capability_unavailable' if safety_superseded else 'scope_stopped')
+     tid, uid = owned['task_id'], owned['run_uid']
+     with kbc.write_txn(live):
+         live.execute('UPDATE tasks SET claim_lock=?,worker_pid=?,worker_started_at=? WHERE id=?',
+@@ -44,6 +45,10 @@ def test_confirmed_projection_settles_ended_run_and_live_claim_atomically(live,
+     rows['task_events', owned['event_uid']]['version'] = 1
+     rows['tasks', tid].update(id=tid, title='Retained fixture', assignee='worker', lease_holder=None, lease_expires=None)
+     rows['task_events', receipt['episode_uid']]['payload'] = json.dumps({'accounting_boundary':False})
++    if safety_superseded:
++        receipt['superseded_by_safety_stop'] = True
++        rows['task_events', owned['event_uid']]['payload'] = json.dumps(receipt)
++        rows['task_runs', uid]['outcome'] = 'safety_refused'
+     with kbc.write_txn(live):
+         live.execute('UPDATE task_runs SET claim_lock=? WHERE uid=?', (kb._host_prefix() + ':1234', uid))
+     if feed_before_confirmation:
+@@ -54,11 +59,14 @@ def test_confirmed_projection_settles_ended_run_and_live_claim_atomically(live,
+     transport.project(live, hub, 'default', result)
+     task = kb.get_task(live, tid)
+     assert task.status == 'triage' and task.current_run_id is None and task.claim_lock is None
+-    assert live.execute('SELECT outcome FROM task_runs WHERE uid=?', (uid,)).fetchone()[0] == 'retained'
++    assert live.execute('SELECT outcome FROM task_runs WHERE uid=?', (uid,)).fetchone()[0] == ('safety_refused' if safety_superseded else 'retained')
+     assert sync.sync_state(live)['cursor'] == cursor
+     assert not sync.outbox(live)
+     from hermes_cli import kanban_spend_decision as decision
+     assert decision.execution_restricted(live, tid)
++    if safety_superseded:
++        from hermes_cli.kanban_refusal_receipt import restricted
++        assert restricted(live, tid)
+     with kbc.write_txn(live):
+         kb._append_event(live, tid, 'promoted_manual', {})
+     assert decision.pending(live, tid)
+diff --git a/tests/hermes_cli/test_kanban_retain_receipt.py b/tests/hermes_cli/test_kanban_retain_receipt.py
+index cd01fa99eb..8a68abe5b1 100644
+--- a/tests/hermes_cli/test_kanban_retain_receipt.py
++++ b/tests/hermes_cli/test_kanban_retain_receipt.py
+@@ -11,9 +11,9 @@ from tests.hermes_cli import test_kanban_retain_transport as support
+ live = support.live
+ 
+ 
+-def fixture(conn):
++def fixture(conn, reason='scope_stopped'):
+     tid, rid = support.support._running(conn)
+-    owned = support.reserve(conn, tid, rid)
++    owned = support.reserve(conn, tid, rid, reason=reason)
+     wire = json.loads(owned['request_json'])
+     episode = 'fixture-stop'
+     gateway = 'fixture-gateway'
+-- 
+2.43.0
+

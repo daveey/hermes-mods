@@ -1,0 +1,376 @@
+From 942587e4589a7d40cfa71f7421e8246c5b561371 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:40:41 +0000
+Subject: [PATCH] feat(plugins): add one-shot guarded ctx.dispose_path seam
+ [daveey]
+
+Add host-owned hermes_cli.path_disposal.dispose_path and the JSON-only
+PluginContext.dispose_path(path: str, *, reason: str) -> dict entrypoint.
+Check parent-resolved/final-component-unfollowed scope and write denial
+before unlink/rmtree; report disposed, missing, refused or error and log
+actor/reason/path/outcome. A refusal is final, with no deletion fallback.
+
+Consumer: disk-cleanup, whose stage-3 migration remains exclusively owned
+by t_5885a5694e360983 and https://github.com/example-org/hermes/pull/3366.
+This own-PR-first seam changes no disk-cleanup or custody files and adds
+no veto registry or plugin_api.json listing (ctx methods are reflected
+into the existing plugin host's ctx_methods).
+
+Proof:
+- Canonical scripts/run_tests.sh: new disposal tests plus unchanged
+  test_plugins_context.py, test_plugin_host.py, test_disk_cleanup_plugin.py,
+  test_boundary_lint.py and test_docs_drift.py: 88 passed, 1 skipped.
+- Guard-deleted RED: replace the scope refusal condition with False;
+  test_outside, test_home_root, test_traversal,
+  test_parent_symlink_traversal and test_tmp_root_and_child all fail (5).
+- Guard-deleted RED: replace is_write_denied condition with False;
+  test_write_denied fails (1). Restore both guards and canonical rerun
+  passes, together with the mcp structured-content ctx consumer tests.
+- Real unprivileged read-only parent returns error; real plugin host
+  child round-trips disposed/missing dicts and plugin actor audit logs.
+- scripts/hermes-python scripts/check --base origin/main: 21 checks pass.
+- Boundary baseline and plugin_api.json unchanged. Docs include capability
+  row, signature/outcomes/scope/no-fallback and disk-cleanup consumer.
+
+Hermes-Card: t_ab7f964a3f3e3ef1
+---
+ hermes_cli/path_disposal.py                  |  68 +++++++
+ hermes_cli/plugins_context.py                |   9 +
+ tests/hermes_cli/test_plugin_dispose_path.py | 186 +++++++++++++++++++
+ website/docs/user-guide/features/plugins.md  |  25 +++
+ 4 files changed, 288 insertions(+)
+ create mode 100644 hermes_cli/path_disposal.py
+ create mode 100644 tests/hermes_cli/test_plugin_dispose_path.py
+
+diff --git a/hermes_cli/path_disposal.py b/hermes_cli/path_disposal.py
+new file mode 100644
+index 0000000000..d0c87d0c64
+--- /dev/null
++++ b/hermes_cli/path_disposal.py
+@@ -0,0 +1,68 @@
++"""One-shot host-owned path disposal, shared by plugin callers and custody policy."""
++
++from __future__ import annotations
++
++import logging
++import os
++import shutil
++import stat
++from pathlib import Path
++
++from agent.file_safety import is_write_denied
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++
++def dispose_path(path: str, *, actor: str, reason: str) -> dict:
++    """Dispose of one scoped path without following its final symlink.
++
++    Return JSON data with path, outcome (disposed/missing/refused/error), and detail.
++    A refusal is final: callers must not fall back to their own deletion.
++    Check and removal deliberately live together here so custody policy can veto
++    disposal before any filesystem mutation.
++    """
++    if not isinstance(path, str):
++        raise TypeError("path must be a string")
++    if not isinstance(reason, str):
++        raise TypeError("reason must be a string")
++    if not reason.strip():
++        raise ValueError("reason must not be empty or blank")
++    if not isinstance(actor, str):
++        raise TypeError("actor must be a string")
++    if not path or "\x00" in path:
++        raise ValueError("path must not be empty or contain NUL")
++
++    checked = os.path.abspath(path)
++
++    def result(outcome: str, detail: str = "") -> dict:
++        logger.info("Path disposal actor=%r reason=%r path=%r outcome=%s detail=%r",
++                    actor, reason, checked, outcome, detail)
++        return {"path": checked, "outcome": outcome, "detail": detail}
++
++    try:
++        candidate = Path(path)
++        # Resolve parents before normalizing '..'; abspath first would hide a
++        # symlink-parent traversal. Never resolve the final link itself.
++        checked = os.path.abspath(candidate.parent.resolve() / candidate.name)
++        target = Path(checked)
++        home = get_hermes_home().resolve()
++        tmp = Path("/tmp").resolve()  # no-tmp: ok — POSIX alias detection, not scratch allocation
++        in_home = target != home and target.is_relative_to(home)
++        tmp_parts = target.relative_to(tmp).parts if target.is_relative_to(tmp) else ()
++        in_tmp = len(tmp_parts) > 1 and tmp_parts[0].startswith("hermes-")
++        if target == home or not (in_home or in_tmp):
++            return result("refused", "path is not strictly inside an allowed disposal root")
++        if is_write_denied(checked):
++            return result("refused", "path is write-denied")
++        try:
++            mode = target.lstat().st_mode
++        except FileNotFoundError as exc:
++            return result("missing", str(exc))
++        if stat.S_ISDIR(mode):
++            shutil.rmtree(target)
++        else:
++            target.unlink()
++        return result("disposed")
++    except OSError as exc:
++        return result("error", str(exc))
+diff --git a/hermes_cli/plugins_context.py b/hermes_cli/plugins_context.py
+index 6135b0b46c..7c9b3c969e 100644
+--- a/hermes_cli/plugins_context.py
++++ b/hermes_cli/plugins_context.py
+@@ -56,6 +56,15 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
+         """Return the effective registry id used for this plugin's namespaces."""
+         return _facade().manifest_key(self.manifest)
+ 
++    def dispose_path(self, path: str, *, reason: str) -> dict:
++        """Dispose of one path through the host's scoped disposal executor.
++
++        Returns JSON path/outcome/detail data; refused is final. Callers must
++        not fall back to their own deletion, including an rm fallback.
++        """
++        from hermes_cli.path_disposal import dispose_path
++        return dispose_path(path, actor=f"plugin:{self.manifest.name}", reason=reason)
++
+     def has_plugin(self, plugin_id: str) -> bool:
+         """Return True when another plugin is loaded and enabled (runtime probe for advisory
+         ``requires_plugins``, #64165). Matches on registry key or manifest name."""
+diff --git a/tests/hermes_cli/test_plugin_dispose_path.py b/tests/hermes_cli/test_plugin_dispose_path.py
+new file mode 100644
+index 0000000000..776e1c9c13
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_dispose_path.py
+@@ -0,0 +1,186 @@
++"""Disposal policy and the real out-of-process ctx round trip."""
++
++import json
++import logging
++import os
++from pathlib import Path
++import tempfile
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import path_disposal
++from hermes_cli.plugin_isolation import HOST_SKIPPED_CTX_METHODS, HOST_UNSUPPORTED_CTX_METHODS
++from hermes_cli.plugins import PluginContext, PluginManager
++from tests.hermes_cli.test_plugin_host import _home_with_plugins
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "hermes-home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    return root
++
++
++def dispose(path, reason="expired test cache"):
++    return path_disposal.dispose_path(str(path), actor="plugin:probe", reason=reason)
++
++
++def test_file_and_actor(home, caplog):
++    path = home / "cache-file"
++    path.write_text("private contents must not be logged")
++    ctx = PluginContext(SimpleNamespace(name="probe"), SimpleNamespace())
++    with caplog.at_level(logging.INFO, logger=path_disposal.__name__):
++        assert ctx.dispose_path(str(path), reason="expired") == {
++            "path": str(path), "outcome": "disposed", "detail": ""}
++    assert not path.exists()
++    assert "plugin:probe" in caplog.text and "expired" in caplog.text
++    assert str(path) in caplog.text and "disposed" in caplog.text
++    assert "private contents" not in caplog.text
++
++
++def test_directory(home):
++    path = home / "cache-dir"
++    (path / "nested").mkdir(parents=True)
++    (path / "nested" / "data").write_text("cache")
++    assert dispose(path)["outcome"] == "disposed"
++    assert not path.exists()
++
++
++def test_missing(home):
++    assert dispose(home / "absent")["outcome"] == "missing"
++
++
++def test_outside(home, tmp_path):
++    path = tmp_path / "ordinary-control"
++    path.write_text("keep")
++    assert dispose(path)["outcome"] == "refused"
++    assert path.read_text() == "keep"
++
++
++def test_home_root(home):
++    (home / "keep").write_text("keep")
++    assert dispose(home)["outcome"] == "refused"
++    assert (home / "keep").read_text() == "keep"
++
++
++def test_final_symlink(home, tmp_path):
++    target = tmp_path / "outside-target"
++    target.write_text("keep")
++    link = home / "link"
++    link.symlink_to(target)
++    assert dispose(link) == {"path": str(link), "outcome": "disposed", "detail": ""}
++    assert not link.is_symlink()
++    assert target.read_text() == "keep"
++
++
++def test_traversal(home, tmp_path):
++    path = tmp_path / "outside-traversal"
++    path.write_text("keep")
++    assert dispose(home / ".." / path.name)["outcome"] == "refused"
++    assert path.read_text() == "keep"
++
++
++def test_parent_symlink_traversal(home, tmp_path):
++    outside = tmp_path / "outside-dir"
++    (outside / "nested").mkdir(parents=True)
++    target = outside / "keep"
++    target.write_text("keep")
++    (home / "parent-link").symlink_to(outside / "nested", target_is_directory=True)
++    result = dispose(home / "parent-link" / ".." / "keep")
++    assert result["path"] == str(target)
++    assert result["outcome"] == "refused"
++    assert target.read_text() == "keep"
++
++
++def test_write_denied(home):
++    path = home / "state.db"
++    path.write_text("{}")
++    assert dispose(path)["outcome"] == "refused"
++    assert path.read_text() == "{}"
++
++
++@pytest.mark.platforms("posix")
++def test_read_only_parent_error(home):
++    parent = home / "readonly"
++    parent.mkdir()
++    path = parent / "data"
++    path.write_text("keep")
++    parent.chmod(0o500)
++    try:
++        result = dispose(path)
++        assert result["outcome"] == "error"
++        assert result["detail"]
++        assert path.read_text() == "keep"
++    finally:
++        parent.chmod(0o700)
++
++
++def test_oserror_text(home, monkeypatch):
++    path = home / "data"
++    path.write_text("keep")
++    def fail(self, *args, **kwargs):
++        raise OSError("controlled unlink error")
++    monkeypatch.setattr(Path, "unlink", fail)
++    assert dispose(path) == {"path": str(path), "outcome": "error", "detail": "controlled unlink error"}
++
++
++@pytest.mark.parametrize("reason", ["", " ", "\n\t"])
++def test_blank_reason(home, reason):
++    with pytest.raises(ValueError):
++        dispose(home / "absent", reason=reason)
++
++
++@pytest.mark.parametrize("path", [None, 1, Path("relative")])
++def test_non_string_path(path):
++    with pytest.raises(TypeError):
++        path_disposal.dispose_path(path, actor="plugin:probe", reason="test")
++
++
++def test_tmp_root_and_child(home):
++    # Deliberate root fixture: exercise the literal /tmp allowlist, not TMPDIR.
++    with tempfile.TemporaryDirectory(prefix="hermes-disposal-", dir="/tmp") as root:  # no-tmp: ok — policy fixture
++        path = Path(root) / "cache"
++        path.write_text("cache")
++        assert dispose(root)["outcome"] == "refused"
++        assert path.exists()
++        assert dispose(path)["outcome"] == "disposed"
++
++
++HOST_PLUGIN = '''
++import json, os
++
++def register(ctx):
++    assert "dispose_path" in ctx._methods
++    def handler(args, **kw):
++        result = ctx.dispose_path(args["path"], reason="expired via host")
++        return json.dumps({"result": result, "pid": os.getpid()})
++    ctx.register_tool(name="disposal_probe", toolset="disposal_probe",
++        schema={"name": "disposal_probe", "description": "test",
++                "parameters": {"type": "object", "properties": {}}}, handler=handler)
++'''
++
++
++def test_host_crossing(tmp_path, monkeypatch, caplog):
++    from tools.registry import registry
++    assert "dispose_path" not in HOST_UNSUPPORTED_CTX_METHODS
++    assert "dispose_path" not in HOST_SKIPPED_CTX_METHODS
++    home = _home_with_plugins(tmp_path, monkeypatch, {"disposal-probe": HOST_PLUGIN})
++    path = home / "cache-file"
++    path.write_text("cache")
++    manager = PluginManager()
++    manager.discover_and_load()
++    try:
++        assert manager._plugins["disposal-probe"].error is None
++        with caplog.at_level(logging.INFO, logger=path_disposal.__name__):
++            reply = json.loads(registry.dispatch("disposal_probe", {"path": str(path)}, scope=manager.scope_key))
++        assert reply["pid"] != os.getpid()
++        assert reply["result"] == {"path": str(path), "outcome": "disposed", "detail": ""}
++        assert "plugin:disposal-probe" in caplog.text
++        assert not path.exists()
++        missing = json.loads(registry.dispatch("disposal_probe", {"path": str(path)}, scope=manager.scope_key))
++        assert missing["result"]["outcome"] == "missing"
++    finally:
++        manager.unload()
++        manager._plugin_host().shutdown()
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index b9326ec94a..85e413e44c 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -113,6 +113,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
+ | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
+ | Inject messages | `ctx.inject_message(content, role="user", session_key=... \| origin=...)` - see [Injecting Messages](#injecting-messages) |
+ | Post and edit a status message | `handle = ctx.post_message(text)`, then `handle.edit(text)` — see [Posting a live message](#posting-a-live-message) |
++| Dispose of a path through host policy | `ctx.dispose_path(path, reason="expired cache")` — see [Guarded path disposal](#guarded-path-disposal) |
+ | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
+ | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
+ | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
+@@ -142,6 +143,30 @@ The classic CLI waits for the reply for as long as the handler runs. Ctrl+C stop
+ See [Register slash commands](../../developer-guide/plugins/index.md#register-slash-commands).
+ :::
+ 
++## Guarded path disposal
++
++`ctx.dispose_path(path: str, *, reason: str) -> dict` performs a one-shot,
++host-owned disposal, including when the plugin runs out of process. **disk-cleanup
++is the first intended consumer**; its migration to this seam is a separate change.
++
++The JSON result is `{"path": "<absolute checked path>", "outcome": "disposed",
++"detail": ""}`. Outcomes are `disposed`, `missing`, `refused`, or `error`; the latter
++three include an explanatory `detail`. Missing paths, policy refusals and OS errors
++are returned rather than raised. Invalid argument types or an empty/blank reason
++raise `TypeError` or `ValueError`.
++
++<!-- no-tmp: ok — documents the disposal allowlist, not scratch allocation -->
++Only paths strictly inside the active `HERMES_HOME` or a top-level `/tmp/hermes-*`
++directory are eligible (including macOS's `/private/tmp` alias). Those roots
++themselves and write-denied paths are refused. Parents are resolved before the
++scope check, but the final symlink is not followed: disposal unlinks that link,
++unlinks a file, or removes a directory tree. Every outcome logs the plugin actor,
++reason and checked path, never file contents.
++
++**A `refused` result is final. Never fall back to a plugin's own deletion or `rm`.**
++The shared host executor is `hermes_cli.path_disposal.dispose_path(path, *, actor,
++reason)`; this is where host custody policy can veto removal.
++
+ ## Plugin discovery
+ 
+ | Source | Path | Use case |
+-- 
+2.43.0
+

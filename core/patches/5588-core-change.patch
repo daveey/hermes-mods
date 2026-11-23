@@ -1,0 +1,199 @@
+From 9cc55fa7ecd61c241d180a7177389b96a7ab69fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:25:37 +0000
+Subject: [PATCH] test(kanban): retain pickup pacing and claim custody with
+ neutral routes [daveey]
+
+---
+ .../test_kanban_claim_pull_fence.py           |  6 +++
+ .../test_kanban_default_assignee.py           |  4 ++
+ .../hermes_cli/test_kanban_dispatch_owner.py  | 13 ++++-
+ .../test_kanban_pickup_paced_window.py        | 48 +++++++++++++++++--
+ .../test_kanban_placement_runs_on.py          |  2 +-
+ .../test_kanban_turn_owner_pickup.py          | 11 +++--
+ 6 files changed, 74 insertions(+), 10 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_claim_pull_fence.py b/tests/hermes_cli/test_kanban_claim_pull_fence.py
+index b6e889e53d..35c1c8dfd2 100644
+--- a/tests/hermes_cli/test_kanban_claim_pull_fence.py
++++ b/tests/hermes_cli/test_kanban_claim_pull_fence.py
+@@ -177,6 +177,12 @@ def plain_home(tmp_path, monkeypatch):
+     home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    profile = home / "profiles" / "alice"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text(_managed_yaml())
++    assert _assignee_config("alice")["model_routing"]["enabled"]
+     kb.init_db()
+     return home
+ 
+diff --git a/tests/hermes_cli/test_kanban_default_assignee.py b/tests/hermes_cli/test_kanban_default_assignee.py
+index 4d8801a347..4e2f52f41a 100644
+--- a/tests/hermes_cli/test_kanban_default_assignee.py
++++ b/tests/hermes_cli/test_kanban_default_assignee.py
+@@ -19,6 +19,10 @@ def isolated_kanban_home(tmp_path, monkeypatch):
+     test_home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(test_home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    (test_home / "config.yaml").write_text(_managed_yaml())
++    assert _assignee_config("default")["model_routing"]["enabled"]
+     from hermes_cli import kanban_db
+     yield kanban_db, test_home
+ 
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner.py b/tests/hermes_cli/test_kanban_dispatch_owner.py
+index b58fd7b331..8cb59b2d70 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner.py
+@@ -101,12 +101,23 @@ def test_allowed_tick_really_claims_and_spawns(board_db, monkeypatch, kind):
+     monkeypatch.setattr(kbd, "reap_terminal_workers", lambda conn: [])
+     tid = kb.create_task(conn, title="Dispatchable card", assignee="default")
+     spawn = Mock(return_value=None)
++    preview = kbd.dispatch_once(conn, dispatcher_id="owner" if kind == "owned" else None,
++                                spawn_fn=spawn, reconcile_orphans=False, dry_run=True)
++    assert preview.skipped_ineligible == [(tid, "model_unroutable:routing_disabled")]
++    assert not preview.spawned and not kb.list_runs(conn, tid)
++    spawn.assert_not_called()
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    home = Path.home() / "home"
++    (home / "config.yaml").write_text(_managed_yaml())
++    assert _assignee_config("default")["model_routing"]["enabled"]
+     result = kbd.dispatch_once(conn, dispatcher_id="owner" if kind == "owned" else None,
+                                spawn_fn=spawn, reconcile_orphans=False)
+     assert result.skipped_owned is False
+     assert result.ownership_error is None
+     assert result.dispatch_owner == ("owner" if kind == "owned" else None)
+-    assert [row[0] for row in result.spawned] == [tid]
++    assert not result.respawn_guarded, result.respawn_guarded
++    assert [row[0] for row in result.spawned] == [tid], result
+     assert spawn.call_count == 1
+     task = kb.get_task(conn, tid)
+     assert task is not None
+diff --git a/tests/hermes_cli/test_kanban_pickup_paced_window.py b/tests/hermes_cli/test_kanban_pickup_paced_window.py
+index cd9d9791d5..cf8509f888 100644
+--- a/tests/hermes_cli/test_kanban_pickup_paced_window.py
++++ b/tests/hermes_cli/test_kanban_pickup_paced_window.py
+@@ -14,10 +14,40 @@ from tests.hermes_cli import kanban_pacing_state as pacing_state
+ from tests.hermes_cli import test_kanban_worker_node as support
+ 
+ svc = support.svc
+-gws = support.gws
++base_gws = support.gws
+ WINDOW = 9
+ 
+ 
++def configure_pool_profile(gateway, name, provider):
++    """Real isolated execution profiles; pacing observes eligible routes, not card pins."""
++    import json
++    from hermes_cli.config_effective import load_profile_config_effective
++    from hermes_cli.kanban_model_assignment import _assignee_config
++
++    gateway.enter()
++    config = load_profile_config_effective(gateway.home / "config.yaml", fail_closed=True)
++    policy = config["model_routing"]
++    policy["routes"] = {
++        level: [route for route in routes if route["provider"] == provider]
++        for level, routes in policy["routes"].items()
++        if any(route["provider"] == provider for route in routes)
++    }
++    profile = gateway.home / "profiles" / name
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text(json.dumps(config))
++    effective = _assignee_config(name)
++    assert effective is not None
++    assert effective["model_routing"] == policy
++
++
++@pytest.fixture
++def gws(base_gws):
++    for gateway in base_gws:
++        configure_pool_profile(gateway, "paced", "openai-codex")
++        configure_pool_profile(gateway, "open", "anthropic")
++    return base_gws
++
++
+ @pytest.fixture
+ def pools(monkeypatch):
+     """Per-provider state: codex follows ``state['codex']`` (HELD = at reserve in v2), anthropic is open; each
+@@ -46,16 +76,24 @@ def imports(monkeypatch):
+ 
+ def _codex(hub, n):
+     hub.enter()
+-    ids = [kb.create_task(hub.conn, title=f"codex {i}", assignee="default", priority=100 - i, runs_on=["linux"],
+-                          model_override="gpt-5.5", provider_override="openai-codex") for i in range(n)]
++    ids = [kb.create_task(hub.conn, title=f"codex {i}", assignee="paced", priority=100 - i, runs_on=["linux"])
++           for i in range(n)]
++    for tid in ids:
++        task = kb.get_task(hub.conn, tid)
++        assert task is not None
++        assert (task.model_override, task.provider_override) == (None, None)
++        assert pd.candidate_providers(hub.conn, task, "ready") == ["openai-codex"]
+     hub.round()
+     return ids
+ 
+ 
+ def _anthropic(hub, priority=0):
+     hub.enter()
+-    tid = kb.create_task(hub.conn, title="anthropic", assignee="default", priority=priority, runs_on=["linux"],
+-                         model_override="claude-sonnet-5-5", provider_override="anthropic")
++    tid = kb.create_task(hub.conn, title="anthropic", assignee="open", priority=priority, runs_on=["linux"])
++    task = kb.get_task(hub.conn, tid)
++    assert task is not None
++    assert (task.model_override, task.provider_override) == (None, None)
++    assert pd.candidate_providers(hub.conn, task, "ready") == ["anthropic"]
+     hub.round()
+     return tid
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement_runs_on.py b/tests/hermes_cli/test_kanban_placement_runs_on.py
+index 66c31cbb96..7590707a38 100644
+--- a/tests/hermes_cli/test_kanban_placement_runs_on.py
++++ b/tests/hermes_cli/test_kanban_placement_runs_on.py
+@@ -43,7 +43,7 @@ def test_mandatory_model_pin_is_refused_not_silently_relaxed(mac):
+     mac["result"]["help"] = helpers.NEW_HELP
+     out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub",
+                                         "model": "example-model", "pin_mandatory": True}))
+-    assert out.get("code") == "placement_unavailable" and "pin_mandatory" in out["error"], out
++    assert "Kanban is model-neutral" in out["error"], out
+     assert mac["calls"] == [] and helpers._local_count() == 0
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_turn_owner_pickup.py b/tests/hermes_cli/test_kanban_turn_owner_pickup.py
+index 6112f07d5e..50b2dfeedb 100644
+--- a/tests/hermes_cli/test_kanban_turn_owner_pickup.py
++++ b/tests/hermes_cli/test_kanban_turn_owner_pickup.py
+@@ -18,10 +18,12 @@ from hermes_cli import kanban_llm_pacing as lp
+ from hermes_cli import kanban_llm_pacing_dispatch as pd
+ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli import kanban_pacing_state as pacing_state
++from tests.hermes_cli import test_kanban_pickup_paced_window as pickup
+ from tests.hermes_cli import test_kanban_worker_node as support
+ 
+ svc = support.svc
+-gws = support.gws
++base_gws = pickup.base_gws
++gws = pickup.gws
+ AGED_S = 90 * 60  # the aged codex queue: ready 90 min, like the 21 cards ahead of #3207's owner at 16:55Z
+ TURN_LEFT_S = 70 * 60
+ 
+@@ -55,8 +57,11 @@ def pools(monkeypatch):
+ 
+ 
+ def _codex(conn, title, *, aged):
+-    tid = kb.create_task(conn, title=title, assignee="default", priority=1000, runs_on=["linux"],
+-                         model_override="gpt-5.5", provider_override="openai-codex")
++    tid = kb.create_task(conn, title=title, assignee="paced", priority=1000, runs_on=["linux"])
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    assert (task.model_override, task.provider_override) == (None, None)
++    assert pd.candidate_providers(conn, task, "ready") == ["openai-codex"]
+     if aged:
+         old = int(time.time()) - AGED_S
+         conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old, tid))
+-- 
+2.43.0
+

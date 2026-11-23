@@ -1,0 +1,164 @@
+From 702affa8bf80869562446a999216d00259a3d2f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:53:55 +0000
+Subject: [PATCH] fix(fairness): reject overflowing clock bounds and cover
+ provenance branches [daveey]
+
+---
+ hermes_cli/kanban_fairness_journal.py         |  4 +-
+ scripts/kanban_fairness.py                    | 12 +++-
+ .../test_kanban_fairness_clock_bounds.py      | 62 +++++++++++++++++++
+ .../test_kanban_fairness_provenance.py        |  1 +
+ tests/hermes_cli/test_kanban_fairness_root.py |  2 +-
+ 5 files changed, 75 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_clock_bounds.py
+
+diff --git a/hermes_cli/kanban_fairness_journal.py b/hermes_cli/kanban_fairness_journal.py
+index 6965c057b2..7b7f8e9231 100644
+--- a/hermes_cli/kanban_fairness_journal.py
++++ b/hermes_cli/kanban_fairness_journal.py
+@@ -135,8 +135,8 @@ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_REC
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_fairness_clocks import register
+ 
+-    if clock_error_ns is not None and (type(clock_error_ns) is not int or clock_error_ns < 0):
+-        raise JournalError("clock_error_ns must be a nonnegative integer or None")
++    if clock_error_ns is not None and (type(clock_error_ns) is not int or not 0 <= clock_error_ns < 2**63):
++        raise JournalError("clock_error_ns must be a nonnegative signed-64-bit integer or None")
+     register(conn)
+     if not capture_id or not all(c.isalnum() or c in "-_." for c in capture_id):
+         raise JournalError("capture id must be letters, digits, '-', '_' or '.'")
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index 5a4c6cc5da..b4a22e5204 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -26,6 +26,7 @@ from __future__ import annotations
+ import argparse
+ import hashlib
+ import json
++import math
+ import subprocess
+ import sys
+ 
+@@ -75,8 +76,14 @@ def _policy() -> dict:
+ 
+ def _arm(args) -> int:
+     out = Path(args.out)
+-    if getattr(args, "writer_clocks", False) and not args.db:
++    if args.writer_clocks and not args.db:
+         raise ValueError("writer clocks require explicit --db and exclusively controlled upgraded writers")
++    clock_error_ns = None
++    if args.writer_clocks:
++        scaled = args.clock_error_s * 1_000_000_000
++        if not math.isfinite(scaled) or not 0 <= scaled < 2**63:
++            raise ValueError("clock-error-s must yield a nonnegative signed-64-bit nanosecond bound")
++        clock_error_ns = int(scaled)
+     if args.db:
+         db = args.db
+     else:
+@@ -110,8 +117,7 @@ def _arm(args) -> int:
+             armed = True  # Keep the plan unless rollback is positively established.
+             try:
+                 state = journal.arm(conn, args.capture_id, replace=args.replace,
+-                                    clock_error_ns=int(args.clock_error_s * 1_000_000_000)
+-                                    if getattr(args, "writer_clocks", False) else None)
++                                    clock_error_ns=clock_error_ns)
+             except BaseException:
+                 conn.rollback()  # Also discard a transaction interrupted by Ctrl-C.
+                 armed = conn.execute("PRAGMA schema_version").fetchone()[0] != schema_before
+diff --git a/tests/hermes_cli/test_kanban_fairness_clock_bounds.py b/tests/hermes_cli/test_kanban_fairness_clock_bounds.py
+new file mode 100644
+index 0000000000..8745e85325
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_clock_bounds.py
+@@ -0,0 +1,62 @@
++"""Clock bounds and pre-upgrade capture compatibility at the persisted boundary."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_fairness_clocks as clocks
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli import kanban_fairness_store as store
++from tests.hermes_cli import test_kanban_fairness_journal as helpers
++from tests.hermes_cli import test_kanban_fairness_vertical as vertical_helpers
++
++conn = helpers.conn
++
++
++@pytest.mark.parametrize("bound", [2**63, 10**40])
++def test_out_of_sqlite_range_clock_bound_refuses_before_replace(conn, bound):
++    journal.arm(conn, "original")
++    with pytest.raises(journal.JournalError, match="clock_error_ns"):
++        journal.arm(conn, "bad", replace=True, clock_error_ns=bound)
++    assert journal.status(conn)["capture_id"] == "original"
++
++
++@pytest.mark.parametrize("bound", ["inf", "-inf", "nan", "1e30", "1e300", "-1"])
++def test_cli_invalid_clock_bound_is_tool_error_without_capture(conn, tmp_path, bound):
++    out = tmp_path / "invalid"
++    result = vertical_helpers.cli.main([
++        "capture", "arm", "--out", str(out), "--capture-id", "bad",
++        "--db", journal.identity(conn)["path"], "--writer-clocks", "--clock-error-s=" + bound])
++    assert result == 3
++    assert journal.status(conn) is None
++    assert not (out / "plan.json").exists()
++
++
++def test_sample_bound_includes_sampling_interval(monkeypatch):
++    ticks = iter([100, 137])
++    monkeypatch.setattr(clocks.time, "monotonic_ns", lambda: next(ticks))
++    monkeypatch.setattr(clocks.time, "time_ns", lambda: 123456789)
++    assert json.loads(clocks.sample(20)) == {
++        "wall_ns": 123456789, "mono_ns": 100, "clock_error_ns": 57}
++
++
++def test_deep_persisted_clock_reports_gap_without_advancing(conn, tmp_path):
++    kb.create_task(conn, title="deep", assignee="a")
++    journal.arm(conn, "deep", clock_error_ns=0)
++    depth = 100000  # Exceed both Python and native JSON decoder recursion limits.
++    raw = "[" * depth + "0" + "]" * depth
++    with pytest.raises(RecursionError):
++        json.loads(raw)
++    conn.execute(f"UPDATE {journal.JOURNAL} SET clock_json=?", (raw,))
++    receipts = store.drain(conn, tmp_path)
++    assert "export_failed" in {g["code"] for g in receipts["gaps"]}
++    assert receipts["journal_seq"] == 0
++
++
++def test_pre_upgrade_session_can_be_inspected_and_sealed(conn):
++    journal.arm(conn, "old")
++    conn.execute(f"ALTER TABLE {journal.SESSION} DROP COLUMN clock_error_ns")
++    assert journal.status(conn)["triggers_complete"] is True
++    sealed = journal.seal(conn)
++    assert sealed["sealed_ms"] is not None
++    assert sealed["trigger_integrity"] is True
+diff --git a/tests/hermes_cli/test_kanban_fairness_provenance.py b/tests/hermes_cli/test_kanban_fairness_provenance.py
+index a7aefcc7be..415fcc8d3e 100644
+--- a/tests/hermes_cli/test_kanban_fairness_provenance.py
++++ b/tests/hermes_cli/test_kanban_fairness_provenance.py
+@@ -37,6 +37,7 @@ def test_writer_clocks_survive_later_export_and_reopen(conn, tmp_path):
+     persisted = conn.execute(f"SELECT source_uid, clock_json FROM {journal.JOURNAL} ORDER BY seq").fetchall()
+     assert uids == [row[0] for row in persisted]
+     assert [r["mono_ns"] for r in records] == [json.loads(row[1])["mono_ns"] for row in persisted]
++    assert [r["wall_ns"] for r in records] == [json.loads(row[1])["wall_ns"] for row in persisted]
+ 
+ 
+ def test_clock_observation_rolls_back_with_writer(conn):
+diff --git a/tests/hermes_cli/test_kanban_fairness_root.py b/tests/hermes_cli/test_kanban_fairness_root.py
+index 519319a90a..d6c5231d69 100644
+--- a/tests/hermes_cli/test_kanban_fairness_root.py
++++ b/tests/hermes_cli/test_kanban_fairness_root.py
+@@ -127,7 +127,7 @@ def test_arm_ceiling_applies_before_database_activation(tmp_path, monkeypatch):
+     monkeypatch.setattr(cli, "_connect", lambda *a: pytest.fail("database activated before plan budget"))
+     args = SimpleNamespace(out=str(tmp_path / "small"), db="unused", board="default", replica=False,
+                            replace=False, capture_id="small", clock_error_s=0, apply_lag_s=0,
+-                           unclaimed_exit="unknown")
++                           unclaimed_exit="unknown", writer_clocks=False)
+     with pytest.raises(budget.BudgetExceeded):
+         cli._arm(args)
+     assert budget._limit(tmp_path / "small") == 64
+-- 
+2.43.0
+

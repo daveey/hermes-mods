@@ -1,0 +1,214 @@
+From a3d9c6f10f9b2572cdf95cb99ea855bf5596761f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:02:56 +0000
+Subject: [PATCH] fix(state): record refresh custody and bounded caller
+ provenance [daveey]
+
+Prospective observability repair only; earlier producer attribution remains unproven. Existing custody events omit refresh and invoking call sites, so even first-flush refusal cannot correlate every ownership operation. Add real refresh rowcount plus bounded code-location chains to existing transaction/settlement events; no ownership or persistence policy changes.
+
+Proof: unchanged-base first-assistant/tool-round gate fixture fails 6 cases at absent refresh event; patched fixture passes 6. Eight existing consumer suites pass 221 tests. Missing/mismatch refuse before dispatcher and UI, valid flush persists once across repeat; zero-row refresh never recreates ownership. Full scripts/check passes. No live fault injection, prompt or credential values recorded.
+---
+ hermes_state_compression.py                   |   7 +-
+ hermes_state_lease_custody.py                 |  26 +++-
+ .../test_first_assistant_flush_custody.py     | 115 ++++++++++++++++++
+ 3 files changed, 144 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_state/test_first_assistant_flush_custody.py
+
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index 2cdb7b399a..7c99ce6c89 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -919,10 +919,13 @@ class SessionCompressionMixin:
+         expires_at = time.time() + max(0.1, float(ttl_seconds))
+         def _do(conn):
+             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+-            return conn.execute(
++            changed = conn.execute(
+                 "UPDATE session_turn_leases SET expires_at = ? "
+                 "WHERE conversation_id = ? AND holder = ?", (expires_at, conversation_id, holder),
+-            ).rowcount > 0
++            ).rowcount
++            _custody.observe("refresh", conversation_id, holder, store=getattr(self, "db_path", None),
++                             session_id=session_id, changed=changed)
++            return changed > 0
+         return bool(self._execute_write(_do, patience_s=patience_s))
+ 
+     def release_session_turn_lease(
+diff --git a/hermes_state_lease_custody.py b/hermes_state_lease_custody.py
+index a0fca2a7f2..b3bd2c4dbb 100644
+--- a/hermes_state_lease_custody.py
++++ b/hermes_state_lease_custody.py
+@@ -17,6 +17,7 @@ import hashlib
+ import logging
+ import os
+ import sqlite3
++import sys
+ import threading
+ from typing import NoReturn
+ 
+@@ -35,6 +36,27 @@ def _txn() -> str:
+ 
+ 
+ 
++def _caller() -> str:
++    """Bounded code locations only; never inspect locals, arguments or source text."""
++    frame = sys._getframe(1)
++    locations = []
++    try:
++        for _ in range(12):
++            if frame is None:
++                break
++            code = frame.f_code
++            # Strip directory names and restrict log delimiters, including dynamic code names.
++            filename = os.path.basename(code.co_filename)
++            if filename != "hermes_state_lease_custody.py":
++                def clean(s):
++                    return "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in s[:80])
++                locations.append(f"{clean(filename)}:{clean(code.co_name)}:{frame.f_lineno}")
++            frame = frame.f_back
++        return ">".join(locations) or "-"
++    finally:
++        del frame
++
++
+ def observe(op: str, key, holder, *, store=None, changed=None, row_holder=None, session_id=None, why=None) -> None:
+     """One custody event from inside a transaction. ``changed`` is the statement's SQL rowcount."""
+     try:
+@@ -45,11 +67,11 @@ def observe(op: str, key, holder, *, store=None, changed=None, row_holder=None,
+         _LOG.log(
+             level,
+             "turn_lease_custody phase=txn op=%s txn=%s store=%s key=%s session=%s root_is_session=%s "
+-            "holder=%s row_holder=%s changed=%s why=%s sqlite=%s",
++            "holder=%s row_holder=%s changed=%s why=%s sqlite=%s caller=%s",
+             op, _txn(), tag(store), tag(key), tag(session_id),
+             "-" if session_id is None else int(session_id == key),
+             tag(holder), tag(row_holder), changed if type(changed) is int else "-", why or "-",
+-            sqlite3.sqlite_version,
++            sqlite3.sqlite_version, _caller(),
+         )
+     except Exception:  # health: allow BLE001 -- optional diagnostics cannot change fencing
+         return
+diff --git a/tests/hermes_state/test_first_assistant_flush_custody.py b/tests/hermes_state/test_first_assistant_flush_custody.py
+new file mode 100644
+index 0000000000..5ec3d1a1b3
+--- /dev/null
++++ b/tests/hermes_state/test_first_assistant_flush_custody.py
+@@ -0,0 +1,115 @@
++"""First assistant flush diagnostic contract; disposable store, no provider or live chat."""
++import logging
++import os
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++import hermes_state_lease_custody as custody
++from tests.tui_gateway.test_cli_takeover_full_turn import make_agent
++
++LOGGER = "hermes_state.lease_custody"
++
++
++@pytest.mark.parametrize("state", ["valid", "missing", "mismatch"])
++@pytest.mark.parametrize("tool_gate", [False, True])
++def test_first_assistant_flush_custody(tmp_path, monkeypatch, caplog, state, tool_gate):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    caplog.set_level(logging.INFO, logger=LOGGER)
++    agent = make_agent(tmp_path, "desktop")
++    db = agent._session_db
++    sid = "handoff"
++    owner = f"pid={os.getpid()}:turn=private-owner"
++    presented = owner if state != "mismatch" else f"pid={os.getpid()}:turn=private-other"
++    content = "private-first-assistant-content"
++    try:
++        db.create_session(sid, source="desktop")
++        assert db.try_acquire_session_turn_lease(sid, owner)
++        assert db.refresh_session_turn_lease(sid, owner)
++        if state == "missing":
++            db.release_session_turn_lease(sid, owner)
++        agent._active_session_turn_lease_holder = presented
++        messages = [] if tool_gate else [{"role": "assistant", "content": content}]
++        if tool_gate:
++            _first_tool_gate(agent, messages, content, state, monkeypatch)
++        else:
++            assert agent._flush_messages_to_session_db(messages, []) is (state == "valid")
++        rows = db.get_messages(sid)
++        assert [r["content"] for r in rows] == ([content] if state == "valid" else [])
++        if state == "valid":
++            assert agent._flush_messages_to_session_db(messages, [])
++            assert len(db.get_messages(sid)) == 1
++        else:
++            assert agent._last_persistence_error_cause == "turn_lease"
++        events = [dict(p.split("=", 1) for p in r.getMessage().split()[1:])
++                  for r in caplog.records if r.name == LOGGER]
++        claim = next(e for e in events if e.get("op") == "claim")
++        assert claim["holder"] == custody.tag(owner)
++        assert claim["txn"].startswith(str(os.getpid()) + ".")
++        if state != "valid":
++            refused = next(e for e in events if e.get("op") == state)
++            assert refused["store"] == claim["store"]
++            assert refused["key"] == claim["key"]
++            assert refused["holder"] == custody.tag(presented)
++            assert refused["row_holder"] == ("-" if state == "missing" else custody.tag(owner))
++            assert any(e["phase"] == "rolled_back" and e["txn"] == refused["txn"] for e in events)
++        actual = db.session_turn_lease_owner(sid)
++        assert (actual is None) == (state == "missing")
++        if actual:
++            assert actual["holder"] == owner
++        text = "\n".join(r.getMessage() for r in caplog.records if r.name == LOGGER)
++        for secret in (owner, presented, content, str(tmp_path)):
++            assert secret not in text
++        # Prospective provenance gap: each real refresh and mutation must name its caller.
++        refresh = next(e for e in events if e.get("op") == "refresh")
++        assert refresh["changed"] == "1"
++        for event in (claim, refresh):
++            assert "test_first_assistant_flush_custody.py:test_first_assistant_flush_custody:" in event["caller"]
++            assert len(event["caller"].split(">")) <= 12
++            assert any(e["phase"] == "committed" and e["txn"] == event["txn"] for e in events)
++        assert "refresh_session_turn_lease:" in refresh["caller"]
++        if state == "missing":
++            release = next(e for e in events if e.get("op") == "release")
++            assert "release_session_turn_lease:" in release["caller"]
++        if state != "valid":
++            assert not db.refresh_session_turn_lease(sid, presented)
++            zero = [r.getMessage() for r in caplog.records if r.name == LOGGER][-2]
++            assert "op=refresh" in zero and "changed=0" in zero
++            assert not db.get_messages(sid)
++    finally:
++        agent._active_session_turn_lease_holder = None
++        agent.close()
++
++
++def _first_tool_gate(agent, messages, content, state, monkeypatch):
++    from agent.turn_tool_round import run_tool_round
++
++    class ReachedDispatcher(Exception):
++        pass
++
++    agent.valid_tool_names = {"skill_view"}
++    message = SimpleNamespace(content=content, tool_calls=[SimpleNamespace(
++        id="call_fixture", type="function", function=SimpleNamespace(name="skill_view", arguments='{"name":"fixture"}'))],
++        reasoning=None, reasoning_content=None, reasoning_details=None)
++    dispatch = Mock(side_effect=ReachedDispatcher)
++    interim = Mock()
++    monkeypatch.setattr(agent, "_execute_tool_calls", dispatch)
++    monkeypatch.setattr(agent, "_emit_interim_assistant_message", interim)
++    monkeypatch.setattr("agent.prepared_compaction.maybe_prepare", Mock())
++    args = dict(assistant_message=message, finish_reason="tool_calls", messages=messages,
++                conversation_history=[], api_call_count=1, effective_task_id="fixture", user_message="read",
++                system_message="", active_system_prompt="", compression_attempts=0, max_compression_attempts=1,
++                final_response=None, failed=False, _turn_exit_reason=None, truncated_tool_call_retries=0,
++                current_turn_user_idx=0)
++    if state == "valid":
++        with pytest.raises(ReachedDispatcher):
++            run_tool_round(agent, **args)
++        dispatch.assert_called_once()
++        interim.assert_called_once()
++    else:
++        verdict = run_tool_round(agent, **args)
++        assert verdict.action == "break" and verdict.failed
++        assert verdict._turn_exit_reason == "session_persistence_failed"
++        dispatch.assert_not_called()
++        interim.assert_not_called()
+-- 
+2.43.0
+

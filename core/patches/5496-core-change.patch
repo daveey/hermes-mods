@@ -1,0 +1,118 @@
+From e8f66177e1f414afef6dfc95a866f4eb6c475d7c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:30:34 +0000
+Subject: [PATCH] [daveey] Unclaimable-ready: print the card id in queue note,
+ pin sweep wiring/queue wording, no immediate alarm re-fire
+
+---
+ hermes_cli/kanban_claimants.py                |  2 +-
+ hermes_cli/kanban_queue_position.py           |  2 +-
+ hermes_cli/kanban_unclaimable_ready.py        |  8 +++-
+ .../test_kanban_unclaimable_runs_on.py        | 41 +++++++++++++++++++
+ 4 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_claimants.py b/hermes_cli/kanban_claimants.py
+index 6c3939718c..1754cb49b1 100644
+--- a/hermes_cli/kanban_claimants.py
++++ b/hermes_cli/kanban_claimants.py
+@@ -63,6 +63,6 @@ def stranded_text(task_id: str, labels: list[str], why: Mapping[str, str]) -> st
+     ``why`` is :func:`refusals` (empty: no machine carries the labels at all)."""
+     named = ", ".join(f"{n}: {r}" for n, r in sorted(why.items())) or "no machine carries these labels"
+     return (f"NO MACHINE CAN CLAIM {task_id} (runs_on {labels}): {named}. Waiting will not start it. Remedy: "
+-            + (f"re-create it on the Mac's own gateway (cross-gateway create, placement='{sorted(why)[0]}'), "
++            + (f"re-create it on {sorted(why)[0]}'s own gateway (cross-gateway create, placement='{sorted(why)[0]}'), "
+                if why else "re-place it onto labels a machine carries (`kanban_move`), ")
+             + "or drop the label.")
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index b3c1b71cd3..1c8f5cc295 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -142,7 +142,7 @@ def placement(conn: sqlite3.Connection, task_id: str, *, backlog: bool = True) -
+     every = set().union(*carried.values())
+     refused = kc.refusals(labels, machines, str(me))
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+-            "machines": sorted(machines), **({"refused": refused} if refused else {})}
++            "machines": sorted(machines), "task_id": task_id, **({"refused": refused} if refused else {})}
+ 
+ 
+ def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+diff --git a/hermes_cli/kanban_unclaimable_ready.py b/hermes_cli/kanban_unclaimable_ready.py
+index eb77b3a819..99adc43e22 100644
+--- a/hermes_cli/kanban_unclaimable_ready.py
++++ b/hermes_cli/kanban_unclaimable_ready.py
+@@ -22,9 +22,10 @@ from typing import Any, Optional
+ _log = logging.getLogger(__name__)
+ 
+ KEY = "unclaimable-ready:"
++REFIRE_S = 6 * 3600  # a closed alarm is not reopened sooner than this while its cards stay stranded
+ HOWTO = (
+     "Each listed card is ready but no enrolled machine can ever claim it, so waiting will not start it. For each: "
+-    "if its work needs a Mac, create a new card on that Mac's own gateway (cross-gateway create, "
++    "if its work needs the named machine, create a new card on that machine's own gateway (cross-gateway create, "
+     "placement='<machine>') and archive the stranded one with a comment naming the replacement; otherwise "
+     "`kanban_move` it to labels an active pool worker carries. Do not change Mac policy (pinned_only) to make it "
+     "claimable. Comment on this alarm with what you did for each card.")
+@@ -68,6 +69,11 @@ def _alarm(conn, cards: list[dict[str, Any]], own: str, now_ms: int) -> Optional
+         seen = {r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (existing,))}
+         if all(c["id"] in body or any(c["id"] in s for s in seen if s) for c in cards):
+             return existing  # every card is already on the open alarm: one alarm, no repeat comments
++    since = int(now_ms / 1000) - REFIRE_S
++    if not existing and conn.execute(
++            "SELECT 1 FROM tasks WHERE created_by = ? AND idempotency_key >= ? AND idempotency_key < ? "
++            "AND created_at > ? LIMIT 1", (kps.DETECTOR, key, key + "\U0010ffff", since)).fetchone():
++        return None  # an alarm for this class closed recently: no immediate re-fire loop
+     listed = "\n".join(f"- {c['id']} ({c['title']}): " + kc.stranded_text(c["id"], c["runs_on"], c["why"])
+                        for c in cards)
+     body = (f"{len(cards)} ready card(s) on {own} that no enrolled machine can ever claim (structural, not a wait):"
+diff --git a/tests/hermes_cli/test_kanban_unclaimable_runs_on.py b/tests/hermes_cli/test_kanban_unclaimable_runs_on.py
+index 9054e874c3..f3ec4fca2e 100644
+--- a/tests/hermes_cli/test_kanban_unclaimable_runs_on.py
++++ b/tests/hermes_cli/test_kanban_unclaimable_runs_on.py
+@@ -139,3 +139,44 @@ def test_unknown_registry_flags_nothing(hub):
+ def test_a_worker_may_reroute_the_stranded_card(hub):
+     tid = _ready_macos_card(hub)
+     assert kcr.stranded_refusal(hub.conn, tid) is None
++
++
++def _alarms(conn):
++    return [r[0] for r in conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'pickup-stall:hub:"
++                                       "unclaimable-ready:%'")]
++
++
++def test_the_dispatcher_tick_runs_the_sweep(hub):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    tid = _ready_macos_card(hub)
++    pu.safe_sweep(hub.conn)
++    assert len(_events(hub.conn, tid, "chat_wait_unclaimed")) == 1 and len(_alarms(hub.conn)) == 1
++
++
++def test_queue_note_names_the_card_and_each_refusal_not_a_wait_for_the_mac(hub):
++    from hermes_cli import kanban_queue_position as kqp
++    tid = _ready_macos_card(hub)
++    place = kqp.placement(hub.conn, tid)
++    assert place and place["lane"] == "unplaceable" and place["task_id"] == tid
++    note = kqp._describe_lane(place)
++    assert f"NO MACHINE CAN CLAIM {tid}" in note and "<id>" not in note
++    assert "macbook: pinned_only" in note and "cross-gateway create" in note and "waiting for macbook" not in note
++
++
++def test_a_closed_alarm_is_not_reopened_on_the_next_sweep(hub):
++    tid = _ready_macos_card(hub)
++    ur.sweep(hub.conn)
++    (alarm,) = _alarms(hub.conn)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (alarm,))
++    ur.sweep(hub.conn)
++    assert _alarms(hub.conn) == [alarm]  # no immediate re-fire
++    ur.sweep(hub.conn, now=__import__("time").time() + ur.REFIRE_S + 60)
++    assert len(_alarms(hub.conn)) == 2 and tid  # after the interval the stranded card is raised again
++
++
++def test_only_the_operator_lane_files_the_alarm(hub, monkeypatch):
++    tid = _ready_macos_card(hub)
++    from hermes_cli import kanban_pickup_stall as kps
++    monkeypatch.setattr(kps, "OPERATOR_LANE", "not-this-gateway")
++    assert ur.sweep(hub.conn) == [tid] and _alarms(hub.conn) == []
+-- 
+2.43.0
+

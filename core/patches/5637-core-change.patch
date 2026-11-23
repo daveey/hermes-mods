@@ -1,0 +1,537 @@
+From f88973c6fd24138f369ff4c80b15dfd5eb3131e4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:11:09 +0000
+Subject: [PATCH] fix(fairness): persist observation identities and writer
+ clocks [daveey]
+
+Why: every exported DB row previously lacked source and clock evidence, so
+otherwise-passing fairness gates were always indeterminate. Owner history
+also used the unrelated metadata bound and could reject complete journals.
+
+Persist observation IDs transactionally at the source journal, not at drain.
+Add opt-in writer-side wall/monotonic samples with arm-time declared UTC
+uncertainty and preserve legacy unknowns. Register the SQLite sampler on
+tracked connections. Require explicit --db for clock-enabled capture and
+document old/raw-writer incompatibility and clear/reconnect recovery; do not
+activate it automatically on shared live databases. The metric kernel must
+not narrow persisted uncertainty to a smaller manifest assumption.
+
+Read the complete owner journal up to a separate 64 MiB bound; never drop
+its early coverage by tail truncation. Keep the assembled capture bound.
+
+Proof: canonical run_tests.sh, 622 passed / 0 failed across 33 files.
+scripts/check --base origin/main: 21 checks passed.
+Seven exact-anchor mutants killed: source ID removal, drain-time clock,
+missing opening trigger, wrong owner limit, narrowed clock uncertainty,
+missing reopen registration, malformed clock accepted.
+Initial regression was red for unsupported clock_error_ns; live one-hour
+acceptance is intentionally still outstanding, not replaced with fixtures.
+---
+ docs/kanban-fairness-capture.md               |  36 +++++
+ hermes_cli/kanban_fairness_clocks.py          |  23 +++
+ hermes_cli/kanban_fairness_journal.py         |  30 +++-
+ hermes_cli/kanban_fairness_metrics.py         |   3 +
+ hermes_cli/kanban_fairness_schema.py          |   3 +
+ hermes_cli/kanban_fairness_store.py           |  34 ++++-
+ hermes_cli/sqlite_safe_read.py                |   3 +
+ scripts/kanban_fairness.py                    |   8 +-
+ .../test_kanban_fairness_journal.py           |   2 +-
+ .../test_kanban_fairness_provenance.py        | 140 ++++++++++++++++++
+ .../test_kanban_fairness_vertical.py          |   2 +-
+ 11 files changed, 267 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_fairness_clocks.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_provenance.py
+
+diff --git a/docs/kanban-fairness-capture.md b/docs/kanban-fairness-capture.md
+index 4cc8289ec3..4f3f66c21d 100644
+--- a/docs/kanban-fairness-capture.md
++++ b/docs/kanban-fairness-capture.md
+@@ -42,6 +42,42 @@ cards from one host, arm the board's replica (`--board default --replica`, the `
+ its worst pull lag with `--apply-lag-s`. The reader widens every time by that lag. A replica that is rebuilt
+ from a snapshot loses its journal; the next drain records `journal_missing` and the capture is incomplete.
+ 
++## Observation provenance and writer clocks
++
++New journals assign each source observation row a persistent, transactionally generated
++`journal-observation:<random-id>` UID. Export preserves it across drains and exporter restarts.
++It identifies a local database observation, **not** a remote Board lifecycle event: replica
++applications are separate sightings, and these IDs must not be used for cross-database event
++deduplication. The original remote event UID is not attested by this capture.
++
++`capture arm --db PATH --writer-clocks --clock-error-s 2` additionally persists a wall/monotonic pair
++inside each writer transaction (including the opening snapshot and creation receipts).
++The operator declares UTC disagreement at arm time; it is an assumption, not an NTP
++measurement. Each persisted bound includes the sampling duration. Reports use at least the
++largest persisted uncertainty, even if the manifest declares a smaller bound. No export-time
++clock is substituted for an unknown historical sample. Old journals stay incomplete.
++
++**Writer compatibility is a hard prerequisite.** Clock-enabled triggers invoke a
++connection-local SQLite function registered by upgraded native tracked connections.
++Pre-upgrade long-lived connections and raw/nonnative SQLite writers lack it and their writes
++will fail atomically while the capture is armed. Do not enable writer clocks on a shared
++live database merely because this CLI has upgraded. Use a dedicated capture replica with
++exclusively controlled upgraded writers, or first verify that every writer process and
++connection has been replaced naturally with the upgraded build. A version check of the
++exporter alone is not sufficient. The default capture leaves clock sampling off, preserving
++legacy writer compatibility and the explicit `clock_unknown` gap. If an incompatible writer
++is discovered, stop the capture and run `capture clear --out DIR` from an upgraded CLI to
++remove the triggers; preserve the incomplete evidence rather than certifying it.
++Reconnect affected old writers to discard SQLite's cached failed statements/schema.
++The CLI requires explicit `--db` in this mode; it will not select the shared board or
++shared `--replica` automatically. That path selection is not a writer-readiness attestation.
++
++The owner JSONL input has its own 64 MiB bound, separate from the 8 MiB metadata bound.
++The entire file is validated, including early intervals and coverage lines; it is never
++silently tail-truncated. Above 64 MiB it remains a `bad_owner_record` coverage gap. The
++assembled capture byte limit still applies. Archive older owner history only outside the
++capture, keeping every interval overlapping the window and both sources' coverage.
++
+ ## Reading a capture
+ 
+ `validate --input DIR` lists coverage gaps. `report --mode live --input DIR --output live.json` writes the
+diff --git a/hermes_cli/kanban_fairness_clocks.py b/hermes_cli/kanban_fairness_clocks.py
+new file mode 100644
+index 0000000000..47d83f534a
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_clocks.py
+@@ -0,0 +1,23 @@
++"""Writer-side clock samples for explicitly armed fairness journals.
++
++These are local observation clocks, not the remote lifecycle event's clocks.
++The UTC uncertainty is declared by the operator at arm time, not inferred from
++export time. Registering the function does no I/O and observes nothing until SQL
++calls it inside a clock-enabled capture transaction.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++
++def sample(clock_error_ns):
++    before = time.monotonic_ns()
++    wall = time.time_ns()
++    after = time.monotonic_ns()
++    return json.dumps({"wall_ns": wall, "mono_ns": before,
++                       "clock_error_ns": clock_error_ns + after - before}, separators=(",", ":"))
++
++
++def register(conn):
++    conn.create_function("hermes_fairness_clock", 1, sample)
+diff --git a/hermes_cli/kanban_fairness_journal.py b/hermes_cli/kanban_fairness_journal.py
+index 991bdb9529..6965c057b2 100644
+--- a/hermes_cli/kanban_fairness_journal.py
++++ b/hermes_cli/kanban_fairness_journal.py
+@@ -24,11 +24,12 @@ _NOW_MS = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+ _WATCHED = ("status", "priority", "idempotency_key", "assignee", "ready_since", "lease_holder")
+ _SCHEMA = (
+     f"CREATE TABLE {JOURNAL} (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
+-    "wall_ms INTEGER NOT NULL, task_id TEXT NOT NULL, op TEXT, fields TEXT NOT NULL)",
++    "wall_ms INTEGER NOT NULL, task_id TEXT NOT NULL, op TEXT, fields TEXT NOT NULL, "
++    "source_uid TEXT NOT NULL DEFAULT ('journal-observation:' || lower(hex(randomblob(16)))), clock_json TEXT)",
+     f"CREATE TABLE {SESSION} (id INTEGER PRIMARY KEY CHECK (id = 1), capture_id TEXT NOT NULL, "
+     "armed_ms INTEGER NOT NULL, sealed_ms INTEGER, max_records INTEGER NOT NULL, max_bytes INTEGER NOT NULL, "
+     "stored INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, dropped INTEGER NOT NULL DEFAULT 0, "
+-    "first_drop_ms INTEGER, last_drop_ms INTEGER, admit INTEGER NOT NULL DEFAULT 1)",
++    "first_drop_ms INTEGER, last_drop_ms INTEGER, admit INTEGER NOT NULL DEFAULT 1, clock_error_ns INTEGER)",
+ )
+ 
+ 
+@@ -63,7 +64,7 @@ def _triggers(conn: sqlite3.Connection) -> dict[str, str]:
+     changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _WATCHED if c in present)
+     kinds = ", ".join(f"'{k}'" for k in EVENT_KINDS)
+     event = "json_object('kind', NEW.kind, 'created_at', NEW.created_at)"
+-    return {
++    triggers = {
+         "kanban_fairness_tasks_ins": "CREATE TRIGGER kanban_fairness_tasks_ins AFTER INSERT ON tasks BEGIN "
+         + _append("task", "NEW.id", "insert", _fields_sql(columns, "NEW")) + " END",
+         "kanban_fairness_tasks_upd": "CREATE TRIGGER kanban_fairness_tasks_upd AFTER UPDATE ON tasks "
+@@ -73,6 +74,14 @@ def _triggers(conn: sqlite3.Connection) -> dict[str, str]:
+         "kanban_fairness_events_ins": "CREATE TRIGGER kanban_fairness_events_ins AFTER INSERT ON task_events "
+         f"WHEN NEW.kind IN ({kinds}) BEGIN " + _append("event", "NEW.task_id", None, event) + " END",
+     }
++    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({SESSION})")}
++    if "clock_error_ns" in columns and conn.execute(
++            f"SELECT clock_error_ns FROM {SESSION} WHERE id=1").fetchone()[0] is not None:
++        triggers["kanban_fairness_clock"] = (
++            f"CREATE TRIGGER kanban_fairness_clock AFTER INSERT ON {JOURNAL} BEGIN "
++            f"UPDATE {JOURNAL} SET clock_json = hermes_fairness_clock("
++            f"(SELECT clock_error_ns FROM {SESSION} WHERE id=1)) WHERE seq=NEW.seq; END")
++    return triggers
+ 
+ 
+ def _has(conn: sqlite3.Connection, name: str) -> bool:
+@@ -121,10 +130,14 @@ def status(conn: sqlite3.Connection) -> Optional[dict]:
+ 
+ 
+ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_RECORDS,
+-        max_bytes: int = MAX_BYTES, replace: bool = False) -> dict:
++        max_bytes: int = MAX_BYTES, replace: bool = False, clock_error_ns: Optional[int] = None) -> dict:
+     """Start a capture on this database: tables, opening snapshot and triggers in one transaction."""
+     from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_fairness_clocks import register
+ 
++    if clock_error_ns is not None and (type(clock_error_ns) is not int or clock_error_ns < 0):
++        raise JournalError("clock_error_ns must be a nonnegative integer or None")
++    register(conn)
+     if not capture_id or not all(c.isalnum() or c in "-_." for c in capture_id):
+         raise JournalError("capture id must be letters, digits, '-', '_' or '.'")
+     with write_txn(conn):
+@@ -137,8 +150,11 @@ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_REC
+             conn.execute(f"DROP TABLE IF EXISTS {SESSION}")
+         for ddl in _SCHEMA:
+             conn.execute(ddl)
+-        conn.execute(f"INSERT INTO {SESSION} (id, capture_id, armed_ms, max_records, max_bytes) "
+-                     f"VALUES (1, ?, {_NOW_MS}, ?, ?)", (capture_id, max_records, max_bytes))
++        conn.execute(f"INSERT INTO {SESSION} (id, capture_id, armed_ms, max_records, max_bytes, clock_error_ns) "
++                     f"VALUES (1, ?, {_NOW_MS}, ?, ?, ?)", (capture_id, max_records, max_bytes, clock_error_ns))
++        # Install before the opening snapshot so opening observations get real clocks too.
++        for ddl in _triggers(conn).values():
++            conn.execute(ddl)
+         present = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
+         fields = _fields_sql([c for c in TASK_FIELDS if c in present], "s")
+         # The opening snapshot is not optional evidence: an armed session that could not hold it is a gap.
+@@ -157,8 +173,6 @@ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_REC
+             f"(SELECT COUNT(*) FROM {JOURNAL})) WHERE id = 1")
+         conn.execute(f"UPDATE {SESSION} SET first_drop_ms = armed_ms, last_drop_ms = armed_ms "
+                      "WHERE id = 1 AND dropped > 0")
+-        for ddl in _triggers(conn).values():
+-            conn.execute(ddl)
+     return _open_status(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_fairness_metrics.py b/hermes_cli/kanban_fairness_metrics.py
+index cddee28103..cfee8027ea 100644
+--- a/hermes_cli/kanban_fairness_metrics.py
++++ b/hermes_cli/kanban_fairness_metrics.py
+@@ -274,6 +274,9 @@ def verdict(capture: dict, *, alarm_prefixes: tuple, min_window_s: float = 0) ->
+     armed_s, close_s = armed_ms / 1000, close_ms / 1000
+     assumed = manifest.get("assumptions") or {}
+     err, lag = float(assumed.get("clock_error_s", 2.0)), float(assumed.get("apply_lag_s", 0.0))
++    # Never narrow writer-attested uncertainty to a smaller report assumption.
++    err = max([err, *(rec["clock_error_ns"] / 1_000_000_000 for rec in capture["records"]
++                     if rec.get("clock_error_ns") is not None)])
+     unclaimed = assumed.get("unclaimed_exit", "unknown")
+     clock = Clock(close_s, err, lag, unclaimed == "elapsed_ready")
+     if close_s - armed_s < min_window_s:
+diff --git a/hermes_cli/kanban_fairness_schema.py b/hermes_cli/kanban_fairness_schema.py
+index e9db3473f4..9868f5f640 100644
+--- a/hermes_cli/kanban_fairness_schema.py
++++ b/hermes_cli/kanban_fairness_schema.py
+@@ -57,6 +57,9 @@ ENVELOPE_KEYS = ("version", "capture_id", "source_gateway", "board_uid", "source
+ RECORD_KINDS = ("opening", "row_change", "owner_generation", "membership", "creation", "loss")
+ LIFECYCLE_KINDS = ("opening", "row_change")
+ LIFECYCLE_KEYS = ("task_id", "op", "fields", "journal_seq", "journal_kind", "database_uid", "source_uid")
++# source_uid identifies the source observation row, not a remote lifecycle event.
++# journal-observation: IDs survive exporter restarts; replica sightings remain local
++# observations and must never be deduplicated as upstream events across databases.
+ MAX_PAYLOAD_BYTES = 256 * 1024
+ _MAX_DEPTH = 16
+ 
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+index d5576d47fd..e62f52aeb8 100644
+--- a/hermes_cli/kanban_fairness_store.py
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -2,8 +2,8 @@
+ 
+ Runtime consumers use append_records/seal_records in an exclusively owned directory. DB export preserves
+ its transactionally monotonic journal_seq separately from each exporter process epoch's envelope seq.
+-The current DB journal does not observe monotonic clocks, clock error, or event source UIDs: those remain
+-unknown. Export never retroactively invents them from a present-day row or an assumed clock bound.
++New journals persist local observation UIDs and optionally writer-side clock samples. Legacy
++rows stay unknown: export never substitutes drain-time clocks or a remote lifecycle event UID.
+ """
+ from __future__ import annotations
+ 
+@@ -22,6 +22,7 @@ from hermes_cli.kanban_fairness_segments import append_records, seal_records
+ __all__ = ["append_records", "drain", "load", "seal_records", "write_manifest"]
+ 
+ RECEIPTS, MANIFEST, OWNERS = segments.RECEIPTS, segments.MANIFEST, "owner_authority.jsonl"
++MAX_OWNER_BYTES = 64 * 1024 * 1024
+ _PROCESS_EPOCH = (os.getpid(), str(uuid.uuid4()))
+ 
+ 
+@@ -99,12 +100,14 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+         seq = cuts.get((receipts["source_gateway"], epoch), 0)
+         records = []
+         try:
++            provenance = _provenance(conn, rows[0][0], rows[-1][0])
+             for db_seq, kind, wall_ms, task_id, op, fields in rows:
+                 seq += 1
++                source_uid, clock = provenance.get(db_seq, (None, {}))
+                 record_kind = "opening" if kind == "opening" else "row_change"
+                 payload = {"task_id": task_id, "op": op, "fields": json.loads(fields),
+                            "journal_seq": db_seq, "journal_kind": kind,
+-                           "database_uid": receipts["database_uid"], "source_uid": None}
++                           "database_uid": receipts["database_uid"], "source_uid": source_uid}
+                 if kind == "creation":
+                     record_kind, payload = "creation", json.loads(fields)
+                 if len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+@@ -115,15 +118,32 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+                 records.append(make_record(
+                     capture_id=state["capture_id"], source_gateway=receipts["source_gateway"],
+                     board_uid=receipts["board_uid"], source_epoch=epoch, seq=seq,
+-                    kind=record_kind, wall_ns=wall_ms * 1_000_000, payload=payload))
++                    kind=record_kind, wall_ns=clock.get("wall_ns", wall_ms * 1_000_000), payload=payload,
++                    mono_ns=clock.get("mono_ns"), clock_error_ns=clock.get("clock_error_ns")))
+             receipts = append_records(out, records, _metadata={"journal_seq": rows[-1][0]})
+-        except (ValueError, OSError) as exc:
++        except (ValueError, OSError, TypeError, RecursionError) as exc:
+             _gap(receipts, "export_failed", type(exc).__name__)
+             _write(out / RECEIPTS, segments.encoded(receipts))
+             return receipts
+ 
+ 
+ 
++def _provenance(conn, first, last):
++    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({journal.JOURNAL})")}
++    if not {"source_uid", "clock_json"} <= columns:
++        return {}
++    result = {}
++    for seq, uid, raw in conn.execute(
++            f"SELECT seq, source_uid, clock_json FROM {journal.JOURNAL} WHERE seq BETWEEN ? AND ?", (first, last)):
++        clock = json.loads(raw) if raw is not None else {}
++        if (not isinstance(clock, dict) or (raw is not None and (
++                set(clock) != {"wall_ns", "mono_ns", "clock_error_ns"}
++                or any(type(v) is not int or v < 0 for v in clock.values())))):
++            raise ValueError("invalid journal clock sample")
++        result[seq] = (uid, clock)
++    return result
++
++
+ def write_manifest(conn: sqlite3.Connection, out: Path, *, board: str, assumptions: dict,
+                    policy: dict, roster: Optional[list] = None) -> dict:
+     if (out / MANIFEST).exists():
+@@ -214,7 +234,9 @@ def _owners(out: Path, gaps: list[dict]) -> Optional[list[dict]]:
+         return None
+     owners = []
+     try:
+-        data = segments.read_bounded(path, min(segments.MAX_CAPTURE_BYTES, segments.MAX_METADATA_BYTES))
++        # A JSONL journal is not metadata. Keep all coverage/interval lines, not a tail
++        # which can silently discard the beginning of the capture's owner history.
++        data = segments.read_bounded(path, MAX_OWNER_BYTES)
+         lines = data.decode("utf-8-sig").splitlines()
+     except (OSError, ValueError):
+         gaps.append({"code": "bad_owner_record", "detail": "owner file unreadable or over bound"})
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 88c3140d9c..3347ef39ef 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -228,6 +228,9 @@ def connect_tracked(
+     with _tracking_access(wait_for_tracking, key=key, unknown=unknown):
+         conn = opener(str(path), **kwargs)
+         try:
++            from hermes_cli.kanban_fairness_clocks import register
++
++            register(conn)
+             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+             if resolved is None:
+                 return conn  # in-memory / unnamed: nothing on disk to byte-probe
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index 827f7bdbac..5a4c6cc5da 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -75,6 +75,8 @@ def _policy() -> dict:
+ 
+ def _arm(args) -> int:
+     out = Path(args.out)
++    if getattr(args, "writer_clocks", False) and not args.db:
++        raise ValueError("writer clocks require explicit --db and exclusively controlled upgraded writers")
+     if args.db:
+         db = args.db
+     else:
+@@ -107,7 +109,9 @@ def _arm(args) -> int:
+             # schema cookie witnesses commit even for same-id, same-ms replacement.
+             armed = True  # Keep the plan unless rollback is positively established.
+             try:
+-                state = journal.arm(conn, args.capture_id, replace=args.replace)
++                state = journal.arm(conn, args.capture_id, replace=args.replace,
++                                    clock_error_ns=int(args.clock_error_s * 1_000_000_000)
++                                    if getattr(args, "writer_clocks", False) else None)
+             except BaseException:
+                 conn.rollback()  # Also discard a transaction interrupted by Ctrl-C.
+                 armed = conn.execute("PRAGMA schema_version").fetchone()[0] != schema_before
+@@ -230,6 +234,8 @@ def _parser() -> argparse.ArgumentParser:
+     capture.add_argument("--board", default="default")
+     capture.add_argument("--replica", action="store_true")
+     capture.add_argument("--clock-error-s", type=float, default=2.0)
++    capture.add_argument("--writer-clocks", action="store_true",
++                         help="sample clocks in writer transactions; ALL writers must use upgraded native connections")
+     capture.add_argument("--apply-lag-s", type=float, default=None)
+     capture.add_argument("--unclaimed-exit", choices=("unknown", "elapsed_ready"), default="unknown")
+     capture.add_argument("--replace", action="store_true")
+diff --git a/tests/hermes_cli/test_kanban_fairness_journal.py b/tests/hermes_cli/test_kanban_fairness_journal.py
+index d7f2c567f1..c41e8408ec 100644
+--- a/tests/hermes_cli/test_kanban_fairness_journal.py
++++ b/tests/hermes_cli/test_kanban_fairness_journal.py
+@@ -109,7 +109,7 @@ def test_seal_stops_capture_and_survives_a_reopen(conn, tmp_path):
+         assert journal.status(again)["triggers"] == []
+         assert journal.status(again)["stored"] == manifest["journal"]["stored"]
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     assert len(manifest["segments"]) == 2
+     assert [r["seq"] for r in capture["records"]] == list(range(1, len(capture["records"]) + 1))
+diff --git a/tests/hermes_cli/test_kanban_fairness_provenance.py b/tests/hermes_cli/test_kanban_fairness_provenance.py
+new file mode 100644
+index 0000000000..a7aefcc7be
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_provenance.py
+@@ -0,0 +1,140 @@
++"""Transactional observation provenance, not export-time fabrication."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli import kanban_fairness_metrics as metrics
++from hermes_cli import kanban_fairness_store as store
++from tests.hermes_cli import test_kanban_fairness_journal as helpers
++from tests.hermes_cli import test_kanban_fairness_metrics as metric_helpers
++from tests.hermes_cli import test_kanban_fairness_vertical as vertical_helpers
++
++conn = helpers.conn
++
++
++def test_writer_clocks_survive_later_export_and_reopen(conn, tmp_path):
++    tid = kb.create_task(conn, title="opening", assignee="a")
++    before = time.monotonic_ns()
++    journal.arm(conn, "clocked", clock_error_ns=2_000_000_000)
++    with kbc.connect_closing() as other:
++        other.execute("UPDATE tasks SET priority=3 WHERE id=?", (tid,))
++    after = time.monotonic_ns()
++    out = tmp_path / "capture"
++    store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    capture = store.load(out)
++    assert {g["code"] for g in capture["gaps"]} == {"source_identity_unknown"}
++    records = capture["records"]
++    uids = [r["payload"]["source_uid"] for r in records]
++    assert len(set(uids)) == len(records)
++    assert all(uid.startswith("journal-observation:") for uid in uids)
++    assert all(before <= r["mono_ns"] <= after for r in records)
++    assert all(r["clock_error_ns"] >= 2_000_000_000 for r in records)
++    persisted = conn.execute(f"SELECT source_uid, clock_json FROM {journal.JOURNAL} ORDER BY seq").fetchall()
++    assert uids == [row[0] for row in persisted]
++    assert [r["mono_ns"] for r in records] == [json.loads(row[1])["mono_ns"] for row in persisted]
++
++
++def test_clock_observation_rolls_back_with_writer(conn):
++    tid = kb.create_task(conn, title="rollback", assignee="a")
++    journal.arm(conn, "clocked", clock_error_ns=0)
++    before = list(conn.execute(f"SELECT * FROM {journal.JOURNAL}"))
++    with pytest.raises(RuntimeError), kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET priority=3 WHERE id=?", (tid,))
++        raise RuntimeError("abort")
++    assert list(conn.execute(f"SELECT * FROM {journal.JOURNAL}")) == before
++
++
++def test_legacy_rows_are_not_backfilled(conn, tmp_path):
++    kb.create_task(conn, title="old", assignee="a")
++    journal.arm(conn, "legacy")
++    conn.execute(f"ALTER TABLE {journal.JOURNAL} DROP COLUMN source_uid")
++    conn.execute(f"ALTER TABLE {journal.JOURNAL} DROP COLUMN clock_json")
++    store.write_manifest(conn, tmp_path, board="default", assumptions={}, policy={})
++    capture = store.load(tmp_path)
++    assert {"clock_unknown", "source_uid_unknown"} <= {g["code"] for g in capture["gaps"]}
++    assert all(r["mono_ns"] is None and r["payload"]["source_uid"] is None for r in capture["records"])
++
++
++@pytest.mark.parametrize("raw", ["[]", "{}", "null", '{"wall_ns":1,"mono_ns":2,"clock_error_ns":true}',
++                                 '{"wall_ns":1,"mono_ns":-1,"clock_error_ns":0}', "not json"])
++def test_bad_persisted_clock_is_export_gap(conn, tmp_path, raw):
++    kb.create_task(conn, title="bad", assignee="a")
++    journal.arm(conn, "bad", clock_error_ns=0)
++    conn.execute(f"UPDATE {journal.JOURNAL} SET clock_json=?", (raw,))
++    receipts = store.drain(conn, tmp_path)
++    assert "export_failed" in {g["code"] for g in receipts["gaps"]}
++    assert receipts["journal_seq"] == 0
++
++
++@pytest.mark.parametrize("bound", [-1, True, 1.5])
++def test_invalid_clock_bound_does_not_arm(conn, bound):
++    with pytest.raises(journal.JournalError):
++        journal.arm(conn, "bad", clock_error_ns=bound)
++    assert journal.status(conn) is None
++
++
++def test_unregistered_writer_refuses_atomically_until_clear(conn):
++    tid = kb.create_task(conn, title="writer", assignee="a")
++    path = journal.identity(conn)["path"]
++    journal.arm(conn, "clocked", clock_error_ns=0)
++    # Deliberate raw connection models a pre-upgrade or nonnative writer.
++    with sqlite3.connect(path) as old:
++        with pytest.raises(sqlite3.OperationalError, match="hermes_fairness_clock"):
++            old.execute("UPDATE tasks SET priority=3 WHERE id=?", (tid,))
++        old.rollback()
++        assert old.execute("SELECT priority FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 0
++        journal.clear(conn)
++    # Reconnect also discards SQLite's cached failed statement/schema on old writers.
++    with sqlite3.connect(path) as recovered:
++        recovered.execute("UPDATE tasks SET priority=3 WHERE id=?", (tid,))
++
++
++def test_owner_journal_larger_than_metadata_is_not_truncated(tmp_path):
++    line = json.dumps({"version": 1, "kind": "coverage", "source": "core-lane",
++                       "from_s": 1, "to_s": 2, "complete": True}) + "\n"
++    count = 100000
++    (tmp_path / store.OWNERS).write_text(line * count)
++    gaps = []
++    owners = store._owners(tmp_path, gaps)
++    assert owners is not None and len(owners) == count
++    assert gaps == []
++
++
++def test_owner_journal_bound_is_still_fail_closed(tmp_path, monkeypatch):
++    monkeypatch.setattr(store, "MAX_OWNER_BYTES", 10)
++    (tmp_path / store.OWNERS).write_text(" " * 11)
++    gaps = []
++    assert store._owners(tmp_path, gaps) == []
++    assert {g["code"] for g in gaps} == {"bad_owner_record"}
++
++
++def test_writer_clock_cli_requires_explicit_database(tmp_path):
++    out = tmp_path / "no-capture"
++    assert vertical_helpers.cli.main(["capture", "arm", "--out", str(out), "--capture-id", "c",
++                                      "--writer-clocks"]) == 3
++    assert not out.exists()
++
++
++def test_writer_clock_cli_persists_opening_samples(conn, tmp_path):
++    kb.create_task(conn, title="cli", assignee="a")
++    path = journal.identity(conn)["path"]
++    assert vertical_helpers.cli.main(["capture", "arm", "--out", str(tmp_path / "cli"),
++                                      "--capture-id", "c", "--db", path, "--writer-clocks"]) == 0
++    raw = conn.execute(f"SELECT clock_json FROM {journal.JOURNAL}").fetchone()[0]
++    assert json.loads(raw)["clock_error_ns"] >= 2_000_000_000
++
++
++def test_report_does_not_narrow_attested_uncertainty():
++    log = metric_helpers.Log()
++    log.wait("near", 0, 1799)
++    capture = log.capture(3600)
++    for rec in capture["records"]:
++        rec["clock_error_ns"] = 2_000_000_000
++    result = metrics.verdict(capture, alarm_prefixes=())
++    assert result["assumptions"]["clock_error_s"] == 2
++    assert result["gates"]["p0_median_wait"]["status"] == "INDETERMINATE"
+diff --git a/tests/hermes_cli/test_kanban_fairness_vertical.py b/tests/hermes_cli/test_kanban_fairness_vertical.py
+index 5ccb5d89b1..c042e7f73e 100644
+--- a/tests/hermes_cli/test_kanban_fairness_vertical.py
++++ b/tests/hermes_cli/test_kanban_fairness_vertical.py
+@@ -102,7 +102,7 @@ def test_dispatch_to_report(kanban_home, all_assignees_spawnable, tmp_path, caps
+     capsys.readouterr()
+ 
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     eps = metrics.episodes(capture["records"], armed_s=capture["manifest"]["window"]["armed_ms"] / 1000,
+                            err=0)
+-- 
+2.43.0
+

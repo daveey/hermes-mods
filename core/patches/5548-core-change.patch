@@ -1,0 +1,157 @@
+From 106bf5b0b97f2e3748767e2a46b6cc3e40a1f9f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:05:10 +0000
+Subject: [PATCH] [daveey] Narrow lanes source metadata to open candidates
+
+Avoid materializing all historical task metadata on each pushed view. Fetch terminal counterparts by primary key and resolve terminal-only parent authority lazily in the same read snapshots. Real hub backup parity passes; under controlled GIL contention source selection drops from 1.73-2.35s to 0.11-0.15s. Full projection remains 3.07-3.44s in that synthetic stress, not live <=3s acceptance. Regression materialized 203 irrelevant rows before versus fewer than 10 after.
+---
+ hermes_cli/kanban_lanes_sources.py            | 50 +++++++++++++++----
+ tests/hermes_cli/test_kanban_lanes_sources.py | 44 ++++++++++++++++
+ 2 files changed, 83 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_lanes_sources.py b/hermes_cli/kanban_lanes_sources.py
+index 7cbfcd6b01..7af01859e8 100644
+--- a/hermes_cli/kanban_lanes_sources.py
++++ b/hermes_cli/kanban_lanes_sources.py
+@@ -46,8 +46,27 @@ def presentation(local, fleet=None):
+     return Sources(local, fleet) if primary else Evidence(fleet)
+ 
+ 
+-def _metadata(db):
+-    return {r['id']: r for r in db.execute('SELECT id,status,sync_version FROM tasks')}
++def _metadata(db, ids=None):
++    """Read open candidates, or their exact counterparts; never all history."""
++    from hermes_cli import kanban_lanes_flow as flow
++
++    if ids is None:
++        return {r['id']: r for r in db.execute(
++            f'SELECT id,status,sync_version FROM tasks WHERE status IN {flow._OPEN}')}
++    rows = {}
++    ids = list(ids)
++    for start in range(0, len(ids), 400):
++        batch = ids[start:start + 400]
++        marks = ','.join('?' for _ in batch)
++        rows.update((r['id'], r) for r in db.execute(
++            f'SELECT id,status,sync_version FROM tasks WHERE id IN ({marks})', batch))
++    return rows
++
++
++def _selected_source(task_id, own, remote, pending, local, fleet):
++    use_local = own is not None and (task_id in pending or remote is None or
++        int(own['sync_version'] or 0) >= int(remote['sync_version'] or 0))
++    return local if use_local else fleet
+ 
+ 
+ def open_counts(out, pol, evidence, now):
+@@ -109,8 +128,8 @@ def _pending(db):
+ class Sources(Evidence):
+     """Request-local selected open cards, lazy parents and source-owned histories.
+ 
+-    Caller owns both connections and their short read snapshots. Metadata scans
+-    contain no bodies; full terminal rows are read only when a parent needs one.
++    Metadata reads cover open candidates and their counterparts; full terminal
++    rows and their source metadata are read only when a parent needs one.
+     """
+ 
+     def __init__(self, local, fleet):
+@@ -123,18 +142,22 @@ class Sources(Evidence):
+         self._urls: dict[str, Any] = {}
+         self._readers = {id(db): Evidence(db, rows=[]) for db in (local, fleet)}
+         local_meta, fleet_meta = _metadata(local), _metadata(fleet)
+-        pending = _pending(local)
++        # A terminal counterpart can suppress an open candidate. Unrelated
++        # terminal cards need no source decision until used as a parent.
++        candidates = local_meta.keys() | fleet_meta.keys()
++        local_meta.update(_metadata(local, candidates - local_meta.keys()))
++        fleet_meta.update(_metadata(fleet, candidates - fleet_meta.keys()))
++        self._pending = _pending(local)
+         self._deleted = _deleted(local) | _deleted(fleet)
+         self._source: dict[str, Any] = {}
+         selected = {}
+-        for tid in local_meta.keys() | fleet_meta.keys():
++        for tid in candidates:
+             if tid in self._deleted:
+                 continue
+             own, remote = local_meta.get(tid), fleet_meta.get(tid)
+-            use_local = own is not None and (tid in pending or remote is None or
+-                int(own['sync_version'] or 0) >= int(remote['sync_version'] or 0))
+-            self._source[tid] = local if use_local else fleet
+-            selected[tid] = own if use_local else remote
++            db = _selected_source(tid, own, remote, self._pending, local, fleet)
++            self._source[tid] = db
++            selected[tid] = own if db is local else remote
+         for db in (local, fleet):
+             ids = [tid for tid, row in selected.items()
+                    if self._source[tid] is db and row['status'] in flow._OPEN]
+@@ -146,7 +169,12 @@ class Sources(Evidence):
+         self.rows = sorted(self._rows.values(), key=lambda r: (r['created_at'], r['id']))
+ 
+     def connection(self, task_id) -> sqlite3.Connection:
+-        return self._source[task_id] if task_id in self._source else self.conn
++        if task_id not in self._source and task_id not in self._deleted:
++            own = _metadata(self.local, [task_id]).get(task_id)
++            remote = _metadata(self.conn, [task_id]).get(task_id)
++            self._source[task_id] = _selected_source(
++                task_id, own, remote, self._pending, self.local, self.conn)
++        return self._source.get(task_id, self.conn)
+ 
+     def identity(self, task_id):
+         return self._readers[id(self.connection(task_id))].identity(task_id)
+diff --git a/tests/hermes_cli/test_kanban_lanes_sources.py b/tests/hermes_cli/test_kanban_lanes_sources.py
+index 4c29acd92f..4431b82c98 100644
+--- a/tests/hermes_cli/test_kanban_lanes_sources.py
++++ b/tests/hermes_cli/test_kanban_lanes_sources.py
+@@ -188,6 +188,50 @@ def test_terminal_bodies_are_not_bulk_loaded(copies, configured):
+     assert full and all('WHERE id IN' in q for q in full), full
+ 
+ 
++def test_historical_metadata_is_not_materialized(copies, configured):
++    import sqlite3
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'open', 'ready')
++    card(live, 'parent', 'done', 3)
++    card(fleet, 'parent', 'archived', 2)
++    for i in range(200):
++        card(fleet, f'past-{i}', 'done')
++    metadata_rows = []
++    def factory(cursor, values):
++        if tuple(col[0] for col in cursor.description) == ('id', 'status', 'sync_version'):
++            metadata_rows.append(values[0])
++        return sqlite3.Row(cursor, values)
++    old = [db.row_factory for db in (live, fleet)]
++    for db in (live, fleet):
++        db.row_factory = factory
++    try:
++        chosen = Sources(live, fleet)
++        assert [row['id'] for row in chosen.rows] == ['open']
++        assert chosen.row('parent')['status'] == 'done'
++        assert chosen.connection('parent') is live
++        assert len(metadata_rows) < 10, len(metadata_rows)
++    finally:
++        for db, original in zip((live, fleet), old):
++            db.row_factory = original
++
++
++@pytest.mark.parametrize('pending,expected', [(False, 'archived'), (True, 'done')])
++def test_terminal_only_parent_keeps_revision_and_pending_authority(copies, configured, pending, expected):
++    from hermes_cli.kanban_lanes_sources import Sources
++    live, fleet = copies
++    card(live, 'p', 'done', 1)
++    card(fleet, 'p', 'archived', 2)
++    if pending:
++        live.execute('INSERT INTO kanban_sync_outbox VALUES(?,?,?,?,?)',
++                     ('p', 'tasks', 'upsert', 'pending', '{}'))
++    evidence = Sources(live, fleet)
++    assert evidence.rows == []
++    assert evidence.row('p')['status'] == expected
++    assert evidence.connection('p') is (live if pending else fleet)
++    assert evidence.row('absent') is None
++
++
+ def test_flow_held_predicate_reads_selected_source(copies, configured):
+     from hermes_cli import kanban_lanes_flow as flow
+     from hermes_cli.kanban_lanes_sources import Sources
+-- 
+2.43.0
+

@@ -1,0 +1,203 @@
+From 7de4aa19a35db52e460f88c911304394ee0bb2e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:12:58 +0000
+Subject: [PATCH] fix(kanban): admit authenticated foreign selfwork creators
+ without replica lookup [daveey]
+
+Problem: retained sw-example authorized at Mac origin, but its deterministic
+selfwork-create downstream remains pending/origin_dispatch_pending at hub.
+Why 1: owner creator_task rejects creator namespace != intake home.
+Why 2: it conflates local creator lookup with authenticated courier provenance.
+Root (happened): foreign creators unsupported despite origin-authenticated forwarding.
+Root (not caught): local creator tests assert namespace refusal, while forwarding
+composition ends at origin authorization rather than real intake dispatch.
+Recurrence: follows #3743 origin auth repair; distinct next intake boundary, same
+retained request and recovery owner t_a350d386d29bb646, not a reissued envelope.
+
+Allow foreign creator only bound to authenticated origin gateway/profile and
+sender. Keep full original creator/run in immutable intake intent; return no
+local lookup ID, never consult a colliding local/replica task. Apply conservative
+home lane policy to declared courier work, including no missing-row exemption.
+No wire format changes, foreign policy lookup, or journal/request rewrites.
+
+Proof: RED 3 failures; real registered CLI receive creates/appends/replays and
+preserves immutable creator, with collision isolation and enforced lane tests.
+715 all-consumer tests passed before final added enforced integration variant;
+11 final targeted tests passed; scripts/check 21 OK. Independent exact-head
+review and required CI still required. Gzip implementation not part of this fix.
+---
+ hermes_cli/kanban_lanes.py                    |  7 +-
+ hermes_cli/kanban_selfwork_owner.py           | 16 ++-
+ .../test_kanban_selfwork_foreign_creator.py   | 99 +++++++++++++++++++
+ 3 files changed, 115 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index c13a7f6616..1f231fa35f 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -404,7 +404,10 @@ def _gated(conn, pol: Policy, lane_name: str, opts: dict) -> bool:
+     if not lane.gated or _by_user(opts) or opts.get("created_by") in RECOVERY_CREATORS:
+         return False
+     key = opts.get("idempotency_key")
+-    filed_by_agent = bool(_agent_task(opts)) or opts.get("created_by") in lane.creators \
++    # Courier self-work has no local creator row when its producer is foreign.
++    # Keep that durable sender/declaration pair agent-filed, never a human exemption.
++    courier_work = opts.get("self_work") is not None and str(opts.get("created_by", "")).startswith("gw:")
++    filed_by_agent = bool(_agent_task(opts)) or courier_work or opts.get("created_by") in lane.creators \
+         or _key_matches(lane, key)
+     if not filed_by_agent or _alarm_key(key) or opts.get("admission_class") == "urgent":
+         return False
+@@ -415,7 +418,7 @@ def _gated(conn, pol: Policy, lane_name: str, opts: dict) -> bool:
+         # it finishes too. A named detector (``creators``) filing such a title still waits.
+         row = _creator_row(conn, opts)
+         if row is None:
+-            if opts.get("created_by") not in lane.creators:
++            if not courier_work and opts.get("created_by") not in lane.creators:
+                 return False
+         elif not (row["status"] == "triage" and row["block_kind"] == GATE_KIND):
+             return False
+diff --git a/hermes_cli/kanban_selfwork_owner.py b/hermes_cli/kanban_selfwork_owner.py
+index eb0e2ac8b0..8681ff5ed3 100644
+--- a/hermes_cli/kanban_selfwork_owner.py
++++ b/hermes_cli/kanban_selfwork_owner.py
+@@ -58,10 +58,10 @@ def validate_home(conn, intent, board):
+ 
+ 
+ def creator_task(conn, intent):
+-    """Resolve private provenance only in its authoritative home namespace.
++    """Return only an authoritative LOCAL lookup ID, never a foreign replica.
+ 
+-    Foreign creator policy is not yet supported: a same-ID replica must never
+-    silently stand in for an authenticated creator from another namespace.
++    The authenticated origin vouches for its foreign creator. Full provenance
++    remains in the immutable intake intent, not in the local creator-ID field.
+     """
+     if 'creator' not in intent:
+         return None
+@@ -69,9 +69,15 @@ def creator_task(conn, intent):
+     if (not isinstance(creator, dict)
+             or set(creator) != {'gateway', 'profile', 'board', 'task_id', 'run_uid'}
+             or not all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', v)
+-                       for v in creator.values())
+-            or {k: creator[k] for k in ('gateway', 'profile', 'board')} != intent['owner']):
++                       for v in creator.values())):
+         raise policy.SelfWorkError('self-work creator namespace unavailable at intake home')
++    if {k: creator[k] for k in ('gateway', 'profile', 'board')} != intent['owner']:
++        origin = intent.get('origin')
++        if (not isinstance(origin, dict)
++                or any(creator[k] != origin.get(k) for k in ('gateway', 'profile'))
++                or intent.get('sender') != 'gw:' + creator['gateway']):
++            raise policy.SelfWorkError('self-work creator namespace unavailable at intake home')
++        return None  # Do not read a colliding local task, its tenant or subscriptions.
+     columns = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
+     provenance = 'created_on' if 'created_on' in columns else 'NULL'
+     row = conn.execute(f'SELECT {provenance} FROM tasks WHERE id=?', (creator['task_id'],)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py b/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
+new file mode 100644
+index 0000000000..6ec8eabe03
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
+@@ -0,0 +1,99 @@
++"""Foreign provenance is not an intake-local primary key or a lane exemption."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_selfwork_owner as owner, kanban_lanes as lanes
++from hermes_cli.kanban_selfwork import SelfWorkError
++from tests.hermes_cli import test_kanban_selfwork_creator as creator_support
++from tests.hermes_cli import test_kanban_origin_owner as origin_support
++
++home, local, board = creator_support.home, creator_support.local, creator_support.board
++context = creator_support.context
++world, invoke = origin_support.world, origin_support.invoke
++
++
++@pytest.mark.parametrize('gated', [False, True])
++def test_real_foreign_receiver_create_append_replay(world, tmp_path, monkeypatch, capsys, gated):
++    import json
++    from hermes_cli import kanban_db_connect as kbc
++    if gated:
++        lane_policy = lanes.Policy({'hermes': lanes.Lane('hermes', gated=True, self_work=True)},
++                                   'hermes', 10)
++        monkeypatch.setattr(lanes, 'safe_policy', lambda: lane_policy)
++    (tmp_path / 'config.yaml').write_text(json.dumps({'kanban': {'self_work': {
++        'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}}}}))
++    with kbc.connect_closing() as conn:
++        collision = kb.create_task(conn, title='Unrelated', session_id='wrong-chat')
++    creator = {'gateway': 'origin', 'profile': 'work', 'board': 'default',
++               'task_id': collision, 'run_uid': 'original-run'}
++    world['action'] = 'selfwork-create'
++    world['args']['creator'] = creator
++    world['args']['create'].update(self_work={'version': 1, 'repository': 'hermes-core',
++                                            'area': 'transcript', 'kind': 'post-merge'}, requires=[])
++    first = invoke(world, monkeypatch, capsys, 'selfwork-create')
++    assert first.get('created') is True, first
++    assert first['handoff_complete'] is False
++    assert first['task_id'] != collision
++    assert invoke(world, monkeypatch, capsys, 'selfwork-create')['replayed'] is True
++    world['id'] = 'request-owner-002'
++    world['args']['create']['title'] = 'More evidence'
++    appended = invoke(world, monkeypatch, capsys, 'selfwork-create')
++    assert appended.get('disposition') == 'append', appended
++    assert appended['task_id'] == first['task_id']
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, first['task_id'])
++        assert task.status == ('triage' if gated else 'ready')
++        assert task.block_kind == ('lane_gate' if gated else None)
++        rows = conn.execute('SELECT request_json FROM self_work_intake').fetchall()
++        assert len(rows) == 2
++        assert all(json.loads(row[0])['intent']['creator'] == creator for row in rows)
++        event = next(e for e in kb.list_events(conn, first['task_id']) if e.kind == 'created')
++        assert event.payload['creator_task_id'] is None
++        assert not conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND chat_id='wrong-chat'",
++                                (first['task_id'],)).fetchone()
++
++
++def foreign(task_id):
++    intent = context(task_id)
++    intent.update(origin={'gateway': 'macbook', 'profile': 'default', 'session': 'chat'}, sender='gw:macbook')
++    intent['creator']['gateway'] = 'macbook'
++    return intent
++
++
++def test_foreign_creator_never_resolves_colliding_local_task(home):
++    task = kb.create_task(home, title='Unrelated local creator', session_id='wrong-chat')
++    assert owner.creator_task(home, foreign(task)) is None
++
++
++@pytest.mark.parametrize('field,value', [('gateway', 'spoof'), ('profile', 'other')])
++def test_foreign_creator_must_match_authenticated_origin(home, field, value):
++    intent = foreign('t_missing')
++    intent['creator'][field] = value
++    with pytest.raises(SelfWorkError):
++        owner.creator_task(home, intent)
++
++
++@pytest.mark.parametrize('sender', [None, 'gw:spoof', 'macbook'])
++def test_foreign_creator_requires_authenticated_sender(home, sender):
++    intent = foreign('t_missing')
++    intent['sender'] = sender
++    with pytest.raises(SelfWorkError):
++        owner.creator_task(home, intent)
++
++
++def test_foreign_creator_requires_origin(home):
++    intent = foreign('t_missing')
++    del intent['origin']
++    with pytest.raises(SelfWorkError):
++        owner.creator_task(home, intent)
++
++
++@pytest.mark.parametrize('title', ['Fix transcript traffic', 'Review transcript fix'])
++def test_courier_selfwork_without_local_creator_is_agent_filed(home, title):
++    from types import SimpleNamespace
++    import re
++    lane = SimpleNamespace(gated=True, creators=(), key_prefixes=(),
++                           gate_exempt=(re.compile('^Review'),))
++    policy = SimpleNamespace(lanes={'hermes': lane}, lane_of=lambda _: 'hermes')
++    opts = {'self_work': {'version': 1, 'repository': 'hermes-core', 'area': 'transport', 'kind': 'post-merge'},
++            'created_by': 'gw:macbook', 'title': title, 'creator_task_id': None}
++    assert lanes._gated(home, policy, 'hermes', opts)
+-- 
+2.43.0
+

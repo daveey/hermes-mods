@@ -1,0 +1,250 @@
+From 8496eef77438ac22f245a715e78177b8329a94bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:32:24 +0000
+Subject: [PATCH] [daveey] kanban delegation: judge built-child overrides by
+ provenance, admit the allocated route's own extra_body
+
+Review of PR #4048 at 1b4afbaf3293 (t_59ae72a4aa530f45) found a regression this PR introduced (B1):
+`_build_children` re-ran `check_request_overrides` on the built child's whole `request_overrides`.
+Construction merges the allocator-selected custom route's own `custom_providers[].extra_body` into that
+mapping (`agent_init._merge_custom_provider_extra_body`), so a valid `class:deep` delegation from a Kanban
+worker was refused whenever the allocator landed on a custom route whose operator config carries
+`provider` / `models` / `route` / `model` in `extra_body`. On base that delegation works.
+
+Why it happened: the post-construction check treated everything in the final mapping as caller authority.
+Operator route config and delegation overrides were only told apart by key name, not by where they came from.
+
+Fix: `kanban_delegation_policy.check_built_child(child, tier)` judges each source on its own record.
+- The tier overlay and the caller's body captured before the merge (`_caller_extra_body`) refuse any routing
+  key, whether or not its value equals the route config. The pre-construction checks are unchanged, so a
+  caller overlay is still refused before a child is built.
+- A routing key in the final `extra_body` is admitted only when the child's own route config, re-read from
+  `custom_providers` for its concrete provider/model/endpoint, holds the same key with the same value.
+- Everything else in the final mapping gets the full check, so a key added or replaced after the merge
+  still refuses. Nothing is removed from what the child sends.
+
+Tests (tests/tools/test_kanban_delegation_component79.py), through real `_routes_for` + `_build_children`
++ `AIAgent` unless marked unit:
+- route extra_body with provider/models/route, and with model: RED on 1b4afbaf3293 (the reviewer's
+  refusal text), GREEN here; the child's request_overrides equal the route config.
+- controls, green before and after: route extra_body service_tier only; native anthropic route.
+- tier overlay carrying routing keys equal to the route config (spoof), same key equal, same key different,
+  top-level model: child is built, refused before launch and closed.
+- caller overlay equal to the route config: refused at `_routes_for`, nothing constructed.
+- unit, `check_built_child`: caller-owned equal value, case variant, replaced value, added key, no trusted
+  route, another provider's config, top-level / extra_query / header keys, malformed shapes.
+
+Not covered here: header/query credential names beyond Authorization, x-api-key, api-key and host are not
+refused (operator config only; unchanged by this commit). Auxiliary, MoA, curator, side-question, plugin and
+external delegation paths, `register_root` against a live worker process, and macOS/Windows stay unproven.
+
+Card: t_b76fc0ced1eeacb2
+---
+ agent/kanban_delegation_policy.py             |  29 ++++
+ .../test_kanban_delegation_component79.py     | 133 ++++++++++++++++++
+ tools/delegate_tool.py                        |   6 +-
+ 3 files changed, 165 insertions(+), 3 deletions(-)
+
+diff --git a/agent/kanban_delegation_policy.py b/agent/kanban_delegation_policy.py
+index 49e58b722b..fd0e0bcd27 100644
+--- a/agent/kanban_delegation_policy.py
++++ b/agent/kanban_delegation_policy.py
+@@ -180,6 +180,35 @@ def check_request_overrides(overrides: Any, index: Optional[int] = None) -> None
+                 raise _refuse(index, f"request_overrides.extra_headers.{key} is a destination/auth override")
+ 
+ 
++def check_built_child(child: Any, tier: Any = None) -> None:
++    """Post-construction recheck of a built child's ``request_overrides``, judged by where each key came from.
++
++    Construction merges the allocator-selected custom route's own ``custom_providers[].extra_body`` under the
++    caller's.  That operator route config is not a delegation override, so a routing key in the final
++    ``extra_body`` is admitted only when that route's config (re-read here for the child's concrete
++    provider/model/endpoint) holds the same key with the same value.  Caller authority is judged on its own
++    record: the body captured before the merge and the tier overlay refuse any routing key, whether or not its
++    value equals the route config.  Everything else in the final mapping gets the full check, so a key added or
++    replaced after the merge still refuses.  Nothing is removed from what the child sends."""
++    check_request_overrides(tier)
++    caller = getattr(child, "_caller_extra_body", None)
++    if caller:
++        check_request_overrides({"extra_body": caller})
++    final = getattr(child, "request_overrides", None)
++    if not isinstance(final, Mapping) or not isinstance(final.get("extra_body"), Mapping):
++        return check_request_overrides(final)
++    body = final["extra_body"]
++    from agent.agent_init import _custom_provider_extra_body_for_agent
++    providers = getattr(child, "_custom_providers", None)
++    trusted = _custom_provider_extra_body_for_agent(
++        provider=str(getattr(child, "provider", "") or ""), model=str(getattr(child, "model", "") or ""),
++        base_url=str(getattr(child, "base_url", "") or ""),
++        custom_providers=providers if isinstance(providers, list) else []) or {}
++    unowned = {key: value for key, value in body.items()
++               if not (str(key).lower() in _ROUTING_KEYS and key in trusted and trusted[key] == value)}
++    check_request_overrides({**final, "extra_body": unowned})
++
++
+ def preflight_tasks(parent: Any, tasks: Any) -> list[str]:
+     """Class for every task (whole-batch refusal); non-list/non-dict shapes keep their native handling."""
+     if not isinstance(tasks, list):
+diff --git a/tests/tools/test_kanban_delegation_component79.py b/tests/tools/test_kanban_delegation_component79.py
+index 574974e103..df8bc59ac8 100644
+--- a/tests/tools/test_kanban_delegation_component79.py
++++ b/tests/tools/test_kanban_delegation_component79.py
+@@ -194,3 +194,136 @@ def test_malformed_bound_root_capability_refused(worker, field):
+     agent._native_origin_worker_custody = replace(bound, **{field: changes[field]})
+     with pytest.raises(policy.RestrictionError, match="invalid_worker_origin_registration"):
+         policy.register_root(agent, agent._test_original_worker_custody)
++
++
++# ── post-construction recheck: allocator-selected route config is not caller authority ───────
++
++RELAY_URL = "http://127.0.0.1:9/v1"
++ROUTE_BODY = {"provider": {"order": ["x"], "allow_fallbacks": False}, "models": ["relay-model"], "route": "fallback"}
++
++
++def _real_children(native, monkeypatch, *, route_body=None, tier=None):
++    """Real ``_routes_for`` + ``_build_children`` + ``AIAgent``; ``route_body`` None = native subscription route."""
++    from pathlib import Path
++    from hermes_cli.config import atomic_config_write, load_config_readonly
++    from hermes_constants import get_hermes_home
++    from tests.agent.test_model_routing import policy as routing_policy
++    import tools.delegate_tool as dt
++    home = get_hermes_home()
++    monkeypatch.setattr(Path, "home", lambda: home.parent / "account79")
++    cfg = load_config_readonly()
++    cfg.update(routing_policy())
++    base = deepcopy(cfg["model_routing"]["routes"]["deep"][0])
++    base["capabilities"]["streaming"] = True
++    if route_body is None:
++        cfg["model_routing"]["routes"]["deep"] = [base]
++        (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"anthropic": [
++            {"id": "eligible", "auth_type": "oauth", "source": "manual", "priority": 0,
++             "access_token": "-".join(("sk", "ant", "oat01", "fixture", "only"))}]}}))
++        monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", lambda *a, **kw: MagicMock())
++    else:
++        cfg["model_routing"]["routes"]["deep"] = [dict(base, provider="custom:relay", model="relay-model",
++                                                       billing="metered")]
++        cfg["model_routing"]["allow_metered"] = True
++        cfg["custom_providers"] = [{"name": "relay", "base_url": RELAY_URL, "api_key": "k", "model": "relay-model",
++                                    "extra_body": deepcopy(route_body)}]
++    cfg["model"] = {"context_length": 100000}
++    atomic_config_write(home / "config.yaml", cfg)
++    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 4)
++    monkeypatch.setattr(dt, "_open_child_session_db", lambda *a, **kw: None)
++    # The relay endpoint is never contacted: stub the local-server probe and keep every other send fatal.
++    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", lambda *a, **kw: None)
++    monkeypatch.setattr("httpx.Client.send", lambda *a, **kw: pytest.fail("network during construction"))
++    closed = []
++    real_close = dt._close_child
++    monkeypatch.setattr(dt, "_close_child", lambda obj, *a: closed.append(obj) or real_close(obj, *a))
++    routes, error = dt._routes_for([{"goal": "neutral analysis", "model": "class:deep"}], {}, None, native)
++    assert not error
++    if tier is not None:
++        routes[0].creds["task_tier_overrides"] = tier
++    children, error = dt._build_children([{"goal": "neutral analysis"}], [None], routes, top_role="leaf",
++        max_iterations=2, parent_agent=native, live_deleg_id=None, live_writers=[])
++    return [c for _, _, c in children], error, closed
++
++
++@pytest.mark.parametrize("route_body", [ROUTE_BODY, {"model": "upstream-alias"}, {"service_tier": "flex"}, None],
++                         ids=["routing-keys", "model-key", "control-tier", "native"])
++def test_real_build_children_admits_the_allocated_routes_own_extra_body(native, monkeypatch, route_body):
++    children, error, closed = _real_children(native, monkeypatch, route_body=route_body)
++    try:
++        assert not error, error
++        child, = children
++        assert closed == [] and policy.origin_for(child) is policy.origin_for(native)
++        if route_body is None:
++            assert child.provider == "anthropic" and not (child.request_overrides or {}).get("extra_body")
++        else:  # the operator's route config reaches the wire unchanged; nothing was stripped to pass the check
++            assert child.provider == "custom:relay" and child.model == "relay-model"
++            assert child.request_overrides == {"extra_body": route_body}
++    finally:
++        for child in children:
++            child.release_clients()
++
++
++@pytest.mark.parametrize("tier", [
++    {"extra_body": deepcopy(ROUTE_BODY)},                       # spoof: same keys AND values as the trusted route
++    {"extra_body": {"provider": ROUTE_BODY["provider"]}},       # same-key collision, equal value
++    {"extra_body": {"provider": {"only": ["other"]}}},          # same key, different value
++    {"model": "late-pin"},
++], ids=["spoof-equal", "collision-equal", "collision-differs", "top-level"])
++def test_real_build_children_refuses_tier_overlay_routing_keys_even_when_equal_to_route_config(
++        native, monkeypatch, tier):
++    children, error, closed = _real_children(native, monkeypatch, route_body=ROUTE_BODY, tier=tier)
++    assert children == [] and error and "routing override" in error
++    assert len(closed) == 1 and closed[0].provider == "custom:relay"  # built, refused before launch, closed
++
++
++@pytest.mark.parametrize("overrides", [{"extra_body": {"provider": ROUTE_BODY["provider"]}},
++                                       {"extra_body": {"route": "fallback"}}])
++def test_caller_overlay_equal_to_route_config_is_refused_before_construction(native, monkeypatch, overrides):
++    import tools.delegate_tool as dt
++    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", lambda **kw: pytest.fail("constructed"))
++    routes, error = dt._routes_for([{"goal": "neutral analysis", "model": "class:deep"}],
++                                   {"request_overrides": overrides}, None, native)
++    assert routes == [] and error and "routing override" in error
++
++
++def _built(final, *, caller=None, providers=None):
++    from types import SimpleNamespace
++    return SimpleNamespace(provider="custom:relay", model="relay-model", base_url=RELAY_URL, request_overrides=final,
++                           _caller_extra_body=caller or {}, _custom_providers=providers if providers is not None else [
++                               {"name": "relay", "base_url": RELAY_URL, "model": "relay-model",
++                                "extra_body": deepcopy(ROUTE_BODY)}])
++
++
++def test_built_child_check_admits_only_the_trusted_routes_exact_extra_body():
++    policy.check_built_child(_built({"temperature": 0.1, "extra_body": {**ROUTE_BODY, "service_tier": "flex"}}))
++    policy.check_built_child(_built({"extra_body": {"service_tier": "flex"}}, providers=[]))
++    policy.check_built_child(_built(None))
++
++
++@pytest.mark.parametrize("child", [
++    _built({"extra_body": deepcopy(ROUTE_BODY)}, caller={"provider": ROUTE_BODY["provider"]}),  # caller-owned, equal
++    _built({"extra_body": deepcopy(ROUTE_BODY)}, caller={"Provider": {"order": ["x"]}}),
++    _built({"extra_body": {**ROUTE_BODY, "provider": {"order": ["y"]}}}),                # route value was replaced
++    _built({"extra_body": {**ROUTE_BODY, "fallbacks": ["m"]}}),                          # key the route never set
++    _built({"extra_body": deepcopy(ROUTE_BODY)}, providers=[]),                          # no trusted source at all
++    _built({"extra_body": deepcopy(ROUTE_BODY)},
++           providers=[{"name": "other", "base_url": RELAY_URL, "extra_body": deepcopy(ROUTE_BODY)}]),
++    _built({"extra_body": deepcopy(ROUTE_BODY), "model": "x"}),
++    _built({"extra_body": deepcopy(ROUTE_BODY), "extra_query": {"model": "x"}}),
++    _built({"extra_body": deepcopy(ROUTE_BODY), "extra_headers": {"Authorization": "Bearer x"}}),
++    _built({"extra_body": ["provider"]}),
++    _built({"extra_body": deepcopy(ROUTE_BODY)}, caller=["provider"]),
++], ids=["caller-equal", "caller-case", "replaced", "added", "no-route", "other-route", "top-level", "query",
++        "header", "body-shape", "caller-shape"])
++def test_built_child_check_refuses_unauthorized_or_caller_owned_routing_keys(child):
++    with pytest.raises(policy.RestrictionError):
++        policy.check_built_child(child)
++
++
++def test_built_child_check_refuses_tier_routing_keys_before_reading_the_route():
++    child = _built({"extra_body": deepcopy(ROUTE_BODY)})
++    with pytest.raises(policy.RestrictionError):
++        policy.check_built_child(child, {"extra_body": {"provider": ROUTE_BODY["provider"]}})
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 659c4d9f78..53ecc19c06 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -632,11 +632,11 @@ def _build_children(
+                 **{"toolsets": None, "model": route.creds["model"], **(rebuild[i] if rebuild else {})},
+             )
+             pin_child_service_tier(child, route.creds)
+-            # Construction and the tier overlay can both add SDK kwargs after logical preflight.
+-            # Inspect only request tuning, never the concrete route chosen by the native allocator.
++            # Construction and the tier overlay can both add SDK kwargs after logical preflight. Caller and
++            # tier input are judged apart from the allocated route's own operator extra_body (check_built_child).
+             from agent import kanban_delegation_policy as _policy
+             if _policy.origin_for(parent_agent) is not None:
+-                _policy.check_request_overrides(getattr(child, "request_overrides", None))
++                _policy.check_built_child(child, route.creds.get("task_tier_overrides"))
+         except ValueError as exc:
+             if child is not None:
+                 _detach_child(parent_agent, child)
+-- 
+2.43.0
+

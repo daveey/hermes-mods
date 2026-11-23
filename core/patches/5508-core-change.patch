@@ -1,0 +1,133 @@
+From 7638f5ed1dd132293b1a4de8358a91e97643deab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:39:22 +0000
+Subject: [PATCH] fix(kanban): serialize legacy creation-key replay checks
+ [daveey]
+
+The real CLI concurrency acceptance exposed a pre-existing legacy race: both creators could miss the early lookup, while only strict native admission rechecked inside write_txn. Recheck every keyed creation there; retain strict receipt checks and archived-key semantics. Deterministic barrier RED on 3ebbb87 returns two IDs; GREEN deduplicates tasks and created events. Distinct/no-key and archived reuse controls plus actual CLI timeout/ambiguous-response coverage remain.
+
+Isolate receipt-artifact process inventory from unrelated host process churn while preserving deletion assertions and a real fail-closed scan-unavailable control. Original broad run had four cleanup assertion failures; isolated greens do not identify their historical cause. Controlled inventory failure reproduces all four, without any production cleanup change. Nine focused files389passed without retries; scripts/check21passed.
+---
+ hermes_cli/kanban_origin_admission.py         |  4 +-
+ .../test_kanban_creation_key_race.py          | 48 +++++++++++++++++++
+ .../test_kanban_receipt_artifacts.py          | 29 +++++++++++
+ 3 files changed, 79 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_creation_key_race.py
+
+diff --git a/hermes_cli/kanban_origin_admission.py b/hermes_cli/kanban_origin_admission.py
+index 02e8dd9d6e..d38ee48958 100644
+--- a/hermes_cli/kanban_origin_admission.py
++++ b/hermes_cli/kanban_origin_admission.py
+@@ -93,8 +93,8 @@ def require_receipt(conn, task_id):
+ 
+ 
+ def existing(conn, idempotency_key):
+-    """Strict replays are decided under the same write lock as insertion."""
+-    if not active() or not idempotency_key:
++    """Recheck every replay under the insertion lock; validate strict custody too."""
++    if not idempotency_key:
+         return None
+     from hermes_cli.kanban_db_creation import existing_creation_key
+     row = existing_creation_key(conn, idempotency_key)
+diff --git a/tests/hermes_cli/test_kanban_creation_key_race.py b/tests/hermes_cli/test_kanban_creation_key_race.py
+new file mode 100644
+index 0000000000..e96fcd4863
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creation_key_race.py
+@@ -0,0 +1,48 @@
++"""Legacy idempotency replay stays atomic across concurrent creators."""
++from concurrent.futures import ThreadPoolExecutor
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_origin_admission as admission
++
++
++@pytest.mark.parametrize("same_key", [True, False, None])
++def test_legacy_recheck_after_concurrent_early_miss(tmp_path, monkeypatch, same_key):
++    db = tmp_path / "board.db"
++    kb.init_db(db)
++    barrier = threading.Barrier(2)
++    original = admission.early_existing
++
++    def early(*args):
++        result = original(*args)
++        assert result is None
++        barrier.wait(timeout=10)
++        return result
++
++    monkeypatch.setattr(admission, "early_existing", early)
++
++    def create(index):
++        with kbc.connect_closing(db) as conn:
++            key = None if same_key is None else "same-key" if same_key else f"key-{index}"
++            return kb.create_task(conn, title="isolated race fixture", idempotency_key=key)
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        ids = list(pool.map(create, range(2)))
++    expected = 1 if same_key else 2
++    assert len(set(ids)) == expected, ids
++    with kbc.connect_closing(db) as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == expected
++        assert conn.execute("SELECT count(*) FROM task_events WHERE kind='created'").fetchone()[0] == expected
++
++
++def test_archived_legacy_key_allows_new_card(tmp_path):
++    with kbc.connect_closing(tmp_path / "board.db") as conn:
++        original = kb.create_task(conn, title="old", idempotency_key="reusable")
++        assert kb.archive_task(conn, original)
++        replacement = kb.create_task(conn, title="new", idempotency_key="reusable")
++        assert replacement != original
++        assert kb.create_task(conn, title="retry", idempotency_key="reusable") == replacement
++        assert kb.get_task(conn, original).status == "archived"
+diff --git a/tests/hermes_cli/test_kanban_receipt_artifacts.py b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+index d58687b79f..d37766d56a 100644
+--- a/tests/hermes_cli/test_kanban_receipt_artifacts.py
++++ b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+@@ -15,11 +15,40 @@ from tests.hermes_cli import test_kanban_metadata_files as helpers
+ kanban_home = helpers.kanban_home
+ 
+ 
++@pytest.fixture(autouse=True)
++def receipt_process_inventory(monkeypatch):
++    # Receipt preservation tests own no external jobs. Real host process scans
++    # may fail closed and defer deletion; that separate safety contract is
++    # exercised in test_kanban_workspace_jobs, not by receipt byte assertions.
++    from hermes_cli import kanban_workspace_jobs as jobs
++    monkeypatch.setattr(jobs.psutil, "process_iter", lambda: iter(()))
++
++
+ def receipt(ref):
+     return {"version": 1, "items": [{"scope": "report", "disposition": "delivered",
+         "evidence": [{"ref": ref, "observed_at": "2026-01-01T00:00:00Z", "verification": "reported"}], "remaining": []}]}
+ 
+ 
++def test_receipt_preserved_when_process_scan_defers_cleanup(kanban_home, monkeypatch):
++    from hermes_cli import kanban_workspace_jobs as jobs
++
++    def unavailable():
++        raise jobs.psutil.AccessDenied(pid=123456789)
++
++    monkeypatch.setattr(jobs.psutil, "process_iter", unavailable)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        report = ws / "report.md"
++        report.write_text("preserved despite cleanup deferral")
++        value = receipt(str(report))
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                                metadata={"completion_receipt": value})
++        meta = kb.latest_run(conn, task).metadata
++        assert meta["completion_receipt"] == value
++        assert Path(meta["attached_from_workspace"][str(report)]).read_text() == report.read_text()
++        assert ws.exists()  # fail-closed safety remains production behaviour
++
++
+ def test_receipt_identity_survives_artifact_relocation(kanban_home):
+     with kbc.connect_closing() as conn:
+         task, ws, run = helpers._scratch_card(conn)
+-- 
+2.43.0
+

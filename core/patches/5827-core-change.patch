@@ -1,0 +1,261 @@
+From 5507a38228bf6124592b10c880fabd29cb90d741 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:16:54 +0000
+Subject: [PATCH] [daveey] fix(kanban): queued strict links readers share one
+ rebuild instead of each projecting in turn
+
+On a board written every few seconds, a strict reader's fingerprint (taken before _links_lock) never matched
+the projection it had waited for, so every reader queued on the lock rebuilt in series. Hub observation: 412
+strict projections in 57 min at ~6 s wall each, the lock held ~98% of the time, ~12 threadpool workers parked
+on it and Desktop user-steps polls timing out at 6-10 s while the hub sat 79% idle.
+
+Readers now take an arrival ticket before fingerprinting and each projection a start ticket before reading any
+store. Under the lock, a cached projection that started after the reader arrived answers it: it read every store
+after the reader's own writes, so read-your-writes holds. A reader never takes a projection that started before
+it arrived. New diag event <lane>.shared counts the reuse.
+
+Co-Authored-By: Contributor <contributor@example.com>
+---
+ hermes_cli/kanban_links_diagnostics.py        |  5 +
+ hermes_cli/kanban_links_tickets.py            | 41 +++++++++
+ hermes_cli/kanban_session_activity.py         | 15 ++-
+ .../test_kanban_links_single_flight.py        | 91 +++++++++++++++++++
+ 4 files changed, 147 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_links_tickets.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_single_flight.py
+
+diff --git a/hermes_cli/kanban_links_diagnostics.py b/hermes_cli/kanban_links_diagnostics.py
+index f72c486b76..a8bbcc05ea 100644
+--- a/hermes_cli/kanban_links_diagnostics.py
++++ b/hermes_cli/kanban_links_diagnostics.py
+@@ -76,6 +76,11 @@ def published() -> None:
+     event(_lane.get() + ".publish")
+ 
+ 
++def shared() -> None:
++    """A queued strict reader took a projection that started after it arrived (no rebuild of its own)."""
++    event(_lane.get() + ".shared")
++
++
+ def board_decision(done, inputs, started, max_age, reads) -> str:
+     """Original short-circuit admission, with its reason exposed; never replay twice."""
+     if inputs is None:
+diff --git a/hermes_cli/kanban_links_tickets.py b/hermes_cli/kanban_links_tickets.py
+new file mode 100644
+index 0000000000..6b151b2e3b
+--- /dev/null
++++ b/hermes_cli/kanban_links_tickets.py
+@@ -0,0 +1,41 @@
++"""Single-flight tickets and freshness for the linked-cards projection (``kanban_session_activity``). [daveey]
++
++Every strict reader takes an arrival ticket before its fingerprint; every projection takes a start ticket before it
++reads any store. A cached projection whose start ticket is later than a reader's arrival read every store after that
++reader's own writes, so it answers the reader (read-your-writes) even though the fingerprint moved meanwhile.
++
++Without this, on a board written every few seconds each reader queued on ``_links_lock`` rebuilt in turn: hub
++observation window, many strict projections took seconds of wall each, the lock was held most of the time and Desktop user-steps
++polls timing out behind it while the hub sat idle. ``publish``/``answers``/``reset`` run under ``_links_lock``."""
++import itertools
++from typing import Callable
++
++from hermes_cli import kanban_links_narrow as _links_narrow
++
++
++class StartTickets:
++    def __init__(self, clock: Callable[[], float]):
++        self._clock = clock  # the owner's monotonic clock, looked up per call (tests replace it)
++        self._tickets = itertools.count(1)
++        self._started: dict[tuple, int] = {}
++
++    def take(self) -> int:
++        """A reader's arrival or a projection's start; strictly increasing across threads."""
++        return next(self._tickets)
++
++    def publish(self, scope: tuple, started: int, live_scopes) -> None:
++        """``scope``'s cached projection is now the one that took ``started``; forget scopes the cache evicted."""
++        self._started[scope] = started
++        for stale in [key for key in self._started if key not in live_scopes]:
++            del self._started[stale]
++
++    def answers(self, scope: tuple, arrival: int, hit: tuple) -> bool:
++        """``hit`` (the cached entry) started after ``arrival`` and is within its max age."""
++        return self._started.get(scope, 0) > arrival and self._clock() < hit[0]
++
++    def reset(self) -> None:
++        self._started.clear()
++
++    def fresh(self, hit: tuple, fingerprint: tuple) -> bool:
++        """Within its max age, and read under ``fingerprint`` except for boards it never read (``kanban_links_narrow``)."""
++        return self._clock() < hit[0] and (hit[2] == fingerprint or _links_narrow.matches(hit, fingerprint))
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cd0a23d62f..5efe5c9d5c 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -49,6 +49,7 @@ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+ from hermes_cli.kanban_links_refresh import ScopeRefresher
+ from hermes_cli import kanban_links_diagnostics as diag
++from hermes_cli.kanban_links_tickets import StartTickets as _StartTickets
+ from hermes_cli import kanban_links_narrow as _links_narrow, kanban_external_activity as _external_activity
+ from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
+ from hermes_cli.kanban_open_asks import card_is_open_human_ask, stamp_needs_you
+@@ -880,6 +881,8 @@ _links_lock = threading.Lock()
+ # from, released ones included (``remote_links_and_origin_rows``).
+ _LINKS_SCOPE_CAP = 16
+ _links_cache: dict[tuple, tuple] = {}
++_links_tickets = _StartTickets(lambda: time.monotonic())  # queued strict readers share one rebuild
++_links_fresh = _links_tickets.fresh
+ _origin_rows_sink = threading.local()  # .rows: set by _project_remote_links for _store_links
+ 
+ 
+@@ -964,6 +967,7 @@ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
+             diag.event("links_display.stale")
+             _refresh_links_in_background(scope)
+             return hit
++        arrival = _links_tickets.take()  # before the fingerprint: ``kanban_links_tickets``
+         fingerprint = diag.timed("fingerprint", _links_fingerprint)
+         if hit is not None and _links_fresh(hit, fingerprint):
+             diag.source_decision(hit, fingerprint, True, time.monotonic())
+@@ -976,15 +980,13 @@ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
+             if stale_ok and hit is not None:
+                 diag.event("links_display.stale")
+                 return hit
++            if hit is not None and _links_tickets.answers(scope, arrival, hit):
++                diag.shared()
++                return hit
+             diag.source_decision(hit, fingerprint, False, time.monotonic())
+             return _publish_links(scope, fingerprint)
+ 
+ 
+-def _links_fresh(hit: tuple, fingerprint: tuple) -> bool:
+-    """Within its max age, and read under ``fingerprint`` except for boards it never read (``kanban_links_narrow``)."""
+-    return time.monotonic() < hit[0] and (hit[2] == fingerprint or _links_narrow.matches(hit, fingerprint))
+-
+-
+ def _publish_links(scope: tuple, fingerprint: tuple) -> tuple:
+     projector = _project_remote_links  # the one ``_store_links`` runs: a replaced projection declares no reads
+     return _links_narrow.remember(_store_links(scope, fingerprint), projector, _board_db_paths(), _board_slug)
+@@ -994,6 +996,7 @@ def _store_links(scope: tuple, fingerprint: tuple) -> tuple:
+     """Project and publish (caller holds ``_links_lock``); returns the published entry. ``fingerprint`` is taken
+     before projecting, so a store change during the projection leaves the cache stale and triggers another rebuild."""
+     global _links_cache
++    started = _links_tickets.take()
+     _origin_rows_sink.rows = []
+     try:
+         cards = diag.timed("projection", _project_remote_links)
+@@ -1008,6 +1011,7 @@ def _store_links(scope: tuple, fingerprint: tuple) -> tuple:
+     while len(updated) > _LINKS_SCOPE_CAP:
+         del updated[next(iter(updated))]
+     _links_cache = updated
++    _links_tickets.publish(scope, started, updated)
+     diag.published()
+     return entry
+ 
+@@ -1974,6 +1978,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     _busy.reset()
+     with _links_lock:
+         _links_cache.clear()
++        _links_tickets.reset()
+         _links_narrow.reset()
+     with _cache_lock:
+         _cache = None
+diff --git a/tests/hermes_cli/test_kanban_links_single_flight.py b/tests/hermes_cli/test_kanban_links_single_flight.py
+new file mode 100644
+index 0000000000..8cf3f1a266
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_single_flight.py
+@@ -0,0 +1,91 @@
++"""Strict linked-card readers queued behind one projection share the next one instead of each rebuilding in turn.
++
++Hub observation: workers wrote a board every few seconds, so a strict reader's fingerprint (taken before
++``_links_lock``) never matched the projection it had waited for. Every queued reader rebuilt in series (~6 s each),
++the lock was held 98% of the time and Desktop user-steps polls timed out behind it. [daveey]"""
++import itertools
++import threading
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from tests.waiting import wait_until
++
++
++class _CountingLock:
++    """``_links_lock`` stand-in that counts acquire attempts, so a test knows every reader is queued."""
++
++    def __init__(self):
++        self._lock = threading.Lock()
++        self._mutex = threading.Lock()
++        self.attempts = 0
++
++    def __enter__(self):
++        with self._mutex:
++            self.attempts += 1
++        self._lock.acquire()
++        return self
++
++    def __exit__(self, *exc):
++        self._lock.release()
++        return False
++
++
++@pytest.fixture
++def busy_board(monkeypatch):
++    """Every fingerprint read sees a new board write; the first projection blocks until released."""
++    lock = _CountingLock()
++    monkeypatch.setattr(activity, "_links_lock", lock)
++    monkeypatch.setattr(activity, "_origin_scope", lambda: ("A",))
++    writes = itertools.count()
++    monkeypatch.setattr(activity, "_links_fingerprint", lambda: (next(writes),))
++    projections = []
++    first_started, release_first = threading.Event(), threading.Event()
++
++    def project():
++        n = len(projections)
++        projections.append(n)
++        if n == 0:
++            first_started.set()
++            assert release_first.wait(10)
++        return [{"id": "A", "projection": n}]
++
++    monkeypatch.setattr(activity, "_project_remote_links", project)
++    activity._reset_cache_for_tests()
++    lock.attempts = 0
++    yield lock, projections, first_started, release_first
++    release_first.set()
++    activity._reset_cache_for_tests()
++
++
++def _read_in_thread(results, key):
++    thread = threading.Thread(target=lambda: results.__setitem__(key, activity._remote_links()), daemon=True)
++    thread.start()
++    return thread
++
++
++def test_queued_strict_readers_share_one_rebuild(busy_board):
++    lock, projections, first_started, release_first = busy_board
++    results = {}
++    first = _read_in_thread(results, "first")
++    assert first_started.wait(5)
++    waiters = [_read_in_thread(results, i) for i in range(4)]
++    wait_until(lambda: lock.attempts == 5, what="every reader queued on _links_lock")
++    release_first.set()
++    for thread in [first, *waiters]:
++        thread.join(10)
++        assert not thread.is_alive()
++    # The first projection started before the waiters arrived, so it cannot answer them (read-your-writes);
++    # the second started after all of them arrived, so it answers every one.
++    assert projections == [0, 1]
++    assert results["first"][0]["projection"] == 0
++    assert {results[i][0]["projection"] for i in range(4)} == {1}
++
++
++def test_reader_never_takes_a_projection_that_started_before_it(busy_board):
++    _, projections, _, release_first = busy_board
++    release_first.set()
++    assert activity._remote_links()[0]["projection"] == 0
++    # The board moved since (new fingerprint) and this reader arrived after projection 0 started: it must rebuild.
++    assert activity._remote_links()[0]["projection"] == 1
++    assert projections == [0, 1]
+-- 
+2.43.0
+

@@ -1,0 +1,241 @@
+From 4f5b1dd49c083d35166aa98ddf09edd3274ffb6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:09:43 +0000
+Subject: [PATCH] fix(kanban): refuse structural reviews before allocating runs
+ [daveey]
+
+Unknown-author review admission previously fell through to claimed spawn accounting; ready retries additionally leaked through generic quota preflight. Move typed structural refusal accounting into review-owned preclaim handling, retain bounded visible escalation and home custody, and exempt classified reviews from generic quota resolution. Preserve author history, failure budgets and candidate walls.
+
+Proof: two actual-dispatch unknown-author cases fail before repair (extra run / uncaught refusal); both now pass with no claims, runs or provider launches. Final saved13-file no-retry run:297 passed,2 failed, both new ready-known-author controls whose same-card sdlc-review fixture intentionally suppresses own author evidence. Stop at bounded two iterations; controls retained red for authentic source-linked fixture correction. Full scripts/check --base origin/main passes. No fleet remediation or landing claimed.
+---
+ hermes_cli/kanban_dispatch_skip.py            |  5 +-
+ hermes_cli/kanban_review_admission.py         | 49 ++++++++++--
+ .../test_kanban_managed_pin_policy.py         |  9 ++-
+ .../test_kanban_review_preclaim_refusal.py    | 79 +++++++++++++++++++
+ 4 files changed, 135 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_preclaim_refusal.py
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 6912f5f17f..e950c43082 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -259,14 +259,17 @@ def record_tick(conn: sqlite3.Connection, result: Any, *, dry_run: bool = False)
+ # --- fresh card on a quota-walled explicit pin --------------------------------------------------------------
+ 
+ 
+-def pinned_quota_hold(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str, float]]:
++def pinned_quota_hold(conn: sqlite3.Connection, task_id: str, *, lane: str = 'ready') -> Optional[tuple[str, str, float]]:
+     """``(class, auto, reset)`` when every eligible class route is quota-walled.
+ 
+     Legacy concrete selectors are historical evidence, never an admission gate.
+     Existing run quota episodes retain their own admission checks.
+     """
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_review_model import is_review_run
+     task = kb.get_task(conn, task_id)
++    if task is not None and is_review_run(conn, task, lane):
++        return None  # reviewer provenance and candidate walls belong to review admission
+     if task is not None:
+         from hermes_cli.kanban_class_walls import class_wall_routes
+         from hermes_cli.kanban_model_tier import resolve_model_tier
+diff --git a/hermes_cli/kanban_review_admission.py b/hermes_cli/kanban_review_admission.py
+index 4a974b0dc6..89ee6c431b 100644
+--- a/hermes_cli/kanban_review_admission.py
++++ b/hermes_cli/kanban_review_admission.py
+@@ -10,10 +10,10 @@ REASON = "review_provider_wall"
+ 
+ 
+ def hold(conn, task_id, result, *, lane, dry_run):
+-    """Defer only proven temporary exhaustion, not missing provenance/policy errors.
++    """Review-owned preclaim admission: walls defer and structural refusals escalate.
+ 
+-    Resolve with the same host-local policy as spawn. Leave status and run/failure
+-    budgets untouched so another host with an available reviewer can claim it.
++    Resolve with the same host-local policy as spawn. Refusals allocate no run
++    and preserve failure budgets; only the home counts structural rejections.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_model_tier import load_tier_config
+@@ -25,8 +25,11 @@ def hold(conn, task_id, result, *, lane, dry_run):
+         review.resolve_review_model(conn, task, load_tier_config())
+     except review.ReviewRouteDeferred as exc:
+         payload = {"reason": REASON, "until": int(exc.until)}
+-    except review.ReviewModelUnavailable:
+-        return False
++    except review.ReviewModelUnavailable as exc:
++        result.respawn_guarded.append((task_id, "review_model_unavailable"))
++        if not dry_run:
++            record_refusal(conn, task_id, exc, result, lane=lane)
++        return True
+     except Exception:
+         # This is an optional preflight, not the per-card failure boundary.
+         # Spawn retains structural/error accounting and lets siblings proceed.
+@@ -45,6 +48,42 @@ def hold(conn, task_id, result, *, lane, dry_run):
+     return True
+ 
+ 
++def record_refusal(conn, task_id, exc, result, *, lane):
++    """Home-owned, task-scoped refusal accounting; never allocate or finish a run."""
++    import time
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_check import foreign_copy
++
++    if foreign_copy(conn, task_id):
++        return  # the executor refuses safely; its home owns escalation
++    now = int(time.time())
++    error = str(exc)[:500]
++    with kb.write_txn(conn):
++        task = kb.get_task(conn, task_id)
++        if task is None or task.status != lane or task.claim_lock or foreign_copy(conn, task_id):
++            return
++        last = conn.execute(
++            "SELECT kind, payload, created_at FROM task_events WHERE task_id=? "
++            "AND kind IN ('review_admission_refused', 'claimed', 'review_requested', 'unblocked', 'assigned') "
++            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++        prior = kb._json_dict(last['payload']) if last and last['kind'] == 'review_admission_refused' else {}
++        same = prior.get('error') == error and prior.get('source_run') == task.current_run_id
++        if same and now - last['created_at'] < kb._resolve_rate_limit_cooldown_seconds():
++            return
++        count = int(prior.get('deferrals', 0)) + 1 if same else 1
++        payload = {'admission_refusal': 'review_model_unavailable', 'error': error,
++                   'deferrals': count, 'source_run': task.current_run_id, 'infrastructure': True,
++                   'retry_status': lane, 'preclaim': True}
++        kb._append_event(conn, task_id, 'review_admission_refused', payload)
++        exhausted = isinstance(exc, review.ReviewModelsExhausted) or count >= review.DEFERRAL_LIMIT
++        if exhausted:
++            conn.execute("UPDATE tasks SET status='triage', block_kind='transient', human_request=NULL, "
++                         "last_failure_error=? WHERE id=? AND status=? AND claim_lock IS NULL", (error, task_id, lane))
++            kb._append_event(conn, task_id, 'gave_up', {**payload, 'kind': 'transient', 'sticky': True,
++                             'reason_code': 'review_model_unavailable', 'trigger_outcome': 'review_admission_refused'})
++            result.auto_blocked.append(task_id)
++
++
+ def pickup_hold(replica, card):
+     """Read-only twin of :func:`hold`: the wall's ``until`` when this machine's dispatcher would defer
+     ``card``, else None. Records nothing; any fault returns None (fail open)."""
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index e4fd2f4059..12a050160d 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -333,6 +333,7 @@ def test_class_routed_implementer_receipts_do_not_gate_review_admission(board):
+ def test_review_owned_preclaim_does_not_resolve_generic_class(board, monkeypatch, lane):
+     """Review lanes and skill-classified ready retries retain review-owned refusal accounting."""
+     from hermes_cli.kanban_class_walls import unroutable_class
++    from hermes_cli.kanban_dispatch_skip import pinned_quota_hold
+     from hermes_cli import kanban_model_tier as tier
+     from hermes_cli.kanban_review_model import is_review_run
+     conn, _ = board
+@@ -349,6 +350,7 @@ def test_review_owned_preclaim_does_not_resolve_generic_class(board, monkeypatch
+ 
+     monkeypatch.setattr(tier, 'resolve_model_tier', generic_resolution_forbidden)
+     assert unroutable_class(conn, tid, lane=lane) is None
++    assert pinned_quota_hold(conn, tid, lane=lane) is None
+     assert list(conn.iterdump()) == before  # no claim, run, receipt or author changes
+ 
+ 
+@@ -366,11 +368,16 @@ def test_repeated_identical_review_refusal_moves_to_a_visible_block(board, monke
+         conn.commit()
+     _disable_anthropic()
+     seen = []
++    runs_before = [tuple(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=?', (tid,))]
++    claims_before = [e.id for e in kb.list_events(conn, tid) if e.kind == 'claimed']
+     for attempt in range(1, DEFERRAL_LIMIT + 1):
+         dispatch_once(conn, spawn_fn=lambda *args: seen.append(args), max_spawn=1)
+         task = kb.get_task(conn, tid)
++        assert [tuple(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=?', (tid,))] == runs_before
++        assert [e.id for e in kb.list_events(conn, tid) if e.kind == 'claimed'] == claims_before
++        assert task.claim_lock is None
+         if attempt < DEFERRAL_LIMIT:
+-            assert (task.status, task.consecutive_failures) == ('review', 0), attempt
++            assert (task.status, task.consecutive_failures) == (lane, 0), attempt
+     assert seen == []
+     assert task.status == 'triage'
+     gave_up = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'gave_up'][-1]
+diff --git a/tests/hermes_cli/test_kanban_review_preclaim_refusal.py b/tests/hermes_cli/test_kanban_review_preclaim_refusal.py
+new file mode 100644
+index 0000000000..c938b3149e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_preclaim_refusal.py
+@@ -0,0 +1,79 @@
++"""Review structural refusal belongs before claim/run allocation, on both lanes."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_managed_pin_policy as helpers
++
++board = helpers.board
++
++
++def unknown_author(conn, lane):
++    tid = helpers._hand_off_for_review(conn, {})
++    helpers._receipts(conn, tid, route=('class:deep', None))
++    if lane == 'ready':
++        conn.execute("UPDATE tasks SET status='ready', skills=? WHERE id=?", ('["sdlc-review"]', tid))
++        conn.commit()
++    return tid
++
++
++def result():
++    return SimpleNamespace(clock_held={}, respawn_guarded=[], auto_blocked=[])
++
++
++@pytest.mark.parametrize('lane', ['review', 'ready'])
++def test_dry_review_refusal_is_read_only(board, lane):
++    from hermes_cli.kanban_review_admission import hold
++    conn, _ = board
++    tid = unknown_author(conn, lane)
++    before = list(conn.iterdump())
++    assert hold(conn, tid, result(), lane=lane, dry_run=True)
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize('lane', ['review', 'ready'])
++def test_refusal_cooldown_and_foreign_home_never_allocate(board, monkeypatch, lane):
++    from hermes_cli.kanban_review_admission import hold
++    from hermes_cli import kanban_wake_check
++    conn, _ = board
++    tid = unknown_author(conn, lane)
++    before_runs = [tuple(r) for r in conn.execute('SELECT * FROM task_runs')]
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '300')
++    assert hold(conn, tid, result(), lane=lane, dry_run=False)
++    before = list(conn.iterdump())
++    for _ in range(4):
++        assert hold(conn, tid, result(), lane=lane, dry_run=False)
++    assert list(conn.iterdump()) == before
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    monkeypatch.setattr(kanban_wake_check, 'foreign_copy', lambda *a: True)
++    assert hold(conn, tid, result(), lane=lane, dry_run=False)
++    assert list(conn.iterdump()) == before
++    assert [tuple(r) for r in conn.execute('SELECT * FROM task_runs')] == before_runs
++
++
++@pytest.mark.parametrize('lane', ['review', 'ready'])
++@pytest.mark.parametrize('blocked', [False, True])
++def test_known_author_actual_dispatch_still_obeys_candidate_walls(board, monkeypatch, lane, blocked):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    from hermes_cli import kanban_provider_walls as walls
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    conn, _ = board
++    tid = helpers._hand_off_for_review(conn, {})
++    if lane == 'ready':
++        conn.execute("UPDATE tasks SET status='ready', skills=? WHERE id=?", ('["sdlc-review"]', tid))
++        conn.commit()
++    monkeypatch.setattr(walls, 'active_walls', lambda **kw: {})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *a: None)
++    monkeypatch.setattr(pacing, 'held_pools', lambda *a: {'anthropic': 9999999999, 'openai-codex': 9999999999} if blocked else {})
++    before_runs = conn.execute('SELECT count(*) FROM task_runs').fetchone()[0]
++    seen = []
++    outcome = dispatch_once(conn, spawn_fn=lambda task, *a: seen.append(task.model_override), max_spawn=1)
++    assert len(seen) == (0 if blocked else 1)
++    assert conn.execute('SELECT count(*) FROM task_runs').fetchone()[0] == before_runs + (0 if blocked else 1)
++    if blocked:
++        assert outcome.clock_held[tid][0] == 'review_provider_wall'
++    else:
++        assert seen[0] != 'claude-sonnet-5-5'  # authenticated actual author remains excluded
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.model_override is None and task.provider_override is None
+-- 
+2.43.0
+

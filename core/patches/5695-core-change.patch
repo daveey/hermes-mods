@@ -1,0 +1,357 @@
+From cfadfff8274970a33fb96332b8fda29c80c723da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:04:26 +0000
+Subject: [PATCH] fix(desktop): isolate draft display without changing send
+ workspace [daveey]
+
+Keep first-send cwd equal to the pre-PR target/Home/current/fallback
+computation. A display-only selector retains the main draft's placement
+while a center tile borrows Files' cwd; deliberate workspace choices clear
+that borrowing in the existing chosen-cwd setter.
+
+Regression coverage compares session.create to an independent pre-PR cwd
+oracle across every workspace writer, including project entry after a tile,
+same-path choices, round trips and tile closure. Five regression cases fail
+on the prior head; focused repaired tests pass.
+---
+ .../src/app/chat/sidebar/draft-rows.tsx       |   4 +-
+ .../session/hooks/new-session-target.test.tsx | 116 ++++++++++++++++--
+ .../hooks/use-session-actions/index.ts        |   3 +-
+ .../src/app/session/new-session-cwd.ts        |  51 ++++----
+ apps/desktop/src/store/session.ts             |   2 +
+ apps/desktop/src/store/sidebar-draft.ts       |   5 +-
+ 6 files changed, 144 insertions(+), 37 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+index aca66c8bb3..a095787cdd 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
+ import { useLocation } from 'react-router'
+ 
+ import { NEW_CHAT_ROUTE } from '@/app/routes'
+-import { $mainDraftSessionCwd } from '@/app/session/new-session-cwd'
++import { $mainSidebarDisplayCwd } from '@/app/session/new-session-cwd'
+ import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
+ import type { SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
+@@ -46,7 +46,7 @@ export function SidebarDraftRows({
+   const selected = useStore($selectedStoredSessionId)
+   const focused = useStore($focusedStoredSessionId)
+   const tileFocused = useStore($focusedSessionIsTile)
+-  const cwd = useStore($mainDraftSessionCwd)
++  const cwd = useStore($mainSidebarDisplayCwd)
+   const key = useStore($freshDraftKey)
+   const titles = useStore($draftTitles)
+   const sessions = useStore($sessions)
+diff --git a/apps/desktop/src/app/session/hooks/new-session-target.test.tsx b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+index 73b83ea7ed..bf275842bb 100644
+--- a/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
++++ b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+@@ -32,8 +32,15 @@ import {
+   ensureGatewayAgent
+ } from '@/store/profile'
+ import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+-import { $projects, followEnteredProjectCwd } from '@/store/projects'
+-import { $sessions, setFreshDraftReady, setSelectedStoredSessionId } from '@/store/session'
++import { $projects, followEnteredProjectCwd, resolveNewSessionCwd } from '@/store/projects'
++import {
++  $currentCwd,
++  $newChatWorkspaceTarget,
++  $sessions,
++  setFreshDraftReady,
++  setNewChatWorkspaceTarget,
++  setSelectedStoredSessionId
++} from '@/store/session'
+ import { $unlistedSessionOwnerRows } from '@/store/session'
+ import {
+   _resetSessionOwnerHintsForTests,
+@@ -68,6 +75,18 @@ vi.mock('@/store/gateway', async original => ({
+ const HUB = { connectionId: 'hermes-hub', profile: 'default' }
+ const FOREGROUND_CREATE_DIAL = [undefined, undefined, { spawnPriority: 'foreground' }] as const
+ 
++// Oracle copied verbatim from the pre-PR send path, independent of display selectors.
++function prePrSendCwd() {
++  const workspaceTarget = $newChatWorkspaceTarget.get()
++  const homeScope = $projectScope.get() === NO_PROJECT_ID
++
++  return workspaceTarget === null || (workspaceTarget === undefined && homeScope)
++    ? ''
++    : typeof workspaceTarget === 'string'
++      ? workspaceTarget.trim()
++      : $currentCwd.get().trim() || resolveNewSessionCwd()
++}
++
+ function mountActions() {
+   const ref = <T,>(current: T) => ({ current })
+   const state = createClientSessionState()
+@@ -155,6 +174,78 @@ afterEach(() => {
+ })
+ 
+ describe('new-session gateway target', () => {
++  it.each(['enter project after tile', 'pick same tile folder', 'choose same cwd', 'return to tile cwd', 'close tile'])(
++    'preserves main workspace intent after %s',
++    async operation => {
++      const { closeSessionTile } = await import('@/store/session-states')
++      const { result } = mountActions()
++      await act(() => setDefaultProfile(HUB))
++      act(() => {
++        $projects.set([
++          { id: 'original', name: 'Original', folders: [{ path: '/repo' }] },
++          { id: 'next', name: 'Next', folders: [{ path: '/new-project' }] },
++          { id: 'tile', name: 'Tile', folders: [{ path: '/other-project' }] }
++        ] as never)
++        $layoutTree.set(group(['workspace'], { active: 'workspace', id: 'boundary' }))
++        $activeTreeGroup.set('boundary')
++        setSelectedStoredSessionId(null)
++        result.current.startFreshSessionDraft()
++        followEnteredProjectCwd('/repo')
++      })
++      vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
++        session_id: 'tile-runtime',
++        stored_session_id: 'tile-stored',
++        info: { cwd: '/other-project' }
++      })
++      await act(() => result.current.openNewSessionTile('center', { cwd: '/other-project', listed: false, route: HUB }))
++      act(() => {
++        $layoutTree.set(group(['workspace', 'session-tile:tile-stored'], { active: 'workspace', id: 'boundary' }))
++        $activeTreeGroup.set('boundary')
++
++        if (operation === 'close tile') {
++          closeSessionTile('tile-stored')
++        } else if (operation === 'pick same tile folder') {
++          setNewChatWorkspaceTarget('/other-project')
++        } else if (operation === 'choose same cwd') {
++          setCurrentCwd('/other-project')
++        } else if (operation === 'return to tile cwd') {
++          followEnteredProjectCwd('/new-project')
++          followEnteredProjectCwd('/other-project')
++        } else {
++          followEnteredProjectCwd('/new-project')
++        }
++      })
++      const expectedCwd = operation === 'enter project after tile' ? '/new-project' : '/other-project'
++
++      const expectedBucket =
++        operation === 'close tile' ? 'original' : operation === 'enter project after tile' ? 'next' : 'tile'
++
++      const view = render(
++        <MemoryRouter>
++          <SidebarDraftRows projectId="original" />
++          <SidebarDraftRows projectId="next" />
++          <SidebarDraftRows projectId="tile" />
++        </MemoryRouter>
++      )
++
++      expect
++        .soft(view.container.querySelector('[data-sidebar-draft-project]')?.getAttribute('data-sidebar-draft-project'))
++        .toBe(expectedBucket)
++      const beforeSendCwd = prePrSendCwd()
++      await act(() => result.current.createBackendSessionForSend('First send'))
++      const call = vi.mocked(requestGatewayForAgent).mock.calls.findLast(call => call[2] === 'session.create')!
++      expect(call[3]?.cwd).toBe(expectedCwd)
++      expect(call[3]?.cwd || '').toBe(beforeSendCwd)
++      expect(sessionBucketId($sessions.get()[0], $projects.get())).toBe(
++        operation === 'close tile' ? 'tile' : expectedBucket
++      )
++      expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
++      act(() => {
++        $projects.set([])
++        closeAllOpenSessionTiles('workspace')
++      })
++    }
++  )
+   it.each([
+     'default seed',
+     'gateway and seed',
+@@ -196,7 +287,10 @@ describe('new-session gateway target', () => {
+         settings: { getDefaultProjectDir: async () => ({ dir: '/repo', defaultLabel: '', resolvedCwd: '/repo' }) }
+       } as never
+ 
+-      if (operation === 'gateway and seed') {act(() => wipeSessionListsForGatewaySwitch())}
++      if (operation === 'gateway and seed') {
++        act(() => wipeSessionListsForGatewaySwitch())
++      }
++
+       await act(() => ensureDefaultWorkspaceCwd())
+     } else if (operation.startsWith('normalized')) {
+       vi.mocked(requestGatewayForAgent).mockImplementation(async (_connection, _profile, method) =>
+@@ -230,9 +324,13 @@ describe('new-session gateway target', () => {
+       act(() => {
+         setCurrentCwd('/repo')
+ 
+-        if (operation === 'detached') {setNewChatWorkspaceTarget(null)}
++        if (operation === 'detached') {
++          setNewChatWorkspaceTarget(null)
++        }
+ 
+-        if (operation === 'Home scope') {$projectScope.set(NO_PROJECT_ID)}
++        if (operation === 'Home scope') {
++          $projectScope.set(NO_PROJECT_ID)
++        }
+       })
+     }
+ 
+@@ -240,11 +338,15 @@ describe('new-session gateway target', () => {
+     const expectedBucket = expectedCwd ? 'p1' : NO_PROJECT_ID
+     expect(placement()).toBe(expectedBucket)
+     expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(1)
++    const beforeSendCwd = prePrSendCwd()
+     await act(() => result.current.createBackendSessionForSend('First send'))
+     const createCall = vi.mocked(requestGatewayForAgent).mock.calls.findLast(call => call[2] === 'session.create')!
+-    expect(createCall[3]?.cwd || '').toBe(expectedCwd)
++    expect(createCall[3]?.cwd || '').toBe(beforeSendCwd)
++    expect(beforeSendCwd).toBe(operation === 'tile workspace' ? '/other-project' : expectedCwd)
+     expect($sessions.get()).toHaveLength(1)
+-    expect(sessionBucketId($sessions.get()[0], $projects.get())).toBe(expectedBucket)
++    expect(sessionBucketId($sessions.get()[0], $projects.get())).toBe(
++      sessionBucketId(makeSessionInfo({ cwd: beforeSendCwd }), $projects.get())
++    )
+     expect(view.container.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
+     act(() => {
+       $projects.set([])
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 87de5a90ab..2f3fbd8364 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -140,7 +140,7 @@ import {
+ import { broadcastSessionsChanged } from '@/store/session-sync'
+ import { forgetSessionUnread } from '@/store/session-unread'
+ import { $archivedSessions } from '@/store/sidebar-archive'
+-import { $mainSidebarDraftCwd } from '@/store/sidebar-draft'
++import { $mainSidebarDraftCwd, $sidebarBorrowedTileCwd } from '@/store/sidebar-draft'
+ import { clearSessionSubagents } from '@/store/subagents'
+ import { clearSessionTodos, restoreSessionTodosFromSnapshot } from '@/store/todos'
+ import {
+@@ -635,6 +635,7 @@ export function useSessionActions({
+       setCurrentBranch('')
+       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
+       $mainSidebarDraftCwd.set($currentCwd.get())
++      $sidebarBorrowedTileCwd.set(null)
+       setFreshDraftReady(true)
+     },
+     [activeSessionIdRef, busyRef, navigate, onFreshDraftRouteIntent, resetViewSync, selectedStoredSessionIdRef]
+diff --git a/apps/desktop/src/app/session/new-session-cwd.ts b/apps/desktop/src/app/session/new-session-cwd.ts
+index 8157a32328..971a6cd444 100644
+--- a/apps/desktop/src/app/session/new-session-cwd.ts
++++ b/apps/desktop/src/app/session/new-session-cwd.ts
+@@ -3,56 +3,59 @@ import { computed } from 'nanostores'
+ import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
+ import { $projectScope } from '@/store/project-scope'
+ import { $projects, resolveNewSessionCwd } from '@/store/projects'
+-import { $currentCwd, $newChatWorkspaceTarget, $workspaceCwdOwner, type NewChatWorkspaceTarget } from '@/store/session'
++import { $currentCwd, $newChatWorkspaceTarget, type NewChatWorkspaceTarget } from '@/store/session'
+ import { $focusedSessionIsTile } from '@/store/session-focus'
+-import { $sessionTiles } from '@/store/session-states'
+-import { $mainSidebarDraftCwd } from '@/store/sidebar-draft'
++import { $mainSidebarDraftCwd, $sidebarBorrowedTileCwd } from '@/store/sidebar-draft'
+ 
+-/** The draft preview and first send must resolve the same workspace intent. */
++/** Pure extraction of the pre-existing first-send workspace computation. */
+ export function resolveMainDraftCwd(
+   target: NewChatWorkspaceTarget,
+   homeScope: boolean,
+   currentCwd: string,
+   fallbackCwd: string
+ ): string {
+-  if (target === null || (target === undefined && homeScope)) {
+-    return ''
+-  }
+-
+-  if (typeof target === 'string') {
+-    return target.trim()
+-  }
+-
+-  return currentCwd.trim() || fallbackCwd
++  return target === null || (target === undefined && homeScope)
++    ? ''
++    : typeof target === 'string'
++      ? target.trim()
++      : currentCwd.trim() || fallbackCwd
+ }
+ 
+-/** The only boundary lending main's ambient cwd to a different chat. */
++/** Display-only snapshot before a center tile borrows the workspace for Files. */
+ export function captureMainDraftBeforeTile(dir: string, cwd?: null | string): void {
+   if (dir === 'center' && cwd) {
+-    $mainSidebarDraftCwd.set($mainDraftSessionCwd.get())
++    $mainSidebarDraftCwd.set($mainSidebarDisplayCwd.get())
++    $sidebarBorrowedTileCwd.set(cwd)
+   }
+ }
+ 
+ export const $mainDraftSessionCwd = computed(
++  [$newChatWorkspaceTarget, $projectScope, $currentCwd, $projects],
++  (target, scope, currentCwd) =>
++    resolveMainDraftCwd(target, scope === NO_PROJECT_ID, currentCwd, resolveNewSessionCwd())
++)
++
++// Tile paint must not move the main draft's display. A subsequent main choice
++// wins immediately. This selector is NEVER an input to session.create.
++export const $mainSidebarDisplayCwd = computed(
+   [
+     $newChatWorkspaceTarget,
+     $projectScope,
+     $currentCwd,
+-    $focusedSessionIsTile,
+-    $mainSidebarDraftCwd,
+     $projects,
+-    $workspaceCwdOwner,
+-    $sessionTiles
++    $mainSidebarDraftCwd,
++    $sidebarBorrowedTileCwd,
++    $focusedSessionIsTile
+   ],
+-  (target, scope, currentCwd, tileFocused, initialCwd, _projects, cwdOwner, tiles) => {
+-    // A center tile lends its cwd to Files even after focus returns to main.
+-    const tileCwd = tileFocused || tiles.some(tile => tile.storedSessionId === cwdOwner)
++  (target, scope, currentCwd, _projects, initialCwd, borrowedCwd, tileFocused) => {
++    const borrowed = tileFocused || (borrowedCwd !== null && currentCwd === borrowedCwd)
++    const displayCwd = borrowed ? initialCwd || '' : currentCwd
+ 
+     return resolveMainDraftCwd(
+       target,
+       scope === NO_PROJECT_ID,
+-      tileCwd ? initialCwd || '' : currentCwd,
+-      tileCwd ? initialCwd || '' : resolveNewSessionCwd()
++      displayCwd,
++      borrowed ? initialCwd || '' : resolveNewSessionCwd()
+     )
+   }
+ )
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index 449a299c89..cdb2917c13 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -31,6 +31,7 @@ import { idsShareLineage, lineageAliases, sessionMatchesStoredId } from './sessi
+ import { $removedSessionIds, isSessionRemovalPending, tombstoneRowIds } from './session-removal'
+ import type { SessionOwnerRoute, SessionOwnerScope } from './session-request-router'
+ import { clearUnreadOnOpen } from './session-unread-remote'
++import { $sidebarBorrowedTileCwd } from './sidebar-draft'
+ 
+ type Updater<T> = T | ((current: T) => T)
+ export type ComposerModelSource = '' | 'default' | 'manual'
+@@ -1839,6 +1840,7 @@ export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive,
+  *  a conversation's cwd, use `setCurrentCwdTransient`.
+  */
+ export const setCurrentCwd = (next: Updater<string>) => {
++  $sidebarBorrowedTileCwd.set(null)
+   updateAtom($currentCwd, next)
+   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
+ }
+diff --git a/apps/desktop/src/store/sidebar-draft.ts b/apps/desktop/src/store/sidebar-draft.ts
+index e9daa12e2b..afd709cfae 100644
+--- a/apps/desktop/src/store/sidebar-draft.ts
++++ b/apps/desktop/src/store/sidebar-draft.ts
+@@ -1,6 +1,5 @@
+ import { atom } from 'nanostores'
+ 
+-// Main's fallback while a center tile borrows $currentCwd for Files. Captured
+-// only at draft creation and at that tile boundary, never mirrored by cwd
+-// writers. Placement and send resolve live main intent via $mainDraftSessionCwd.
++// Display-only main workspace snapshot; never consumed by the send path.
+ export const $mainSidebarDraftCwd = atom<string | null>(null)
++export const $sidebarBorrowedTileCwd = atom<string | null>(null)
+-- 
+2.43.0
+

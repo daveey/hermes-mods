@@ -1,0 +1,191 @@
+From 86b1b54c06022209bc645d316c63b1ffd314888f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 00:59:31 +0000
+Subject: [PATCH] fix(tests/ci): key the workflow replay memo on the bash it
+ selected [daveey]
+
+Hermes-Card: t_2e160efc6fd5b408
+
+Upstream's replay memo (d836448951, "stop the Windows lane timing out on
+workflow replays") keys a replayed step on its rendered script, env and cwd
+only. The bash that runs it is a function of the ambient PATH and
+BASH4_KNOWN_DIRS, and the memo is read before replay_bash() is reached, so a
+hit both replays another PATH's result and skips replay_bash()'s "no bash >= 4"
+pytest.skip.
+
+tests/ci/test_workflow_steps_bash.py runs one STEP under three fake-bash
+settings. Whole file on sync/upstream-6e76a5bc82 (run 44964378873, job
+137029983679): test_no_bash4_anywhere_skips_naming_the_bash_found fails with
+"DID NOT RAISE Skipped" (1 failed, 3 passed) because the earlier tests filled
+the memo; the node alone passes, so a file-level retry "recovers" it.
+
+Why: the memo key described the step, not what the step runs under.
+Fix: select the bash first (replay_bash() is itself memoized per PATH and known
+dirs, so a hit costs one dict lookup, and the skip diagnostic fires on every
+replay) and put it in the key. Same bash => same memo entry, so the routing
+suites keep their 37-spawns-for-363-replays; a different bash is its own entry.
+
+main does not carry d836448951 yet (it arrives with the next upstream sync), so
+this lands the memo verbatim plus the key change: against the sync head the
+delta is the four `bash` lines in _run/_execute, which is the whole conflict to
+resolve when that sync merges. Taking this side keeps the fix.
+
+Tests (each RED alone on the sync head with the memo and no key change, GREEN
+here; no sleeps, no retries, no skips):
+- a path change to one without bash 4+ skips naming the bash found, then the
+  original PATH is served from the memo without a respawn;
+- the same for a BASH4_KNOWN_DIRS change;
+- three replays under one bash spawn once; another bash is a separate entry.
+Mutants killed: bash out of the key; selection left inside _execute.
+---
+ tests/ci/test_workflow_steps_bash.py | 94 ++++++++++++++++++++++++++++
+ tests/ci/workflow_steps.py           | 23 ++++++-
+ 2 files changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ci/test_workflow_steps_bash.py b/tests/ci/test_workflow_steps_bash.py
+index ce5d3ecda7..5dfe99775d 100644
+--- a/tests/ci/test_workflow_steps_bash.py
++++ b/tests/ci/test_workflow_steps_bash.py
+@@ -114,3 +114,97 @@ def test_a_bash_that_does_not_answer_is_not_selected(fake_path, tmp_path, monkey
+     bash, reason = workflow_steps.find_replay_bash()
+     assert bash is None
+     assert f"{old / 'bash'} (bash unknown version)" in reason
++
++
++# The replay memo (workflow_steps._REPLAYED) must not outlive the PATH / known dirs it was filled
++# under. These tests share one STEP, so any order of them (or of other files' replays of the same
++# script in this process) used to hand test_no_bash4_anywhere... a hit from a bash 4 run: the hit
++# skipped replay_bash(), so nothing skipped and the test failed whole-file yet passed alone.
++
++
++@pytest.fixture
++def memo(monkeypatch):
++    """A private replay memo; the list records the bash of every replay that really spawned."""
++    spawned: list[str] = []
++    real = workflow_steps._execute
++
++    def counting(*args, **kwargs):
++        spawned.append(workflow_steps.replay_bash())
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(workflow_steps, "_REPLAYED", {})
++    monkeypatch.setattr(workflow_steps, "_execute", counting)
++    return spawned
++
++
++def _bash4_dir(parent: Path, name: str, real: str) -> tuple[Path, Path]:
++    directory = parent / name
++    directory.mkdir()
++    return directory, _executable(directory / "bash", f'#!/bin/sh\nexec "{real}" "$@"\n')
++
++
++def _skip_reason() -> str:
++    with pytest.raises(pytest.skip.Exception) as skipped:
++        workflow_steps.outputs(STEP, {})
++    return str(skipped.value)
++
++
++def test_a_memoized_replay_never_hides_a_path_without_bash4(fake_path, memo, tmp_path, monkeypatch):
++    old, real = fake_path
++    first, new = _bash4_dir(tmp_path, "first", real)
++    empty = tmp_path / "empty"
++    empty.mkdir()
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(empty),), raising=False)
++    both = os.pathsep.join((str(first), str(old)))
++    monkeypatch.setenv("PATH", both)
++
++    assert workflow_steps.outputs(STEP, {})["count"] == "2"  # fills the memo under bash 4
++    assert memo == [str(new)]
++
++    monkeypatch.setenv("PATH", str(old))  # same step, env and cwd: only PATH changed
++    reason = _skip_reason()
++    assert f"{old / 'bash'} (bash 3)" in reason
++    assert "bash >= 4" in reason and str(empty) in reason
++    assert memo == [str(new)]  # skipped before any spawn
++
++    monkeypatch.setenv("PATH", both)  # back: the first entry is still memoized
++    assert workflow_steps.outputs(STEP, {})["count"] == "2"
++    assert memo == [str(new)]
++
++
++def test_a_memoized_replay_never_hides_a_known_dir_change(fake_path, memo, tmp_path, monkeypatch):
++    old, real = fake_path
++    brew, new = _bash4_dir(tmp_path, "brew", real)
++    empty = tmp_path / "empty"
++    empty.mkdir()
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(brew),), raising=False)
++
++    assert workflow_steps.outputs(STEP, {})["count"] == "2"  # bash 3 on PATH, bash 4 in a known dir
++    assert memo == [str(new)]
++
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(empty),), raising=False)
++    reason = _skip_reason()
++    assert f"{old / 'bash'} (bash 3)" in reason
++    assert "bash >= 4" in reason and str(empty) in reason and str(brew) not in reason
++    assert memo == [str(new)]
++
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(brew),), raising=False)
++    assert workflow_steps.outputs(STEP, {})["count"] == "2"
++    assert memo == [str(new)]
++
++
++def test_the_memo_still_serves_one_bash_and_reselects_another(fake_path, memo, tmp_path, monkeypatch):
++    old, real = fake_path
++    first, one = _bash4_dir(tmp_path, "one", real)
++    second, two = _bash4_dir(tmp_path, "two", real)
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (), raising=False)
++
++    monkeypatch.setenv("PATH", os.pathsep.join((str(first), str(old))))
++    for _ in range(3):
++        assert int(workflow_steps.outputs(STEP, {})["major"]) >= 4
++    assert memo == [str(one)]  # three replays, one spawn
++
++    monkeypatch.setenv("PATH", os.pathsep.join((str(second), str(old))))
++    workflow_steps.outputs(STEP, {})
++    workflow_steps.outputs(STEP, {})
++    assert memo == [str(one), str(two)]  # the other bash is its own entry, then memoized too
+diff --git a/tests/ci/workflow_steps.py b/tests/ci/workflow_steps.py
+index de588be2df..7638e6a413 100644
+--- a/tests/ci/workflow_steps.py
++++ b/tests/ci/workflow_steps.py
+@@ -128,15 +128,36 @@ def replay_bash() -> str:
+     return bash
+ 
+ 
++# A replayed step is a pure function of its rendered script, env and cwd within one process.
++# The routing tests replay the same unmutated workflow dozens of times (363 Bash runs, 37
++# distinct, in the Windows lane's selection); each Git Bash spawn costs ~0.5 s on a loaded
++# Windows runner, which pushed the file past the runner's 300 s per-file cap.
++_REPLAYED: dict[tuple, tuple[dict, list]] = {}
++
++
+ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = False) -> tuple[dict, list]:
+     required(step, ctx)
+     assert step.get("shell", "bash") == "bash", "only safe Bash selection steps are replayed"
++    # Selected before the memo is read, and part of its key: the bash is a function of the ambient
++    # PATH and BASH4_KNOWN_DIRS, which the step's own text, env and cwd do not name. Without it a
++    # hit replays another PATH's result and never reaches replay_bash(), so a PATH with no bash 4+
++    # neither skips nor re-selects (test_workflow_steps_bash.py). replay_bash() is itself memoized
++    # per (PATH, known dirs), so this costs one dict lookup per replay, not a probe.
++    bash = replay_bash()
++    key = (bash, gha.render(step["run"], ctx), receipt, str(cwd),
++           tuple((k, gha.to_string(gha.render(v, ctx))) for k, v in step.get("env", {}).items()))
++    if key not in _REPLAYED:
++        _REPLAYED[key] = _execute(step, ctx, cwd, receipt=receipt, bash=bash)
++    outputs, calls = _REPLAYED[key]
++    return dict(outputs), list(calls)
++
++
++def _execute(step: dict, ctx: dict, cwd: Path | None, *, receipt: bool, bash: str) -> tuple[dict, list]:
+     with tempfile.TemporaryDirectory(prefix="workflow-replay-", ignore_cleanup_errors=True) as directory:
+         root = Path(directory)
+         output, calls = root / "outputs", root / "calls"
+         output.touch()
+         calls.touch()
+-        bash = replay_bash()
+         # Steps call git too. Linux reaches it through os.defpath; on Windows the bash found
+         # first may be Git's usr\bin (no git.exe), so git's own dir rides along like bash's.
+         git = locate_command("git").command[0]
+-- 
+2.43.0
+

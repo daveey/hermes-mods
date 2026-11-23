@@ -1,0 +1,209 @@
+From d1a1be824576284c41a2915e040ee5d3b4b459ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:30:06 +0000
+Subject: [PATCH] perf(sync): attribute selection probes and checkpoint proof
+ CPU [daveey]
+
+Problem: run16 live non-board CPU remains 11.798 ms/round; select is 2.925 ms/round while wait fell to 1.009. The global checkpoint-keep counter cannot identify its triggering step or proof subpart. Why the remaining selection cost is high is not established; changing restore defenses from fixture timings would repeat the failed sizing assumption.
+
+Add inclusive sync.detail diagnostics for executed select outbox probes and checkpoint WAL/shrink/schema work, plus checkpoint keeps by triggering step. Preserve all selection short circuits and restore predicates. These records use outer=False, never create sync.step or sync.board entries, and do not change total-minus-board accounting. Instrumentation is diagnostic, not a claimed performance cut or live acceptance.
+
+Proof: three behavioral tests fail on parent due to absent counters, pass on candidate. Six exact-anchor instrumentation mutants killed by named tests; 15 importer test files pass (285 tests); scripts/check passes. Restore guard and existing tests unchanged. Independent review must explicitly check restore-safety preservation and nonadditive accounting. No Mac actions; natural deployment and a new valid live window remain required.
+---
+ hermes_cli/kanban_sync_board_watch.py         |   6 +-
+ hermes_cli/kanban_sync_cpu.py                 |  22 ++++
+ hermes_cli/kanban_sync_work.py                |   4 +-
+ .../test_kanban_sync_probe_split.py           | 109 ++++++++++++++++++
+ 4 files changed, 137 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_probe_split.py
+
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index da71458356..13d0622b05 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -158,12 +158,12 @@ class BoardWatch:
+         if ent[0][:2] != identity[:2] or identity[3] < ent[0][3]:
+             return False
+         began = time.thread_time()
+-        now = _wal_evidence.read(ent[5])
++        now = _sync_cpu.detail("checkpoint_wal", _wal_evidence.read, ent[5])
+         if not _wal_evidence.checkpointed(ent[3], now):
+             return False
+         try:
+-            ent[1].execute("PRAGMA shrink_memory")
+-            parsed = parsed_from(ent[1], ent[5])
++            _sync_cpu.detail("checkpoint_shrink", ent[1].execute, "PRAGMA shrink_memory")
++            parsed = _sync_cpu.detail("checkpoint_schema", parsed_from, ent[1], ent[5])
+             if parsed is None or parsed != ent[6]:
+                 return False
+         except sqlite3.Error:
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index a690915a29..20b8639e3b 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -48,6 +48,28 @@ def note_reader_open(cpu, reason):
+ def note_reader_keep(cpu):
+     """A reader kept across a proven checkpoint (the CPU is the proof's own cost)."""
+     loop_accounting.record("sync.reader_keep/checkpoint", cpu_s=cpu, outer=False)
++    loop_accounting.record(f"sync.reader_keep.step/{_step_name()}", cpu_s=cpu, outer=False)
++
++
++def _step_name():
++    return getattr(_local, "step", None) or ("board" if getattr(_local, "frames", ()) else "other")
++
++
++def detail(part, fn, *args):
++    """Always-on inclusive diagnostic, not an accounted scope or a new loop step.
++
++    ``sync.detail/<triggering step>.<part>`` overlaps its enclosing step, probe
++    and successful keep. Failed proof attempts are included too. Never sum these
++    with steps or subtract them from the collector's total-minus-board value.
++    Only fixed call-site names are used; no board paths or unbounded identifiers.
++    """
++    where = _step_name()
++    began = time.thread_time()
++    try:
++        return fn(*args)
++    finally:
++        loop_accounting.record(f"sync.detail/{where}.{part}",
++                               cpu_s=time.thread_time() - began, outer=False)
+ 
+ 
+ WAIT_PARTS = ("event_wait", "outbox_probe", "reader_open")  # sync.wait/boundary: TimingDiag.wait
+diff --git a/hermes_cli/kanban_sync_work.py b/hermes_cli/kanban_sync_work.py
+index 3226d8efde..c42d8a563c 100644
+--- a/hermes_cli/kanban_sync_work.py
++++ b/hermes_cli/kanban_sync_work.py
+@@ -6,6 +6,8 @@ from pathlib import Path
+ from collections.abc import Callable
+ from typing import Optional
+ 
++from hermes_cli import kanban_sync_cpu as _sync_cpu
++
+ # A board whose round failed is not rerun for its pending outbox, a dirty flag or the poll until this backoff
+ # passes: 1 s, doubling, capped at the feed socket's own 60 s reconnect cap. Incident (2026-11-15, laptop-1,
+ # t_d3f56f1f216a033d): DNS failed for 25 min and pending local edits reselected every board on each 0.5 s wait
+@@ -90,4 +92,4 @@ class SyncWork:
+         return [(slug, path) for slug, path in boards
+                 if slug not in waiting and ((slug, path) in new or slug in dirty
+                                             or (poll and (slug not in connected or slug in self._failed))
+-                                            or pending([path]))]
++                                            or _sync_cpu.detail("outbox_probe", pending, [path]))]
+diff --git a/tests/hermes_cli/test_kanban_sync_probe_split.py b/tests/hermes_cli/test_kanban_sync_probe_split.py
+new file mode 100644
+index 0000000000..b5645bb69e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_probe_split.py
+@@ -0,0 +1,109 @@
++"""Nested sync diagnostics must preserve selection, restore fences and outer CPU."""
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_sync_cpu as cpu
++from hermes_cli import kanban_sync_board_watch as watch_module
++from hermes_cli import loop_accounting
++from hermes_cli.kanban_sync_work import SyncWork
++
++
++@pytest.fixture
++def accounting(monkeypatch):
++    loop_accounting.reset()
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    yield
++    loop_accounting.reset()
++
++
++def test_select_probe_records_only_executed_calls(accounting):
++    work = SyncWork(10)
++    boards = [(s, Path(s)) for s in ("dirty", "quiet", "pending", "blocked")]
++    assert work.select(boards, 1, lambda paths: False) == boards
++    work.changed("dirty")
++    work.finished("blocked", False, now=1)
++    calls = []
++
++    def pending(paths):
++        calls.append(paths)
++        return paths == [Path("pending")]
++
++    assert cpu.step(work.select, boards, 1.5, pending) == [boards[0], boards[2]]
++    assert calls == [[Path("quiet")], [Path("pending")]]
++    stats = loop_accounting.counters()
++    assert stats["sync.detail/select.outbox_probe"]["runs"] == 2
++    assert not [k for k in stats if k.startswith(("sync.step/", "sync.board/"))]
++    assert sum(loop_accounting._copy_accounted().values()) == 0
++
++
++def test_select_probe_records_exception_and_restores_step(accounting):
++    work = SyncWork(10)
++    boards = [("one", Path("one"))]
++    work.select(boards, 1, lambda paths: False)
++    error = ValueError("probe")
++
++    def pending(paths):
++        raise error
++
++    with pytest.raises(ValueError) as caught:
++        cpu.step(work.select, boards, 2, pending)
++    assert caught.value is error
++    cpu.note_reader_keep(0.25)
++    stats = loop_accounting.counters()
++    assert stats["sync.detail/select.outbox_probe"]["runs"] == 1
++    assert stats["sync.reader_keep.step/other"]["cpu_s"] == 0.25
++    assert sum(loop_accounting._copy_accounted().values()) == 0
++
++
++def test_keep_proof_parts_and_step_cpu_are_nonadditive(accounting, monkeypatch):
++    now = [10.0]
++    monkeypatch.setattr(cpu.time, "thread_time", lambda: now[0])
++    monkeypatch.setattr(loop_accounting, "_thread_time", lambda: now[0])
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: True)
++    watch = watch_module.BoardWatch()
++    identity = (1, 2, 3, 4)
++
++    class Reader:
++        def execute(self, sql):
++            assert sql == "PRAGMA shrink_memory"
++            now[0] += 0.2
++
++    reader = Reader()
++    ent = (identity, reader, 1, "old", 1, "path", ["schema"])
++    watch._conns["path"] = ent
++    watch._answers["path"] = {"query": (1, "old")}
++
++    def read(path):
++        assert path == "path"
++        now[0] += 0.1
++        return "new"
++
++    def parsed(conn, path):
++        assert conn is reader and path == "path"
++        now[0] += 0.3
++        return ["schema"]
++
++    monkeypatch.setattr(watch_module._wal_evidence, "read", read)
++    monkeypatch.setattr(watch_module._wal_evidence, "checkpointed", lambda a, b: (a, b) == ("old", "new"))
++    monkeypatch.setattr(watch_module, "parsed_from", parsed)
++
++    def select():
++        assert watch._kept_over_checkpoint("path", ent, (1, 2, 5, 4))
++
++    with cpu.service("loop"):
++        cpu.step(select)
++    stats = loop_accounting.counters()
++    expected = {"checkpoint_wal": 0.1, "checkpoint_shrink": 0.2, "checkpoint_schema": 0.3}
++    for part, seconds in expected.items():
++        assert stats[f"sync.detail/select.{part}"]["cpu_s"] == pytest.approx(seconds)
++    assert stats["sync.reader_keep.step/select"]["cpu_s"] == pytest.approx(0.6)
++    assert stats["sync.reader_keep/checkpoint"]["cpu_s"] == pytest.approx(0.6)
++    assert stats["sync.cpu.total/loop"]["cpu_s"] == pytest.approx(0.6)
++    assert sum(loop_accounting._copy_accounted().values()) == pytest.approx(0.6)
++    assert len([k for k in stats if k.startswith("sync.step/")]) == 1
++    assert not [k for k in stats if k.startswith("sync.board/")]
++    assert "path" not in watch._answers
++    assert watch._conns["path"][1] is reader
+-- 
+2.43.0
+

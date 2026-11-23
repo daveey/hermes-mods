@@ -1,0 +1,151 @@
+From 58b2bc87d3332a5c908d133ef9a4a320d3664788 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:32:37 +0000
+Subject: [PATCH] [daveey] Pin annotation trailing reads and source re-arm
+ transitions
+
+Add deterministic loop tests for a lone write deferred inside the coalescing gap, failed-wait source recovery, and ownership reacquisition. A virtual clock prevents lease beats or scheduling from masking the branches. No product changes.
+
+Proof: each test passes on main and fails with its corresponding timeout/source assignment removed; full scripts/check --base origin/main and adjacent loop/native-holder suites pass.
+---
+ .../test_annotation_event_loop_rearm.py       | 128 ++++++++++++++++++
+ 1 file changed, 128 insertions(+)
+ create mode 100644 tests/hermes_cli/test_annotation_event_loop_rearm.py
+
+diff --git a/tests/hermes_cli/test_annotation_event_loop_rearm.py b/tests/hermes_cli/test_annotation_event_loop_rearm.py
+new file mode 100644
+index 0000000000..11ea5fa376
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_event_loop_rearm.py
+@@ -0,0 +1,128 @@
++"""Deterministic trailing-read and source re-arm transitions in the real loop."""
++from types import SimpleNamespace
++
++from hermes_cli import annotation_event_loop as loop
++
++
++class Clock:
++    """Advance only at waits, with the same clock for deadlines and coalescing."""
++
++    def __init__(self):
++        self.now = 0.0
++        self.stopped = False
++
++    def monotonic(self):
++        return self.now
++
++    def time(self):
++        return self.now
++
++    def wait(self, timeout):
++        self.now += timeout
++        return self.stopped
++
++    def is_set(self):
++        return self.stopped
++
++    def set(self):
++        self.stopped = True
++
++
++def test_deferred_gap_reads_lone_trailing_write(monkeypatch, tmp_path):
++    """No lease beat, provider deadline or later event can rescue the final read."""
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    path = tmp_path / 'source'
++    path.write_text('initial')
++    writes = [(1.0, 'first'), (1.05, 'second')]
++    reads = []
++
++    class Events:
++        control_only = False
++
++        def wait(self, timeout):
++            # The half-second observation bound also terminates the mutant that
++            # waits until the 30 s lease beat instead of the coalescing deadline.
++            until = min(clock.now + timeout, 1.55)
++            if writes and writes[0][0] <= until:
++                clock.now, value = writes.pop(0)
++                path.write_text(value)
++                self.control_only = False
++                return True
++            clock.now = until
++            if clock.now >= 1.55:
++                clock.set()
++            return False
++
++    def refresh():
++        reads.append((clock.now, path.read_text()))
++
++    lease = SimpleNamespace(held=lambda: True, beat=lambda: None)
++    loop.run(Events(), clock, lease, refresh, interval=30)
++
++    assert reads[1] == (1.0, 'first'), 'first write after quiet must read immediately'
++    assert [value for _, value in reads] == ['initial', 'first', 'second']
++    assert 1.05 < reads[2][0] <= 1.55, 'lone trailing write must read within 0.5 s'
++    assert not writes
++
++
++def test_failed_wait_rearms_with_source_refresh(monkeypatch):
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    seen = []
++
++    class Events:
++        control_only = False
++        calls = 0
++
++        def wait(self, timeout):
++            self.calls += 1
++            if self.calls == 1:
++                self.control_only = True
++                raise OSError('notification descriptor unavailable')
++            clock.set()  # bounded even if the recovery refresh is omitted
++            return False
++
++    events = Events()
++
++    def refresh():
++        seen.append(events.control_only)
++
++    lease = SimpleNamespace(held=lambda: True, beat=lambda: None)
++    loop.run(events, clock, lease, refresh, interval=1)
++
++    assert events.calls == 2
++    assert seen == [False, False], 'wait failure must reinstall source coverage'
++
++
++def test_regained_ownership_rearms_with_source_refresh(monkeypatch):
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    seen, held_calls = [], []
++
++    class Events:
++        control_only = False
++
++        def wait(self, timeout):
++            self.control_only = True  # no source notification during lease loss
++            clock.wait(timeout)
++            if clock.now >= 4:
++                clock.set()  # bounded even if reacquisition never refreshes
++            return False
++
++    events = Events()
++
++    def held():
++        held_calls.append(clock.now)
++        return len(held_calls) != 2  # owned, lost, regained
++
++    def refresh():
++        seen.append((len(held_calls), events.control_only))
++        if len(seen) == 2:
++            clock.set()
++
++    lease = SimpleNamespace(held=held, beat=lambda: None)
++    loop.run(events, clock, lease, refresh, interval=1)
++
++    assert held_calls == [0.0, 1.0, 2.0]
++    assert seen == [(1, False), (3, False)], 'new ownership must reinstall source coverage'
+-- 
+2.43.0
+

@@ -1,0 +1,1015 @@
+From ed9e24e36c0bb43982343f779fc74e4b63ebe749 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:12:16 +0000
+Subject: [PATCH] [daveey] Expose hardened authenticated card-answer runtime
+ with courier integration proof
+
+---
+ hermes_cli/kanban_card_answer.py              |  59 ++-
+ hermes_cli/kanban_card_answer_proof.py        |   4 +
+ hermes_cli/kanban_card_answer_runtime.py      |  85 ++++-
+ hermes_cli/kanban_card_answer_source.py       |  20 +-
+ tests/hermes_cli/conftest.py                  |   6 +
+ .../test_card_answer_courier_integration.py   | 331 ++++++++++++++++
+ .../test_kanban_card_answer_hardening.py      | 354 ++++++++++++++++++
+ .../test_kanban_card_answer_source.py         |   2 +-
+ 8 files changed, 840 insertions(+), 21 deletions(-)
+ create mode 100644 tests/hermes_cli/test_card_answer_courier_integration.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_answer_hardening.py
+
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index 13b4406e69..3f3635601d 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -65,17 +65,62 @@ def validate_provenance(value: dict, task: str) -> None:
+         raise AnswerRefused("invalid_decision_provenance")
+ 
+ 
+-def _receipt(conn, task, operation_id, fingerprint):
++def _payload(raw):
++    try:
++        value = json.loads(raw or "{}")
++    except (ValueError, TypeError):
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def _valid_receipt(conn, task, request, fingerprint, kind, receipt) -> bool:
++    """Every receipt field and its same-transaction decision comment, exactly."""
++    fields = set(request) | {"originGateway", "fingerprint", "destination", "executionStarted", "decisionProvenance"}
++    origin = receipt.get("originGateway")
++    if (set(receipt) != fields or any(receipt.get(k) != v for k, v in request.items())
++            or not isinstance(origin, str) or not origin or receipt["fingerprint"] != fingerprint
++            or receipt["destination"] != "kanban_ask" or receipt["executionStarted"] is not False
++            or receipt["decisionProvenance"] != "recorded_desktop_operation"
++            or (kind == "archived" and request["choice"] != "archive")):
++        return False
++    provenance = {**request, "originGateway": origin}
++    found = []
++    for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='commented' ORDER BY id", (task,),
++    ):
++        payload = _payload(row[0])
++        decision = payload.get("recorded_decision") if payload else None
++        if isinstance(decision, dict) and decision.get("operationId") == request["operationId"]:
++            found.append(payload)
++    if len(found) != 1:
++        return False
++    payload = found[0]
++    if (payload["recorded_decision"] != provenance or payload.get("writer_kind") != "agent"
++            or "relayed_human" in payload or payload.get("author") != "user-steps"):
++        return False
++    comment = conn.execute("SELECT author,body FROM task_comments WHERE id=? AND task_id=?",
++                           (payload.get("comment_id"), task)).fetchone()
++    prefix, suffix = "Choice recorded in Desktop (remote): ", "\nOperation: " + request["operationId"]
++    if comment is None or comment[0] != "user-steps" or not (comment[1].startswith(prefix) and comment[1].endswith(suffix)):
++        return False
++    chosen = _payload(comment[1][len(prefix):-len(suffix)])
++    return chosen is not None and chosen.get("value") == request["choice"]
++
++
++def _receipt(conn, request, fingerprint):
++    task, operation_id = request["task"], request["operationId"]
+     for row in conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived') ORDER BY id DESC",
++        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived') ORDER BY id DESC",
+         (task,),
+     ):
+-        payload = json.loads(row[0] or "{}")
+-        receipt = payload.get(FIELD) if isinstance(payload, dict) else None
++        payload = _payload(row[1])
++        receipt = payload.get(FIELD) if payload else None
+         if not isinstance(receipt, dict) or receipt.get("operationId") != operation_id:
+             continue
+         if receipt.get("fingerprint") != fingerprint:
+             raise AnswerRefused("operation_conflict")
++        if not _valid_receipt(conn, task, request, fingerprint, row[0], receipt):
++            raise AnswerRefused("operation_receipt_invalid")
+         return receipt
+     return None
+ 
+@@ -113,7 +158,7 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+         raise AnswerRefused("invalid_answer")
+     _owner(conn, request['task'], owner_gateway, require_primary=require_primary)
+     fingerprint = digest(request)
+-    old = _receipt(conn, request["task"], request["operationId"], fingerprint)
++    old = _receipt(conn, request, fingerprint)
+     if old:
+         return old
+     # Replays of committed decisions do not depend on a now-offline origin.
+@@ -147,7 +192,7 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+             return "containment_hold"
+         if not archive and pending(c, request["task"]):
+             return "spend_decision_pending"
+-        if _receipt(c, request["task"], request["operationId"], fingerprint):
++        if _receipt(c, request, fingerprint):
+             return "already_recorded"
+         fresh = snapshot(c, request["task"])
+         return None if fresh == current else "stale_ask"
+@@ -158,7 +203,7 @@ def apply(conn, request: dict, *, owner_gateway: str, owner_profile: str, board:
+     comment = RecordedDecisionComment("user-steps", note, provenance)
+     transition(conn, request["task"], precondition=fence, comment=comment,
+                event_extra={FIELD: receipt})
+-    recorded = _receipt(conn, request["task"], request["operationId"], fingerprint)
++    recorded = _receipt(conn, request, fingerprint)
+     if not recorded:
+         raise AnswerRefused("ask_changed_or_held")
+     return recorded
+diff --git a/hermes_cli/kanban_card_answer_proof.py b/hermes_cli/kanban_card_answer_proof.py
+index 280177e571..a02983064d 100644
+--- a/hermes_cli/kanban_card_answer_proof.py
++++ b/hermes_cli/kanban_card_answer_proof.py
+@@ -16,6 +16,10 @@ def verify(answer: dict, *, request_id: str, proof_id: str, owner_gateway: str,
+     """
+     original = read_request(request_id)
+     proof = read_request(proof_id)
++    fields = {"ownerGateway", "ownerProfile", "board", "task", "generation", "choice", "operationId"}
++    if (not isinstance(answer, dict) or set(answer) != fields
++            or any(not isinstance(v, str) or not v for v in answer.values())):
++        raise AnswerRefused("source_request_invalid")
+     if not isinstance(original, dict) or not isinstance(proof, dict):
+         raise AnswerRefused("source_proof_unavailable")
+     args = original.get("args")
+diff --git a/hermes_cli/kanban_card_answer_runtime.py b/hermes_cli/kanban_card_answer_runtime.py
+index 243ad19d83..64babbd6c3 100644
+--- a/hermes_cli/kanban_card_answer_runtime.py
++++ b/hermes_cli/kanban_card_answer_runtime.py
+@@ -1,11 +1,31 @@
+-"""Private managed-runtime entry points; IDs are hints, authenticated records are truth.
++"""Managed-runtime entry points; IDs are hints, authenticated records are truth.
+ 
+-No public tool or CLI is registered here. The courier must run these in the exact
+-receiving profile. Network evidence is read independently of its stdin envelope.
++The only entry is the module CLI (no tool or ``hermes`` subcommand is registered)::
++
++    python -m hermes_cli.kanban_card_answer_runtime owner REQUEST_ID PROOF_ID
++    python -m hermes_cli.kanban_card_answer_runtime source PROOF_ID
++
++Run it in the exact receiving profile (``HERMES_HOME``). One JSON object is printed
++to stdout. Success: exit 0, ``{"ok": true, "result": {...}}``. Controlled refusal
++(``AnswerRefused``; nothing was changed): exit 2, ``{"ok": false, "refused": CODE}``.
++Retryable unavailability (courier/store I/O): exit 3,
++``{"ok": false, "retryable": true, "error": "unavailable"}``. Any other failure:
++exit 1, ``{"ok": false, "error": "internal_error", "type": NAME}``. Bad usage: exit
++64. Network evidence is read independently of any caller-supplied envelope; there is
++no flag that supplies, skips or overrides proof.
++
++Routing coordinates: ``ownerProfile`` and the courier key ``profile/board/task`` name
++the Hermes profile whose runtime executes this transition. They are routing
++coordinates, NOT the task's assignee, which is never consulted or changed. Boards
++are shared across profiles under the trusted base Hermes root.
+ """
+ from __future__ import annotations
+ 
++import json
+ import re
++import sqlite3
++import sys
++from pathlib import Path
+ 
+ from hermes_cli.kanban_card_answer import AnswerRefused, apply
+ from hermes_cli.kanban_card_answer_proof import verify
+@@ -22,9 +42,31 @@ def _profile():
+     return profile, get_hermes_home()
+ 
+ 
++def _board_db(board) -> Path:
++    """Canonical live board DB under the trusted base Hermes root.
++
++    ``HERMES_KANBAN_HOME`` and ``HERMES_KANBAN_DB`` (worker/test pins) are ignored:
++    only ``<base>/kanban.db`` (default) or ``<base>/kanban/boards/<slug>/kanban.db``.
++    """
++    if not isinstance(board, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', board):
++        raise AnswerRefused('owner_board_invalid')
++    from hermes_constants import get_default_hermes_root
++    root = get_default_hermes_root().resolve()
++    if board == 'default':
++        path = (root / 'kanban.db').resolve()
++        if path.parent != root:
++            raise AnswerRefused('owner_board_invalid')
++    else:
++        path = (root / 'kanban' / 'boards' / board / 'kanban.db').resolve()
++        if not path.is_relative_to(root / 'kanban' / 'boards'):  # symlink escaping the root
++            raise AnswerRefused('owner_board_invalid')
++    if not path.is_file():
++        raise AnswerRefused('owner_board_missing')
++    return path
++
++
+ def owner(request_id: str, proof_id: str) -> dict:
+     """Apply an authenticated exact request only in this profile's own live board."""
+-    from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import connect_closing
+     records = Records()
+     profile, _ = _profile()
+@@ -34,14 +76,10 @@ def owner(request_id: str, proof_id: str) -> dict:
+     if (not isinstance(answer, dict) or answer.get('ownerGateway') != records.gateway
+             or answer.get('ownerProfile') != profile):
+         raise AnswerRefused('owner_route_mismatch')
+-    # board_own_db_path ignores a worker's HERMES_KANBAN_DB pin. Resolve only a
+-    # canonical board, never a supplied file or the hub's replica database.
++    # Resolve only a canonical board under the trusted base root, never a supplied
++    # file, a worker's pinned DB, or the hub's replica database.
+     board = answer.get('board')
+-    if not isinstance(board, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', board):
+-        raise AnswerRefused('owner_board_invalid')
+-    path = kb.board_own_db_path(board)
+-    if not path.is_file():
+-        raise AnswerRefused('owner_board_missing')
++    path = _board_db(board)
+     # Validate the original even on receipt replay; source readback may be offline
+     # only after the durable owner receipt already exists.
+     if (original.get('id') != request_id or original.get('to_gw') != records.gateway
+@@ -49,7 +87,7 @@ def owner(request_id: str, proof_id: str) -> dict:
+             or original.get('key') != f"{profile}/{board}/{answer.get('task')}"):
+         raise AnswerRefused('owner_route_mismatch')
+     with connect_closing(path) as conn:
+-        return apply(conn, answer, owner_gateway=records.gateway, owner_profile=profile, board=board, require_primary=True,
++        return apply(conn, answer, owner_gateway=records.gateway, owner_profile=profile, board=str(board), require_primary=True,
+                      verify_source=lambda a: verify(a, request_id=request_id, proof_id=proof_id,
+                                                    owner_gateway=records.gateway, read_request=records.read))
+ 
+@@ -78,3 +116,26 @@ def source(proof_id: str) -> dict:
+            read_request=lambda rid: validated if rid == proof_id else original)
+     return recorded(home / 'user-steps/actions.sqlite3', source=identity,
+                     owner_gateway=answer['ownerGateway'], request_id=args['requestId'], answer=answer)
++
++
++def main(argv=None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    shape = {'owner': 2, 'source': 1}
++    if not argv or argv[0] not in shape or len(argv) != shape[argv[0]] + 1:
++        print(json.dumps({'ok': False, 'error': 'usage'}))
++        return 64
++    try:
++        result = owner(*argv[1:]) if argv[0] == 'owner' else source(*argv[1:])
++        out, code = {'ok': True, 'result': result}, 0
++    except AnswerRefused as exc:
++        out, code = {'ok': False, 'refused': str(exc) or 'refused'}, 2
++    except (OSError, sqlite3.OperationalError):
++        out, code = {'ok': False, 'retryable': True, 'error': 'unavailable'}, 3
++    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
++        out, code = {'ok': False, 'error': 'internal_error', 'type': type(exc).__name__}, 1
++    print(json.dumps(out, sort_keys=True, ensure_ascii=False, default=str))
++    return code
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/hermes_cli/kanban_card_answer_source.py b/hermes_cli/kanban_card_answer_source.py
+index a1ed3a7fad..0d59d05ea2 100644
+--- a/hermes_cli/kanban_card_answer_source.py
++++ b/hermes_cli/kanban_card_answer_source.py
+@@ -13,7 +13,25 @@ from pathlib import Path
+ from hermes_cli.kanban_card_answer import AnswerRefused
+ 
+ 
+-def recorded(path: Path, *, source: dict, owner_gateway: str, request_id: str, answer: dict) -> dict:
++def recorded(path: Path, **kwargs) -> dict:
++    """Controlled boundary: a malformed/absent source store or row is a refusal.
++
++    Only genuinely transient SQLite lock/busy conditions stay retryable (OSError);
++    anything else a stored operation can do wrong becomes ``AnswerRefused``.
++    """
++    try:
++        return _recorded(path, **kwargs)
++    except AnswerRefused:
++        raise
++    except sqlite3.OperationalError as exc:
++        if any(word in str(exc).lower() for word in ('locked', 'busy')):
++            raise OSError('source_store_busy') from None
++        raise AnswerRefused('source_store_unavailable') from None
++    except (sqlite3.DatabaseError, KeyError, TypeError, ValueError, AttributeError, IndexError, UnicodeError):
++        raise AnswerRefused('source_operation_malformed') from None
++
++
++def _recorded(path: Path, *, source: dict, owner_gateway: str, request_id: str, answer: dict) -> dict:
+     """Exact namespace/session operation + producer-owned remote binding.
+ 
+     The binding's snapshot.remote contains version=1, target (the six owner/ask
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 90d02791c5..e4213f498d 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -259,3 +259,9 @@ def _reset_retired_host_loops():
+     yield
+     from tests._fixtures.host_loop_reset import reset_retired_host_loops
+     reset_retired_host_loops()
++
++
++def pytest_addoption(parser):
++    """Explicit cross-repository input for the courier/core integration gate."""
++    parser.addoption("--card-answer-courier", default=None,
++                     help="Exact hermes-hub client source for test_card_answer_courier_integration.py")
+diff --git a/tests/hermes_cli/test_card_answer_courier_integration.py b/tests/hermes_cli/test_card_answer_courier_integration.py
+new file mode 100644
+index 0000000000..6ea085fea2
+--- /dev/null
++++ b/tests/hermes_cli/test_card_answer_courier_integration.py
+@@ -0,0 +1,331 @@
++"""Courier + core card-answer integration gate (NOT live proof).
++
++Real: the staged courier's ``handle_requests``/``queue_request``/journals (two separate homes and
++databases), core ``kanban_card_answer_runtime.main`` (-> ``source()`` reading actual user-steps
++SQL, ``owner()`` applying to the real primary board DB), ``verify`` and ``apply``.
++
++Simulated seams only: (1) an authenticated Hub service/registry (in-memory; NOT TLS, NOT live)
++that stamps the sender and serves records; (2) the runtime's OS identity/root (``_profile``) and
++credential-bound ``Records`` client. The decision, proof and transaction are never stubbed.
++
++Run: scripts/run_tests.sh tests/hermes_cli/test_card_answer_courier_integration.py \
++         -- --card-answer-courier=/path/staged/hermes_hub.py   (stage outside live-home paths first)
++Source SQL fixture: protocol-shaped copies of the user-steps ``operations`` table and
++``kanban_projections`` DDL. This does not exercise the ActionStore producer (M2).
++"""
++from __future__ import annotations
++
++import contextlib
++import copy
++import importlib.util
++import io
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_runtime as runtime
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_card_answer as helpers
++
++kanban_home = helpers.kanban_home
++SRC = dict(gateway="origin", profile="work", session="chat-one")
++
++OPERATIONS_DDL = ("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, namespace TEXT, session TEXT, "
++                  "request TEXT, revision INTEGER, idem TEXT, fingerprint TEXT, body TEXT)")  # fixture copy
++PROJECTIONS_DDL = ("CREATE TABLE IF NOT EXISTS kanban_projections (namespace TEXT NOT NULL, request_id TEXT NOT NULL, "
++                   "session TEXT NOT NULL, board TEXT NOT NULL, task TEXT NOT NULL, snapshot TEXT NOT NULL, "
++                   "request TEXT NOT NULL, PRIMARY KEY(namespace,request_id))")  # fixture copy of kanban_mirror.py
++
++
++class Service:
++    """Simulated authenticated Hub registry: stamps sender, routes by to_gw. Not TLS/live."""
++
++    def __init__(self):
++        self.requests = {}
++
++    def deliver(self, db, gateway):
++        for (raw,) in db.execute("SELECT body FROM sent").fetchall():
++            body = json.loads(raw)
++            assert "from" not in body
++            env = {**body, "from": "gw:" + gateway}
++            old = self.requests.get(body["id"])
++            if old:
++                assert all(old.get(k) == v for k, v in env.items())  # same id, same envelope
++            else:
++                self.requests[body["id"]] = {**env, "state": "queued"}
++
++    def get(self, rid):
++        return copy.deepcopy(self.requests.get(rid))
++
++    def requeue(self, rid):  # server redelivers an already-finished request
++        self.requests[rid]["state"] = "queued"
++
++
++class Api:
++    def __init__(self, service, gateway):
++        self.service, self.gateway = service, gateway
++
++    def call(self, method, path, body=None):
++        s = self.service
++        if path.endswith("/claim"):
++            mine = [r for r in s.requests.values() if r["to_gw"] == self.gateway and r["state"] == "queued"]
++            for r in mine:
++                r["state"] = "claimed"
++            return 200, {"requests": copy.deepcopy([{k: v for k, v in r.items() if k not in ("state", "result")}
++                                                    for r in mine])}
++        rid = path.rsplit("/", 1)[-1] if method == "GET" else path.split("/")[-2]
++        rec = s.requests.get(rid)
++        if method == "GET":
++            return (200, {"request": copy.deepcopy(rec)}) if rec else (404, {})
++        assert rec and rec["to_gw"] == self.gateway
++        if body["status"] in ("done", "rejected"):
++            rec["state"], rec["result"] = body["status"], body["result"]
++        return 200, {"request": copy.deepcopy(rec)}
++
++
++class World:
++    def __init__(self, courier, tmp_path, owner_home, monkeypatch):
++        self.courier, self.mp, self.service = courier, monkeypatch, Service()
++        self.homes = {"owner": owner_home, "source": tmp_path / "source-home"}
++        self.homes["source"].mkdir()
++        self.profile = {"owner": ("default", "owner"), "source": ("work", "origin")}
++        self.runs, self.reads, self.dbs = [], [], {}
++        for name, home in self.homes.items():
++            (home / "mail.json").write_text(json.dumps({"gateway": self.profile[name][1]}))
++        self.restart_journal("owner", first=True)
++        self.restart_journal("source", first=True)
++        assert self.dbs["owner"].execute("PRAGMA database_list").fetchone()[2] != \
++            self.dbs["source"].execute("PRAGMA database_list").fetchone()[2]
++
++    @contextlib.contextmanager
++    def host(self, name):
++        home, (profile, gateway) = self.homes[name], self.profile[name]
++        world = self
++
++        class Records:  # authenticated-HTTP seam: reads the simulated registry for THIS gateway
++            def __init__(self):
++                self.gateway = gateway
++
++            def read(self, rid):
++                world.reads.append((name, rid))
++                rec = world.service.get(rid)
++                if rec is None:
++                    raise ca.AnswerRefused("courier_record_missing")
++                return rec
++
++        with self.mp.context() as p:
++            for k in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD"):
++                p.delenv(k, raising=False)
++            p.setenv("HERMES_HOME", str(home))
++            p.setenv("HERMES_HUB_STATE", str(home / "courier"))
++            p.setenv("HERMES_MAIL_CONFIG", str(home / "mail.json"))
++            p.setattr(runtime, "Records", Records)
++            p.setattr(runtime, "_profile", lambda: (profile, home))  # OS identity/root seam
++            p.setattr(self.courier, "_home_for", lambda prof: home if prof == profile else None)
++            yield
++
++    def restart_journal(self, name, first=False):
++        with self.host(name):
++            if not first:
++                self.dbs[name].close()
++            self.dbs[name] = self.courier.open_db()
++            self.courier.mset(self.dbs[name], "gateway", self.profile[name][1])
++            self.dbs[name].commit()
++
++    def runner(self, name):
++        def run(cfg, argv, stdin=None, **kw):  # runs the real runtime main in this host
++            assert argv[:4] == ["-p", self.profile[name][0], "--run-module", "hermes_cli.kanban_card_answer_runtime"]
++            out = io.StringIO()
++            with contextlib.redirect_stdout(out):
++                rc = runtime.main(argv[4:])
++            self.runs.append((name, argv[4], rc, json.loads(out.getvalue())))
++            return rc, out.getvalue(), ""
++        return run
++
++    def tick(self, name):
++        with self.host(name):
++            n = self.courier.handle_requests(self.dbs[name], Api(self.service, self.profile[name][1]), {},
++                                             self.runner(name))
++            self.service.deliver(self.dbs[name], self.profile[name][1])
++        return n
++
++    def submit(self, rid, answer, source=SRC):
++        with self.host("source"):
++            self.courier.queue_request(self.dbs["source"], answer["ownerGateway"], "tasks",
++                                       "/".join(answer[k] for k in ("ownerProfile", "board", "task")),
++                                       "card-answer", {"answer": answer, "source": source}, rid=rid)
++            self.service.deliver(self.dbs["source"], "origin")
++
++    def drive(self, rid, answer, source=SRC):
++        """submit -> owner queues proof child -> source journal proves via real SQL -> owner restarts -> receipt."""
++        self.submit(rid, answer, source)
++        self.tick("owner")
++        assert self.service.requests[rid]["state"] == "claimed"  # pending, not finished
++        self.tick("source")
++        self.restart_journal("owner")  # fresh process/journal handle before the receipt
++        self.tick("owner")
++        return self.service.requests[rid]
++
++
++def record_operation(home, answer, source=SRC, op_id=None):
++    """Write the user's recorded Desktop operation into the SOURCE home's real-shaped store."""
++    path = home / "user-steps/actions.sqlite3"
++    path.parent.mkdir(exist_ok=True)
++    # Protocol-shaped fixture only; M2 separately exercises the real ActionStore producer.
++    ns = json.dumps([source["gateway"], source["profile"]], separators=(",", ":"))
++    label = {"plan-a": "Apply plan A", "plan-b": "Apply plan B"}[answer["choice"]]
++    cid = "a" if answer["choice"] == "plan-a" else "b"
++    req = dict(requestId="request-one", revision=1, choices=[dict(id="a", effect="answer", label="Apply plan A"),
++                                                            dict(id="b", effect="answer", label="Apply plan B")])
++    op = dict(owner=dict(gatewayId=source["gateway"], profile=source["profile"], storedSessionId=source["session"]),
++              operationId=answer["operationId"], recordedAt="2026-01-01T00:00:00+00:00", requestId="request-one",
++              revision=1, dispatchState="pending",
++              decision=dict(requestId="request-one", expectedRevision=1, choiceId=cid),
++              intent=dict(request=req, effect="answer", revisionText=label, executionAuthorized=False,
++                          permissionGrants=[]))
++    remote = dict(version=1, target={k: v for k, v in answer.items() if k not in ("choice", "operationId")},
++                  choiceValues={"a": "plan-a", "b": "plan-b"})
++    with sqlite3.connect(path) as c:
++        c.execute(OPERATIONS_DDL)
++        c.execute(PROJECTIONS_DDL)
++        c.execute("INSERT INTO operations(id,namespace,session,request,revision,idem,fingerprint,body) "
++                  "VALUES(?,?,?,?,?,?,?,?)", (answer["operationId"], ns, source["session"], "request-one", 1,
++                                              answer["operationId"], "fp", json.dumps(op)))
++        c.execute("INSERT OR IGNORE INTO kanban_projections VALUES(?,?,?,?,?,?,?)",
++                  (ns, "request-one", source["session"], answer["board"], answer["task"],
++                   json.dumps(dict(remote=remote)), json.dumps(req)))
++
++
++@pytest.fixture
++def courier(request, tmp_path, monkeypatch):
++    source = request.config.getoption("--card-answer-courier")
++    if not source:
++        pytest.skip("cross-repository test requires --card-answer-courier PATH")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "load-state"))
++    spec = importlib.util.spec_from_file_location("card_answer_courier", Path(source).resolve())
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.fixture
++def world(courier, kanban_home, tmp_path, monkeypatch):
++    with kbc.connect_closing() as conn:  # the REAL primary board DB at <owner root>/kanban.db
++        conn.execute("CREATE TABLE kanban_sync_state(gateway_id TEXT, mode TEXT)")
++        conn.execute("INSERT INTO kanban_sync_state VALUES ('owner','primary')")
++        conn.commit()
++    w = World(courier, tmp_path, kanban_home, monkeypatch)
++    yield w
++    for db in w.dbs.values():
++        db.close()
++
++
++def answer_for(choice="plan-a", op="desktop-op-1"):
++    with kbc.connect_closing() as conn:
++        a = helpers.setup_answer(conn)
++    a.update(choice=choice, operationId=op, ownerGateway="owner")
++    return a
++
++
++def card(answer):
++    with kbc.connect_closing() as conn:
++        t = kb.get_task(conn, answer["task"])
++        return t.status, bool(t.human_request), helpers.comments(conn, answer["task"]), \
++            len(kb.list_events(conn, answer["task"]))
++
++
++@pytest.mark.parametrize("choice,label", [("plan-a", "Apply plan A"), ("plan-b", "Apply plan B")])
++def test_end_to_end_receipt_idempotence_and_readback(world, choice, label):
++    a = answer_for(choice)
++    record_operation(world.homes["source"], a)
++    final = world.drive("answer-request-0001", a)
++    assert final["state"] == "done", final
++    modes = [(n, m, rc) for n, m, rc, _ in world.runs]
++    assert modes == [("source", "source", 0), ("owner", "owner", 0)]
++    receipt = final["result"]
++    assert receipt["operationId"] == a["operationId"] and receipt["choice"] == choice
++    assert receipt["originGateway"] == "origin" and receipt["executionStarted"] is False
++    status, held, comments, events = card(a)
++    assert (status, held) == ("ready", False)
++    assert comments == [("user-steps", "Choice recorded in Desktop (remote): "
++                         + json.dumps({"label": label, "value": choice}, separators=(",", ":"))
++                         + "\nOperation: " + a["operationId"])]
++    # proof child was queued through owner 'sent', read via registry by source, journals are separate
++    child = next(r for r in world.service.requests.values() if r["action"] == "card-answer-proof")
++    assert child["from"] == "gw:owner" and child["to_gw"] == "origin" and child["state"] == "done"
++    assert child["result"] == {**child["args"], "gateway": "origin", "recorded": True}
++    assert world.dbs["source"].execute("SELECT state FROM req_ledger WHERE id=?", (child["id"],)).fetchone()
++    assert world.dbs["owner"].execute("SELECT state FROM req_ledger WHERE id=?", ("answer-request-0001",)).fetchone()
++    assert ("source", "answer-request-0001") in world.reads and ("owner", child["id"]) in world.reads
++
++    # repeated delivery of the same request: journal replay, no new effects, same receipt
++    world.service.requeue("answer-request-0001")
++    runs = len(world.runs)
++    world.tick("owner")
++    assert world.service.requests["answer-request-0001"]["result"] == receipt
++    assert len(world.runs) == runs and card(a) == (status, held, comments, events)
++
++    # a NEW request id for the same operationId: full flow again, receipt replayed, still one effect
++    final2 = world.drive("answer-request-0002", a)
++    assert final2["state"] == "done" and final2["result"] == receipt
++    assert card(a) == (status, held, comments, events)
++
++
++def test_stale_generation_has_no_effect(world):
++    a = answer_for()
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=json_set(human_request,'$.action','New question') WHERE id=?",
++                         (a["task"],))
++    before = card(a)
++    record_operation(world.homes["source"], a)
++    final = world.drive("answer-request-stale", a)
++    assert final["state"] == "rejected" and final["result"]["refused"] == "stale_ask"
++    assert world.runs[-1][:3] == ("owner", "owner", 2)
++    assert card(a) == before and before[0] == "blocked"
++
++
++def test_containment_hold_refuses_without_effect(world):
++    a = answer_for()
++    with kbc.connect_closing() as conn:
++        conn.execute("CREATE TABLE containment_observations(task_id TEXT, episode TEXT)")
++        conn.execute("INSERT INTO containment_observations VALUES (?, 'unverified-episode')", (a["task"],))
++        conn.commit()
++    before = card(a)
++    record_operation(world.homes["source"], a)
++    final = world.drive("answer-request-held", a)
++    assert final["state"] == "rejected" and final["result"]["refused"] == "ask_changed_or_held"
++    assert card(a) == before and before[0] == "blocked"
++
++
++def test_non_ask_human_hold_is_not_released(world):
++    a = answer_for()
++    with kbc.connect_closing() as conn:  # the hold stops being an exact ask
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=NULL WHERE id=?", (a["task"],))
++    before = card(a)
++    record_operation(world.homes["source"], a)
++    final = world.drive("answer-request-nonask", a)
++    assert final["state"] == "rejected" and final["result"]["refused"] == "stale_ask"
++    assert card(a) == before and before[0] == "blocked"
++
++
++def test_unrecorded_source_operation_never_reaches_owner_write(world):
++    a = answer_for()
++    record_operation(world.homes["source"], answer_for(op="other-op") | {"task": a["task"]})  # other operation only
++    before = card(a)
++    world.submit("answer-request-noop", a)
++    world.tick("owner")
++    world.tick("source")
++    assert world.runs[-1][:3] == ("source", "source", 2)
++    assert world.runs[-1][3]["refused"] == "source_operation_missing"
++    world.restart_journal("owner")
++    world.tick("owner")
++    assert world.service.requests["answer-request-noop"]["state"] == "rejected"
++    assert all(m != "owner" for _, m, *_ in world.runs)  # owner core never executed
++    assert card(a) == before
+diff --git a/tests/hermes_cli/test_kanban_card_answer_hardening.py b/tests/hermes_cli/test_kanban_card_answer_hardening.py
+new file mode 100644
+index 0000000000..61c628eda4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_answer_hardening.py
+@@ -0,0 +1,354 @@
++"""Hardening: trusted board root, exact receipt replay, controlled source refusals, module CLI."""
++import copy
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_proof as proof
++from hermes_cli import kanban_card_answer_runtime as runtime
++from hermes_cli import kanban_card_answer_source as source
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_card_answer as helpers
++from tests.hermes_cli import test_kanban_card_answer_runtime as rt
++from tests.hermes_cli import test_kanban_card_answer_source as src
++
++kanban_home = helpers.kanban_home
++REPO = Path(__file__).resolve().parents[2]
++
++
++# --- trusted board root / profile coordinate -------------------------------------------------
++
++def test_board_root_ignores_kanban_home_and_db_pins(kanban_home, monkeypatch, tmp_path):
++    decoy = tmp_path / 'decoy'
++    (decoy / 'kanban' / 'boards' / 'side').mkdir(parents=True)
++    (decoy / 'kanban.db').write_bytes(b'')
++    (decoy / 'kanban' / 'boards' / 'side' / 'kanban.db').write_bytes(b'')
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(decoy))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(decoy / 'kanban.db'))
++    assert runtime._board_db('default') == (kanban_home / 'kanban.db').resolve()
++    with pytest.raises(ca.AnswerRefused, match='owner_board_missing'):
++        runtime._board_db('side')  # exists only under the untrusted pin
++    real = kanban_home / 'kanban' / 'boards' / 'side'
++    real.mkdir(parents=True)
++    (real / 'kanban.db').write_bytes(b'')
++    assert runtime._board_db('side') == (real / 'kanban.db').resolve()
++
++
++def test_owner_applies_in_trusted_home_despite_kanban_home_pin(kanban_home, monkeypatch, tmp_path):
++    answer, _, _ = rt.setup(monkeypatch, kanban_home)
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'elsewhere'))
++    assert runtime.owner('original', 'proof')['operationId'] == answer['operationId']
++    with kbc.connect_closing(kanban_home / 'kanban.db') as conn:
++        assert kb.get_task(conn, answer['task']).status == 'ready'
++
++
++def test_symlinked_board_cannot_escape_boards_root(kanban_home, tmp_path):
++    outside = tmp_path / 'outside'
++    outside.mkdir()
++    (outside / 'kanban.db').write_bytes(b'')
++    (kanban_home / 'kanban' / 'boards').mkdir(parents=True)
++    (kanban_home / 'kanban' / 'boards' / 'link').symlink_to(outside)
++    with pytest.raises(ca.AnswerRefused, match='owner_board_invalid'):
++        runtime._board_db('link')
++
++
++@pytest.mark.parametrize('board', ['../x', 'A', '', None, 'a/b', 5])
++def test_board_slug_validated(kanban_home, board):
++    with pytest.raises(ca.AnswerRefused, match='owner_board_invalid'):
++        runtime._board_db(board)
++
++
++def test_profile_is_routing_coordinate_not_assignee(kanban_home, monkeypatch):
++    answer, _, _ = rt.setup(monkeypatch, kanban_home)
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET assignee=? WHERE id=?', ('some-other-profile', answer['task']))
++    runtime.owner('original', 'proof')
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, answer['task'])
++        assert task.status == 'ready' and task.assignee == 'some-other-profile'
++
++
++# --- exact receipt replay --------------------------------------------------------------------
++
++def _tamper_event(conn, tid, kind, edit):
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
++                           (tid, kind)).fetchone()
++        payload = json.loads(row[1])
++        edit(payload)
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row[0]))
++
++
++def _receipt_edit(fn):
++    return lambda p: fn(p[ca.FIELD])
++
++
++RECEIPT_EDITS = {
++    'origin_removed': _receipt_edit(lambda r: r.pop('originGateway')),
++    'origin_empty': _receipt_edit(lambda r: r.update(originGateway='')),
++    'extra_field': _receipt_edit(lambda r: r.update(extra=1)),
++    'destination': _receipt_edit(lambda r: r.update(destination='elsewhere')),
++    'execution_started': _receipt_edit(lambda r: r.update(executionStarted=True)),
++    'execution_missing_bool': _receipt_edit(lambda r: r.update(executionStarted=0)),
++    'provenance': _receipt_edit(lambda r: r.update(decisionProvenance='transcript')),
++    'choice': _receipt_edit(lambda r: r.update(choice='plan-b')),
++    'generation': _receipt_edit(lambda r: r.update(generation='b' * 64)),
++}
++
++
++@pytest.mark.parametrize('name', sorted(RECEIPT_EDITS))
++def test_replay_refuses_inexact_receipt(kanban_home, name):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        _tamper_event(conn, req['task'], 'unblocked', RECEIPT_EDITS[name])
++        with pytest.raises(ca.AnswerRefused, match='operation_(receipt_invalid|conflict)'):
++            helpers.apply(conn, req, lambda _: pytest.fail('replay must not reach the origin'))
++
++
++def test_replay_fingerprint_forgery_cannot_make_receipt(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        _tamper_event(conn, req['task'], 'unblocked', _receipt_edit(lambda r: r.update(fingerprint='f' * 64)))
++        with pytest.raises(ca.AnswerRefused, match='operation_conflict'):
++            helpers.apply(conn, req)
++
++
++COMMENT_EDITS = {
++    'provenance_origin': lambda p: p['recorded_decision'].update(originGateway='forged'),
++    'provenance_choice': lambda p: p['recorded_decision'].update(choice='plan-b'),
++    'provenance_removed': lambda p: p.pop('recorded_decision'),
++    'relayed_human': lambda p: p.update(relayed_human={'message_id': 'x'}),
++    'writer_human': lambda p: p.update(writer_kind='human'),
++    'author': lambda p: p.update(author='someone'),
++    'comment_id': lambda p: p.update(comment_id=10**9),
++}
++
++
++@pytest.mark.parametrize('name', sorted(COMMENT_EDITS))
++def test_replay_requires_recorded_decision_comment_provenance(kanban_home, name):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        _tamper_event(conn, req['task'], 'commented', COMMENT_EDITS[name])
++        with pytest.raises(ca.AnswerRefused, match='operation_receipt_invalid'):
++            helpers.apply(conn, req, lambda _: pytest.fail('replay must not reach the origin'))
++
++
++@pytest.mark.parametrize('body', ['hello', 'Choice recorded in Desktop (remote): {"value":"plan-b"}\nOperation: desktop-operation-one',
++                                  'Choice recorded in Desktop (remote): not-json\nOperation: desktop-operation-one'])
++def test_replay_requires_exact_comment_body(kanban_home, body):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        with kb.write_txn(conn):
++            conn.execute('UPDATE task_comments SET body=? WHERE task_id=?', (body, req['task']))
++        with pytest.raises(ca.AnswerRefused, match='operation_receipt_invalid'):
++            helpers.apply(conn, req)
++
++
++def test_replay_refuses_missing_comment_and_duplicate_provenance(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        helpers.apply(conn, req)
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? AND kind='commented'",
++                               (req['task'],)).fetchone()
++            kb._append_event(conn, req['task'], 'commented', json.loads(row[1]))
++        with pytest.raises(ca.AnswerRefused, match='operation_receipt_invalid'):
++            helpers.apply(conn, req)
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute('DELETE FROM task_comments')
++        with pytest.raises(ca.AnswerRefused, match='operation_receipt_invalid'):
++            helpers.apply(conn, req)
++
++
++def test_archived_receipt_must_be_archive_choice(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        first = helpers.apply(conn, req)
++        assert helpers.apply(conn, req, lambda _: pytest.fail('offline replay')) == first
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET kind='archived' WHERE task_id=? AND kind='unblocked'", (req['task'],))
++        with pytest.raises(ca.AnswerRefused, match='operation_receipt_invalid'):
++            helpers.apply(conn, req)
++
++
++def test_malformed_event_payload_is_not_a_receipt_or_crash(kanban_home):
++    with kbc.connect_closing() as conn:
++        req = helpers.setup_answer(conn)
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                         (req['task'], 'unblocked', '{not json', 1))
++            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                         (req['task'], 'commented', '[1]', 1))
++        req['generation'] = ca.snapshot(conn, req['task'])['generation']
++        assert helpers.apply(conn, req)['operationId'] == req['operationId']
++
++
++# --- malformed source store ------------------------------------------------------------------
++
++def _set_body(path, edit):
++    with sqlite3.connect(path) as conn:
++        body = json.loads(conn.execute('SELECT body FROM operations').fetchone()[0])
++        edit(body)
++        conn.execute('UPDATE operations SET body=?', (json.dumps(body),))
++
++
++SOURCE_BODY_EDITS = {
++    'no_intent': lambda b: b.pop('intent'),
++    'no_decision': lambda b: b.pop('decision'),
++    'intent_not_dict': lambda b: b.update(intent=5),
++    'no_request_id': lambda b: b.pop('requestId'),
++    'decision_not_dict': lambda b: b.update(decision='x'),
++}
++
++
++@pytest.mark.parametrize('name', sorted(SOURCE_BODY_EDITS))
++def test_malformed_operation_body_is_controlled_refusal(tmp_path, name):
++    path, answer, origin, _, _ = src.fixture(tmp_path)
++    _set_body(path, SOURCE_BODY_EDITS[name])
++    with pytest.raises(ca.AnswerRefused):
++        src.read(path, answer, origin)
++
++
++@pytest.mark.parametrize('table,column,value', [('operations', 'body', '{bad'), ('operations', 'body', '[]'),
++                                                ('kanban_projections', 'snapshot', '{bad'),
++                                                ('kanban_projections', 'snapshot', '{}'),
++                                                ('kanban_projections', 'request', '{"x":1}'),
++                                                ('kanban_projections', 'request', 'null')])
++def test_malformed_stored_json_is_controlled_refusal(tmp_path, table, column, value):
++    path, answer, origin, _, _ = src.fixture(tmp_path)
++    with sqlite3.connect(path) as conn:
++        conn.execute(f'UPDATE {table} SET {column}=?', (value,))
++    with pytest.raises(ca.AnswerRefused):
++        src.read(path, answer, origin)
++
++
++def test_missing_or_schemaless_store_refused_without_creation(tmp_path):
++    path = tmp_path / 'missing.sqlite3'
++    with pytest.raises(ca.AnswerRefused, match='source_store_unavailable'):
++        src.read(path, {'operationId': 'x'}, dict(gateway='origin', profile='work', session='chat-one'))
++    assert not path.exists()
++    empty = tmp_path / 'empty.sqlite3'
++    sqlite3.connect(empty).close()
++    with pytest.raises(ca.AnswerRefused, match='source_store_unavailable'):
++        src.read(empty, {'operationId': 'x'}, dict(gateway='origin', profile='work', session='chat-one'))
++    garbage = tmp_path / 'garbage.sqlite3'
++    garbage.write_bytes(b'not a database' * 100)
++    with pytest.raises(ca.AnswerRefused, match='source_operation_malformed'):
++        src.read(garbage, {'operationId': 'x'}, dict(gateway='origin', profile='work', session='chat-one'))
++
++
++def test_busy_store_is_retryable_not_refusal(tmp_path):
++    path, answer, origin, _, _ = src.fixture(tmp_path)
++    holder = sqlite3.connect(path, isolation_level=None)
++    holder.execute('BEGIN EXCLUSIVE')
++    try:
++        reader_error = None
++        try:
++            src.read(path, answer, origin)
++        except OSError as exc:
++            reader_error = exc
++        except ca.AnswerRefused:
++            pytest.fail('lock contention must not be a terminal refusal')
++        # Journal-mode dependent: a rollback-journal read may or may not block; when it
++        # does, it must surface as retryable.
++        assert reader_error is None or str(reader_error) == 'source_store_busy'
++    finally:
++        holder.execute('ROLLBACK')
++        holder.close()
++
++
++@pytest.mark.parametrize('bad', [None, [], 'x', {}, {'ownerGateway': 'owner'}, {'a': 1}])
++def test_proof_refuses_malformed_answer_without_keyerror(bad):
++    with pytest.raises(ca.AnswerRefused, match='source_request_invalid'):
++        proof.verify(bad, request_id='original', proof_id='proof', owner_gateway='owner',
++                     read_request=lambda rid: {})
++
++
++# --- module CLI -------------------------------------------------------------------------------
++
++def run_main(capsys, argv):
++    code = runtime.main(argv)
++    out = capsys.readouterr().out
++    return code, json.loads(out)
++
++
++def test_cli_owner_and_source_json_contract(monkeypatch, capsys):
++    seen = []
++    monkeypatch.setattr(runtime, 'owner', lambda r, p: seen.append(('owner', r, p)) or {'receipt': 1})
++    monkeypatch.setattr(runtime, 'source', lambda p: seen.append(('source', p)) or {'proof': 2})
++    assert run_main(capsys, ['owner', 'req', 'prf']) == (0, {'ok': True, 'result': {'receipt': 1}})
++    assert run_main(capsys, ['source', 'prf']) == (0, {'ok': True, 'result': {'proof': 2}})
++    assert seen == [('owner', 'req', 'prf'), ('source', 'prf')]
++
++
++@pytest.mark.parametrize('argv', [[], ['owner'], ['owner', 'a'], ['owner', 'a', 'b', 'c'], ['source'],
++                                  ['source', 'a', 'b'], ['apply', 'a'], ['--recorded', 'owner', 'a', 'b']])
++def test_cli_usage_never_calls_functions(monkeypatch, capsys, argv):
++    monkeypatch.setattr(runtime, 'owner', lambda *a: pytest.fail('called'))
++    monkeypatch.setattr(runtime, 'source', lambda *a: pytest.fail('called'))
++    assert run_main(capsys, argv) == (64, {'ok': False, 'error': 'usage'})
++
++
++@pytest.mark.parametrize('exc,code,body', [
++    (ca.AnswerRefused('stale_ask'), 2, {'ok': False, 'refused': 'stale_ask'}),
++    (OSError('/secret/path'), 3, {'ok': False, 'retryable': True, 'error': 'unavailable'}),
++    (sqlite3.OperationalError('locked'), 3, {'ok': False, 'retryable': True, 'error': 'unavailable'}),
++    (RuntimeError('token=abc'), 1, {'ok': False, 'error': 'internal_error', 'type': 'RuntimeError'}),
++])
++def test_cli_error_envelopes_leak_nothing(monkeypatch, capsys, exc, code, body):
++    def boom(*_):
++        raise exc
++    monkeypatch.setattr(runtime, 'owner', boom)
++    monkeypatch.setattr(runtime, 'source', boom)
++    for argv in (['owner', 'a', 'b'], ['source', 'a']):
++        got_code, got = run_main(capsys, argv)
++        assert (got_code, got) == (code, body)
++
++
++def test_cli_real_owner_refusal_leaves_card_untouched(kanban_home, monkeypatch, capsys):
++    answer, rows, _ = rt.setup(monkeypatch, kanban_home)
++    rows['proof']['state'] = 'pending'
++    code, out = run_main(capsys, ['owner', 'original', 'proof'])
++    assert code == 2 and out['refused'] == 'source_proof_unavailable'
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, answer['task']).status == 'blocked'
++    rows['proof']['state'] = 'done'
++    code, out = run_main(capsys, ['owner', 'original', 'proof'])
++    assert code == 0 and out['result']['operationId'] == answer['operationId']
++
++
++def test_cli_real_source_malformed_store_is_refusal(monkeypatch, capsys, tmp_path):
++    answer, rows = rt.proof_helpers.records()
++    rows['proof'].pop('result')
++    rows['proof']['state'] = 'pending'
++
++    class Records:
++        gateway = 'origin'
++        def read(self, rid):
++            return copy.deepcopy(rows[rid])
++    monkeypatch.setattr(runtime, 'Records', Records)
++    monkeypatch.setattr(runtime, '_profile', lambda: ('work', tmp_path))
++    code, out = run_main(capsys, ['source', 'proof'])
++    assert (code, out) == (2, {'ok': False, 'refused': 'source_store_unavailable'})
++
++
++def test_module_entry_point_subprocess(tmp_path):
++    env = {k: v for k, v in os.environ.items() if not k.startswith('HERMES_')}
++    env.update(HERMES_HOME=str(tmp_path / 'home'), HOME=str(tmp_path), PYTHONPATH=str(REPO))
++    done = subprocess.run([sys.executable, '-m', 'hermes_cli.kanban_card_answer_runtime', 'owner', 'only-one'],
++                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
++    assert done.returncode == 64
++    assert json.loads(done.stdout) == {'ok': False, 'error': 'usage'}
+diff --git a/tests/hermes_cli/test_kanban_card_answer_source.py b/tests/hermes_cli/test_kanban_card_answer_source.py
+index 3167708945..e90ffcd612 100644
+--- a/tests/hermes_cli/test_kanban_card_answer_source.py
++++ b/tests/hermes_cli/test_kanban_card_answer_source.py
+@@ -96,6 +96,6 @@ def test_unbound_operation_is_not_authority(tmp_path):
+ 
+ def test_missing_store_never_created(tmp_path):
+     path = tmp_path / 'missing.sqlite3'
+-    with pytest.raises(sqlite3.OperationalError):
++    with pytest.raises(ca.AnswerRefused, match='source_store_unavailable'):
+         read(path, {}, dict(gateway='origin', profile='work', session='chat-one'))
+     assert not path.exists()
+-- 
+2.43.0
+

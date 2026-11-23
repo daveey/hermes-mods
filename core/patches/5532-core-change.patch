@@ -1,0 +1,641 @@
+From aecf3818d5a8756bf7ef825fd659894fa210df3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:45:17 +0000
+Subject: [PATCH] fix(kanban): release idle green PR owners and bound
+ publication holds [daveey]
+
+The active_pr duplicate-publication guard discharged terminal PRs and explicit
+handoffs, but never discharged a bound open PR merely because its checks finished
+green. Its generic six-hour hold cap exceeded the two-hour fairness threshold.
+A diagnostic reporting zero failing checks was not a release or a wake source.
+
+Reuse exact-head required CI acceptance, fail closed for missing evidence, and
+admit only an idle ready publisher when every unfinished holding PR is green,
+including local-only multi-publication cards like the original incident.
+Preserve open-run and wake-probe custody. Collect in a two-worker
+background pool with no backlog; guard ticks never wait for acceptance. Scope
+cached observations to DB, task, publisher run, comment watermark and head;
+discard observations taking over 120s, refresh after 300s, bound cache at 256.
+Revalidate custody/publication identity before admission. This permits finishing
+the existing PR, never bypasses exact-head independent review or merge gates;
+ordinary crash/spend breakers still apply to subsequent recovery attempts.
+
+Cap remaining active_pr holds at 2100s (35 min) using the existing home-owned
+supervisor escalation. Preserve the existing 30-min notice and every existing
+guard test unedited. Other guards keep their configured caps/exemptions.
+
+Proof: fail-first idle-green returns active_pr; base cap is 21600 not 2100.
+Pre-background compatibility selection: 50 files,1116 pass,0 fail,1 existing skip.
+New custody/async tests exercise real dispatch, blocked network, two-job bound,
+late observations, head/contract/assignee/watch/publication races and TTL.
+
+Implementation: t_5d887b9331377cdf
+---
+ hermes_cli/kanban_block_routing.py            |  12 ++
+ hermes_cli/kanban_db_dispatch.py              |   7 +-
+ hermes_cli/kanban_db_dispatch_pr_state.py     |   5 +
+ hermes_cli/kanban_pr_idle_checks.py           |  72 +++++++++++
+ hermes_cli/kanban_pr_idle_green.py            |  61 +++++++++
+ .../test_kanban_active_pr_idle_async.py       | 120 ++++++++++++++++++
+ .../test_kanban_active_pr_idle_custody.py     | 113 +++++++++++++++++
+ .../test_kanban_active_pr_idle_green.py       | 107 ++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  14 ++
+ 9 files changed, 506 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_idle_checks.py
+ create mode 100644 hermes_cli/kanban_pr_idle_green.py
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_idle_async.py
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_idle_custody.py
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_idle_green.py
+
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index fafa05ec56..14f61bb43c 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -161,6 +161,18 @@ def route_block(
+     return "blocked", "blocked", set_sql, (kind, recurrences), payload
+ 
+ 
++def guard_hold_cap_seconds(reason: str) -> int | None:
++    """Keep active PR publication waits below the fairness limit, with a notice first."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    if reason == "active_pr":
++        return 2100  # 35 min: existing 30-min notice precedes home-owned escalation
++    if reason in dispatch._GUARD_HOLD_EXEMPT_REASONS:
++        return None
++    if reason in dispatch._GUARD_HOLD_SHORT_CAP_REASONS:
++        return dispatch._env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", dispatch.DEFAULT_GUARD_HOLD_CAP_SECONDS)
++    return dispatch._env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", dispatch.DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS)
++
++
+ def block_if_guard_hold_capped(conn, task_id: str, reason: str) -> bool:
+     """Block ``task_id`` when the guard has held it for ``reason`` past the cap. [daveey]"""
+     from hermes_cli import kanban_db_dispatch as dispatch
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 59957399d6..dfcc89ca4c 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -120,11 +120,8 @@ def _env_seconds(name: str, default: int) -> int:
+ 
+ def guard_hold_cap_seconds(reason: str) -> Optional[int]:
+     """Max seconds the respawn guard may hold a card for ``reason`` (None = no cap)."""
+-    if reason in _GUARD_HOLD_EXEMPT_REASONS:
+-        return None
+-    if reason in _GUARD_HOLD_SHORT_CAP_REASONS:
+-        return _env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", DEFAULT_GUARD_HOLD_CAP_SECONDS)
+-    return _env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS)
++    from hermes_cli.kanban_block_routing import guard_hold_cap_seconds as cap
++    return cap(reason)
+ 
+ 
+ def _is_completion_gate_error(err: str) -> bool:
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 828123efe8..6cca9499c5 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -669,10 +669,15 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+             if state == "REJECTED":
+                 comment_rejection(conn, task_id, url, _rejections[norm_pr(url)])
+         return None
++    from hermes_cli.kanban_pr_idle_green import releases
++    if releases(conn, task_id, states):
++        return None  # finish this idle owner's green bound PR; landing gates remain intact
+     return "active_pr"
+ 
+ 
+ def clear_cache() -> None:
++    from hermes_cli import kanban_pr_idle_green
++    kanban_pr_idle_green.clear_cache()
+     _cache.clear()
+     _rejections.clear()
+     _heads.clear()
+diff --git a/hermes_cli/kanban_pr_idle_checks.py b/hermes_cli/kanban_pr_idle_checks.py
+new file mode 100644
+index 0000000000..9d9e90bea0
+--- /dev/null
++++ b/hermes_cli/kanban_pr_idle_checks.py
+@@ -0,0 +1,72 @@
++"""Bounded background exact-head CI observations; never wait inside the dispatch lock."""
++from __future__ import annotations
++
++from collections import OrderedDict
++from concurrent.futures import Future, ThreadPoolExecutor
++from contextvars import copy_context
++from threading import RLock
++import time
++
++TTL_SECONDS = 300
++MAX_ENTRIES = 256
++OBSERVATION_BUDGET_SECONDS = 120
++_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kanban-idle-pr")
++_cache: OrderedDict[tuple, tuple[float, bool]] = OrderedDict()
++_pending: dict[tuple, tuple[float, Future]] = {}
++_lock = RLock()
++
++
++def clear_cache() -> None:
++    with _lock:
++        _clear_cache()
++
++
++def _clear_cache() -> None:
++    _cache.clear()
++    # Running jobs have no DB handle and cannot publish a release themselves.
++    for _started, future in _pending.values():
++        future.cancel()
++    _pending.clear()
++
++
++def _collect(contract, assignee, head) -> bool:
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    from hermes_cli.kanban_pr_acceptance import collect_acceptance
++    receipt = collect_acceptance(contract, contract, assignee=assignee)
++    green = (receipt.get("ok") is True and receipt.get("pr_state") == "OPEN"
++             and receipt.get("pr_url") == contract and receipt.get("head_sha") == head
++             and bool(receipt.get("checks")))
++    return bool(green and prs.pr_head(contract, max_age=0) == head)
++
++
++def green(key, contract, assignee, head) -> bool:
++    with _lock:
++        return _green(key, contract, assignee, head)
++
++
++def _green(key, contract, assignee, head) -> bool:
++    """At most two outstanding jobs, no queued backlog, discard over-budget observations."""
++    now = time.monotonic()
++    hit = _cache.get(key)
++    if hit is not None and now < hit[0]:
++        return hit[1]
++    # Reap finished jobs even if their original task never asks again.
++    for old, (started, future) in list(_pending.items()):
++        if future.done():
++            try:
++                passed = future.result() is True and now - started <= OBSERVATION_BUDGET_SECONDS
++            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
++                # Failed observation remains fail-closed; never retain exception text.
++                passed = False
++            _cache[old] = (now + TTL_SECONDS, passed)
++            _pending.pop(old)
++    while len(_cache) > MAX_ENTRIES:
++        _cache.popitem(last=False)
++    hit = _cache.get(key)
++    if hit is not None and now < hit[0]:
++        return hit[1]
++    if key not in _pending and len(_pending) < 2:
++        _pending[key] = (now, _pool.submit(copy_context().run, _collect, contract, assignee, head))
++        if _pending[key][1].done():
++            return green(key, contract, assignee, head)
++    return False  # next tick consumes the result; the 35-min home cap bounds an outage
+diff --git a/hermes_cli/kanban_pr_idle_green.py b/hermes_cli/kanban_pr_idle_green.py
+new file mode 100644
+index 0000000000..8baa920134
+--- /dev/null
++++ b/hermes_cli/kanban_pr_idle_green.py
+@@ -0,0 +1,61 @@
++"""Resume idle PR publishers after bounded-age, exact-head green CI observations.
++
++Admission is to finish the existing PR, never permission to merge. Repeated crash
++recovery remains subject to ordinary run/spend breakers; green CI is not review.
++"""
++from __future__ import annotations
++
++from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
++from hermes_cli import kanban_pr_idle_checks as checks
++
++
++def clear_cache() -> None:
++    checks.clear_cache()
++
++
++def _idle(conn, task_id: str) -> bool:
++    row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return bool(row and row[0] == "ready" and not conn.execute(
++        "SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL LIMIT 1", (task_id,),
++    ).fetchone() and not conn.execute(
++        "SELECT 1 FROM task_wake_checks WHERE task_id=?", (task_id,),
++    ).fetchone())
++
++
++def _identity(conn, task_id):
++    row = conn.execute("SELECT completion_contract, assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
++    comments = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (task_id,)).fetchone()[0]
++    run = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
++    return (*row, comments, run) if row else None
++
++
++def releases(conn, task_id: str, states: dict[str, str | None]) -> bool:
++    """Every unfinished provenance-filtered holding PR must have green exact-head CI."""
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    from hermes_cli.kanban_pr_acceptance import validate_contract
++
++    if not _idle(conn, task_id):
++        return False
++    before = _identity(conn, task_id)
++    if before is None:
++        return False
++    contract, assignee = before[:2]
++    try:
++        contract = validate_contract(contract)
++    except ValueError:
++        return False
++    unfinished = {url: state for url, state in states.items() if state not in prs.TERMINAL_STATES}
++    if not unfinished or any(state != "OPEN" for state in unfinished.values()):
++        return False
++    if contract.startswith("https://github.com/") and norm_pr(contract) not in {norm_pr(u) for u in states}:
++        return False
++    database = tuple(tuple(r) for r in conn.execute("PRAGMA database_list"))
++    results = []
++    for url in unfinished:
++        head = prs.pr_head(url)
++        if head is None:
++            return False
++        key = (database, task_id, before, url, head)
++        results.append(checks.green(key, url, assignee, head))
++    # A newly published PR/run cannot reuse a prior observation, even on another board.
++    return bool(all(results) and before == _identity(conn, task_id) and _idle(conn, task_id))
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_async.py b/tests/hermes_cli/test_kanban_active_pr_idle_async.py
+new file mode 100644
+index 0000000000..abbe1180bc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_async.py
+@@ -0,0 +1,120 @@
++"""Background collection cannot stall ready-lane evaluation or reuse stale publication."""
++from concurrent.futures import Future, ThreadPoolExecutor
++from threading import Event
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_pr_idle_checks as checks
++from hermes_cli import kanban_pr_acceptance as acceptance
++from tests.hermes_cli import test_kanban_active_pr_idle_green as helpers
++
++kanban_home = helpers.kanban_home
++green = helpers.green
++pytestmark = pytest.mark.usefixtures("kanban_home")
++
++
++def test_blocked_network_does_not_block_guard_and_next_tick_releases(green, monkeypatch):
++    entered, finish = Event(), Event()
++    def collect(*args, **kwargs):
++        entered.set()
++        assert finish.wait(5)
++        return green[0]
++    monkeypatch.setattr(acceptance, "collect_acceptance", collect)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        monkeypatch.setattr(checks, "_pool", pool)
++        with kbc.connect() as conn:
++            tid = helpers.published(conn)
++            try:
++                assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++                assert entered.wait(5)  # the guard returned while the network is still blocked
++                assert not finish.is_set()
++                future = next(iter(checks._pending.values()))[1]
++            finally:
++                finish.set()
++            assert future.result(timeout=5)
++            assert dispatch.check_respawn_guard(conn, tid) is None
++
++
++def test_only_two_jobs_and_no_queued_backlog(monkeypatch):
++    class HeldPool:
++        calls = []
++        def submit(self, *args):
++            future = Future()
++            self.calls.append(future)
++            return future
++    pool = HeldPool()
++    checks.clear_cache()
++    monkeypatch.setattr(checks, "_pool", pool)
++    try:
++        for i in range(40):
++            assert not checks.green((i,), helpers.URL, "a", helpers.SHA)
++        assert len(pool.calls) == len(checks._pending) == 2
++        pool.calls[0].set_result(True)
++        assert checks.green((0,), helpers.URL, "a", helpers.SHA)
++    finally:
++        checks.clear_cache()
++
++
++def test_late_observation_is_discarded(monkeypatch):
++    future = Future()
++    clock = [1000.0]
++    checks.clear_cache()
++    monkeypatch.setattr(checks.time, "monotonic", lambda: clock[0])
++    checks._pending[(1,)] = (clock[0], future)
++    clock[0] += 121
++    future.set_result(True)
++    try:
++        assert not checks.green((1,), helpers.URL, "a", helpers.SHA)
++    finally:
++        checks.clear_cache()
++
++
++def test_new_publication_during_collection_does_not_reuse_green(green, monkeypatch):
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        def collect(*args, **kwargs):
++            worker_comment(conn, tid, "a", f"Also opened {helpers.URL}0")
++            return green[0]
++        monkeypatch.setattr(acceptance, "collect_acceptance", collect)
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++
++
++def test_multiple_publications_all_need_green(green, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++    other = helpers.URL + "0"
++    failing = [other]
++    def collect(url, *args, **kwargs):
++        return {**green[0], "pr_url": url, "ok": url != failing[0]}
++    monkeypatch.setattr(acceptance, "collect_acceptance", collect)
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        conn.execute("UPDATE tasks SET completion_contract='local-only' WHERE id=?", (tid,))
++        conn.commit()
++        worker_comment(conn, tid, "a", f"Also opened {other}")
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        checks.clear_cache()
++        failing[0] = None
++        assert dispatch.check_respawn_guard(conn, tid) is None
++
++
++def test_failed_background_observation_stays_held(monkeypatch):
++    checks.clear_cache()
++    future = Future()
++    future.set_exception(ValueError("unreadable"))
++    checks._pending[(1,)] = (checks.time.monotonic(), future)
++    try:
++        assert not checks.green((1,), helpers.URL, "a", helpers.SHA)
++    finally:
++        checks.clear_cache()
++
++
++def test_cache_has_a_hard_size_bound(green, monkeypatch):
++    monkeypatch.setattr(checks, "MAX_ENTRIES", 3)
++    for i in range(8):
++        assert checks.green((i,), helpers.URL, "a", helpers.SHA)
++    assert len(checks._cache) <= 3
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_custody.py b/tests/hermes_cli/test_kanban_active_pr_idle_custody.py
+new file mode 100644
+index 0000000000..d879916246
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_custody.py
+@@ -0,0 +1,113 @@
++"""Bounded caching, custody races and actual ready-lane dispatch for idle-green PRs."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_pr_idle_green as idle
++from hermes_cli import kanban_pr_idle_checks as checks
++from hermes_cli import kanban_pr_acceptance as acceptance
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli import test_kanban_active_pr_idle_green as helpers
++
++kanban_home = helpers.kanban_home
++green = helpers.green
++pytestmark = pytest.mark.usefixtures("kanban_home")
++
++
++def test_green_owner_reaches_real_dispatch(green, all_assignees_spawnable):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *a, **kw: 987654)
++        assert any(row[0] == tid for row in result.spawned)
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_hold_cap_uses_existing_visible_supervisor_escalation(green, monkeypatch):
++    from hermes_cli import kanban_db_dispatch_guard_notice as notice
++    green[0]["ok"] = False
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        now = int(kb.time.time())
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
++        monkeypatch.setattr(kb.time, "time", lambda: now + 2099)
++        assert not dispatch._block_if_guard_hold_capped(conn, tid, "active_pr")
++        assert notice.guard_hold_started_at(conn, tid) == now
++        monkeypatch.setattr(kb.time, "time", lambda: now + 2100)
++        assert dispatch._block_if_guard_hold_capped(conn, tid, "active_pr")
++        assert kb.get_task(conn, tid).status == "triage"
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id=? "
++                             "AND kind='supervisor_escalated'", (tid,)).fetchone()
++        assert event and 'active_pr' in event[0]
++
++
++def test_pending_cache_refreshes_after_five_minutes(green, monkeypatch):
++    clock = [1000.0]
++    monkeypatch.setattr(checks.time, "monotonic", lambda: clock[0])
++    green[0]["ok"] = False
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        green[0]["ok"] = True
++        clock[0] += 299
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        assert len(green[1]) == 1
++        clock[0] += 1
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert len(green[1]) == 2
++
++
++@pytest.mark.parametrize("race", ["claim", "watch", "contract", "assignee", "head"])
++def test_ci_collection_revalidates_custody_and_head(green, monkeypatch, race):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        def collect(*args, **kwargs):
++            updates = {
++                "claim": ("UPDATE tasks SET status='running' WHERE id=?", (tid,)),
++                "contract": ("UPDATE tasks SET completion_contract='local-only' WHERE id=?", (tid,)),
++                "assignee": ("UPDATE tasks SET assignee='b' WHERE id=?", (tid,)),
++            }
++            with kb.write_txn(conn):
++                if race in updates:
++                    conn.execute(*updates[race])
++                elif race == "watch":
++                    from hermes_cli.kanban_wake_check import set_check
++                    set_check(conn, tid, "true", 120)
++                else:
++                    monkeypatch.setattr(prs, "pr_head", lambda *a, **kw: "b" * 40)
++            return green[0]
++        monkeypatch.setattr(acceptance, "collect_acceptance", collect)
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++
++
++@pytest.mark.parametrize("states", [{helpers.URL: None}, {helpers.URL: "OPEN", helpers.URL + "0": "OPEN"}])
++def test_unknown_or_additional_holding_pr_is_not_discharged(green, states):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        assert not idle.releases(conn, tid, states)
++        assert len(green[1]) == (0 if None in states.values() else 2)
++
++
++def test_missing_head_is_not_green(green, monkeypatch):
++    monkeypatch.setattr(prs, "pr_head", lambda *a, **kw: None)
++    with kbc.connect() as conn:
++        assert dispatch.check_respawn_guard(conn, helpers.published(conn)) == "active_pr"
++        assert green[1] == []
++
++
++@pytest.mark.parametrize("contract", ["malformed", helpers.URL + "0"])
++def test_invalid_or_uncovered_contract_stays_held(green, contract):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (contract, tid))
++        conn.commit()
++        assert not idle.releases(conn, tid, {helpers.URL: "OPEN"})
++        assert green[1] == []
++
++
++def test_disappearing_task_identity_is_not_admitted(green, monkeypatch):
++    with kbc.connect() as conn:
++        tid = helpers.published(conn)
++        monkeypatch.setattr(idle, "_identity", lambda *a: None)
++        assert not idle.releases(conn, tid, {helpers.URL: "OPEN"})
+diff --git a/tests/hermes_cli/test_kanban_active_pr_idle_green.py b/tests/hermes_cli/test_kanban_active_pr_idle_green.py
+new file mode 100644
+index 0000000000..6780e27e70
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_idle_green.py
+@@ -0,0 +1,107 @@
++"""Idle bound PRs resume after green CI without an operator handoff."""
++import time
++from concurrent.futures import Future
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_pr_acceptance as acceptance
++from hermes_cli import kanban_pr_idle_checks as checks
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
++from tests.hermes_cli.test_kanban_park_invariants import kanban_home
++
++__all__ = ["kanban_home"]
++pytestmark = pytest.mark.usefixtures("kanban_home")
++URL = "https://github.com/example/project/pull/19"
++SHA = "a" * 40
++
++
++@pytest.fixture
++def green(monkeypatch):
++    prs.clear_cache()
++    class ImmediatePool:
++        def submit(self, fn, *args):
++            future = Future()
++            future.set_result(fn(*args))
++            return future
++    monkeypatch.setattr(checks, "_pool", ImmediatePool())
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    monkeypatch.setattr(prs, "pr_head", lambda url, **kw: SHA)
++    receipt = {"ok": True, "pr_state": "OPEN", "head_sha": SHA,
++               "pr_url": URL, "checks": [{"name": "required", "conclusion": "success"}]}
++    calls = []
++    def collect(*args, **kwargs):
++        calls.append((args, kwargs))
++        return dict(receipt)
++    monkeypatch.setattr(acceptance, "collect_acceptance", collect)
++    yield receipt, calls
++    prs.clear_cache()
++
++
++def published(conn):
++    tid = kb.create_task(conn, title="finish published work", assignee="a", completion_contract=URL)
++    kb.claim_task(conn, tid)
++    worker_comment(conn, tid, "a", f"Opened {URL}")
++    # A lost publisher, not an orderly park/handoff: ordinary active_pr reproducer.
++    conn.execute("UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=? WHERE task_id=?",
++                 (int(time.time()), tid))
++    conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
++                 "claim_expires=NULL, worker_pid=NULL WHERE id=?", (tid,))
++    conn.commit()
++    return tid
++
++
++def test_idle_bound_green_released_on_next_guard_tick(green):
++    with kbc.connect() as conn:
++        tid = published(conn)
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert len(green[1]) == 1
++
++
++@pytest.mark.parametrize("change", [
++    {"ok": False, "classification": "failing"},
++    {"ok": False, "classification": "pending"},
++    {"ok": False, "classification": "infra"},
++    {"head_sha": "b" * 40}, {"pr_url": URL + "0"}, {"checks": []}, {"pr_state": "CLOSED"},
++])
++def test_missing_or_non_green_exact_head_stays_held(green, change):
++    green[0].update(change)
++    with kbc.connect() as conn:
++        assert dispatch.check_respawn_guard(conn, published(conn)) == "active_pr"
++
++
++def test_active_run_stays_held_without_ci_lookup(green):
++    with kbc.connect() as conn:
++        tid = published(conn)
++        conn.execute("UPDATE task_runs SET status='running', outcome=NULL, ended_at=NULL WHERE task_id=?", (tid,))
++        conn.commit()
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        assert green[1] == []
++
++
++def test_live_wake_watch_stays_held_without_ci_lookup(green):
++    from hermes_cli import kanban_wake_check as wake
++    with kbc.connect() as conn:
++        tid = published(conn)
++        with kb.write_txn(conn):
++            wake.set_check(conn, tid, "true", 120)
++        assert dispatch.check_respawn_guard(conn, tid) == "active_pr"
++        assert green[1] == []
++
++
++def test_local_only_publication_resumes_existing_pr_after_green(green):
++    with kbc.connect() as conn:
++        tid = published(conn)
++        conn.execute("UPDATE tasks SET completion_contract='local-only' WHERE id=?", (tid,))
++        conn.commit()
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert len(green[1]) == 1
++
++
++def test_active_pr_cap_is_at_most_thirty_five_minutes(monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", "21600")
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "7200")
++    assert dispatch.guard_hold_cap_seconds("active_pr") == 2100
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index ef1573d646..b5938840be 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1624,6 +1624,20 @@ hermes kanban create "nightly backup audit" \
+ 
+ ### Respawn guard
+ 
++An idle ready publisher can resume to finish its existing PRs when every holding
++PR's required exact-head checks are green (or all reported checks when none are
++required). This reuses completion acceptance; missing evidence is not green.
++A live run or registered wake probe keeps the publication hold. CI observations
++are cached for at most five minutes, so release follows on the next eligible tick
++after refresh. Observations taking over two minutes are discarded: with an
++available collection slot, the refresh grace is at most seven minutes plus a
++dispatch tick. This is not merge approval and does not bypass review or landing.
++This includes local-only cards with multiple provenance-filtered publications; no
++new PR associations are inferred. Collection runs in the background with at most
++two jobs and no backlog, never blocking the dispatch tick. Any remaining
++`active_pr` hold gets the existing 30-minute notice and reaches visible,
++home-owned supervisor triage at 35 minutes rather than silently waiting six hours.
++
+ The dispatcher refuses to re-spawn a ready task when it hit an auth error (401, invalid API key, unauthorized, billing) on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). Two cooldowns hold a card without ever counting against it: `rate_limit_cooldown` after a quota-wall requeue and `infrastructure_cooldown` after the host refused to place the worker (no restart-safe systemd scope — see [Workers and systemd cgroups](#workers-and-systemd-cgroups)); both share the `HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS` window (default 300 s). Quota / rate-limit / 429 text in `last_failure_error` always takes the `rate_limit_cooldown` path, even when a later non-failure run superseded the `rate_limited` one; once the cooldown elapses the stamp is cleared and the card retries. A quota wall is never `blocker_auth` and never escalates to a human block kind, and a legacy guard-hold block on a quota error is released automatically once another card completes after it. This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+ 
+ ## Project lanes
+-- 
+2.43.0
+

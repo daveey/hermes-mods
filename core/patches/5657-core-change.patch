@@ -1,0 +1,192 @@
+From e16f3820490db96322ca088f628068b57b4d62f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:07:55 +0000
+Subject: [PATCH] [daveey] retain refusal stops when decision notice
+ publication fails
+
+Use the existing safe publisher inside reclaim so a notification outage cannot roll back the durable stop or other dead-worker progress. Resolve uid-less restricted episodes by their existing id fallback; reuse the prior supervisor route, never issue another execution allowance.
+
+Proof: actual child interpreter -> writer -> detect_crashed_workers regressions RED 3/3 before, GREEN after; 12 focused control files pass with retries disabled. Seven independent provenance/release/notice mutants killed. No provider call or original incident mutation. Addresses review6009581388 on PR3996.
+---
+ hermes_cli/kanban_refusal_receipt.py          |  2 +-
+ hermes_cli/kanban_spend_decision.py           |  3 +-
+ .../test_kanban_refusal_provenance.py         | 60 +++++++++++++++
+ .../test_kanban_refusal_recovery.py           | 74 +++++++++++++++++++
+ 4 files changed, 137 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_refusal_provenance.py
+ create mode 100644 tests/hermes_cli/test_kanban_refusal_recovery.py
+
+diff --git a/hermes_cli/kanban_refusal_receipt.py b/hermes_cli/kanban_refusal_receipt.py
+index 00e386c269..e31d226ab8 100644
+--- a/hermes_cli/kanban_refusal_receipt.py
++++ b/hermes_cli/kanban_refusal_receipt.py
+@@ -89,5 +89,5 @@ def stop_failed_refusal(conn, row, proof) -> bool:
+     else:
+         kb._append_event(conn, task, decision.EVENT, payload, run_id=run)
+     kb._append_event(conn, task, 'safety_refused', payload, run_id=run)
+-    decision.ensure_producer(conn, task)
++    decision.safe_ensure_producer(conn, task)
+     return True
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 1bed0d303b..c9fc0e2eac 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -55,7 +55,8 @@ def pending_episode(conn, task_id: str):
+             continue
+         if (isinstance(payload, dict) and payload.get('cause') == 'safety_refusal'
+                 and event['kind'] in (EVENT, 'decision_hold_restricted')):
+-            return next((e for e in events if e['kind'] == EVENT and e.get('uid') == payload.get('episode')),
++            return next((e for e in events if e['kind'] == EVENT
++                         and (e.get('uid') or str(e['id'])) == payload.get('episode')),
+                         event) if event['kind'] != EVENT else event
+     ordinary = [e for e in events if e['kind'] != 'decision_hold_restricted']
+     return ordinary[0] if ordinary and ordinary[0]['kind'] == EVENT else None
+diff --git a/tests/hermes_cli/test_kanban_refusal_provenance.py b/tests/hermes_cli/test_kanban_refusal_provenance.py
+new file mode 100644
+index 0000000000..2c5fa9ccea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_provenance.py
+@@ -0,0 +1,60 @@
++"""Independent refusal evidence fences; ordinary death proof alone is insufficient."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_refusal_proof as refusal
++from tests.hermes_cli import test_kanban_refusal_stop as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize('corruption', ['retryable', 'claim', 'legacy_order', 'modern_identity'])
++def test_select_refusal_rejects_individually_wrong_provenance(board, monkeypatch, corruption):
++    from hermes_cli.kanban_failed_result import failed_result_proof
++    conn, context = board
++    result = fixtures.refused_child(conn, context, monkeypatch)
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (context['task_id'],)).fetchone()
++    proof = failed_result_proof(conn, row['id'], row['current_run_id'], row['claim_lock'])
++    assert proof is not None
++    assert refusal.select_refusal(conn, row, proof) is not None
++    payload = json.loads(result['payload'])
++    if corruption == 'retryable':
++        payload['failure_retryable'] = True
++    elif corruption == 'claim':
++        payload['claim_lock'] = 'foreign:claim'
++    elif corruption == 'modern_identity':
++        payload['bound_event_identity'] = 'foreign:event'
++    else:
++        payload.pop('death_proof_version', None)
++        payload.pop('bound_event_identity', None)
++    with kb.write_txn(conn):
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), result['id']))
++        if corruption == 'legacy_order':
++            bound = conn.execute("SELECT * FROM task_events WHERE run_id=? AND kind='worker_bound'",
++                                 (context['run_id'],)).fetchone()
++            assert bound is not None
++            conn.execute('DELETE FROM task_events WHERE id=?', (bound['id'],))
++            kb._append_event(conn, row['id'], 'worker_bound', json.loads(bound['payload']),
++                             run_id=context['run_id'])
++    assert refusal.select_refusal(conn, row, proof) is None
++
++
++def test_release_surfaces_identify_safety_not_budget_recovery(board, monkeypatch):
++    from hermes_cli import kanban_spend_promote as promote
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_spend_decision as decision
++    conn, context = board
++    fixtures.refused_child(conn, context, monkeypatch)
++    dispatch.detect_crashed_workers(conn)
++    stop = decision.pending_episode(conn, context['task_id'])
++    assert stop is not None
++    reason = promote.scope_refusal(conn, context['task_id'], 'fixture-supervisor',
++                                   stop.get('uid') or str(stop['id']), 1)
++    assert reason and 'safety restriction' in reason and 'not clearance' in reason
++    reason = decision.unblock_refusal(conn, context['task_id'])
++    assert reason and 'safety restriction' in reason and 'no supported execution release' in reason
++    assert 'manually promote' not in reason
+diff --git a/tests/hermes_cli/test_kanban_refusal_recovery.py b/tests/hermes_cli/test_kanban_refusal_recovery.py
+new file mode 100644
+index 0000000000..1ab8c6df1d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_recovery.py
+@@ -0,0 +1,74 @@
++"""Refusal custody survives notification failure and uid-less episode upgrades."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_refusal_stop as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize('observer', [False, True])
++def test_failed_notice_keeps_stop_and_other_worker_progress(board, monkeypatch, observer):
++    conn, context = board
++    other = kb.create_task(conn, title='ordinary failed interpreter', assignee='default')
++    ordinary = kb.claim_task(conn, other, claimer=kb._claimer_id())
++    assert ordinary is not None
++    fixtures.fixtures._failed_child(conn, {'db': context['db'], 'task_id': other,
++                                         'run_id': ordinary.current_run_id, 'claim_lock': ordinary.claim_lock})
++    fixtures.refused_child(conn, context, monkeypatch)
++    real_producer = decision.producer
++
++    def broken(*args):
++        raise RuntimeError('fixture publication failed')
++
++    monkeypatch.setattr(decision, 'producer', broken)
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    stopped = kb.get_task(conn, context['task_id'])
++    assert stopped is not None
++    assert stopped.status == 'triage' and stopped.current_run_id is None and stopped.claim_lock is None
++    run = conn.execute('SELECT * FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    assert run['outcome'] == 'safety_refused' and run['ended_at'] is not None
++    assert decision.pending(conn, stopped.id)
++    assert kb.get_task(conn, other).status == 'ready'
++    assert kb.get_task(conn, other).consecutive_failures == 1
++    assert not conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=?',
++                            (stopped.id, decision.NOTICE)).fetchall()
++    monkeypatch.setattr(decision, 'producer', real_producer)
++    decision.ensure_producer(conn, stopped.id)
++    decision.ensure_producer(conn, stopped.id)
++    notices = conn.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?',
++                           (stopped.id, decision.NOTICE)).fetchall()
++    assert len(notices) == 1 and json.loads(notices[0][0])['cause'] == 'safety_refusal'
++    assert decision.pending(conn, stopped.id)
++
++
++def test_uidless_upgrade_reuses_original_episode_and_notice_route(board, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, decision.EVENT, {'reason': 'budget fixture'})
++    decision.ensure_producer(conn, tid)
++    stop = decision.pending_episode(conn, tid)
++    assert not stop.get('uid')
++    before = conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    prior = json.loads(conn.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?',
++                                   (tid, decision.NOTICE)).fetchone()[0])
++    fixtures.refused_child(conn, context, monkeypatch)
++    dispatch.detect_crashed_workers(conn)
++    assert decision.pending_episode(conn, tid)['id'] == stop['id']
++    notices = [json.loads(r[0]) for r in conn.execute(
++        'SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id', (tid, decision.NOTICE))]
++    assert len(notices) == 2
++    assert notices[-1]['episode'] == str(stop['id'])
++    assert notices[-1]['producer'] == prior['producer']
++    assert notices[-1]['cause'] == 'safety_refusal'
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
++    decision.ensure_producer(conn, tid)
++    assert conn.execute('SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?',
++                        (tid, decision.NOTICE)).fetchone()[0] == 2
+-- 
+2.43.0
+

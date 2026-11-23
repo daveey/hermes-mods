@@ -1,0 +1,225 @@
+From 6b17317e98e940b57b5105f5d716f9dfadc16bed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:32:05 +0000
+Subject: [PATCH] [daveey] Isolate scratch cleanup test process censuses from
+ host bystanders
+
+Cleanup fixtures previously enumerated every host process. psutil normalizes a deleted cwd by stat-ing it, triggering the real-home tripwire on unrelated pytest garbage directories. Direct GC fails; completion/prune retain workspaces after the scan error. File/home isolation never isolated process inputs, and clean CI did not carry those foreign children.
+
+Scope only the two default cleanup censuses to real pytest descendants and sandbox cwd holders, before fetching requested attributes. Preserve explicit synthetic inventories and unrelated integration discovery. Existing cleanup assertions and production code are unchanged.
+
+Proof: canonical regression RED on da012d940b: two expected failures, three controls passed. Focused six-file GREEN and scripts/check --base origin/main exit 0; new controls cover real cwd holders without ancestry, deleted suffix and sibling boundaries, and foreign attribute exclusion. Frozen 1818-file 16-worker no-retry gate and independent exact-head review required before landing.
+---
+ tests/_fixtures/process_census.py       |  62 +++++++++++++
+ tests/conftest.py                       |   1 +
+ tests/test_cleanup_process_isolation.py | 117 ++++++++++++++++++++++++
+ 3 files changed, 180 insertions(+)
+ create mode 100644 tests/_fixtures/process_census.py
+ create mode 100644 tests/test_cleanup_process_isolation.py
+
+diff --git a/tests/_fixtures/process_census.py b/tests/_fixtures/process_census.py
+new file mode 100644
+index 0000000000..f7020a6ba5
+--- /dev/null
++++ b/tests/_fixtures/process_census.py
+@@ -0,0 +1,62 @@
++"""A pytest process census must not inspect other sessions on its host."""
++from __future__ import annotations
++
++import os
++import sys
++
++import psutil
++import pytest
++
++_PROCESS = psutil.Process
++_PROCESS_ITER = psutil.process_iter
++
++
++def session_process_iter(roots, attrs=None, ad_value=None):
++    """Keep real current-session children, before reading any requested attributes.
++
++    Real host enumeration matters for integration tests, but another pytest's
++    deleted cwd or thousands of unrelated jobs are not inputs to this session.
++    Tests installing a synthetic process_iter still replace this default normally.
++    """
++    root = _PROCESS(os.getpid())
++    owned = {root.pid, *(child.pid for child in root.children(recursive=True))}
++    # Do not ask the host iterator for attrs: cwd() may stat a foreign deleted
++    # path, and environ/cmdline can inspect unrelated real Hermes processes.
++    for proc in _PROCESS_ITER():
++        if proc.pid not in owned and not _rooted_in_session(proc, roots):
++            continue
++        if attrs is not None:
++            try:
++                proc.info = proc.as_dict(attrs=attrs, ad_value=ad_value)
++            except psutil.NoSuchProcess:
++                continue
++        yield proc
++
++
++def _rooted_in_session(proc, roots):
++    """Also retain reparented fixture daemons, without stat'ing a foreign cwd."""
++    try:
++        # psutil's Linux cwd() stats a path ending in ' (deleted)' to distinguish
++        # a deleted inode from a literal suffix. Read only the procfs link here.
++        cwd = os.readlink(f"/proc/{proc.pid}/cwd") if os.path.isdir("/proc/self") else proc.cwd()
++        cwd = cwd.removesuffix(" (deleted)")
++        return any(cwd == root or cwd.startswith(root + os.sep) for root in roots)
++    except (psutil.Error, OSError):
++        return False
++
++
++@pytest.fixture(autouse=True)
++def isolate_process_census(monkeypatch, tmp_path_factory):
++    roots = (str(tmp_path_factory.getbasetemp()), os.environ.get("HERMES_TEST_SANDBOX_HOME", ""))
++    roots = tuple(os.path.realpath(root) for root in roots if root)
++    def process_iter(attrs=None, ad_value=None):
++        # Only cleanup's census is isolated. Other integration tests discover
++        # abandoned gateway/desktop descendants by environment, not cwd, and
++        # must retain their normal psutil census. No caller gets fake processes.
++        caller = sys._getframe(1).f_globals.get("__name__")
++        if caller in {"hermes_constants_scratch", "hermes_cli.kanban_workspace_jobs"}:
++            return session_process_iter(roots, attrs, ad_value)
++        return _PROCESS_ITER(attrs=attrs, ad_value=ad_value)
++
++    process_iter.cache_clear = _PROCESS_ITER.cache_clear
++    monkeypatch.setattr(psutil, "process_iter", process_iter)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 6ebd5e116e..ee5a515f09 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -285,6 +285,7 @@ from tests._fixtures.live_system_guard import (
+     _live_system_guard,
+ )
+ from tests._fixtures.authority_cwd import authority_cwd_in_tmp  # opt-in cwd for symbolic profile ids
++from tests._fixtures.process_census import isolate_process_census  # real fixture processes, not host bystanders
+ from tests._fixtures.fake_dns import public_dns  # opt-in offline resolver for SSRF-guard tests
+ from tests._fixtures.model_peer import model_peer  # fixture registers here
+ from tests._fixtures.card_trees import _card_trees_off_the_real_home  # autouse: no real ~/code/_wt
+diff --git a/tests/test_cleanup_process_isolation.py b/tests/test_cleanup_process_isolation.py
+new file mode 100644
+index 0000000000..91d2614d76
+--- /dev/null
++++ b/tests/test_cleanup_process_isolation.py
+@@ -0,0 +1,117 @@
++"""Host bystanders must not affect scratch cleanup in another pytest session."""
++from __future__ import annotations
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import psutil
++import pytest
++
++from tests import conftest as suite_conftest
++from tests._fixtures.process_census import session_process_iter
++
++
++@pytest.fixture
++def foreign_deleted_cwd(tmp_path_factory, monkeypatch):
++    """Replay psutil's real deleted-cwd stat against a guarded foreign home.
++
++    Only the kernel readlink result is injected: the process exists (pytest's
++    parent), and psutil's cwd/readlink/path_exists_strict and the I/O guard run
++    unchanged. Never modify or signal the actual bystander.
++    """
++    foreign = tmp_path_factory.getbasetemp().with_name("foreign-home")
++    poison = str(foreign / "pytest-of-user" / "garbage-dead" / "test-child") + " (deleted)"
++    monkeypatch.setattr(suite_conftest, "_REAL_HERMES_ROOT_CANDIDATES",
++                        [*suite_conftest._REAL_HERMES_ROOT_CANDIDATES, foreign])
++    real_readlink = os.readlink
++    bystander = os.getppid()
++
++    def readlink(path, *args, **kwargs):
++        if os.fspath(path) == f"/proc/{bystander}/cwd":
++            return poison
++        return real_readlink(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "readlink", readlink)
++    return bystander
++
++
++def test_owned_job_scan_ignores_foreign_deleted_cwd(tmp_path, foreign_deleted_cwd):
++    from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
++
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++    assert not defer_owned_job_cleanup("t_0123456789abcdef", workspace)
++
++
++def test_scratch_prune_ignores_foreign_deleted_cwd(tmp_path, foreign_deleted_cwd):
++    from hermes_constants_scratch import prune_idle_entries
++
++    root = tmp_path / "scratch"
++    idle = root / "probe"
++    idle.mkdir(parents=True)
++    assert prune_idle_entries(root, 0, frozenset()) == 1
++    assert not idle.exists()
++
++
++def test_process_census_keeps_current_test_process():
++    assert os.getpid() in {proc.pid for proc in psutil.process_iter()}
++
++
++def test_process_census_keeps_real_child_with_requested_attributes(tmp_path):
++    with subprocess.Popen([sys.executable, "-c", "input()"], cwd=tmp_path,
++                          stdin=subprocess.PIPE, text=True) as child:
++        try:
++            found = {proc.pid: proc.info for proc in session_process_iter(
++                (str(tmp_path),), ["pid", "cwd"])}
++            assert child.pid in found
++            assert found[child.pid]["cwd"] == str(tmp_path)
++            assert os.getppid() not in found
++        finally:
++            child.communicate("done\n", timeout=10)
++
++
++def test_census_keeps_real_cwd_holder_without_ancestry(tmp_path, monkeypatch):
++    from tests._fixtures import process_census as census
++
++    # Model a lost/reparented ancestry snapshot, retaining real process/cwd I/O.
++    monkeypatch.setattr(census, "_PROCESS", lambda pid: SimpleNamespace(
++        pid=pid, children=lambda recursive: []))
++    with subprocess.Popen([sys.executable, "-c", "input()"], cwd=tmp_path,
++                          stdin=subprocess.PIPE, text=True) as child:
++        try:
++            assert child.pid in {proc.pid for proc in session_process_iter((str(tmp_path),))}
++        finally:
++            child.communicate("done\n", timeout=10)
++
++
++@pytest.mark.parametrize("suffix,expected", [("", True), (" (deleted)", True), ("-sibling", False)])
++def test_root_filter_deleted_cwd_and_path_boundary(tmp_path, monkeypatch, suffix, expected):
++    from tests._fixtures import process_census as census
++
++    cwd = str(tmp_path) + suffix
++    # Exercise both procfs and portable fallback without touching any real pid.
++    real_isdir, real_readlink = census.os.path.isdir, census.os.readlink
++    monkeypatch.setattr(census.os.path, "isdir", lambda path: True if path == "/proc/self" else real_isdir(path))
++    monkeypatch.setattr(census.os, "readlink", lambda path, *a, **kw:
++                        cwd if path == "/proc/12345/cwd" else real_readlink(path, *a, **kw))
++    assert census._rooted_in_session(SimpleNamespace(pid=12345), (str(tmp_path),)) is expected
++
++
++def test_foreign_attributes_are_not_requested(monkeypatch, tmp_path):
++    from tests._fixtures import process_census as census
++
++    touched = []
++    foreign = SimpleNamespace(pid=os.getppid(), as_dict=lambda **kw: touched.append(kw))
++    monkeypatch.setattr(census, "_PROCESS_ITER", lambda: iter([foreign]))
++    monkeypatch.setattr(census, "_rooted_in_session", lambda proc, roots: False)
++    assert list(session_process_iter((str(tmp_path),), ["cwd", "environ"])) == []
++    assert touched == []
++
++
++def test_synthetic_process_census_override_still_wins(monkeypatch):
++    sentinel = object()
++    monkeypatch.setattr(psutil, "process_iter", lambda *args, **kwargs: iter([sentinel]))
++    assert list(psutil.process_iter()) == [sentinel]
+-- 
+2.43.0
+
