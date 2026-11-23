@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v21-local-clock'
+const VERSION = 'session-panel-v22-receipt-presentation'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -97,7 +97,7 @@ export function feedVouches(route, nowMs = Date.now()) {
   return feedIsLive(route, nowMs) && !!st?.fresh?.includes(route.session)
 }
 const modelVersions = new Map()
-export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear(); modelVersions.clear(); decisionTimings.clear() }
+export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear(); modelVersions.clear(); decisionTimings.clear(); provisionalDecisions.clear() }
 
 /** Cache only the model. Missing/unsupported models invalidate this exact scope; raw cards are never a fallback. */
 export function ingestBundle(connectionId, profile, b, version = null) {
@@ -549,6 +549,26 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
 
 const MODEL_INTENT_PREFIX = 'hermes.sessionPanel.decision.v1:'
 const modelDecisions = new Map()
+// Presentation-only receipt overlay. Never mutate the canonical cached model or
+// infer executor state from a recorded choice. Exact source/owner/revision fences
+// keep an unrelated ask (including another gateway's identical id) untouched.
+const provisionalDecisions = new Map()
+export function decisionPresentation(model, route) {
+  if (!model) return model
+  const moving = model.sections.needs_you.filter(row => [...provisionalDecisions.values()].some(p =>
+    routeKey(p.sourceRoute) === routeKey(route) && p.key === modelDecisionKey(row)))
+  if (!moving.length) return model
+  const sections = { ...model.sections,
+    needs_you: model.sections.needs_you.filter(row => !moving.includes(row)),
+    waiting: [...model.sections.waiting, ...moving.map(row => ({ ...row, detail: '', options: [],
+      actions: row.actions.filter(a => a.kind !== 'decide'),
+      decision: { request_id: row.request_id, text: modelDecisionStatus(row)?.text || 'Decision recorded; updating status…' } }))] }
+  const counts = { ...model.header.counts, needs_you: model.header.counts.needs_you - moving.length,
+    waiting: model.header.counts.waiting + moving.length }
+  const pips = MODEL_SECTIONS.filter(([s]) => counts[s] > 0).map(([section, label]) => ({ section, label, count: counts[section] }))
+  return { ...model, sections, header: { ...model.header, counts, pips,
+    ...(counts.needs_you === 0 ? { label: 'Decision recorded' } : {}) } }
+}
 const modelDecisionKey = row => JSON.stringify([row.actions.find(a => a.kind === 'decide')?.owner, row.request_id, row.request_revision])
 export function modelDecisionStatus(row) {
   const key = modelDecisionKey(row)
@@ -615,13 +635,26 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     const intent = { route, sourceRoute, owner: action.owner, requestId: action.request_id, decision }
     // Modern owners return the durable canonical operation. Do not throw that
     // receipt away and wait on three redundant GETs before repainting.
-    if (applyDecisionReceipt(row, intent, data)) await refreshDecisionPanel(intent, call, { clicked, posted, responded, operationId: data?.operation?.operationId || data?.operation?.id })
+    if (applyDecisionReceipt(row, intent, data)) {
+      const operationId = data.operation.operationId || data.operation.id
+      if (decisionTimings.size >= 100) decisionTimings.delete(decisionTimings.keys().next().value)
+      decisionTimings.set(operationId, { clicked, posted, responded, operationId, ...intent, call })
+      const state = data.operation.dispatchState || data.operation.state
+      if (Number.isSafeInteger(data.request.revision) && data.request.revision >= decision.expectedRevision &&
+          data.operation.idempotencyKey === decision.idempotencyKey &&
+          ['recorded', 'pending', 'queued', 'dispatching', 'delivering', 'delivered'].includes(state)) {
+        provisionalDecisions.set(operationId, { ...intent, key, operationId })
+        modelChanged()
+      }
+      void refreshDecisionPanel(intent, call, { operationId })
+    }
     else await checkModelDecision(row, { call }) // mixed-version owner
   } catch (e) {
     decisionFailed(key, e, true)
   }
 }
 function decisionFailed(key, e, admission = false) {
+  for (const [id, p] of provisionalDecisions) if (p.key === key) provisionalDecisions.delete(id)
   const retained = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
   const message = String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, '').replace(/^Error:\s*/, '')
   // This exact server refusal occurs BEFORE the work is admitted. Generic 503,
@@ -637,6 +670,9 @@ function applyDecisionReceipt(row, intent, data) {
     (op.requestId && op.requestId !== intent.requestId) || (op.owner && !sameModelOwner(op.owner, intent.owner)) ||
     (op.idempotencyKey && op.idempotencyKey !== intent.decision.idempotencyKey) || r.resolution?.operationId !== id) return false
   const state = op.dispatchState || op.state
+  if (['failed', 'reverted', 'cancelled', 'rejected'].includes(state)) {
+    for (const [opId, p] of provisionalDecisions) if (p.key === modelDecisionKey(row)) provisionalDecisions.delete(opId)
+  }
   modelDecisions.set(modelDecisionKey(row), { locked: true, text: state === 'delivered' ? 'Decision delivered.' : `Decision recorded; delivery ${state || 'unconfirmed'}. Check status.` })
   modelChanged()
   return true
@@ -651,7 +687,8 @@ export function reportDecisionTiming(call, route, t) {
     const r = n => Math.round(n * 10) / 10
     const body = { session: route.session, operation: String(t.operationId),
       posted_ms: r(t.posted - t.clicked), responded_ms: r(t.responded - t.clicked),
-      refreshed_ms: r(t.refreshed - t.clicked), painted_ms: r(t.painted - t.clicked) }
+      refreshed_ms: r(t.refreshed - t.clicked), painted_ms: r(t.painted - t.clicked),
+      ...(t.visible != null ? { visible_ms: r(t.visible - t.clicked) } : {}) }
     Promise.resolve(call('/api/plugins/user-steps/client-timing', { ...route, method: 'POST', body })).catch(() => {})
   } catch {}
 }
@@ -668,31 +705,40 @@ function observeDecisionRender(route, model) {
     if (!Array.isArray(model.diagnostics) || model.diagnostics.includes('user-steps requests unavailable')) continue
     if (model.sections.needs_you.some(row => row.request_id === t.requestId &&
         row.actions.some(a => a.kind === 'decide' && sameModelOwner(a.owner, t.owner)))) continue
-    decisionTimings.delete(id) // consume before calling arbitrary transport code
-    reportDecisionTiming(t.call, t.route, { ...t, painted: now })
+    if (t.painted == null) {
+      t.painted = now
+      if (provisionalDecisions.has(id)) t.visible = now
+    }
+    finishDecisionTiming(id, t)
   }
+}
+function finishDecisionTiming(id, t) {
+  if (t?.painted == null || t.refreshed == null) return
+  decisionTimings.delete(id)
+  reportDecisionTiming(t.call, t.route, t)
 }
 async function refreshDecisionPanel(intent, call, timing = null) {
   const route = intent.sourceRoute || intent.route
   const started = performance.now()
   try {
     const data = await call('/api/plugins/session-panel/decision-refresh', { ...route, method: 'POST', body: { session: route.session } })
-    const refreshed = performance.now()
     if (data?.bundle?.session !== route.session || !validModel(data.bundle.model) || typeof data.epoch !== 'string' || !Number.isSafeInteger(data.rev)) throw Error('Panel refresh unavailable')
+    if (data.bundle.model.diagnostics?.includes('user-steps requests unavailable')) throw Error('Canonical decision status unavailable')
     const cur = feeds.get(connKey(route.connectionId, route.profile))
-    if (cur && (cur.feed !== data.feed || cur.epoch !== data.epoch)) return
+    if (cur && (cur.feed !== data.feed || cur.epoch !== data.epoch)) throw Error('Panel feed changed; check status')
     // An unrelated chat may have advanced the connection cursor. The per-scope
     // version fence below, not that global cursor, owns this model's freshness.
-    // Only backend-authored classification/counts; never move a row locally on
-    // the assumption that recording a choice means a worker is running.
-    if (timing?.operationId) {
-      if (decisionTimings.size >= 100) decisionTimings.delete(decisionTimings.keys().next().value)
-      decisionTimings.set(timing.operationId, { ...timing, ...intent, sourceRoute: route, call, refreshed })
-    }
+    // Replace the temporary receipt presentation with canonical classification.
+    for (const [id, p] of provisionalDecisions) if (routeKey(p.sourceRoute) === routeKey(route) && p.requestId === intent.requestId) provisionalDecisions.delete(id)
     ingestBundle(route.connectionId, route.profile, data.bundle, data)
+    modelChanged()
     feedLog(`decision model-applied refresh_ms=${(performance.now()-started).toFixed(1)} rev=${data.rev}`)
   } catch (e) {
     log('decision recorded; panel refresh deferred', e?.message || e)
+    for (const [id, p] of provisionalDecisions) if (routeKey(p.sourceRoute) === routeKey(route) && p.requestId === intent.requestId) decisionFailed(p.key, e)
+  } finally {
+    const t = decisionTimings.get(timing?.operationId)
+    if (t) { t.refreshed = performance.now(); finishDecisionTiming(timing.operationId, t) }
   }
 }
 export async function checkModelDecision(row, { call = modelApi } = {}) {
@@ -741,7 +787,7 @@ export async function openUrl(url) {
 /** True while the focused chat's cached hub model carries the one status line for this answered request, so the
  *  decision queue (user-steps) stays silent about it. */
 export function showsDecision(requestId, route = panelRoute()) {
-  const model = cachedModel(route)
+  const model = decisionPresentation(cachedModel(route), route)
   return !!requestId && !!model && MODEL_SECTIONS.some(([section]) => model.sections?.[section]?.some(row => row?.decision?.request_id === requestId))
 }
 export function PendingModel({ waiting, onRetry }) {
@@ -774,7 +820,7 @@ export function Panel() {
     })
     return () => { active = false }
   }, [scope, retry])
-  const model = cachedModel(route)
+  const model = decisionPresentation(cachedModel(route), route)
   useEffect(() => { observeDecisionRender(route, model) })
   if (!route.session) return null
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })

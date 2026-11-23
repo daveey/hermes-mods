@@ -109,10 +109,14 @@ class ClientTimingBody(BaseModel):
     responded_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
     refreshed_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
     painted_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
+    visible_ms: float | None = Field(default=None, strict=True, ge=0, le=600_000, allow_inf_nan=False)
 
     @model_validator(mode='after')
     def monotonic(self):
-        if not self.posted_ms <= self.responded_ms <= self.refreshed_ms <= self.painted_ms:
+        if not (self.posted_ms <= self.responded_ms <= self.refreshed_ms and
+                self.responded_ms <= self.painted_ms and
+                (self.visible_ms is not None and self.visible_ms == self.painted_ms or
+                 self.visible_ms is None and self.refreshed_ms <= self.painted_ms)):
             raise ValueError('Timing offsets must be monotonic')
         return self
 
@@ -499,9 +503,10 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             # Telemetry is read-only and can name only an operation of this owner.
             store().operation(owner(body.session), body.operation)
             logging.getLogger('user-steps').info(
-                'Decision client timing operation=%s owner_ms=%.1f post_ms=%.1f refresh_ms=%.1f paint_ms=%.1f total_ms=%.1f',
+                'Decision client timing operation=%s owner_ms=%.1f post_ms=%.1f refresh_ms=%.1f paint_ms=%.1f total_ms=%.1f%s',
                 body.operation, body.posted_ms, body.responded_ms-body.posted_ms,
-                body.refreshed_ms-body.responded_ms, body.painted_ms-body.refreshed_ms, body.painted_ms)
+                body.refreshed_ms-body.responded_ms, max(0, body.painted_ms-body.refreshed_ms), body.painted_ms,
+                '' if body.visible_ms is None else f' visible_ms={body.visible_ms:.1f}')
             return {'ok': True}
         return run(action)
 

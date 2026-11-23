@@ -390,6 +390,9 @@ test('2xx receipt repaints authoritative panel within 1s without polling', async
    if (path.includes('/operations')) throw Error('Receipt GET deliberately blocked')
    return { request }
  } })
+ // The decision handler no longer awaits canonical refresh. This case checks
+ // its eventual per-scope revision fence; the slow-refresh case checks immediacy.
+ await new Promise(resolve => setTimeout(resolve, 0))
  await paint(m.renderModel(m.cachedModel(route)))
  assert.ok(performance.now() - started < 1000)
  assert.equal(m.modelDecisionStatus(q).text, 'Decision delivered.')
@@ -456,6 +459,107 @@ test('a real decision click emits exactly one monotonic client timing record; a 
   await paint(null)
   delete window.hermesDesktop
  }
+ m.resetFeedForTests()
+})
+test('recorded receipt leaves NEEDS YOU before a two-second refresh, then records visible timing', async () => {
+ m.resetFeedForTests()
+ const before = structuredClone(publicCases.own_letters.model)
+ const q = before.sections.needs_you[0]; q.request_revision += 301
+ const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+ const route = { connectionId: 'provisional', profile: 'default', session: 'provisional-chat' }
+ const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+   scope: { complete: true, markdown: 'Exact scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+ const timings = []; let refreshed = false
+ window.hermesDesktop = { api: async () => ({ feed: 'f', epoch: 'e', rev: 1, bundles: {} }) }
+ m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before })
+ current = route
+ await paint(React.createElement(m.Panel))
+ const clicked = performance.now()
+ await m.chooseModelOption(q, q.options[0], route, { call: async (path, opts) => {
+   if (path.endsWith('/decision-refresh')) {
+     await new Promise(resolve => setTimeout(resolve, 2000)); refreshed = true
+     return { feed: 'f', epoch: 'e', rev: 2, bundle: { session: route.session, model: publicCases.instant_decision.model } }
+   }
+   if (path.endsWith('/client-timing')) { timings.push(opts.body); return {} }
+   if (path.endsWith('/decisions')) return { operation: { operationId: 'provisional-op', dispatchState: 'recorded', idempotencyKey: opts.body.idempotencyKey }, request: { ...request, resolution: { operationId: 'provisional-op' } } }
+   return { request }
+ } })
+ await paint(React.createElement(m.Panel))
+ assert.ok(performance.now() - clicked < 1000)
+ assert.equal(refreshed, false)
+ assert.ok(document.querySelector('[data-model-section="needs_you"]') === null, 'provisional ask departed')
+ assert.equal(document.querySelector('[data-model-count="needs_you"]').textContent, '0')
+ assert.ok(document.querySelector('[data-model-section="waiting"]'))
+ assert.equal(m.cachedModel(route).header.counts.needs_you, 1, 'canonical cache untouched')
+ assert.equal(m.decisionPresentation(before, { ...route, connectionId: 'other' }), before)
+ assert.equal(timings.length, 0, 'refresh duration not yet known')
+ await new Promise(resolve => setTimeout(resolve, 2050))
+ await paint(React.createElement(m.Panel))
+ assert.equal(timings.length, 1)
+ assert.ok(timings[0].visible_ms < 1000)
+ assert.equal(timings[0].painted_ms, timings[0].visible_ms)
+ assert.ok(timings[0].refreshed_ms >= 2000)
+ await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+})
+test('refresh failure restores the locked ask; failed POST operation never hides it', async () => {
+ for (const [index, state] of ['recorded', 'failed', 'missing-key', 'bad-revision'].entries()) {
+  m.resetFeedForTests()
+  const before = structuredClone(publicCases.own_letters.model)
+  const q = before.sections.needs_you[0]; q.request_revision += 401 + index
+  const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+  const route = { connectionId: 'restore', profile: 'default', session: 'restore-chat' }
+  const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+    scope: { complete: true, markdown: 'Exact scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+  let rejectRefresh
+  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before })
+  await m.chooseModelOption(q, q.options[0], route, { call: async (path, opts) => {
+    if (path.endsWith('/decision-refresh')) return new Promise((resolve, reject) => { rejectRefresh = reject })
+    if (path.endsWith('/decisions')) return { operation: { operationId: 'restore-' + state,
+      dispatchState: ['missing-key', 'bad-revision'].includes(state) ? 'pending' : state,
+      ...(state === 'missing-key' ? {} : { idempotencyKey: opts.body.idempotencyKey }) },
+      request: { ...request, revision: state === 'bad-revision' ? undefined : request.revision, resolution: { operationId: 'restore-' + state } } }
+    return { request }
+  } })
+  assert.equal(m.decisionPresentation(before, route).header.counts.needs_you, state === 'recorded' ? 0 : 1)
+  rejectRefresh(Error('Canonical read unavailable')); await new Promise(resolve => setTimeout(resolve, 0))
+  await paint(m.renderModel(m.decisionPresentation(before, route), { decisionStatus: m.modelDecisionStatus, onCheck: () => {} }))
+  assert.ok(document.querySelector('[data-model-section="needs_you"]'))
+  assert.ok(document.body.textContent.includes('Check status'))
+  assert.ok([...document.querySelectorAll('[data-choice-letter]')].every(button => button.disabled))
+  assert.equal(m.modelDecisionStatus(q).locked, true)
+  await paint(null)
+ }
+ m.resetFeedForTests()
+})
+test('operation failure readback restores a provisional row without posting again', async () => {
+ m.resetFeedForTests()
+ const before = structuredClone(publicCases.own_letters.model)
+ const q = before.sections.needs_you[0]; q.request_revision += 501
+ const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+ const route = { connectionId: 'operation-failure', profile: 'default', session: 'operation-failure-chat' }
+ const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+   scope: { complete: true, markdown: 'Exact scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+ let posts = 0, refreshes = 0, rejectOriginal, frozen
+ const receipt = state => ({ operation: { operationId: 'later-failed-op', dispatchState: state, idempotencyKey: frozen.idempotencyKey },
+   request: { ...request, resolution: { operationId: 'later-failed-op' } } })
+ const call = async (path, opts) => {
+   if (path.endsWith('/decision-refresh')) {
+     if (++refreshes === 1) return new Promise((resolve, reject) => { rejectOriginal = reject })
+     throw Error('Canonical refresh still unavailable')
+   }
+   if (path.endsWith('/decisions')) { posts++; frozen = opts.body; return receipt('pending') }
+   if (path.includes('/operations/')) return receipt('failed')
+   if (path.includes('/operations?')) return { operation: { operationId: 'later-failed-op' } }
+   return { request }
+ }
+ m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before })
+ await m.chooseModelOption(q, q.options[0], route, { call })
+ assert.equal(m.decisionPresentation(before, route).header.counts.needs_you, 0)
+ await m.checkModelDecision(q, { call })
+ assert.equal(m.decisionPresentation(before, route).header.counts.needs_you, 1)
+ assert.ok(m.modelDecisionStatus(q).text.includes('failed'))
+ assert.equal(posts, 1)
+ rejectOriginal(Error('Original refresh unavailable')); await new Promise(resolve => setTimeout(resolve, 0))
  m.resetFeedForTests()
 })
 test('never-started admission refusal offers explicit same-key retry without unlocking choices', async () => {

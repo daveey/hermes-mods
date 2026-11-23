@@ -314,10 +314,13 @@ The endpoint verifies operation ownership and finite, monotonic click-relative
 offsets bounded to ten minutes; it does not dispatch or retry anything.
 
 `Decision client timing operation=... owner_ms=... post_ms=... refresh_ms=...
-paint_ms=... total_ms=...` splits owner lookup, POST roundtrip, response-to-refresh,
-and refresh-to-committed-render time. `paint_ms` observes a React commit, not GPU
-presentation. `total_ms` includes all four hops. No record means no observed
-completion, not zero latency: failed refreshes, unfocused/unmounted panels,
+paint_ms=... total_ms=... [visible_ms=...]` splits owner lookup, POST roundtrip,
+and response-to-refresh. `total_ms` is click-to-first mounted departure, including
+the receipt-qualified provisional presentation; optional `visible_ms` measures
+that provisional commit. Refresh may finish later, so `paint_ms` is the nonnegative
+refresh-to-commit tail, not a sum component when `visible_ms` is present. These
+observe React commits, not GPU presentation. No record means no observed
+completion, not zero latency: unfocused/unmounted panels,
 reloads and dropped telemetry can omit records. Tracking is ephemeral, expires
 after ten minutes, and is capped at 100 pending clicks. Neither decision nor
 telemetry is retried by this instrumentation. Older servers may reject the route.

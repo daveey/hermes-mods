@@ -124,7 +124,28 @@ unknown and can only check status; a failed GET never grants POST retry.
 Durable operation/idempotency semantics are unchanged.
 
 Desktop validates the canonical POST receipt immediately instead of discarding it
-and doing three sequential GETs. It then requests `POST /decision-refresh {session}`
+and doing three sequential GETs. A complete owner/request/revision/idempotency-bound
+receipt with a recorded/pending or delivered operation creates a temporary, local
+presentation keyed by operation ID: that exact ask moves from Needs you to Waiting,
+its count/pip changes, and its single line says the decision was recorded. It does
+not alter the cached backend model, canonical status, execution trust or leases,
+and does not imply that work is running or grant any authority. The header may
+say `Decision recorded` until canonical replacement. Failed/unknown POSTs never
+create this presentation. A failed operation/readback or unavailable refresh
+restores the locked ask with Check status; the frozen intent/key is retained.
+The scoped canonical refresh runs in the background, replacing the temporary
+presentation whether it confirms departure or returns a still-open ask. Other
+owners, source chats and request revisions remain untouched.
+
+Client telemetry observes a mounted React commit, not GPU presentation. Optional
+`visible_ms` is click-to-provisional-commit; `painted_ms`/logged `total_ms` measure
+the first observed departure (provisional or canonical). `refreshed_ms` remains
+independent and may finish later. A single best-effort report waits until both
+refresh completion and a committed departure have been observed; an unavailable
+canonical model alone is never departure evidence. Older clients retain their
+ordered responded → refreshed → painted offsets.
+
+Desktop requests `POST /decision-refresh {session}`
 on the **source panel** connection/profile, not an ambient or foreign request
 owner. This endpoint reads current canonical requests/outcome only, independent
 of the sweep decision lock, and returns a compact backend-authored model. It

@@ -537,3 +537,12 @@ def test_client_timing_endpoint_logs_one_joinable_line(tmp_path, caplog):
     lines = [r.getMessage() for r in caplog.records if 'Decision client timing' in r.getMessage()]
     assert lines == [f'Decision client timing operation={op} owner_ms=13.0 post_ms=40.5 refresh_ms=120.0 paint_ms=16.7 total_ms=190.2']
     assert s.operation(OWNER, op) == before
+    with caplog.at_level('INFO', logger='user-steps'):
+        early = {**body, 'visible_ms': 70.0, 'painted_ms': 70.0, 'refreshed_ms': 2053.5}
+        assert client.post('/client-timing', json=early).status_code == 200
+        for change in [dict(visible_ms=True), dict(visible_ms='70'), dict(visible_ms=-1),
+                       dict(visible_ms=600001), dict(visible_ms=71.0), dict(painted_ms=50.0),
+                       dict(refreshed_ms=50.0)]:
+            assert client.post('/client-timing', json={**early, **change}).status_code == 422
+    assert caplog.records[-1].getMessage().endswith('refresh_ms=2000.0 paint_ms=0.0 total_ms=70.0 visible_ms=70.0')
+    assert s.operation(OWNER, op) == before
