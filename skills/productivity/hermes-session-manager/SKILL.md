@@ -22,7 +22,7 @@ Route quickly, recover stalled work, and verify closeout in the originating sess
 | Route | When | Do |
 |---|---|---|
 | **Answer here** | A few tool calls: status, "what's blocked", a lookup | Answer from the ledger and one fresh read |
-| **Existing work** | A card or session already owns it | Comment on the card (`kanban_comment`) or resume that session with the message; reply with the id. A comment only subscribes this chat to notices, which don't count toward its outcome, so it paints green while the work is open: bind it with `hermes kanban --board <b> notify-subscribe <task> --platform tui --chat-id <this session>` (`kanban_origin_adopt` is for cross-gateway courier adoption only) and read back `outcome` = `waiting` on that card |
+| **Existing work** | A card or session already owns it | Comment on the card (`kanban_comment`) or resume that session with the message; reply with the id. A comment subscribes this chat (`via=subscribed`); that link doesn't hold the chat open for work, so bind it with `hermes kanban --board <b> notify-subscribe <task> --platform tui --chat-id <this session>` (`kanban_origin_adopt` is for cross-gateway courier adoption only) and read back `outcome` = `waiting` on that card |
 | **New work** | Anything bigger or long-running | `kanban_create` a card with acceptance criteria (never `hermes kanban create` from a shell, so it links to this chat); reply with the card id at once |
 
 Never wait on a worker inside a turn and never predict its result. For a user-requested separate chat that preserves stopped work without restarting it, follow [Preservation handoff](references/preservation-handoff.md).
@@ -188,6 +188,7 @@ say what's running, never what needs the user.
 - When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
   pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
+- A `decision` outcome whose `items` name a card this chat doesn't own: check `hermes kanban chat-tasks <chat> --json` for that card's `via`. `subscribed` means a `kanban_comment` here imported the foreign card's `human_request`, which is often a system parking stamp, as this chat's ask. Linking the card under your own card or `kanban schedule` doesn't clear it. Run `hermes kanban notify-unsubscribe <task> --platform <from notify-list> --chat-id <chat>`, then `outcome --refresh`. Before commenting on another chat's parked card, expect this and unsubscribe afterwards.
 - "Why are you red?" (asked in the red chat itself): read the recorded reason, never guess from linked cards:
   `hermes sessions outcome $HERMES_SESSION_ID` prints a `Desktop stripe <x> ...` line with the stuck inputs the
   app reported (needs-input + runtime, stalled, kanban_blocked + card ids, review_wait, outcome decision); the raw
