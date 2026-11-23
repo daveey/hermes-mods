@@ -97,7 +97,7 @@ For a private historical golden, retain raw input, observation time, source revi
 
 Before changing independent source admission or queue scheduling, read `references/source-admission-fairness.md` (external/board coverage, observation-only carriage, saturated FIFO service).
 
-When the panel disagrees with the board ("nothing running", missing dependency) or you change the feed producer, read `references/latency-and-freshness.md` first: how to read the timing and published-model files, compare transition times with the painted pass, find remote parents, and the producer design rules.
+When the panel disagrees with the board ("nothing running", missing dependency, stale row square) or you change the feed producer, read `references/latency-and-freshness.md` first: timing and model files, transition times versus the painted pass, remote parents, unseen squares, producer rules.
 
 ## Live proof
 

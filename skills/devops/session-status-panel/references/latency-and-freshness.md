@@ -18,6 +18,7 @@
    ```
    `pa.CoreReaders().linked(lineage)` / `.done(lineage)` give the raw task inputs when you only need the source side.
 4. A remote parent (a card on a worker board) is absent from local `tasks`; `hermes kanban show <id>` says "no such task". Its status lives in hub `kanban_sync_remote_parents` (and `kanban_move_parent_results`, `task_chat_links`): query those directly instead of scanning every board DB (that scan timed out).
+5. Sidebar row with a violet "Done, not yet seen" square but nothing new: the square is `kanban_unseen`, the count of the chat's `tui` subscriptions in `kanban_notify_subs` whose card has a result event (`completed`/`blocked`/`gave_up`/…) with `id > last_event_id`. The grey dot is the settled outcome; a parked card shows grey. On the backend's kanban.db, compare each subscription's `last_event_id` with that card's newest result event. If all are caught up, the Mac's row is stale. Count `conn=<gateway> ... Timed out connecting` lines per 10 minutes in the Mac's `~/.hermes/logs/desktop.log` through `tailnet_exec`: refreshes that never land keep the old row. When the hub side is caught up, the fix is the Mac-to-hub transport, not the square renderer.
 
 ## Producer design rules
 
