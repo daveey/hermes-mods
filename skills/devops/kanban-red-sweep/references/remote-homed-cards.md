@@ -18,7 +18,8 @@ absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is me
 "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
 `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
 alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list` covers both.
-Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments. The Desktop
+Remote cards are unblocked, promoted and archived on their own host; comment on them with `cross_task` (it reads and
+comments, never unblocks). The Desktop
 "For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
 - Workers: answer a parked decision with `cross_task` action=comment (hub courier). It wakes the card, and a
