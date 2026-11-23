@@ -67,6 +67,9 @@ class Core:
 def core(api, monkeypatch):
     fake = Core()
     monkeypatch.setattr(api, "core", lambda: (fake, fake, fake))
+    # This fixture is a legacy core. Never import the installed core's real
+    # flow on its fake connection (cold imports can exceed the REST warm budget).
+    monkeypatch.setattr(api, "flow_core", lambda: None)
     return fake
 
 
