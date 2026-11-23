@@ -579,7 +579,20 @@ def recorded(request):
 
 
 RECORDED_STALE_S = 900
-HEADER_LABELS = {'unresolved': 'interrupted'}
+def header_label(state, status):
+    """Backend wording for the reason, never collapse unavailable evidence into a failed turn."""
+    reason = obj(status).get('reason')
+    codes = obj(obj(status).get('presentation')).get('reason_codes') or []
+    if reason == 'source_unknown' or 'linked_status_unknown' in codes:
+        sources = obj(obj(status).get('coverage')).get('reasons') or []
+        return "status unknown · couldn't read linked cards" if any(r.startswith('cards:') for r in sources) else 'status unknown · source unavailable'
+    if state == 'unresolved':
+        return {'interrupted': 'interrupted', 'empty': 'not started', 'turn_failed': 'turn failed',
+                'linked_work_unsuccessful': 'linked work needs attention', 'turn_unsettled': 'turn outcome unknown',
+                'notice_tail': 'reply pending'}.get(reason, 'status unknown')
+    if state == 'running' and 'own_turn_active' in codes:
+        return 'running · this chat’s agent is replying'
+    return state.replace('needs-you', 'needs you')
 
 
 def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, rentals=None, projector=None, wire=False):
@@ -674,8 +687,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = f'reported {row.get("reported_status") or "done"} by {row.get("gateway") or "another gateway"} · not confirmed by its owner'
             sections['waiting'].append(v)
             continue
-        if row.get('stale'):
-            v['detail'] = f'status unknown · last known: {state or "unknown"}; the card could not be re-read'
+        if row.get('stale') or row.get('partial_source_unknown'):
+            v['evidence_state'] = 'unknown'
+            v['detail'] = f'status unknown · last known: {state or "unknown"}; waiting for status from {row.get("gateway") or "the card’s owner"}'
+            v['details'].append('The card could not be re-read. Its owner’s agent acts next; unavailable status is not a request for you.')
             sections['waiting'].append(v)
             continue
         matches = [(i, r) for i, r in enumerate(requests) if any(_matches(row, a, same_gateway) for a in _aliases(r))]
@@ -835,7 +850,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                'running' if counts['running'] else
                'waiting' if counts['waiting'] or counts['ready'] else 'idle')
     state = status['kind'] if status else derived
-    label = HEADER_LABELS.get(state, state).replace('needs-you', 'needs you')
+    label = header_label(state, status)
     source = 'canonical' if status else 'derived'
     header = {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}
     if delivery and state == 'waiting' and not (counts['needs_you'] or counts['stuck'] or counts['running']):

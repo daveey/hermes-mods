@@ -40,6 +40,20 @@ const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'p
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
+for (const [name, expected] of [['source_unavailable', "status unknown · couldn't read linked cards"],
+ ['own_turn_unknown_remote', 'running · this chat’s agent is replying'], ['genuine_interruption', 'interrupted']]) {
+ test(`shared status evidence ${name}: canonical reason reaches the actual header and unknown row`, async () => {
+  const { model, now } = cases[name]
+  await paint(m.renderModel(model, { now }))
+  assert.equal(model.header.label, expected)
+  assert.equal(document.querySelector('[data-session-status]').textContent, expected)
+  assert.equal(document.querySelectorAll('[data-panel-row]').length, 1)
+  assert.equal(model.sections.running.length, 0)
+  assert.equal(model.sections.waiting[0].evidence_state, 'unknown')
+  assert.ok(document.body.textContent.includes('waiting for status from remote'))
+  assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+ })
+}
 for (const [name, { model, now, status }] of Object.entries(partialCases)) {
  test(`real partial projector ${name}: unknown coverage never becomes empty or consent`, async () => {
   assert.equal(model.header.state, 'unknown')

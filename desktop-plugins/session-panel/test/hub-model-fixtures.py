@@ -70,6 +70,17 @@ cases['relative_clock'] = f.bundle(f.observed(f.task('t_clock', status='running'
 decided = f.request(state='resolved')
 decided['resolution'] = {'operationId': 'instant-op', 'choiceId': 'card-0', 'revision': 3}
 cases['instant_decision'] = f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[decided])
+for name, kind, reason in [('source_unavailable', 'unresolved', 'source_unknown'),
+                           ('own_turn_unknown_remote', 'running', None),
+                           ('genuine_interruption', 'unresolved', 'interrupted')]:
+    outcome = f.canonical_outcome(kind)
+    if reason:
+        outcome['status']['reason'] = reason
+    outcome['status']['presentation'] = {'stripe': 'none' if reason == 'source_unknown' else ('waiting' if kind == 'running' else 'attention'),
+                                         'reason_codes': ['own_turn_active' if kind == 'running' else reason]}
+    if reason == 'source_unknown':
+        outcome['status']['coverage'] = {'state': 'unknown', 'reasons': ['cards:card_read_failed:LinksUnavailable']}
+    cases[name] = f.bundle(f.task(status='running', stale=True), outcome_json=outcome)
 sys.path.insert(0, str(path.parent))
 from test_hierarchy import outline_case
 cases.update({
