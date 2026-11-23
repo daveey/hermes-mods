@@ -288,6 +288,7 @@ def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch, befo
     r = Readers()
     f = core.Feed(r, emit=lambda p: None)
     f.changes(['S1', 'S2'])
+    f._panel_subscribers = {s: (s, f.clock() + 75) for s in f.interest}
     r.links = {s: [{**rows[0], 'status': 'ready'}] for s, rows in r.links.items()}
     entered, release = threading.Event(), threading.Event()
     r.external_stamps = lambda: 99

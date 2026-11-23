@@ -802,6 +802,27 @@ export function PendingModel({ waiting, onRetry }) {
     !waiting && jsx('button', { type: 'button', onClick: onRetry, children: 'Retry' })
   ] })
 }
+// Each mounted panel owns a short lease; sidebar registrations are not visibility.
+export function watchPanel(route) {
+  const subscriber = `panel-${Math.random().toString(36).slice(2)}-${Date.now()}`
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !route?.session || !route.connectionId) return () => {}
+  const send = visible => {
+    void Promise.resolve().then(() => bridge({ path: FEED_PATH, method: 'POST',
+      connectionId: route.connectionId, profile: route.profile || 'default', timeoutMs: 5000,
+      body: { sessions: [], subscriber, visible_session: visible ? route.session : null }
+    })).catch(() => {})
+  }
+  const renew = () => send(typeof document === 'undefined' || !document.hidden)
+  renew()
+  const timer = setInterval(renew, 30000)
+  if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', renew)
+  return () => {
+    clearInterval(timer)
+    if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', renew)
+    send(false)
+  }
+}
 export function Panel() {
   const [, tick] = useState(0)
   const [retry, setRetry] = useState(0)
@@ -811,6 +832,7 @@ export function Panel() {
   useValue(host.state.connectionId)
   useValue(host.state.profile || host.state.connectionId)
   const route = panelRoute(), scope = routeKey(route)
+  useEffect(() => watchPanel(route), [scope])
   useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
   useEffect(() => {
     const timer = setInterval(() => { if (!document.hidden) tick(v => v + 1) }, 1000)

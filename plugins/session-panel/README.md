@@ -6,6 +6,15 @@ The backend half of the Desktop `session-panel` plugin (same name, so hermes-syn
 
 ## Contract
 
+Urgent mitigation `HERMES_PANEL_BOARD_VISIBLE_ONLY` defaults ON. BoardLane marks
+hidden sessions dirty without hydrating them; only mounted Desktop panels lease
+visibility (`subscriber`, `visible_session` on `/changes`, renewed every 30s,
+expires after 75s, released on unmount/window hide). Sidebar registrations are not
+visibility. Attaching to a dirty cached session enqueues one immediate refresh;
+the cached value may remain stale until that read publishes. `0`, `false`, `off`
+or `no` restores all tracked-session BoardLane admission. This does not change
+canonical reconciliation or cold sidebar population.
+
 - `POST /api/plugins/session-panel/changes` `{sessions: [...≤200], since: rev, epoch}` registers the chats (they stay watched for 15 min after the last registration; 200 at most across all windows) and returns `{feed, profile, epoch, rev, reset, bundles: {session: bundle}}`: every bundle newer than `since`, or all of them when `epoch` is not this process's (`reset: true`). Bundles not yet computed are computed now (and pushed, so every client's revision chain stays unbroken).
 - **One profile per feed.** A feed serves its process's launch profile (lineage comes from that profile's `state.db`). A request scoped to another profile (`?profile=` on a host serving several) gets `{feed, profile, profile_unsupported: true}` and no feed; the Desktop keeps its own reads for it.
 - Push: `plugin.session-panel.changed` `{feed, profile, epoch, prev, rev, bundles}` via core's `hermes_cli.plugin_events.broadcast_plugin_event`, to every connected Desktop window. Every revision is pushed exactly once, in order (`prev` is the revision before the batch). Every push carries `fresh`: the chats it vouches for (held, watched, last computed without a failure). With nothing changed, a **heartbeat** `{..., prev: rev, rev, bundles: {}, heartbeat: true, fresh}` goes out every 20 s while any chat is watched: clients trust the feed only while pushes or heartbeats reach them, and only for the chats in `fresh`. A batch over 512 KB carries `sessions` (names only) and an empty `bundles`; clients fetch those with `/changes`.
