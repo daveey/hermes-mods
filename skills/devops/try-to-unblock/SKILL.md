@@ -150,8 +150,13 @@ authority needed rather than treating every spent attempt as a new approval requ
   pick, message the owning chat. A non-owner never files the carrier itself. If the held card's own deliverable
   already shipped through another card, the owning chat archives it itself after a live read: the merge SHA on the
   hub core, exact-head CI on it, and no unpublished commits in the held card's workspace (`git cherry` against main).
-  The trail comment names what stays unclaimed. Archiving releases its `todo` children. A child held in `triage`
-  with a spend decision pending stays held, because `recompute_ready` promotes only `todo`/`blocked` cards.
+  The trail comment names what stays unclaimed. Archiving releases none of its children: the Board never counts a
+  safety-restricted parent as satisfied, even archived (hermes-hub `transitions.ts` `parentsSatisfied` →
+  `restrictedPending`). For each child that needs only what another card delivered, `kanban_link` that done card,
+  then `kanban_unlink` the held card, and say so in a comment on the child. Leave children with their own holds to
+  their owners, noting the edge on their release card. Until core matches the Board (t_01a2060b18ab218d), core keeps
+  promoting such a child and the Board keeps demoting it (`claim_rejected parents_not_done`), so re-point in the
+  same turn as the archive.
 
 ## 5. Leave a trail
 
