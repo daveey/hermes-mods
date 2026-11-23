@@ -368,7 +368,7 @@ async def post_admit(card: str, body: Dict[str, Any] = Body(default={})) -> Dict
 
 
 WATCH_S = 0.25  # change-cursor poll; a change is projected on the first tick that sees it
-MIN_PROJECT_GAP_S = 1.0  # start-to-start floor; projections remain single-flight
+MIN_PROJECT_GAP_S = 3.0 if os.environ.get('HERMES_LANES_CHANGE_ONLY', '1').lower() not in ('0', 'false', 'off', 'no') else 1.0  # reversible start-to-start floor; trailing demand retained
 HEARTBEAT_S = 30.0
 _seen_cursor = None
 _active_streams = 0  # accepted viewers in this backend process, including non-debug clients
@@ -400,33 +400,47 @@ def _ws_upgrade_authorized(ws):
 
 
 def change_cursor():
-    """Cheap watch of the source board AND fleet replica, policy and planner notes."""
+    """Native source admission, followed by semantic—not WAL—revision comparison."""
+    enabled = os.environ.get('HERMES_LANES_CHANGE_ONLY', '1').lower() not in ('0', 'false', 'off', 'no')
+    source = _change_source.read(_capture_cursor) if enabled else _capture_cursor()[0]
+    observation = _observations().cursor() if _observations.cache_info().currsize else None
+    return [source, observation]
+
+
+def _capture_cursor():
+    """Read after a source notification (or initial demand), never an idle timer."""
     from pathlib import Path
     from hermes_constants import get_default_hermes_root
+    from hermes_cli import kanban_activity_revision as activity
     mods = core()
     if mods is None:
-        return None
+        return None, ()
     kbc, _, cli = mods
-    cursors = []
+    cursors, paths = [], []
     with kbc.connect_closing() as conn:
         replica = cli._fleet(conn, local=False)
         try:
             for db in (conn, replica):
                 if db is not None:
-                    cursors.append(tuple(db.execute('SELECT coalesce(max(id),0) FROM task_events').fetchone()))
+                    path = next(row[2] for row in db.execute('PRAGMA database_list') if row[1] == 'main')
+                    paths.append(path)
+                    # Revision triggers explicitly omit heartbeat/claim clocks.
+                    # Older boards still use event identity, never file write stamps.
+                    revision = activity.read_key(db, activity.tables_for(path))
+                    cursors.append((path, revision if revision is not None else tuple(
+                        db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
         finally:
             if replica is not None:
                 replica.close()
     root = Path(get_default_hermes_root())
     for path in (root / 'config.yaml', root / 'kanban' / 'lanes-planner.json'):
+        paths.append(str(path))
         try:
             stat = path.stat()
             cursors.append((stat.st_mtime_ns, stat.st_size))
         except FileNotFoundError:
             cursors.append(None)
-    if _observations.cache_info().currsize:
-        cursors.append(_observations().cursor())
-    return cursors
+    return cursors, tuple(paths)
 
 
 @router.websocket('/v1/lanes/stream')
@@ -472,6 +486,7 @@ assert _spec is not None and _spec.loader is not None
 _identity = _import_util.module_from_spec(_spec)
 _spec.loader.exec_module(_identity)
 _loaded_identity = _identity.capture(_Path(__file__).parent)
+_change_source = _identity.load(_Path(__file__).with_name('change_source.py'), 'lanes_change_source').Source()
 _rpc_client = _identity.load(_Path(__file__).with_name('projector_client.py'), 'lanes_rpc_client')
 _stream_engine = _identity.load(_Path(__file__).with_name('stream_engine.py'), 'lanes_stream_engine')
 _compat_fallback = _rpc_client.Fallback()

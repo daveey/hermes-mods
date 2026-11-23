@@ -232,9 +232,9 @@ def test_real_stream_auth_shared_child_and_archive_push(actual_board, monkeypatc
                 for socket in (one, two):
                     frame = socket.receive_json()
                     while frame.get('type') == 'heartbeat' or frame.get('view', {}).get('totals', {}).get('open') != 0:
-                        assert time.monotonic() - changed < 3
+                        assert time.monotonic() - changed < api.MIN_PROJECT_GAP_S + 2  # coalesced trailing run plus transport
                         frame = socket.receive_json()
-                    assert time.monotonic() - changed < 3
+                    assert time.monotonic() - changed < api.MIN_PROJECT_GAP_S + 2  # coalesced trailing run plus transport
                     assert frame['projector']['mode'] == 'projector'
                     assert frame['projector']['projector_pid'] == pid
     assert api._active_streams == 0

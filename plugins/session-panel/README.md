@@ -46,6 +46,12 @@ Changes with no `task_events` row (a chat link adopted or released, a wake probe
 
 ## Urgent board-read mitigation
 
+`HERMES_PANEL_EXTERNAL_VISIBLE_ONLY` defaults on. Board capture defers global
+external-ledger reads when no panel is mounted and partitions captures only for
+visible sessions. Hidden sessions retain dirty demand; attachment still hydrates
+current data. Set it to `0` to capture external inputs for all watched sessions.
+Canonical decision reconciliation is not visibility-gated.
+
 `HERMES_PANEL_BOARD_COALESCE` is default-on (unset or any value except
 `0`, `false`, `off`, `no`, case-insensitive). BoardLane runs one hydration
 worker at a time and retains each session's pending change until at least
