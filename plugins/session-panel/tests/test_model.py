@@ -333,6 +333,16 @@ def test_terminal_last_known_status_is_unknown_until_owner_recovery():
             assert not recovered['sections']['waiting']
 
 
+def test_partial_card_cannot_revive_an_unused_mirror_ask():
+    for flag in ({'stale': True}, {'partial_source_unknown': 'origin_ledger_unavailable'}):
+        row = task(human_request=human(), block_kind='needs_input', **flag)
+        value = model.reduce_panel(bundle(row, requests=[request()]), now=NOW)
+        assert not value['sections']['needs_you']
+        assert value['sections']['waiting'][0]['evidence_state'] == 'unknown'
+    known = model.reduce_panel(bundle(task(human_request=human()), requests=[request()]), now=NOW)
+    assert len(known['sections']['needs_you']) == 1
+
+
 def test_running_precedence_explains_independent_own_turn():
     outcome = canonical_outcome('running')
     outcome['status']['presentation']['reason_codes'] = ['own_turn_active']

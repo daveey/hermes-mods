@@ -434,7 +434,7 @@ def agent_hold(row, bundle):
 def human_owned(row):
     """block_kind survives old blocks. It alone is NEVER evidence of a current ask."""
     state = row.get('status')
-    if state in TERMINAL or row.get('stale'):
+    if state in TERMINAL or row.get('stale') or row.get('partial_source_unknown'):
         return False
     wait = obj(row.get('wait'))
     if wait.get('wait_state'):
