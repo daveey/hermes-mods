@@ -122,6 +122,8 @@ For held-card decision notices, verify the exact notified session passes the rea
 
 Before superseding a duplicate transcript row, inspect whether its carrier already folded unrelated input. A retained notice ID identifies the original row, not necessarily all current content. Exercise interleaved A/B/A rows and both sidecar orders; guard differing composite content from wholesale retirement, and verify unrelated text and durable row identities survive.
 
+When a restriction or release is recognized by joining an audit event with private authority metadata, test both insertion orders and orphan halves. Fencing only metadata leaves a pre-existing orphan able to acquire authority through a later event insert; protect every authority-bearing half, while keeping ordinary audit writes allowed. Exercise SQLite REPLACE against the conflicting old primary-key identity as well as NEW task identity, since implicit deletion need not invoke ordinary DELETE triggers.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
