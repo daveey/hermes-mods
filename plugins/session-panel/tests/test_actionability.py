@@ -206,8 +206,11 @@ def test_source_named_administrative_owner_inputs(state, monkeypatch, input_name
     held = {'chat': {'lineage': {'chat'}, 'refs': {tid}, 'bundle': b}}
     monkeypatch.setattr(ksa, 'remote_links_and_origin_rows', lambda **kw: ([], []))
     _, cursor = r.board_changes(None)
+    w.execute('ALTER TABLE task_runs ADD COLUMN uid TEXT')
     w.execute('CREATE TABLE IF NOT EXISTS kanban_failure_commands(task_id TEXT,run_uid TEXT,request_uid TEXT,request_sha256 TEXT,operation_kind TEXT,delivery_state TEXT,canonical_receipt_json TEXT,updated_at INTEGER)')
-    w.execute("INSERT INTO kanban_failure_commands VALUES (?,'run','request','digest','retain','pending',NULL,1)", (owner,))
+    w.execute("INSERT INTO kanban_failure_commands VALUES (?,'run','request','digest','retain','confirmed',NULL,1)", (owner,))
+    held['chat']['bundle'] = bundle(state)
+    assert held['chat']['bundle']['cards'][tid]['detail']['actionability']['owner']['refs'] == [owner], held['chat']['bundle']['cards'][tid]['detail']['actionability']
     old = r.external_capture(held)
     _, cursor = r.board_changes(cursor)
     if input_name == 'owner_status':
@@ -215,15 +218,16 @@ def test_source_named_administrative_owner_inputs(state, monkeypatch, input_name
     elif input_name == 'owner_event':
         kanban_db._append_event(w, owner, 'stopped_scope_decision', {})
     elif input_name == 'owner_pending':
-        w.execute("UPDATE kanban_failure_commands SET delivery_state='confirmed' WHERE task_id=?", (owner,))
+        w.execute("UPDATE kanban_failure_commands SET delivery_state='pending' WHERE task_id=?", (owner,))
     else:
         w.execute('UPDATE kanban_failure_commands SET updated_at=updated_at+1 WHERE task_id=?', (owner,))
     changed, _ = r.board_changes(cursor)
     new = r.external_capture(held)
     if input_name == 'retry_counter':
         assert old == new, 'nonsemantic retry telemetry must not dirty a diagnostic'
+        assert r.diagnostic_stale(held) == set()
     else:
-        assert changed.affects(held['chat']) or old != new
+        assert changed.affects(held['chat']) or r.diagnostic_stale(held) == {'chat'}
 
 
 def test_heartbeat_key_deadline_and_wire_revision_stable(state):
@@ -233,6 +237,50 @@ def test_heartbeat_key_deadline_and_wire_revision_stable(state):
     kanban_db._append_event(state[3],state[5],'heartbeat',{})
     assert first == diagnostic(state)
     assert initial['revision'] == view(state)['revision']
+
+
+@pytest.mark.parametrize('input_name', ['wake', 'pending', 'sync'])
+def test_diagnostic_bootstrap_first_mutation_and_convergence(state, monkeypatch, input_name):
+    from hermes_cli import kanban_session_activity as ksa
+    _, _, r, w, _, tid = state
+    monkeypatch.setattr(ksa, 'remote_links_and_origin_rows', lambda **kw: ([], []))
+    empty = {'chat': {'lineage': {'chat'}, 'refs': set()}}
+    before = r.external_capture(empty)
+    assert r.diagnostic_stale(empty) == set()
+    held = {'chat': {'lineage': {'chat'}, 'refs': {tid}, 'bundle': bundle(state)}}
+    assert r.external_capture(held) == before
+    assert r.diagnostic_stale(held) == set(), 'demand acquisition is not a source write'
+    if input_name == 'wake':
+        w.execute('INSERT INTO task_wake_checks(task_id,cmd,every,next_at) VALUES (?,?,?,?)',
+                  (tid, 'test -e fixture-ready', 120, NOW))
+    elif input_name == 'pending':
+        w.execute('CREATE TABLE kanban_failure_commands(task_id TEXT,run_uid TEXT,request_uid TEXT,operation_kind TEXT,delivery_state TEXT,canonical_receipt_json TEXT,updated_at INTEGER)')
+        w.execute("INSERT INTO kanban_failure_commands VALUES (?,'run','request','retain','pending',NULL,1)", (tid,))
+    else:
+        w.execute('CREATE TABLE kanban_sync_state(board_id TEXT,mode TEXT)')
+        w.execute("INSERT INTO kanban_sync_state VALUES ('fixture','on')")
+    assert r.diagnostic_stale(held) == {'chat'}, 'first real write cannot be swallowed as demand seeding'
+    held['chat']['bundle'] = bundle(state)
+    assert r.diagnostic_stale(held) == set(), 'hydration consumes the change exactly once'
+    assert r.external_capture(held) == before, 'diagnostics never alter canonical inventory tuples'
+    if input_name == 'pending':
+        w.execute('UPDATE kanban_failure_commands SET updated_at=updated_at+1')
+        assert r.diagnostic_stale(held) == set(), 'retry telemetry is not semantic change'
+
+
+def test_diagnostic_signature_and_projection_share_snapshot(state, monkeypatch):
+    from hermes_cli import kanban_actionability_sources as sources
+    _, _, r, w, _, tid = state
+    real = sources.describe
+    def racing(c, task_id, *, now):
+        result = real(c, task_id, now=now)
+        w.execute('INSERT INTO task_wake_checks(task_id,cmd,every,next_at) VALUES (?,?,?,?)',
+                  (tid, 'test -e fixture-ready', 120, NOW))
+        return result
+    monkeypatch.setattr(sources, 'describe', racing)
+    held = {'chat': {'lineage': {'chat'}, 'refs': {tid}, 'bundle': bundle(state)}}
+    assert r.diagnostic_stale(held) == {'chat'}, 'post-projection write cannot certify stale diagnostic'
+    assert not r.conn(state[4]).in_transaction, 'owned snapshot must not leak'
 
 
 @pytest.mark.parametrize('input_name',['task','event','parent_status','parent_event','run','pending','wake','sync'])
@@ -277,7 +325,7 @@ def test_source_mutations_refresh_demanded_inputs(state, monkeypatch, input_name
         w.execute("INSERT INTO kanban_sync_state(board_id,mode) VALUES ('fixture','on')")
     changed,_=r.board_changes(cursor)
     new=r.external_capture(held)
-    assert changed.affects(held['chat']) or new != old, input_name
+    assert changed.affects(held['chat']) or r.diagnostic_stale(held) == {'chat'}, input_name
     fresh=diagnostic(state)
     assert 'actionability' in r.card(tid,'default')['detail']
     # Source mutations need fresh acquisition, not necessarily a changed contract identity.

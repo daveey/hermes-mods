@@ -1291,6 +1291,9 @@ class Feed:
                 previous = getattr(self, '_external_captures', None) or {}
                 semantic = getattr(self.readers, 'external_semantic', lambda value: value)
                 dirty.update(s for s in watched if semantic(captured[s]) != semantic(previous.get(s)))
+                diagnostic_stale = getattr(self.readers, 'diagnostic_stale', None)
+                if callable(diagnostic_stale):
+                    dirty.update(diagnostic_stale(held))
                 if callable(getattr(self.readers, 'advance_external', None)):
                     observations = {s: (capture_seq, captured[s]) for s in watched
                                     if s not in dirty and captured[s] != previous.get(s)}

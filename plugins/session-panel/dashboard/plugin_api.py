@@ -340,23 +340,21 @@ class CoreReaders:
                                     (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
                                 or refers(s, row)))
                 for s, value in held.items()}
-        inputs = self._actionability_inputs(held)
-        captured = {s: tuple(sorted((*value, *inputs.get(s, ())))) for s, value in captured.items()}
         if include_inventory:
             return captured, {'origin': cards, 'history': history, 'replica': replica,
                               'gateway': gateway, 'profile': profile}
         return captured
 
-    def _actionability_inputs(self, held):
-        """Demand-only signatures for optional inputs outside core revision triggers.
+    def diagnostic_stale(self, held):
+        """Compare extra source inputs with their own hydration snapshot.
 
-        This existing capture reads only already hydrated local identities. No
-        full-board task/history scan, new poller or eligibility certification.
+        Demand acquisition is not a source change. Comparing capture-to-capture
+        signatures would re-admit every chat after pre-hydration bootstrap.
+        No reader opens until an already hydrated local identity demands it.
         """
         paths = None
-        memo, modes, captured = {}, {}, {}
+        memo, stale = {}, set()
         for session, value in held.items():
-            values = []
             for tid, rec in value.get('bundle', {}).get('cards', {}).items():
                 detail = rec.get('detail', {})
                 if detail.get('source') != 'live' or detail.get('task', {}).get('id') != tid:
@@ -368,36 +366,37 @@ class CoreReaders:
                     if paths is None:
                         paths = dict(self.boards())
                     c = self.conn(paths[board]) if board in paths else None
-                    facts = []
-                    if c is not None:
-                        if board not in modes:
-                            try:
-                                modes[board] = bool(c.execute("SELECT 1 FROM kanban_sync_state WHERE mode!='off' LIMIT 1").fetchone())
-                            except sqlite3.Error:
-                                modes[board] = 'unavailable'
-                        for query, params in (
-                            ('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)),
-                        ):
-                            try:
-                                facts.append([tuple(row) for row in c.execute(query, params)])
-                            except sqlite3.Error:
-                                facts.append('unavailable')
-                        for ref in refs:
-                            try:
-                                pending = c.execute("SELECT * FROM kanban_failure_commands WHERE task_id=? AND operation_kind='retain' "
-                                    "AND (delivery_state IS NULL OR delivery_state NOT IN ('confirmed','rejected')) "
-                                    'ORDER BY run_uid,request_uid LIMIT 2', (ref,))
-                                facts.append([ref, [{k: row[k] for k in row.keys() if k in (
-                                    'run_uid', 'request_uid', 'request_sha256', 'operation_kind',
-                                    'delivery_state', 'canonical_receipt_json')} for row in pending]])
-                            except sqlite3.Error:
-                                facts.append([ref, 'unavailable'])
-                        facts.append(modes[board])
-                    memo[identity] = json.dumps({'diagnostic_inputs': facts, 'board': board, 'id': tid},
-                                               sort_keys=True, separators=(',', ':'))
-                values.append(memo[identity])
-            captured[session] = tuple(sorted(values))
-        return captured
+                    memo[identity] = self._diagnostic_signature(c, board, tid, refs) if c else None
+                if memo[identity] is None or memo[identity] != detail.get('actionability_inputs'):
+                    stale.add(session)
+        return stale
+
+    @staticmethod
+    def _diagnostic_signature(c, board, tid, refs):
+        """Bounded exact-ID reads for inputs outside core semantic triggers."""
+        facts = []
+        try:
+            mode = bool(c.execute("SELECT 1 FROM kanban_sync_state WHERE mode!='off' LIMIT 1").fetchone())
+        except sqlite3.Error:
+            mode = 'unavailable'
+        try:
+            facts.append([tuple(row) for row in c.execute(
+                'SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,))])
+        except sqlite3.Error:
+            facts.append('unavailable')
+        for ref in refs:
+            try:
+                pending = c.execute("SELECT * FROM kanban_failure_commands WHERE task_id=? AND operation_kind='retain' "
+                    "AND (delivery_state IS NULL OR delivery_state NOT IN ('confirmed','rejected')) "
+                    'ORDER BY run_uid,request_uid LIMIT 2', (ref,))
+                facts.append([ref, [{k: row[k] for k in row.keys() if k in (
+                    'run_uid', 'request_uid', 'request_sha256', 'operation_kind',
+                    'delivery_state', 'canonical_receipt_json')} for row in pending]])
+            except sqlite3.Error:
+                facts.append([ref, 'unavailable'])
+        facts.append(mode)
+        return json.dumps({'diagnostic_inputs': facts, 'board': board, 'id': tid},
+                          sort_keys=True, separators=(',', ':'))
 
     def snapshot_select_external(self, inventory, ids, *, observed_at):
         """Select from the one strict inventory using the existing canonical helpers."""
@@ -1078,7 +1077,10 @@ class CoreReaders:
                 out.update(extra)
             except Exception:
                 pass
+        owned_snapshot = not c.in_transaction
         try:
+            if owned_snapshot:
+                c.execute('BEGIN')
             from hermes_cli.kanban_actionability_sources import describe
             diagnostic = describe(c, card_id, now=0)
             if isinstance(diagnostic, dict):
@@ -1086,6 +1088,15 @@ class CoreReaders:
         except Exception:
             # Optional old-core/malformed evidence must not break hydration.
             pass
+        finally:
+            if not replica:
+                try:
+                    refs = tuple(sorted({card_id, *_diagnostic_refs(out)}))
+                    out['actionability_inputs'] = self._diagnostic_signature(c, board, card_id, refs)
+                except Exception:
+                    out.pop('actionability', None)
+            if owned_snapshot and c.in_transaction:
+                c.rollback()
         return out
 
 
