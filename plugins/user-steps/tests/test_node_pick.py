@@ -68,5 +68,5 @@ def test_no_node_at_all_fails_rather_than_skips(tmp_path):
 
 def test_contract_test_uses_the_picker_not_the_first_path_node():
     source = Path(__file__).with_name('test_desktop_contract.py').read_text()
-    assert 'find_node()' in source
+    assert 'find_node(home=tmp_path)' in source
     assert 'shutil.which' not in source
