@@ -80,11 +80,8 @@ def capture_local(readers, source, prior_part, demands, hints):
         previous = None  # a new source generation cannot inherit old acquisition trust
     reusable = set()
     if previous:
-        for sid, keys in previous.scope_keys.items():
-            certificate = previous.scope_receipts.get(sid)
-            if (sid in previous.receipt.coverage.completed_scopes
-                    or certificate and certificate.cursor == previous.receipt.cursor):
-                reusable.update(keys)
+        for sid in previous.receipt.coverage.completed_scopes:
+            reusable.update(previous.scope_keys.get(sid, ()))
     with closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0.5)) as conn:
         conn.row_factory = sqlite3.Row
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, hints.variable_limit)
