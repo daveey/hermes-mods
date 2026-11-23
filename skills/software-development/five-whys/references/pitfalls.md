@@ -18,6 +18,10 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
 
 - Inject receipt stalls at the exact append, not metadata POSTs; assert call return/raise, not renamed logs. Synchronize profiler sampling with RPC.
 
+- Verify recurrence evidence delivery separately from incident dedupe: a create transport returning an existing open card proves neither that the new occurrence was appended nor that it is readable. Exercise actual handlers on a disposable board, assert full body/comment evidence before local ACK, and test a receipt-write crash followed by incident completion before retry. Earlier receipts from an unverified protocol must not become trusted ACKs merely through migration.
+
+- Run real-handler lifecycle proofs in the CI fixture environment before review, not only under an installed launcher. Use the suite interpreter, explicit selected core and disposable storage when CI supplies source and dependencies but no launcher; prove the old failure under a launcher-free PATH and retain every transport/readback assertion. Local deployed-runtime success does not establish CI execution.
+
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
