@@ -244,11 +244,19 @@ export function attentionStore(ctx) {
     const listeners = new Set()
     let subscription
     const clients = new Map()
-    store = { view: null, publish(view) { store.view = view; for (const fn of listeners) fn(view) },
+    store = { view: null, sessionMatch: () => true,
+      setSessionMatch(match) {
+        store.sessionMatch = match
+        // Only attention listeners repaint. The filter effect depends on scalar
+        // selection/map keys, never this notification, so it cannot re-register itself.
+        store.publish(store.view && { ...store.view })
+      },
+      publish(view) { store.view = view; for (const fn of listeners) fn(view) },
       listen(fn) { listeners.add(fn); return () => listeners.delete(fn) },
       connect(params, onView, onLive = () => {}, primary = false) {
         const token = {}
         clients.set(token, { params, onView, onLive })
+        if (store.view) onView(store.view)
         if (!subscription) subscription = sourceFor(ctx).subscribe(params,
           (view, err) => {
             if (view) store.publish(view)
@@ -268,13 +276,13 @@ export function attentionStore(ctx) {
   return store
 }
 
-export function uncoveredAsks(view, sessions) {
+export function uncoveredAsks(view, sessions, match = () => true) {
   if (!view?.attention?.available) return []
-  // A subscription is not proof of a visible red session. In particular an
-  // archived/filtered chat, or a linked legacy device wait, still needs a row.
+  // SDK rows precede plugin filters. Apply the very same registered matcher
+  // before treating a chat as coverage; otherwise a lane-hidden ask disappears.
   return view.attention.rows.filter(row => sessions == null ? row.unlinked :
-    !sessions.some(session => (session.needs_you || []).some(ask => ask.kind === 'card' &&
-      (ask.ref === row.id || ask.ref?.endsWith('/' + row.id)))))
+    !sessions.some(session => match(session) && (session.needs_you || []).some(ask =>
+      ask.kind === 'card' && ask.ref === `${row.target?.board || 'default'}/${row.id}`)))
 }
 
 export function UnlinkedAsks({ ctx }) {
@@ -288,7 +296,7 @@ export function UnlinkedAsks({ ctx }) {
     const disconnect = store.connect({ hours: loadWindow(), window: flowWindow(loadWindow()), expanded: false }, () => {})
     return () => { unlisten(); disconnect() }
   }, [store])
-  const rows = uncoveredAsks(view, sessions)
+  const rows = uncoveredAsks(view, sessions, store.sessionMatch)
   if (!rows.length || !sdk.SidebarSection || !sdk.SidebarSectionRow) return null
   return h('div', { 'data-unlinked-asks': '1', 'data-needs-you-count': rows.length },
     h(sdk.SidebarSection, { label: 'Unlinked asks', count: rows.length, open, onToggle: () => setOpen(v => !v) },
@@ -906,10 +914,14 @@ export function Lanes({ ctx }) {
     const sel = { lanes: filterLanes, status: statusPicked, noCards }
     if (!sel.lanes.length && !sel.status.length && !sel.noCards) return undefined
     const parts = [...sel.lanes, ...sel.status.map((key) => STATUS.find(([k]) => k === key)?.[1] || key), ...(sel.noCards ? ['no cards'] : [])]
-    return ctx.register({
+    const match = (session) => sessionMatches(session, sessionMap, sel)
+    const store = attentionStore(ctx)
+    store.setSessionMatch(match)
+    const unregister = ctx.register({
       id: 'session-filter', area: SESSION_FILTER_AREA,
-      data: { label: `Lanes: ${parts.join(', ')}`, match: (session) => sessionMatches(session, sessionMap, sel), onClear: () => clearAll() }
+      data: { label: `Lanes: ${parts.join(', ')}`, match, onClear: () => clearAll() }
     })
+    return () => { unregister(); store.setSessionMatch(() => true) }
   }, [filterKey, sessionKey, working])
   // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
   // shows them, name the lane that failed, and keep the draft so the rest can be retried.
