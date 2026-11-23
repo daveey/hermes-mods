@@ -45,6 +45,18 @@ semantics.
 
 ## How it stays current
 
+Native watch admission distinguishes source writes from inventory hints. An
+unrelated temporary-file or SQLite SHM lifecycle only rearms discovery; it does
+not wake either producer unless relevant source membership changed. Exact DB/WAL
+writes and lost watch coverage remain conservative source hints. With keyed
+hints available, the reader's derived `origin-work.db` publication is excluded
+from exact watches: its cache-only changes are covered by the existing 30-second
+keyed reconciliation. Older cores retain the legacy exact watch. The canonical
+hub replica and origin ledger remain immediate inputs. Regression controls in
+`tests/test_source_coverage.py` bound producer wakes over a virtual idle minute
+using real inotify, and preserve concurrent source writes, new-board discovery,
+legacy fallback and the two 30-second recovery admissions.
+
 The feed thread starts on the first request (only `hermes serve`, which runs plugin routers and holds the Desktop sockets, ever serves one), one per process, and ticks every second until the plugin unloads (`register` stops it). `feed.py` lives under `dashboard/`, so hermes-sync's dashboard restart picks up a change to it.
 
 1. Data stamps of every board, board replica and `state.db` (core's `session_list_flight.data_stamp`, else file mtime/size): 2 ms on the hub for 19 files. Unchanged and no full refresh due: done.
