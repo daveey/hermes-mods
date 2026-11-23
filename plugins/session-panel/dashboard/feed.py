@@ -1201,6 +1201,9 @@ class Feed:
     def status(self) -> dict:
         with self.lock:
             return {'epoch': self.epoch, 'rev': self.rev, 'watched': len(self.interest), 'bundles': len(self.bundles),
+                    'board_visible_only': getattr(getattr(self, '_board_lane', None), 'visible_only', None),
+                    'panel_subscribers': sum(expires > self.clock() for _, expires in self._panel_subscribers.values()),
+                    'board_dirty': len(self._board_dirty),
                     'failures': {s: dict(f) for s, f in self.failures.items()}, 'last_tick_s': round(self.last_tick_s, 3), 'timing': dict(getattr(self, 'timing', {})),
                     'decision_failures': sorted(self._decision_failures),
                     'stopped': self.stopped.is_set()}
