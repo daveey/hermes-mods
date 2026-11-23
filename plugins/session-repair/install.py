@@ -142,6 +142,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--apply', action='store_true')
     p.add_argument('--mode', choices=('off', 'shadow', 'live'))
+    p.add_argument('--nudge-mode', choices=('shadow', 'live'), help='independent nudge lane only')
     p.add_argument('--failure-deliver', default=None,
                    help='cron --failure-deliver target for failed ticks (default bot-chat; never local)')
     args = p.parse_args(argv)
@@ -151,6 +152,8 @@ def main(argv=None) -> int:
         p.error('--failure-deliver local would hide failed ticks')
     h = home()
     steps = plan(h, args.mode, args.failure_deliver, explicit_target=explicit)
+    if args.nudge_mode:
+        steps.append(('nudge_config', args.nudge_mode))
     if not steps:
         print('session-repair: already installed')
         return 0
@@ -167,10 +170,12 @@ def main(argv=None) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(WRAPPER)
             path.chmod(0o755)
-        elif kind == 'config':
+        elif kind in ('config', 'nudge_config'):
             cfg = h / 'session-repair' / 'config.json'
             cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(json.dumps({'mode': what}) + '\n')
+            data = json.loads(cfg.read_text()) if cfg.exists() else {'mode':'shadow'}
+            data['mode' if kind == 'config' else 'nudge_mode'] = what
+            cfg.write_text(json.dumps(data) + '\n')
         elif kind in ('cron', 'reconcile'):
             argv = (cron_argv(args.failure_deliver) if kind == 'cron'
                     else edit_argv(str(find_job(h).get('id')), args.failure_deliver))

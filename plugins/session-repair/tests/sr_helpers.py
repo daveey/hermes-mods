@@ -24,6 +24,9 @@ class Env:
 
     def __init__(self, tmp_path, monkeypatch, *, max_in_progress=4):
         monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+        monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+        monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
         (tmp_path / 'config.yaml').write_text(
             f'kanban:\n  max_in_progress: {max_in_progress}\n'
             f'  sync:\n    key_file: {tmp_path / "missing-gateway.key"}\n')
@@ -34,6 +37,8 @@ class Env:
         self.state = fixtures().state_db(tmp_path / 'state.db')
         self.now = time.time()
         self.scan_mod = load('_sr_scan', PLUGIN / 'scan.py')
+        # Ordinary pattern fixtures have no outcome-audit CLI or production chat runtime.
+        monkeypatch.setattr(self.scan_mod.Sources, 'outcome_rows', lambda self: [])
         self.monkeypatch = monkeypatch
 
     def sources(self, now=None):

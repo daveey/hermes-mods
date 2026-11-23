@@ -260,6 +260,54 @@ no turn followed it. Act on it now."` (the turn core's guarantee would start). *
 or a close-out that fails again): find why the sweeper skips it (gateway log `kanban-unloaded`, `poller miss`).
 **Done when:** a turn followed the notice / the cursor passed the event.
 
+## BS-long-wait: potentially stuck on an external producer
+
+**Seen as:** a correct CI, review, deployment, resource or card park that has lasted too long, or whose event
+already happened. Unlike a broken wake, this asks the owner to reassess; it never releases a decision hold.
+
+**Detection** (`rule_long_wait`): open `scheduled`/`blocked`/`todo` cards, no live run, never a valid human ask,
+worker copy, repair-created card, containment or recovery hold. Core's newest `PARK_EVENT_KINDS` event, fenced by
+latest run admission, supplies `awaiting` through `kanban_wait_info.parse_awaiting` and the episode's age.
+Thresholds (`LONG_WAIT_S`): CI and deploy **45 min**, external/review **3 h**, card **4 h** only when the producer
+has had no event for **1 h**, resource **2 h**. Clock: never (`BS-overdue-wake` owns it). Canonical GitHub run/PR
+URLs get a bounded `gh` read through token-broker: a completed run, merged/closed/approved PR or nonempty all-green
+checks gives `event_happened` immediately, regardless of age. Otherwise `too_long` at the threshold. Failed reads
+retain `readback_failed` evidence and still use age. Unreadable card-producer freshness fails closed. A matching
+chat-closeout `owner-wake.db` fired premise is excluded, as for `BS-unexplained-wait`.
+
+**Evidence:** kind, ref, waited_s, threshold_s, live_producer, park id/time, last card event.
+**Safe automatic fix** (`nudge`, area card): re-read first; a moved park/event, human ask or running owner means no
+write. Add ONE `[session-repair]` comment asking whether it is stuck, showing duration/limit/live state, and
+asking it to continue, re-park with a fresh reason/wake, or block with the real reason. It wakes the owner through
+the normal comment path; no forced unblock. **Done when:** the owner takes a turn and reassesses its wait.
+
+## BS-quiet-chat: unresolved cardless chat with no executor
+
+**Detection** (`quiet_chat_findings`): unarchived/unmuted desktop/tui chats active in the last **3 days**, stored
+`hermes sessions outcome-audit --json` outcome `unresolved` or `waiting`, last activity more than **60 min** ago.
+No open linked card (including compression lineage), owned live cron, running turn/process/subagent or open ask.
+The Session repair chat is always excluded, by id and title. Unreadable guard inputs fail closed with a scan error.
+
+**Safe automatic fix** (`nudge`, area card): re-read eligibility and last message; one turn through
+`hermes chat --resume <session> --oneshot -Q -q "[session-repair] ... Are you stuck? ..."`.
+**Done when:** the chat takes a turn, resumes work or names its real wait.
+
+### Nudge cadence and rollout (both rules)
+
+`config.json` **nudge_mode** is `shadow` (default) or `live`, independently of the existing fixes' `mode`;
+`mode=off` remains a global stop. Re-nudge the same fingerprint every **2 h**, not the other rules' 24 h seen
+window. Second and later messages include count and earlier UTC times. Three unanswered nudges (no subsequent
+non-nudge card/chat event) produce one normal area-card repair finding, never a fourth nudge. Replies/re-parks
+reset the unanswered sequence. Nudge limits: **15/run**, **100/rolling 24 h**, separate from fix-card caps.
+Durable write-ahead pending delivery prevents crash/timeout resend; exact comment/message readback is the receipt,
+and unknown delivery stays pending for recovery, not a blind retry. `nudges-<mode>.json[l]` holds cadence/receipts;
+shadow rows also go to `actions-shadow.jsonl`. Never copy live chat/card evidence into the public repository.
+
+Install merged code on the hub in shadow; adjudicate every would-nudge row from **two consecutive 15-minute
+ticks** (about 30 min), preserving rows and verdicts on the owning card. Then set only `nudge_mode=live`; verify an
+exact comment/chat receipt and a following owner event. This shorter nudge-only gate does **not** waive the existing
+24-hour shadow gate for the other fixes. To reverse rollout, set `nudge_mode=shadow` without changing `mode`.
+
 ## Adding a pattern or example
 
 When the user shows a broken session (screenshot, chat id, "this one again"):

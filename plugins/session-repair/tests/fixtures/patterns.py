@@ -41,6 +41,14 @@ def age_all_events(conn, tid: str, at: float) -> None:
 
 
 # ── BS-ready-worker-free ─────────────────────────────────────────────────────────────────────────────────────────
+def long_wait(conn, now, *, waited_s=3000, kind='ci', status='scheduled'):
+    tid = card(conn, 'Waiting for producer', status=status)
+    age_all_events(conn, tid, now-waited_s)
+    event(conn, tid, 'scheduled', {'awaiting': {'kind':kind, 'ref':'job'}, 'reason':'producer',
+                                 'wake_at':now+86400}, at=now-waited_s)
+    return tid
+
+
 def ready_worker_free(conn, now, *, waited_s=2400):
     tid = card(conn, 'Ready, unclaimed, free slot', status='ready', ready_since=int((now - waited_s) * 1000))
     age_all_events(conn, tid, now - waited_s)
@@ -290,7 +298,9 @@ def state_db(path):
     c = sqlite3.connect(path)
     c.executescript('''
         CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT, parent_session_id TEXT,
-            archived INTEGER DEFAULT 0, muted INTEGER DEFAULT 0, end_reason TEXT, started_at REAL, pinned INTEGER DEFAULT 0);
+            archived INTEGER DEFAULT 0, muted INTEGER DEFAULT 0, end_reason TEXT, source TEXT DEFAULT 'desktop',
+            outcome_json TEXT,
+            started_at REAL, pinned INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
             content TEXT, timestamp REAL, display_kind TEXT, display_metadata TEXT, active INTEGER DEFAULT 1);
     ''')
