@@ -101,7 +101,7 @@ def test_unreadable_decisions_are_not_successful_empty_controls(decide, monkeypa
     so, plugin, us, owner, store, request, db = decide
     def unavailable(*a, **kw):
         raise OSError('decision source unavailable')
-    monkeypatch.setattr(us, 'open_steps', unavailable)
+    monkeypatch.setattr(us.ActionStore, '_read', unavailable)
     status = so.refresh_outcome('chat', 'manual', db=db)['status']
     assert status['coverage']['state'] == 'unknown'
     assert status['kind'] != 'done'

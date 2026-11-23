@@ -31,6 +31,31 @@ def choose(store, owner, request):
         idempotencyKey=str(uuid.uuid4())))['operation']
 
 
+def test_provider_never_opens_writable_action_store(action, monkeypatch):
+    plugin, us, owner, store, request, step = action
+    init = us.ActionStore.__init__
+    opens = []
+    def readonly_only(self, *args, **kwargs):
+        opens.append(kwargs.get('read_only', False))
+        assert kwargs.get('read_only') is True, 'status provider must never initialize/migrate storage'
+        return init(self, *args, **kwargs)
+    monkeypatch.setattr(us.ActionStore, '__init__', readonly_only)
+    assert plugin.provider('S1')['decision_items']
+    assert opens == [True]
+
+
+def test_provider_uses_current_canonical_revision(action):
+    plugin, us, owner, store, request, step = action
+    replacement = copy.deepcopy(request)
+    replacement['title'] = 'Current revised question'
+    replacement['choices'][0]['label'] = 'Current revised option'
+    store.revise(owner, request['requestId'], 1, replacement)
+    item = plugin.provider('S1')['decision_items'][0]
+    assert item['id'] == step['id']
+    assert item['question'] == 'Current revised question'
+    assert item['choices'][0]['label'] == 'Current revised option'
+
+
 def test_open_and_pending_have_distinct_responsibility(action):
     plugin, us, owner, store, request, step = action
     assert plugin.provider('S1')['decision_items'][0]['id'] == step['id']
