@@ -38,9 +38,9 @@ def cases():
                     if error[0]:
                         raise error[0]('linked cards unavailable')
                     return reads
-                def capture(name):
+                def capture(name, requests=None):
                     outcome = so.refresh_outcome('chat', 'card_change', db=db)
-                    model = f.model.reduce_panel(f.bundle(*reads, outcome_json=outcome), now=f.NOW, projector=f.project)
+                    model = f.model.reduce_panel(f.bundle(*reads, requests=requests or [], outcome_json=outcome), now=f.NOW, projector=f.project)
                     result[name] = {'model': model, 'now': f.NOW, 'status': outcome['status']}
                 with (
                     patch.object(ksa, 'session_outcome_tasks', cards),
@@ -65,8 +65,17 @@ def cases():
                     # Regressed evidence after recovery must not preserve the old running verdict.
                     row['stale'] = True
                     capture('new_failure_after_recovery')
+                    row.update(status='blocked', stale=False, partial_source_unknown='origin_ledger_unavailable',
+                               human_request=f.human(), block_kind='needs_input')
+                    capture('partial_human', [f.request()])
+                    row.update(stale=True, partial_source_unknown=None)
+                    capture('stale_human', [f.request()])
+                    row['stale'] = False
+                    capture('known_human', [f.request()])
+                    row.update(status='done', human_request=None, block_kind=None)
                     reads.clear()  # the authoritative active list drops a confirmed terminal card
                     capture('recovered_done')
+                    row.update(status='running', stale=True)
                     reads.append(row)
                     from tui_gateway.turn_marker import record_turn_start, clear_turn_marker
                     record_turn_start(home, 'chat', 'working locally')

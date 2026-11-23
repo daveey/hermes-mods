@@ -138,24 +138,26 @@ test('ordinary waits and stale/blocked chip controls keep pips', async () => {
 })
 const producerCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./status-producer-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 test('real core status producer available for composed acceptance', { skip: !process.env.HERMES_CORE_SOURCE }, () => {
- assert.equal(Object.keys(producerCases).length, 9)
+ assert.equal(Object.keys(producerCases).length, 12)
 })
 for (const [name, { model, now, status }] of Object.entries(producerCases)) {
  test(`real refresh_outcome through panel and mounted DOM: ${name}`, async () => {
   await paint(m.renderModel(model, { now }))
   assert.equal(model.header.source, 'canonical')
   assert.deepEqual(model.header.status, status)
-  const active = name === 'active_local_turn', recovered = name === 'recovered_running', done = name === 'recovered_done'
+  const active = name === 'active_local_turn', recovered = name === 'recovered_running', done = name === 'recovered_done', human = name === 'known_human'
   const header = document.querySelector('[data-session-status]')
   if (done) assert.equal(header, null, 'confirmed zero unfinished work hides the panel')
   else assert.equal(header.textContent, model.header.label || model.header.state)
-  assert.equal(status.kind, done ? 'done' : active || recovered ? 'running' : ['LinksUnavailable', 'TimeoutError', 'expired_lease'].includes(name) ? 'unresolved' : 'waiting')
-  if (!active && !recovered && !done) {
+  assert.equal(status.kind, human ? 'decision' : done ? 'done' : active || recovered ? 'running' : ['LinksUnavailable', 'TimeoutError', 'expired_lease'].includes(name) ? 'unresolved' : 'waiting')
+  if (human) assert.ok(document.querySelector('[data-choice-letter]'), 'known current human request retains choices')
+  if (!active && !recovered && !done && !human) {
    assert.equal(status.coverage.state, 'unknown')
    assert.ok(!['done', 'waiting', 'attention'].includes(status.presentation.stripe))
    assert.equal(model.sections.running.length, 0)
    assert.equal(model.sections.waiting[0].evidence_state, 'unknown')
-   assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+   assert.equal(model.sections.needs_you.length, 0)
+   assert.equal(document.querySelectorAll('[data-choice-letter]').length, 0)
    assert.ok(!document.querySelector('[data-session-status]').textContent.includes('interrupted'))
   }
   if (active) assert.ok(document.querySelector('[data-session-status]').textContent.includes('this chat’s agent is replying'))
