@@ -2052,8 +2052,13 @@ def _run(f) -> None:
                 break
             started = last = time.monotonic()
             try:
+                # Maintenance must not depend on an idle timeout: a steady stream
+                # of keyed hints must still renew interest and publish heartbeats.
+                f.beat()
                 with f.lock:
-                    keyed = f.__dict__.pop('_keyed_pending', set())
+                    pending = f.__dict__.setdefault('_keyed_pending', set())
+                    keyed = set(sorted(pending)[:4])
+                    pending.difference_update(keyed)
                     keyed_only = bool(keyed) and not (
                         getattr(f, '_legacy_wake', False) or f._cold.is_set() or f._retry)
                     f._legacy_wake = False
@@ -2065,6 +2070,9 @@ def _run(f) -> None:
                     f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
+            with f.lock:
+                if f.__dict__.get('_keyed_pending'):
+                    f._wake.set()  # bounded batch yields; the remainder owns a trailing pass
             f.readers.release()  # no connection outlives one pass
             readiness = getattr(f, '_facts_readiness', None)
             if readiness is not None:
