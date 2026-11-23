@@ -1436,10 +1436,13 @@ const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
 const legacyLiveCard = c => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
 
 export function Chip({ chip: rawChip, now }) {
+  // Owner-qualified PanelModel text is authoritative, including historical ages.
+  // Legacy execution fallback applies only when no backend display was supplied.
+  rawChip = rawChip.display ? { ...rawChip, title: `${rawChip.display.title}\n${rawChip.display.detail}` } : rawChip
   const ev = ['bg', 'sub'].includes(rawChip.kind) ? chipObservation(rawChip, now / 1000) : null
   const chip = ev
     ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` }
-    : legacyLiveCard(rawChip)
+    : !rawChip.display && legacyLiveCard(rawChip)
       ? { ...rawChip, state: 'unknown', title: `${rawChip.title}\n${rawChip.replica ? `status ${observationLine(unobservedView(rawChip, now / 1000), now / 1000)}` : `status unknown (producer sent no observations) · last known: ${rawChip.state}`}` }
       : rawChip
   const color = chipColor(chip.look || chip.state)

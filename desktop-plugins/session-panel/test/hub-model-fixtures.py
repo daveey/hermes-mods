@@ -109,5 +109,8 @@ for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service')
         cases[f'eta_{kind}_{suffix}'] = f.bundle(f.task(status='scheduled', wait={
             'wait_state': 'external_running', 'waiting_on': on, 'waiting_since': f.NOW - waited,
             'waited_since': f.NOW - waited, 'expected_s': expected, 'estimate_source': 'fixture history'}))
+cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
+    'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
+    computed_at=f.NOW - 120)
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
-    wire=name == 'relative_clock' or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()}))
+    wire=name in ('relative_clock', 'aged_parked') or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()}))

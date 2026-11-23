@@ -878,11 +878,21 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v.update(evidence_state='reported', reported=True)
         provenance = (f'Reported by {row.get("gateway") or "another gateway"}\'s board; no live run evidence reached this gateway.'
                       if reported else 'Board status; no live run evidence for this card.')
-        if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and fresh:
+        # Aged board data still describes the last parked state; absence of a run
+        # identity is expected there. Do not extend this to contradictory evidence
+        # or future read clocks, and never imply the historical producer is live.
+        aged_parked = now > read_at + 60 and reason in PRODUCER_GAPS
+        if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and (fresh or aged_parked):
             v['parked'] = True
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
             v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
             v['details'].append(provenance)
+            if aged_parked:
+                v.pop('wait_kind', None)
+                v.pop('wait_eta', None)
+                age = relative(read_at, 'elapsed') if wire else short_dur(now - read_at)
+                v['detail'] += f' · as of {pacific(read_at)} (panel data {age} old)'
+                v['details'].append('Historical board status: the panel data is over 60 seconds old; this does not establish current execution or producer liveness.')
             v['queued'] = queued
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
         if unknown:

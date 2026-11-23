@@ -109,6 +109,17 @@ calls do not create successful emit records. These bounded records distinguish
 capture/admission and emission from sparse disk checkpoint observations.
 These are producer timings, not installed Desktop click-to-render measurements.
 
+## Historical parked board status
+
+When a board snapshot is over 60 seconds old and a parked card has only a
+producer gap (for example no run identity), retain its last board-derived parked
+or ready detail with `as of <Pacific time> (panel data <elapsed> old)`. The age
+uses `clock_text` in wire mode. Execution evidence remains unknown; omit live
+producer `wait_kind`/ETA signals. Fresh snapshots retain their existing text.
+Real execution contradictions, unknown board states, future read clocks and
+explicit stale/partial owner reads continue to show unknown. Running cards never
+use this historical parked fallback. Session-tasks copies the same model detail.
+
 ## Canonical decision freshness
 
 A separate backend lane reads canonical request lifecycle/resolution and session outcome

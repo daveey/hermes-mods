@@ -112,7 +112,10 @@ def test_idle_heartbeat_reduces_a_clock_edge_without_renewing_inputs(monkeypatch
     t['now'] += 120
     f.beat()
     after = f.bundles['S1']['bundle']
-    assert 'status unknown' in after['model']['sections']['waiting'][0]['detail']
+    parked = after['model']['sections']['waiting'][0]
+    assert 'overdue' in parked['detail'] and 'panel data' in parked['detail']
+    assert 'status unknown' not in parked['detail']
+    assert parked['evidence_state'] == 'unknown' and 'wait_kind' not in parked
     assert {k: v for k, v in after.items() if k != 'model'} == {k: v for k, v in before.items() if k != 'model'}
     assert f._carried == {'S1'} and f._reissue == {'S1'}
     assert 'S1' not in pushed[-1]['fresh']
