@@ -17,7 +17,7 @@ test('real renderer tree guides survive current, legacy and missing theme tokens
  const bundle = await build({ stdin: { contents: `
  import React from 'react'; import {createRoot} from 'react-dom/client'; import {renderModel} from './plugin.js';
  const root = createRoot(document.getElementById('root'));
- window.paint = model => root.render(renderModel(model, {now: 1800000000}));
+ window.paint = (model, now = 1800000000) => root.render(renderModel(model, {now}));
  `, resolveDir: here, sourcefile: 'fixture.mjs' }, bundle: true, format: 'esm', write: false,
  nodePaths: [resolve(deps, 'node_modules')], define: {'process.env.NODE_ENV': '"production"'},
  plugins: [{name: 'unused-sdk', setup(b) {
@@ -65,6 +65,27 @@ test('real renderer tree guides survive current, legacy and missing theme tokens
      await page.screenshot({path:resolve(process.env.HIERARCHY_SCREENSHOTS, `${theme}.png`)})
     }
    }
+  }
+  // Real reducer copy, with an intentionally long administrative reason. A DOM
+  // text assertion alone cannot catch an age hidden by overflow/ellipsis.
+  for (const width of [1100, 700, 420]) {
+   await page.setViewportSize({width, height: 1000})
+   const fixture = fixtures.agent_held_local
+   await page.evaluate(({model, now}) => window.paint(model, now), fixture)
+   await page.waitForFunction(() => document.querySelector('[data-row-detail]')?.textContent.includes('in triage'))
+   const metric = await page.locator('[data-row-detail]').first().evaluate(el => {
+    const text = el.firstChild, content = el.textContent
+    const start = content.lastIndexOf('in triage')
+    const range = document.createRange(); range.setStart(text, start); range.setEnd(text, content.length)
+    const age = range.getBoundingClientRect(), bounds = el.getBoundingClientRect()
+    return {text:content, age:{left:age.left,right:age.right,top:age.top,bottom:age.bottom},
+     bounds:{left:bounds.left,right:bounds.right,top:bounds.top,bottom:bounds.bottom},
+     overflow:el.scrollWidth > el.clientWidth, viewport:innerWidth}
+   })
+   assert.ok(metric.text.includes('5h 20m'), JSON.stringify(metric))
+   assert.ok(!metric.overflow && metric.age.right <= metric.bounds.right + 1 && metric.age.left >= metric.bounds.left - 1 && metric.age.right <= width, `${width}px: age clipped: ${JSON.stringify(metric)}`)
+   assert.ok(metric.age.bottom <= metric.bounds.bottom + 1, `${width}px: age clipped vertically`)
+   if (process.env.HIERARCHY_SCREENSHOTS) await page.screenshot({path:resolve(process.env.HIERARCHY_SCREENSHOTS, `age-${width}.png`)})
   }
   assert.deepEqual(errors, [])
  } finally { await browser.close() }
