@@ -1232,11 +1232,11 @@ class Feed:
             wanted = set(sessions) & set(self.interest)
             if not wanted:
                 return
-            self.__dict__.setdefault('_keyed_pending', set()).update(wanted)
             lane = getattr(self, '_board_lane', None)
             if lane is not None:
                 lane._admit(wanted, time.time())
                 lane.service_wake.set()
+            self.__dict__.setdefault('_keyed_pending', set()).update(wanted)
             self._wake.set()
 
     def refresh_keyed(self, sessions=None):

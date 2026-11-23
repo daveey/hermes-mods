@@ -369,16 +369,29 @@ def test_saturated_64_fifo_coalescing_refills_while_next_strict_capture_is_held(
     lane = compose(f, r)
     f.changes(sessions); drain(lane)
     lane.capacity = 0
+    # This is a service-order proof, not an acquisition latency benchmark. The
+    # deliberately held adapter must not consume the real 2s capture budget and
+    # invalidate all 64 in-flight admissions on a loaded CI runner. Replace only
+    # this capture module's clock (not process-global time or scheduler clocks).
+    import time
+    from types import SimpleNamespace
+    capture_time = SimpleNamespace(**vars(time))
+    capture_time.monotonic = lambda: 100.
+    monkeypatch.setattr(lane.capture, 'time', capture_time)
     entered, release, served = threading.Event(), threading.Event(), threading.Event()
+    publications = {s: threading.Event() for s in sessions}
     published = set()
     def emit(payload):
-        published.update(s for s, b in payload.get('bundles', {}).items()
-                         if any(t.get('title') == 'Saturated shared change' for t in b.get('tasks', ())))
+        completed = {s for s, b in payload.get('bundles', {}).items()
+                     if any(t.get('title') == 'Saturated shared change' for t in b.get('tasks', ()))}
+        published.update(completed)
         if published == set(sessions):
             served.set()
+        for s in completed:
+            publications[s].set()
     f.emit = emit
     def strict(held, *, include_inventory=False):
-        entered.set(); assert release.wait(10)
+        entered.set(); release.wait()
         return strict_empty(held, include_inventory=include_inventory)
     monkeypatch.setattr(r, 'external_capture', strict)
     seen, lock = [], threading.Lock()
@@ -404,7 +417,11 @@ def test_saturated_64_fifo_coalescing_refills_while_next_strict_capture_is_held(
             assert len(lane.pending) == 64
             lane.capacity = 2
         lane.start_service()
-        assert served.wait(5), 'completed pure slots were withheld behind strict acquisition'
+        # Bound each completion hand-off, not the aggregate wall time of 64
+        # real reducers competing with unrelated -j4 work. No retries or sleeps.
+        for s in sessions:
+            assert publications[s].wait(5), 'completed pure slots were withheld behind strict acquisition'
+        assert served.is_set()
         assert seen.index('S00') < seen.index('S63')
         assert not release.is_set() and set(lane.acquiring) == {'external'}
         assert all(f.bundles[s]['bundle']['tasks'][0]['title'] == 'Saturated shared change' for s in sessions)
@@ -502,7 +519,7 @@ def compose(f, r):
     return method(lambda: r, gateway='fixture', profile='default') if method else feedmod.BoardLane(f, lambda: r)
 
 
-@pytest.mark.parametrize('route', ['compute', 'full', 'tick', 'catchup', 'board'])
+@pytest.mark.parametrize('route', ['compute', 'full', 'tick', 'catchup', 'board', 'keyed'])
 def test_real_all_routes_share_materialization_and_pure_projection(api, board, monkeypatch, route):
     import collections
     import sqlite3
@@ -545,6 +562,11 @@ def test_real_all_routes_share_materialization_and_pure_projection(api, board, m
             f._publish(f._compute_all(sessions, refresh=True))
         elif route == 'tick':
             f.tick()
+        elif route == 'keyed':
+            f.queue_keyed(set(sessions))
+            assert f._keyed_pending == set(sessions)
+            f.refresh_keyed()
+            assert not getattr(f, '_keyed_pending', set())
         elif route == 'catchup':
             assert set(f.changes(sessions)['bundles']) == set(sessions)
         else:
@@ -553,6 +575,74 @@ def test_real_all_routes_share_materialization_and_pure_projection(api, board, m
         assert counts['details'] == original
         assert all(f.bundles[s]['bundle']['tasks'][0]['id'] == task for s in sessions)
         assert all('board_admission' in f.bundles[s] for s in sessions)
+    finally:
+        f.stopped.set(); lane.close(); r.release(); conn.close()
+
+
+def test_composed_keyed_recovery_keeps_real_watcher_alive(api, board, monkeypatch):
+    from types import SimpleNamespace
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    kanban_db.create_task(conn, title='Watcher recovery', session_id='S')
+    f = feedmod.Feed(r, emit=lambda _: None)
+    f.watch(['S']); lane = compose(f, r)
+    f.changes(['S']); drain(lane)
+    continued, closed = threading.Event(), threading.Event()
+    class Hints:
+        next_reconcile = 0.
+        reader = SimpleNamespace(source_dirty=False)
+        calls = 0
+        def due(self):
+            self.calls += 1
+            return self.calls == 1
+    hints = Hints()
+    monkeypatch.setattr(api, '_keyed_hints', lambda: hints)
+    class Watch:
+        stale = False
+        calls = 0
+        def set_paths(self, *args, **kwargs):
+            pass
+        def wait(self, timeout):
+            self.calls += 1
+            if self.calls > 1:
+                continued.set()
+                f.stopped.wait(5)
+            return False
+        def close(self):
+            closed.set()
+    thread = threading.Thread(target=api._watch, args=(f, Watch(), lambda: [path]),
+                              name='fixture-composed-keyed-watch')
+    f._watching = True
+    try:
+        thread.start()
+        assert continued.wait(2), 'keyed recovery killed the actual watcher before its next wait'
+        assert thread.is_alive() and not closed.is_set() and f._watching
+        assert f._keyed_pending == {'S'}
+        f.refresh_keyed()
+        assert not getattr(f, '_keyed_pending', set())
+        assert f.bundles['S']['bundle']['tasks'][0]['title'] == 'Watcher recovery'
+    finally:
+        f.stopped.set(); thread.join(3)
+        lane.close(); r.release(); conn.close()
+    assert not thread.is_alive() and closed.is_set()
+
+
+def test_keyed_admission_failure_does_not_mutate_pending(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    f = feedmod.Feed(r, emit=lambda _: None)
+    f.watch(['S']); lane = compose(f, r)
+    try:
+        f.changes(['S']); drain(lane)
+        f._keyed_pending = {'existing'}
+        def fail(*args):
+            raise RuntimeError('admission refused')
+        monkeypatch.setattr(lane, '_admit', fail, raising=False)
+        with pytest.raises(RuntimeError, match='admission refused'):
+            f.queue_keyed({'S'})
+        assert f._keyed_pending == {'existing'}
     finally:
         f.stopped.set(); lane.close(); r.release(); conn.close()
 
