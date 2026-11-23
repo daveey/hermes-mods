@@ -270,8 +270,8 @@ def wait_info(row, now, *, wire=False):
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
         prefix = f'waiting {relative(since, "elapsed") if wire else short_dur(now - since)} · ' if 0 < since <= now else ''
         if due >= now:
-            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
-        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
+            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock'}
+        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock'}
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
     age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
@@ -393,6 +393,11 @@ def wait_reason(row, bundle):
         if not isinstance(event, dict):
             continue
         kind, payload = event.get('kind'), obj(event.get('payload'))
+        if kind == 'decision_retained':
+            disposition = obj(payload.get('disposition'))
+            return flat(obj(payload.get('next_action')).get('instruction') or disposition.get('next_step') or disposition.get('summary'))
+        if kind == 'spend_budget_triaged':
+            return flat(payload.get('reason')) or 'the stage allowance needs review'
         if kind == 'decision_requested':
             return 'asks origin: ' + flat(payload.get('why') or payload.get('reason'))
         if kind in ('scheduled', 'continued', 'blocked'):
@@ -406,6 +411,23 @@ def wait_reason(row, bundle):
 
 def wait_phrase(row, now):
     return wait_info(row, now)['text']
+
+
+def agent_hold(row, bundle):
+    """Administrative custody, not a human ask or permission to resume execution."""
+    if row.get('status') not in ('triage', 'blocked') or row.get('stale') or human_owned(row):
+        return False
+    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    if row.get('status') == 'triage':
+        return True
+    for event in reversed(detail.get('events') or []):
+        if not isinstance(event, dict):
+            continue
+        if event.get('kind') in ('decision_retained', 'spend_budget_triaged', 'decision_requested'):
+            return True
+        if event.get('kind') in ('claimed', 'unblocked', 'completed', 'archived', 'blocked', 'scheduled', 'continued'):
+            break
+    return False
 
 
 def human_owned(row):
@@ -426,6 +448,21 @@ def human_owned(row):
         # always consumes core's predicate, never a second block-kind authority.
         return state in ('blocked', 'triage') and bool(hr.get('action') and hr.get('why_human') and hr.get('interaction')) and row.get('block_kind') not in ('dependency', 'time', 'transient', 'assignment')
     return card_is_open_human_ask(state, row.get('block_kind'), hr)
+
+
+def agent_hold_text(row, bundle):
+    authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
+    if authority.get('id'):
+        task = obj(obj(obj(obj(bundle.get('cards')).get(authority['id'])).get('detail')).get('task'))
+        name = clean(task.get('title')) or authority['id']
+        status = task.get('status') or authority.get('status') or 'status unknown'
+        return f'waiting on the release-authority agent: {name} ({status})'
+    reason = wait_reason(row, bundle) or 'review the held scope and choose the next step'
+    reason = re.sub(r'^Administering owner(?: chat [\w-]+)?:\s*', '', reason, flags=re.I)
+    reason = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', reason))
+    if len(reason) > WAIT_MAX:
+        reason = reason[:WAIT_MAX - 1].rstrip() + '…'
+    return "waiting on this chat's agent to decide: " + reason
 
 
 def ask(row, request=None):
@@ -516,7 +553,7 @@ def _parked(row, on):
     state = row.get('status')
     up = obj(row.get('upstream'))
     unpublished = not on or 'did not publish' in on
-    if not unpublished and not (state == 'triage' and obj(row.get('wait')).get('waiting_on') == 'triage'):
+    if not unpublished:
         return on
     if state == 'triage':
         return 'in triage · waiting to be specified and promoted'
@@ -664,7 +701,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 wi['text'] = dependency_text
             v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})
         on = wi['text']
-        if wi.get('kind') and on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
+        if wi.get('kind') == 'clock' or wi.get('kind') and on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
             # Delivery waits (CI, deploy) paint light blue, not the amber/grey of an ordinary park.
             v['wait_kind'] = wi['kind']
         if wi['raw'] and wi['raw'] != on:
@@ -675,12 +712,13 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['waiting'].append(v)
             continue
         if row.get('stale'):
+            v.pop('wait_kind', None)
             v['detail'] = f'status unknown · last known: {state or "unknown"}; the card could not be re-read'
             sections['waiting'].append(v)
             continue
         matches = [(i, r) for i, r in enumerate(requests) if any(_matches(row, a, same_gateway) for a in _aliases(r))]
-        if human_owned(row):
-            live = next(((i, r) for i, r in matches if r.get('state') in ('open', 'needs_context') and not r.get('resolution')), None)
+        live = next(((i, r) for i, r in matches if r.get('state') in ('open', 'needs_context') and not r.get('resolution')), None)
+        if human_owned(row) or (state in ('blocked', 'triage') and live):
             if live:
                 used.add(live[0]); sections['needs_you'].append(ask(row, live[1]))
             elif matches:
@@ -698,6 +736,20 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         wait = obj(row.get('wait'))
         look = wait.get('wait_state')
+        # Preserve primary producers. Otherwise name the administrative actor,
+        # including when the held card is an off-list dependency on another home.
+        blocker_wait = wait_info(blocker, now, wire=wire)
+        if dependency and blocker_wait.get('kind') and not blocker.get('stale'):
+            v['wait_kind'] = blocker_wait['kind']
+            on = dependency_text + ' · ' + blocker_wait['text']
+        elif dependency and dependency.get('status') in ('running', 'review') and not dependency.get('stale'):
+            v['wait_kind'] = 'card'
+        elif not v.get('wait_kind') and agent_hold(blocker, bundle):
+            v['wait_kind'] = 'agent'
+            actor = agent_hold_text(blocker, bundle)
+            on = dependency_text + ' · ' + actor if dependency else actor
+            if look == 'stalled':
+                look = 'waiting'
         upstream = obj(row.get('blocked_upstream'))
         if upstream and look != 'stalled':
             contained = obj(upstream.get('contained'))
@@ -732,6 +784,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['queued'] = queued
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
         if unknown:
+            v.pop('wait_kind', None)
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
         if state == 'running' and progress and now - progress >= STUCK_S:
@@ -817,14 +870,25 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     groups = _hierarchy.project(sections, rows_by_key, bundle, key=key, row_view=row_view,
                                 successors=lambda row: wait_parents(row, bundle),
                                 terminal=TERMINAL, prefixes=dependency_prefixes)
+    for group in groups:
+        card = obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task') or {}
+        if human_owned(card):
+            group['section'] = 'needs_you'
+        elif not card.get('stale') and wait_info(card, now, wire=wire).get('kind'):
+            group.update(section='waiting', wait_kind=wait_info(card, now, wire=wire)['kind'],
+                         detail=wait_info(card, now, wire=wire)['text'])
+        elif agent_hold(card, bundle):
+            group.update(section='waiting', wait_kind='agent',
+                         detail=agent_hold_text(card, bundle))
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
     # Every waiting row waits on CI or a deploy: the waiting pip and the header dot paint light blue.
     delivery = counts['waiting'] > 0 and all(v.get('wait_kind') for v in sections['waiting'])
+    wait_kind = 'agent' if any(v.get('wait_kind') == 'agent' for v in sections['waiting']) else next((v.get('wait_kind') for v in sections['waiting']), None)
     for pip in pips:
         if pip['section'] == 'waiting' and delivery:
-            pip['wait_kind'] = sections['waiting'][0]['wait_kind']
+            pip['wait_kind'] = wait_kind
     status = published_status(outcome)
     # Presentation fallback only: legacy outcome.kind is never a status envelope.
     # An unavailable outcome does not make otherwise readable panel rows unknown.
@@ -839,7 +903,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     source = 'canonical' if status else 'derived'
     header = {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}
     if delivery and state == 'waiting' and not (counts['needs_you'] or counts['stuck'] or counts['running']):
-        header['wait_kind'] = sections['waiting'][0]['wait_kind']
+        header['wait_kind'] = wait_kind
     result = {'version': 1, 'header': header, 'sections': sections,
               'groups': groups, 'diagnostics': list(bundle.get('input_errors') or [])}
     if wire:

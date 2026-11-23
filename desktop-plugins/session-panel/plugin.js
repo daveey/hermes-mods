@@ -371,12 +371,13 @@ export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: 
 // Light blue: work waiting on CI or a deploy (row `wait_kind`, status reason `linked_work_delivery`). Not amber
 // (nothing is wrong) and not grey (something is actively producing the result).
 export const DELIVERY_COLOR = '#38bdf8'
-/** Backend-selected delivery wait (PanelModel `wait_kind` on a row, pip or header): CI or deploy. */
-export const deliveryWait = item => item?.wait_kind === 'ci' || item?.wait_kind === 'deploy'
+/** Backend-selected producer wait; administrative agent decisions use ordinary blue. */
+export const deliveryWait = item => ['ci', 'deploy', 'clock', 'card'].includes(item?.wait_kind)
+export const waitColor = item => item?.wait_kind === 'agent' ? SECTION_COLOR.running : deliveryWait(item) ? DELIVERY_COLOR : SECTION_COLOR.waiting
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
-  ...(section === 'waiting' ? { border: `1.5px solid ${deliveryWait(row) ? DELIVERY_COLOR : SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+  ...(section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -439,7 +440,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const stripe = status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
-    blocked: 'var(--color-zinc-400)', waiting: hasHeader && deliveryWait(model.header) ? DELIVERY_COLOR : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
+    blocked: 'var(--color-zinc-400)', waiting: hasHeader && model.header.wait_kind ? waitColor(model.header) : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
@@ -532,7 +533,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const next = new Set([...visited, raw.key])
     return jsxs('div', { 'data-tree-node': row.key, 'data-tree-depth': row.depth || 0,
       'data-tree-parent': row.parent || undefined, children: [
-      section === 'needs_you' ? askRow(row) : lineRow(row, section),
+      section === 'needs_you' && row.kind !== 'blocker' ? askRow(row) : lineRow(row, section),
       children.has(row.key) && jsx('div', { 'data-tree-guide': '', style: {
         // Desktop publishes --dt-border, not the legacy --border alias. Keep
         // geometry independent of color resolution so missing tokens cannot erase guides.

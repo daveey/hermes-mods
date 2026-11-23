@@ -11,6 +11,10 @@ f = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(f)
 
 cases = {
+    'agent_held_local': f.held_bundle(),
+    'agent_held_replica': f.held_bundle(remote=True),
+    'agent_held_spend': f.held_bundle(kind='spend_budget_triaged'),
+    'agent_held_human': f.held_bundle(human_request=f.human(), block_kind='needs_input'),
     'canonical_done_with_open_rows': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), outcome_json=f.canonical_outcome('done', revision=41)),
     'derived_idle_with_done_history': f.bundle(done=[f.task('t_done', status='done')], outcome_json={'kind': 'done'}),
     'derived_unknown_with_done_history': f.bundle(done=[f.task('t_done', status='done')], input_errors=['user-steps requests unavailable']),
@@ -26,6 +30,10 @@ cases = {
     'all_sections': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), f.task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}), f.task('t_ready', status='ready'), f.task('t_wait', status='blocked'), rentals=[{'id': 'box', 'name': 'Machine'}], done=[f.task('t_done', status='done')], outcome_json={'state': 'needs_user'}),
 }
 parent, leaf = 't_1111111111111111', 't_2222222222222222'
+for kind, on in [('ci', 'CI job 42'), ('deploy', 'deploy release 42'), ('clock', 'the clock until 2026-11-25 12:00 UTC')]:
+    b = f.held_bundle()
+    b['tasks'][0]['wait']['waiting_on'] = on
+    cases['producer_' + kind] = b
 cases['leaf_wait_with_running'] = f.bundle(
     f.task(status='todo', upstream={'id': parent, 'title': 'Intermediate', 'gateway': 'remote', 'profile': 'default'}),
     f.observed(f.task('t_running', status='running', title='Active portable work')),

@@ -39,7 +39,32 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
+ test(`real reducer ${name}: actor text and human-only red`, async () => {
+  const { model, now } = cases[name]
+  await paint(m.renderModel(model, { now }))
+  const human = name === 'agent_held_human'
+  if (human) {
+   assert.equal(model.sections.needs_you.length, 1)
+   assert.equal(model.sections.waiting.length, 0)
+   assert.equal(window.getComputedStyle(document.querySelector('[data-ask-row]')).borderLeftColor, 'rgb(248, 81, 73)')
+  } else {
+   const pip = document.querySelector('[data-row-pip="waiting"]')
+   assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(59, 130, 246)')
+   assert.ok(document.querySelector('[data-row-detail]').textContent.includes("waiting on this chat's agent to decide: "))
+   assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+  }
+ })
+}
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
+for (const kind of ['ci', 'deploy', 'clock']) {
+ test(`held canonical ${kind} stays producer light-blue`, async () => {
+  const { model, now } = cases['producer_' + kind]
+  await paint(m.renderModel(model, { now }))
+  assert.equal(window.getComputedStyle(document.querySelector('[data-row-pip]')).borderTopColor, 'rgb(56, 189, 248)')
+  assert.ok(!document.querySelector('[data-row-detail]').textContent.includes('agent to decide'))
+ })
+}
 for (const [name, { model, now, status }] of Object.entries(partialCases)) {
  test(`real partial projector ${name}: unknown coverage never becomes empty or consent`, async () => {
   assert.equal(model.header.state, 'unknown')
