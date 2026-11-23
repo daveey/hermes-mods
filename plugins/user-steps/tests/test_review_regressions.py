@@ -94,8 +94,10 @@ def test_card_failure_after_admission_reconciles_same_turn(tmp_path):
         assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 1
 
 
-def router_app(tmp_path, s, receiver):
+def router_app(tmp_path, s, receiver, *, retry_interval=None):
     api = load_module('review_api', ROOT / 'dashboard' / 'plugin_api.py')
+    if retry_interval is not None:
+        api.RETRY_INTERVAL_S = retry_interval
     app = FastAPI()
     app.include_router(api.create_router(ledger_dir=tmp_path, action_store=s, receiver=receiver,
         owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid)))
@@ -115,7 +117,8 @@ def test_startup_recovers_crashed_pending_and_checks_owner(tmp_path):
     assert s.operation(OWNER, oid=op['operationId'])['operation']['dispatchState'] == 'pending'
     runs = Runs()
     receiver = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=runs)
-    with TestClient(router_app(tmp_path, store(tmp_path), receiver)) as client:
+    # Preserve the durable post-crash cadence, but bound it for this fixture.
+    with TestClient(router_app(tmp_path, store(tmp_path), receiver, retry_interval=0.01)) as client:
         result = client.get('/operations/' + op['operationId'], params={'session': OWNER['storedSessionId']}).json()
         from async_receipt_support import await_operation
         assert result['operation']['operationId'] == op['operationId']

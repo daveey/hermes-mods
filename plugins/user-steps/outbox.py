@@ -6,14 +6,22 @@ import contextvars
 import logging
 import threading
 import weakref
+import sys
+from types import ModuleType
 
 
 class Token:
     pass
 
 
-_LOCK = threading.Lock()
-_WORKERS = {}
+# API hot reload may execute this module again while an older worker is in I/O.
+# Keep custody in a process-stable, loader-name-scoped registry. Existing workers
+# accept the current mount's callbacks without creating a second executor.
+_candidate = ModuleType(__name__ + '_registry')
+_candidate.__dict__.update(lock=threading.Lock(), workers={})
+_state = sys.modules.setdefault(_candidate.__name__, _candidate)
+_LOCK = _state.__dict__['lock']
+_WORKERS = _state.__dict__['workers']
 
 
 class Worker:
@@ -54,14 +62,20 @@ class Worker:
 def acquire(key, token, recover, retry, interval):
     with _LOCK:
         worker = _WORKERS.get(key)
-        new = worker is None
+        new = worker is None or not worker.thread.is_alive()
         if new:
+            prior_owners = list(worker.owners) if worker is not None else []
             worker = _WORKERS[key] = Worker(key, recover, retry, interval)
+            worker.owners.update(prior_owners)
         else:
             worker.configure(recover, retry, interval)
         worker.owners.add(token)
         if new:
-            worker.thread.start()
+            try:
+                worker.thread.start()
+            except BaseException:
+                _WORKERS.pop(key, None)
+                raise
         return worker
 
 
