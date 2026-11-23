@@ -1567,6 +1567,25 @@ def test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_th
     assert _mac_jobs(mac) == []
 
 
+def test_mac_start_observes_withdraw_marker_before_final_result(remote, monkeypatch, tmp_path):
+    """The withdrawal marker is published before final.lock/result.json."""
+    real_create = ut.create_job
+    opened = []
+
+    def create_then_begin_withdraw(*args, **kwargs):
+        job = real_create(*args, **kwargs)
+        (job / "withdraw").write_text("superseded")
+        assert ut.read_status(job)["status"] == "waiting_for_user"
+        return job
+
+    monkeypatch.setattr(ut, "create_job", create_then_begin_withdraw)
+    monkeypatch.setattr(ut, "open_window", lambda job: opened.append(job) or "fake")
+    result = ut.start_relayed("true", "", str(tmp_path), {**ORIGIN, "request_id": "a" * 32})
+    assert result["ok"] is False and result["status"] == "withdrawn", result
+    assert result["code"] == "withdrawn" and "nothing ran" in result["error"]
+    assert not opened
+
+
 def test_mac_start_and_withdraw_of_one_request_exactly_one_wins(remote, monkeypatch, tmp_path):
     """Mac side: a claimed start racing its withdrawal. Withdraw first -> the start is refused before any job or
     window; start first -> the job exists and is withdrawn (the error-free result names the Mac job dir)."""

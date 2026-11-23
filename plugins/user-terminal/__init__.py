@@ -2955,7 +2955,8 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
             return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
         job = create_job(command, str(reason or ""), cwd, origin, owner={"kind": "relayed", "gateway": gateway})
     if (job / "withdraw").exists():  # withdrawn between create_job and here: no window at all
-        return {**read_status(job), "ok": False, "job_id": job.name, "code": "withdrawn",
+        # The marker precedes the final result; status.json may still say waiting_for_user.
+        return {**read_status(job), "status": "withdrawn", "ok": False, "job_id": job.name, "code": "withdrawn",
                 "error": f"refused: request {rid} was withdrawn by {gateway} before its window opened; nothing ran"}
     spawn_watchdog(job)  # max age + dead runner; the remote card's board is not readable here
     where, failed = _open_or_fail(job, "could not open a terminal window on the Mac")
