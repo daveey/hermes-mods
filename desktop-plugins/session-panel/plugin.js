@@ -653,8 +653,8 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     decisionFailed(key, e, true)
   }
 }
-function decisionFailed(key, e, admission = false) {
-  for (const [id, p] of provisionalDecisions) if (p.key === key) provisionalDecisions.delete(id)
+function decisionFailed(key, e, admission = false, operationId = null) {
+  for (const [id, p] of provisionalDecisions) if (p.key === key && (operationId == null || id === operationId)) provisionalDecisions.delete(id)
   const retained = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
   const message = String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, '').replace(/^Error:\s*/, '')
   // This exact server refusal occurs BEFORE the work is admitted. Generic 503,
@@ -720,6 +720,12 @@ function finishDecisionTiming(id, t) {
 async function refreshDecisionPanel(intent, call, timing = null) {
   const route = intent.sourceRoute || intent.route
   const started = performance.now()
+  // A background response belongs to one frozen intent, not every same-ID ask
+  // in this panel. Another owner/revision may have been answered in the meantime.
+  const ownReceipt = (id, p) => id === timing?.operationId &&
+    routeKey(p.sourceRoute) === routeKey(route) && sameModelOwner(p.owner, intent.owner) &&
+    p.requestId === intent.requestId && p.decision.expectedRevision === intent.decision.expectedRevision &&
+    p.decision.idempotencyKey === intent.decision.idempotencyKey
   try {
     const data = await call('/api/plugins/session-panel/decision-refresh', { ...route, method: 'POST', body: { session: route.session } })
     if (data?.bundle?.session !== route.session || !validModel(data.bundle.model) || typeof data.epoch !== 'string' || !Number.isSafeInteger(data.rev)) throw Error('Panel refresh unavailable')
@@ -729,13 +735,13 @@ async function refreshDecisionPanel(intent, call, timing = null) {
     // An unrelated chat may have advanced the connection cursor. The per-scope
     // version fence below, not that global cursor, owns this model's freshness.
     // Replace the temporary receipt presentation with canonical classification.
-    for (const [id, p] of provisionalDecisions) if (routeKey(p.sourceRoute) === routeKey(route) && p.requestId === intent.requestId) provisionalDecisions.delete(id)
+    for (const [id, p] of provisionalDecisions) if (ownReceipt(id, p)) provisionalDecisions.delete(id)
     ingestBundle(route.connectionId, route.profile, data.bundle, data)
     modelChanged()
     feedLog(`decision model-applied refresh_ms=${(performance.now()-started).toFixed(1)} rev=${data.rev}`)
   } catch (e) {
     log('decision recorded; panel refresh deferred', e?.message || e)
-    for (const [id, p] of provisionalDecisions) if (routeKey(p.sourceRoute) === routeKey(route) && p.requestId === intent.requestId) decisionFailed(p.key, e)
+    for (const [id, p] of provisionalDecisions) if (ownReceipt(id, p)) decisionFailed(p.key, e, false, id)
   } finally {
     const t = decisionTimings.get(timing?.operationId)
     if (t) { t.refreshed = performance.now(); finishDecisionTiming(timing.operationId, t) }
@@ -758,7 +764,7 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
       retryPost = true
       const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(intent.requestId)}/decisions`, { ...route, method: 'POST', body: intent.decision })
       if (!applyDecisionReceipt(row, intent, data)) throw Error('Invalid decision receipt')
-      await refreshDecisionPanel(intent, call)
+      await refreshDecisionPanel(intent, call, { operationId: data.operation.operationId || data.operation.id })
       return
     }
     const query = `?session=${encodeURIComponent(route.session)}`
@@ -770,7 +776,7 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
     if (!op || (op.operationId || op.id) !== id || !sameModelOwner(r?.owner, intent.owner) || r.requestId !== intent.requestId || r.revision < intent.decision.expectedRevision ||
       (op.requestId && op.requestId !== intent.requestId) || (op.owner && !sameModelOwner(op.owner, intent.owner))) throw Error('Invalid decision receipt')
     if (!applyDecisionReceipt(row, intent, data)) throw Error('Invalid decision receipt')
-    await refreshDecisionPanel(intent, call)
+    await refreshDecisionPanel(intent, call, { operationId: id })
     // Keep intent even after confirmation: an old cached model must never offer the choice again.
     void request
   } catch (e) { decisionFailed(key, e, retryPost) }
