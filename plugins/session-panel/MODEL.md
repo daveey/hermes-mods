@@ -1,5 +1,21 @@
 # PanelModel v1
 
+## Delivery wait ETA
+
+Rows may carry `wait_kind: "ci" | "deploy" | "clock"` and
+`wait_eta: {waited_since: number | null, expected_s: number | null,
+estimate_source: string | null}`. Times are Unix seconds and durations in seconds,
+passed through from the producer without estimating in the reducer. The waiting
+header and section pip may also use these three kinds for light blue (`#38bdf8`).
+Non-delivery rows omit the fields.
+
+Desktop replaces a delivery row's pip with right-aligned `waited / expected  left`
+columns when a park timestamp is present. Its one-second display clock updates
+the readout without network reads or model revisions. Missing estimates show
+`?` and `—`; overruns show `+duration` in `#f0883e`. Hover text names the
+producer's estimate source. Older payloads lacking a park timestamp retain pips.
+Double-clicking the readout retains the owner-qualified Open card action.
+
 ## Relative display text
 
 The feed calls `reduce_panel(..., wire=True)`. A row (or its `decision`)

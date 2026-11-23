@@ -261,6 +261,7 @@ def wait_info(row, now, *, wire=False):
     when it differs), `urls` for an Open action. Never inlines a URL, commit hash or run reference.
     """
     wait = obj(row.get('wait'))
+    eta = {k: wait.get(k) for k in ('waited_since', 'expected_s', 'estimate_source')}
     on = text(wait.get('waiting_on'))
     since = number(wait.get('waiting_since'))
     if not on:
@@ -270,8 +271,8 @@ def wait_info(row, now, *, wire=False):
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
         prefix = f'waiting {relative(since, "elapsed") if wire else short_dur(now - since)} · ' if 0 < since <= now else ''
         if due >= now:
-            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock'}
-        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock'}
+            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta}
+        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta}
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
     age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
@@ -291,7 +292,7 @@ def wait_info(row, now, *, wire=False):
         if len(body) > WAIT_MAX:
             body = body[:WAIT_MAX - 1].rstrip() + '…'
         phrase = f'waiting on {body}' if body else 'waiting'
-    return {'text': phrase + age, 'raw': on, 'urls': urls[:1], **({'kind': kind} if kind else {})}
+    return {'text': phrase + age, 'raw': on, 'urls': urls[:1], **({'kind': kind, 'eta': eta} if kind else {})}
 
 
 def wait_target(row, bundle, detail):
@@ -759,9 +760,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 wi['text'] = dependency_text
             v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})
         on = wi['text']
-        if wi.get('kind') == 'clock' or wi.get('kind') and on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
-            # Delivery waits (CI, deploy) paint light blue, not the amber/grey of an ordinary park.
+        if wi.get('kind') and (wi['kind'] == 'clock' or on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy'))):
+            # Delivery waits (CI, deploy, clock) paint light blue.
             v['wait_kind'] = wi['kind']
+            v['wait_eta'] = wi['eta']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
         # A CI wait links its first run from the word "CI" in the detail line (`inline`), not a separate button.

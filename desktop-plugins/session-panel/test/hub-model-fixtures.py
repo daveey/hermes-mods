@@ -93,5 +93,10 @@ cases.update({
     'tree_cycle': outline_case({'t_a': ['t_b'], 't_b': ['t_a']}),
     'tree_depth': outline_case({f't_{i:x}': [f't_{i+1:x}'] for i in range(10)}),
 })
+for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service'), ('clock', 'the clock until 2026-11-24 14:30 UTC')]:
+    for suffix, expected, waited in [('normal', 1500, 720), ('over', 1500, 2460), ('unknown', None, 720)]:
+        cases[f'eta_{kind}_{suffix}'] = f.bundle(f.task(status='scheduled', wait={
+            'wait_state': 'external_running', 'waiting_on': on, 'waiting_since': f.NOW - waited,
+            'waited_since': f.NOW - waited, 'expected_s': expected, 'estimate_source': 'fixture history'}))
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
     wire=name == 'relative_clock' or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()}))

@@ -38,6 +38,39 @@ import * as SDK from '@hermes/plugin-sdk' // namespace: the optional projector e
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
+// Identical in the two standalone disk plugins; matches core lib/wait-eta.ts.
+export function formatWaitDuration(seconds) {
+  const s = Math.max(0, Number.isFinite(seconds) ? seconds : 0)
+  for (const [size, unit] of [[86400, 'd'], [3600, 'h'], [60, 'm']]) {
+    if (s >= size) {
+      const value = s / size
+      return unit === 'm' || value >= 10 ? `${Math.round(value)}${unit}` : `${value.toFixed(1).replace(/\.0$/, '')}${unit}`
+    }
+  }
+  return `${Math.round(s)}s`
+}
+export function waitReadout(eta, now) {
+  if (!eta || !['ci', 'deploy', 'clock'].includes(eta.wait_kind) || !Number.isFinite(eta.waited_since)) return null
+  const waitedS = Math.max(0, now - eta.waited_since), waited = formatWaitDuration(waitedS)
+  const what = `Waiting on ${{ ci: 'CI', deploy: 'deploy', clock: 'timer' }[eta.wait_kind]}`
+  const source = typeof eta.estimate_source === 'string' ? eta.estimate_source.trim() : ''
+  if (!Number.isFinite(eta.expected_s)) return { waited, expected: null, left: '—', over: false,
+    title: `${what} · ${waited} so far · no estimate${source ? ` (${source})` : ''}` }
+  const leftS = eta.expected_s - waitedS, expected = formatWaitDuration(eta.expected_s), over = leftS < 0
+  const left = over ? `+${formatWaitDuration(-leftS)}` : formatWaitDuration(leftS)
+  return { waited, expected, left, over,
+    title: `${what} · waited ${waited} · expected ${expected}${source ? ` (${source})` : ''} · ${over ? `${left.slice(1)} over` : `${left} left`}` }
+}
+export function renderWaitEta(eta, now, props = {}) {
+  const r = waitReadout(eta, now)
+  return r && jsxs('span', { ...props, 'data-wait-eta': eta.wait_kind, title: r.title,
+    style: { display: 'inline-grid', gridTemplateColumns: '4ch 5ch 5ch', columnGap: 2, alignItems: 'baseline',
+      fontSize: 11, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', flex: 'none', textAlign: 'right', ...props.style },
+    children: [jsx('span', { style: { opacity: .75 }, children: r.waited }),
+      jsx('span', { style: { color: 'var(--muted-foreground)', textAlign: 'left', paddingLeft: 2 }, children: `/ ${r.expected ?? '?'}` }),
+      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : '#38bdf8' }, children: r.left })] })
+}
+
 const ID = 'session-tasks'
 const POLL_MS = 5_000
 const KANBAN_POLL_MS = 10_000
@@ -289,7 +322,7 @@ export function sinceClock(sec, nowMs = Date.now()) {
  *  `delivery` = a non-stalled wait the backend names as CI or a deploy (`waiting_on` starts with `ci`/`deploy`). */
 export function waitLook(wait) {
   const state = wait && typeof wait === 'object' ? str(wait.wait_state) : ''
-  if ((state === 'waiting' || state === 'external_running') && /^(ci|deploy)\b/i.test(str(wait.waiting_on))) return 'delivery'
+  if ((state === 'waiting' || state === 'external_running') && (/^(ci|deploy)\b/i.test(str(wait.waiting_on)) || wait.wait_kind === 'clock' || /^the clock until\b/i.test(str(wait.waiting_on)))) return 'delivery'
   return state === 'stalled' ? 'stalled' : state === 'human' ? 'needs-you' : state === 'waiting' ? 'waiting' : null
 }
 
@@ -397,6 +430,8 @@ function taskChip(t, status) {
     ...(wait && wait.contained ? { contained: wait.contained } : {}),
     waitingOn,
     waitingSince,
+    waitEta: look === 'delivery' ? { waited_since: wait.waited_since, expected_s: wait.expected_s,
+      estimate_source: wait.estimate_source, wait_kind: wait.wait_kind || (/^the clock until\b/i.test(waitingOn) ? 'clock' : /^ci\b/i.test(waitingOn) ? 'ci' : 'deploy') } : null,
     // What the card asks the user to do, in its own words (Needs you shows this, never the card title).
     humanRequest: humanRequestOf(t.human_request),
     // The producer's raw v1 work records (null = older producer); projected at render time, never here.
@@ -1417,6 +1452,7 @@ export function Chip({ chip: rawChip, now }) {
       ? () => window.__computeRentalsShow(chip.id)
       : undefined
   const age = elapsed(chip.since, now)
+  const eta = chip.look === 'delivery' && renderWaitEta(chip.waitEta, now / 1000)
   return jsxs(clickable ? 'button' : 'span', {
     type: clickable ? 'button' : undefined,
     onClick,
@@ -1440,8 +1476,9 @@ export function Chip({ chip: rawChip, now }) {
       fontFamily: 'inherit'
     },
     children: [
-      jsx('span', {
+      !eta && jsx('span', {
         'aria-hidden': true,
+        'data-chip-pip': '',
         className: chip.state === 'running' ? 'session-tasks-pulse' : undefined,
         style: { width: 6, height: 6, borderRadius: 999, background: color, flex: 'none' }
       }),
@@ -1451,7 +1488,7 @@ export function Chip({ chip: rawChip, now }) {
       jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.display?.title || chip.label) }),
       chip.extra && jsx('span', { style: { opacity: 0.7, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: chip.extra }),
       chip.state !== 'running' && jsx('span', { style: { color, fontSize: 10.5 }, children: chip.look === 'stalled' ? 'stalled' : chip.state }),
-      age && jsx('span', { style: { opacity: 0.6, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: age })
+      eta || (age && jsx('span', { style: { opacity: 0.6, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: age }))
     ]
   })
 }
@@ -1491,7 +1528,7 @@ export function cardRowModel(chip, now = Date.now()) {
   }
 }
 
-function CardRow({ chip, now }) {
+export function CardRow({ chip, now }) {
   const m = cardRowModel(chip, now)
   const color = chipColor(chip.look || (m.status === 'unknown' ? 'unknown' : chip.state))
   const clickable = !!chip.connectionId && !!chip.profile
@@ -1540,13 +1577,15 @@ function CardRow({ chip, now }) {
           })
         ]
       }),
+      jsxs('span', { style: { display: 'flex', alignItems: 'baseline', gap: 6 }, children: [
+      chip.look === 'delivery' && renderWaitEta(chip.waitEta, now / 1000),
       m.prUrl
         ? jsx('a', {
             href: m.prUrl, target: '_blank', rel: 'noreferrer', onClick: e => e.stopPropagation(),
             style: { fontSize: 11, lineHeight: '16px', whiteSpace: 'nowrap', color: 'var(--accent, #3b82f6)' },
             children: m.prLabel
           })
-        : jsx('span', {})
+        : null] })
     ]
   })
 }
@@ -1566,6 +1605,10 @@ function Strip() {
   const route = focusedRoute()
   const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
   useEffect(() => subscribe(next => (setSnap(next), setNow(Date.now()))), [])
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) setNow(Date.now()) }, 1000)
+    return () => clearInterval(timer)
+  }, [])
   useEffect(() => void refresh(), [focused, scope])
   const chips = snap.runtime === focused && snap.scope === scope ? progressChips(snap.chips) : []
   // The session panel shows this work in its own sections; the strip stays subscribed so polling keeps running.

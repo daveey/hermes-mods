@@ -3,6 +3,39 @@ import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
+// Identical in the two standalone disk plugins; matches core lib/wait-eta.ts.
+export function formatWaitDuration(seconds) {
+  const s = Math.max(0, Number.isFinite(seconds) ? seconds : 0)
+  for (const [size, unit] of [[86400, 'd'], [3600, 'h'], [60, 'm']]) {
+    if (s >= size) {
+      const value = s / size
+      return unit === 'm' || value >= 10 ? `${Math.round(value)}${unit}` : `${value.toFixed(1).replace(/\.0$/, '')}${unit}`
+    }
+  }
+  return `${Math.round(s)}s`
+}
+export function waitReadout(eta, now) {
+  if (!eta || !['ci', 'deploy', 'clock'].includes(eta.wait_kind) || !Number.isFinite(eta.waited_since)) return null
+  const waitedS = Math.max(0, now - eta.waited_since), waited = formatWaitDuration(waitedS)
+  const what = `Waiting on ${{ ci: 'CI', deploy: 'deploy', clock: 'timer' }[eta.wait_kind]}`
+  const source = typeof eta.estimate_source === 'string' ? eta.estimate_source.trim() : ''
+  if (!Number.isFinite(eta.expected_s)) return { waited, expected: null, left: '—', over: false,
+    title: `${what} · ${waited} so far · no estimate${source ? ` (${source})` : ''}` }
+  const leftS = eta.expected_s - waitedS, expected = formatWaitDuration(eta.expected_s), over = leftS < 0
+  const left = over ? `+${formatWaitDuration(-leftS)}` : formatWaitDuration(leftS)
+  return { waited, expected, left, over,
+    title: `${what} · waited ${waited} · expected ${expected}${source ? ` (${source})` : ''} · ${over ? `${left.slice(1)} over` : `${left} left`}` }
+}
+export function renderWaitEta(eta, now, props = {}) {
+  const r = waitReadout(eta, now)
+  return r && jsxs('span', { ...props, 'data-wait-eta': eta.wait_kind, title: r.title,
+    style: { display: 'inline-grid', gridTemplateColumns: '4ch 5ch 5ch', columnGap: 2, alignItems: 'baseline',
+      fontSize: 11, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', flex: 'none', textAlign: 'right', ...props.style },
+    children: [jsx('span', { style: { opacity: .75 }, children: r.waited }),
+      jsx('span', { style: { color: 'var(--muted-foreground)', textAlign: 'left', paddingLeft: 2 }, children: `/ ${r.expected ?? '?'}` }),
+      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : '#38bdf8' }, children: r.left })] })
+}
+
 const ID = 'session-panel'
 const VERSION = 'session-panel-v24-visible-tree-guides'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
@@ -500,6 +533,8 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const compact = section === 'waiting' || section === 'ready'
     const title = plain(row.title) || row.id
     const own = ownCard(row)
+    const eta = section === 'waiting' && deliveryWait(row) && renderWaitEta({ ...row.wait_eta, wait_kind: row.wait_kind }, now,
+      own ? { 'data-open-own-card': '', onDoubleClick: () => onAction?.(row, own) } : {})
     // The backend names the word of the detail that opens a link (`inline: "CI"`): that word is the link, no button.
     const word = action => {
       const w = str(action.inline).replace(/[^A-Za-z0-9 ]/g, '')
@@ -515,7 +550,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const hover = [title, ...(row.details || [])].join('\n')
     return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
-      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
+      eta ? jsx('span', { 'aria-hidden': true }) : jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
@@ -527,7 +562,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.
         row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text })
       ] }),
-      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row, own, hit ? linked : null) })
+      jsxs('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: [eta, ...openLinks(row, own, hit ? linked : null)] })
     ] }, row.key)
   }
   // The backend owns parent/depth. Keep classification/counts on the original

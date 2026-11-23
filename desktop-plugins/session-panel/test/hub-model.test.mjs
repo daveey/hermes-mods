@@ -82,6 +82,60 @@ for (const state of ['dismissed', 'answered', 'withdrawn', 'open']) {
   }
  })
 }
+const tasksEta = await import('../../session-tasks/plugin.js')
+test('ETA formatter matches both standalone plugins', () => {
+ for (const [seconds, text] of [[30, '30s'], [720, '12m'], [12240, '3.4h'], [50400, '14h'], [172800, '2d'], [129600, '1.5d']]) {
+  assert.equal(m.formatWaitDuration(seconds), text)
+  assert.equal(tasksEta.formatWaitDuration(seconds), text)
+ }
+})
+for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'over', 'unknown']) {
+ test(`real reducer ETA ${kind}/${state} replaces only its pip, ticks and preserves opening`, async () => {
+  const { model, now } = cases[`eta_${kind}_${state}`]
+  const row = model.sections.waiting[0]
+  const actions = []
+  await paint(m.renderModel(model, { now, onAction: (...args) => actions.push(args) }))
+  const article = document.querySelector('[data-line-row]')
+  assert.ok(article.querySelector('[data-row-pip]') === null)
+  const eta = article.querySelector('[data-wait-eta]')
+  assert.equal(eta.dataset.waitEta, kind)
+  assert.ok(eta.title.includes('fixture history'))
+  assert.equal(eta.querySelector('[data-eta-left]').textContent, {normal:'13m',over:'+16m',unknown:'—'}[state])
+  if (state === 'over') assert.equal(eta.querySelector('[data-eta-left]').style.color, 'rgb(240, 136, 62)')
+  if (state === 'unknown') assert.ok(eta.textContent.includes('/ ?'))
+  eta.dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true }))
+  assert.equal(actions[0][1].target.id, row.id)
+  await paint(m.renderModel(model, { now: now + 60 }))
+  if (state === 'normal') assert.equal(document.querySelector('[data-eta-left]').textContent, '12m')
+  const wait = {...row.wait_eta, wait_kind:kind, wait_state:'external_running', waiting_on: kind === 'clock' ? 'the clock until 2026-11-24 14:30 UTC' : `${kind} example`}
+  const [chip] = tasksEta.sessionTaskChips([{id:row.id, status:'scheduled', wait}])
+  assert.equal(chip.look, 'delivery')
+  assert.equal(tasksEta.chipColor(chip.look), '#38bdf8')
+  assert.deepEqual(tasksEta.waitReadout(chip.waitEta, now), m.waitReadout({...row.wait_eta,wait_kind:kind}, now))
+  await paint(React.createElement(tasksEta.Chip, { chip, now: now * 1000 }))
+  assert.ok(document.querySelector('[data-chip-pip]') === null)
+  assert.equal(document.querySelector('[data-wait-eta]').dataset.waitEta, kind)
+  await paint(React.createElement(tasksEta.CardRow, {chip, now: now * 1000}))
+  assert.equal(document.querySelector('[data-wait-eta]').dataset.waitEta, kind)
+ })
+}
+test('ordinary waits and stale/blocked chip controls keep pips', async () => {
+ const model = structuredClone(cases.eta_ci_normal.model)
+ delete model.sections.waiting[0].wait_kind
+ await paint(m.renderModel(model))
+ assert.ok(document.querySelector('[data-row-pip]'))
+ assert.ok(document.querySelector('[data-wait-eta]') === null)
+ for (const status of ['blocked','running']) {
+  const [chip] = tasksEta.sessionTaskChips([{id:'t_control',status,wait:{wait_state:'external_running',waiting_on:'ci example',waited_since:1,expected_s:50}}])
+  await paint(React.createElement(tasksEta.Chip,{chip,now:100000}))
+  assert.ok(document.querySelector('[data-chip-pip]'))
+  assert.ok(document.querySelector('[data-wait-eta]') === null)
+ }
+ const [stale] = tasksEta.sessionTaskChips([{id:'t_stale',status:'scheduled',stale:true,wait:{wait_state:'external_running',waiting_on:'the clock until tomorrow',waited_since:1,expected_s:50}}])
+ assert.equal(stale.look,null)
+ assert.equal(stale.waitEta,null)
+ for (const wait_state of ['human','stalled']) assert.notEqual(tasksEta.waitLook({wait_state,wait_kind:'clock',waiting_on:'the clock until tomorrow'}),'delivery')
+})
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 for (const kind of ['ci', 'deploy', 'clock']) {
  test(`held canonical ${kind} stays producer light-blue`, async () => {
