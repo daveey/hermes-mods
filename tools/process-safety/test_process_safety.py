@@ -61,6 +61,14 @@ def kill_tagged(tag):
         finally:
             os.close(fd)
 
+def dead_status(status):
+    """A reaped process can disappear during open/read of its proc status."""
+    try:
+        return '\nState:\tZ' in status.read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+
+
 class SafetyTests(unittest.TestCase):
     def test_foreign_same_name_process_never_receives_signal(self):
         # Same executable as the target, but a foreign session, like a shared agent.
@@ -128,8 +136,23 @@ class SafetyTests(unittest.TestCase):
             pid = int(marker.read_text())
             status = Path(f'/proc/{pid}/status')
             deadline = time.monotonic() + 2
-            while status.exists() and '\nState:\tZ' not in status.read_text():
+            while not dead_status(status):
                 self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+
+    def test_dead_status_accepts_exit_during_proc_read(self):
+        for error in (FileNotFoundError(), ProcessLookupError()):
+            with self.subTest(error=type(error).__name__), patch.object(Path, 'read_text', side_effect=error):
+                self.assertTrue(dead_status(Path('/proc/self/status')))
+
+    def test_dead_status_requires_missing_or_zombie_process(self):
+        for state in ('R', 'S', 'T'):
+            with self.subTest(state=state), patch.object(Path, 'read_text', return_value=f'Name:\tpython\nState:\t{state}\n'):
+                self.assertFalse(dead_status(Path('/proc/self/status')))
+        with patch.object(Path, 'read_text', return_value='Name:\tpython\nState:\tZ (zombie)\n'):
+            self.assertTrue(dead_status(Path('/proc/self/status')))
+        with patch.object(Path, 'read_text', side_effect=PermissionError()):
+            with self.assertRaises(PermissionError):
+                dead_status(Path('/proc/self/status'))
 
     def test_permission_denied_does_not_skip_later_handles(self):
         with patch.object(signal, 'pidfd_send_signal', side_effect=[PermissionError(), None]) as sender:
