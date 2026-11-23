@@ -12,7 +12,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 14
+const VERSION = 15
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -894,7 +894,12 @@ export async function refreshRequests(call = api) {
     // settling after a wake (SlowLinkHeldError/PowerSettlingError; IPC strips `code`, the name survives in the
     // message). That is "no new answer yet", not an outage: keep the last authoritative queue; the next poll retries.
     if (isSkippedRead(e)) return
-    canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Earlier asks shown below are not approvals.` }
+    const reason = /Timed out connecting to Hermes backend/i.test(str(e?.message))
+      ? 'Hermes did not return the action queue in time.'
+      : /lane_busy/.test(str(e?.message))
+        ? 'Hermes is busy with other feed reads; this queue read did not start.'
+        : 'Hermes could not read the action queue.'
+    canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable on ${route.connectionId || 'this device'} (${route.profile || 'default'}): ${reason} Choose Reload actions to retry this read; it does not submit or resend a decision. Earlier asks remain unavailable until the queue reloads. Details: ${e.message}` }
     publishCanonical()
   }
 }

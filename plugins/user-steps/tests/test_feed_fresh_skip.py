@@ -109,6 +109,67 @@ def test_requests_route_skips_remote_only_when_fresh(tmp_path):
     assert second.json()['requests'] == first.json()['requests']
 
 
+def test_queue_admission_reports_busy_before_desktop_timeout(tmp_path, monkeypatch):
+    """A saturated feed must answer 503, not spend Desktop's 10s budget queued.
+
+    Use the real core lane, held until teardown. The 2s watchdog only bounds the
+    test: old code waits the lane's 25s default and hits it without reading asks.
+    """
+    import asyncio
+    import threading
+    import httpx
+    from fastapi import FastAPI
+    lanes = pytest.importorskip('hermes_cli.web_thread_lanes')
+    from test_kanban_mirror import fixture
+    mirror, store, path, _hr = fixture(tmp_path)
+    api = load_module('queue_admission_api', ROOT / 'dashboard' / 'plugin_api.py')
+    api.RETRY_INTERVAL_S = 0
+    monkeypatch.setattr(api, '_run_in_lane', lanes.run_in_lane)
+    app = FastAPI()
+    router = api.create_router(
+        ledger_dir=tmp_path / 'ledger', state_db=tmp_path / 'missing.db', action_store=store,
+        owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid),
+        kanban_boards=[('default', path)], kanban_mirror=mirror)
+    app.include_router(router)
+    reads = []
+    mirror.reconcile_poll = lambda *args: reads.append(args)
+
+    async def scenario():
+        # Isolate this module's lane table, never a production app's configuration.
+        monkeypatch.setattr(lanes, '_lanes', {})
+        monkeypatch.setattr(lanes, '_deadline_s', None)
+        lanes.configure(dict(lanes.DEFAULT_SIZES, feed=1), queue_deadline_s=25)
+        entered, release = threading.Event(), threading.Event()
+        def busy():
+            entered.set()
+            assert release.wait(5), 'test failed to release the occupied lane'
+        holder = asyncio.create_task(lanes.run_in_lane('feed', busy))
+        try:
+            async with asyncio.timeout(2):
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                try:
+                    response = await asyncio.wait_for(client.get('/requests?session=session-a'), 2)
+                except TimeoutError:
+                    pytest.fail('Action queue timed out waiting for feed capacity instead of returning actionable 503')
+                assert response.status_code == 503
+                assert response.json()['detail']['error'] == 'lane_busy'
+                assert response.headers['retry-after']
+                assert reads == []  # refused work never starts later
+                release.set()
+                await holder
+                recovered = await client.get('/requests?session=session-a')
+                assert recovered.status_code == 200
+                assert isinstance(recovered.json()['requests'], list)
+                assert len(reads) == 1
+        finally:
+            release.set()
+            await holder  # join before mocks/stores are restored
+            router.stop_delivery()
+    asyncio.run(scenario())
+
+
 def test_a_failed_strict_pass_clears_an_earlier_fresh_mark():
     self, remote, _ = fake()
     mirror_mod.Mirror.reconcile(self, OWNER, strict=True)  # clean: fresh
