@@ -820,6 +820,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
+    # Every waiting row waits on CI or a deploy: the waiting pip and the header dot paint light blue.
+    delivery = counts['waiting'] > 0 and all(v.get('wait_kind') for v in sections['waiting'])
+    for pip in pips:
+        if pip['section'] == 'waiting' and delivery:
+            pip['wait_kind'] = sections['waiting'][0]['wait_kind']
     status = published_status(outcome)
     # Presentation fallback only: legacy outcome.kind is never a status envelope.
     # An unavailable outcome does not make otherwise readable panel rows unknown.
@@ -832,7 +837,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     state = status['kind'] if status else derived
     label = HEADER_LABELS.get(state, state).replace('needs-you', 'needs you')
     source = 'canonical' if status else 'derived'
-    result = {'version': 1, 'header': {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
+    header = {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}
+    if delivery and state == 'waiting' and not (counts['needs_you'] or counts['stuck'] or counts['running']):
+        header['wait_kind'] = sections['waiting'][0]['wait_kind']
+    result = {'version': 1, 'header': header, 'sections': sections,
               'groups': groups, 'diagnostics': list(bundle.get('input_errors') or [])}
     if wire:
         result = _relative.encode(result)

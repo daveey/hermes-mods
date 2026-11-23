@@ -165,6 +165,17 @@ def test_delivery_wait_kind_only_on_ci_and_deploy_rows():
     assert 'wait_kind' not in waiting('cinema tickets')
 
 
+def test_header_and_pip_go_light_blue_only_when_every_wait_is_delivery():
+    def header(*ons):
+        tasks = [task(f't_{i}', status='scheduled', wait={'wait_state': 'external_running', 'waiting_on': on, 'waiting_since': NOW - 120})
+                 for i, on in enumerate(ons)]
+        return model.reduce_panel(bundle(*tasks), now=NOW)['header']
+    h = header('deploy hermes-hub mods-pull')
+    assert h['wait_kind'] == 'deploy' and [p.get('wait_kind') for p in h['pips'] if p['section'] == 'waiting'] == ['deploy']
+    mixed = header('ci run 1', 'the result of a review')
+    assert 'wait_kind' not in mixed and all('wait_kind' not in p for p in mixed['pips'])
+
+
 def test_deploy_wait_hides_hashes():
     r = waiting('deploy hermes-hub scheduled hub-core-update / mods-pull for core106bf5b0abcdef12…and mods10902a1a99aa…')
     assert r['detail'] == 'waiting on hub deploy · 2m on remote'

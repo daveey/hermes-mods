@@ -101,7 +101,7 @@ test('CI/deploy waits paint light blue: row box, waiting pip and header dot (Dav
   const blue = /rgb\(56, 189, 248\)|#38bdf8/i
   const pips = [{ section: 'waiting', count: 1, label: 'waiting' }]
   await paint(m.renderModel(model({ waiting: [row('a', { wait_kind: 'deploy', detail: 'waiting on deploy' })] },
-    { state: 'waiting', status: status(['linked_work_open', 'linked_work_delivery']), pips })))
+    { state: 'waiting', status: status(['linked_work_open']), wait_kind: 'deploy', pips: [{ ...pips[0], wait_kind: 'deploy' }] })))
   assert.match(document.querySelector('[data-row-pip]').style.border, blue)
   assert.equal(document.querySelector('[data-row-pip]').dataset.waitKind, 'deploy')
   assert.match(document.querySelector('[data-model-pip="waiting"] span').style.border, blue)

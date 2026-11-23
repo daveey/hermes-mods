@@ -222,6 +222,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
         "source": {"enum": ["canonical", "derived"]},
         "state": {"type": "string"},
         "status": {"type": ["object", "null"], "description": "Validated core status_version=1 envelope, preserved with identity, revision, generation, coverage and presentation."},
+        "wait_kind": {"enum": ["ci", "deploy"], "description": "Set when the header is waiting and every waiting row waits on CI or a deploy: the header dot paints light blue."},
         "counts": {
           "type": "object",
           "required": ["needs_you", "stuck", "running", "waiting", "ready", "done"],
@@ -231,7 +232,8 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
           "type": "object", "required": ["section", "count", "label"],
           "properties": {
             "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
-            "count": {"type": "integer", "minimum": 1}, "label": {"type": "string"}
+            "count": {"type": "integer", "minimum": 1}, "label": {"type": "string"},
+            "wait_kind": {"enum": ["ci", "deploy"]}
           }
         }}
       }

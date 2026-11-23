@@ -371,13 +371,12 @@ export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: 
 // Light blue: work waiting on CI or a deploy (row `wait_kind`, status reason `linked_work_delivery`). Not amber
 // (nothing is wrong) and not grey (something is actively producing the result).
 export const DELIVERY_COLOR = '#38bdf8'
-/** Backend-selected delivery wait: the canonical envelope's reason code says every open item waits on CI/deploy. */
-export const deliveryWait = status => status?.presentation?.stripe === 'waiting' && Array.isArray(status?.presentation?.reason_codes) &&
-  status.presentation.reason_codes.includes('linked_work_delivery') && status?.kind !== 'running'
+/** Backend-selected delivery wait (PanelModel `wait_kind` on a row, pip or header): CI or deploy. */
+export const deliveryWait = item => item?.wait_kind === 'ci' || item?.wait_kind === 'deploy'
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
-  ...(section === 'waiting' ? { border: `1.5px solid ${row?.wait_kind === 'ci' || row?.wait_kind === 'deploy' ? DELIVERY_COLOR : SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+  ...(section === 'waiting' ? { border: `1.5px solid ${deliveryWait(row) ? DELIVERY_COLOR : SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -440,7 +439,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const stripe = status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
-    blocked: 'var(--color-zinc-400)', waiting: deliveryWait(status) ? DELIVERY_COLOR : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
+    blocked: 'var(--color-zinc-400)', waiting: hasHeader && deliveryWait(model.header) ? DELIVERY_COLOR : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
@@ -572,9 +571,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
       ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
-        // The waiting pip goes light blue only when every waiting row is a CI/deploy wait.
-        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip.section === 'waiting' && model.sections.waiting.length > 0 &&
-          model.sections.waiting.every(row => row.wait_kind === 'ci' || row.wait_kind === 'deploy') ? { wait_kind: 'ci' } : null) }),
+        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip) }),
         `${pip.count} ${pip.label}`
       ] }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
