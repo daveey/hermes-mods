@@ -9,12 +9,12 @@ PLAN = '## Build plan\n\n1. Update the example renderer to show the new control.
 ASK = 'Say **go** and I will start the build.'
 
 
-def publish(tmp_path, reply, *, kind='approve', source=None):
+def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     if source:
-        core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
-    llm = lambda *_: json.dumps({'steps': [{'text': ASK, 'kind': kind, 'verbatim_span': ASK}], 'resolved': []})
+        core.add_step(OWNER['storedSessionId'], span, ['Go', 'Change plan'], ledger=ledger)
+    llm = lambda *_: json.dumps({'steps': [{'text': span, 'kind': kind, 'verbatim_span': span}], 'resolved': []})
     result = core.process_reply(reply, OWNER['storedSessionId'], ledger=ledger, llm=llm,
                                 action_store=store, action_owner=OWNER)
     return store, store.requests(OWNER), result
@@ -108,7 +108,7 @@ def test_repeated_final_transform_does_not_duplicate_confirmation(tmp_path):
 def test_trailing_limits_are_frozen_too(tmp_path):
     limit = 'Limit: do not publish or deploy until a separate review.'
     _, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK + '\n\n' + limit)
-    assert limit in requests[0]['scope']['markdown']
+    assert not requests[0]['scope']['complete']  # Ask must be the final block.
 
 
 @pytest.mark.parametrize('source', [None, 'session_outcome'])
@@ -138,8 +138,7 @@ def test_fenced_confirmation_never_becomes_authorizing(tmp_path, source, opening
 def test_closed_code_in_plan_preserves_limits(tmp_path):
     code = '\n\n````text\n```example\nNo network writes.\n```\n````'
     _, requests, _ = publish(tmp_path, PLAN + code + '\n\n' + ASK)
-    assert requests[0]['scope']['complete'] is True
-    assert code in requests[0]['scope']['markdown']
+    assert not requests[0]['scope']['complete']  # Adjacent block is code, not prose.
 
 
 def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path):
@@ -147,3 +146,36 @@ def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path):
     op = store.decide(OWNER, decision(requests[0], choice='change-plan', text='Use a smaller patch'))['operation']
     assert op['intent']['executionAuthorized'] is False
     assert PLAN in op['intent']['request']['scope']['markdown']
+
+
+# Transcribed from both independent reviewers' compare.py / probe.py.
+@pytest.mark.parametrize('source', [None, 'session_outcome'])
+@pytest.mark.parametrize('block,span', [
+    (ASK + ' Say yes to also deploy production.', ASK + ' Say yes to also deploy production.'),
+    ('Example only:\n\n    ' + ASK, ASK),
+    ('> ```text\n> ' + ASK + '\n> ```', ASK),
+    ('Example only: `' + ASK + '`', ASK),
+    ('- ' + ASK, ASK),
+    ('1. ' + ASK, ASK),
+    ('> ' + ASK, ASK),
+    ('<div>\n' + ASK + '\n</div>', ASK),
+    ('<!--\n' + ASK + '\n-->', ASK),
+    ('`' + ASK + '`', ASK),
+    (ASK + '\n\nLimit: no network writes.', ASK),
+    (ASK + '\nLimit: no network writes.', ASK),
+    ('````markdown\n```example\n' + ASK + '\n```\n````', ASK),
+    (ASK + '\n\nSay yes to also deploy production.', ASK),
+    ('Example: say yes to deploy.\n\n' + ASK, ASK),
+    ('Example only:\n\n' + ASK, ASK),
+])
+def test_reviewer_probes_never_offer_authorizing_choice(tmp_path, source, block, span):
+    reply = PLAN + '\n\n' + block
+    store, requests, _ = publish(tmp_path, reply, source=source, span=span)
+    assert core.preceding_plan(reply, span) is None
+    assert not any(r['scope']['complete'] for r in requests)
+    assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+    for r in requests:
+        if r['choices']:
+            op = store.decide(OWNER, decision(r, choice=r['choices'][0]['id'],
+                                             text=r['choices'][0]['label']))['operation']
+            assert not op['intent']['executionAuthorized']

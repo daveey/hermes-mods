@@ -14,9 +14,12 @@ For yes/go confirmation, use `action_request` with the full exact plan in
 “say go” in a free-text user-step, and never emit another directive for an ask
 already published by the tool.
 
-As a compatibility backstop, extracted explicit confirmations after a structured
-plan in the same assistant message freeze that preceding text into the approval
-scope. They show Go and Change plan; clicking Go records an exact-revision approval
+As a compatibility backstop, exactly one explicit top-level prose confirmation,
+as the final block immediately after a substantive plan, freezes the preceding
+text into the approval scope. Unsupported Markdown (including code, quotes, HTML
+and indented text), multiple confirmations anywhere, trailing blocks and intervening
+non-plan text are not recovered. Use explicit `action_request` for richer plans.
+Eligible requests show Go and Change plan; clicking Go records an exact-revision approval
 and delivers a Go user turn with canonical scope/receipt metadata. A standalone
 ask, a promised future plan, or a fenced example still grants no permission.
 Session-outcome confirmations with Go / Change plan choices use the same backstop
