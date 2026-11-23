@@ -334,11 +334,19 @@ def test_terminal_last_known_status_is_unknown_until_owner_recovery():
 
 
 def test_partial_card_cannot_revive_an_unused_mirror_ask():
-    for flag in ({'stale': True}, {'partial_source_unknown': 'origin_ledger_unavailable'}):
-        row = task(human_request=human(), block_kind='needs_input', **flag)
-        value = model.reduce_panel(bundle(row, requests=[request()]), now=NOW)
-        assert not value['sections']['needs_you']
-        assert value['sections']['waiting'][0]['evidence_state'] == 'unknown'
+    for state in ('blocked', 'triage', 'scheduled'):
+        for flag in ({'stale': True}, {'partial_source_unknown': 'origin_ledger_unavailable'}):
+            row = task(status=state, human_request=human(), block_kind='needs_input',
+                       wait={'wait_state': 'human'}, **flag)
+            value = model.reduce_panel(bundle(row, requests=[request()]), now=NOW)
+            assert not value['sections']['needs_you']
+            assert value['sections']['waiting'][0]['evidence_state'] == 'unknown'
+            # Recovery of the source restores the same current request, not a new ask.
+            for field in flag:
+                row.pop(field)
+            recovered = model.reduce_panel(bundle(row, requests=[request()]), now=NOW)
+            assert len(recovered['sections']['needs_you']) == 1
+            assert recovered['sections']['needs_you'][0]['request_id'] == 'req-1'
     known = model.reduce_panel(bundle(task(human_request=human()), requests=[request()]), now=NOW)
     assert len(known['sections']['needs_you']) == 1
 

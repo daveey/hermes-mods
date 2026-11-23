@@ -432,7 +432,11 @@ def agent_hold(row, bundle):
 
 
 def human_owned(row):
-    """Use the same current-card attention contract as the lane totals."""
+    """Use the shared attention contract only for readable card snapshots."""
+    # Partial source coverage is panel-local evidence: an old mirror ask cannot
+    # become current merely because core can still validate its stored request.
+    if row.get('stale') or row.get('partial_source_unknown'):
+        return False
     try:
         from hermes_cli.kanban_open_asks import needs_you
     except ImportError:
