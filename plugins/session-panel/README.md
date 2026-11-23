@@ -35,6 +35,18 @@ Bundles are computed outside any lock, on per-thread read-only connections (reop
 
 Changes with no `task_events` row (a chat link adopted or released, a wake probe's next run, another card's queue move, origin receipt history) show at the next full refresh: within 60 s for a chat with open cards, 5 min for one with none.
 
+## Urgent board-read mitigation
+
+`HERMES_PANEL_BOARD_COALESCE` is default-on (unset or any value except
+`0`, `false`, `off`, `no`, case-insensitive). BoardLane runs one hydration
+worker at a time and retains each session's pending change until at least
+three seconds after that session's previous read finishes. Changes during a
+read or cooldown coalesce into one trailing read; the service wakes at the
+cooldown deadline even without a later source event. Other eligible sessions
+keep oldest-pending-first service. This deliberately trades immediate board
+freshness for bounded read pressure. Set the flag to `0` before normal plugin
+reload to restore the legacy four-worker, no-cooldown behavior.
+
 ## Desktop
 
 `desktop-plugins/session-panel` runs the client (its README, "Pushed from the gateway"). A gateway without this plugin answers 404 and the Desktop keeps its own reads for it, asking again after 10 min.

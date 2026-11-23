@@ -177,7 +177,8 @@ def test_reconciliation_blocks_neither_board_capture_nor_publication():
             lane.close()
 
 
-def test_external_source_change_publishes_during_blocked_full_sweep():
+def test_external_source_change_publishes_during_blocked_full_sweep(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy subsecond budget
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)
     f.changes(['S1', 'S2'])
@@ -274,7 +275,8 @@ def test_admitted_chats_refill_capacity_while_next_external_capture_blocks():
         lane.close()
 
 
-def test_new_local_change_is_admitted_before_blocked_external_capture():
+def test_new_local_change_is_admitted_before_blocked_external_capture(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy subsecond budget
     """Unlike the refill case, there is NO admitted work before recapture starts."""
     r = Readers()
     emitted = threading.Event()
@@ -315,7 +317,8 @@ def test_new_local_change_is_admitted_before_blocked_external_capture():
         lane.close()
 
 
-def test_local_admission_keeps_external_failure_retry_and_later_successor():
+def test_local_admission_keeps_external_failure_retry_and_later_successor(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy subsecond budget
     r = Readers()
     now = [1000.0]
     f = feedmod.Feed(r, emit=lambda p: None, clock=lambda: now[0])
@@ -359,7 +362,8 @@ def test_local_admission_keeps_external_failure_retry_and_later_successor():
         lane.close()
 
 
-def test_failed_capture_cannot_be_vouched_by_earlier_local_read():
+def test_failed_capture_cannot_be_vouched_by_earlier_local_read(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy subsecond budget
     r = Readers()
     now = [1000.0]
     pushes = []
@@ -495,7 +499,8 @@ def settle(lane, timeout=2):
     raise AssertionError('board workers did not settle')
 
 
-def test_slow_lane_worker_does_not_block_other_changed_chat():
+def test_slow_lane_worker_does_not_block_other_changed_chat(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy parallel capacity
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)
     f.changes(['S1', 'S2'])
@@ -571,7 +576,8 @@ def test_forget_rewatch_and_stop_fence_inflight_publication():
     assert f._publish({'S2': candidate}, watch_tokens={'S2': token}) == {}
 
 
-def test_event_during_worker_is_coalesced_into_one_followup_and_idle_does_no_db_capture():
+def test_event_during_worker_is_coalesced_into_one_followup_and_idle_does_no_db_capture(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_COALESCE', '0')  # legacy subsecond budget
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)
     f.changes(['S2'])
