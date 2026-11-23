@@ -103,6 +103,8 @@ def _write_json(p: Path, value) -> None:
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f'.{p.name}.')
     with os.fdopen(fd, 'w') as f:
         json.dump(value, f, indent=1, default=str)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
@@ -339,7 +341,7 @@ def _row(now: float, m: str, f: dict, **extra) -> dict:
             'commands': (f.get('fix') or {}).get('commands'), 'summary': f.get('summary'), **extra}
 
 
-def _tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
+def _ordinary_tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
          runner: Callable[..., Any] = subprocess.run, now: Optional[float] = None,
          run_mode: Optional[str] = None) -> dict:
     """One pass. Returns {mode, new, handed, deferred, turn, line} (line = what stdout prints, '' = silent)."""
@@ -349,7 +351,7 @@ def _tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] 
         return out
     now = time.time() if now is None else now
     sd = state_dir(home)
-    with _lock(sd) as held:
+    with contextlib.nullcontext(True) as held:  # _tick owns run.lock for both lanes
         if not held:
             out['skipped'] = 'locked'
             return out
@@ -431,6 +433,59 @@ def _tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] 
         return out
 
 
+def load_nudge():
+    key = '_session_repair_nudge'
+    if key not in sys.modules:
+        spec = importlib.util.spec_from_file_location(key, HERE / 'nudge.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules[key] = mod
+    return sys.modules[key]
+
+
+def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=None):
+    m = run_mode or mode(home)
+    out = {'mode':m,'new':0,'handed':[],'deferred':0,'turn':None,'line':''}
+    if m == 'off':
+        return out
+    now = time.time() if now is None else now
+    home = home or hermes_home()
+    sd = state_dir(home)
+    with _lock(sd) as held:
+        if not held:
+            return {**out,'skipped':'locked'}
+        result = (scanner or (lambda: load_scan().scan()))()
+        findings = result.get('findings') or []
+        nudges = [f for f in findings if (f.get('fix') or {}).get('kind')=='nudge']
+        nm = load_nudge().config_mode(home)
+        actions, escalations, nm = load_nudge().process(
+            nudges,home=home,now=now,scan=load_scan(),runner=runner,argv=hermes_argv(),
+            read_json=_read_json,write_json=_write_json,append=_append) if nudges else ([],[],nm)
+        ordinary = [f for f in findings if (f.get('fix') or {}).get('kind')!='nudge']
+        out = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':ordinary+(escalations if nm==m else [])},
+                             now=now,run_mode=m,runner=runner)
+        if escalations and nm != m:
+            extra = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':escalations},now=now,run_mode=nm,runner=runner)
+            out['handed'] += extra['handed']
+            out['failed'] = out.get('failed',False) or extra.get('failed',False)
+            out['line'] += ('; ' if out['line'] else '') + extra['line']
+        out['nudges'], out['nudge_mode'] = actions, nm
+        if any(a.get('outcome') == 'delivery_unknown' for a in actions):
+            out['failed'] = True
+        if escalations:
+            path = sd / f'nudges-{nm}.json'
+            state = _read_json(path, {'fps':{}, 'sent':[]})
+            for f in escalations:
+                if f['fingerprint'] in out['handed']:
+                    state['fps'][f['fingerprint']]['escalated'] = now
+            _write_json(path, state)
+        _write_json(sd/'last.json',{**_read_json(sd/'last.json', {}), **result,'mode':m,'nudge_mode':nm,'tick_at':now,
+                                  'handed':out['handed'],'nudges':actions})
+        if actions:
+            out['line'] += ('; ' if out['line'] else '') + f'session-repair nudges ({nm}): {len(actions)} outcome(s)'
+        return out
+
+
 TICK_LOG_MAX_BYTES = 4 * 1024 * 1024  # current + one rotated segment; months at 15-minute cadence
 
 
@@ -478,14 +533,15 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
         if out.get('failed'):
             errors.append(str(out.get('line') or 'repair turn failed')[:500])
         # Include a source fingerprint so a soak cannot silently span a code change.
-        build = hashlib.sha256((HERE / 'scan.py').read_bytes() + (HERE / 'run.py').read_bytes()).hexdigest()
+        build = hashlib.sha256(b''.join((HERE / name).read_bytes() for name in ('scan.py', 'run.py', 'nudge.py', 'producer.py'))).hexdigest()
         _tick_summary(state_dir(home), {
             'ts': ts, 'mode': m, 'build': build, 'chats': result.get('chats', 0),
             'cards': result.get('cards', 0), 'findings': len(result.get('findings') or []),
             'errors': errors[:20], 'error_count': max(len(errors), result.get('error_count', 0)),
             'duration_s': round(time.monotonic() - started, 6),
             'scanned': bool(result), 'skipped': out.get('skipped'),
-            'handed': out.get('handed', []),
+            'handed': out.get('handed', []), 'nudge_mode': out.get('nudge_mode'),
+            'nudges': out.get('nudges', []),
         })
 
 

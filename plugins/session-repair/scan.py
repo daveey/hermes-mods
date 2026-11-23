@@ -45,10 +45,14 @@ REVIEW_IDLE_S = 60 * 60            # BS-review-no-reviewer
 NOTICE_STALE_S = 2 * 3600          # BS-notice-undelivered: unclaimed notice, or deferred retry this far past due
 NOTICE_LOOKBACK_S = 3 * 86400      # core notice_guarantee.LOOKBACK_S: older chats are out of the retry policy
 SUB_LAG_S = 60 * 60                # BS-notice-undelivered: a subscription's oldest undelivered event
+LONG_WAIT_S = {'ci': 45 * 60, 'deploy': 45 * 60, 'external': 3 * 3600,
+               'card': 4 * 3600, 'resource': 2 * 3600}  # clock is owned by BS-overdue-wake
+PRODUCER_QUIET_S = 3600
+QUIET_CHAT_S = 3600
 MAX_CHATS = 1000
 
 RULES = ('BS-ready-worker-free', 'BS-overdue-wake', 'BS-unexplained-wait', 'BS-parent-done', 'BS-stuck-run',
-         'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered')
+         'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered', 'BS-long-wait', 'BS-quiet-chat')
 REPAIR_CHAT_TITLE = 'Session repair'
 REPAIR_KEY_PREFIX = 'session-repair:'
 READY_ENTRY_EVENTS = ('promoted', 'unblocked', 'continuation_woken', 'created', 'reclaimed', 'released', 'status',
@@ -166,6 +170,62 @@ class Sources:
         self._copies: dict[str, set] = {}
         self.exclude_chats = set(exclude_chats) if exclude_chats is not None else self.repair_chats()
         self._ours: Optional[set] = None
+
+    def producer_state(self, kind: str, ref: str) -> dict:
+        # Cache per tick: a chain can name the same producer many times.
+        spec = importlib.util.spec_from_file_location('_session_repair_producer', Path(__file__).with_name('producer.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        read_github = mod.read_github
+        cache = self.__dict__.setdefault('_producer_cache', {})
+        key = (kind, ref)
+        if key not in cache:
+            cache[key] = (read_github(kind, ref) if len(cache) < 20 else
+                          {'state':'readback_failed','happened':False,'reason':'per-scan producer read budget'})
+        return cache[key]
+
+    def outcome_rows(self) -> list[dict]:
+        import subprocess
+        r = subprocess.run(['hermes', 'sessions', 'outcome-audit', '--json', '--limit', str(MAX_CHATS)],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            raise RuntimeError('outcome-audit failed')
+        rows = json.loads(r.stdout)
+        if not isinstance(rows, list):
+            raise ValueError('outcome-audit did not return a list')
+        return rows
+
+    def chat_obligations(self, sid: str) -> bool:
+        # Canonical liveness/cron readers include compression ancestors and live writer leases.
+        from hermes_state import SessionDB
+        from hermes_state_outcome import _lineage_ids, _live_turn, _cron_items, _process_items, _subagent_items
+        with SessionDB(self.readers.state_db(), read_only=True) as db:
+            ids = _lineage_ids(db, sid)
+            linked = self.linked_chats()
+            if any(s in linked or _live_turn(db, s) for s in ids) or _cron_items(ids):
+                return True
+            if _process_items(sid, ids) or _subagent_items(db, ids):
+                return True
+            # Read canonical asks without importing plugin hooks or initializing their writable stores.
+            asks = self.home() / 'user-steps' / 'actions.sqlite3'
+            if asks.exists():
+                c = self.readers.conn(asks)
+                if c is None:
+                    raise RuntimeError('open-ask store unreadable')
+                marks = ','.join('?' for _ in ids)
+                rows = c.execute(f"SELECT resolution FROM requests WHERE session IN ({marks}) "
+                                 "AND state IN ('open','needs_context')", ids)
+                if any(not _json(r[0]) for r in rows):
+                    return True
+            # Legacy asks can predate canonical request backfill; conservatively retain their human hold too.
+            import re
+            for ancestor in ids:
+                legacy = self.home() / 'user-steps' / (re.sub(r'[^A-Za-z0-9_.-]', '_', ancestor) + '.json')
+                if legacy.exists():
+                    data = json.loads(legacy.read_text())
+                    if any(s.get('status') == 'open' for s in data.get('steps', [])):
+                        return True
+            return False
 
     def home(self) -> Path:
         return Path(Path(self.readers.state_db()).parent)
@@ -1017,7 +1077,107 @@ def rule_broken_chain(card: Card, src: Sources) -> Optional[Finding]:
     return None
 
 
-CARD_RULES: tuple[Rule, ...] = (rule_ready_worker_free, rule_overdue_wake, rule_unexplained_wait, rule_parent_done,
+def current_park(card: Card) -> Optional[dict]:
+    """Newest core park in this episode, fenced by the latest admitted run."""
+    park = _events(card.conn, card.id, _core_wait()[0])
+    if not park:
+        return None
+    row = card.conn.execute('SELECT MAX(started_at) FROM task_runs WHERE task_id=?', (card.id,)).fetchone()
+    if row and row[0] is not None and park[0]['at'] < row[0]:
+        return None
+    return park[0]
+
+
+def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
+    if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
+        return None
+    c = card.conn
+    if c.execute("SELECT 1 FROM task_runs WHERE task_id=? AND status='running' LIMIT 1", (card.id,)).fetchone():
+        return None
+    if _promotion_held(c, card):
+        return None  # containment, spend and independent recovery holds are not execution authority
+    park = current_park(card)
+    if not park:
+        return None
+    from hermes_cli.kanban_wait_info import parse_awaiting
+    awaited = parse_awaiting(park['payload'].get('awaiting'))
+    if not awaited or awaited['kind'] not in LONG_WAIT_S:
+        return None
+    kind, ref = awaited['kind'], awaited['ref']
+    threshold = LONG_WAIT_S[kind]
+    waited = int(src.now - park['at'])
+    wait = (card.row or {}).get('wait') or {}
+    if not wait:
+        from hermes_cli.kanban_wait_info import describe
+        wait = describe(card.status, block_kind=getattr(card.task, 'block_kind', None),
+                        park=park['payload'], park_kind=park['kind'], since=park['at'], now=src.now) or {}
+    if src.closeout_waking(card.board, card.id, wait.get('premise')):
+        return None
+    live = {'state': 'not_resolvable', 'happened': False}
+    if kind == 'card':
+        board, producer = src.find_card(ref, card.board)
+        if not producer or not board or producer.get('source') != 'live':
+            return None  # no invented idle age for an unreadable/remote producer
+        at = _last_event_at(src.conn(board), ref)
+        if at is None or src.now - at < PRODUCER_QUIET_S:
+            return None
+        live = {'state': producer, 'last_event_at': at, 'happened': False}
+    elif kind in ('ci', 'external'):
+        live = src.producer_state(kind, ref)
+    if not live.get('happened') and waited < threshold:
+        return None
+    last = _events(c, card.id)
+    return _finding('BS-long-wait', card, 'event_happened' if live.get('happened') else 'too_long',
+                    f'potentially stuck: {kind} {ref}, waiting {_fmt_age(waited)}',
+                    {'kind': kind, 'ref': ref, 'waited_s': waited, 'threshold_s': threshold,
+                     'live_producer': live, 'park_id': park['id'], 'park_at': park['at'],
+                     'last_event': last[0] if last else None},
+                    {'kind': 'nudge', 'action': 'ask the owner whether it is stuck and continue', 'commands': [],
+                     'why': 'long wait or producer event already happened; never forcibly unblock'})
+
+
+def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Finding]:
+    out = []
+    c = src.state_conn()
+    if c is None:
+        return out
+    try:
+        if only:
+            # outcome-audit exposes this same stored outcome; revalidation reads only the exact target.
+            stored = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (only,)).fetchone()
+            rows = [{'id':only, **(_json(stored[0]) or {})}] if stored else []
+        else:
+            rows = src.outcome_rows()
+        linked = src.linked_chats()
+        for row in rows:
+            sid = str(row.get('id') or '')
+            if sid in src.exclude_chats or sid in linked or row.get('kind') not in ('unresolved', 'waiting'):
+                continue
+            if row.get('items') or any(x.get('kind') in ('human', 'decision', 'ask', 'cron', 'card') for x in row.get('on') or []):
+                continue
+            source_filter = " AND source IN ('desktop','tui')"
+            s = c.execute("SELECT title FROM sessions WHERE id=? AND archived=0 AND COALESCE(muted,0)=0 "
+                          "AND COALESCE(end_reason,'') NOT IN ('compression') "
+                          "AND COALESCE(end_reason,'') NOT LIKE 'moved_to_gateway:%'" + source_filter, (sid,)).fetchone()
+            last = c.execute('SELECT id,timestamp FROM messages WHERE session_id=? AND active=1 ORDER BY id DESC LIMIT 1', (sid,)).fetchone()
+            if not s or s[0] == REPAIR_CHAT_TITLE or not last:
+                continue
+            age = src.now-last[1]
+            if not QUIET_CHAT_S < age <= NOTICE_LOOKBACK_S or src.chat_obligations(sid):
+                continue
+            out.append(Finding(rule='BS-quiet-chat', card=None, board=None, chat=sid, title=s[0] or '',
+                               summary=f'potentially stuck: {row["kind"]} chat quiet {_fmt_age(age)}', variant='quiet',
+                               evidence={'kind':'chat', 'ref':sid, 'waited_s':int(age), 'threshold_s':QUIET_CHAT_S,
+                                         'last_message_id':last[0], 'last_activity':last[1], 'outcome':row,
+                                         'live_producer':{'state':'no linked card, cron or live turn'}},
+                               fix={'kind':'nudge','action':'ask the chat whether it is stuck and continue',
+                                    'commands':[], 'why':'unresolved cardless chat has no executor'}, area='card'))
+    except Exception as e:
+        src.error('quiet chats', e)
+    return out
+
+
+CARD_RULES: tuple[Rule, ...] = (rule_long_wait, rule_ready_worker_free, rule_overdue_wake, rule_unexplained_wait, rule_parent_done,
                                 rule_stuck_run, rule_review_no_reviewer, rule_broken_chain)
 
 
@@ -1230,6 +1390,23 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
                 continue  # a replica (another gateway's card): its owner judges it
             judge(board, cid, chat, rows.get(cid), None if cid in rows else 'chain')
 
+    if 'BS-long-wait' in wanted:
+        for board, _path in src.boards():
+            c = src.conn(board)
+            if c is not None:
+                for r in c.execute("SELECT id FROM tasks WHERE status IN ('scheduled','blocked','todo')"):
+                    if (board, str(r[0])) not in judged:
+                        # Only the new rule widens the historic linked-card scan.
+                        task, conn = src.task(board, str(r[0]))
+                        if task and str(r[0]) not in src.copies(board) and str(r[0]) not in src.ours_ids():
+                            card = Card(str(r[0]), board, None, task, conn, None)
+                            if not card.ours and getattr(task, 'session_id', None) not in src.exclude_chats:
+                                try:
+                                    f = rule_long_wait(card, src)
+                                    if f:
+                                        findings.setdefault(f.fingerprint, f)
+                                except Exception as e:
+                                    src.error(f'BS-long-wait {board}/{r[0]}', e)
     def on_person(cid: str) -> bool:
         """Whether a card a notice names is blocked on a valid ask (core never wakes such a notice)."""
         if cid not in human_blocked:
@@ -1244,6 +1421,9 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     alive = _alive_chats(src)
     if 'BS-notice-undelivered' in wanted:
         for f in notice_findings(src, on_person) + subscription_findings(src, alive):
+            findings.setdefault(f.fingerprint, f)
+    if 'BS-quiet-chat' in wanted:
+        for f in quiet_chat_findings(src):
             findings.setdefault(f.fingerprint, f)
     _allot_free_workers(findings)
     for f in findings.values():  # the turn comments on an open fix card instead of filing a second one

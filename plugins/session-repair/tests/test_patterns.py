@@ -580,3 +580,25 @@ def test_ledger_rows_that_are_not_objects_are_ignored(env):
     (env.home / 'session-repair' / 'ledger-live.jsonl').write_text('[1, 2]\n"x"\n' + json.dumps(
         {'fingerprint': 'f', 'outcome': 'card', 'filed': tid}) + '\n')
     assert env.sources().tracked() == {'f': {tid}}
+
+
+# BS-long-wait: fixed acceptance boundary fixtures.
+@pytest.mark.parametrize('waited_s,expected', [(3000, 1), (1800, 0)])
+def test_long_wait_ci_boundary(env, monkeypatch, waited_s, expected):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
+    tid = F.long_wait(env.conn, env.now, waited_s=waited_s)
+    fs = env.findings(rule='BS-long-wait', card=tid)
+    assert len(fs) == expected
+    if fs:
+        assert fs[0]['fix']['kind'] == 'nudge'
+
+
+def test_long_wait_completed_green_at_five_minutes(env, monkeypatch):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True})
+    f = one(env, 'BS-long-wait', F.long_wait(env.conn, env.now, waited_s=300))
+    assert f['variant']=='event_happened' and f['fix']['kind']=='nudge'
+
+
+def test_long_wait_human_ask_and_running_never_nudged(env):
+    none(env, 'BS-long-wait', F.blocked_valid_ask(env.conn, env.now))
+    none(env, 'BS-long-wait', F.long_wait(env.conn, env.now, status='running'))

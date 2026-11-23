@@ -25,8 +25,10 @@ Three parts:
 | BS-review-no-reviewer | review with no running run > 60 min after the newest review event: `idle` (review dispatch on), `idle_manual_review` (off) | `dispatch --max 1` (`idle` only) |
 | BS-broken-chain | `missing_parent`, `missing_awaited`, `cycle` | none: fix card |
 | BS-notice-undelivered | last message a `kanban_notice` whose close-out ended `error` / `busy`, deferred > 2 h past due, claimed > 2 h with no verdict, or never claimed > 2 h (not human-blocked); `subscription_lag` (a `tui` subscription with an event undelivered > 60 min). Never the repair chat | one close-out turn (`hermes chat --resume <id> --oneshot`) |
+| BS-long-wait | external-producer park: CI/deploy 45m, external 3h, card 4h (producer quiet 1h), resource 2h; GitHub event already happened overrides age; clock never | `nudge`: one owner comment, not an unblock |
+| BS-quiet-chat | unresolved/waiting desktop/tui chat quiet >60m within 3d, no linked card, live cron/run or open ask; never repair chat | `nudge`: one resumed chat turn |
 
-A finding: `{id, variant, card, board, chat, title, summary, evidence, fix: {kind: auto|card, action, commands,
+A finding: `{id, variant, card, board, chat, title, summary, evidence, fix: {kind: auto|card|nudge, action, commands,
 why}, area: hermes|card, fingerprint}`; fingerprint = `<id>:<board>/<card>` (`<id>:chat/<session>` for a chat-level
 one). `area` says who a fix card is for: `hermes` (Hermes machinery misbehaved) or `card` (the card owner's work).
 
@@ -92,6 +94,25 @@ Unexplained-wait detection excludes canonical pending spend decisions in triage,
 these need an explicit owner decision, not a generic unblock. For other waits, an old generic park and the
 panel's projected age cannot predate the latest run's admission/end boundary. This scanner-side guard avoids
 reusing core projections from an earlier episode; it does not change the card, its budget or its block kind.
+
+## Independent nudge lane
+
+`config.json` additionally accepts `nudge_mode: shadow|live` (default shadow). This does not enable the older
+repairs; `mode=off` stops both lanes. `nudge.py` performs safe-auto nudges directly through normal CLI comment/chat
+paths, after re-reading the target and all exclusions. No board SQL writes or forced unblocks. A moved event or
+park cancels the action. Each send has a durable pending identity and exact persisted comment/message receipt;
+an uncertain delivery remains pending for readback, never blindly repeated.
+
+The same fingerprint is eligible again after 2h, not 24h. Later messages include nudge count/times; any non-nudge
+owner event resets unanswered history. After three unanswered nudges the normal area-card fix path handles one
+escalation instead of a fourth nudge, with its usual card caps and open-fix dedupe. Nudge caps are separate:
+15/run, 100/rolling 24h (uncertain attempts reserve room). `nudges-{shadow,live}.json` stores cadence/pending state;
+`nudges-{shadow,live}.jsonl` stores outcomes/receipts. Shadow actions also appear in `actions-shadow.jsonl`.
+
+Nudge-only rollout: install merged main with `nudge_mode=shadow`, inspect all would-nudge rows from two consecutive
+15-minute ticks (about 30 minutes), record each verdict, then set `nudge_mode=live`. Verify one persisted real
+nudge and its owner's following event. Keep the older fixes' 24-hour shadow gate unchanged. Reverse by setting
+only `nudge_mode=shadow`. The tick build hash includes scan/run/nudge/producer sources.
 
 ## Scheduling: Hermes cron, no-agent script
 
