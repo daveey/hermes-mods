@@ -24,6 +24,10 @@ BATCH_MAX = 16
 
 
 class BoardLane:
+    def __new__(cls, feed, reader_factory, **kwargs):
+        owner = getattr(feed, '_source_coordinator', None)
+        return owner if owner is not None else super().__new__(cls)
+
     def __init__(self, feed, reader_factory, *, capacity=None):
         self.feed, self.reader_factory = feed, reader_factory
         self.cooldown = 0.0 if os.environ.get(
