@@ -1,0 +1,1853 @@
+From 8a4e07260ad7e4a388754ec0d92ddc7816e5c94d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:22:21 +0000
+Subject: [PATCH] feat(facts): activate in-process board and project-tree
+ owners [daveey]
+
+Why: published canonical consumers were inert without a trusted serving owner.
+Legacy board/tree requests still hydrated source state despite the facts API.
+
+Own native detached board/shadow/catalog and project-tree captures through the
+existing ContentOwner feed, in-process ctx.facts.v1 transport and pure canonical
+reducers. Bind board cutover at the trusted bundled-plugin mount and tree at the
+outer app lifespan, retaining links and plugin lifetime ordering. Keep native
+host adapters outside the plugin boundary and pass existing plugin serializers
+explicitly through the trusted mount.
+
+HERMES_FACTS_BOARD is read only at startup, defaults ON, and OFF restores the
+legacy board lifetime once while leaving tree activation absent. Cold, missing,
+foreign-scope and failed captures return retryable unavailability, not legacy
+hydration. Failed shutdown blocks admission while retaining retryable custody;
+healthy sibling resources still drain. Current-board selection uses the captured
+catalog, never request-time discovery. Authorized board/profile rosters are
+startup-bound; new scopes fail closed until a subsequent authorized boot.
+
+Proof:
+- Original nine-suite baseline: 52 passed (raw inventory-baseline.log).
+- Broad canonical board/tree/native/startup suite: 306 passed in 38 files.
+- Boundary lint, unittest safety and handler ledger: 18 passed in 3 files.
+- Actual startup/current-selector/direct+HTTP entry tests: green.
+- Adjacent caller gate: green (raw caller-gate.log).
+- Full scripts/check --base origin/main: exit 0 after boundary extraction.
+- RED/GREEN actual mount and app-lifespan entry tests, capture/project parity,
+  stale recovery, source vectors, selector/byte bounds, native mutations,
+  request legacy/source tripwires, OFF rollback and failed-drain retry controls.
+
+Evidence boundaries: local native hints plus <=30s recapture and 60s local
+validity do not imply <1s upstream truth. No dedicated fact host; no sessions
+sidebar/stamps ownership changes. Required CI, independent exact-head review,
+canonical shipping and naturally routed live boot/mutation/rollback proof are
+separate gates; no live activation or performance claim is made by these tests.
+---
+ hermes_cli/fact_board_inputs.py               | 176 ++++++++++++++++++
+ hermes_cli/fact_board_native.py               |  84 +++++++++
+ hermes_cli/fact_board_startup.py              | 120 ++++++++++++
+ hermes_cli/fact_plugin_mount.py               |  15 +-
+ hermes_cli/fact_tree_inputs.py                |  56 ++++++
+ hermes_cli/fact_tree_startup.py               |  96 ++++++++++
+ hermes_cli/fact_view_owner.py                 |  68 +++++++
+ hermes_cli/web_server_app.py                  |   3 +-
+ .../kanban/dashboard/board_fact_capture.py    |  12 +-
+ plugins/kanban/dashboard/board_shadow.py      |  48 ++++-
+ plugins/kanban/dashboard/plugin_api.py        |   6 +-
+ tests/hermes_cli/test_fact_board_inputs.py    | 163 ++++++++++++++++
+ tests/hermes_cli/test_fact_tree_startup.py    |  96 ++++++++++
+ tests/hermes_cli/test_fact_view_owner.py      |  24 +++
+ tests/plugins/test_board_native_inputs.py     |  76 ++++++++
+ tests/plugins/test_board_native_owner.py      |  70 +++++++
+ tests/plugins/test_board_shadow_capture.py    | 101 ++++++++++
+ tests/plugins/test_board_startup.py           | 115 ++++++++++++
+ tests/plugins/test_board_teardown.py          |  38 ++++
+ .../tui_gateway/test_project_tree_capture.py  |  83 +++++++++
+ .../test_project_tree_native_capture.py       |  22 +++
+ tui_gateway/methods_projects.py               |  23 ++-
+ tui_gateway/project_tree_capture.py           |  59 ++++++
+ 23 files changed, 1537 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/fact_board_inputs.py
+ create mode 100644 hermes_cli/fact_board_native.py
+ create mode 100644 hermes_cli/fact_board_startup.py
+ create mode 100644 hermes_cli/fact_tree_inputs.py
+ create mode 100644 hermes_cli/fact_tree_startup.py
+ create mode 100644 hermes_cli/fact_view_owner.py
+ create mode 100644 tests/hermes_cli/test_fact_board_inputs.py
+ create mode 100644 tests/hermes_cli/test_fact_tree_startup.py
+ create mode 100644 tests/hermes_cli/test_fact_view_owner.py
+ create mode 100644 tests/plugins/test_board_native_inputs.py
+ create mode 100644 tests/plugins/test_board_native_owner.py
+ create mode 100644 tests/plugins/test_board_shadow_capture.py
+ create mode 100644 tests/plugins/test_board_startup.py
+ create mode 100644 tests/plugins/test_board_teardown.py
+ create mode 100644 tests/tui_gateway/test_project_tree_capture.py
+ create mode 100644 tests/tui_gateway/test_project_tree_native_capture.py
+ create mode 100644 tui_gateway/project_tree_capture.py
+
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+new file mode 100644
+index 0000000000..8c8b26019e
+--- /dev/null
++++ b/hermes_cli/fact_board_inputs.py
+@@ -0,0 +1,176 @@
++"""Demanded native board/tree evidence on the existing ContentOwner feed. [daveey]
++
++This adapter owns no task/session clock or route response cache. Trusted startup
++supplies scoped native capture functions; the engine's ordinary view reducers
++consume their detached inputs. Request demand only edits a bounded memory queue.
++Each worker turn captures one selector, so a slow view cannot starve its peers.
++"""
++from collections import deque
++from contextvars import copy_context
++from dataclasses import dataclass, replace
++import hashlib
++import json
++import threading
++import time
++
++from hermes_cli.fact_capture import CaptureBudgetExceeded
++from hermes_cli.fact_contract import Fact, FactKey, freeze
++from hermes_cli.fact_store import view_key
++from hermes_cli.fact_source_watch import NativeSourceWatch
++
++
++@dataclass(frozen=True)
++class CapturedInput:
++    value: object
++    source_vector: tuple
++    observed_at: float
++
++
++@dataclass(frozen=True)
++class BoardCapture:
++    key: object = None
++    value: object = None
++    source_vector: tuple = ()
++    observed_at: float = 0
++    after: object = None
++    next_deadline: float | None = None
++    failed: bool = False
++
++
++class BoardInputSource:
++    """One bounded round-robin evidence source per authenticated board scope."""
++    def __init__(self, engine, source, capture, *, paths=(), max_selectors=128, refresh_seconds=30, valid_seconds=60):
++        if source.scope != engine.scope or source.kind != 'board.input':
++            raise ValueError('invalid board input source')
++        if max_selectors <= 0 or not 0 < refresh_seconds < valid_seconds:
++            raise ValueError('invalid board input bounds')
++        self.engine, self.source, self._capture = engine, source, capture
++        self.key = FactKey(source.scope, 'BoardInput', '')  # one operational input namespace per scope
++        self._maximum, self._refresh, self._valid = max_selectors, refresh_seconds, valid_seconds
++        self._context = copy_context()
++        self._lock = threading.Lock()
++        self._wanted, self._pending = {}, deque()
++        self._closed = False
++        self._worker = self._result = self._wake = self._deadline = self._active = None
++        self._paths, self._watch = tuple(paths), None
++
++    def input_key(self, view, selector):
++        return FactKey(self.source.scope, 'BoardInput', view_key(self.source.scope, view, selector).id)
++
++    def want(self, view, selector):
++        key = self.input_key(view, selector)
++        with self._lock:
++            if self._closed:
++                return False
++            if key not in self._wanted:
++                if len(self._wanted) >= self._maximum:
++                    return False
++                self._wanted[key] = (view, freeze(selector))
++                self._pending.append(key)
++                wake = self._wake
++            else:
++                wake = None
++        if wake is not None:
++            wake()
++        return True
++
++    def watch(self, wake):
++        with self._lock:
++            if self._closed or self._wake is not None:
++                raise RuntimeError('board source closed or already watched')
++            self._wake = wake
++        if self._paths:
++            self._watch = NativeSourceWatch(self._paths, self._invalidate)
++        return self
++
++    def _invalidate(self):
++        with self._lock:
++            if self._closed:
++                return
++            pending = set(self._pending)
++            self._pending.extend(key for key in self._wanted if key not in pending)
++            wake = self._wake
++        if wake is not None:
++            wake()
++
++    def capture(self, cursor, budget):
++        if self._watch is not None:
++            self._watch.check()
++        with self._lock:
++            if self._closed or self._wake is None:
++                raise RuntimeError('board source unavailable')
++            if self._result is not None:
++                return replace(self._result, next_deadline=time.monotonic() + (0 if self._pending else self._refresh))
++            if self._worker is None or not self._worker.is_alive():
++                if not self._pending:
++                    self._pending.extend(self._wanted)
++                if not self._pending:
++                    return BoardCapture(after=cursor)
++                self._active = self._pending.popleft()
++                self._deadline = time.monotonic() + budget.max_seconds
++                view, selector = self._wanted[self._active]
++                self._worker = threading.Thread(target=self._context.run,
++                    args=(self._build, self._active, view, selector, budget), daemon=True, name='fact-board-capture')
++                self._worker.start()
++            if self._deadline is not None and time.monotonic() >= self._deadline:
++                self._deadline = None
++                return BoardCapture(key=self._active, after=cursor, failed=True, observed_at=time.time())
++            return BoardCapture(after=cursor, next_deadline=self._deadline)
++
++    def _build(self, key, view, selector, budget):
++        started = time.monotonic()
++        try:
++            captured = self._capture(view, selector, budget)
++            encoded = json.dumps(captured.value, separators=(',', ':'), allow_nan=False).encode()
++            if len(encoded) > budget.max_bytes or time.monotonic() - started > budget.max_seconds:
++                raise CaptureBudgetExceeded('board evidence capture budget exceeded')
++            result = BoardCapture(key, freeze(captured.value), captured.source_vector, captured.observed_at,
++                                  hashlib.sha256(encoded).hexdigest())
++        except Exception:  # health: allow BLE001 -- retain prior evidence stale; never publish exception text or empty success
++            import logging
++            logging.getLogger(__name__).debug('board capture failed view=%s', view, exc_info=True)
++            result = BoardCapture(key=key, failed=True, observed_at=time.time())
++        with self._lock:
++            if self._closed:
++                return
++            self._result = result
++            wake = self._wake
++        wake()
++
++    def commit(self, capture):
++        if capture.key is None:
++            return
++        if capture.failed:
++            self._fail(capture.key)
++        else:
++            self.engine.publish([Fact(capture.key, capture.value, source_vector=capture.source_vector,
++                observed_at=capture.observed_at, valid_until=capture.observed_at + self._valid, health='fresh')], now=time.time())
++        with self._lock:
++            # capture() supplies an updated scheduling deadline on a detached result.
++            if self._result is not None and self._result.key == capture.key:
++                self._result = None
++
++    def _fail(self, key):
++        old = self.engine.store.snapshot(self.engine.scope).get(key)
++        fact = (replace(old, health='stale', error_code='board_capture_failed') if old is not None
++                else Fact(key, {}, error_code='board_capture_failed'))
++        self.engine.publish([fact], now=time.time())
++
++    def failure(self):
++        with self._lock:
++            keys = tuple(self._wanted)
++        for key in keys:
++            self._fail(key)
++
++    def close(self, timeout=5):
++        with self._lock:
++            self._closed = True
++            worker = self._worker
++        if self._watch is not None:
++            self._watch.close()
++        if worker is not None:
++            worker.join(timeout)
++            if worker.is_alive():
++                raise TimeoutError('board capture did not stop; custody retained')
++        with self._lock:
++            self._wake = self._result = None
+diff --git a/hermes_cli/fact_board_native.py b/hermes_cli/fact_board_native.py
+new file mode 100644
+index 0000000000..083c8e6aec
+--- /dev/null
++++ b/hermes_cli/fact_board_native.py
+@@ -0,0 +1,84 @@
++"""Native board/catalog inputs; never call these captures from a request. [daveey]
++
++Only trusted startup supplies ``api`` and the board scope. Related live rows
++share one transaction; shadow and catalog databases retain independent source
++observations. External policy/roster/clock evidence is bounded-refresh, not a
++claim of an atomic cross-database snapshot or instantaneous external truth.
++"""
++from contextlib import closing
++import sqlite3
++import time
++
++from dataclasses import asdict
++from hermes_cli import kanban_task_change as changes
++from hermes_cli import kanban_shadow_view as shadow_view
++
++
++
++def _observation(conn):
++    _dirty, cursor = changes.changed_since(conn, None, limit=1)
++    return {'content': asdict(cursor) if cursor is not None else None,
++            'schema': conn.execute('PRAGMA schema_version').fetchone()[0]}
++
++
++def _board(api, board, selector):
++    observed_at = time.time()
++    with closing(api._conn(board=board)) as live:
++        live.execute('BEGIN')
++        local = api.board_fact_capture.capture(live, **selector)
++        observations = {'local': _observation(live)}
++        shadow = None
++        try:
++            with shadow_view.open_shadow_replica(live) as replica:
++                if replica is not None:
++                    replica.execute('BEGIN')
++                    observations['replica'] = _observation(replica)
++                    shadow = api.board_shadow.capture(live, replica, api.board_fact_capture.project(local),
++                        selector['tenant'], selector['include_archived'], selector['workflow_template_id'],
++                        selector['current_step_key'], selector['done_limit'])
++                    replica.rollback()
++        except sqlite3.Error:
++            # Canonical shadow failure preserves healthy live cards. Record the
++            # degraded source separately rather than claiming a healthy empty replica.
++            observations['replica'] = {'health': 'failed'}
++        live.rollback()
++    return {'value': {'local': local, 'shadow': shadow}, 'observed_at': observed_at,
++            'observations': observations}
++
++
++def capture(api, board, view, selector):
++    """Gather detached canonical inputs on the authorized auxiliary worker."""
++    if view == 'board':
++        return _board(api, board, selector)
++    if view not in ('projects', 'boards'):
++        raise ValueError('unknown board view')
++    from hermes_cli import kanban_db, projects_db
++    observed_at = time.time()
++    with projects_db.connect_closing() as conn:
++        conn.execute('BEGIN')
++        rows = [p.to_dict() for p in projects_db.list_projects(conn, include_archived=view == 'boards')]
++        schema = conn.execute('PRAGMA schema_version').fetchone()[0]
++        conn.rollback()
++    if view == 'projects':
++        value = {'rows': rows}
++    else:
++        boards = kanban_db.list_boards(include_archived=selector['include_archived'])
++        value = {'rows': boards, 'current': kanban_db.get_current_board(),
++                 'counts': {b['slug']: api.board_counts._query(kanban_db.kanban_db_path(board=b['slug']))[0] for b in boards},
++                 'workspace_kinds': {b['slug']: api._default_workspace_kind(b) for b in boards},
++                 'project_names': {p['id']: p['name'] for p in rows}}
++    return {'value': value, 'observed_at': observed_at, 'observations': {'catalog': {'schema': schema}}}
++
++
++def project(api, view, captured):
++    """Canonical serializers only; all discovery and dynamic evidence are captured."""
++    value = api.board_fact_capture._plain(captured)
++    if view == 'board':
++        local = api.board_fact_capture.project(value['local'])
++        return local if value['shadow'] is None else api.board_shadow.project_captured(local, value['shadow'])
++    if view == 'projects':
++        return api.board_catalog_projection.projects(value['rows'])
++    if view == 'boards':
++        return api.board_catalog_projection.boards(value['rows'], value['current'], counts=value['counts'],
++            workspace_kinds=value['workspace_kinds'], project_names=value['project_names'])
++    raise ValueError('unknown board view')
+diff --git a/hermes_cli/fact_board_startup.py b/hermes_cli/fact_board_startup.py
+new file mode 100644
+index 0000000000..36c76b6fc0
+--- /dev/null
++++ b/hermes_cli/fact_board_startup.py
+@@ -0,0 +1,120 @@
++"""Trusted bundled board mount cutover and scoped native evidence. [daveey]
++
++The flag is startup-only. ON admits no legacy board read, including cold views;
++OFF starts the unchanged prewarm lifetime once. External roster/diagnostic inputs
++have 30s bounded recapture and 60s local validity, not subsecond upstream truth.
++"""
++import json
++import os
++import sys
++import threading
++
++from hermes_cli.fact_board_inputs import CapturedInput
++from hermes_cli.fact_content_owner import ContentBinding
++from hermes_cli.fact_contract import Scope, SourceId, Ready, Pending, Unavailable
++from hermes_cli.fact_view_owner import ViewOwner
++from functools import partial
++from hermes_cli import fact_board_native as board_native_inputs
++
++
++class BoardRuntime:
++    Ready, Pending, Unavailable = Ready, Pending, Unavailable
++
++    def __init__(self, api, *, boards=None):
++        from hermes_cli import kanban_db
++        from hermes_cli.config import get_hermes_home
++        from hermes_cli.profiles import get_active_profile_name
++        self.api = api
++        self.home = str(get_hermes_home())
++        self.profile = get_active_profile_name()
++        self.current = kanban_db.get_current_board()
++        self.boards = tuple(dict.fromkeys(boards if boards is not None else
++                            [self.current, *(b['slug'] for b in kanban_db.list_boards())]))
++        self.owners, self.views = {}, {}
++        self._closed = self._drained = False
++        self._lock = threading.RLock()
++        self._previous = None
++
++    def start(self):
++        from hermes_cli import kanban_db
++        self.api.board_prewarm.stop_board_prewarm()
++        for board in self.boards:
++            scope = Scope(self.home, self.profile, board)
++            path = kanban_db.kanban_db_path(board=board)
++            def capture(view, selector, budget, board=board, scope=scope):
++                result = board_native_inputs.capture(self.api, board, view, dict(selector))
++                source = SourceId(scope, 'board.input', 'native')
++                return CapturedInput(result['value'], ((source, result['observations']),), result['observed_at'])
++            owner = ViewOwner(scope, capture, partial(board_native_inputs.project, self.api), ('board', 'boards', 'projects'),
++                              paths=(path, path.parent, self.home),
++                              bindings=[ContentBinding(SourceId(scope, 'tasks.content', 'local'), path)])
++            self.owners[board] = owner
++            handle = owner.start()
++            paths = (str(path),)
++            def stop(paths=paths):
++                self.api.board_legacy.stop(paths)
++                self.api.board_rows.retire(paths)
++                self.api.board_snapshot.retire(paths)
++            view = self.api.board_fact_views.bind(handle.v1, scope, stop_legacy=stop,
++                start_legacy=lambda: None, demand=handle.demand,
++                hot_selectors=(('board', self.api.board_fact_views.board_selector()), ('projects', {}),
++                               ('boards', {'include_archived': False})))
++            self.views[board] = view
++            view.on_mode('facts', 1)
++            view.prepare()
++        self._previous = self.api.board_fact_views._installed
++        self.api.board_fact_views.install_provider(self, self.provider)
++        return self
++
++    def provider(self, board):
++        from hermes_cli.config import get_hermes_home
++        # Scope comes from the already-authenticated native/plugin route context.
++        # Foreign profiles must never borrow the launch profile's projection.
++        if str(get_hermes_home()) != self.home or self._closed:
++            return Unavailable('board_scope_unavailable')
++        if board is None:
++            owner = self.owners.get(self.current)
++            if owner is None or owner.handle is None:
++                return Unavailable('board_scope_unavailable')
++            catalog = owner.handle.v1.snapshot(owner.scope).view('boards', {'include_archived': False})
++            if not isinstance(catalog, Ready):
++                return Unavailable('board_catalog_unavailable')
++            board = json.loads(catalog.encoded)['current']
++        return self.views.get(board, Unavailable('board_scope_unavailable'))
++
++    def ready(self, board):
++        return self.views[board].prepare()
++
++    def close(self):
++        with self._lock:
++            if self._drained:
++                return
++            self._closed = True  # failed teardown keeps a fail-closed installed provider
++            failures = []
++            for resource in (*self.views.values(), *self.owners.values()):
++                try:
++                    resource.close()
++                except Exception as exc:  # health: allow BLE001 -- retain failed custody and attempt all sibling drains
++                    failures.append(exc)
++            if failures:
++                raise ExceptionGroup('board shutdown incomplete', failures)
++            views = self.api.board_fact_views
++            if views._installed is not None and views._installed[1] == self.provider:
++                views._installed = self._previous
++            self._drained = True
++
++
++def start(api):
++    # health: allow HX002 -- task-defined startup-only rollback switch; not a credential
++    if (os.environ.get('HERMES_FACTS_BOARD', '1').strip().lower() in ('0', 'off', 'false', 'no')
++            or not sys.platform.startswith('linux')):
++        from hermes_cli import kanban_db
++        boards = {kanban_db.get_current_board(), *(b['slug'] for b in kanban_db.list_boards())}
++        api.board_legacy.resume(str(kanban_db.kanban_db_path(board=board)) for board in boards)
++        return api.board_prewarm.LegacyLifecycle(api)
++    runtime = BoardRuntime(api)
++    try:
++        return runtime.start()
++    except BaseException:
++        runtime.close()
++        raise
+diff --git a/hermes_cli/fact_plugin_mount.py b/hermes_cli/fact_plugin_mount.py
+index 24c30d0489..8e8bb1d336 100644
+--- a/hermes_cli/fact_plugin_mount.py
++++ b/hermes_cli/fact_plugin_mount.py
+@@ -35,16 +35,23 @@ class PluginLifecycles:
+             self._bindings[key] = (ctx, dict(kwargs))
+ 
+     def start(self, api_path, module):
++        from hermes_cli._startup_fast import project_root_str
+         key = Path(api_path).resolve()
+         with self._lock:
+             if self._closed or key in self._handles:
+                 raise RuntimeError("plugin lifecycle custody retained or closed")
+             binding = self._bindings.get(key)
+             if binding is None:
+-                hook = getattr(module, "start_legacy", None)
+-                if hook is None:
+-                    return
+-                handle = hook()
++                if key == Path(project_root_str()) / 'plugins/kanban/dashboard/plugin_api.py':
++                    # The trusted bundled mount supplies canonical serializers;
++                    # the core owns sources and scope, never a plugin-side cache.
++                    from hermes_cli.fact_board_startup import start
++                    handle = start(module)
++                else:
++                    hook = getattr(module, "start_legacy", None)
++                    if hook is None:
++                        return
++                    handle = hook()
+             else:
+                 ctx, kwargs = binding
+                 handle = module.bind_facts(ctx, **kwargs)
+diff --git a/hermes_cli/fact_tree_inputs.py b/hermes_cli/fact_tree_inputs.py
+new file mode 100644
+index 0000000000..3cdaf49171
+--- /dev/null
++++ b/hermes_cli/fact_tree_inputs.py
+@@ -0,0 +1,56 @@
++"""Project-tree source captures and pure canonical payload composition. [daveey]"""
++import time
++
++from hermes_cli.fact_board_inputs import CapturedInput
++from tui_gateway import project_tree_capture
++
++
++def capture(targets, source, view, selector, budget):
++    from hermes_cli.web_routers import profiles
++    from tui_gateway import server
++    observed_at = time.time()
++    selected = selector.get('profile')
++    native = selector['surface'] == 'native'
++    drill = view == 'project_sessions'
++    rows, errors = [], []
++    names = targets[:1] if native and selected is None else targets
++    if selected is not None:
++        names = tuple(item for item in targets if item[0] == selected)
++        if not names:
++            raise ValueError('unauthorized tree profile')
++    for name, home in names:
++        def read(db, home=home):
++            with profiles._hermes_home_scope(home):
++                return server._capture_project_tree(db, preview_limit=0 if drill else selector['preview_limit'],
++                    hydrate=drill, session_limit=selector['session_limit'], include_discovered=native and not drill)
++        failed = []
++        result = profiles._read_profile_db(name, home, failed, read)
++        errors.extend(failed)
++        rows.append((name, result))
++    return CapturedInput({'rows': rows, 'errors': errors, 'view': view, 'selector': dict(selector)},
++                         ((source, {'profiles': tuple(name for name, _home in names)}),), observed_at)
++
++
++def project(view, captured):
++    from hermes_cli.web_routers.profiles import _merge_profile_tree
++    from tui_gateway.project_tree import stamp_profile
++    value = project_tree_capture._plain(captured)
++    selector = value['selector']
++    rows = []
++    for name, result in value['rows']:
++        if result is None:
++            tree, active = {'projects': [], 'scoped_session_ids': []}, None
++        else:
++            tree, active = project_tree_capture.project(result[0]), result[1]
++        if selector['surface'] == 'native':
++            stamp_profile(tree['projects'], name)
++            if view == 'project_sessions':
++                return {'project': next((p for p in tree['projects'] if p['id'] == selector['project_id']), None)}
++            return {'projects': tree['projects'], 'active_id': active, 'scoped_session_ids': tree['scoped_session_ids']}
++        rows.append((name, tree))
++    merged, ids = {}, []
++    for name, tree in rows:
++        _merge_profile_tree(merged, tree['projects'], name, selector['preview_limit'])
++        ids.extend(tree['scoped_session_ids'])
++    return {'projects': sorted(merged.values(), key=lambda p: p.get('lastActive') or 0, reverse=True),
++            'active_id': None, 'scoped_session_ids': ids, 'errors': value['errors']}
+diff --git a/hermes_cli/fact_tree_startup.py b/hermes_cli/fact_tree_startup.py
+new file mode 100644
+index 0000000000..dfb5be193d
+--- /dev/null
++++ b/hermes_cli/fact_tree_startup.py
+@@ -0,0 +1,96 @@
++"""Serve-owned project-tree activation, independent of sessions annotations. [daveey]"""
++from contextlib import asynccontextmanager
++from functools import partial
++import asyncio
++import os
++import sys
++
++from hermes_cli import fact_tree_inputs, projects_fact_routes
++from hermes_cli.fact_contract import Scope, SourceId, Unavailable
++from hermes_cli.fact_content_owner import ContentBinding
++from hermes_cli.fact_view_owner import ViewOwner
++
++
++class TreeBinding:
++    def __init__(self, runtime, profile):
++        self.runtime, self.profile = runtime, profile
++
++    def read(self, view, selector):
++        runtime = self.runtime
++        if runtime.closed:
++            return Unavailable('tree_owner_closed')
++        selector = dict(selector)
++        if self.profile is not None:
++            selector['profile'] = self.profile
++        try:
++            result = runtime.handle.v1.snapshot(runtime.scope).view(view, selector)
++            if isinstance(result, runtime.handle.v1.Pending):
++                runtime.handle.demand(view, selector)
++            return result
++        except RuntimeError:
++            return Unavailable('tree_owner_unavailable')
++
++
++class TreeRuntime:
++    def __init__(self, *, targets=None):
++        from hermes_cli.config import get_hermes_home
++        from hermes_cli.web_routers import profiles
++        self.home = str(get_hermes_home())
++        self.targets = tuple(targets if targets is not None else profiles._scoped_profile_targets('facts tree startup', None))
++        self.targets = tuple(sorted(self.targets, key=lambda item: str(item[1]) != self.home))
++        self.names = {name for name, _home in self.targets}
++        self.homes = {str(home): name for name, home in self.targets}
++        self.scope = Scope(self.home, self.homes.get(self.home, 'default'))
++        self.source_id = SourceId(self.scope, 'board.input', 'native')
++        self.closed = self.drained = False
++        self._previous = None
++        self.handle = None
++        bindings = [ContentBinding(SourceId(self.scope, 'sessions.content', name), home / 'state.db')
++                    for name, home in self.targets if (home / 'state.db').exists()]
++        paths = [path for _name, home in self.targets for path in (home, home / 'state.db', home / 'projects.db')]
++        self.owner = ViewOwner(self.scope, partial(fact_tree_inputs.capture, self.targets, self.source_id),
++            fact_tree_inputs.project, ('tree', 'project_sessions'), paths=paths, bindings=bindings, consumer='projects')
++
++    def start(self):
++        self.handle = self.owner.start()
++        self._previous = projects_fact_routes._installed
++        projects_fact_routes.install(self.handle.v1, self.provider)
++        for surface in ('native', 'profiles'):
++            self.handle.demand('tree', {'surface': surface, 'profile': None, 'preview_limit': 3, 'session_limit': 2000})
++        return self
++
++    def provider(self, profile):
++        from hermes_cli.config import get_hermes_home
++        home = str(get_hermes_home())
++        if self.closed or home not in self.homes or profile is not None and profile not in self.names:
++            return Unavailable('tree_scope_unavailable')
++        # Native grant overrides the ambient home before this memory-only lookup.
++        # An omitted profile then means that grant, never the launch profile.
++        selected = profile if profile is not None else (self.homes[home] if home != self.home else None)
++        if home != self.home and selected != self.homes[home]:
++            return Unavailable('tree_scope_unavailable')
++        return TreeBinding(self, selected)
++
++    def close(self):
++        if self.drained:
++            return
++        self.closed = True
++        self.owner.close()
++        if projects_fact_routes._installed is not None and projects_fact_routes._installed[1] == self.provider:
++            projects_fact_routes._installed = self._previous
++        self.drained = True
++
++
++@asynccontextmanager
++async def lifespan(app):
++    # health: allow HX002 -- shared board/projects startup-only emergency rollback switch
++    if (os.environ.get('HERMES_FACTS_BOARD', '1').strip().lower() in ('0', 'off', 'false', 'no')
++            or not sys.platform.startswith('linux')):
++        yield
++        return
++    runtime = TreeRuntime()
++    try:
++        runtime.start()
++        yield
++    finally:
++        await asyncio.to_thread(runtime.close)
+diff --git a/hermes_cli/fact_view_owner.py b/hermes_cli/fact_view_owner.py
+new file mode 100644
+index 0000000000..c22b9d8d55
+--- /dev/null
++++ b/hermes_cli/fact_view_owner.py
+@@ -0,0 +1,68 @@
++"""Scoped in-process canonical view ownership on ContentOwner. [daveey]
++
++Trusted startup supplies source paths, identities and detached capture/render
++functions. Demands only enqueue; no request discovery, source access or reducer
++execution occurs here. This is an in-process transport, not a dedicated host.
++"""
++from hermes_cli.fact_board_inputs import BoardInputSource
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_content_owner import ContentOwner
++from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
++from hermes_cli.fact_materializers import Projection, view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++
++
++class ViewOwner:
++    def __init__(self, scope, capture, render, views, *, paths=(), bindings=(), consumer='board'):
++        self.scope, self.consumer = scope, consumer
++        self.store = FactStore()
++        engine = ReducerEngine(self.store, scope)
++        from hermes_cli.fact_contract import SourceId
++        self.source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, paths=paths)
++        self.owner = self.transport = self.handle = None
++        self.lifecycle = IncrementalLifecycle({(scope, consumer)})
++        self._bindings = tuple(bindings)
++        self._states = []
++
++        def projection(view):
++            def dependencies(scope, selector, snapshot):
++                return {self.source.input_key(view, selector), *self._states}
++            def reduce(selector, facts, now):
++                return render(view, facts[self.source.input_key(view, selector)].value)
++            return Projection(view, ('BoardInput', 'SourceState'), dependencies, reduce)
++        engine.register(view_reducer(projection(view) for view in views))
++        self.engine = engine
++
++    def start(self):
++        if self.owner is not None:
++            raise RuntimeError('view owner already started')
++        try:
++            self.owner = ContentOwner({self.scope: self.engine}, self._bindings,
++                                      operational=[self.source], budget=CaptureBudget(max_seconds=10))
++        except BaseException as exc:
++            self.owner = getattr(exc, 'owner', None)
++            raise
++        self._states.extend(self.owner.publisher(binding.source).state_key for binding in self._bindings)
++        self.transport = InProcessFacts(self.store, [self.scope], demand=self.demand)
++        self.handle = self.transport.acquire(self.scope, lifecycle=self.lifecycle)
++        return self.handle
++
++    def demand(self, scope, view, selector):
++        if scope != self.scope:
++            raise ValueError('unauthorized view scope')
++        if not self.source.want(view, selector):
++            return False
++        self.owner.demand(scope, view, selector)
++        return True
++
++    def close(self):
++        errors = []
++        for resource in (self.handle, self.transport, self.owner):
++            if resource is not None:
++                try:
++                    resource.close()
++                except Exception as exc:  # health: allow BLE001 -- drain every resource; retain all failed custody for retry
++                    errors.append(exc)
++        if errors:
++            raise ExceptionGroup('view owner shutdown incomplete', errors)
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 6ae2394238..5739694157 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -318,8 +318,9 @@ async def app_lifespan(app: FastAPI):
+     from hermes_cli.fact_plugin_mount import lifespan as plugin_lifespan
+     from hermes_cli.fact_links_startup import lifespan as links_lifespan
+     from hermes_cli.sessions_native_startup import lifespan as sessions_lifespan
++    from hermes_cli.fact_tree_startup import lifespan as tree_lifespan
+     try:
+-        async with links_lifespan(app), sessions_lifespan(app), plugin_lifespan(app), lifespan(app):
++        async with links_lifespan(app), sessions_lifespan(app), tree_lifespan(app), plugin_lifespan(app), lifespan(app):
+             yield
+     finally:
+         host_attach.enable_stale_while_revalidate(False)
+diff --git a/plugins/kanban/dashboard/board_fact_capture.py b/plugins/kanban/dashboard/board_fact_capture.py
+index 0d3bc75f58..637d56c4da 100644
+--- a/plugins/kanban/dashboard/board_fact_capture.py
++++ b/plugins/kanban/dashboard/board_fact_capture.py
+@@ -24,6 +24,11 @@ def capture(conn, *, tenant=None, include_archived=False, workflow_template_id=N
+     observed_at = time.time()
+     rows = board_read.materialize(conn, tenant, include_archived, workflow_template_id,
+                                   current_step_key, done_limit)
++    return capture_rows(rows, include_archived=include_archived, observed_at=observed_at)
++
++
++def capture_rows(rows, *, include_archived, observed_at):
++    """Detach related-row materialization before publishing any owner input."""
+     diagnostics = board_read.diagnostics_from_inputs(rows['diag_inputs'])
+     ages = {}
+     for task, _fields, _extra in rows['cards']:
+@@ -32,8 +37,13 @@ def capture(conn, *, tenant=None, include_archived=False, workflow_template_id=N
+         except Exception:  # health: allow BLE001 -- preserve canonical malformed age fallback
+             ages[task.id] = {'created_age_seconds': None, 'started_age_seconds': None,
+                              'time_to_complete_seconds': None}
++    cards = []
++    for _task, fields, extra in rows['cards']:
++        fields = dict(fields)
++        board_read.preview_list_body(fields)  # idempotent canonical preview before bounded input publication
++        cards.append((fields, extra))
+     return {
+-        'rows': {'cards': [(fields, extra) for _task, fields, extra in rows['cards']],
++        'rows': {'cards': cards,
+                  'done_total': rows['done_total'], 'tenants': rows['tenants'],
+                  'latest_event_id': rows['latest_event_id']},
+         'include_archived': include_archived, 'diagnostics_per_task': diagnostics,
+diff --git a/plugins/kanban/dashboard/board_shadow.py b/plugins/kanban/dashboard/board_shadow.py
+index 2ff5d505e9..600c80f8ac 100644
+--- a/plugins/kanban/dashboard/board_shadow.py
++++ b/plugins/kanban/dashboard/board_shadow.py
+@@ -89,16 +89,60 @@ def merge(payload: dict, live, tenant, include_archived, workflow_template_id, c
+             return payload
+     # Never retain projections: clock/config/profile diagnostics are current on every poll.
+     remote = board_read.project(rows, include_archived, diagnostics_from_inputs)
++    return merge_fields(payload, remote, rows['homes'], rows['done_total'], cap)
++
++
++def capture(live, replica, payload, tenant, include_archived, workflow_template_id, current_step_key, done_limit):
++    """Capture a supplied authorized replica; never discover or suppress read errors.
++
++    Both caller-owned transactions must remain pinned through selection, related
++    rows and ownership metadata. Independent databases retain separate vectors.
++    """
++    from plugins.kanban.dashboard import board_fact_capture
++    import time
++
++    if not live.in_transaction or not replica.in_transaction:
++        raise ValueError('shadow capture requires caller-owned read transactions')
++    observed_at = time.time()
++    live_ids = frozenset(r[0] for r in live.execute('SELECT id FROM tasks')) | frozenset(
++        t['id'] for col in payload['columns'] for t in col['tasks'])
++    live_done = tuple((t['id'], t['completed_at']) for col in payload['columns']
++                      if col['name'] == 'done' for t in col['tasks'])
++    cap = int(done_limit or 0)
++    filters = dict(tenant=tenant, include_archived=include_archived,
++                   workflow_template_id=workflow_template_id, current_step_key=current_step_key)
++    ids, total = _selection(replica, filters, live_ids, live_done, cap)
++    rows = board_read.materialize(replica, tenant, include_archived, workflow_template_id,
++                                  current_step_key, cap, selected_ids=ids)
++    rows['done_total'] = total
++    homes = shadow_view.homes_of(replica, [t.id for t, _fields, _extra in rows['cards']])
++    return {'capture': board_fact_capture.capture_rows(rows, include_archived=include_archived,
++                                                      observed_at=observed_at),
++            'homes': homes, 'done_total': total, 'cap': cap}
++
++
++def project_captured(payload, captured):
++    """The canonical merge over detached inputs, without SQL, discovery or clocks."""
++    from plugins.kanban.dashboard import board_fact_capture
++
++    captured = board_fact_capture._plain(captured)
++    payload = board_fact_capture._plain(payload)
++    remote = board_fact_capture.project(captured['capture'])
++    return merge_fields(payload, remote, captured['homes'], captured['done_total'], captured['cap'])
++
++
++def merge_fields(payload, remote, homes, done_total, cap):
++    """Canonical in-place merge shared by legacy reads and detached projections."""
+     by_name = {c['name']: c for c in remote['columns']}
+     for col in payload['columns']:
+         extra = by_name.get(col['name'])
+         if extra is None:
+             continue
+-        col['tasks'] = col['tasks'] + [shadow_view.mark(t, rows['homes'].get(t['id'])) for t in extra['tasks']]
++        col['tasks'] = col['tasks'] + [shadow_view.mark(t, homes.get(t['id'])) for t in extra['tasks']]
+         if col['name'] == 'done':
+             col['tasks'].sort(key=lambda d: d['id'], reverse=True)
+             col['tasks'].sort(key=lambda d: (d['completed_at'] is None, -(d['completed_at'] or 0)))
+-            total = col.get('total', 0) + rows['done_total']
++            total = col.get('total', 0) + done_total
+             if cap > 0:
+                 col['tasks'] = col['tasks'][:cap]
+             col['total'] = total
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 6d9c4e5c53..47bcb9b1d8 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -269,8 +269,6 @@ def get_board(
+ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key, done_limit=_BOARD_DONE_LIMIT):
+     """Board payload: retained SQL rows (re-read only after a commit, see board_rows) projected
+     with the current clock, config, profiles on disk and hub replica."""
+-    from plugins.kanban.dashboard import board_rows
+-
+     board = _resolve_board(board)
+     done_limit = int(done_limit or 0)
+ 
+@@ -1984,9 +1982,9 @@ async def stream_events(ws: WebSocket):
+         await tail.shutdown()
+ 
+ 
+-from plugins.kanban.dashboard.board_prewarm import LegacyLifecycle
++from plugins.kanban.dashboard import board_counts, board_fact_capture, board_legacy, board_prewarm, board_rows, board_snapshot
+ 
+-start_legacy = partial(LegacyLifecycle, sys.modules[__name__])
++start_legacy = partial(board_prewarm.LegacyLifecycle, sys.modules[__name__])
+ 
+ 
+ bind_facts = partial(board_fact_views.bind_api, api=sys.modules[__name__])
+diff --git a/tests/hermes_cli/test_fact_board_inputs.py b/tests/hermes_cli/test_fact_board_inputs.py
+new file mode 100644
+index 0000000000..a7af0d4194
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_board_inputs.py
+@@ -0,0 +1,163 @@
++"""The board's native evidence worker is demanded, bounded and fail-closed."""
++import threading
++import time
++
++import pytest
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++
++
++@pytest.fixture
++def source():
++    from hermes_cli.fact_board_inputs import BoardInputSource, CapturedInput
++    scope = Scope('installation', 'default', 'main')
++    engine = ReducerEngine(FactStore(), scope)
++    calls = []
++    woke = threading.Event()
++
++    def capture(view, selector, budget):
++        calls.append((threading.get_ident(), view, selector))
++        return CapturedInput({'local': {'answer': selector['n']}}, ((source_id, 'native-token'),), time.time())
++
++    source_id = SourceId(scope, 'board.input', 'local')
++    adapter = BoardInputSource(engine, source_id, capture, max_selectors=2)
++    adapter.watch(woke.set)
++    yield adapter, engine, calls, woke
++    adapter.close()
++
++
++def settle(adapter, woke):
++    for _ in range(10):
++        woke.clear()
++        result = adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert result.next_deadline is not None
++        assert woke.wait(2), 'native capture worker did not finish'
++        adapter._worker.join(2)
++        assert not adapter._worker.is_alive()
++        result = adapter.capture(None, CaptureBudget(max_seconds=2))
++        adapter.commit(result)
++        if result.next_deadline > time.monotonic():
++            return result
++    pytest.fail('selector cycle did not settle')
++
++
++def test_want_has_no_capture_and_worker_publishes_vector(source):
++    adapter, engine, calls, woke = source
++    assert adapter.want('board', {'n': 1})
++    assert calls == []
++    assert adapter.want('board', {'n': 1})
++    assert adapter.want('board', {'n': 2})
++    assert not adapter.want('board', {'n': 3})
++    result = settle(adapter, woke)
++    assert len(calls) == 2
++    assert all(thread != threading.get_ident() for thread, _, _ in calls)
++    fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++    assert fact.health == 'fresh'
++    assert fact.value['local']['answer'] == 1
++    assert fact.source_vector == ((adapter.source, 'native-token'),)
++    assert fact.valid_until > result.observed_at
++
++
++def test_capture_failure_retains_stale_value_and_recovers(source):
++    adapter, engine, _calls, woke = source
++    adapter.want('board', {'n': 1})
++    settle(adapter, woke)
++    key = adapter.input_key('board', {'n': 1})
++    old = engine.store.snapshot(engine.scope).get(key)
++    original = adapter._capture
++
++    def fail(*args):
++        raise OSError('private source path must not be published')
++
++    adapter._capture = fail
++    settle(adapter, woke)
++    stale = engine.store.snapshot(engine.scope).get(key)
++    assert stale.value == old.value
++    assert stale.health == 'stale'
++    assert stale.error_code == 'board_capture_failed'
++    assert 'private' not in repr(stale)
++    adapter._capture = original
++    settle(adapter, woke)
++    assert engine.store.snapshot(engine.scope).get(key).health == 'fresh'
++
++
++def test_source_close_forbids_new_demand(source):
++    adapter, _, _, _ = source
++    adapter.close()
++    assert not adapter.want('board', {'n': 1})
++
++
++def test_busy_capture_is_not_replaced_and_close_retains_custody(source):
++    adapter, engine, _calls, _woke = source
++    entered, release = threading.Event(), threading.Event()
++    original = adapter._capture
++
++    def blocked(*args):
++        entered.set()
++        assert release.wait(5)
++        return original(*args)
++
++    adapter._capture = blocked
++    adapter.want('board', {'n': 1})
++    adapter.capture(None, CaptureBudget(max_seconds=2))
++    try:
++        assert entered.wait(2)
++        worker = adapter._worker
++        adapter._deadline = time.monotonic() - 1
++        failed = adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert failed.failed
++        adapter.commit(failed)
++        assert adapter.capture(None, CaptureBudget(max_seconds=2)).next_deadline is None
++        assert adapter._worker is worker
++        fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++        assert fact.health == 'unknown'
++        with pytest.raises(TimeoutError, match='custody retained'):
++            adapter.close(timeout=0)
++        assert worker.is_alive()
++    finally:
++        release.set()
++        adapter.close(timeout=2)
++
++
++def test_failed_selector_does_not_suppress_healthy_peer(source):
++    adapter, engine, _calls, woke = source
++    original = adapter._capture
++
++    def capture(view, selector, budget):
++        if selector['n'] == 1:
++            raise OSError('one broken source')
++        return original(view, selector, budget)
++
++    adapter._capture = capture
++    adapter.want('board', {'n': 1})
++    adapter.want('board', {'n': 2})
++    settle(adapter, woke)
++    snapshot = engine.store.snapshot(engine.scope)
++    assert snapshot.get(adapter.input_key('board', {'n': 1})).health == 'unknown'
++    assert snapshot.get(adapter.input_key('board', {'n': 2})).health == 'fresh'
++
++
++def test_oversize_native_evidence_never_publishes_truncated_success(source):
++    adapter, engine, _calls, woke = source
++    adapter.want('board', {'n': 1})
++    woke.clear()
++    adapter.capture(None, CaptureBudget(max_seconds=2, max_bytes=1))
++    assert woke.wait(2)
++    adapter._worker.join(2)
++    result = adapter.capture(None, CaptureBudget(max_seconds=2, max_bytes=1))
++    adapter.commit(result)
++    fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++    assert fact.health == 'unknown'
++    assert fact.error_code == 'board_capture_failed'
++
++
++@pytest.mark.parametrize('options', [{'max_selectors': 0}, {'refresh_seconds': 0},
++                                    {'refresh_seconds': 60, 'valid_seconds': 60}])
++def test_invalid_source_bounds_refused(source, options):
++    from hermes_cli.fact_board_inputs import BoardInputSource
++    adapter, engine, _calls, _woke = source
++    with pytest.raises(ValueError, match='bounds'):
++        BoardInputSource(engine, adapter.source, adapter._capture, **options)
+diff --git a/tests/hermes_cli/test_fact_tree_startup.py b/tests/hermes_cli/test_fact_tree_startup.py
+new file mode 100644
+index 0000000000..2e6f282a2f
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_tree_startup.py
+@@ -0,0 +1,96 @@
++"""Native tree startup, direct/HTTP projections and source mutation. [daveey]"""
++import asyncio
++import json
++import pytest
++
++from hermes_cli import projects_fact_routes
++from hermes_cli.web_routers import profiles
++from tests.hermes_cli import test_profiles_sidebar_scope as helpers
++from tests.waiting import wait_until
++
++profiles_on_disk = helpers.profiles_on_disk
++
++
++def test_tree_startup_parity_and_native_mutation(profiles_on_disk, monkeypatch):
++    from hermes_cli.fact_tree_startup import TreeRuntime
++    from hermes_cli.fact_contract import Ready
++    import time
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    for name, home in profiles_on_disk.items():
++        helpers._seed_session(home, name + '-chat', source='cli', cwd='/fixture/repo')
++    monkeypatch.setattr(profiles, '_SIDEBAR_CACHE_TTL_SECONDS', 0)
++    expected = profiles.get_profiles_projects_tree()
++    runtime = TreeRuntime(targets=tuple(profiles_on_disk.items()))
++    selector = {'surface': 'profiles', 'preview_limit': 3, 'session_limit': 2000, 'profile': None}
++    try:
++        runtime.start()
++        bound = runtime.provider(None)
++        assert wait_until(lambda: isinstance(bound.read('tree', selector), Ready), timeout=10)
++        actual = profiles.get_profiles_projects_tree()
++        import difflib
++        diff = [line for line in difflib.ndiff(json.dumps(expected, sort_keys=True, indent=2).splitlines(),
++                                             json.dumps(actual, sort_keys=True, indent=2).splitlines())
++                if line.startswith(('- ', '+ '))]
++        assert actual == expected, diff
++        assert json.loads(asyncio.run(profiles.get_profiles_projects_tree.http_endpoint()).body) == expected
++        helpers._seed_session(profiles_on_disk['worker'], 'new-chat', source='cli', cwd='/fixture/repo')
++        assert wait_until(lambda: 'new-chat' in str(bound.read('tree', selector)), timeout=10)
++        def forbidden(*args, **kwargs):
++            raise AssertionError('legacy tree source called from warmed request')
++        monkeypatch.setattr(profiles, 'profile_project_trees', forbidden)
++        assert 'new-chat' in str(profiles.get_profiles_projects_tree())
++    finally:
++        runtime.close()
++
++
++def test_real_app_lifespan_enters_tree_owner(monkeypatch):
++    from contextlib import asynccontextmanager
++    from types import SimpleNamespace
++    from hermes_cli import web_server_app, fact_tree_startup, fact_plugin_mount, fact_links_startup
++    from hermes_cli import sessions_native_startup
++    from gateway import host_attach
++    calls = []
++    @asynccontextmanager
++    async def tree(app):
++        calls.append('tree-start')
++        try:
++            yield
++        finally:
++            calls.append('tree-close')
++    @asynccontextmanager
++    async def quiet(app):
++        yield
++    monkeypatch.setattr(fact_tree_startup, 'lifespan', tree)
++    monkeypatch.setattr(fact_plugin_mount, 'lifespan', quiet)
++    monkeypatch.setattr(fact_links_startup, 'lifespan', quiet)
++    monkeypatch.setattr(sessions_native_startup, 'lifespan', quiet)
++    monkeypatch.setattr(web_server_app, 'standalone_lifespan', quiet)
++    monkeypatch.setattr(host_attach, 'enable_stale_while_revalidate', lambda *a: None)
++    async def exercise():
++        async with web_server_app.app_lifespan(SimpleNamespace(state=SimpleNamespace())):
++            assert calls == ['tree-start']
++    asyncio.run(exercise())
++    assert calls == ['tree-start', 'tree-close']
++
++
++def test_tree_foreign_profile_never_falls_back(profiles_on_disk):
++    from hermes_cli.fact_tree_startup import TreeRuntime
++    from hermes_cli.fact_contract import Unavailable
++    runtime = TreeRuntime(targets=tuple(profiles_on_disk.items()))
++    assert isinstance(runtime.provider('foreign'), Unavailable)
++    runtime.close()
++
++
++@pytest.mark.parametrize('flag,platform', [('off', 'linux'), ('1', 'darwin'), ('1', 'win32')])
++def test_rollback_and_unsupported_native_backend_skip_tree(monkeypatch, flag, platform):
++    from types import SimpleNamespace
++    from hermes_cli import fact_tree_startup
++    monkeypatch.setenv('HERMES_FACTS_BOARD', flag)
++    monkeypatch.setattr(fact_tree_startup, 'sys', SimpleNamespace(platform=platform))
++    def forbidden():
++        raise AssertionError('native capture on rollback/unsupported platform')
++    monkeypatch.setattr(fact_tree_startup, 'TreeRuntime', forbidden)
++    async def exercise():
++        async with fact_tree_startup.lifespan(SimpleNamespace()):
++            pass
++    asyncio.run(exercise())
+diff --git a/tests/hermes_cli/test_fact_view_owner.py b/tests/hermes_cli/test_fact_view_owner.py
+new file mode 100644
+index 0000000000..a7b3534bbf
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_view_owner.py
+@@ -0,0 +1,24 @@
++"""Owned source/transport teardown retains all failure custody. [daveey]"""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.fact_view_owner import ViewOwner
++
++
++def test_failed_reader_close_still_stops_transport_and_capture():
++    calls = []
++    def fail():
++        calls.append('reader')
++        raise TimeoutError('reader busy')
++    owner = object.__new__(ViewOwner)
++    owner.handle = SimpleNamespace(close=fail)
++    owner.transport = SimpleNamespace(close=lambda: calls.append('transport'))
++    owner.owner = SimpleNamespace(close=lambda: calls.append('source'))
++    with pytest.raises(ExceptionGroup, match='shutdown incomplete') as error:
++        owner.close()
++    assert calls == ['reader', 'transport', 'source']
++    assert isinstance(error.value.exceptions[0], TimeoutError)
++    owner.handle = SimpleNamespace(close=lambda: calls.append('reader-stopped'))
++    owner.close()
++    assert calls[-3:] == ['reader-stopped', 'transport', 'source']
+diff --git a/tests/plugins/test_board_native_inputs.py b/tests/plugins/test_board_native_inputs.py
+new file mode 100644
+index 0000000000..3c1140a456
+--- /dev/null
++++ b/tests/plugins/test_board_native_inputs.py
+@@ -0,0 +1,76 @@
++"""Real board-source captures and memory-only canonical renderers. [daveey]"""
++import builtins
++import json
++import socket
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli.fact_contract import freeze
++from plugins.kanban.dashboard import board_fact_views
++from tests.plugins import test_kanban_board_shadow as helpers
++
++shadow_board = helpers.shadow_board
++
++
++@pytest.mark.parametrize('archived,cap', [(False, 0), (False, 1), (True, 80)])
++def test_native_board_capture_has_typed_detached_parity(shadow_board, monkeypatch, archived, cap):
++    from hermes_cli import fact_board_native as board_native_inputs
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    api = shadow_board['mod']
++    selector = board_fact_views.board_selector(include_archived=archived, done_limit=cap)
++    expected = helpers._read(shadow_board, archived=archived, done_limit=cap)
++    captured = freeze(board_native_inputs.capture(api, None, 'board', selector))
++    assert captured['observations']['local']['content'] is not None
++    assert 'replica' in captured['observations']
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('board renderer reopened a source')
++
++    with monkeypatch.context() as guard:
++        guard.setattr(builtins, 'open', forbidden)
++        guard.setattr(socket, 'socket', forbidden)
++        guard.setattr(subprocess, 'Popen', forbidden)
++        guard.setattr(api, '_conn', forbidden)
++        actual = board_native_inputs.project(api, 'board', captured['value'])
++    assert json.dumps(actual, separators=(',', ':')) == json.dumps(expected, separators=(',', ':'))
++
++
++def test_native_capture_unknown_view_refuses_before_source_read(shadow_board, monkeypatch):
++    from hermes_cli import fact_board_native as board_native_inputs
++    monkeypatch.setattr(shadow_board['mod'], '_conn', lambda *a, **k: pytest.fail('unexpected source read'))
++    with pytest.raises(ValueError, match='unknown board view'):
++        board_native_inputs.capture(shadow_board['mod'], None, 'unknown', {})
++
++
++def test_board_input_bounds_body_before_publication_without_changing_wire(shadow_board, monkeypatch):
++    from contextlib import closing
++    from hermes_cli import kanban_db_connect
++    from hermes_cli import fact_board_native as board_native_inputs
++    from plugins.kanban.dashboard import board_read
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    with closing(kanban_db_connect.connect()) as conn, conn:
++        conn.execute('UPDATE tasks SET body = ? WHERE id = ?', ('body' * 100_000, shadow_board['live_id']))
++    expected = helpers._read(shadow_board)
++    captured = board_native_inputs.capture(shadow_board['mod'], None, 'board', board_fact_views.board_selector())
++    fields = captured['value']['local']['rows']['cards'][0][0]
++    assert len(fields['body']) == board_read._CARD_SUMMARY_PREVIEW_CHARS
++    assert fields['body_truncated'] is True
++    assert board_native_inputs.project(shadow_board['mod'], 'board', freeze(captured['value'])) == expected
++
++
++@pytest.mark.parametrize('view,selector', [('projects', {}), ('boards', {'include_archived': False}),
++                                           ('boards', {'include_archived': True})])
++def test_native_catalog_capture_retains_canonical_fields_order_and_nulls(shadow_board, view, selector):
++    from hermes_cli import projects_db
++    from hermes_cli import fact_board_native as board_native_inputs
++    with projects_db.connect_closing() as conn:
++        projects_db.create_project(conn, name='Zeta', slug='zeta', icon=None, color=None)
++        projects_db.create_project(conn, name='Alpha', slug='alpha', icon='tree', color='blue')
++        conn.commit()
++    api = shadow_board['mod']
++    expected = api.list_kanban_projects() if view == 'projects' else api.list_boards(**selector)
++    captured = freeze(board_native_inputs.capture(api, None, view, selector))
++    actual = board_native_inputs.project(api, view, captured['value'])
++    assert json.dumps(actual, separators=(',', ':')) == json.dumps(expected, separators=(',', ':'))
+diff --git a/tests/plugins/test_board_native_owner.py b/tests/plugins/test_board_native_owner.py
+new file mode 100644
+index 0000000000..637f97a696
+--- /dev/null
++++ b/tests/plugins/test_board_native_owner.py
+@@ -0,0 +1,70 @@
++"""Composed native DB → existing content owner → pure board ViewFact. [daveey]
++
++This exercises real sources and mutation hints, not serve startup activation.
++"""
++from contextlib import closing
++import json
++import time
++
++from hermes_cli import kanban_db, kanban_db_connect
++from hermes_cli.fact_board_inputs import BoardInputSource, CapturedInput
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_content_owner import ContentBinding, ContentOwner
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_materializers import Projection, view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore, view_key
++from plugins.kanban.dashboard import board_fact_views
++from hermes_cli import fact_board_native as board_native_inputs
++from tests.plugins import test_kanban_board_shadow as helpers
++from tests.waiting import wait_until
++
++shadow_board = helpers.shadow_board
++
++
++def test_real_source_mutation_reaches_canonical_view_without_legacy_route(shadow_board, monkeypatch):
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    scope = Scope('fixture-install', 'default', 'default')
++    engine = ReducerEngine(FactStore(), scope)
++    source_id = SourceId(scope, 'board.input', 'local')
++    content_id = SourceId(scope, 'tasks.content', 'local')
++    path = kanban_db.kanban_db_path()
++    api = shadow_board['mod']
++
++    def capture(view, selector, budget):
++        result = board_native_inputs.capture(api, None, view, selector)
++        return CapturedInput(result['value'], ((source_id, result['observations']),), result['observed_at'])
++
++    source = BoardInputSource(engine, source_id, capture, paths=(path,))
++
++    def dependencies(scope, selector, snapshot):
++        return {source.input_key('board', selector), owner.publisher(content_id).state_key}
++
++    def render(selector, facts, now):
++        return board_native_inputs.project(api, 'board', facts[source.input_key('board', selector)].value)
++
++    engine.register(view_reducer([Projection('board', ('BoardInput', 'SourceState'), dependencies, render)]))
++    owner = ContentOwner({scope: engine}, [ContentBinding(content_id, path)], operational=[source],
++                         budget=CaptureBudget(max_seconds=5))
++    selector = board_fact_views.board_selector()
++    key = view_key(scope, 'board', selector)
++
++    def payload():
++        fact = engine.store.snapshot(scope).get(key)
++        return json.loads(fact.value['encoded']) if fact is not None and fact.health == 'fresh' else None
++
++    try:
++        source.want('board', selector)
++        owner.demand(scope, 'board', selector)
++        assert wait_until(lambda: payload() is not None, timeout=5)
++        assert payload() == helpers._read(shadow_board)
++        with closing(kanban_db_connect.connect()) as conn, conn:
++            conn.execute('UPDATE tasks SET title = ? WHERE id = ?', ('Native mutation', shadow_board['live_id']))
++        assert wait_until(lambda: payload() is not None and
++                          helpers._cards(payload())[shadow_board['live_id']]['title'] == 'Native mutation', timeout=5)
++        fact = engine.store.snapshot(scope).get(key)
++        assert any(entry[0] == content_id for entry in fact.source_vector)
++        assert any(entry[0] == source_id for entry in fact.source_vector)
++        assert payload() == helpers._read(shadow_board)
++    finally:
++        owner.close()
+diff --git a/tests/plugins/test_board_shadow_capture.py b/tests/plugins/test_board_shadow_capture.py
+new file mode 100644
+index 0000000000..bbcaaf7c78
+--- /dev/null
++++ b/tests/plugins/test_board_shadow_capture.py
+@@ -0,0 +1,101 @@
++"""Shadow input captures retain canonical ownership/caps without live render reads."""
++from contextlib import closing
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli.fact_contract import freeze
++from plugins.kanban.dashboard import board_fact_capture, board_shadow
++from tests.plugins import test_kanban_board_shadow as helpers
++
++shadow_board = helpers.shadow_board
++
++
++def _capture(env, cap=80):
++    with closing(kbc.connect()) as live, closing(kbc.connect(env['shadow'])) as replica:
++        live.execute('BEGIN')
++        replica.execute('BEGIN')
++        local = board_fact_capture.capture(live, done_limit=cap)
++        payload = board_fact_capture.project(freeze(local))
++        captured = board_shadow.capture(live, replica, payload, None, False, None, None, cap)
++        return freeze(local), freeze(captured)
++
++
++def test_shadow_capture_is_plain_canonical_and_detached(shadow_board, monkeypatch):
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    expected = helpers._read(shadow_board)
++    local, remote = _capture(shadow_board)
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('shadow rendering performed source I/O or sampled a clock')
++
++    with monkeypatch.context() as guard:
++        guard.setattr(kbc, 'connect', forbidden)
++        guard.setattr(board_shadow.shadow_view, 'homes_of', forbidden)
++        guard.setattr(board_shadow.board_read, 'materialize', forbidden)
++        guard.setattr(board_shadow.board_read, 'diagnostics_from_inputs', forbidden)
++        guard.setattr(time, 'time', forbidden)
++        actual = board_shadow.project_captured(board_fact_capture.project(local), remote)
++        assert actual == expected
++        actual['columns'][0]['tasks'].clear()
++        assert board_shadow.project_captured(board_fact_capture.project(local), remote) == expected
++
++    with closing(kbc.connect(shadow_board['shadow'])) as replica, replica:
++        replica.execute('DELETE FROM tasks WHERE id=?', (shadow_board['running'],))
++    next_local, next_remote = _capture(shadow_board)
++    updated = board_shadow.project_captured(board_fact_capture.project(next_local), next_remote)
++    assert shadow_board['running'] not in helpers._cards(updated)
++    assert board_shadow.project_captured(board_fact_capture.project(local), remote) == expected
++
++
++@pytest.mark.parametrize('cap', [0, 1, 3, 80])
++@pytest.mark.parametrize('hidden_live', [False, True])
++def test_capture_ownership_precedes_filters_and_combined_done_window(shadow_board, monkeypatch, cap, hidden_live):
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    with closing(kbc.connect()) as live, live:
++        live.execute('UPDATE tasks SET status=?, completed_at=99 WHERE id=?',
++                     ('archived' if hidden_live else 'done', shadow_board['live_id']))
++    with closing(kbc.connect(shadow_board['shadow'])) as replica, replica:
++        replica.execute('UPDATE tasks SET status="done", completed_at=100 WHERE id=?',
++                        (shadow_board['live_id'],))
++        for i, completed in enumerate((99, 99, None, 0)):
++            tid = kb.create_task(replica, title=f'captured done {i}', assignee='default')
++            replica.execute('UPDATE tasks SET status="done", completed_at=? WHERE id=?', (completed, tid))
++        replica.execute('UPDATE tasks SET created_on=NULL WHERE id=?', (shadow_board['ready'],))
++    expected = helpers._read(shadow_board, done_limit=cap)
++    local, remote = _capture(shadow_board, cap)
++    actual = board_shadow.project_captured(board_fact_capture.project(local), remote)
++    assert actual == expected
++    assert helpers._cards(actual)[shadow_board['ready']]['home_gateway'] == 'unknown'
++    if hidden_live:
++        assert shadow_board['live_id'] not in helpers._cards(actual)
++
++
++@pytest.mark.parametrize('missing', ['live', 'replica', 'both'])
++def test_shadow_capture_requires_both_transactions(shadow_board, missing):
++    with closing(kbc.connect()) as live, closing(kbc.connect(shadow_board['shadow'])) as replica:
++        if missing == 'live':
++            replica.execute('BEGIN')
++        elif missing == 'replica':
++            live.execute('BEGIN')
++        with pytest.raises(ValueError, match='caller-owned read transactions'):
++            board_shadow.capture(live, replica, {}, None, False, None, None, 80)
++
++
++def test_shadow_capture_failure_is_not_authoritative_empty(shadow_board, monkeypatch):
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    local, remote = _capture(shadow_board)
++    original = board_shadow.shadow_view.homes_of
++
++    def broken(*args, **kwargs):
++        raise OSError('controlled replica metadata outage')
++
++    with monkeypatch.context() as guard:
++        guard.setattr(board_shadow.shadow_view, 'homes_of', broken)
++        with pytest.raises(OSError, match='controlled replica metadata outage'):
++            _capture(shadow_board)
++    assert board_shadow.shadow_view.homes_of is original
++    recovered_local, recovered_remote = _capture(shadow_board)
++    assert board_shadow.project_captured(board_fact_capture.project(local), remote) == (
++        board_shadow.project_captured(board_fact_capture.project(recovered_local), recovered_remote))
+diff --git a/tests/plugins/test_board_startup.py b/tests/plugins/test_board_startup.py
+new file mode 100644
+index 0000000000..91f6262625
+--- /dev/null
++++ b/tests/plugins/test_board_startup.py
+@@ -0,0 +1,115 @@
++"""Actual bundled mount activation and emergency rollback. [daveey]"""
++import json
++import time
++import pytest
++
++from hermes_cli import kanban_db
++from plugins.kanban.dashboard import board_fact_views
++from tests.plugins import test_kanban_board_shadow as helpers
++from tests.waiting import wait_until
++
++shadow_board = helpers.shadow_board
++
++
++def test_native_startup_prewarms_then_serves_without_legacy(shadow_board, monkeypatch, caplog):
++    caplog.set_level('DEBUG', logger='hermes_cli.fact_board_inputs')
++    from hermes_cli.fact_board_startup import BoardRuntime
++    api = shadow_board['mod']
++    monkeypatch.setattr(time, 'time', lambda: 1_700_000_000.0)
++    expected = helpers._read(shadow_board)
++    runtime = BoardRuntime(api, boards=('default',))
++    try:
++        runtime.start()
++        try:
++            assert wait_until(lambda: runtime.ready('default'), timeout=10)
++        except AssertionError:
++            print(runtime.owners['default'].store.snapshot(runtime.owners['default'].scope))
++            print([(key, fact.health, fact.error_code) for key, fact in runtime.owners['default'].store._facts.items()])
++            raise
++        def forbidden(*args, **kwargs):
++            raise AssertionError('legacy/source read on warmed request')
++        monkeypatch.setattr(api, '_conn', forbidden)
++        monkeypatch.setattr(kanban_db, 'get_current_board', forbidden)
++        monkeypatch.setattr(api, '_get_board_uncached', forbidden)
++        assert api.get_board(board='default', **board_fact_views.board_selector()) == expected
++        import asyncio
++        response = asyncio.run(api.get_board_endpoint(board='default', **board_fact_views.board_selector()))
++        assert json.loads(response.body) == expected
++        with board_fact_views._request.pin('default', board_fact_views._installed):
++            result = board_fact_views.response('board', board_fact_views.board_selector(), board='default')
++        assert json.loads(result.body) == expected
++    finally:
++        runtime.close()
++
++
++def test_current_selection_reads_published_catalog_only(shadow_board, monkeypatch):
++    from types import SimpleNamespace
++    from hermes_cli.fact_board_startup import BoardRuntime
++    from hermes_cli.fact_contract import Ready, Pending, Unavailable
++    runtime = BoardRuntime(shadow_board['mod'], boards=('default',))
++    selected = object()
++    runtime.views = {'other': selected}
++    monkeypatch.setattr(kanban_db, 'get_current_board', lambda: (_ for _ in ()).throw(AssertionError('source I/O')))
++    assert isinstance(runtime.provider(None), Unavailable)
++    result = Pending()
++    snapshot = SimpleNamespace(view=lambda *_args: result)
++    owner = SimpleNamespace(scope=None, handle=None)
++    runtime.owners = {runtime.current: owner}
++    assert isinstance(runtime.provider(None), Unavailable)
++    owner.handle = SimpleNamespace(v1=SimpleNamespace(snapshot=lambda _scope: snapshot))
++    assert isinstance(runtime.provider(None), Unavailable)
++    result = Ready(b'{"current":"other"}', 'catalog', 1)
++    assert runtime.provider(None) is selected
++    result = Ready(b'{"current":"unknown"}', 'catalog', 2)
++    assert isinstance(runtime.provider(None), Unavailable)
++
++
++def test_actual_mount_entry_selects_native_runtime(shadow_board, monkeypatch):
++    from hermes_cli import fact_board_startup as board_startup
++    from hermes_cli.fact_plugin_mount import PluginLifecycles
++    from pathlib import Path
++    api = shadow_board['mod']
++    calls = []
++    class Handle:
++        def close(self):
++            calls.append('close')
++    monkeypatch.delenv('HERMES_FACTS_BOARD', raising=False)
++    monkeypatch.setattr(board_startup, 'start', lambda module: calls.append(module) or Handle())
++    registry = PluginLifecycles()
++    registry.start(Path(api.__file__), api)
++    assert calls == [api]
++    registry.close()
++    assert calls == [api, 'close']
++
++
++def test_same_process_off_rollback_restores_legacy_admission(shadow_board, monkeypatch):
++    from hermes_cli import fact_board_startup as board_startup
++    from plugins.kanban.dashboard import board_legacy
++    api = shadow_board['mod']
++    path = str(kanban_db.kanban_db_path())
++    runtime = board_startup.BoardRuntime(api, boards=('default',)).start()
++    runtime.close()
++    monkeypatch.setenv('HERMES_FACTS_BOARD', 'off')
++    handle = board_startup.start(api)
++    try:
++        with board_legacy.borrowed(path):
++            assert shadow_board['live_id'] in helpers._cards(helpers._read(shadow_board))
++    finally:
++        handle.close()
++
++
++@pytest.mark.parametrize('flag,platform', [('off', 'linux'), ('1', 'darwin'), ('1', 'win32')])
++def test_flag_off_starts_legacy_once_and_never_captures(shadow_board, monkeypatch, flag, platform):
++    from hermes_cli import fact_board_startup as board_startup
++    from types import SimpleNamespace
++    api = shadow_board['mod']
++    calls = []
++    monkeypatch.setenv('HERMES_FACTS_BOARD', flag)
++    monkeypatch.setattr(board_startup, 'sys', SimpleNamespace(platform=platform))
++    monkeypatch.setattr(api.board_prewarm, 'LegacyLifecycle', lambda api: calls.append('legacy') or type(
++        'Handle', (), {'close': lambda self: calls.append('close')})())
++    monkeypatch.setattr(board_startup, 'BoardRuntime', lambda *a, **k: (_ for _ in ()).throw(AssertionError('facts start')))
++    handle = board_startup.start(api)
++    assert calls == ['legacy']
++    handle.close()
++    assert calls == ['legacy', 'close']
+diff --git a/tests/plugins/test_board_teardown.py b/tests/plugins/test_board_teardown.py
+new file mode 100644
+index 0000000000..2fe04be36a
+--- /dev/null
++++ b/tests/plugins/test_board_teardown.py
+@@ -0,0 +1,38 @@
++"""Failed board teardown blocks admission but drains healthy siblings. [daveey]"""
++from types import SimpleNamespace
++import threading
++
++import pytest
++
++from hermes_cli.fact_contract import Unavailable
++from plugins.kanban.dashboard import board_fact_views
++from hermes_cli.fact_board_startup import BoardRuntime
++
++
++def test_failed_shutdown_keeps_provider_closed_and_retries_custody(monkeypatch):
++    runtime = object.__new__(BoardRuntime)
++    runtime.home = 'fixture'
++    runtime.api = SimpleNamespace(board_fact_views=board_fact_views)
++    runtime.current = 'default'
++    runtime._closed = runtime._drained = False
++    runtime._lock = threading.RLock()
++    runtime._previous = None
++    calls = []
++    def fail():
++        calls.append('failed')
++        raise TimeoutError('busy')
++    runtime.views = {'default': SimpleNamespace(close=fail)}
++    runtime.owners = {'default': SimpleNamespace(close=lambda: calls.append('healthy'))}
++    installed = (runtime, runtime.provider)
++    monkeypatch.setattr(board_fact_views, '_installed', installed)
++    with pytest.raises(ExceptionGroup, match='board shutdown incomplete'):
++        runtime.close()
++    assert calls == ['failed', 'healthy']
++    assert board_fact_views._installed == installed
++    assert isinstance(runtime.provider(None), Unavailable)
++    runtime.views['default'].close = lambda: calls.append('recovered')
++    runtime.close()
++    assert calls == ['failed', 'healthy', 'recovered', 'healthy']
++    assert board_fact_views._installed is None
++    runtime.close()
++    assert len(calls) == 4
+diff --git a/tests/tui_gateway/test_project_tree_capture.py b/tests/tui_gateway/test_project_tree_capture.py
+new file mode 100644
+index 0000000000..d0e9cdf94a
+--- /dev/null
++++ b/tests/tui_gateway/test_project_tree_capture.py
+@@ -0,0 +1,83 @@
++"""Canonical tree inputs cross an immutable boundary with all dynamic probe evidence."""
++import builtins
++from copy import deepcopy
++import os
++import socket
++import subprocess
++
++import pytest
++
++from hermes_cli.fact_contract import freeze
++from tests.tui_gateway import test_project_tree as helpers
++from tui_gateway import project_tree
++
++
++def test_tree_capture_replays_dynamic_probes_without_source_access(monkeypatch):
++    from tui_gateway import project_tree_capture
++
++    projects = [helpers._project('p_fixture', 'Explicit', ['/explicit'])]
++    sessions = [helpers._session('/explicit', id='explicit', branch='main'),
++                helpers._session('/work/repo-task-gone/sub', id='deleted', branch='feature'),
++                helpers._session('', id='homeless', title=None, last_active=None)]
++    discovered = [{'root': '/discovered', 'label': None, 'sessions': 0, 'last_active': 0}]
++    resolve = helpers._resolver({'/work/repo': ('/work/repo', '/work/repo'),
++                                 '/explicit': ('/explicit', '/explicit')})
++    kwargs = dict(preview_limit=3, hydrate=True, is_junk_root=lambda _: False,
++                  is_junk_cwd=lambda _: False, exists=lambda p: p != '/work/repo-task-gone/sub')
++    expected = deepcopy(project_tree.build_tree(projects, sessions, discovered, resolve, **kwargs))
++    captured = freeze(project_tree_capture.capture(projects, sessions, discovered, resolve, **kwargs))
++    assert '/work/repo' in captured['probes']['resolve']
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('canonical tree render revisited external evidence')
++
++    with monkeypatch.context() as guard:
++        guard.setattr(builtins, 'open', forbidden)
++        guard.setattr(os.path, 'isdir', forbidden)
++        guard.setattr(socket, 'socket', forbidden)
++        guard.setattr(subprocess, 'Popen', forbidden)
++        actual = project_tree_capture.project(captured)
++        assert actual == expected
++        actual['projects'][0]['name'] = 'mutated output'
++        assert project_tree_capture.project(captured) == expected
++    sessions[0]['title'] = 'changed after capture'
++    assert project_tree_capture.project(captured) == expected
++
++
++@pytest.mark.parametrize('hydrate', [False, True])
++def test_tree_capture_preserves_absent_resolver_defaults(hydrate):
++    from tui_gateway import project_tree_capture
++
++    sessions = [helpers._session('/repo-wt-feature', id='s', branch='feature')]
++    captured = freeze(project_tree_capture.capture([], sessions, [], hydrate=hydrate, preview_limit=0))
++    expected = project_tree.build_tree([], sessions, [], hydrate=hydrate, preview_limit=0)
++    assert project_tree_capture.project(captured) == expected
++    assert captured['probes'] == dict.fromkeys(('resolve', 'is_junk_root', 'is_junk_cwd', 'exists'))
++
++
++def test_missing_probe_is_not_negative_evidence():
++    from tui_gateway import project_tree_capture
++
++    sessions = [helpers._session('/repo', id='s')]
++    captured = project_tree_capture.capture([], sessions, [], lambda p: None)
++    del captured['probes']['resolve']['/repo']
++    with pytest.raises(KeyError, match='/repo'):
++        project_tree_capture.project(freeze(captured))
++
++
++def test_probe_results_are_captured_once_and_not_aliased():
++    from tui_gateway import project_tree_capture
++
++    info = {'repo_root': '/repo', 'worktree_root': '/repo'}
++    seen = []
++
++    def resolve(path):
++        seen.append(path)
++        return info
++
++    sessions = [helpers._session('/repo', id='a'), helpers._session('/repo', id='b')]
++    captured = project_tree_capture.capture([], sessions, [], resolve)
++    expected = project_tree_capture.project(freeze(captured))
++    assert seen == ['/repo']
++    info['repo_root'] = '/changed'
++    assert project_tree_capture.project(freeze(captured)) == expected
+diff --git a/tests/tui_gateway/test_project_tree_native_capture.py b/tests/tui_gateway/test_project_tree_native_capture.py
+new file mode 100644
+index 0000000000..6fe7df896a
+--- /dev/null
++++ b/tests/tui_gateway/test_project_tree_native_capture.py
+@@ -0,0 +1,22 @@
++"""Real gateway normalization → detached probes → canonical tree. [daveey]"""
++from tui_gateway import server
++from tui_gateway import project_tree_capture
++
++
++def test_native_capture_reuses_live_builder_normalization(monkeypatch):
++    rows = ([{'id': 's1', 'cwd': '/fixture/repo', 'git_repo_root': '/fixture/repo'}], [], [], None)
++    monkeypatch.setattr(server, '_project_tree_inputs', lambda *a, **k: rows)
++    monkeypatch.setattr(server, '_canonical_workspace_path', lambda p: p)
++    monkeypatch.setattr(server.git_probe, 'resolve', lambda path: None)
++    monkeypatch.setattr(server.git_probe, 'warm_roots', lambda paths: None)
++    monkeypatch.setattr(server, '_is_repo_junk', lambda path: False)
++    monkeypatch.setattr(server, '_is_session_cwd_junk', lambda path: False)
++    monkeypatch.setattr(server, '_dir_exists_cached', lambda path: True)
++    options = dict(preview_limit=3, hydrate=False, session_limit=2000, include_discovered=False)
++    expected = server._build_project_tree(None, **options)
++    captured, active_id = server._capture_project_tree(None, **options)
++    def forbidden(*a, **k):
++        raise AssertionError('external read during pure replay')
++    monkeypatch.setattr(server, '_project_tree_inputs', forbidden)
++    monkeypatch.setattr(server.git_probe, 'resolve', forbidden)
++    assert (project_tree_capture.project(captured), active_id) == expected
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index f400eabf50..921f5693f9 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -441,11 +441,10 @@ def _dir_exists_cached(path: str) -> bool:
+     return hit
+ 
+ 
+-def _build_project_tree(
+-    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
++def _project_tree_from_inputs(
++    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool, builder
+ ) -> tuple[dict, str | None]:
+-    """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
+-    from tui_gateway import project_tree
++    """Gather normalized inputs once for canonical rendering or detached capture."""
+     _DIR_EXISTS_CACHE.clear()
+     sessions, projects, discovered, active_id = _project_tree_inputs(
+         db, session_limit, include_discovered=include_discovered)
+@@ -464,13 +463,27 @@ def _build_project_tree(
+     git_probe.warm_roots(
+         [str(f.get("path") or "") for p in projects for f in (p.get("folders") or [])]
+         + [str(r.get("root") or "") for r in discovered])
+-    tree = project_tree.build_tree(
++    tree = builder(
+         projects, sessions, discovered, resolve, preview_limit=preview_limit,
+         hydrate=hydrate, is_junk_root=_is_repo_junk, is_junk_cwd=_is_session_cwd_junk,
+         exists=_dir_exists_cached)
+     return tree, active_id
+ 
+ 
++def _build_project_tree(db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool):
++    """Legacy builder; keep the direct caller contract and one canonical render."""
++    from tui_gateway import project_tree
++    return _project_tree_from_inputs(db, preview_limit=preview_limit, hydrate=hydrate,
++        session_limit=session_limit, include_discovered=include_discovered, builder=project_tree.build_tree)
++
++
++def _capture_project_tree(db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool):
++    """Owner-worker capture using exactly the legacy normalization/probe closure."""
++    from tui_gateway import project_tree_capture
++    return _project_tree_from_inputs(db, preview_limit=preview_limit, hydrate=hydrate,
++        session_limit=session_limit, include_discovered=include_discovered, builder=project_tree_capture.capture)
++
++
+ def register(server) -> None:
+     """Publish this module's helpers + handlers onto ``server``, rebound to its globals."""
+     bind_module(globals(), server, skip=("_",))
+diff --git a/tui_gateway/project_tree_capture.py b/tui_gateway/project_tree_capture.py
+new file mode 100644
+index 0000000000..72ca87a317
+--- /dev/null
++++ b/tui_gateway/project_tree_capture.py
+@@ -0,0 +1,59 @@
++"""Detached canonical project-tree inputs and dynamic external evidence. [daveey]
++
++Capture runs on the source worker with already-normalized, authorized inputs.
++The canonical builder discovers its own bounded probe closure (including deleted
++worktree sibling paths); rendering replays only that evidence and never guesses
++that an unobserved path does not exist. This module performs no discovery itself.
++"""
++from collections.abc import Mapping
++
++from tui_gateway import project_tree
++
++
++def _plain(value):
++    if isinstance(value, Mapping):
++        return {key: _plain(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_plain(item) for item in value]
++    return value
++
++
++def capture(projects, sessions, discovered_repos, resolve=None, *, preview_limit=3, hydrate=False,
++            is_junk_root=None, is_junk_cwd=None, exists=None):
++    """Record the exact canonical builder's probe closure, not a guessed path list."""
++    value = _plain({'projects': projects, 'sessions': sessions, 'discovered': discovered_repos,
++                    'preview_limit': preview_limit, 'hydrate': hydrate})
++    probes = {}
++
++    def record(name, function):
++        if function is None:
++            probes[name] = None
++            return None
++        rows = probes[name] = {}
++
++        def read(path):
++            if path not in rows:
++                rows[path] = _plain(function(path))
++            return _plain(rows[path])
++        return read
++
++    project_tree.build_tree(value['projects'], value['sessions'], value['discovered'],
++                            record('resolve', resolve), preview_limit=preview_limit, hydrate=hydrate,
++                            is_junk_root=record('is_junk_root', is_junk_root),
++                            is_junk_cwd=record('is_junk_cwd', is_junk_cwd), exists=record('exists', exists))
++    value['probes'] = probes
++    return value
++
++
++def project(captured):
++    """Reuse the canonical serializer with memory-only evidence lookups."""
++    value = _plain(captured)
++
++    def lookup(name):
++        rows = value['probes'][name]
++        return None if rows is None else rows.__getitem__
++
++    return project_tree.build_tree(value['projects'], value['sessions'], value['discovered'], lookup('resolve'),
++                                   preview_limit=value['preview_limit'], hydrate=value['hydrate'],
++                                   is_junk_root=lookup('is_junk_root'), is_junk_cwd=lookup('is_junk_cwd'),
++                                   exists=lookup('exists'))
+-- 
+2.43.0
+

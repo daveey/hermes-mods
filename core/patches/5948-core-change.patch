@@ -1,0 +1,526 @@
+From b732a04c04e0a0d3b147b46aaa4270d969a0f2b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:35:23 +0000
+Subject: [PATCH] fix(desktop): retain drain custody for K01 mutation children
+ [daveey]
+
+The offline helper introduced two unregistered subprocess seams, making the
+whole-tree worker-drain ratchet fail unrelated required core CI. Route Git
+listing and bounded Vitest runs through one popen_worker launcher, with a
+scrubbed environment and inherited close-only lease retained by real children.
+Kill/reap the direct child on timeout/interruption. Keep descendant descriptors
+visible to the existing drain rather than claiming parent lifetime is custody.
+Move script execution under main so behavior can be tested without a K01 run.
+Inventory the single routed spawn honestly; preserve mutation definitions.
+
+Proof:
+- Baseline source-scan RED: 8 pass, 1 fail (only k01-mutants.py missing).
+- Source-scan / text encoding / env consumers GREEN: 1728 pass.
+- Real child/refusal/timeout/spawn-error/unactivated coverage plus fence and
+  hardening consumers GREEN: 34 pass.
+- Replacing popen_worker with raw Popen kills both draining/sealed tests
+  (2 behavioral failures); restored helper file GREEN: 7 pass.
+- Full canonical scripts/check: 21 checks pass, health 0 blocking/advisory.
+  Used the pinned test interpreter; runtime bootstrap under isolated fake HOME
+  is not a committed dependency environment on this worker profile.
+
+Source/CI only. No native K01 execution, contained-runner release, restart,
+installation or social action is authorized or performed.
+
+
+---
+ apps/desktop/scripts/k01-mutants.py          | 314 ++++++++++---------
+ hermes_cli/worker_drain_spawn_inventory.json |  15 +-
+ tests/hermes_cli/test_k01_mutants_drain.py   | 114 +++++++
+ 3 files changed, 297 insertions(+), 146 deletions(-)
+ create mode 100644 tests/hermes_cli/test_k01_mutants_drain.py
+
+diff --git a/apps/desktop/scripts/k01-mutants.py b/apps/desktop/scripts/k01-mutants.py
+index 5081f2edc9..16e3abe36d 100644
+--- a/apps/desktop/scripts/k01-mutants.py
++++ b/apps/desktop/scripts/k01-mutants.py
+@@ -5,149 +5,181 @@ A mutation is killed only by failed executed testcases, not collection/setup los
+ """
+ import hashlib
+ import json
+-import os
+ from pathlib import Path
+ import shutil
+ import subprocess
+ import sys
+ 
+-core, mods, out = map(lambda p: Path(p).resolve(), sys.argv[1:4])
+-out.mkdir(parents=True, exist_ok=True)
+-fixture = out / 'fixture'
+-if fixture.exists(): shutil.rmtree(fixture)
+-fixture.mkdir()
+-paths = subprocess.check_output(['git','-C',str(core),'ls-files','-z','--cached','--others','--exclude-standard'],timeout=30).decode().split('\0')
+-inputs = {}
+-for name in filter(None,paths):
+-    source=core/name
+-    if not source.is_file(): continue
+-    dest=fixture/'core'/name; dest.parent.mkdir(parents=True,exist_ok=True)
+-    shutil.copy2(source,dest)
+-    inputs['core/'+name]=hashlib.sha256(source.read_bytes()).hexdigest()
+-companion=fixture/'mods/session-tasks-plugin.js';companion.parent.mkdir(parents=True)
+-shutil.copy2(mods/'desktop-plugins/session-tasks/plugin.js',companion)
+-inputs['mods/session-tasks-plugin.js']=hashlib.sha256(companion.read_bytes()).hexdigest()
+-for rel in ['node_modules','apps/desktop/node_modules']:
+-    (fixture/'core'/rel).symlink_to(core/rel,target_is_directory=True)
+-(out/'input-shas.json').write_text(json.dumps(inputs,indent=2))
+-app=fixture/'core/apps/desktop'
+-identity='src/contrib/session-tasks-identity.ts'; runtime='src/sdk/runtime.ts';loader='src/contrib/runtime-loader.ts'
+-itest='src/contrib/session-tasks-identity.test.ts';ctest='src/contrib/session-tasks-capture.test.ts';atest='src/sdk/loaded-assets.test.ts'
+-mutants=[]
+-def add(id,path,old,new,tests): mutants.append(dict(id=id,path=path,old=old,new=new,tests=tests))
+-add('surface-object',identity,'descriptor?.value !== activation.surface','false',[itest])
+-add('surface-required',identity,'!activation.surface','false',[itest])
+-add('surface-names',identity,'names.length !== activation.names?.length','false',[itest])
+-add('surface-per-name',identity,'after !== undefined &&','',[itest])
+-for key in ['configurable','enumerable','writable','value','get','set']:
+-    add('descriptor-'+key,identity,"'"+key+"'," if key!='set' else ",'set'",'', [itest])
+-add('bind-synchronous',identity,'registering !== activation','false',[itest])
+-add('bind-once',identity,'if (called)','if (false)',[itest])
+-add('bind-plugin-id',identity,"input.pluginId !== 'session-tasks'",'false',[itest])
+-add('bind-type',identity,"typeof surface !== 'object'",'false',[itest])
+-add('bind-null',identity,'surface === null','false',[itest])
+-add('reentrant-registration',identity,'if (registering)','if (false)',[itest])
+-add('reentrant-bind',identity,"activation.reason === 'REENTRANT_REGISTRATION'",'false',[itest])
+-add('settle-sticky',identity,"activation.reason !== 'REGISTRATION_PENDING'",'false',[itest])
+-add('settle-dependency',identity,'input.dependencyReason ??','null ??',[ctest])
+-add('settle-binding',identity,"activation.surface ? 'MATCH' : 'MISSING_BINDING'","true ? 'MATCH' : 'MISSING_BINDING'",[itest])
+-add('activation-owner',identity,"input.pluginId === 'session-tasks'",'true',[itest])
+-add('invalidate',identity,'activation.reason = reason','activation.reason = activation.reason',[itest])
+-add('navigation-url',identity,'active.navigation !== location.href','false',[itest])
+-add('surface-status',identity,"active.reason === 'MATCH' && !matches",'false',[itest])
+-add('unload-before-disposal',loader,'if (disposers) {invalidators.get(disposers)?.()}','void disposers',[itest])
+-add('reload-before-await',loader,"if ($pluginRecords.get()[id]?.file === file)",'if (false)',[itest])
+-add('reload-no-file',loader,'if (!file) {return}','if (false) {return}',[itest])
+-add('navigation-document',identity,'active.document !== document','false',[itest])
+-add('read-not-loaded',identity,'if (!active)','if (false)',[ctest])
+-for event in ['pagehide','beforeunload','popstate','hashchange']:
+-    add('event-'+event,identity,"'"+event+"'","'disabled-"+event+"'",[itest])
+-add('disk-reload-before-read',loader,'if (previous)','if (false)',[ctest])
+-add('shim-evaluation-hook',runtime,'globalThis.__HERMES_CAPTURE_PLUGIN_SHIM__?.(import.meta.url, m);','',[ctest])
+-add('shim-known-only',runtime,'!shimSources.has(url) ||','',[ctest])
+-add('shim-capture-once',runtime,'|| captures.has(url)','',[ctest])
+-add('capture-idempotent-end',runtime,'if (ended)','if (false)',[ctest])
+-add('capture-refcount-enter',runtime,'captureUsers++ === 0','true',[ctest])
+-add('capture-refcount-leave',runtime,'--captureUsers === 0','true',[ctest])
+-add('capture-prior-descriptor',runtime,'if (priorCapture)','if (false)',[ctest])
+-add('capture-missing',runtime,'if (!captured)','if (false)',[ctest])
+-add('capture-evidence-failure',runtime,'if (evidence.reason)','if (false)',[ctest])
+-add('capture-reference',runtime,'namespace:captured.namespace',"namespace:(globalThis as any).__HERMES_PLUGIN_SDK__",[ctest])
+-add('companion-immediate-bind','@companion','ctx.bindSessionTasksDiagnostic?.(surface)','void surface',[itest])
+-add('companion-owned-cleanup','@companion',"Object.getOwnPropertyDescriptor(window, '__sessionTasks')?.value === surface",'true',[itest])
+-add('dependency-closed-set',loader,'dynamic || specifiers.some(specifier => !supported.has(specifier))','false',[itest])
+-add('static-import-comments',loader,r'const gap = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)`',r'const gap = String.raw`\s`',[itest])
+-# Digest semantics, not digest-shaped strings.
+-add('exact-sha','src/sdk/loaded-assets.ts',"crypto.subtle.digest('SHA-256', bytes)","crypto.subtle.digest('SHA-256', new Uint8Array())",[atest])
+-add('static-asset-bytes','src/sdk/loaded-assets.ts','...await identifyRawBytes(await read(url))','...await identifyBytes(url)',[atest])
+-add('served-bom-bytes','src/sdk/loaded-assets.ts','new Uint8Array(await response.arrayBuffer())','new TextEncoder().encode(await response.text())',[atest])
+-add('static-closure','src/sdk/loaded-assets.ts','for (const dependency of item.imports ?? [])','for (const dependency of [])',[atest])
+-add('graph-limit','src/sdk/loaded-assets.ts','seen.size >= 256','false',[atest])
+-add('root-protocol','src/sdk/loaded-assets.ts',"!['http:', 'https:', 'file:'].includes(rootUrl.protocol)",'false',[atest])
+-add('root-bundled','src/sdk/loaded-assets.ts',"!rootUrl.pathname.includes('/assets/')",'false',[atest])
+-add('response-ok','src/sdk/loaded-assets.ts','!response.ok','false',[atest])
+-add('response-redirect','src/sdk/loaded-assets.ts','response.url && response.url !== url','false',[atest])
+-add('io-deadline','src/sdk/loaded-assets.ts','AbortSignal.timeout(5_000)','new AbortController().signal',[atest])
+-add('manifest-root','src/sdk/loaded-assets.ts','if (!rootKey)','if (false)',[atest])
+-add('graph-cycle','src/sdk/loaded-assets.ts','if (seen.has(key))','if (false)',[atest])
+-add('graph-entry','src/sdk/loaded-assets.ts','!item ||','',[atest])
+-add('asset-path-regex','src/sdk/loaded-assets.ts',r'!/^assets\/[^?#\\]+\.js$/.test(item.file)','false',[atest])
+-add('asset-path-traversal','src/sdk/loaded-assets.ts',"item.file.split('/').includes('..')",'false',[atest])
+-rtest='src/contrib/k01-review-probes.test.ts'
+-add('pending-owner-exists',loader,'pending && pending.file !== options.file','false',[rtest])
+-add('pending-owner-file',loader,'pending.file !== options.file','false',[rtest])
+-add('pending-unload',loader,'  pendingIdentities.delete(id)','  void id',[rtest])
+-add('pending-current-claim',loader,'pendingIdentities.get(plugin.id) !== claim','false',[rtest])
+-add('pending-release-owned',loader,'pendingIdentities.get(plugin.id) === claim','true',[rtest])
+-add('crypto-fail-closed',loader,"dependencyReason:'DIAGNOSTIC_IDENTITY_UNAVAILABLE'",'dependencyReason:null',[rtest])
+-add('crypto-load-compatibility',loader,'// Diagnostic evidence is optional for loading, never optional for MATCH.',"throw new Error('diagnostic crypto gates loading')",[rtest])
+-add('companion-rollback-custody','@companion','ctx.onDispose?.(dispose)\n    window.__sessionTasks = surface\n    ctx.bindSessionTasksDiagnostic?.(surface)',
+-    'window.__sessionTasks = surface\n    ctx.bindSessionTasksDiagnostic?.(surface)\n    ctx.onDispose?.(dispose)',[rtest])
+-add('companion-rollback-poll','@companion','if (timer) clearInterval(timer)','if (false) clearInterval(timer)',[rtest])
+-add('companion-rollback-rpc','@companion','      clearTimeout(rpcEventTimer)','      void rpcEventTimer',[rtest])
+-add('companion-rollback-focus','@companion','for (const stop of stops) stop?.()','void stops',[rtest])
+-add('companion-rollback-visibility','@companion',"document.removeEventListener('visibilitychange', onVis)",'void onVis',[rtest])
+-dtest='src/contrib/k01-disk-lifecycle.test.ts'
+-add('disk-attempt-owner',loader,'diskLoads.get(entry) === attempt','true',[dtest])
+-add('disk-entry-owner',loader,'disk.get(entry.file) === entry','true',[dtest])
+-add('disk-before-evaluation',loader,'if (!isCurrent()) {return true}\n\n    const result','if (false) {return true}\n\n    const result',[dtest])
+-add('disk-cancellation-not-failure',loader,'if (result.cancelled)','if (false)',[dtest])
+-add('disk-stale-read-error',loader,'if (!isCurrent()) {return true}\n    // An oversize','if (false) {return true}\n    // An oversize',[dtest])
+-add('evaluation-stale-import',loader,'if (!isCurrent()) {return {id:null, cancelled:true}}\n    const plugin','if (false) {return {id:null, cancelled:true}}\n    const plugin',[dtest])
+-add('evaluation-stale-identity',loader,'!== claim || !isCurrent()','!== claim || false',[dtest])
+-add('evaluation-stale-error',loader,'if (!isCurrent()) {return {id:null, cancelled:true}}\n    console.error','if (false) {return {id:null, cancelled:true}}\n    console.error',[dtest])
+-(out/'inventory.json').write_text(json.dumps(mutants,indent=2))
+-selected=set(sys.argv[4].split(',')) if len(sys.argv)>4 else None
+-results=[]
+-def run(id,tests):
+-    report=out/(id+'.json');log=out/(id+'.log')
+-    command=['node',str(core/'apps/desktop/node_modules/vitest/vitest.mjs'),'run','--maxWorkers=1','--no-file-parallelism','--reporter=json','--outputFile='+str(report),*tests]
+-    env={**os.environ,'HERMES_K01_COMPANION':str(companion),'NODE_OPTIONS':'--max-old-space-size=2048'}
+-    with log.open('w') as stream:
+-        try: code=subprocess.run(command,cwd=app,env=env,stdout=stream,stderr=subprocess.STDOUT,timeout=90,check=False).returncode
+-        except subprocess.TimeoutExpired: code=124
+-    data=json.loads(report.read_text()) if report.exists() else {}
+-    assertions=[test for suite in data.get('testResults',[]) for test in suite.get('assertionResults',[])]
+-    failed=[t for t in assertions if t.get('status')=='failed']
+-    verdict='PASS' if code==0 and assertions and not failed else 'KILLED' if code not in [0,124] and failed else 'INVALID'
+-    row=dict(id=id,command=command,exit=code,verdict=verdict,tests=len(assertions),failed=[t['fullName'] for t in failed],skipped=data.get('numPendingTests'))
+-    results.append(row);(out/'results.json').write_text(json.dumps(results,indent=2));print(json.dumps(row),flush=True)
+-    return row
+-baseline=run('baseline',[itest,ctest,atest,rtest,dtest])
+-if baseline['verdict']!='PASS' or baseline['skipped']!=0: raise SystemExit('baseline failed: no mutation evidence accepted')
+-for mutant in mutants:
+-    if selected and mutant['id'] not in selected: continue
+-    file=companion if mutant['path']=='@companion' else app/mutant['path']
+-    original=file.read_text()
+-    if original.count(mutant['old'])!=1:
+-        results.append(dict(id=mutant['id'],verdict='INVALID_ANCHOR',count=original.count(mutant['old'])));continue
+-    file.write_text(original.replace(mutant['old'],mutant['new'],1))
+-    try:
+-        row=run(mutant['id'],mutant['tests'])
+-        if row['verdict']=='PASS': row['verdict']='SURVIVED'
+-        row['mutated_sha256']=hashlib.sha256(file.read_bytes()).hexdigest()
+-    finally: file.write_text(original)
+-(out/'results.json').write_text(json.dumps(results,indent=2))
+-summary={key:sum(row['verdict']==key for row in results[1:]) for key in ['KILLED','SURVIVED','INVALID','INVALID_ANCHOR']}
+-print(json.dumps(summary),flush=True)
+-raise SystemExit(0 if not any(summary[k] for k in ['SURVIVED','INVALID','INVALID_ANCHOR']) else 1)
++# Direct script execution puts scripts/, not the checkout root, on sys.path.
++sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
++from hermes_cli.worker_drain_fence import popen_worker
++from tools.environments.local import build_subprocess_env
++
++
++def run_command(command, *, timeout, env=None, check=False, **kwargs):
++    """Retain a drain lease in the real child through exit, including parent loss.
++
++    Like subprocess.run, kill/reap the direct child on timeout or interruption.
++    Descendants retaining the inherited descriptor remain visible to the drain.
++    """
++    child_env = build_subprocess_env(scrub_secrets=True)
++    child_env.update(env or {})
++    with popen_worker(subprocess.Popen, command, env=child_env,
++                      drain_purpose='desktop.k01-mutants', **kwargs) as process:
++        try:
++            stdout, stderr = process.communicate(timeout=timeout)
++        except BaseException:
++            process.kill()
++            process.wait()
++            raise
++        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
++        if check:
++            result.check_returncode()
++        return result
++
++
++def main():
++    core, mods, out = map(lambda p: Path(p).resolve(), sys.argv[1:4])
++    out.mkdir(parents=True, exist_ok=True)
++    fixture = out / 'fixture'
++    if fixture.exists(): shutil.rmtree(fixture)
++    fixture.mkdir()
++    paths = run_command(['git','-C',str(core),'ls-files','-z','--cached','--others','--exclude-standard'],timeout=30,stdout=subprocess.PIPE,check=True).stdout.decode('utf-8').split('\0')
++    inputs = {}
++    for name in filter(None,paths):
++        source=core/name
++        if not source.is_file(): continue
++        dest=fixture/'core'/name; dest.parent.mkdir(parents=True,exist_ok=True)
++        shutil.copy2(source,dest)
++        inputs['core/'+name]=hashlib.sha256(source.read_bytes()).hexdigest()
++    companion=fixture/'mods/session-tasks-plugin.js';companion.parent.mkdir(parents=True)
++    shutil.copy2(mods/'desktop-plugins/session-tasks/plugin.js',companion)
++    inputs['mods/session-tasks-plugin.js']=hashlib.sha256(companion.read_bytes()).hexdigest()
++    for rel in ['node_modules','apps/desktop/node_modules']:
++        (fixture/'core'/rel).symlink_to(core/rel,target_is_directory=True)
++    (out/'input-shas.json').write_text(json.dumps(inputs,indent=2))
++    app=fixture/'core/apps/desktop'
++    identity='src/contrib/session-tasks-identity.ts'; runtime='src/sdk/runtime.ts';loader='src/contrib/runtime-loader.ts'
++    itest='src/contrib/session-tasks-identity.test.ts';ctest='src/contrib/session-tasks-capture.test.ts';atest='src/sdk/loaded-assets.test.ts'
++    mutants=[]
++    def add(id,path,old,new,tests): mutants.append(dict(id=id,path=path,old=old,new=new,tests=tests))
++    add('surface-object',identity,'descriptor?.value !== activation.surface','false',[itest])
++    add('surface-required',identity,'!activation.surface','false',[itest])
++    add('surface-names',identity,'names.length !== activation.names?.length','false',[itest])
++    add('surface-per-name',identity,'after !== undefined &&','',[itest])
++    for key in ['configurable','enumerable','writable','value','get','set']:
++        add('descriptor-'+key,identity,"'"+key+"'," if key!='set' else ",'set'",'', [itest])
++    add('bind-synchronous',identity,'registering !== activation','false',[itest])
++    add('bind-once',identity,'if (called)','if (false)',[itest])
++    add('bind-plugin-id',identity,"input.pluginId !== 'session-tasks'",'false',[itest])
++    add('bind-type',identity,"typeof surface !== 'object'",'false',[itest])
++    add('bind-null',identity,'surface === null','false',[itest])
++    add('reentrant-registration',identity,'if (registering)','if (false)',[itest])
++    add('reentrant-bind',identity,"activation.reason === 'REENTRANT_REGISTRATION'",'false',[itest])
++    add('settle-sticky',identity,"activation.reason !== 'REGISTRATION_PENDING'",'false',[itest])
++    add('settle-dependency',identity,'input.dependencyReason ??','null ??',[ctest])
++    add('settle-binding',identity,"activation.surface ? 'MATCH' : 'MISSING_BINDING'","true ? 'MATCH' : 'MISSING_BINDING'",[itest])
++    add('activation-owner',identity,"input.pluginId === 'session-tasks'",'true',[itest])
++    add('invalidate',identity,'activation.reason = reason','activation.reason = activation.reason',[itest])
++    add('navigation-url',identity,'active.navigation !== location.href','false',[itest])
++    add('surface-status',identity,"active.reason === 'MATCH' && !matches",'false',[itest])
++    add('unload-before-disposal',loader,'if (disposers) {invalidators.get(disposers)?.()}','void disposers',[itest])
++    add('reload-before-await',loader,"if ($pluginRecords.get()[id]?.file === file)",'if (false)',[itest])
++    add('reload-no-file',loader,'if (!file) {return}','if (false) {return}',[itest])
++    add('navigation-document',identity,'active.document !== document','false',[itest])
++    add('read-not-loaded',identity,'if (!active)','if (false)',[ctest])
++    for event in ['pagehide','beforeunload','popstate','hashchange']:
++        add('event-'+event,identity,"'"+event+"'","'disabled-"+event+"'",[itest])
++    add('disk-reload-before-read',loader,'if (previous)','if (false)',[ctest])
++    add('shim-evaluation-hook',runtime,'globalThis.__HERMES_CAPTURE_PLUGIN_SHIM__?.(import.meta.url, m);','',[ctest])
++    add('shim-known-only',runtime,'!shimSources.has(url) ||','',[ctest])
++    add('shim-capture-once',runtime,'|| captures.has(url)','',[ctest])
++    add('capture-idempotent-end',runtime,'if (ended)','if (false)',[ctest])
++    add('capture-refcount-enter',runtime,'captureUsers++ === 0','true',[ctest])
++    add('capture-refcount-leave',runtime,'--captureUsers === 0','true',[ctest])
++    add('capture-prior-descriptor',runtime,'if (priorCapture)','if (false)',[ctest])
++    add('capture-missing',runtime,'if (!captured)','if (false)',[ctest])
++    add('capture-evidence-failure',runtime,'if (evidence.reason)','if (false)',[ctest])
++    add('capture-reference',runtime,'namespace:captured.namespace',"namespace:(globalThis as any).__HERMES_PLUGIN_SDK__",[ctest])
++    add('companion-immediate-bind','@companion','ctx.bindSessionTasksDiagnostic?.(surface)','void surface',[itest])
++    add('companion-owned-cleanup','@companion',"Object.getOwnPropertyDescriptor(window, '__sessionTasks')?.value === surface",'true',[itest])
++    add('dependency-closed-set',loader,'dynamic || specifiers.some(specifier => !supported.has(specifier))','false',[itest])
++    add('static-import-comments',loader,r'const gap = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)`',r'const gap = String.raw`\s`',[itest])
++    # Digest semantics, not digest-shaped strings.
++    add('exact-sha','src/sdk/loaded-assets.ts',"crypto.subtle.digest('SHA-256', bytes)","crypto.subtle.digest('SHA-256', new Uint8Array())",[atest])
++    add('static-asset-bytes','src/sdk/loaded-assets.ts','...await identifyRawBytes(await read(url))','...await identifyBytes(url)',[atest])
++    add('served-bom-bytes','src/sdk/loaded-assets.ts','new Uint8Array(await response.arrayBuffer())','new TextEncoder().encode(await response.text())',[atest])
++    add('static-closure','src/sdk/loaded-assets.ts','for (const dependency of item.imports ?? [])','for (const dependency of [])',[atest])
++    add('graph-limit','src/sdk/loaded-assets.ts','seen.size >= 256','false',[atest])
++    add('root-protocol','src/sdk/loaded-assets.ts',"!['http:', 'https:', 'file:'].includes(rootUrl.protocol)",'false',[atest])
++    add('root-bundled','src/sdk/loaded-assets.ts',"!rootUrl.pathname.includes('/assets/')",'false',[atest])
++    add('response-ok','src/sdk/loaded-assets.ts','!response.ok','false',[atest])
++    add('response-redirect','src/sdk/loaded-assets.ts','response.url && response.url !== url','false',[atest])
++    add('io-deadline','src/sdk/loaded-assets.ts','AbortSignal.timeout(5_000)','new AbortController().signal',[atest])
++    add('manifest-root','src/sdk/loaded-assets.ts','if (!rootKey)','if (false)',[atest])
++    add('graph-cycle','src/sdk/loaded-assets.ts','if (seen.has(key))','if (false)',[atest])
++    add('graph-entry','src/sdk/loaded-assets.ts','!item ||','',[atest])
++    add('asset-path-regex','src/sdk/loaded-assets.ts',r'!/^assets\/[^?#\\]+\.js$/.test(item.file)','false',[atest])
++    add('asset-path-traversal','src/sdk/loaded-assets.ts',"item.file.split('/').includes('..')",'false',[atest])
++    rtest='src/contrib/k01-review-probes.test.ts'
++    add('pending-owner-exists',loader,'pending && pending.file !== options.file','false',[rtest])
++    add('pending-owner-file',loader,'pending.file !== options.file','false',[rtest])
++    add('pending-unload',loader,'  pendingIdentities.delete(id)','  void id',[rtest])
++    add('pending-current-claim',loader,'pendingIdentities.get(plugin.id) !== claim','false',[rtest])
++    add('pending-release-owned',loader,'pendingIdentities.get(plugin.id) === claim','true',[rtest])
++    add('crypto-fail-closed',loader,"dependencyReason:'DIAGNOSTIC_IDENTITY_UNAVAILABLE'",'dependencyReason:null',[rtest])
++    add('crypto-load-compatibility',loader,'// Diagnostic evidence is optional for loading, never optional for MATCH.',"throw new Error('diagnostic crypto gates loading')",[rtest])
++    add('companion-rollback-custody','@companion','ctx.onDispose?.(dispose)\n    window.__sessionTasks = surface\n    ctx.bindSessionTasksDiagnostic?.(surface)',
++        'window.__sessionTasks = surface\n    ctx.bindSessionTasksDiagnostic?.(surface)\n    ctx.onDispose?.(dispose)',[rtest])
++    add('companion-rollback-poll','@companion','if (timer) clearInterval(timer)','if (false) clearInterval(timer)',[rtest])
++    add('companion-rollback-rpc','@companion','      clearTimeout(rpcEventTimer)','      void rpcEventTimer',[rtest])
++    add('companion-rollback-focus','@companion','for (const stop of stops) stop?.()','void stops',[rtest])
++    add('companion-rollback-visibility','@companion',"document.removeEventListener('visibilitychange', onVis)",'void onVis',[rtest])
++    dtest='src/contrib/k01-disk-lifecycle.test.ts'
++    add('disk-attempt-owner',loader,'diskLoads.get(entry) === attempt','true',[dtest])
++    add('disk-entry-owner',loader,'disk.get(entry.file) === entry','true',[dtest])
++    add('disk-before-evaluation',loader,'if (!isCurrent()) {return true}\n\n    const result','if (false) {return true}\n\n    const result',[dtest])
++    add('disk-cancellation-not-failure',loader,'if (result.cancelled)','if (false)',[dtest])
++    add('disk-stale-read-error',loader,'if (!isCurrent()) {return true}\n    // An oversize','if (false) {return true}\n    // An oversize',[dtest])
++    add('evaluation-stale-import',loader,'if (!isCurrent()) {return {id:null, cancelled:true}}\n    const plugin','if (false) {return {id:null, cancelled:true}}\n    const plugin',[dtest])
++    add('evaluation-stale-identity',loader,'!== claim || !isCurrent()','!== claim || false',[dtest])
++    add('evaluation-stale-error',loader,'if (!isCurrent()) {return {id:null, cancelled:true}}\n    console.error','if (false) {return {id:null, cancelled:true}}\n    console.error',[dtest])
++    (out/'inventory.json').write_text(json.dumps(mutants,indent=2))
++    selected=set(sys.argv[4].split(',')) if len(sys.argv)>4 else None
++    results=[]
++    def run(id,tests):
++        report=out/(id+'.json');log=out/(id+'.log')
++        command=['node',str(core/'apps/desktop/node_modules/vitest/vitest.mjs'),'run','--maxWorkers=1','--no-file-parallelism','--reporter=json','--outputFile='+str(report),*tests]
++        env={'HERMES_K01_COMPANION':str(companion),'NODE_OPTIONS':'--max-old-space-size=2048'}
++        with log.open('w') as stream:
++            try: code=run_command(command,cwd=app,env=env,stdout=stream,stderr=subprocess.STDOUT,timeout=90,check=False).returncode
++            except subprocess.TimeoutExpired: code=124
++        data=json.loads(report.read_text()) if report.exists() else {}
++        assertions=[test for suite in data.get('testResults',[]) for test in suite.get('assertionResults',[])]
++        failed=[t for t in assertions if t.get('status')=='failed']
++        verdict='PASS' if code==0 and assertions and not failed else 'KILLED' if code not in [0,124] and failed else 'INVALID'
++        row=dict(id=id,command=command,exit=code,verdict=verdict,tests=len(assertions),failed=[t['fullName'] for t in failed],skipped=data.get('numPendingTests'))
++        results.append(row);(out/'results.json').write_text(json.dumps(results,indent=2));print(json.dumps(row),flush=True)
++        return row
++    baseline=run('baseline',[itest,ctest,atest,rtest,dtest])
++    if baseline['verdict']!='PASS' or baseline['skipped']!=0: raise SystemExit('baseline failed: no mutation evidence accepted')
++    for mutant in mutants:
++        if selected and mutant['id'] not in selected: continue
++        file=companion if mutant['path']=='@companion' else app/mutant['path']
++        original=file.read_text()
++        if original.count(mutant['old'])!=1:
++            results.append(dict(id=mutant['id'],verdict='INVALID_ANCHOR',count=original.count(mutant['old'])));continue
++        file.write_text(original.replace(mutant['old'],mutant['new'],1))
++        try:
++            row=run(mutant['id'],mutant['tests'])
++            if row['verdict']=='PASS': row['verdict']='SURVIVED'
++            row['mutated_sha256']=hashlib.sha256(file.read_bytes()).hexdigest()
++        finally: file.write_text(original)
++    (out/'results.json').write_text(json.dumps(results,indent=2))
++    summary={key:sum(row['verdict']==key for row in results[1:]) for key in ['KILLED','SURVIVED','INVALID','INVALID_ANCHOR']}
++    print(json.dumps(summary),flush=True)
++    raise SystemExit(0 if not any(summary[k] for k in ['SURVIVED','INVALID','INVALID_ANCHOR']) else 1)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+index 3985bbefa8..8592e9a69f 100644
+--- a/hermes_cli/worker_drain_spawn_inventory.json
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -110,6 +110,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "apps/desktop/scripts/k01-mutants.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
+   "batch_runner.py": {
+    "direct": 2,
+    "routed": 0,
+@@ -920,17 +925,17 @@
+    "routed": 0,
+    "status": "pending"
+   },
+-  "hermes_cli/update_custody.py": {
+-   "direct": 7,
++  "hermes_cli/update_conflict_reporting.py": {
++   "direct": 1,
+    "routed": 0,
+    "status": "pending"
+   },
+-  "hermes_cli/update_gateway_fence.py": {
+-   "direct": 1,
++  "hermes_cli/update_custody.py": {
++   "direct": 7,
+    "routed": 0,
+    "status": "pending"
+   },
+-  "hermes_cli/update_conflict_reporting.py": {
++  "hermes_cli/update_gateway_fence.py": {
+    "direct": 1,
+    "routed": 0,
+    "status": "pending"
+diff --git a/tests/hermes_cli/test_k01_mutants_drain.py b/tests/hermes_cli/test_k01_mutants_drain.py
+new file mode 100644
+index 0000000000..85e961a34f
+--- /dev/null
++++ b/tests/hermes_cli/test_k01_mutants_drain.py
+@@ -0,0 +1,114 @@
++"""Real child/lease proof for the offline helper; no native K01 probe is run."""
++import importlib.util
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import worker_drain_fence as fence
++from tests.waiting import wait_until
++
++SCRIPT = Path(__file__).resolve().parents[2] / 'apps/desktop/scripts/k01-mutants.py'
++
++
++@pytest.fixture
++def helper():
++    spec = importlib.util.spec_from_file_location('k01_mutants', SCRIPT)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.fixture
++def node(tmp_path, monkeypatch):
++    ident = fence.Identity('i-0123456789abcdef0', fence.read_boot_id(), 'k01-test')
++    fence.install_state(tmp_path, ident)
++    monkeypatch.setattr(fence, 'load_activation', lambda *a: {'uid': os.getuid()})  # windows-footgun: ok — POSIX fixture
++    monkeypatch.setattr(fence, '_activation_root', lambda act: tmp_path)
++    monkeypatch.setattr(fence, 'current_identity', lambda *a, **k: ident)
++    return tmp_path, ident
++
++
++def phase(node, value):
++    root, ident = node
++    latch = fence.read_latch(root, ident)
++    latch['phase'] = value
++    fence._write_atomic(root / 'core-update' / fence.LATCH_FILE, latch)
++
++
++@pytest.mark.parametrize('value', ['draining', 'sealed'])
++def test_refuses_before_real_spawn(helper, node, value, tmp_path):
++    marker = tmp_path / 'spawned'
++    child = tmp_path / 'child.py'
++    child.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
++    phase(node, value)
++    with pytest.raises(fence.DrainRefused):
++        helper.run_command([sys.executable, str(child)], timeout=5)
++    assert not marker.exists()
++    assert fence.busy_leases(node[0]) == 0
++
++
++def test_real_child_holds_inherited_lease_until_exit(helper, node, tmp_path):
++    ready, release = tmp_path / 'ready', tmp_path / 'release'
++    child = tmp_path / 'child.py'
++    child.write_text('import os, json, threading\nfrom pathlib import Path\n'
++                     'fd = int(os.environ["HERMES_WORKER_DRAIN_LEASE_FD"])\n'
++                     'os.fstat(fd)\n'
++                     f'Path({str(ready)!r}).write_text(json.dumps(dict(pid=os.getpid(), fd=fd)))\n'
++                     f'while not Path({str(release)!r}).exists(): threading.Event().wait(0.01)\n'
++                     'print("finished")\n')
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        future = pool.submit(helper.run_command, [sys.executable, str(child)],
++                             timeout=15, stdout=subprocess.PIPE, check=True)
++        try:
++            wait_until(ready.exists, timeout=10)
++            record = json.loads(ready.read_text())
++            assert record['pid'] != os.getpid()  # windows-footgun: ok — POSIX fixture
++            assert fence.busy_leases(node[0]) == 1
++            phase(node, 'draining')
++            assert fence.busy_leases(node[0]) == 1
++            with pytest.raises(fence.DrainRefused):
++                helper.run_command([sys.executable, str(child)], timeout=5)
++        finally:
++            release.touch()
++        assert future.result(timeout=10).stdout == b'finished\n'
++    assert fence.busy_leases(node[0]) == 0
++
++
++def test_timeout_reaps_real_child_and_releases_lease(helper, node, tmp_path):
++    child = tmp_path / 'child.py'
++    child.write_text('import threading\nthreading.Event().wait(60)\n')
++    with pytest.raises(subprocess.TimeoutExpired):
++        helper.run_command([sys.executable, str(child)], timeout=0.2)
++    assert fence.busy_leases(node[0]) == 0
++
++
++def test_nonzero_check_and_capture(helper, node, tmp_path):
++    child = tmp_path / 'child.py'
++    child.write_text('import sys\nprint("output")\nsys.exit(7)\n')
++    result = helper.run_command([sys.executable, str(child)], timeout=5, stdout=subprocess.PIPE)
++    assert result.returncode == 7 and result.stdout == b'output\n'
++    with pytest.raises(subprocess.CalledProcessError) as error:
++        helper.run_command([sys.executable, str(child)], timeout=5,
++                           stdout=subprocess.PIPE, check=True)
++    assert error.value.returncode == 7 and error.value.output == b'output\n'
++    assert fence.busy_leases(node[0]) == 0
++
++
++def test_spawn_failure_releases_lease(helper, node, tmp_path):
++    with pytest.raises(FileNotFoundError):
++        helper.run_command([str(tmp_path / 'missing-executable')], timeout=5)
++    assert fence.busy_leases(node[0]) == 0
++
++
++def test_unactivated_child_still_runs(helper, monkeypatch, tmp_path):
++    monkeypatch.setattr(fence, 'load_activation', lambda *a: None)
++    child = tmp_path / 'child.py'
++    child.write_text('import os\nprint(os.environ["HERMES_K01_COMPANION"])\n')
++    result = helper.run_command([sys.executable, str(child)], timeout=5,
++                                env={'HERMES_K01_COMPANION': 'fixture'}, stdout=subprocess.PIPE)
++    assert result.returncode == 0 and result.stdout == b'fixture\n'
+-- 
+2.43.0
+

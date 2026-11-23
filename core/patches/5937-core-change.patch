@@ -1,0 +1,713 @@
+From fb76962b7f1fb39f0dcb67468ec716e4cf59fb69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:54:31 +0000
+Subject: [PATCH] fix(session status): reconcile acknowledged subagent losses
+ and checkpoint shutdown [daveey]
+
+Reconcile acknowledged subagent losses and checkpoint detached children during
+backend shutdown. Retained failures previously required a successful successor
+with no linked work, leaving orchestration chats unable to clear consumed losses.
+
+Record owner-qualified consumption receipts with completion delivery, revoke
+them on reopened admission, retain them through ledger pruning and reconcile
+late completed transcripts. Add sessions outcome --ack-subagent --evidence for
+independently verified historical losses. Preserve genuine unacknowledged loss
+and explicit person-stop precedence; checkpoint settled results before cleanup.
+
+---
+ hermes_cli/sessions_cmd_outcome.py            |  12 +-
+ hermes_cli/subcommands/sessions.py            |   3 +
+ hermes_state_session_status.py                |   6 +-
+ hermes_state_session_status_snapshot.py       |   7 +-
+ hermes_state_subagent_resolution.py           | 114 +++++++++++++++
+ .../test_subagent_status_resolution.py        | 135 ++++++++++++++++++
+ tests/tools/test_delegate_resumable.py        |  12 +-
+ .../tools/test_delegate_settle_checkpoint.py  |  26 ++++
+ .../test_shutdown_delegation_checkpoint.py    |  45 ++++++
+ tools/async_delegation.py                     |  25 +++-
+ tools/delegate_tool_child_run.py              |   3 +
+ tools/delegate_tool_resumable.py              |  22 ++-
+ tui_gateway/server.py                         |   4 +-
+ tui_gateway/session_reaper.py                 |   8 ++
+ website/docs/user-guide/sessions.md           |  21 +++
+ 15 files changed, 426 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_state_subagent_resolution.py
+ create mode 100644 tests/hermes_state/test_subagent_status_resolution.py
+ create mode 100644 tests/tools/test_delegate_settle_checkpoint.py
+ create mode 100644 tests/tui_gateway/test_shutdown_delegation_checkpoint.py
+
+diff --git a/hermes_cli/sessions_cmd_outcome.py b/hermes_cli/sessions_cmd_outcome.py
+index cd867abf90..a2e83fe686 100644
+--- a/hermes_cli/sessions_cmd_outcome.py
++++ b/hermes_cli/sessions_cmd_outcome.py
+@@ -68,13 +68,21 @@ def ensure_outcome_hooks() -> None:
+ def cmd_outcome(db, args):
+     from hermes_state_outcome import get_outcome, refresh_outcome
+ 
+-    if args.refresh:
++    ack = getattr(args, "ack_subagent", [])
++    if args.refresh or ack:
+         ensure_outcome_hooks()
+ 
+     sid = _resolve(db, args.session_id)
+     if not sid:
+         return 1
+-    outcome = refresh_outcome(sid, "manual", db=db) if args.refresh else get_outcome(sid, db=db)
++    if ack:
++        from hermes_state_subagent_resolution import acknowledge_subagents
++        try:
++            acknowledge_subagents(db, sid, ack, getattr(args, "evidence", None))
++        except ValueError as exc:
++            print(str(exc))
++            return 1
++    outcome = refresh_outcome(sid, "manual", db=db) if args.refresh or ack else get_outcome(sid, db=db)
+     stripe = _stripe_report(db, sid)
+     if args.json:
+         print(json.dumps({"session_id": sid, "outcome": outcome, "desktop_stripe": stripe,
+diff --git a/hermes_cli/subcommands/sessions.py b/hermes_cli/subcommands/sessions.py
+index 2eca768fef..951f145ccc 100644
+--- a/hermes_cli/subcommands/sessions.py
++++ b/hermes_cli/subcommands/sessions.py
+@@ -58,6 +58,9 @@ def _add_outcome_parsers(sessions_subparsers) -> None:
+     sessions_outcome = sessions_subparsers.add_parser("outcome", help="Show a session's stored outcome")
+     sessions_outcome.add_argument("session_id", help="Session ID or unique prefix")
+     _flag(sessions_outcome, "--refresh", help="Re-derive and store the outcome first")
++    sessions_outcome.add_argument("--ack-subagent", action="append", default=[], metavar="SESSION_ID",
++                                  help="Acknowledge a verified lost child (repeatable; requires --evidence)")
++    sessions_outcome.add_argument("--evidence", help="Verification evidence for --ack-subagent")
+     add_json_flag(sessions_outcome, "Emit JSON")
+     sessions_audit = sessions_subparsers.add_parser(
+         "outcome-audit", help="Every sidebar-listed session with its outcome (the status auditor's input)")
+diff --git a/hermes_state_session_status.py b/hermes_state_session_status.py
+index 92742e76a4..2ea7e6834d 100644
+--- a/hermes_state_session_status.py
++++ b/hermes_state_session_status.py
+@@ -65,7 +65,8 @@ def _failures(snapshot: dict, previous: dict, generation: int, coverage: dict) -
+             item.get("passive") is True and item.get("state") in {"watching", "scheduled"}) for item in work)
+     )
+     if successful_successor:
+-        retained = []
++        # A new successful turn is not evidence that a missing child was handled.
++        retained = [f for f in retained if f["id"].startswith("subagent:")]
+     current = [{"id": str(item.get("id") or "unknown"), "generation": generation, "state": item["state"]}
+                for item in work if item.get("state") in {"failed", "lost", "cancelled"}]
+     if turn.get("state") == "failed":
+@@ -91,6 +92,9 @@ def _verdict(snapshot: dict, coverage: dict, generation: int, failures: list[dic
+     if any(item.get("kind") == "card" and item.get("state") == "running" for item in open_work):
+         return {"kind": "running", "on": deepcopy(open_work),
+                 "presentation": {"stripe": "waiting", "reason_codes": ["linked_work_running"]}}
++    if any(f["id"].startswith("subagent:") for f in failures):
++        return {"kind": "unresolved", "reason": "linked_work_unsuccessful",
++                "presentation": {"stripe": "attention", "reason_codes": ["linked_work_unsuccessful"]}}
+     if any(item.get("state") == "source_unknown" for item in open_work):
+         return {"kind": "waiting", "on": deepcopy(open_work),
+                 "presentation": {"stripe": "none", "reason_codes": ["linked_status_unknown"]}}
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index 44191d0682..088181c432 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -262,8 +262,13 @@ def canonical_status(db: Any, tip: str, stored: Optional[dict], *, trigger: str,
+         errors["cards"] = "card_status_unavailable"
+     control_asks, control_waits = read("controls", lambda: _control_items(tip), ([], []))
+     subagents, lost_before = read("subagents", lambda: _subagent_items(db, ids, since), ([], []))
++    from hermes_state_subagent_resolution import resolved_subagents
++
++    resolved = read("subagents", lambda: resolved_subagents(db, ids, (prior or {}).get("failures") or []), set())
++    subagents = [s for s in subagents if s["state"] == "running" or s["id"] not in resolved]
++    lost_before = [s for s in lost_before if s["id"] not in resolved]
+     processes = read("processes", lambda: _process_items(db, tip), [])
+-    acknowledged = {p["id"] for p in processes if p.get("acknowledged")}
++    acknowledged = resolved | {p["id"] for p in processes if p.get("acknowledged")}
+     processes = [p for p in processes if p["id"] not in acknowledged]
+     goals = read("goals", lambda: _goal_items(db, ids), [])
+     # Work that failed before this generation's request is retained failure, cleared only by this
+diff --git a/hermes_state_subagent_resolution.py b/hermes_state_subagent_resolution.py
+new file mode 100644
+index 0000000000..f6a98e9795
+--- /dev/null
++++ b/hermes_state_subagent_resolution.py
+@@ -0,0 +1,114 @@
++"""Owner-qualified evidence that a previously lost child has settled or was consumed. [daveey]"""
++from __future__ import annotations
++
++import json
++
++
++def resolved_subagents(db, ids: list[str], retained: list[dict]) -> set[str]:
++    """Only terminal transcript proof or a delivered unit covering this child's last activity resolves loss.
++
++    Read through the caller's store/profile, never a global ledger. Pending delivery (including requeue)
++    and a foreign parent's unit are not acknowledgements. Retained IDs are read even outside inventory TTL.
++    """
++    import hermes_state_outcome as so
++    from hermes_state_common import _placeholders
++    from hermes_state_session_status_snapshot import _transcript_turn
++
++    import time
++
++    kept = [f["id"].removeprefix("subagent:") for f in retained if f.get("id", "").startswith("subagent:")]
++    retained_sql = f" OR id IN ({_placeholders(kept)})" if kept else ""
++    rows = db._read_all(
++        "SELECT id FROM sessions"
++        f" WHERE parent_session_id IN ({_placeholders(ids)}) AND source='subagent'"
++        f" AND (COALESCE(ended_at, started_at) >= ?{retained_sql})",
++        (*ids, time.time() - so.SUBAGENT_LOST_BOUND_S, *kept))
++    resolved = set()
++    by_id = {}
++    for row in rows:
++        sid = str(row["id"])
++        tip = so._tip(db, sid)
++        terminal = dict(db._read_one(
++            "SELECT ended_at, end_reason, last_activity_at, started_at FROM sessions WHERE id=?", (tip,)) or {})
++        by_id[sid] = terminal
++        receipt = db._read_one("SELECT value FROM state_meta WHERE key=?", (f"subagent_ack:{sid}",))
++        if receipt is not None:
++            ack = json.loads(receipt["value"])
++            if ack["parent"] in ids and ack["at"] >= float(terminal.get("last_activity_at") or terminal.get("started_at") or 0):
++                resolved.add(f"subagent:{sid}")
++        if terminal.get("ended_at") is not None and terminal.get("end_reason") in {"agent_close", "completed"}:
++            tail = so._without_finished_notes(so._tail(db, tip))
++            if _transcript_turn(tail)["state"] == "completed":
++                resolved.add(f"subagent:{sid}")
++    exists = db._read_one("SELECT name FROM sqlite_master WHERE type='table' AND name='async_delegations'")
++    if exists is None:
++        return resolved
++    units = db._read_all(
++        "SELECT task_json, delivered_at FROM async_delegations"
++        f" WHERE parent_session_id IN ({_placeholders(ids)}) AND delivery_state='delivered'"
++        " AND delivered_at IS NOT NULL AND state NOT IN ('running','finalizing')", tuple(ids))
++    for unit in units:
++        task = json.loads(unit["task_json"] or "{}")
++        for sid in (task.get("task_session_ids") or {}).values():
++            if sid not in by_id:
++                continue
++            tip = by_id[sid]
++            last = float(tip.get("last_activity_at") or tip.get("started_at") or 0)
++            if float(unit["delivered_at"]) >= last:
++                resolved.add(f"subagent:{sid}")
++    return resolved
++
++
++def acknowledge_subagents(db, parent: str, children: list[str], evidence: str) -> None:
++    """Explicitly handle named lost children after independent verification, without declaring them successful."""
++    import time
++    import hermes_state_outcome as so
++
++    if not isinstance(children, list) or not children or len(children) > 100 or any(
++            not isinstance(sid, str) or not sid for sid in children):
++        raise ValueError("name 1-100 exact subagent session IDs")
++    if not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 2000:
++        raise ValueError("subagent acknowledgement requires evidence (1-2000 characters)")
++    ids = so._lineage_ids(db, so._tip(db, parent))
++
++    def write(conn):
++        receipts = []
++        for sid in children:
++            row = conn.execute("SELECT parent_session_id, source, ended_at, last_activity_at, started_at"
++                               " FROM sessions WHERE id=?", (sid,)).fetchone()
++            if row is None or row[0] not in ids or row[1] != "subagent":
++                raise ValueError(f"not an owned subagent: {sid}")
++            last = float(row[3] or row[4] or 0)
++            if row[2] is None and last >= time.time() - so.SUBAGENT_LIVE_WINDOW_S:
++                raise ValueError(f"subagent is still live: {sid}")
++            receipts.append((f"subagent_ack:{sid}", json.dumps({"parent": row[0], "at": last,
++                             "evidence": evidence.strip(), "acknowledged_at": time.time()})))
++        conn.executemany("INSERT INTO state_meta (key,value) VALUES (?,?)"
++                         " ON CONFLICT(key) DO UPDATE SET value=excluded.value", receipts)
++    db._execute_write(write)
++
++
++def checkpoint_delivery(conn, delegation_id: str) -> None:
++    """Keep consumed-result proof past ledger retention; revoke it if admission is reopened.
++
++    Called within the ledger's own transaction. Qualify children against their real parent.
++    """
++    row = conn.execute("SELECT parent_session_id, task_json, delivery_state, delivered_at"
++                       " FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
++    if row is None:
++        return
++    parent, raw, state, at = row
++    task = json.loads(raw or "{}")
++    for sid in (task.get("task_session_ids") or {}).values():
++        child = conn.execute("SELECT 1 FROM sessions WHERE id=? AND parent_session_id=? AND source='subagent'",
++                             (sid, parent)).fetchone()
++        if child is None:
++            continue
++        key = f"subagent_ack:{sid}"
++        if state == "delivered" and at is not None:
++            value = json.dumps({"parent": parent, "unit": delegation_id, "at": at})
++            conn.execute("INSERT INTO state_meta (key,value) VALUES (?,?)"
++                         " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
++        else:
++            conn.execute("DELETE FROM state_meta WHERE key=? AND json_extract(value,'$.unit')=?",
++                         (key, delegation_id))
+diff --git a/tests/hermes_state/test_subagent_status_resolution.py b/tests/hermes_state/test_subagent_status_resolution.py
+new file mode 100644
+index 0000000000..0c59226bf4
+--- /dev/null
++++ b/tests/hermes_state/test_subagent_status_resolution.py
+@@ -0,0 +1,135 @@
++"""Consumed delegation results resolve retained losses without requiring an empty board."""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from tests.hermes_state import test_session_status_refresh as fixtures
++from tools import async_delegation as ad
++
++board, db, receipts = fixtures.board, fixtures.db, fixtures.receipts
++add_card, refresh, turn = fixtures.add_card, fixtures.refresh, fixtures.turn
++
++
++def child(db, sid="child", reason="delegation_unknown"):
++    db.create_session(sid, source="subagent", parent_session_id="chat")
++    db.append_message(sid, role="user", content="build")
++    db.append_message(sid, role="assistant", content="working", tool_calls=[
++        {"id": "call", "type": "function", "function": {"name": "process_manage", "arguments": "{}"}}])
++    db.end_session(sid, reason)
++
++
++def delivered(db, parent="chat", sid="child"):
++    # Real ledger write and delivery acknowledgement, not an injected reducer flag.
++    with ad._DB_LOCK, ad._transaction() as conn:
++        conn.execute("INSERT INTO async_delegations (delegation_id, origin_session, parent_session_id, state,"
++                     " dispatched_at, updated_at, delivery_state, task_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++                     ("deleg-test", parent, parent, "unknown", time.time(), time.time(), "pending",
++                      json.dumps({"task_session_ids": {"0": sid}})))
++    assert ad.mark_completion_delivered("deleg-test")
++
++
++@pytest.fixture(autouse=True)
++def ledger(db, monkeypatch):
++    ad._reset_for_tests()
++    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
++    yield
++    ad._reset_for_tests()
++
++
++@pytest.mark.parametrize("ack", [False, True])
++def test_retained_loss_successor_open_cards(db, board, ack):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    turn(db, "independently verified work")
++    add_card(board, "t_wait", "todo")
++    if ack:
++        delivered(db)
++    status = refresh(db)
++    assert bool(status["failures"]) is not ack
++    assert status["kind"] == ("waiting" if ack else "unresolved")
++
++
++def test_successful_successor_alone_cannot_acknowledge_loss(db):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    turn(db, "unrelated successful reply")
++    outcome = refresh(db)
++    assert outcome["failures"]
++    assert outcome["kind"] == "unresolved"
++
++
++def test_late_terminal_transcript_reconciles_retained_loss(db, board):
++    turn(db)
++    child(db, reason="startup_orphan_reap")
++    assert refresh(db)["failures"]
++    db.append_message("child", role="tool", content="finished", tool_call_id="call", tool_name="process_manage")
++    db.append_message("child", role="assistant", content='{"pr_url":"https://example.test/1","verified":true}')
++    db._write_sql("UPDATE sessions SET end_reason='agent_close' WHERE id='child'")
++    turn(db)
++    add_card(board, "t_wait", "todo")
++    assert refresh(db)["failures"] == []
++
++
++def test_foreign_delivery_cannot_acknowledge_loss(db):
++    turn(db)
++    child(db)
++    delivered(db, parent="foreign")
++    assert refresh(db)["failures"]
++
++
++def test_pending_delivery_does_not_acknowledge(db):
++    turn(db)
++    child(db)
++    delivered(db)
++    import queue
++    db._write_sql("UPDATE async_delegations SET event_json=?", (json.dumps({"type": "async_delegation", "delegation_id": "deleg-test"}),))
++    assert ad.requeue_admitted_completion("deleg-test", queue.Queue())
++    assert refresh(db)["failures"]
++
++
++def test_acknowledgement_survives_ledger_pruning(db):
++    turn(db)
++    child(db)
++    delivered(db)
++    db._write_sql("DELETE FROM async_delegations")
++    assert refresh(db)["failures"] == []
++
++
++def test_old_delivery_does_not_cover_continued_child(db):
++    turn(db)
++    child(db)
++    delivered(db)
++    later = time.time() + 60
++    db._write_sql("UPDATE sessions SET last_activity_at=? WHERE id='child'", (later,))
++    assert refresh(db)["failures"]
++
++
++def test_explicit_acknowledgement_reaches_cli_and_persists(db, board, monkeypatch, capsys):
++    from types import SimpleNamespace
++    from hermes_cli import sessions_cmd_outcome as cli
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    add_card(board, "t_wait", "todo")
++    monkeypatch.setattr(cli, "ensure_outcome_hooks", lambda: None)
++    args = SimpleNamespace(session_id="chat", refresh=False, json=True, ack_subagent=["child"],
++                           evidence="Independent PR merge and installed proof verified")
++    cli.cmd_outcome(db, args)
++    assert json.loads(capsys.readouterr().out)["outcome"]["status"]["failures"] == []
++    assert refresh(db)["kind"] == "waiting"
++
++
++@pytest.mark.parametrize("target,evidence", [("foreign", "verified"), ("child", ""), ("live", "verified")])
++def test_explicit_acknowledgement_refuses_unowned_live_or_unexplained(db, target, evidence):
++    from hermes_state_subagent_resolution import acknowledge_subagents
++    turn(db)
++    child(db)
++    db.create_session("live", source="subagent", parent_session_id="chat")
++    with pytest.raises(ValueError):
++        acknowledge_subagents(db, "chat", [target], evidence)
++    assert db._read_one("SELECT value FROM state_meta WHERE key='subagent_ack:child'") is None
+diff --git a/tests/tools/test_delegate_resumable.py b/tests/tools/test_delegate_resumable.py
+index b5b49c01c8..802051afb9 100644
+--- a/tests/tools/test_delegate_resumable.py
++++ b/tests/tools/test_delegate_resumable.py
+@@ -84,7 +84,7 @@ def test_a_limit_stopped_child_is_continued_after_a_restart_on_its_own_transcrip
+     assert _db_rows(parent)[sid][0] == "completed"
+ 
+ 
+-@pytest.mark.parametrize("cause", ["gateway", "user"])
++@pytest.mark.parametrize("cause", ["gateway", "user", "tui", "user_then_tui"])
+ def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(cause):
+     import threading
+ 
+@@ -114,15 +114,23 @@ def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(c
+         assert started.wait(10)
+         if cause == "gateway":
+             interrupt_all(reason="gateway shutdown (test)", resumable=True)  # gateway/run_shutdown.py's call
++        elif cause == "tui":
++            from tui_gateway import server
++            from tools.async_delegation import interrupt_for_session
++            server._prepare_delegations_before_exit()
++            interrupt_for_session(parent_session_id=parent.session_id, reason="tui_shutdown")
+         else:
+             with _active_subagents_lock:
+                 assert sid in _active_subagents
+             interrupt_subagent(sid)
++            if cause == "user_then_tui":
++                from tui_gateway import server
++                server._prepare_delegations_before_exit()
+         release.set()
+         _completion(out["delegation_id"])
+ 
+     state, pinned, record = _db_rows(parent)[sid]
+-    if cause == "gateway":
++    if cause in {"gateway", "tui"}:
+         assert (state, record["resume_mode"], record["stop_cause"]) == ("resumable", "AUTO_ON_BOOT", "gateway_shutdown")
+     else:
+         assert (state, pinned) == ("stopped", 0)
+diff --git a/tests/tools/test_delegate_settle_checkpoint.py b/tests/tools/test_delegate_settle_checkpoint.py
+new file mode 100644
+index 0000000000..a751168ebf
+--- /dev/null
++++ b/tests/tools/test_delegate_settle_checkpoint.py
+@@ -0,0 +1,26 @@
++"""Known child outcomes must reach the ledger before slow teardown can be killed."""
++from types import SimpleNamespace
++
++from tests.tools import test_async_delegation_child_row_end as fixtures
++from tools import async_delegation as ad
++from tools.delegate_tool_child_run import _ChildRun
++
++_clean_state, home = fixtures._clean_state, fixtures.home
++
++
++def test_settle_checkpoints_result_before_cleanup(home, monkeypatch):
++    from tools import delegate_tool_resumable as resumable
++    fixtures._seed_sessions(home)
++    fixtures._dead_owner_unit({"0": "child-1"})
++    monkeypatch.setattr(resumable, "stamp_entry", lambda run, entry: None)
++    run = _ChildRun(child=SimpleNamespace(_delegation_unit_id="deleg-x"), parent_agent=None,
++                    task_index=0, goal="g", subagent_id="child-1", child_progress_cb=None)
++    entry = {"task_index": 0, "subagent_id": "child-1", "status": "completed", "summary": "verified result"}
++    assert run.settle(entry) == entry
++    # No close_resources or join has run; simulate process death now.
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, started: False)
++    assert ad.recover_abandoned_delegations() == 1
++    with ad._DB_LOCK, ad._transaction() as conn:
++        import json
++        result = json.loads(conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id='deleg-x'").fetchone()[0])
++    assert result["results"] == [entry]
+diff --git a/tests/tui_gateway/test_shutdown_delegation_checkpoint.py b/tests/tui_gateway/test_shutdown_delegation_checkpoint.py
+new file mode 100644
+index 0000000000..7e7234d98e
+--- /dev/null
++++ b/tests/tui_gateway/test_shutdown_delegation_checkpoint.py
+@@ -0,0 +1,45 @@
++"""TUI backend retirement includes detached children of idle parents."""
++from __future__ import annotations
++
++import signal
++
++from tui_gateway import server
++from tools import async_delegation as ad
++
++
++def test_shutdown_marks_delegations_before_flush(monkeypatch):
++    calls = []
++    monkeypatch.setattr(ad, "interrupt_all", lambda **kw: calls.append(kw))
++    monkeypatch.setattr(server, "_flush_sessions_before_exit", lambda: calls.append("flush"))
++    monkeypatch.setattr(server, "_release_gateway_wake_owner", lambda: None)
++    monkeypatch.setattr(server, "_stop_turns_before_exit", lambda: None)
++    monkeypatch.setattr(server, "_journal_background_jobs_before_exit", lambda: None)
++    monkeypatch.setattr(server, "_sessions", {})
++    server._shutdown_sessions()
++    assert calls == [{"reason": "gateway_shutdown", "resumable": True, "by_shutdown": True}, "flush"]
++
++
++def test_sigterm_marks_delegations_before_flush(monkeypatch):
++    calls = []
++    monkeypatch.setattr(ad, "interrupt_all", lambda **kw: calls.append("children"))
++    monkeypatch.setattr(server, "_flush_sessions_before_exit", lambda: calls.append("flush"))
++    monkeypatch.setattr(server, "_stop_turns_before_exit", lambda: None)
++    monkeypatch.setattr(server, "_journal_background_jobs_before_exit", lambda: None)
++    monkeypatch.setattr(server, "_exit_flush_prev_handlers", {signal.SIGTERM: lambda *a: calls.append("previous")})
++    server._handle_exit_flush_signal(signal.SIGTERM, None)
++    assert calls == ["children", "flush", "previous"]
++
++
++def test_shutdown_session_keeps_successor_debt(monkeypatch):
++    from tools import delegate_tool_auto_resume as auto
++    record = {"status": "running", "delegation_id": "deleg-x"}
++    monkeypatch.setattr(ad, "_session_records", lambda *a: [record])
++    monkeypatch.setattr(ad, "_interrupt_records", lambda *a: 1)
++    superseded = []
++    monkeypatch.setattr(auto, "supersede_for_session", lambda **kw: superseded.append(kw))
++    assert ad.interrupt_for_session(session_key="chat", reason="tui_shutdown") == 1
++    assert record.get("_interrupted_by") == "tui_shutdown"
++    assert not superseded
++    # Explicit person Stop still cancels the resume obligation.
++    ad.interrupt_for_session(session_key="chat", reason="stop")
++    assert superseded
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index d5d57d4f17..c21254fba6 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -780,10 +780,14 @@ def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = Non
+         return 0
+ 
+ 
+-def _update_delivery(sql: str, params: tuple) -> bool:
++def _update_delivery(sql: str, params: tuple, *, checkpoint: str | None = None) -> bool:
+     """Run one UPDATE on the ledger; True iff exactly one row changed."""
+     with _DB_LOCK, _transaction() as conn:
+-        return conn.execute(sql, params).rowcount == 1
++        changed = conn.execute(sql, params).rowcount == 1
++        if changed and checkpoint:
++            from hermes_state_subagent_resolution import checkpoint_delivery
++            checkpoint_delivery(conn, checkpoint)
++        return changed
+ 
+ 
+ def mark_completion_delivered(delegation_id: str) -> bool:
+@@ -792,7 +796,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
+     now = time.time()
+     return _update_delivery(
+         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+-           WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
++           WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id), checkpoint=delegation_id)
+ 
+ 
+ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+@@ -890,7 +894,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+                   delivered_at=?, updated_at=?, delivery_claim=NULL,
+                   delivery_claimed_at=NULL
+            WHERE delegation_id=? AND delivery_state='pending'
+-             AND delivery_claim=?""", (now, now, delegation_id, claim_id))
++             AND delivery_claim=?""", (now, now, delegation_id, claim_id), checkpoint=delegation_id)
+ 
+ 
+ def requeue_admitted_completion(delegation_id: str, target_queue,
+@@ -920,6 +924,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue,
+                WHERE delegation_id=? AND delivery_state='delivered' AND delivery_attempts>=?""",
+             (now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
+         if exhausted.rowcount == 1:
++            from hermes_state_subagent_resolution import checkpoint_delivery
++            checkpoint_delivery(conn, delegation_id)
+             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
+                            "marking terminally dropped (result remains queryable).",
+                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
+@@ -930,6 +936,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue,
+                  AND COALESCE(NULLIF(completed_at, 0), dispatched_at) < ?""",
+             (now, delegation_id, now - _MAX_COMPLETION_REPLAY_AGE_S))
+         if aged.rowcount == 1:
++            from hermes_state_subagent_resolution import checkpoint_delivery
++            checkpoint_delivery(conn, delegation_id)
+             # Never offered past the replay cap (``_replay_pending`` would skip it silently): say so.
+             logger.warning("Async delegation %s: replay age expired before it could be offered again; "
+                            "terminally dropped (result remains queryable).", delegation_id)
+@@ -941,6 +949,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue,
+             (now, recovered_admission_id, delegation_id))
+         if reopened.rowcount != 1:
+             return False
++        from hermes_state_subagent_resolution import checkpoint_delivery
++        checkpoint_delivery(conn, delegation_id)
+         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
+         with _orphan_lock:  # an admitted copy already had its consumer: requeue keeps live routing
+@@ -1741,6 +1751,13 @@ def interrupt_for_session(
+     """Signal running async delegations owned by ONE ending session to stop (any
+     selector matches, see ``_session_records``). Returns how many."""
+     targets = _session_records(_ACTIVE_STATES, session_key, origin_ui_session_id, parent_session_id)
++    if reason == "tui_shutdown":
++        # The backend is restarting, not the conversation ending. Exit preparation has
++        # already marked every owned child resumable; do not cancel that successor debt.
++        with _records_lock:
++            _mark_stop(targets, reason, by_shutdown=True)
++        return _interrupt_records(targets, "interrupt_for_session", reason,
++                                  "Interrupted %d async delegation(s) for backend shutdown (%s)")
+     with _records_lock:
+         _mark_stop(targets, reason, by_shutdown=False)
+     # Its children already waiting to resume must not wake up after the person stopped or closed it.
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index 43c9f880d7..ee9afa0d29 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -849,6 +849,9 @@ class _ChildRun:
+         with _quiet("Could not classify subagent outcome: %s"):
+             stamp_entry(self, entry)
+         self.final_entry = entry
++        if unit_id := getattr(self.child, "_delegation_unit_id", None):
++            from tools.async_delegation import record_unit_child
++            record_unit_child(unit_id, entry)
+         return entry
+ 
+     def elapsed(self) -> float:
+diff --git a/tools/delegate_tool_resumable.py b/tools/delegate_tool_resumable.py
+index f931db158c..aa1413efc6 100644
+--- a/tools/delegate_tool_resumable.py
++++ b/tools/delegate_tool_resumable.py
+@@ -481,16 +481,28 @@ def note_gateway_shutdown() -> int:
+     running records), so each reads as a restart (resumable) rather than a user stop however its run ends, a
+     SIGKILL mid-unwind included. Returns how many records were marked."""
+     from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
++    from tools.async_delegation import _records, _records_lock
++    with _records_lock:
++        stopped = {key for key, record in _records.items() if record.get("_stop_requested")}
+     with _active_subagents_lock:
+-        live = [r.get("agent") for r in _active_subagents.values()]
+-    for agent in live:
+-        if agent is not None:
++        live = [(sid, r.get("agent")) for sid, r in _active_subagents.items()]
++    stopped_children = set()
++    for sid, agent in live:
++        if agent is None:
++            continue
++        if getattr(agent, "_delegate_stop_requested", False) is True:
++            stopped_children.add(sid)
++        elif getattr(agent, "_delegation_unit_id", None) not in stopped:
+             agent._delegate_stop_cause = GATEWAY_SHUTDOWN
+     marked = 0
++    exclusion = (" AND COALESCE(json_extract(record_json, '$.unit_id'), '') NOT IN ("
++                 + ",".join("?" for _ in stopped) + ")") if stopped else ""
++    if stopped_children:
++        exclusion += " AND subagent_id NOT IN (" + ",".join("?" for _ in stopped_children) + ")"
+     for db in _profile_dbs():
+         marked += _write(db, lambda conn: conn.execute(
+-            "UPDATE resumable_subagents SET stop_cause=? WHERE state='running' AND owner_pid=?",
+-            (GATEWAY_SHUTDOWN, os.getpid())).rowcount) or 0
++            "UPDATE resumable_subagents SET stop_cause=? WHERE state='running' AND owner_pid=?" + exclusion,
++            (GATEWAY_SHUTDOWN, os.getpid(), *stopped, *stopped_children)).rowcount) or 0
+     return marked
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9fd91b77ae..f27758ea92 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -267,8 +267,8 @@ def _load_interim_assistant_messages() -> bool:
+ def _shutdown_sessions() -> None:
+     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+     # [daveey] Background jobs are journaled after the turns stop and before close kills them unreported.
+-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit,
+-                 _journal_background_jobs_before_exit):
++    for step in (_prepare_delegations_before_exit, _flush_sessions_before_exit, _release_gateway_wake_owner,
++                 _stop_turns_before_exit, _journal_background_jobs_before_exit):
+         with contextlib.suppress(Exception):
+             step()
+     with _sessions_lock:
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 4d5bbe374d..7c57cb50d9 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -157,6 +157,12 @@ _exit_flush_prev_handlers: dict[int, Any] = {}
+ _exit_flush_handlers_installed = False
+ 
+ 
++def _prepare_delegations_before_exit() -> None:
++    """Checkpoint detached children too, even when their parent has no foreground turn."""
++    from tools.async_delegation import interrupt_all
++    interrupt_all(reason="gateway_shutdown", resumable=True, by_shutdown=True)
++
++
+ def _handle_exit_flush_signal(signum, frame) -> None:
+     """Flush in-memory sessions, then hand off to the prior handler (uvicorn's graceful shutdown, a supervisor's
+     handler, or the default disposition) — this only *prepends* a bounded flush."""
+@@ -166,6 +172,8 @@ def _handle_exit_flush_signal(signum, frame) -> None:
+         # An inherited ignore (`cmd &` from a non-interactive shell) ends nothing: stopping turns here
+         # would raise the one-way exit fence in a process that keeps running and refuses every command.
+         return
++    with contextlib.suppress(Exception):
++        _prepare_delegations_before_exit()
+     with contextlib.suppress(Exception):
+         _flush_sessions_before_exit()
+     # The group signal that stopped us never reaches a command in its own session: reap it now,
+diff --git a/website/docs/user-guide/sessions.md b/website/docs/user-guide/sessions.md
+index 6e382bbadc..a8294f82cb 100644
+--- a/website/docs/user-guide/sessions.md
++++ b/website/docs/user-guide/sessions.md
+@@ -62,6 +62,27 @@ OpenAI-compatible API continuation of local sessions. A gateway crash is differe
+ from a client disconnect: interrupted work becomes `unknown` rather than being
+ automatically replayed, and may need resolution before queued followers proceed.
+ 
++### Acknowledging verified delegated work
++
++A missing or failed subagent keeps the parent outcome unresolved until its result is
++consumed or independently verified. Unrelated successful turns and open linked
++cards do not acknowledge it. A child that later finishes with a complete final
++transcript is reconciled on the next outcome refresh.
++
++After verifying a lost child's work, use the supported acknowledgment command:
++
++```bash
++hermes sessions outcome PARENT_SESSION --ack-subagent CHILD_SESSION \
++  --evidence "Verified the merged change and its deployed behavior" --json
++```
++
++Repeat `--ack-subagent` to acknowledge several children. The command refuses foreign
++or still-live children and requires evidence. It stores an owner-qualified receipt
++and refreshes the outcome; it does not declare the child successful or rewrite its
++transcript. New child activity invalidates old acknowledgment evidence. Normal
++completion delivery records equivalent receipts automatically, retained beyond the
++delegation ledger's pruning window.
++
+ ### What Counts Toward Context
+ 
+ Hermes stores session history so it can resume conversations, but it does not
+-- 
+2.43.0
+

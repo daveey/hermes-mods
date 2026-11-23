@@ -1,0 +1,146 @@
+From 2d308c980c408cbb5592b33230d57fa9b89e32a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:11:54 +0000
+Subject: [PATCH] fix(facts): retain native project capture failure health
+ [daveey]
+
+Propagate native project input failures into BoardInputSource health instead
+of projecting a fresh empty tree or null project. Cold reads stay unavailable;
+warm reads retain last-good stale evidence. Aggregate profile partial results
+remain unchanged. Regression coverage includes failure, recovery and native-only
+scope controls.
+
+---
+ hermes_cli/fact_tree_inputs.py              |   5 +
+ tests/hermes_cli/test_fact_tree_failures.py | 103 ++++++++++++++++++++
+ 2 files changed, 108 insertions(+)
+ create mode 100644 tests/hermes_cli/test_fact_tree_failures.py
+
+diff --git a/hermes_cli/fact_tree_inputs.py b/hermes_cli/fact_tree_inputs.py
+index 3cdaf49171..a5c768cf73 100644
+--- a/hermes_cli/fact_tree_inputs.py
++++ b/hermes_cli/fact_tree_inputs.py
+@@ -25,6 +25,11 @@ def capture(targets, source, view, selector, budget):
+                     hydrate=drill, session_limit=selector['session_limit'], include_discovered=native and not drill)
+         failed = []
+         result = profiles._read_profile_db(name, home, failed, read)
++        # Profile fan-out intentionally returns partial trees with per-profile
++        # errors. Native routes have no such envelope: fail the source capture
++        # so ContentOwner retains prior evidence stale (or cold unavailable).
++        if native and failed:
++            raise OSError('native project tree capture failed')
+         errors.extend(failed)
+         rows.append((name, result))
+     return CapturedInput({'rows': rows, 'errors': errors, 'view': view, 'selector': dict(selector)},
+diff --git a/tests/hermes_cli/test_fact_tree_failures.py b/tests/hermes_cli/test_fact_tree_failures.py
+new file mode 100644
+index 0000000000..6c9edee664
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_tree_failures.py
+@@ -0,0 +1,103 @@
++"""Native capture failures remain unavailable, never fresh empty success. [daveey]"""
++import json
++import threading
++
++import pytest
++from fastapi import HTTPException
++
++from hermes_cli import projects_fact_routes
++from hermes_cli.fact_contract import Ready
++from hermes_cli.fact_tree_startup import TreeRuntime
++from hermes_cli.web_routers import profiles
++from tests.hermes_cli import test_profiles_sidebar_scope as helpers
++from tests.waiting import wait_until
++
++profiles_on_disk = helpers.profiles_on_disk
++
++
++@pytest.mark.parametrize('view', ['tree', 'project_sessions'])
++@pytest.mark.parametrize('warm', [False, True])
++def test_native_failure_and_recovery_through_public_read(profiles_on_disk, monkeypatch, tmp_path, view, warm):
++    from tui_gateway import server
++    home = profiles_on_disk['default']
++    folder = tmp_path / 'repo'
++    folder.mkdir()
++    helpers._seed_session(home, 'retained-chat', source='cli', cwd=folder)
++    project = helpers._seed_project(home, 'retained-project', folder)
++    selector = {'surface': 'native', 'profile': 'default', 'preview_limit': 3, 'session_limit': 2000}
++    if view == 'project_sessions':
++        selector['project_id'] = project
++    failing = threading.Event()
++    if not warm:
++        failing.set()
++    # Preserve the reviewer's real input-boundary reproduction, not a fake
++    # _read_profile_db return or an injected publication result.
++    original = server._project_tree_inputs
++
++    def capture(*args, **kwargs):
++        if failing.is_set():
++            raise OSError('injected project capture failure')
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(server, '_project_tree_inputs', capture)
++    runtime = TreeRuntime(targets=(('default', home),))
++    try:
++        runtime.start()
++        bound = runtime.provider('default')
++        key = runtime.owner.source.input_key(view, selector)
++        bound.read(view, selector)
++        previous = None
++        if warm:
++            assert wait_until(lambda: isinstance(bound.read(view, selector), Ready), timeout=10)
++            previous = runtime.owner.store.snapshot(runtime.scope).get(key)
++            payload = projects_fact_routes.read(view, selector, decoded=True)
++            assert 'retained-project' in json.dumps(payload)
++            failing.set()
++            runtime.owner.source._invalidate()
++        # The same native legacy input boundary propagates the failure rather
++        # than certifying a missing project; keep that parity control explicit.
++        with pytest.raises(OSError, match='injected project capture failure'):
++            server._build_project_tree(None, preview_limit=3, hydrate=view == 'project_sessions',
++                                       session_limit=2000, include_discovered=view == 'tree')
++        assert wait_until(lambda: (fact := runtime.owner.store.snapshot(runtime.scope).get(key)) is not None
++                          and fact.error_code == 'board_capture_failed', timeout=10)
++        failed = runtime.owner.store.snapshot(runtime.scope).get(key)
++        assert failed.health == ('stale' if warm else 'unknown')
++        if warm:
++            assert failed.value == previous.value
++            assert failed.observed_at == previous.observed_at
++            assert failed.source_vector == previous.source_vector
++        # The public entry must not turn this failure into an empty 200 or use legacy.
++        def forbidden(*args, **kwargs):
++            raise AssertionError('legacy fallback after native source failure')
++        monkeypatch.setattr(profiles, 'profile_project_trees', forbidden)
++        assert wait_until(lambda: not isinstance(bound.read(view, selector), Ready), timeout=10)
++        with pytest.raises(HTTPException) as error:
++            projects_fact_routes.read(view, selector, decoded=True)
++        assert error.value.status_code == 503
++        assert error.value.detail['code'] == 'facts_unavailable'
++        failing.clear()
++        runtime.owner.source._invalidate()
++        assert wait_until(lambda: isinstance(bound.read(view, selector), Ready), timeout=10)
++        recovered = projects_fact_routes.read(view, selector, decoded=True)
++        assert 'retained-project' in json.dumps(recovered)
++        assert runtime.owner.store.snapshot(runtime.scope).get(key).health == 'fresh'
++    finally:
++        runtime.close()
++
++
++def test_profiles_partial_failure_keeps_error_envelope(profiles_on_disk, monkeypatch):
++    from hermes_cli import fact_tree_inputs
++    from hermes_cli.fact_contract import Scope, SourceId
++    from tui_gateway import server
++    home = profiles_on_disk['default']
++    helpers._seed_session(home, 'healthy-state', source='cli')
++    def failed(*args, **kwargs):
++        raise OSError('controlled profile project failure')
++    monkeypatch.setattr(server, '_project_tree_inputs', failed)
++    selector = {'surface': 'profiles', 'profile': 'default', 'preview_limit': 3, 'session_limit': 2000}
++    source = SourceId(Scope(str(home), 'default'), 'board.input', 'native')
++    captured = fact_tree_inputs.capture((('default', home),), source, 'tree', selector, None)
++    payload = fact_tree_inputs.project('tree', captured.value)
++    assert payload['projects'] == []
++    assert payload['errors'] == [{'profile': 'default', 'error': 'controlled profile project failure'}]
+-- 
+2.43.0
+

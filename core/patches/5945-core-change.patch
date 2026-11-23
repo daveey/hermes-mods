@@ -1,0 +1,318 @@
+From 3a76706d1da0dcd573c8e273747db769c27b708d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:50:35 +0000
+Subject: [PATCH] fix(facts): isolate optional annotation readiness and
+ preserve replica markers [daveey]
+
+Keep native annotation ownership default-off until measured acceptance. Cover
+startup ordering and failed-drain custody, including the supported creation hook
+and platform-specific health gate. This does not certify live activation.
+
+---
+ hermes_cli/fact_annotation_kanban.py          |   3 +-
+ hermes_cli/fact_annotation_lifespan.py        |   3 +-
+ hermes_cli/fact_annotation_runtime.py         |  10 +-
+ hermes_cli/kanban_annotation_facts.py         |   5 +
+ .../test_annotation_activation_review.py      | 136 ++++++++++++++++++
+ .../test_annotation_native_runtime.py         |   2 +-
+ .../test_annotation_prepare_lifespan.py       |  21 ++-
+ .../test_annotation_serve_startup.py          |   4 +-
+ 8 files changed, 173 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_cli/test_annotation_activation_review.py
+
+diff --git a/hermes_cli/fact_annotation_kanban.py b/hermes_cli/fact_annotation_kanban.py
+index 0dc718f2b2..de38183d73 100644
+--- a/hermes_cli/fact_annotation_kanban.py
++++ b/hermes_cli/fact_annotation_kanban.py
+@@ -31,8 +31,7 @@ def _remote(cards, maps, keys, execution):
+             *activity.PARKED_STATUSES, 'todo', *activity.PENDING_RELEASE_STATUSES)
+         if is_parked:
+             parked[sid] = parked.get(sid, 0) + 1
+-            if activity._external_activity.replica_bucket(card):
+-                keys.setdefault(sid, set()).add((str(card.get('key')), 'external_unknown', False))
++            keys.setdefault(sid, set()).update(activity._external_activity.replica_markers(card))
+         keys.setdefault(sid, set()).add((str(card.get('key')), str(bucket), is_parked))
+         activity._replica_exec.collect(card, execution)
+         if card.get('status') not in activity.PENDING_RELEASE_STATUSES and (
+diff --git a/hermes_cli/fact_annotation_lifespan.py b/hermes_cli/fact_annotation_lifespan.py
+index 16ceda0b28..2a7948c59b 100644
+--- a/hermes_cli/fact_annotation_lifespan.py
++++ b/hermes_cli/fact_annotation_lifespan.py
+@@ -10,8 +10,9 @@ async def lifespan(app):
+     from hermes_cli import fact_annotation_boot
+     if getattr(app.state, 'annotation_facts', None) is not None:
+         raise RuntimeError('annotation startup custody retained')
++    # Opt in until asynchronous activation can guarantee non-blocking serve.
+     # health: allow HX002 -- creator-defined rollback switch, never a credential
+-    enabled = os.environ.get('HERMES_FACTS_ANNOTATION', '1').strip().lower() not in ('0', 'off', 'false', 'no')
++    enabled = os.environ.get('HERMES_FACTS_ANNOTATION', '0').strip().lower() not in ('0', 'off', 'false', 'no')
+     if not enabled or not sys.platform.startswith('linux'):
+         yield
+         return
+diff --git a/hermes_cli/fact_annotation_runtime.py b/hermes_cli/fact_annotation_runtime.py
+index 5ef9278786..25b46ca9f9 100644
+--- a/hermes_cli/fact_annotation_runtime.py
++++ b/hermes_cli/fact_annotation_runtime.py
+@@ -104,15 +104,19 @@ class AnnotationRuntime:
+ 
+     def start(self, seeds, *, timeout=15):
+         """Seed canonical selectors, await real source+output readiness, then cut over."""
+-        keys = {scope: {FactKey(scope, 'AnnotationInput', family) for family in annotations.FIELDS}
+-                for scope in self.scopes.values()}
++        # Discovery includes config-only profiles. Only actual seeded consumers
++        # gate cutover; absent stores retain unavailable evidence and reconcile
++        # in the background. Optional PR information never gates serve.
++        keys = {scope: set() for scope in self.scopes.values()}
+         for profile, rows in seeds.items():
+             scope = self.scopes[profile]
+             for row in rows:
+                 for family in annotations.FIELDS:
+                     selector = selector_for(scope, row, display=family == 'kanban')
+                     self.owner.demand(scope, 'annotations.' + family, selector)
+-                    keys[scope].add(view_key(scope, 'annotations.' + family, selector))
++                    if family != 'review':
++                        keys[scope].add(FactKey(scope, 'AnnotationInput', family))
++                        keys[scope].add(view_key(scope, 'annotations.' + family, selector))
+         deadline = time.monotonic() + timeout
+         with self.store._condition:
+             while True:
+diff --git a/hermes_cli/kanban_annotation_facts.py b/hermes_cli/kanban_annotation_facts.py
+index 8823be6293..9d37dc37a0 100644
+--- a/hermes_cli/kanban_annotation_facts.py
++++ b/hermes_cli/kanban_annotation_facts.py
+@@ -195,6 +195,11 @@ class AnnotationFacts:
+                     self.handle.demand('annotations.' + family if self._view_facts else 'annotations', selector)
+                 except (ValueError, RuntimeError):
+                     raise AnnotationUnavailable('annotation demand unavailable') from None
++            if family == 'review':
++                # Optional PR metadata cannot fail the whole sessions response.
++                # Preserve unavailable fact health, demand background recovery,
++                # and never certify fresh empty evidence or run legacy I/O.
++                return rows
+             raise AnnotationUnavailable('annotation projection unavailable')
+         for fact in facts:
+             if self._view_facts:
+diff --git a/tests/hermes_cli/test_annotation_activation_review.py b/tests/hermes_cli/test_annotation_activation_review.py
+new file mode 100644
+index 0000000000..b3e95cdf80
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_activation_review.py
+@@ -0,0 +1,136 @@
++"""Review repros: optional absence and exact remote replica parity. [daveey]"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as kanban
++from hermes_cli import review_session_activity as review
++from hermes_cli.fact_annotation_runtime import AnnotationRuntime
++from tests.hermes_cli import test_kanban_session_activity as helpers
++
++kanban_root = helpers.kanban_root
++
++
++@pytest.mark.parametrize('case', ['healthy', 'unused-profile', 'no-pr-info', 'failed-pr-info'])
++def test_optional_absence_does_not_prevent_startup(kanban_root, tmp_path, monkeypatch, case):
++    from hermes_state import SessionDB
++    from hermes_cli.fact_contract import FactKey
++    from hermes_cli.fact_annotation_views import selector_for
++    from hermes_cli.fact_store import view_key
++    from tests.waiting import wait_until
++    home = tmp_path / 'default'
++    home.mkdir()
++    db = SessionDB(db_path=home / 'state.db')
++    db.create_session('seed', 'cli')
++    homes = {'default': home}
++    monkeypatch.setattr(kanban, '_remote_cards', lambda *args: [])
++    if case == 'unused-profile':
++        unused = tmp_path / 'profiles/unused'
++        unused.mkdir(parents=True)
++        (unused / 'config.yaml').write_text('{}')
++        homes['unused'] = unused
++    if case in ('no-pr-info', 'failed-pr-info'):
++        db._execute_write(lambda conn: conn.execute(
++            "INSERT INTO messages(session_id,role,content,timestamp) VALUES ('seed','assistant',?,1)",
++            ('https://github.com/review-fixture/private/pull/7',)))
++        def fetch(key):
++            if case == 'failed-pr-info':
++                raise RuntimeError('provider unavailable')
++        monkeypatch.setattr(review, '_fetch_override', fetch)
++        monkeypatch.setattr(review, '_sync_fetch', True)
++        monkeypatch.setattr(review, '_pr_cache', {})
++        monkeypatch.setattr(review, '_inflight', set())
++    runtime = AnnotationRuntime(homes, fallback_profile='default', gateway='fixture',
++                                stop_legacy=lambda: None, start_legacy=lambda: None)
++    try:
++        row = {'id': 'seed', 'profile': 'default'}
++        runtime.start({'default': [row]}, timeout=2)
++        if case == 'unused-profile':
++            key = FactKey(runtime.scopes['unused'], 'AnnotationInput', 'turn')
++            fact = runtime.store.snapshot(runtime.scopes['unused']).get(key)
++            assert fact is None or fact.health != 'fresh'
++            assert not (homes['unused'] / 'state.db').exists()
++        if case in ('no-pr-info', 'failed-pr-info'):
++            scope = runtime.scopes['default']
++            key = view_key(scope, 'annotations.review', selector_for(scope, row))
++            assert wait_until(lambda: runtime.store.snapshot(scope).get(key) is not None, timeout=3)
++            assert runtime.store.snapshot(scope).get(key).health == 'unknown'
++            # Optional unavailability is not a certified empty review result,
++            # and it never admits legacy I/O or fails the whole response.
++            from fastapi import FastAPI
++            from fastapi.testclient import TestClient
++            from tests.hermes_cli.annotation_fact_processes import request_guard
++            app = FastAPI()
++            @app.get('/sessions')
++            def sessions():
++                return review.annotate_review_wait([dict(row)])
++            with TestClient(app) as client, request_guard():
++                for _ in range(3):
++                    response = client.get('/sessions')
++                    assert response.status_code == 200
++                    assert response.json() == [row]
++            assert runtime.store.snapshot(scope).get(key).health == 'unknown'
++            monkeypatch.setattr(review, '_fetch_override', lambda key: {
++                'open': True, 'review_required': True, 'viewer': 'viewer',
++                'author': 'viewer', 'requested': [], 'requested_at': 1})
++            # Existing provider completion wakes the source without a DB write.
++            review._refresh(('review-fixture', 'private', 7))
++            assert wait_until(lambda: runtime.store.snapshot(scope).get(key).health == 'fresh', timeout=3)
++            with TestClient(app) as client, request_guard():
++                response = client.get('/sessions')
++                assert response.status_code == 200
++                assert response.json()[0]['review_wait'] == 'stuck'
++    finally:
++        runtime.close()
++        db.close()
++
++
++def test_remote_clock_ci_deploy_producer_projection_parity(monkeypatch):
++    from hermes_cli.fact_annotation_kanban import _remote
++    from hermes_cli.fact_annotation_views import _kanban
++    from hermes_cli.kanban_external_activity import replica_markers, stamp_replica_counts
++    from hermes_cli.kanban_activity_identity import row_ids
++    now = time.time()
++    cards = [dict(session='root', key='peer/default/' + kind, id=kind,
++                  status='scheduled', title=kind + ' wait', parked_at=now - 60,
++                  awaiting={'kind': kind, 'until': now + 600,
++                            'ref': 'https://example.com/' + kind},
++                  park={'outcome': 'scheduled', 'wake_at': now + 600,
++                        'reason': 'wait', 'ended_at': now - 60})
++             for kind in ('clock', 'ci', 'deploy')]
++    legacy_keys = {'root': set()}
++    for card in cards:
++        legacy_keys['root'].update(replica_markers(card))
++        legacy_keys['root'].add((card['key'], str(kanban._replica_bucket(card)), True))
++    maps, native_keys = tuple({} for _ in range(8)), {}
++    _remote(cards, maps, native_keys, {})
++    assert native_keys == legacy_keys
++    expected = {'id': 'root'}
++    stamp_replica_counts([expected], legacy_keys, row_ids)
++    captured = {'parts': (*maps[:4], {}, maps[5], maps[6], maps[7], native_keys, {}, {}, {}),
++                'observed_at': now, 'external': {}}
++    row = {'id': 'root'}
++    _kanban(row, captured, now)
++    assert {k: v for k, v in row.items() if k.startswith('kanban_external')} == {
++        k: v for k, v in expected.items() if k.startswith('kanban_external')}
++    assert row['kanban_external'] == 3
++    assert row['kanban_external_unknown'] == 2
++    assert len(row['kanban_external_cards']) == 3
++
++
++def test_default_startup_never_admits_native(monkeypatch):
++    from hermes_cli import fact_annotation_boot as boot
++    from hermes_cli import web_server
++    from fastapi.testclient import TestClient
++    from tests.hermes_cli.test_serve_unloaded_sweeper import _quiet_boot
++    _quiet_boot(monkeypatch)
++    monkeypatch.delenv('HERMES_FACTS_ANNOTATION', raising=False)
++    monkeypatch.setattr(boot, 'prepare', lambda **kw: pytest.fail('default admitted blocking startup'))
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_annotation_prewarm as prewarm
++    calls = []
++    monkeypatch.setattr(host, 'start_holder', lambda role: calls.append('legacy'))
++    monkeypatch.setattr(prewarm, 'start_annotation_prewarm', lambda: calls.append('prewarm'))
++    with TestClient(web_server.app):
++        assert getattr(web_server.app.state, 'annotation_facts', None) is None
++    assert calls == ['prewarm', 'legacy']
+diff --git a/tests/hermes_cli/test_annotation_native_runtime.py b/tests/hermes_cli/test_annotation_native_runtime.py
+index 5af5d225d6..5347df91f8 100644
+--- a/tests/hermes_cli/test_annotation_native_runtime.py
++++ b/tests/hermes_cli/test_annotation_native_runtime.py
+@@ -78,7 +78,7 @@ def test_unready_runtime_never_drains_or_installs(kanban_root, tmp_path):
+         stop_legacy=lambda: calls.append('stop'), start_legacy=lambda: calls.append('start'))
+     try:
+         with pytest.raises(TimeoutError):
+-            runtime.start({}, timeout=.05)
++            runtime.start({'default': [{'id': 'consumer'}]}, timeout=.05)
+         assert calls == []
+         assert binding_for() is None
+     finally:
+diff --git a/tests/hermes_cli/test_annotation_prepare_lifespan.py b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+index 6c1ce10fbb..a58ad267db 100644
+--- a/tests/hermes_cli/test_annotation_prepare_lifespan.py
++++ b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+@@ -1,5 +1,6 @@
+ """Real startup owns seven native sources, with no legacy annotation admission."""
+ import asyncio
++import pytest
+ 
+ from hermes_cli import fact_annotation_boot as boot
+ from hermes_cli import fact_annotation_lifespan as startup
+@@ -46,7 +47,8 @@ def test_real_prepare_lifespan_and_canonical_request(kanban_root, tmp_path, monk
+         db.close()
+ 
+ 
+-def test_real_serve_composes_annotations_outside_sessions(kanban_root, tmp_path, monkeypatch):
++@pytest.mark.parametrize('optional', ['healthy', 'unused-profile', 'no-pr-info'])
++def test_real_serve_composes_annotations_outside_sessions(kanban_root, tmp_path, monkeypatch, optional):
+     from contextlib import asynccontextmanager
+     from fastapi.testclient import TestClient
+     from hermes_state import SessionDB
+@@ -59,12 +61,27 @@ def test_real_serve_composes_annotations_outside_sessions(kanban_root, tmp_path,
+     db = SessionDB(db_path=home / 'state.db')
+     db.create_session('composed-row', 'cli')
+     db.set_session_title('composed-row', 'real composition')
++    roster = [('default', home)]
++    if optional == 'unused-profile':
++        unused = tmp_path / 'unused'
++        unused.mkdir()
++        (unused / 'config.yaml').write_text('{}')
++        roster.append(('unused', unused))
++    if optional == 'no-pr-info':
++        from hermes_cli import review_session_activity as review
++        db._execute_write(lambda conn: conn.execute(
++            "INSERT INTO messages(session_id,role,content,timestamp) VALUES ('composed-row','assistant',?,1)",
++            ('https://github.com/review-fixture/private/pull/7',)))
++        monkeypatch.setattr(review, '_fetch_override', lambda key: None)
++        monkeypatch.setattr(review, '_sync_fetch', True)
++        monkeypatch.setattr(review, '_pr_cache', {})
++        monkeypatch.setattr(review, '_inflight', set())
+     @asynccontextmanager
+     async def quiet_services(app):
+         yield
+     monkeypatch.setattr(web_server_app, 'standalone_lifespan', quiet_services)
+     monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
+-    monkeypatch.setattr(routes, '_profile_targets', lambda reason: [('default', home)])
++    monkeypatch.setattr(routes, '_profile_targets', lambda reason: roster)
+     monkeypatch.setattr(kanban, '_remote_cards', lambda *args: [])
+     calls = []
+     monkeypatch.setattr(host, 'suspend_holder', lambda: calls.append('drain'))
+diff --git a/tests/hermes_cli/test_annotation_serve_startup.py b/tests/hermes_cli/test_annotation_serve_startup.py
+index b9945a17f7..3663cded93 100644
+--- a/tests/hermes_cli/test_annotation_serve_startup.py
++++ b/tests/hermes_cli/test_annotation_serve_startup.py
+@@ -10,9 +10,9 @@ from hermes_cli import web_server
+ from tests.hermes_cli.test_serve_unloaded_sweeper import _quiet_boot
+ 
+ 
+-def test_default_on_real_serve_has_no_legacy_starter(monkeypatch):
++def test_explicit_on_real_serve_has_no_legacy_starter(monkeypatch):
+     _quiet_boot(monkeypatch)
+-    monkeypatch.delenv('HERMES_FACTS_ANNOTATION', raising=False)
++    monkeypatch.setenv('HERMES_FACTS_ANNOTATION', '1')
+     calls = []
+     runtime = SimpleNamespace(close=lambda: calls.append('close'))
+     def prepare(*, on_created):
+-- 
+2.43.0
+

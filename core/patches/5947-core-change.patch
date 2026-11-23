@@ -1,0 +1,216 @@
+From c48460c7d7a55f729c49668c8ab7a5c55bcd620e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:56:19 +0000
+Subject: [PATCH] fix(kanban): share current needs-you card predicate [daveey]
+
+---
+ hermes_cli/data/plugin_api.json               |  3 +-
+ hermes_cli/kanban_lanes_flow.py               | 19 ++++++++-
+ hermes_cli/kanban_open_asks.py                | 41 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_lanes_flow.py    |  2 +-
+ .../test_kanban_needs_you_contract.py         | 42 +++++++++++++++++++
+ .../plugins/kanban-validation.md              | 13 ++++++
+ .../developer-guide/plugins/public-api.md     |  1 +
+ 7 files changed, 118 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_needs_you_contract.py
+
+diff --git a/hermes_cli/data/plugin_api.json b/hermes_cli/data/plugin_api.json
+index e8ded94f15..f5b93d6582 100644
+--- a/hermes_cli/data/plugin_api.json
++++ b/hermes_cli/data/plugin_api.json
+@@ -181,7 +181,8 @@
+         "hermes_cli.kanban_model_neutral:validate_review",
+         "hermes_cli.kanban_model_neutral:MANDATORY_FLAGS",
+         "hermes_cli.kanban_model_neutral:validate_explicit_selector",
+-        "hermes_cli.kanban_model_neutral:validate_update_flags"
++        "hermes_cli.kanban_model_neutral:validate_update_flags",
++        "hermes_cli.kanban_open_asks:needs_you"
+       ]
+     },
+     {
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index a2fc3eaaf0..5edc6214eb 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -116,7 +116,9 @@ def _skip_reason(card: dict) -> Optional[str]:
+ 
+ 
+ def classify_reason(card: dict, step: str) -> str:
+-    if card.get("human_request") or card.get("block_kind") in ("needs_input", "capability"):
++    from hermes_cli.kanban_open_asks import needs_you
++
++    if needs_you(card):
+         return "you"
+     gate_reason = card.get("gate_reason")
+     if gate_reason in (LIMIT_CARDS, LIMIT_USD):
+@@ -341,6 +343,21 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None,
+         cards.append({"id": card["id"], "title": card["title"] or "",
+                       "lane": pol.lane_of(card["tenant"]), "step": step, "reason": reason,
+                       "source": source, "age_h": card["age_h"], "pr": pr})
++        if reason == "you":
++            from hermes_cli.kanban_wait_info import describe
++
++            park = {}
++            for event in reversed(card['events']):
++                if event.get('kind') in ('scheduled', 'continued'):
++                    park = _payload(event)
++                    break
++                if event.get('kind') in ('claimed', 'unblocked', 'completed', 'archived'):
++                    break
++            cards[-1]['attention'] = {
++                'id': card['id'], 'title': card['title'], 'status': card['status'],
++                'human_request': card['human_request'], 'block_kind': card['block_kind'],
++                'wait': describe(card['status'], human=bool(card['human_request']), park=park),
++            }
+         if reason == "dep":
+             blockers = evidence.blockers(card["id"])
+             cards[-1].update(blockers=blockers, blocker=blockers[0] if blockers else None)
+diff --git a/hermes_cli/kanban_open_asks.py b/hermes_cli/kanban_open_asks.py
+index 65704830bc..e60f5a7a71 100644
+--- a/hermes_cli/kanban_open_asks.py
++++ b/hermes_cli/kanban_open_asks.py
+@@ -26,6 +26,47 @@ def card_is_open_human_ask(status: Any, block_kind: Any, human_request: Any) ->
+     return bool(_stored_needs_human(human_request, block_kind))
+ 
+ 
++def needs_you(card: dict) -> bool:
++    """Current card attention, never a historical block kind or an implied consent.
++
++    Projected wait evidence and raw lane cards share this entry point. Legacy
++    scheduled device probes carry presentation-only attention, not approval.
++    """
++    status = card.get("status")
++    if status not in ("blocked", "triage", "scheduled") or card.get("stale"):
++        return False
++    import json
++
++    def obj(value):
++        if isinstance(value, str):
++            try:
++                value = json.loads(value)
++            except ValueError:
++                return {}
++        return value if isinstance(value, dict) else {}
++
++    wait = obj(card.get("wait"))
++    if wait.get("wait_state"):
++        return wait["wait_state"] == "human"
++    human = obj(card.get("human_request"))
++    if card_is_open_human_ask(status, card.get("block_kind"), human):
++        return True
++    if status != "scheduled":
++        return False
++    if obj(card.get("wakes")).get("blocks_for_human") and human.get("action"):
++        return True
++    from hermes_cli.kanban_wait_info import owner_device_step
++
++    park = obj(card.get("park"))
++    for event in reversed(card.get("events") or ()):
++        if event.get("kind") in ("scheduled", "continued"):
++            park = obj(event.get("payload"))
++            break
++        if event.get("kind") in ("claimed", "unblocked", "completed", "archived"):
++            break
++    return bool(owner_device_step(park.get("wake_check")))
++
++
+ def open_human_asks(card_refs: Iterable[str], count: int) -> list[dict[str, str]]:
+     """``needs_you`` entries for one row: one ``card`` entry per open ask. ``card_refs`` are the owner-qualified
+     keys (``<board>/<id>``) of the blocked cards of the row's lineage, from the snapshot that supplies ``count``
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow.py b/tests/hermes_cli/test_kanban_lanes_flow.py
+index f4cf8b623d..7f12deee7d 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow.py
+@@ -48,7 +48,7 @@ def test_review_requested_event_is_review_without_guessing_ci():
+ 
+ 
+ @pytest.mark.parametrize("fields,reason", [
+-    ({"human_request": {"action": "pick"}, "status": "blocked", "block_kind": "needs_input"}, "you"),
++    ({"human_request": {"action": "pick", "why_human": "Only you know", "interaction": "reply", "scope": "This card", "evidence": "Choice needed"}, "status": "blocked", "block_kind": "needs_input"}, "you"),
+     ({"parents_open": True, "status": "todo"}, "dep"),
+     ({"status": "triage", "block_kind": lanes.GATE_KIND, "held": True}, "gate"),
+     ({"status": "triage", "block_kind": lanes.GATE_KIND, "held": True,
+diff --git a/tests/hermes_cli/test_kanban_needs_you_contract.py b/tests/hermes_cli/test_kanban_needs_you_contract.py
+new file mode 100644
+index 0000000000..3c2c124851
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_needs_you_contract.py
+@@ -0,0 +1,42 @@
++"""One attention contract for lane reasons and card presentation."""
++import json
++
++import pytest
++
++from hermes_cli.kanban_lanes_flow import classify_reason, classify_step
++
++
++HR = {'action': 'Choose a route', 'why_human': 'Only you know', 'interaction': 'reply',
++      'scope': 'This card', 'evidence': 'A choice is needed'}
++
++
++@pytest.mark.parametrize(('card', 'expected'), [
++    ({'status': 'blocked', 'block_kind': 'needs_input', 'human_request': HR}, True),
++    ({'status': 'triage', 'block_kind': 'capability', 'human_request': json.dumps(HR)}, True),
++    ({'status': 'blocked', 'block_kind': 'needs_input'}, False),
++    ({'status': 'scheduled', 'block_kind': 'capability'}, False),
++    ({'status': 'running', 'human_request': HR}, False),
++    ({'status': 'done', 'wait': {'wait_state': 'human'}}, False),
++    ({'status': 'blocked', 'human_request': {'action': 'incomplete'}}, False),
++    ({'status': 'blocked', 'stale': True, 'human_request': HR}, False),
++    ({'status': 'scheduled', 'wait': {'wait_state': 'human', 'owner_step': 'Connect device'}}, True),
++    ({'status': 'scheduled', 'events': [{'kind': 'scheduled', 'payload': {
++        'wake_check': 'python3 /example/probe_phone_available.py'}}]}, True),
++    ({'status': 'scheduled', 'events': [{'kind': 'scheduled', 'payload': {
++        'wake_check': 'python3 /example/passive_turn_capture.py'}}]}, False),
++])
++def test_needs_you_contract(card, expected):
++    from hermes_cli.kanban_open_asks import needs_you
++
++    assert needs_you(card) is expected
++    assert (classify_reason(card, classify_step(card)) == 'you') is expected
++
++
++def test_blocked_to_scheduled_drops_stale_kind():
++    from hermes_cli.kanban_open_asks import needs_you
++
++    card = {'status': 'blocked', 'block_kind': 'capability', 'human_request': HR}
++    assert needs_you(card)
++    card.update(status='scheduled', human_request=None)
++    assert not needs_you(card)
++    assert classify_reason(card, 'waiting') == 'time'
+diff --git a/website/docs/developer-guide/plugins/kanban-validation.md b/website/docs/developer-guide/plugins/kanban-validation.md
+index 3aa691ca76..077abdeb47 100644
+--- a/website/docs/developer-guide/plugins/kanban-validation.md
++++ b/website/docs/developer-guide/plugins/kanban-validation.md
+@@ -43,3 +43,16 @@ request-error response; these helpers introduce no new wire protocol.
+ Publication is intentionally name-scoped. `effective_selector`, `routing_view`
+ and whole-module imports remain private, and the boundary-lint baseline is not
+ relaxed by this API extension.
++
++## Read-only attention predicate
++
++`hermes_cli.kanban_open_asks:needs_you(card)` returns a boolean for the current
++card snapshot. Pass a dictionary with `status`, `block_kind`, `human_request`
++(decoded object or stored JSON), and optional projected `wait`, `wakes`, `stale`
++and ordered `events`. It rejects terminal/running/stale cards and incomplete
++human requests; a historical `block_kind` is never enough. Current projected
++human waits and bounded legacy scheduled device-access probes also count as
++attention. The result is presentation only: it does not create consent, revive
++a retired canonical request, authorize execution or mutate a card. Lanes and
++session-pane card rendering use this same predicate. Other module names remain
++private.
+diff --git a/website/docs/developer-guide/plugins/public-api.md b/website/docs/developer-guide/plugins/public-api.md
+index 8fbd665713..617f6a3dcb 100644
+--- a/website/docs/developer-guide/plugins/public-api.md
++++ b/website/docs/developer-guide/plugins/public-api.md
+@@ -135,6 +135,7 @@ with a name allows that one name only.
+ | `hermes_cli.kanban_model_neutral` | `MANDATORY_FLAGS` | plugins/kanban-validation.md: pure model-neutral validation before any mixed request writes; no routing or mutation exports |
+ | `hermes_cli.kanban_model_neutral` | `validate_explicit_selector` | plugins/kanban-validation.md: pure model-neutral validation before any mixed request writes; no routing or mutation exports |
+ | `hermes_cli.kanban_model_neutral` | `validate_update_flags` | plugins/kanban-validation.md: pure model-neutral validation before any mixed request writes; no routing or mutation exports |
++| `hermes_cli.kanban_open_asks` | `needs_you` | plugins/kanban-validation.md: pure model-neutral validation before any mixed request writes; no routing or mutation exports |
+ | `hermes_cli.chat_launch` | `hermes_command` | user-guide/features/plugins.md § A plugin with its own chat client |
+ | `hermes_cli.chat_launch` | `print_exit_summary` | user-guide/features/plugins.md § A plugin with its own chat client |
+ | `hermes_cli.gateway_chat` | `shell_client_env` | user-guide/features/plugins.md § A plugin with its own chat client |
+-- 
+2.43.0
+

@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 5923 by `repair_hostname_escapes_5923.py` (snapshot 5836: `repair_hostname_escapes_5836.py`) (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 5949 by `repair_hostname_escapes_5949.py` (snapshot 5923: `repair_hostname_escapes_5923.py`) (snapshot 5836: `repair_hostname_escapes_5836.py`) (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-5923 patches, one entry per non-merge source commit through `02ad53634badad70acff02e4b835df00f46b5d2b`.
+5949 patches, one entry per non-merge source commit through `4252743d44bef7fb852ca145bb861ac8e4a47225`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -41,6 +41,28 @@ The 4353–5011 append adds two source-derived bridges before entries 4353 and 4
 The 5040–5406 append retains 51 bridges and three ancestry-only markers. Its one feature-branch merge is tree-identical to the automatic merge, so no new bridge is required. Snapshot policy: [mirror-policy-5406.json](mirror-policy-5406.json); replay plan: [mirror-replay-5406.json](mirror-replay-5406.json); acceptance evidence: [mirror-5406-verification.md](mirror-5406-verification.md).
 
 The 5438–5836 append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Policy: [mirror-policy-5836.json](mirror-policy-5836.json); replay plan: [mirror-replay-5836.json](mirror-replay-5836.json); verification receipt: [mirror-5836-verification.md](mirror-5836-verification.md). All previously published patch and bridge bytes remain unchanged.
+
+## Mirror 5924–5949
+
+This 26-entry append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Frozen source: `4252743d44bef7fb852ca145bb861ac8e4a47225`. Policy: [mirror-policy-5949.json](mirror-policy-5949.json); replay plan: [mirror-replay-5949.json](mirror-replay-5949.json); acceptance: [mirror-5949-verification.md](mirror-5949-verification.md). Earlier patch and bridge bytes remain unchanged. Source-test lists are not fresh source-suite or live-deployment proof; final Mac attention parity remains unproved.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Loaded-session notification source defaults off](mirror-5949-a-loaded-notification-default-off.md) | 5924 | Legacy default; shared executor requires explicit opt-in |
+| [Unreadable linked cards report unknown status](mirror-5949-a-unknown-linked-card-status.md) | 5925 | Typed source_unknown wait and neutral verdict |
+| [Links-health outcome recovery](mirror-5949-a-links-health-outcome-recovery.md) | 5926–5928 | Reuse the outcome executor and exact origin store |
+| [Owner-qualified sidebar project membership](mirror-5949-a-sidebar-project-membership.md) | 5929–5931 | Deduplicate complete owner/profile/session membership |
+| [In-process board and project-tree owners](mirror-5949-a-native-board-tree-owners.md) | 5932–5933 | Off-request captures and authenticated-home binding |
+| [Native capture failures stay unavailable](mirror-5949-a-native-tree-failure-unavailable.md) | 5934 | Cold unknown and warm stale, never empty success |
+| [Consume elapsed display deadlines](mirror-5949-b-session-display-deadlines.md) | 5935 | Avoid immediate capture rearming |
+| [Quiet automatic continuation ownership retries](mirror-5949-b-auto-continue-ownership.md) | 5936 | Retain custody refusal and durable retry |
+| [Evidence-qualified subagent resolution](mirror-5949-b-subagent-resolution.md) | 5937–5938 | Consumption receipts and shutdown checkpoints |
+| [Loader-owned Session Tasks provenance](mirror-5949-b-session-tasks-provenance.md) | 5939–5940 | Qualified surfaces and hermetic companion input |
+| [Scoped native annotation composition](mirror-5949-b-native-annotation-composition.md) | 5941–5943 | Exact-profile readiness and rollback custody |
+| [Opt-in native annotation serve startup](mirror-5949-c-annotation-serve-startup.md) | 5944–5946 | Startup lifetime and optional review metadata |
+| [Shared needs-you predicate](mirror-5949-c-needs-you-contract.md) | 5947 | Current human asks, bounded device steps and attention rows |
+| [Drain-fenced offline mutation helper](mirror-5949-c-k01-mutants-drain-fence.md) | 5948 | Drain leases for mutation subprocesses |
+| [Responsive owner admission](mirror-5949-c-owner-admission-responsiveness.md) | 5949 | Off-loop submission and unbound-submitter recovery |
 
 ## Mirror 5837–5923
 
@@ -4447,16 +4469,16 @@ The 5407–5437 append retains 51 bridges and three ancestry-only markers and ad
 
 ## Applying
 
-For the current **5923-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5923.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **5949-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5949.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 02ad53634badad70acff02e4b835df00f46b5d2b \
+  --source-tip 4252743d44bef7fb852ca145bb861ac8e4a47225 \
   --base ea405e49a5e281558b3eeb3a13af66c6116cd0f2 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5923.json" \
-  --replay-plan "$MODS/core/mirror-replay-5923.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5949.json" \
+  --replay-plan "$MODS/core/mirror-replay-5949.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -4618,12 +4640,12 @@ git commit -m 'Explicit upstream integration bridge before 4353'
 git am -3 --empty=keep "${patches[@]:4352:145}"
 git apply --index --3way "$MODS/core/bridges/mirror-5011-before-4498.diff"
 git commit -m 'Explicit redaction resolution bridge before 4498'
-git am -3 --empty=keep "${patches[@]:4497:1426}"
+git am -3 --empty=keep "${patches[@]:4497:1452}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_5923.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_5949.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_5923.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_5949.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

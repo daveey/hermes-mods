@@ -1,0 +1,234 @@
+From 1983a09edc6b539a5c40e5039c355afaefb63ee4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:09:39 +0000
+Subject: [PATCH] fix(status): recover unknown-card outcomes with no remote
+ rows from exact origin store on links health
+
+---
+ .../test_session_status_refresh.py            | 96 +++++++++++++++++++
+ tui_gateway/notice_fanout.py                  | 13 ++-
+ tui_gateway/notice_links_health.py            | 67 +++++++++++++
+ 3 files changed, 174 insertions(+), 2 deletions(-)
+ create mode 100644 tui_gateway/notice_links_health.py
+
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+index bd2816205b..16601ca17a 100644
+--- a/tests/hermes_state/test_session_status_refresh.py
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -226,6 +226,102 @@ def test_links_health_recomputes_unchanged_remote_outcome_without_task_event(db,
+         fanout._reset_for_tests()
+ 
+ 
++def _health_setup(db, monkeypatch, tmp_path):
++    """No remote card rows at all: only the stored unknown outcome can be recovered."""
++    from contextlib import contextmanager
++    from hermes_cli import fact_links_health as health
++    from hermes_cli.fact_remote_links import LinksUnavailable
++    from tui_gateway import notice_fanout as fanout
++    from tui_gateway import notice_fanout_state as state
++    turn(db)
++    health.reset_for_tests()
++    fanout._reset_for_tests()
++    origin = ksa._origin_scope()
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [])
++    monkeypatch.setattr(fanout, '_remote_inputs_key', lambda: (('root', 'home', ()), ()))
++    available = [False]
++    def display(*a, **kw):
++        if not available[0]:
++            raise LinksUnavailable('source unavailable')
++        return []
++    monkeypatch.setattr(ksa, 'session_outcome_tasks', display)
++    assert refresh(db, 'card_change')['reason'] == 'source_unknown'
++    assert state.seed_remote({})
++    @contextmanager
++    def nowhere(chat):  # the snapshot path must never be used: there are no remote rows
++        raise AssertionError('no snapshot chat expected')
++        yield
++    @contextmanager
++    def exact(_origin):
++        yield db
++    return health, fanout, origin, available, nowhere, exact
++
++
++def test_links_health_recovers_unknown_outcome_with_no_remote_rows(db, monkeypatch, tmp_path):
++    health, fanout, origin, available, nowhere, exact = _health_setup(db, monkeypatch, tmp_path)
++    try:
++        health.changed(origin, False)
++        fanout._remote_change_pass(nowhere, exact)
++        assert health.pending(origin) is None
++        assert so.get_outcome('chat', db=db)['status']['reason'] == 'source_unknown'
++        available[0] = True
++        health.changed(origin, True)
++        result = fanout._remote_change_pass(nowhere, exact)
++        assert [r['chat_id'] for r in result] == ['chat']
++        assert_done(so.get_outcome('chat', db=db)['status'])
++        assert health.pending(origin) is None
++        assert not fanout._remote_change_pass(nowhere, exact)  # no polling: nothing pending, nothing to do
++    finally:
++        health.reset_for_tests()
++        fanout._reset_for_tests()
++
++
++def test_links_health_never_touches_a_foreign_profile_with_the_same_chat_id(db, monkeypatch, tmp_path):
++    from contextlib import contextmanager
++    from hermes_state import SessionDB
++    health, fanout, origin, available, nowhere, exact = _health_setup(db, monkeypatch, tmp_path)
++    foreign = SessionDB(db_path=tmp_path / 'other' / 'state.db')
++    try:
++        foreign.create_session('chat', source='desktop')
++        foreign.append_message('chat', role='user', content='other profile work')
++        foreign.append_message('chat', role='assistant', content='ok')
++        so.refresh_outcome('chat', 'card_change', db=foreign)
++        before = foreign._read_one('SELECT outcome_json FROM sessions WHERE id = ?', ('chat',))['outcome_json']
++        available[0] = True
++        health.changed(origin, True)
++        fanout._remote_change_pass(nowhere, exact)
++        assert_done(so.get_outcome('chat', db=db)['status'])
++        assert foreign._read_one('SELECT outcome_json FROM sessions WHERE id = ?', ('chat',))['outcome_json'] == before
++    finally:
++        foreign.close()
++        health.reset_for_tests()
++        fanout._reset_for_tests()
++
++
++def test_links_health_failed_recovery_keeps_generation_and_retries(db, monkeypatch, tmp_path):
++    from contextlib import contextmanager
++    health, fanout, origin, available, nowhere, exact = _health_setup(db, monkeypatch, tmp_path)
++    try:
++        available[0] = True
++        health.changed(origin, True)
++        @contextmanager
++        def broken(_origin):
++            raise OSError('store unavailable')
++            yield
++        result = fanout._remote_change_pass(nowhere, broken)
++        assert result.incomplete and health.pending(origin) is not None
++        generation = health.pending(origin)
++        health.changed(origin, False)  # a newer transition during recovery supersedes the old generation
++        assert health.pending(origin) > generation
++        health.changed(origin, True)
++        fanout._remote_change_pass(nowhere, exact)
++        assert_done(so.get_outcome('chat', db=db)['status'])
++        assert health.pending(origin) is None
++    finally:
++        health.reset_for_tests()
++        fanout._reset_for_tests()
++
++
+ def assert_done(status):
+     assert (status["kind"], status["presentation"]["stripe"], status["coverage"]["state"]) == ("done", "done", "complete")
+ 
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 34bb76f74b..b4242f7eb3 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -388,7 +388,7 @@ def _remote_boards_quiet(base: tuple, polled: dict, known: dict) -> bool:
+     return True
+ 
+ 
+-def _remote_change_pass(session_db: Callable) -> FanoutResult:
++def _remote_change_pass(session_db: Callable, origin_db: Optional[Callable] = None) -> FanoutResult:
+     """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
+     global _remote_memo
+     from hermes_cli import kanban_session_activity as activity
+@@ -464,6 +464,15 @@ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+     committed = state.ack_remote(acked)
+     if not committed:
+         out.retry()
++    recovered_all = True
++    if health_generation is not None:
++        from tui_gateway import notice_links_health
++        done, recovered_all = notice_links_health.recover(origin, set(previous.keys() | snapshot.keys()), origin_db)
++        for chat, tip in done:
++            out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
++                        "status": None, "skipped": None, "source": "remote"})
++        if not recovered_all:
++            out.retry()
+     if committed and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+         # Only certify a projection if its cursor stayed still THROUGH fingerprint collection. A later
+         # fingerprint must not describe a write the projection never saw.
+@@ -472,7 +481,7 @@ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+         if prints is not None and after is not None and all(after[slug][1] == polled[slug][1] for slug in polled):
+             _remote_memo = (inputs[0], _ledger_content_key(inputs[1]), {slug: polled[slug][1] for slug in polled}, prints)
+     fact_links_health.acknowledge(origin, health_generation,
+-                                  complete=committed and (previous.keys() | snapshot.keys()) <= acked.keys())
++                                  complete=committed and recovered_all and (previous.keys() | snapshot.keys()) <= acked.keys())
+     return out
+ 
+ 
+diff --git a/tui_gateway/notice_links_health.py b/tui_gateway/notice_links_health.py
+new file mode 100644
+index 0000000000..f72ece89c2
+--- /dev/null
++++ b/tui_gateway/notice_links_health.py
+@@ -0,0 +1,67 @@
++"""Exact-store recovery of retained unknown-card outcomes on a links-health transition. [daveey]
++
++Runs only from the normal outcome executor after a health generation is pending, never from the
++source callback. It reads the origin home's own ``state.db`` (no profile fallback, so equal chat ids
++in a foreign profile are never aliased) and refreshes outcomes whose stored status says the linked
++cards could not be read. Sessions without any remote card row are covered the same way.
++"""
++from __future__ import annotations
++
++import contextlib
++import logging
++from pathlib import Path
++from typing import Any, Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++
++# Stored-envelope markers of an unreadable card source (reason / reason_codes / coverage).
++_MARKERS = ("source_unknown", "linked_status_unknown", "card_read_failed", "card_status_unavailable")
++
++
++@contextlib.contextmanager
++def origin_store(origin: tuple) -> Iterator[Any]:
++    """Writable SessionDB for exactly the origin home, or None when it has no store."""
++    path = Path(origin[0]) / "state.db"
++    if not path.exists():
++        yield None
++        return
++    from hermes_state_registry import acquire
++    db = acquire(path)
++    try:
++        yield db
++    finally:
++        with contextlib.suppress(Exception):
++            db.close()
++
++
++def unknown_outcome_ids(db: Any) -> list[str]:
++    where = " OR ".join("outcome_json LIKE ?" for _ in _MARKERS)
++    rows = db._read_all(f"SELECT id FROM sessions WHERE outcome_json IS NOT NULL AND ({where})",
++                        tuple(f"%{m}%" for m in _MARKERS))
++    return [r["id"] for r in rows]
++
++
++def recover(origin: tuple, skip: set[str], opener: Optional[Callable] = None) -> tuple[list[tuple[str, str]], bool]:
++    """Refresh stored unknown-card outcomes in the origin store. Returns ([(chat, tip)], complete)."""
++    from hermes_state_outcome import refresh_outcomes_quietly
++    from tui_gateway.notice_fanout import chat_skip_reason
++    done: list[tuple[str, str]] = []
++    complete = True
++    try:
++        with (opener or origin_store)(origin) as db:
++            if db is None:
++                return done, True
++            for chat in unknown_outcome_ids(db):
++                if chat in skip:
++                    continue
++                if chat_skip_reason(db, chat) is not None:
++                    continue
++                tip = db.get_compression_tip(chat) or chat
++                if refresh_outcomes_quietly([tip], "card_change", db=db):
++                    done.append((chat, tip))
++                else:
++                    complete = False
++    except Exception:  # health: allow BLE001 -- an unreadable store keeps the generation pending
++        logger.warning("links-health outcome recovery failed", exc_info=True)
++        complete = False
++    return done, complete
+-- 
+2.43.0
+

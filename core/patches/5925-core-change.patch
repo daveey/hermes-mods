@@ -1,0 +1,146 @@
+From 3ea5bc5065dd3c44aa84244c1f8ac19f93036d9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:47:15 +0000
+Subject: [PATCH] fix(status): retain unavailable card obligations without live
+ claims [daveey]
+
+---
+ hermes_state_outcome.py                       |  7 +++
+ hermes_state_session_status.py                |  7 ++-
+ hermes_state_session_status_snapshot.py       |  2 +
+ .../test_session_status_refresh.py            | 49 ++++++++++++++++++-
+ 4 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 8e6e736eea..aeb418474a 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -375,6 +375,13 @@ def _read_card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+                 request = json.loads(request)
+         status = str(card.get("status") or "")
+         wait = card.get("wait") if isinstance(card.get("wait"), dict) else {}
++        # A retained display row is an obligation, not evidence of its last state.
++        # Check before human-ask handling too: unavailable data cannot ask the user.
++        if card.get("stale") or card.get("partial_source_unknown") or status == "unknown":
++            waits.append({"kind": "card", "id": tid, "label": _str(card.get("title")) or tid,
++                          "state": "source_unknown", "source_unknown": _str(card.get("partial_source_unknown"))
++                          or "card_status_unavailable"})
++            continue
+         human = card_is_open_human_ask(status, card.get("block_kind"), request)
+         explained = card.get("retained_wait") if isinstance(card.get("retained_wait"), str) else None
+         # A notification subscription observes another chat's card; it does not adopt its human decision.
+diff --git a/hermes_state_session_status.py b/hermes_state_session_status.py
+index 112ee49838..92742e76a4 100644
+--- a/hermes_state_session_status.py
++++ b/hermes_state_session_status.py
+@@ -15,7 +15,7 @@ _IDENTITY_KEYS = ("gateway", "profile", "session_id", "owner_epoch")
+ _SUCCESS = frozenset({"succeeded", "done", "completed"})
+ _TURN_REASONS = frozenset({"notice_tail", "turn_unsettled", "subagent_killed"})
+ _OPEN = frozenset({"ready", "todo", "running", "waiting", "blocked", "scheduled", "review", "triage",
+-                   "external_running", "external_unknown", "pending", "queued"})
++                   "external_running", "external_unknown", "source_unknown", "pending", "queued"})
+ 
+ 
+ def _identity(value: Any) -> dict[str, str]:
+@@ -91,6 +91,9 @@ def _verdict(snapshot: dict, coverage: dict, generation: int, failures: list[dic
+     if any(item.get("kind") == "card" and item.get("state") == "running" for item in open_work):
+         return {"kind": "running", "on": deepcopy(open_work),
+                 "presentation": {"stripe": "waiting", "reason_codes": ["linked_work_running"]}}
++    if any(item.get("state") == "source_unknown" for item in open_work):
++        return {"kind": "waiting", "on": deepcopy(open_work),
++                "presentation": {"stripe": "none", "reason_codes": ["linked_status_unknown"]}}
+     if any(item.get("state") in ("external_unknown", "external_running") for item in open_work):
+         return {"kind": "waiting", "on": deepcopy(open_work),
+                 "presentation": {"stripe": "external", "reason_codes": ["linked_ci_deploy_wait"]}}
+@@ -114,7 +117,7 @@ def _verdict(snapshot: dict, coverage: dict, generation: int, failures: list[dic
+             turn["reason"] if turn.get("reason") in _TURN_REASONS else "interrupted")
+     if reason:
+         return {"kind": "unresolved", "reason": reason,
+-                "presentation": {"stripe": "attention", "reason_codes": [reason]}}
++                "presentation": {"stripe": "none" if reason == "source_unknown" else "attention", "reason_codes": [reason]}}
+     return {"kind": "done", "presentation": {"stripe": "done", "reason_codes": ["work_settled"]}}
+ 
+ 
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index ef263d6adb..44191d0682 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -258,6 +258,8 @@ def canonical_status(db: Any, tip: str, stored: Optional[dict], *, trigger: str,
+     kept = (prior.get("turn_evidence") or {}) if same_owner else {}
+     turn, evidence = _turn(tail, live, concluding, trigger, kept, generation)
+     card_asks, card_waits = read("cards", lambda: so._card_items(ids), ([], []))
++    if any(w.get("state") == "source_unknown" for w in card_waits):
++        errors["cards"] = "card_status_unavailable"
+     control_asks, control_waits = read("controls", lambda: _control_items(tip), ([], []))
+     subagents, lost_before = read("subagents", lambda: _subagent_items(db, ids, since), ([], []))
+     processes = read("processes", lambda: _process_items(db, tip), [])
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+index 6f89157287..9dc147b106 100644
+--- a/tests/hermes_state/test_session_status_refresh.py
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -119,6 +119,53 @@ def test_replica_ci_deploy_wait_publishes_external_stripe(db, monkeypatch, kind,
+     assert published is not None and published["status"] == status
+ 
+ 
++@pytest.mark.parametrize("status", ["running", "todo", "done", "blocked"])
++@pytest.mark.parametrize("failure", [{"stale": True}, {"partial_source_unknown": "origin_ledger_unavailable"}])
++def test_unavailable_card_is_not_live_work_or_a_human_ask(db, monkeypatch, status, failure):
++    turn(db)
++    card = {"id": "t_remote", "status": status, "remote": True, "gateway": "edge",
++            "board": "build", "profile": "default", "human_request": HUMAN_REQUEST,
++            "block_kind": "needs_input", **failure}
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **kw: [card])
++    value = refresh(db, "card_change")
++    assert value["kind"] == "waiting", value
++    assert value["presentation"]["reason_codes"] == ["linked_status_unknown"]
++    assert value["coverage"]["state"] == "unknown"
++    assert value["on"][0]["state"] == "source_unknown"
++    # Recovery uses the same card, not a forced status or manual DB repair.
++    card.update(status="running", stale=False, partial_source_unknown=None, block_kind=None, human_request=None)
++    value = refresh(db, "card_change")
++    assert value["kind"] == "running"
++    assert value["coverage"]["state"] == "complete"
++
++
++def test_real_running_card_wins_over_another_unavailable_card(db, monkeypatch):
++    turn(db)
++    cards = [{"id": "t_remote", "status": "running", "remote": True, "stale": True},
++             {"id": "t_local", "status": "running"}]
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **kw: cards)
++    value = refresh(db, "card_change")
++    assert value["kind"] == "running"
++    assert value["coverage"]["state"] == "unknown"
++    assert [w["state"] for w in value["on"]] == ["source_unknown", "running"]
++
++
++@pytest.mark.parametrize("error", [TimeoutError, RuntimeError])
++def test_card_read_failure_is_neutral_and_recovers(db, monkeypatch, error):
++    turn(db)
++    from hermes_cli.fact_remote_links import LinksUnavailable
++    exc = LinksUnavailable if error is RuntimeError else error
++    def fail(*args, **kwargs):
++        raise exc("linked cards unavailable")
++    with monkeypatch.context() as patch:
++        patch.setattr(ksa, "session_outcome_tasks", fail)
++        value = refresh(db, "card_change")
++    assert value["kind"] == "unresolved"
++    assert value["reason"] == "source_unknown"
++    assert value["presentation"]["stripe"] == "none"
++    assert_done(refresh(db, "card_change"))
++
++
+ def assert_done(status):
+     assert (status["kind"], status["presentation"]["stripe"], status["coverage"]["state"]) == ("done", "done", "complete")
+ 
+@@ -303,7 +350,7 @@ def test_unreadable_process_inventory_is_unknown_then_recovers(db, receipts):
+     bad.write_text("{")
+     unknown = refresh(db, "manual")
+     assert (unknown["kind"], unknown["reason"], unknown["presentation"]["stripe"]) == (
+-        "unresolved", "source_unknown", "attention")
++        "unresolved", "source_unknown", "none")
+     assert unknown["coverage"]["state"] == "unknown"
+     assert any(reason.startswith("processes:process_read_failed") for reason in unknown["coverage"]["reasons"])
+     assert unknown["revision"] == done["revision"] + 1
+-- 
+2.43.0
+

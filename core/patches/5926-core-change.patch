@@ -1,0 +1,407 @@
+From 0ad51f2686b46a5e2fda167196fd3dc79bb0dc24 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:01:24 +0000
+Subject: [PATCH] fix(status): wake existing outcome executor on scoped links
+ health recovery [daveey]
+
+---
+ gateway/kanban_notification_schedule.py       |  9 ++-
+ hermes_cli/fact_links_health.py               | 64 +++++++++++++++++
+ hermes_cli/fact_remote_links.py               |  4 ++
+ .../test_kanban_notification_schedule.py      | 36 ++++++++++
+ tests/hermes_cli/test_fact_links_health.py    | 69 +++++++++++++++++++
+ .../test_session_status_refresh.py            | 60 ++++++++++++++++
+ tui_gateway/notice_fanout.py                  | 16 +++--
+ 7 files changed, 252 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/fact_links_health.py
+ create mode 100644 tests/hermes_cli/test_fact_links_health.py
+
+diff --git a/gateway/kanban_notification_schedule.py b/gateway/kanban_notification_schedule.py
+index 36cc536d7b..6f8a19b2a5 100644
+--- a/gateway/kanban_notification_schedule.py
++++ b/gateway/kanban_notification_schedule.py
+@@ -22,9 +22,12 @@ class BoundActions:
+         self.retry_at = float("inf")
+         self.retry_floor = False
+         self.watch = observe_bindings(wake)
++        from hermes_cli.fact_links_health import HealthWatch
++        self.links_health = HealthWatch(wake)
+ 
+     def due(self, now: float, *, legacy_due: bool) -> bool:
+-        owners = {owner for _home, owner in self.watch.snapshot()}
++        bindings = self.watch.snapshot()
++        owners = {owner for _home, owner in bindings}
+         self.was_bound = self.was_bound or bool(owners)
+         for owner in self.actions.keys() - owners:
+             self.actions.pop(owner).close()
+@@ -45,7 +48,8 @@ class BoundActions:
+             return False  # bursts must not spend refusal attempts faster than legacy
+         # Consume every pending bit, not just the first true action.
+         changed = [action.due(legacy_due=legacy_due) for action in self.actions.values()]
+-        return any(changed) or now >= self.retry_at
++        health_changed = self.links_health.due({str(home) for home, _owner in bindings})
++        return any(changed) or health_changed or now >= self.retry_at
+ 
+     def settled(self, report, now: float, interval: float) -> None:
+         self.retry_at = report.next_due(now, interval)
+@@ -53,6 +57,7 @@ class BoundActions:
+ 
+     def close(self) -> None:
+         self.watch.close()
++        self.links_health.close()
+         for action in self.actions.values():
+             action.close()
+         self.actions.clear()
+diff --git a/hermes_cli/fact_links_health.py b/hermes_cli/fact_links_health.py
+new file mode 100644
+index 0000000000..f9429ecb33
+--- /dev/null
++++ b/hermes_cli/fact_links_health.py
+@@ -0,0 +1,64 @@
++"""Scoped links-health invalidations for the existing unloaded executor. [daveey]
++
++Publication does no I/O and starts no worker. A failed/recovered source invalidates
++canonical outcomes even when every retained card's last status stayed unchanged.
++"""
++from __future__ import annotations
++
++import threading
++from collections.abc import Callable
++
++_lock = threading.RLock()
++_health: dict[tuple, tuple[int, bool]] = {}
++_pending: dict[tuple, int] = {}
++_watches: set[HealthWatch] = set()
++
++
++def changed(origin: tuple, available: bool) -> None:
++    with _lock:
++        old = _health.get(origin)
++        if old is not None and old[1] == available:
++            return
++        generation = old[0] + 1 if old else 1
++        _health[origin] = (generation, available)
++        _pending[origin] = generation
++        # Wake callbacks are Event.set only, never refresh/DB work.
++        for watch in tuple(_watches):
++            watch.wake()
++
++
++def pending(origin: tuple) -> int | None:
++    with _lock:
++        return _pending.get(origin)
++
++
++def acknowledge(origin: tuple, generation: int | None, *, complete: bool = True) -> None:
++    with _lock:
++        if complete and generation is not None and _pending.get(origin) == generation:
++            _pending.pop(origin)
++
++
++class HealthWatch:
++    def __init__(self, wake: Callable[[], None]):
++        self.wake = wake
++        self.seen: dict[tuple, int] = {}
++        with _lock:
++            _watches.add(self)
++
++    def due(self, homes: set[str]) -> bool:
++        with _lock:
++            current = {origin: value[0] for origin, value in _health.items() if origin[0] in homes}
++        dirty = current != self.seen
++        self.seen = current
++        return dirty
++
++    def close(self) -> None:
++        with _lock:
++            _watches.discard(self)
++
++
++def reset_for_tests() -> None:
++    with _lock:
++        _health.clear()
++        _pending.clear()
++        _watches.clear()
+diff --git a/hermes_cli/fact_remote_links.py b/hermes_cli/fact_remote_links.py
+index ddc977e375..c840cf2d8b 100644
+--- a/hermes_cli/fact_remote_links.py
++++ b/hermes_cli/fact_remote_links.py
+@@ -190,6 +190,8 @@ class RemoteLinksSource:
+             self.engine.publish([Fact(self.key, capture.value, source_vector=((self.source, capture.after),),
+                                       observed_at=capture.observed_at, valid_until=capture.observed_at + 90,
+                                       health='fresh')], now=time.time())
++            from hermes_cli.fact_links_health import changed
++            changed(self._origin_scope, True)
+         with self._lock:
+             if self._result is capture:
+                 self._result = None
+@@ -199,6 +201,8 @@ class RemoteLinksSource:
+         fact = (replace(old, health='stale', error_code=error_code) if old is not None
+                 and old.health != 'unknown' else Fact(self.key, {}, error_code=error_code))
+         self.engine.publish([fact], now=time.time())
++        from hermes_cli.fact_links_health import changed
++        changed(self._origin_scope, False)
+ 
+     def close(self, timeout=5):
+         with self._lock:
+diff --git a/tests/gateway/test_kanban_notification_schedule.py b/tests/gateway/test_kanban_notification_schedule.py
+index 92e3e48c49..7c554b08a9 100644
+--- a/tests/gateway/test_kanban_notification_schedule.py
++++ b/tests/gateway/test_kanban_notification_schedule.py
+@@ -2,6 +2,8 @@
+ import builtins
+ import sqlite3
+ 
++from hermes_cli import fact_links_health as links_health
++
+ from gateway.kanban_notification_schedule import BoundActions, PassReport
+ from hermes_cli.fact_contract import Fact, FactKey
+ from hermes_cli.fact_fake import FakeStore
+@@ -46,3 +48,37 @@ def test_binding_churn_quiet_lookup_and_retry_floor(monkeypatch):
+     finally:
+         gate.close()
+         owner.close()
++
++
++def test_links_recovery_admits_existing_executor_without_unrelated_write(monkeypatch):
++    links_health.reset_for_tests()
++    store = FakeStore()
++    helpers.ready_siblings(store)
++    owner = facts.bind(store, helpers.SCOPE, '/canonical/gateway')
++    gate = BoundActions(lambda: None)
++    owner.report_ready()
++    store.activate(helpers.SCOPE)
++    store.drain()
++    try:
++        assert gate.due(0, legacy_due=True)
++        gate.settled(PassReport(), 0, 60)
++        assert not gate.due(1, legacy_due=False)
++        links_health.changed(('/foreign', 'other', 'boards'), False)
++        assert not gate.due(2, legacy_due=False)
++        def forbidden(*a, **kw):
++            raise AssertionError('health scheduling did source I/O')
++        with monkeypatch.context() as patch:
++            patch.setattr(builtins, 'open', forbidden)
++            patch.setattr(sqlite3, 'connect', forbidden)
++            links_health.changed(('/canonical/gateway', 'default', 'boards'), False)
++            assert gate.due(3, legacy_due=False)
++            gate.settled(PassReport(pending=True), 3, 60)
++            links_health.changed(('/canonical/gateway', 'default', 'boards'), True)
++            assert not gate.due(4, legacy_due=False)  # retain refusal floor, not extra polling
++            assert gate.due(63, legacy_due=False)
++            gate.settled(PassReport(), 63, 60)
++            assert not gate.due(64, legacy_due=False)
++    finally:
++        gate.close()
++        owner.close()
++        links_health.reset_for_tests()
+diff --git a/tests/hermes_cli/test_fact_links_health.py b/tests/hermes_cli/test_fact_links_health.py
+new file mode 100644
+index 0000000000..7ab3de366e
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_links_health.py
+@@ -0,0 +1,69 @@
++"""Health transition wakeups, owner isolation and same-generation acknowledgement."""
++import time
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import fact_links_health as health
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_remote_links import LinksCapture, RemoteLinksSource
++from hermes_cli.fact_store import FactStore
++
++
++@pytest.fixture(autouse=True)
++def isolated_health():
++    health.reset_for_tests()
++    yield
++    health.reset_for_tests()
++
++
++def test_source_publication_notifies_health_after_actual_fact_commit():
++    scope = Scope('home', 'default')
++    origin = ('home', 'default', 'boards', 'hub', 'mail')
++    engine = ReducerEngine(FactStore(), scope)
++    source = RemoteLinksSource(engine, SourceId(scope, 'remote.links', 'origin'), origin)
++    observations = []
++    watch = health.HealthWatch(lambda: observations.append(engine.store.snapshot(scope).get(source.key).health))
++    try:
++        capture = LinksCapture(value={'cards': [], 'origin_rows': []}, observed_at=time.time())
++        source.commit(capture)
++        assert observations == ['fresh']
++        source.commit(capture)  # unchanged health does not wake on every recapture
++        assert observations == ['fresh']
++        source.failure()  # preserve the old no-argument contract
++        assert observations == ['fresh', 'stale']
++        source.failure('links_capture_time_budget')
++        assert observations == ['fresh', 'stale']
++        source.commit(capture)
++        assert observations == ['fresh', 'stale', 'fresh']
++    finally:
++        watch.close()
++
++
++def test_watch_scope_and_ack_do_not_consume_newer_failure_or_another_owner():
++    wake = Mock()
++    watch = health.HealthWatch(wake)
++    a = ('home', 'default', 'boards', 'hub', 'mail')
++    b = ('other', 'profile', 'boards', 'hub', 'mail')
++    try:
++        health.changed(b, False)
++        assert not watch.due({'home'})
++        assert health.pending(a) is None
++        health.changed(a, False)
++        failed = health.pending(a)
++        assert watch.due({'home'})
++        assert not watch.due({'home'})
++        health.changed(a, True)
++        recovered = health.pending(a)
++        health.acknowledge(a, failed)
++        assert health.pending(a) == recovered
++        health.changed(a, False)  # failure while recovery work was in flight
++        health.acknowledge(a, recovered)
++        assert health.pending(a) not in (failed, recovered)
++        assert health.pending(b) is not None
++    finally:
++        watch.close()
++    calls = wake.call_count
++    health.changed(a, True)
++    assert wake.call_count == calls
+diff --git a/tests/hermes_state/test_session_status_refresh.py b/tests/hermes_state/test_session_status_refresh.py
+index 9dc147b106..bd2816205b 100644
+--- a/tests/hermes_state/test_session_status_refresh.py
++++ b/tests/hermes_state/test_session_status_refresh.py
+@@ -150,6 +150,24 @@ def test_real_running_card_wins_over_another_unavailable_card(db, monkeypatch):
+     assert [w["state"] for w in value["on"]] == ["source_unknown", "running"]
+ 
+ 
++@pytest.mark.parametrize('failed_read', [False, True])
++def test_own_live_turn_is_independent_of_unknown_remote_cards(db, monkeypatch, failed_read):
++    turn(db)
++    record_turn_start(db.db_path.parent, 'chat', 'working locally')
++    def cards(*a, **kw):
++        if failed_read:
++            raise TimeoutError('remote unavailable')
++        return [{'id': 't_remote', 'status': 'running', 'remote': True, 'stale': True}]
++    monkeypatch.setattr(ksa, 'session_outcome_tasks', cards)
++    try:
++        value = refresh(db, 'card_change')
++        assert value['kind'] == 'running'
++        assert value['presentation']['reason_codes'] == ['own_turn_active']
++        assert value['coverage']['state'] == 'unknown'
++    finally:
++        clear_turn_marker(db.db_path.parent, 'chat')
++
++
+ @pytest.mark.parametrize("error", [TimeoutError, RuntimeError])
+ def test_card_read_failure_is_neutral_and_recovers(db, monkeypatch, error):
+     turn(db)
+@@ -166,6 +184,48 @@ def test_card_read_failure_is_neutral_and_recovers(db, monkeypatch, error):
+     assert_done(refresh(db, "card_change"))
+ 
+ 
++def test_links_health_recomputes_unchanged_remote_outcome_without_task_event(db, monkeypatch):
++    from contextlib import contextmanager
++    from hermes_cli import fact_links_health as health
++    from tui_gateway import notice_fanout as fanout
++    from tui_gateway import notice_fanout_state as state
++    turn(db)
++    health.reset_for_tests()
++    fanout._reset_for_tests()
++    origin = ksa._origin_scope()
++    row = dict(id='t_remote', key='edge/default/build/t_remote', title='remote work',
++               session='chat', status='running', remote=True, board='build', gateway='edge')
++    available = [False]
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *a, **kw: [row])
++    def display(*a, **kw):
++        if not available[0]:
++            from hermes_cli.fact_remote_links import LinksUnavailable
++            raise LinksUnavailable('source unavailable')
++        return [row]
++    monkeypatch.setattr(ksa, 'session_outcome_tasks', display)
++    monkeypatch.setattr(fanout, '_remote_inputs_key', lambda: (('root', 'home', ()), ()))
++    @contextmanager
++    def owner(chat):
++        assert chat == 'chat'
++        yield db, chat
++    try:
++        # The retained strict snapshot is unchanged throughout. Only display-source health moves.
++        assert state.seed_remote({'chat': frozenset({(row['key'], 'running')})})
++        health.changed(origin, False)
++        assert len(fanout._remote_change_pass(owner)) == 1
++        assert so.get_outcome('chat', db=db)['status']['reason'] == 'source_unknown'
++        assert health.pending(origin) is None
++        available[0] = True
++        health.changed(origin, True)
++        assert len(fanout._remote_change_pass(owner)) == 1
++        assert so.get_outcome('chat', db=db)['status']['kind'] == 'running'
++        assert health.pending(origin) is None
++        assert not fanout._remote_change_pass(owner)
++    finally:
++        health.reset_for_tests()
++        fanout._reset_for_tests()
++
++
+ def assert_done(status):
+     assert (status["kind"], status["presentation"]["stripe"], status["coverage"]["state"]) == ("done", "done", "complete")
+ 
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index d16057051f..34bb76f74b 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -391,6 +391,10 @@ def _remote_boards_quiet(base: tuple, polled: dict, known: dict) -> bool:
+ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+     """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
+     global _remote_memo
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import fact_links_health
++    origin = activity._origin_scope()
++    health_generation = fact_links_health.pending(origin)
+     out = FanoutResult()
+     try:
+         inputs = _remote_inputs_key()
+@@ -410,12 +414,11 @@ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+             out.retry()
+             inputs = None
+     memo = _remote_memo
+-    if inputs is not None and memo is not None and memo[0] == inputs[0] and memo[1] == _ledger_content_key(inputs[1]) \
++    if health_generation is None and inputs is not None and memo is not None and memo[0] == inputs[0] and memo[1] == _ledger_content_key(inputs[1]) \
+             and _remote_boards_quiet(inputs[0], polled, memo[3]):
+         _remote_memo = (memo[0], memo[1], {slug: polled[slug][1] for slug in polled}, memo[3])
+         return out
+     _remote_memo = None
+-    from hermes_cli import kanban_session_activity as activity
+     from hermes_state_outcome import refresh_outcomes_quietly
+     from tui_gateway import notice_fanout_state as state
+     from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+@@ -433,10 +436,13 @@ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+     if previous is None:
+         if not state.seed_remote(snapshot):
+             out.retry()
+-        return out
++            return out
++        if health_generation is None:
++            return out
++        previous = {}  # first source publication must also repair retained unknown outcomes
+     acked: dict[str, Optional[frozenset[tuple[str, str]]]] = {}
+     for chat in sorted(previous.keys() | snapshot.keys()):
+-        if previous.get(chat) == snapshot.get(chat):
++        if health_generation is None and previous.get(chat) == snapshot.get(chat):
+             continue
+         try:
+             with session_db(chat) as (db, tip):
+@@ -465,6 +471,8 @@ def _remote_change_pass(session_db: Callable) -> FanoutResult:
+         after = _poll_boards(inputs[0], {slug: polled[slug][1] for slug in polled})
+         if prints is not None and after is not None and all(after[slug][1] == polled[slug][1] for slug in polled):
+             _remote_memo = (inputs[0], _ledger_content_key(inputs[1]), {slug: polled[slug][1] for slug in polled}, prints)
++    fact_links_health.acknowledge(origin, health_generation,
++                                  complete=committed and (previous.keys() | snapshot.keys()) <= acked.keys())
+     return out
+ 
+ 
+-- 
+2.43.0
+

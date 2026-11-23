@@ -1,0 +1,176 @@
+From 6ee4ef8488608b67eae1475576119f3fd693acdc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:32:54 +0000
+Subject: [PATCH] fix(session status): resolve delegated compression
+ continuations before acknowledgment [daveey]
+
+---
+ hermes_state_subagent_resolution.py           | 32 +++++-
+ .../test_subagent_rotation_resolution.py      | 98 +++++++++++++++++++
+ 2 files changed, 125 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_state/test_subagent_rotation_resolution.py
+
+diff --git a/hermes_state_subagent_resolution.py b/hermes_state_subagent_resolution.py
+index f6a98e9795..2350fffa5e 100644
+--- a/hermes_state_subagent_resolution.py
++++ b/hermes_state_subagent_resolution.py
+@@ -4,6 +4,27 @@ from __future__ import annotations
+ import json
+ 
+ 
++def _child_tip_row(db, conn, sid: str) -> dict:
++    """Follow child compression, not the conversation-only tip filter, on one snapshot.
++
++    Inherited delegate markers do not make a continuation a new delegated fork. Use the
++    canonical explicit-fork predicate so branch/reset/tool children cannot lend terminal proof.
++    The writer uses this same walk before acknowledging, fencing concurrent rotations.
++    """
++    row = dict(conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone() or {})
++    seen = {sid}
++    while row.get("end_reason") == "compression":
++        children = conn.execute("SELECT * FROM sessions WHERE parent_session_id=?"
++                                " ORDER BY started_at DESC, id DESC", (row["id"],)).fetchall()
++        tip = next((dict(child) for child in children if child["source"] == "subagent"
++                    and not db._is_explicit_fork_child_row(dict(child), include_reset=True)), None)
++        if not tip or tip["id"] in seen:
++            break
++        seen.add(tip["id"])
++        row = tip
++    return row
++
++
+ def resolved_subagents(db, ids: list[str], retained: list[dict]) -> set[str]:
+     """Only terminal transcript proof or a delivered unit covering this child's last activity resolves loss.
+ 
+@@ -27,9 +48,9 @@ def resolved_subagents(db, ids: list[str], retained: list[dict]) -> set[str]:
+     by_id = {}
+     for row in rows:
+         sid = str(row["id"])
+-        tip = so._tip(db, sid)
+-        terminal = dict(db._read_one(
+-            "SELECT ended_at, end_reason, last_activity_at, started_at FROM sessions WHERE id=?", (tip,)) or {})
++        with db._read_ctx() as conn:
++            terminal = _child_tip_row(db, conn, sid)
++        tip = terminal.get("id", sid)
+         by_id[sid] = terminal
+         receipt = db._read_one("SELECT value FROM state_meta WHERE key=?", (f"subagent_ack:{sid}",))
+         if receipt is not None:
+@@ -78,8 +99,9 @@ def acknowledge_subagents(db, parent: str, children: list[str], evidence: str) -
+                                " FROM sessions WHERE id=?", (sid,)).fetchone()
+             if row is None or row[0] not in ids or row[1] != "subagent":
+                 raise ValueError(f"not an owned subagent: {sid}")
+-            last = float(row[3] or row[4] or 0)
+-            if row[2] is None and last >= time.time() - so.SUBAGENT_LIVE_WINDOW_S:
++            terminal = _child_tip_row(db, conn, sid)
++            last = float(terminal.get("last_activity_at") or terminal.get("started_at") or 0)
++            if terminal.get("ended_at") is None and last >= time.time() - so.SUBAGENT_LIVE_WINDOW_S:
+                 raise ValueError(f"subagent is still live: {sid}")
+             receipts.append((f"subagent_ack:{sid}", json.dumps({"parent": row[0], "at": last,
+                              "evidence": evidence.strip(), "acknowledged_at": time.time()})))
+diff --git a/tests/hermes_state/test_subagent_rotation_resolution.py b/tests/hermes_state/test_subagent_rotation_resolution.py
+new file mode 100644
+index 0000000000..a6ab602d17
+--- /dev/null
++++ b/tests/hermes_state/test_subagent_rotation_resolution.py
+@@ -0,0 +1,98 @@
++"""Delegated compression tips govern terminal reconciliation and acknowledgment."""
++import json
++
++import pytest
++
++from tests.hermes_state import test_subagent_status_resolution as fixtures
++from hermes_state_subagent_resolution import acknowledge_subagents
++from tools.delegate_tool_sessions import stored_child_session
++
++board, db, receipts, ledger = fixtures.board, fixtures.db, fixtures.receipts, fixtures.ledger
++child, delivered, refresh, turn = fixtures.child, fixtures.delivered, fixtures.refresh, fixtures.turn
++
++
++def rotate(db):
++    marker = {"_delegate_from": "chat", "_subagent_id": "sa_review"}
++    db._write_sql("UPDATE sessions SET model_config=?, ended_at=NULL, end_reason=NULL WHERE id=?",
++                  (json.dumps(marker), "child"))
++    db.end_session("child", "compression")
++    db.create_session("child-tip", source="subagent", parent_session_id="child", model_config=marker)
++    assert stored_child_session(db, "sa_review", ["chat"]) == "child-tip"
++    return marker
++
++
++def test_late_completed_rotated_child_clears_retained_loss(db):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    rotate(db)
++    db.append_message("child-tip", role="user", content="finish")
++    db.append_message("child-tip", role="assistant", content="verified done")
++    db.end_session("child-tip", "agent_close")
++    assert refresh(db)["failures"] == []
++
++
++def test_explicit_ack_refuses_live_rotated_child(db):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    rotate(db)
++    db.append_message("child-tip", role="user", content="continue work")
++    with pytest.raises(ValueError, match="still live"):
++        acknowledge_subagents(db, "chat", ["child"], "verified earlier work")
++    assert db._read_one("SELECT value FROM state_meta WHERE key='subagent_ack:child'") is None
++
++
++@pytest.mark.parametrize("receipt", ["explicit", "delivered"])
++def test_old_receipt_does_not_cover_new_live_continuation(db, receipt):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    if receipt == "explicit":
++        acknowledge_subagents(db, "chat", ["child"], "verified earlier work")
++    else:
++        delivered(db)
++    assert refresh(db)["failures"] == []
++    rotate(db)
++    from hermes_state_subagent_resolution import resolved_subagents
++    assert "subagent:child" not in resolved_subagents(db, ["chat"], [])
++
++
++@pytest.mark.parametrize("marker", ["_branched_from", "_reset_from", "_delegate_from"])
++def test_completed_fork_cannot_resolve_compressed_child(db, marker):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    rotate(db)
++    db._write_sql("UPDATE sessions SET model_config=? WHERE id='child-tip'",
++                  (json.dumps({marker: "child"}),))
++    db.append_message("child-tip", role="user", content="separate work")
++    db.append_message("child-tip", role="assistant", content="done")
++    db.end_session("child-tip", "agent_close")
++    assert refresh(db)["failures"]
++
++
++def test_multiple_rotations_resolve_only_at_terminal_tip(db):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    marker = rotate(db)
++    db.end_session("child-tip", "compression")
++    db.create_session("child-tip-2", source="subagent", parent_session_id="child-tip", model_config=marker)
++    with pytest.raises(ValueError, match="still live"):
++        acknowledge_subagents(db, "chat", ["child"], "earlier work")
++    db.append_message("child-tip-2", role="user", content="finish")
++    db.append_message("child-tip-2", role="assistant", content="done")
++    db.end_session("child-tip-2", "agent_close")
++    assert refresh(db)["failures"] == []
++
++
++def test_explicit_ack_of_ended_continuation_covers_tip_activity(db):
++    turn(db)
++    child(db)
++    assert refresh(db)["failures"]
++    rotate(db)
++    db.append_message("child-tip", role="user", content="work")
++    db.end_session("child-tip", "delegation_unknown")
++    acknowledge_subagents(db, "chat", ["child"], "independently verified successor work")
++    assert refresh(db)["failures"] == []
+-- 
+2.43.0
+

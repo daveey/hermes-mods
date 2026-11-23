@@ -1,0 +1,93 @@
+From 0173f1bc4b6f70016efb830c1cded8ec88ccc1e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:21:07 +0000
+Subject: [PATCH] [daveey] Keep auto-continuation ownership races off the
+ takeover surface
+
+Keep automatic continuation ownership races off the takeover surface. Ownership
+can change between kickoff preflight and submit admission. This caller opts out
+of terminal ownership-card reporting, retaining refusal, durable markers and the
+existing retry. Typed submissions retain default reporting. Tests exercise the
+real kickoff and submit path rather than replacing submit wholesale.
+
+---
+ tests/tui_gateway/test_auto_continue.py | 46 +++++++++++++++++++++++++
+ tui_gateway/session_auto_continue.py    |  4 ++-
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_auto_continue.py b/tests/tui_gateway/test_auto_continue.py
+index f1bd6c60bb..772bfcd3cf 100644
+--- a/tests/tui_gateway/test_auto_continue.py
++++ b/tests/tui_gateway/test_auto_continue.py
+@@ -416,6 +416,52 @@ def schedule_env(monkeypatch, marker_home):
+     return submitted
+ 
+ 
++@pytest.mark.parametrize("paused", [False, True])
++@pytest.mark.parametrize("status", ["started", "unknown", None])
++def test_second_gate_ownership_race_keeps_continuation_without_card(
++    monkeypatch, emits, turn_env, marker_home, paused, status
++):
++    """Real kickoff/submit: custody can appear after the first slot check."""
++    record_turn_start(marker_home, "session-key", "original request", attempts=1)
++    if paused:
++        from tui_gateway.turn_marker import mark_turn_paused
++        mark_turn_paused(marker_home, "session-key", "core_update_pause")
++    marker = read_turn_marker(marker_home, "session-key")
++    session = _session()
++    checks, errors, turns = [], [], []
++    refusal = types.SimpleNamespace(
++        reason="SESSION_NOT_OWNED", ledger_status=status,
++        ownership_cause="ledger_started" if status else "lease_foreign", holder_pid=0)
++
++    def slot(*args, **kwargs):
++        checks.append(kwargs)
++        return None if len(checks) == 1 else refusal
++
++    monkeypatch.setattr(server, "_load_cfg", dict)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *args: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda *args, **kwargs: None)
++    monkeypatch.setattr(server, "_session_moved_refusal", lambda _: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", slot)
++    monkeypatch.setattr(server, "_emit_terminal_turn_error", lambda *a, **k: errors.append(a))
++    monkeypatch.setattr(server, "_invoke_agent", lambda *a, **k: turns.append(a))
++    before = time.monotonic()
++
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is not None
++
++    assert len(checks) == 2  # preflight passed; the actual submit lost custody
++    assert errors == []
++    assert turns == []
++    assert session["running"] is False
++    assert session["_auto_continue_scheduled"] is False
++    assert session["_auto_continue_retry_after"] >= before + 30
++    assert session["_turn_owner_refusal"] == "SESSION_NOT_OWNED"
++    assert read_turn_marker(marker_home, "session-key") == marker
++    assert "_auto_continue_prompt" not in session
++    # A resume during backoff cannot dispatch or consume another attempt.
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
++    assert len(checks) == 2
++
++
+ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
+     record_turn_start(marker_home, "session-key", "fix the flaky test")
+     session = _session()
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index a58a05374e..e74f3d657d 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -375,8 +375,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str, *,
+                                                  else "Resuming interrupted turn…"})
+                     _emit("message.start", sid)
+                 render_notification(announce, platform="tui", diagnostic=diagnostic)
++                # The slot can change after preflight. This automatic retry keeps its marker/backoff;
++                # a second-gate refusal must not ask the user to take over the other owner's turn.
+                 accepted = _run_prompt_submit(rid, sid, session, text,
+-                    display_kind=None if held else "auto_continue",
++                    display_kind=None if held else "auto_continue", report_ownership_refusal=False,
+                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+         except Exception as exc:
+             _notif_log_failure("auto-continue dispatch failed", exc)
+-- 
+2.43.0
+

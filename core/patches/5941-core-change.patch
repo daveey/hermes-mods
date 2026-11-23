@@ -1,0 +1,1194 @@
+From 43f57ba762b9c8ccb841f0c6f1ab9bf505e5fc87 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:40:57 +0000
+Subject: [PATCH] feat(facts): capture native annotation inputs and scoped
+ views [daveey]
+
+Implementation checkpoint; lifecycle activation is deliberately not wired yet. Reuse the shared ChangeFeed, v1 selectors and canonical reducers for all annotation views. Add bounded turn/process/child/review captures and exact-profile memory lookup.
+
+Proof: canonical 8-file focused suite: 92 passed. RED/GREEN raw-holder nonpublication and review aggregate-byte limit; four killing mutants cover holder leakage, aggregate byte cap, demand cap and rejected-demand poisoning. Full scripts/check --base origin/main passes with new files staged. Baseline and activation guarantees remain separate; no live performance claim.
+---
+ hermes_cli/fact_annotation_capture.py         | 198 ++++++++++++++++++
+ hermes_cli/fact_annotation_sources.py         | 130 ++++++++++++
+ hermes_cli/fact_annotation_startup.py         |  45 ++++
+ hermes_cli/fact_annotation_views.py           |  72 ++++++-
+ hermes_cli/kanban_annotation_facts.py         |  36 +++-
+ hermes_cli/review_session_activity.py         |  14 ++
+ .../turn_process_execution_observations.py    |   9 +-
+ hermes_cli/turn_session_activity.py           |  14 +-
+ .../test_annotation_capture_bounds.py         |  57 +++++
+ .../test_annotation_capture_privacy.py        |  40 ++++
+ .../test_annotation_native_families.py        | 163 ++++++++++++++
+ .../test_annotation_native_sources.py         | 143 +++++++++++++
+ .../test_annotation_startup_lookup.py         |  82 ++++++++
+ 13 files changed, 995 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/fact_annotation_capture.py
+ create mode 100644 hermes_cli/fact_annotation_sources.py
+ create mode 100644 hermes_cli/fact_annotation_startup.py
+ create mode 100644 tests/hermes_cli/test_annotation_capture_bounds.py
+ create mode 100644 tests/hermes_cli/test_annotation_capture_privacy.py
+ create mode 100644 tests/hermes_cli/test_annotation_native_families.py
+ create mode 100644 tests/hermes_cli/test_annotation_native_sources.py
+ create mode 100644 tests/hermes_cli/test_annotation_startup_lookup.py
+
+diff --git a/hermes_cli/fact_annotation_capture.py b/hermes_cli/fact_annotation_capture.py
+new file mode 100644
+index 0000000000..18db46a3fd
+--- /dev/null
++++ b/hermes_cli/fact_annotation_capture.py
+@@ -0,0 +1,198 @@
++"""Detached operational annotation inputs; called only by the feed owner. [daveey]
++
++Paths and profile identity come from authorized startup. No discovery, source
++publication or legacy annotation admission occurs in these capture functions.
++"""
++from contextlib import closing, contextmanager
++import json
++import os
++from pathlib import Path
++import stat
++import sqlite3
++import time
++
++from hermes_cli.fact_capture import CaptureBudgetExceeded
++
++
++@contextmanager
++def read_state(path, budget):
++    from hermes_state import _connect_tracked_db
++    from hermes_state_holders import read_only_db_uri
++    deadline = time.monotonic() + budget.max_seconds
++    with closing(_connect_tracked_db(read_only_db_uri(path), tracking_path=path,
++                                     uri=True, isolation_level=None, timeout=0)) as conn:
++        conn.execute('PRAGMA query_only=ON')
++        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, budget.max_bytes)
++        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
++        conn.execute('BEGIN')
++        yield conn
++        if time.monotonic() >= deadline:
++            raise CaptureBudgetExceeded('annotation state capture deadline exceeded')
++
++
++def limited(cursor, budget):
++    rows = []
++    size = 0
++    for row in cursor:
++        size += len(repr(row).encode())
++        if len(rows) >= budget.max_keys or size > budget.max_bytes:
++            raise CaptureBudgetExceeded('annotation state capture exceeds inventory budget')
++        rows.append(tuple(row))
++    return rows
++
++
++def read_json(path, budget, *, absent):
++    try:
++        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0))
++    except FileNotFoundError:
++        return absent
++    with os.fdopen(fd, 'rb') as stream:
++        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
++            raise ValueError('annotation input must be a regular file')
++        raw = stream.read(budget.max_bytes + 1)
++    if len(raw) > budget.max_bytes:
++        raise CaptureBudgetExceeded('annotation file capture exceeds byte budget')
++    return json.loads(raw.decode('utf-8-sig'))
++
++
++def turns(path, budget, *, profile, gateway, now):
++    from hermes_cli import turn_session_activity as turns
++    from hermes_cli.turn_process_execution_observations import holder_digest
++    from tui_gateway.turn_marker import auto_continue_bounds
++    from hermes_cli.config_effective import load_profile_config_effective
++    due = [now + 30]
++    with read_state(path, budget) as conn:
++        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"
++                  " AND name IN ('session_turn_leases','state_meta','session_admissions','messages')")}
++        leases = limited(conn.execute(
++            'SELECT conversation_id,holder,acquired_at,expires_at FROM session_turn_leases'
++            ' WHERE expires_at > ? LIMIT ?', (now, budget.max_keys + 1)), budget) if 'session_turn_leases' in tables else []
++        live = set()
++        if {'state_meta', 'session_admissions', 'messages'} <= tables:
++            pauses = limited(conn.execute(
++                'SELECT a.target_session_id,m.value FROM state_meta m CROSS JOIN session_admissions a'
++                " ON a.admission_id=substr(m.key,?) WHERE m.key>=? AND m.key<? AND a.status='started' LIMIT ?",
++                (len(turns._GATEWAY_CHECKPOINT_PREFIX) + 1, turns._GATEWAY_CHECKPOINT_PREFIX,
++                 turns._GATEWAY_CHECKPOINT_END, budget.max_keys + 1)), budget)
++            for sid, raw in pauses:
++                try:
++                    receipt = json.loads(raw)
++                    message_id = int(receipt['max_message_id'])
++                except (ValueError, TypeError, KeyError):
++                    continue
++                stamp = conn.execute('SELECT timestamp FROM messages WHERE id=?', (message_id,)).fetchone()
++                if sid and stamp and stamp[0] is not None:
++                    expires = float(stamp[0]) + turns._GATEWAY_PAUSE_FRESH_S
++                    if now <= expires:
++                        live.add(str(sid))
++                        due.append(expires)
++    data = read_json(Path(path).parent / 'desktop/interrupted_turns.json', budget, absent={})
++    def bounds():
++        return auto_continue_bounds(load_profile_config_effective(Path(path).parent / 'config.yaml'))
++    live.update(turns.project_paused_tui_turns(data, bounds, now))
++    by_session = {}
++    for cid, holder, acquired, expires in leases:
++        if cid and not turns._holder_dead(str(holder or '')):
++            live.add(cid)
++            by_session.setdefault(cid, []).append({'conversation_id': cid, 'holder_digest': holder_digest(holder),
++                'acquired_at': acquired, 'expires_at': expires, 'profile': profile})
++            due.append(float(expires))
++    # Paused-turn eligibility is bounded by its producer policy. Reconcile its
++    # wall boundary as well as leases, without a request-time config read.
++    if isinstance(data, dict) and data:
++        _, fresh, _ = bounds()
++        for entry in data.values():
++            if isinstance(entry, dict):
++                try:
++                    due.append(max(float(entry.get(k) or 0) for k in ('started_at', 'parked_at', 'paused_at')) + fresh)
++                except (ValueError, TypeError):
++                    continue
++    return {'live': live, 'leases': by_session, 'gateway': gateway}, min((d for d in due if d > now), default=now + 30)
++
++
++def children(path, budget, *, profile, gateway, now):
++    from hermes_cli.subagent_session_activity import _WINDOW
++    with read_state(path, budget) as conn:
++        rows = limited(conn.execute(
++            "SELECT id,parent_session_id,last_activity_at,started_at FROM sessions"
++            " WHERE source='subagent' AND parent_session_id IS NOT NULL AND ended_at IS NULL"
++            ' AND started_at >= ? LIMIT ?', (now - _WINDOW, budget.max_keys + 1)), budget)
++    due = min((row[3] + _WINDOW for row in rows if row[3] + _WINDOW > now), default=now + 30)
++    return {'by_profile': {profile: (rows, None)}, 'gateway': gateway}, min(due, now + 30)
++
++
++def processes(path, budget, *, profile, gateway, now):
++    from hermes_cli import process_session_activity as activity
++    from tools.process_registry import process_registry
++    entries = read_json(path, budget, absent=[])
++    if not isinstance(entries, list):
++        raise ValueError('invalid process checkpoint')
++    if len(entries) > budget.max_keys:
++        raise CaptureBudgetExceeded('process checkpoint exceeds key budget')
++    owned, details, evidence = {}, {}, {}
++    if not process_registry._lock.acquire(timeout=budget.max_seconds):
++        raise CaptureBudgetExceeded('process registry lock capture deadline exceeded')
++    try:
++        if len(process_registry._running) > budget.max_keys:
++            raise CaptureBudgetExceeded('process registry exceeds key budget')
++        fields = ('session_key', 'pid_scope', 'pid', 'host_start_time', 'parent_session_id',
++                  'owner_task_id', 'task_id', 'id', 'command', 'started_at')
++        running = [{field: getattr(s, field) for field in fields}
++                   for s in process_registry._running.values() if not s.exited]
++    finally:
++        process_registry._lock.release()
++    for item in running:
++        recorded = activity._registry_profile(item['session_key'])
++        if recorded and recorded != profile:
++            continue
++        if item['pid_scope'] == 'host' and not activity._live(item['pid'], item['host_start_time']):
++            continue
++        owners = frozenset(activity._owner_ids(item))
++        proc_id = item['id']
++        evidence[proc_id] = {'id': proc_id, 'pid': item['pid'], 'host_start_time': item['host_start_time'],
++            'profile': recorded, 'pid_scope': item['pid_scope'], 'source': 'process.registry',
++            'observed_at': now, 'owners': owners}
++        details[proc_id] = activity._detail(proc_id, item['command'], item['started_at'], item['pid'])
++        for sid in owners:
++            owned.setdefault(sid, set()).add(proc_id)
++    for item in entries:
++        if not isinstance(item, dict) or item.get('pid_scope', 'host') != 'host':
++            continue
++        if not activity._live(item.get('pid'), item.get('host_start_time')):
++            continue
++        pid = str(item.get('session_id') or item.get('pid'))
++        owners = frozenset(activity._owner_ids(item))
++        evidence.setdefault(pid, {'id': item.get('session_id') or None, 'pid': item.get('pid'),
++            'host_start_time': item.get('host_start_time'), 'pid_scope': 'host', 'profile': profile,
++            'source': 'process.checkpoint', 'observed_at': now, 'owners': owners})
++        details.setdefault(pid, activity._detail(pid, item.get('command'), item.get('started_at'), item.get('pid')))
++        for sid in owners:
++            owned.setdefault(sid, set()).add(pid)
++    return {'owned': owned, 'details': details, 'evidence': evidence,
++            'gateway': gateway, 'local_profile': profile}, now + 30
++
++
++def reviews(path, budget, *, ids, now):
++    from hermes_cli import review_session_activity as review
++    messages, keys = {}, set()
++    if len(ids) > budget.max_keys:
++        raise CaptureBudgetExceeded('review lineage exceeds capture key budget')
++    size = 0
++    with read_state(path, budget) as conn:
++        for sid in sorted(ids):
++            row = conn.execute("SELECT id,content FROM messages WHERE session_id=? AND role='assistant'"
++                               " AND coalesce(content,'') <> '' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
++            size += len(str(row[1]).encode('utf-8')) if row else 0
++            if size > budget.max_bytes:
++                raise CaptureBudgetExceeded('review assistant evidence exceeds total byte budget')
++            message_keys = review.pr_keys(str(row[1])) if row else []
++            messages[sid] = (row[0] if row else -1, message_keys)
++            keys.update(message_keys)
++    # Provider lookup is the retained asynchronous bounded canonical owner. Its
++    # completion publication wakes our source; upstream TTL remains 300/120s.
++    values = [(key, review._pr_info(key)) for key in sorted(keys)]
++    due = [now + 30]
++    for _, value in values:
++        if value and value.get('requested_at') is not None:
++            due.append(value['requested_at'] + review.PARK_WINDOW_S)
++    return {'messages': messages, 'reviews': values}, min((d for d in due if d > now), default=now + 30)
+diff --git a/hermes_cli/fact_annotation_sources.py b/hermes_cli/fact_annotation_sources.py
+new file mode 100644
+index 0000000000..4f68dedbde
+--- /dev/null
++++ b/hermes_cli/fact_annotation_sources.py
+@@ -0,0 +1,130 @@
++"""Native annotation adapters on the existing ChangeFeed, not a second cache. [daveey]"""
++import hashlib
++from pathlib import Path
++import threading
++import time
++
++from hermes_cli.fact_annotation_membership import AnnotationMembershipSource, MembershipCapture
++from hermes_cli.fact_capture import CaptureBudgetExceeded
++from hermes_cli.fact_content_owner import ContentOwner
++from hermes_cli.fact_contract import Fact, FactKey, freeze
++from hermes_cli.fact_source_watch import NativeSourceWatch
++from hermes_cli.fact_wire import encode
++
++
++class NativeAnnotationOwner(ContentOwner):
++    def __init__(self, engines, bindings, *, budget, operational=()):
++        for source in operational:
++            if isinstance(source, NativeAnnotationSource):
++                source.max_keys = budget.max_keys
++        super().__init__(engines, bindings, budget=budget, operational=operational)
++
++    def demand(self, scope, view, selector):
++        from hermes_cli.fact_annotation_views import selector_for
++        if scope not in self._demands:
++            raise ValueError('unauthorized annotation scope')
++        try:
++            valid = view.startswith('annotations.') and selector == selector_for(
++                scope, selector['row'], display=selector['display'])
++        except (AttributeError, KeyError, TypeError):
++            valid = False
++        if not valid:
++            raise ValueError('invalid annotation demand')
++        admit = lambda: super(NativeAnnotationOwner, self).demand(scope, view, selector)
++        if view == 'annotations.review':
++            for source, publisher in self._by_source.items():
++                if source.scope == scope and source.kind == view:
++                    publisher.demand(selector, admit=admit)
++                    return
++        admit()
++
++
++class NativeAnnotationSource(AnnotationMembershipSource):
++    """Capture off-request, then publish one immutable input + its derived views.
++
++    Review lineage is bounded demand membership, not a query on the caller. All
++    deadlines are monotonic; wall-clock evidence is recorded before the read.
++    """
++    def __init__(self, engine, source, paths, capture):
++        family = source.kind.removeprefix('annotations.')
++        if source.scope != engine.scope or family not in {'kanban', 'background', 'turn', 'subagent', 'review'}:
++            raise ValueError('invalid native annotation source')
++        if 'AnnotationInput' in engine._specs:
++            raise ValueError('annotation input cannot be a derived kind')
++        self.engine, self.source, self.family = engine, source, family
++        self.key = FactKey(engine.scope, 'AnnotationInput', family)
++        self.paths = tuple(Path(p).absolute() for p in paths)
++        self._capture = capture
++        self._watch = None
++        self._wake = None
++        self._ids = set()
++        self.max_keys = 2000
++        self._lock = threading.Lock()
++        self._unsubscribe = None
++        self._next_wall = 0
++
++    def watch(self, wake):
++        if self._watch is not None:
++            raise RuntimeError('annotation source already watched')
++        self._wake = wake
++        self._watch = NativeSourceWatch(self.paths, wake)
++        if self.family == 'review':
++            from hermes_cli.review_session_activity import subscribe_refresh
++            self._unsubscribe = subscribe_refresh(wake)
++        return self
++
++    def close(self):
++        if self._watch is not None:
++            self._watch.close()
++        if self._unsubscribe is not None:
++            self._unsubscribe()
++            self._unsubscribe = None
++
++    def demand(self, selector, *, admit=lambda: None):
++        if self.family != 'review':
++            raise ValueError('review demand sent to another annotation source')
++        row = selector['row']
++        ids = {row['id'], *(row.get('_lineage_ids') or ())}
++        if row.get('_lineage_root_id'):
++            ids.add(row['_lineage_root_id'])
++        with self._lock:
++            combined = self._ids | ids
++            if len(combined) > self.max_keys:
++                raise CaptureBudgetExceeded('review demand inventory exceeds key budget')
++            # The mailbox must accept before capture membership changes. Keep
++            # bounded rejected demand from poisoning all existing review views.
++            admit()
++            changed = combined != self._ids
++            self._ids = combined
++        if changed and self._wake is not None:
++            self._wake()
++
++    def capture(self, cursor, budget):
++        started, wall = time.monotonic(), time.time()
++        if self._watch is not None:
++            self._watch.check()
++        with self._lock:
++            ids = frozenset(self._ids)
++        value, due = self._capture(budget, wall, ids)
++        value = freeze(value)
++        raw = encode(value)
++        if len(raw) > budget.max_bytes or time.monotonic() - started >= budget.max_seconds:
++            raise CaptureBudgetExceeded('native annotation capture exceeds time/byte budget')
++        token = hashlib.sha256(raw).hexdigest()
++        if self._watch is not None:
++            self._watch.check()
++        if self._next_wall > wall:
++            due = min(due, self._next_wall)
++        return MembershipCapture(value, token, wall, started + min(30, max(0.001, due - wall)))
++
++    def commit(self, capture):
++        if capture.observed_at >= self._next_wall:
++            self.engine.publish([Fact(self.key, capture.value,
++                source_vector=((self.source, capture.after),), observed_at=capture.observed_at,
++                valid_until=capture.observed_at + 90, health='fresh')], now=capture.observed_at)
++            self._next_wall = capture.observed_at + max(0.001, capture.next_deadline - time.monotonic())
++        else:
++            super().commit(capture)
++            self._next_wall = min(self._next_wall, capture.observed_at + max(
++                0.001, capture.next_deadline - time.monotonic()))
++
+diff --git a/hermes_cli/fact_annotation_startup.py b/hermes_cli/fact_annotation_startup.py
+new file mode 100644
+index 0000000000..6cfd3e05b3
+--- /dev/null
++++ b/hermes_cli/fact_annotation_startup.py
+@@ -0,0 +1,45 @@
++"""Startup custody and memory-only profile lookup for native annotations. [daveey]"""
++from types import MappingProxyType
++import threading
++
++from hermes_cli import kanban_annotation_facts as annotations
++
++_lock = threading.RLock()
++_registry = None
++
++
++class AnnotationRegistry:
++    """No discovery, capture or alternate view cache: only authorized handles."""
++    def __init__(self, bindings, fallback_profile):
++        self.bindings = MappingProxyType(dict(bindings))
++        if fallback_profile not in self.bindings or any(
++                name != binding.scope.profile_id for name, binding in self.bindings.items()):
++            raise ValueError('invalid annotation binding profile')
++        self.fallback_profile = fallback_profile
++        self._release = None
++
++    def select(self, profile=None):
++        return self.bindings.get(self.fallback_profile if profile is None else profile)
++
++    def install(self):
++        global _registry
++        with _lock:
++            if _registry is not None:
++                raise RuntimeError('annotation registry already installed')
++            self._release = annotations.install_lookup(self.select)
++            _registry = self
++        return self
++
++    def close(self):
++        global _registry
++        with _lock:
++            if _registry is self:
++                self._release()
++                _registry = None
++
++
++def binding_for(profile=None):
++    """Existing authorized v1 binding; a missing binding is never discovered."""
++    with _lock:
++        registry = _registry
++    return registry.select(profile) if registry is not None else None
+diff --git a/hermes_cli/fact_annotation_views.py b/hermes_cli/fact_annotation_views.py
+index c791e62fff..fc84c4a2b0 100644
+--- a/hermes_cli/fact_annotation_views.py
++++ b/hermes_cli/fact_annotation_views.py
+@@ -48,11 +48,81 @@ def _membership_projection(family, field, project, argument):
+     return Projection('annotations.' + family, ('AnnotationInput',), dependencies, render)
+ 
+ 
++def _captured_projection(family, project):
++    from hermes_cli.kanban_annotation_facts import FIELDS, _thaw
++
++    def dependencies(scope, selector, snapshot):
++        if selector != selector_for(scope, selector['row'], display=selector['display']):
++            raise ValueError('invalid annotation selector')
++        return {FactKey(scope, 'AnnotationInput', family)}
++
++    def render(selector, facts, now):
++        captured = next(iter(facts.values())).value
++        row = dict(selector['row'])
++        project(row, captured, now)
++        fields = FIELDS[family] | {'execution_observations'}
++        return _thaw({key: value for key, value in row.items() if key in fields})
++
++    return Projection('annotations.' + family, ('AnnotationInput',), dependencies, render)
++
++
++def _kanban(row, captured, now):
++    from hermes_cli.kanban_activity_identity import row_ids
++    from hermes_cli.kanban_activity_projection import project_kanban_activity
++    from hermes_cli.kanban_external_activity import stamp_replica_counts
++    from hermes_cli.kanban_annotation_facts import _thaw
++    parts = list(captured['parts'])
++    if len(parts) > 11:
++        ids = set(row_ids(row))
++        parts[11] = _thaw({sid: values for sid, values in parts[11].items() if sid in ids})
++    project_kanban_activity([row], parts=parts, observed_at=captured['observed_at'],
++                            external=captured['external'], now=now)
++    stamp_replica_counts([row], captured['parts'][8], row_ids)
++
++
++def _background(row, captured, now):
++    from hermes_cli.process_session_activity import project_background_activity
++    project_background_activity([row], **captured, now=now)
++
++
++def _turn(row, captured, now):
++    from hermes_cli.turn_session_activity import project_turn_activity
++    from hermes_cli.turn_process_execution_observations import turn_from_digest
++
++    def project(lease, **kwargs):
++        return turn_from_digest(lease, digest=lease['holder_digest'], **kwargs)
++
++    project_turn_activity([row], **captured, now=now, lease_project=project)
++
++
++def _subagent(row, captured, now):
++    from hermes_cli.subagent_session_activity import project_subagent_activity
++    project_subagent_activity([row], **captured, now=now)
++
++
++def _review(row, captured, now):
++    from hermes_cli.review_session_activity import _row_ids, project_review_row
++    # Latest assistant message across exactly this lineage, not a union of PRs
++    # from older messages. Message IDs preserve the canonical SQLite ordering.
++    ids = _row_ids(row)
++    if any(sid not in captured['messages'] for sid in ids):
++        raise ValueError('review lineage not captured')
++    latest = max((captured['messages'][sid] for sid in ids),
++                 key=lambda item: item[0], default=(-1, ()))
++    info = {tuple(key): value for key, value in captured['reviews']}
++    if any(info.get(tuple(key)) is None for key in latest[1]):
++        raise ValueError('review provider pending or unavailable')
++    project_review_row(row, reviews=[(tuple(key), info[tuple(key)]) for key in latest[1]], now=now)
++
++
+ def projections():
+-    """Register captured goal/cron families, never silently empty other families."""
++    """All seven families consume detached captures, never legacy I/O readers."""
+     from hermes_cli.goal_session_activity import project_goal_activity
+     from hermes_cli.cron_session_activity import project_cron_activity
+     return (
+         _membership_projection('goal', 'goal_active', project_goal_activity, 'active'),
+         _membership_projection('cron', 'cron_active', project_cron_activity, 'owners'),
++        *(_captured_projection(family, project) for family, project in (
++            ('kanban', _kanban), ('background', _background), ('turn', _turn),
++            ('subagent', _subagent), ('review', _review))),
+     )
+diff --git a/hermes_cli/kanban_annotation_facts.py b/hermes_cli/kanban_annotation_facts.py
+index 7d59bd8f2e..bce41e234f 100644
+--- a/hermes_cli/kanban_annotation_facts.py
++++ b/hermes_cli/kanban_annotation_facts.py
+@@ -55,7 +55,7 @@ class AnnotationUnavailable(RuntimeError):
+ def _thaw(value):
+     if isinstance(value, Mapping):
+         return {key: _thaw(item) for key, item in value.items()}
+-    if isinstance(value, tuple):
++    if isinstance(value, (tuple, list)):
+         return [_thaw(item) for item in value]
+     return value
+ 
+@@ -241,9 +241,43 @@ def _legacy_call(rows, legacy, **kwargs):
+             _active_lock.notify_all()
+ 
+ 
++_native_lookup = None
++
++
++def install_lookup(lookup):
++    """Authorized startup installs one immutable profile binding registry."""
++    global _native_lookup
++    with _active_lock:
++        if _native_lookup is not None:
++            raise RuntimeError('annotation lookup already installed')
++        _native_lookup = lookup
++    def close():
++        global _native_lookup
++        with _active_lock:
++            if _native_lookup is lookup:
++                _native_lookup = None
++    return close
++
++
+ def annotate(family, rows, legacy, **kwargs):
+     """Request seam; binding is installed by the authorized host lifecycle."""
+     binding = _current.get()
++    lookup = _native_lookup
++    if binding is None and lookup is not None:
++        pending = [(row, dict(row)) for row in rows]
++        groups = {}
++        for _, row in pending:
++            selected = lookup(row.get('profile'))
++            if selected is None:
++                raise AnnotationUnavailable('annotation profile not authorized')
++            groups.setdefault(selected, []).append(row)
++        for selected, batch in groups.items():
++            selected.annotate(family, batch, legacy, **kwargs)
++        # Publish no partial row mutation if another profile is unavailable.
++        for original, projected in pending:
++            original.clear()
++            original.update(projected)
++        return rows
+     if binding is None:
+         return _legacy_call(rows, legacy, **kwargs)
+     return binding.annotate(family, rows, legacy, **kwargs)
+diff --git a/hermes_cli/review_session_activity.py b/hermes_cli/review_session_activity.py
+index d068fc900f..b583116180 100644
+--- a/hermes_cli/review_session_activity.py
++++ b/hermes_cli/review_session_activity.py
+@@ -62,6 +62,17 @@ _lock = threading.Lock()
+ # (owner, repo, number) -> (expires_monotonic, info | None)
+ _pr_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any] | None]] = {}
+ _inflight: set[tuple[str, str, int]] = set()
++_refresh_listeners: set[Callable] = set()
++
++
++def subscribe_refresh(callback):
++    """Native capture wake only; callbacks must not perform reads or projection."""
++    with _lock:
++        _refresh_listeners.add(callback)
++    def close():
++        with _lock:
++            _refresh_listeners.discard(callback)
++    return close
+ # row id -> ((last_active, message_count), [pr keys])
+ _msg_cache: dict[str, tuple[tuple[Any, Any], list[tuple[str, str, int]]]] = {}
+ 
+@@ -177,6 +188,9 @@ def _refresh(key: tuple[str, str, int]) -> None:
+     with _lock:
+         _pr_cache[key] = (time.monotonic() + ttl, info)
+         _inflight.discard(key)
++        listeners = tuple(_refresh_listeners)
++    for listener in listeners:
++        listener()
+ 
+ 
+ def _pr_info(key: tuple[str, str, int]) -> dict[str, Any] | None:
+diff --git a/hermes_cli/turn_process_execution_observations.py b/hermes_cli/turn_process_execution_observations.py
+index 0ec317196f..37f46a7319 100644
+--- a/hermes_cli/turn_process_execution_observations.py
++++ b/hermes_cli/turn_process_execution_observations.py
+@@ -66,10 +66,15 @@ def turn(lease, *, gateway, profile, now):
+     token (``pid=..:turn=..`` or ``..:nonce=..``), so its digest identifies the lease instance.
+     A missing/padded token leaves the generation absent and the projection unknown.
+     """
+-    cid = lease.get("conversation_id")
+     digest = holder_digest(lease.get("holder"))
++    return turn_from_digest(lease, digest=digest, gateway=gateway, profile=profile, now=now)
++
++
++def turn_from_digest(lease, *, digest, gateway, profile, now):
++    """Native capture supplies only the one-way digest, never its CAS credential."""
++    cid = lease.get("conversation_id")
+     generation = f"holder-sha256:{digest}" if digest else None
+-    # The raw holder never leaves this function: not in identity, revision or references.
++    # The raw holder never leaves the legacy adapter or enters a captured fact.
+     reference = f"session_turn_leases/{cid}/{generation}"
+     raw = {"version": 1, "identity": _identity("turn", cid, gateway, profile, cid, generation),
+            "owner": _owner(gateway, profile, cid), "state": "running", "source": TURN_SOURCE,
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+index 827aa27459..a9af43dfa2 100644
+--- a/hermes_cli/turn_session_activity.py
++++ b/hermes_cli/turn_session_activity.py
+@@ -26,7 +26,7 @@ import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+-from typing import Any, Iterable
++from typing import Any, Callable, Iterable
+ 
+ from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
+ from hermes_cli.turn_process_execution_observations import TURN_SOURCE, profile_for_state_path, replace, turn
+@@ -134,6 +134,11 @@ def _update_paused_tui_turns(home: Path, now: float) -> set[str]:
+         data = json.loads((home / "desktop" / "interrupted_turns.json").read_text(encoding="utf-8-sig"))
+     except (OSError, ValueError):
+         return set()
++    return project_paused_tui_turns(data, lambda: _auto_continue_bounds(home), now)
++
++
++def project_paused_tui_turns(data, bounds_for_home: Callable[[], tuple[bool, float, int]], now):
++    """Pure canonical pause classifier; bounded captures supply detached data."""
+     out: set[str] = set()
+     bounds: tuple[bool, float, int] | None = None
+     for key, entry in (data.items() if isinstance(data, dict) else ()):
+@@ -146,7 +151,7 @@ def _update_paused_tui_turns(home: Path, now: float) -> set[str]:
+         except (TypeError, ValueError):
+             continue
+         if bounds is None:
+-            bounds = _auto_continue_bounds(home)
++            bounds = bounds_for_home()
+         enabled, fresh_s, max_attempts = bounds
+         if enabled and now - since <= fresh_s and attempts < max_attempts:
+             out.add(str(key))
+@@ -239,8 +244,9 @@ def annotate_turn_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     return project_turn_activity(rows, live=live, leases=leases, gateway=gateway, now=now)
+ 
+ 
+-def project_turn_activity(rows, *, live, leases, gateway, now):
++def project_turn_activity(rows, *, live, leases, gateway, now, lease_project=None):
+     """Pure serializer over captured live IDs and per-ID lease dictionaries."""
++    lease_project = turn if lease_project is None else lease_project
+     for row in rows:
+         roots = [sid for sid in _row_ids(row) if sid in live]
+         if roots:
+@@ -249,7 +255,7 @@ def project_turn_activity(rows, *, live, leases, gateway, now):
+             row.pop("turn_live", None)
+         try:
+             found = [lease for sid in dict.fromkeys(roots) for lease in leases.get(sid, ())]
+-            replace(row, {TURN_SOURCE}, [turn(lease, gateway=gateway, profile=lease["profile"], now=now)
++            replace(row, {TURN_SOURCE}, [lease_project(lease, gateway=gateway, profile=lease["profile"], now=now)
+                                          for lease in found])
+         except ADAPTER_ERRORS:
+             _log.debug("turn execution observation unavailable", exc_info=True)
+diff --git a/tests/hermes_cli/test_annotation_capture_bounds.py b/tests/hermes_cli/test_annotation_capture_bounds.py
+new file mode 100644
+index 0000000000..f980e2433b
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_capture_bounds.py
+@@ -0,0 +1,57 @@
++"""Review membership admission cannot poison existing native captures."""
++import time
++
++import pytest
++
++from hermes_cli import fact_annotation_capture as capture
++from hermes_cli.fact_annotation_sources import NativeAnnotationOwner, NativeAnnotationSource
++from hermes_cli.fact_annotation_views import projections, selector_for
++from hermes_cli.fact_capture import CaptureBudget, CaptureBudgetExceeded
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_materializers import view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++from tests.hermes_cli import test_fact_session_source as helpers
++
++store = helpers.store
++
++
++def test_review_demand_budget_and_failed_mailbox_admission_preserve_membership():
++    scope = Scope('review-demand-bounds', 'default')
++    engine = ReducerEngine(FactStore(), scope)
++    engine.register(view_reducer(projections()))
++    source = NativeAnnotationSource(engine, SourceId(scope, 'annotations.review', 'local'), [],
++        lambda budget, wall, ids: ({'messages': {}, 'reviews': []}, wall + 30))
++    owner = NativeAnnotationOwner({scope: engine}, [], operational=[source],
++                                  budget=CaptureBudget(max_keys=1, max_seconds=2))
++    try:
++        owner.demand(scope, 'annotations.review', selector_for(scope, {'id': 's'}))
++        assert source._ids == {'s'}
++        with pytest.raises(CaptureBudgetExceeded):
++            owner.demand(scope, 'annotations.review', selector_for(scope, {'id': 'other'}))
++        assert source._ids == {'s'}
++        with pytest.raises(ValueError):
++            owner.demand(scope, 'annotations.review', {})
++        assert source._ids == {'s'}
++        # Mailbox validation refuses a new key before source membership changes.
++        source.max_keys = 2
++        owner._demands[scope].close()
++        with pytest.raises(RuntimeError):
++            owner.demand(scope, 'annotations.review', selector_for(scope, {'id': 'other'}))
++        assert source._ids == {'s'}
++    finally:
++        owner.close()
++
++
++def test_review_raw_assistant_text_total_byte_budget_precedes_provider_io(store, monkeypatch):
++    from hermes_cli import review_session_activity as review
++    db, _, path = store
++    now = time.time()
++    for sid in ('a', 'b'):
++        db.create_session(sid, 'cli')
++        db._execute_write(lambda conn, sid=sid: conn.execute(
++            'INSERT INTO messages(session_id,role,content,timestamp) VALUES (?,\'assistant\',?,?)',
++            (sid, 'x' * 3000, now)))
++    monkeypatch.setattr(review, '_pr_info', lambda key: pytest.fail('provider lookup before byte validation'))
++    with pytest.raises(CaptureBudgetExceeded):
++        capture.reviews(path, CaptureBudget(max_bytes=5000, max_seconds=2), ids={'a', 'b'}, now=now)
+diff --git a/tests/hermes_cli/test_annotation_capture_privacy.py b/tests/hermes_cli/test_annotation_capture_privacy.py
+new file mode 100644
+index 0000000000..ccb03d5290
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_capture_privacy.py
+@@ -0,0 +1,40 @@
++"""Private native captures must not publish turn lease CAS credentials."""
++from copy import deepcopy
++import time
++
++from hermes_cli import fact_annotation_capture as capture
++from hermes_cli.fact_annotation_views import projections, selector_for
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_wire import encode
++from hermes_cli.turn_session_activity import project_turn_activity
++from tests.hermes_cli import test_fact_session_source as helpers
++from tests.hermes_cli.annotation_fact_processes import request_guard
++
++store = helpers.store
++
++
++def test_native_turn_input_drops_cas_holder_but_preserves_canonical_observation(store):
++    db, _, path = store
++    now = time.time()
++    secret = 'opaque-cas-credential-never-publish'
++    db.create_session('root', 'cli')
++    db._execute_write(lambda conn: conn.execute(
++        'INSERT INTO session_turn_leases(conversation_id,holder,acquired_at,expires_at) VALUES (?,?,?,?)',
++        ('root', secret, now, now + 60)))
++    value, _ = capture.turns(path, CaptureBudget(max_seconds=2), profile='default', gateway='gateway', now=now)
++    scope = Scope('turn-capture', 'default')
++    key = FactKey(scope, 'AnnotationInput', 'turn')
++    fact = Fact(key, value, health='fresh')
++    assert secret.encode() not in encode(fact.value)
++    assert secret not in repr(fact.value)
++    expected = [{'id': 'root', 'profile': 'default'}]
++    project_turn_activity(expected, live={'root'}, leases={'root': [{'conversation_id': 'root',
++        'holder': secret, 'acquired_at': now, 'expires_at': now + 60, 'profile': 'default'}]},
++        gateway='gateway', now=now)
++    projection = next(p for p in projections() if p.name == 'annotations.turn')
++    row = {'id': 'root', 'profile': 'default'}
++    with request_guard():
++        actual = projection.render(selector_for(scope, row), {key: fact}, now)
++    assert {**deepcopy(row), **actual} == expected[0]
++    assert secret not in repr(actual)
+diff --git a/tests/hermes_cli/test_annotation_native_families.py b/tests/hermes_cli/test_annotation_native_families.py
+new file mode 100644
+index 0000000000..9d67f1c48e
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_native_families.py
+@@ -0,0 +1,163 @@
++"""All captured families through real selectors, reducers and decorated callers."""
++from copy import deepcopy
++import importlib
++import time
++
++import pytest
++
++from hermes_cli import kanban_annotation_facts as annotations
++from hermes_cli.fact_annotation_views import projections, selector_for
++from hermes_cli.fact_contract import Fact, FactKey, Scope, SourceId
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++from hermes_cli.fact_materializers import view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore, view_key
++from tests.hermes_cli.annotation_fact_processes import request_guard
++
++
++FAMILIES = (
++    ('kanban', 'kanban_session_activity', 'annotate_kanban_activity'),
++    ('background', 'process_session_activity', 'annotate_background_activity'),
++    ('turn', 'turn_session_activity', 'annotate_turn_activity'),
++    ('subagent', 'subagent_session_activity', 'annotate_subagent_activity'),
++    ('review', 'review_session_activity', 'annotate_review_wait'),
++)
++
++
++def captured(family, now):
++    if family == 'kanban':
++        from hermes_cli.kanban_execution_observations import card
++        execution = {'root': {'default/t1': card({'id': 't1', 'board': 'default', 'status': 'running',
++            'current_run_id': 7}, gateway='gateway', profile='default', now=now)}}
++        parts = ({'root': 2}, {'root': 1}, {'root': 1}, {}, {'root': {'t2', 't1'}},
++                 {'root': 1}, {'root': 1}, {},
++                 {'root': {('default/t1', 'active', True), ('default/t2', 'blocked', False),
++                           ('peer/default/t3', 'external_unknown', True)}}, {}, {'root': 1}, execution)
++        return {'parts': parts, 'observed_at': now - 3, 'external': {
++            'root': {'counts': [1, 1, 0], 'cards': [{'task_id': 'external', 'title': '',
++                'external': {'observed_at': None, 'url': None, 'next_due_at': None}}]}}}
++    if family == 'background':
++        return {'owned': {'root': {'p2', 'p1'}}, 'details': {
++            'p1': {'id': 'p1', 'command': 'first', 'started_at': now - 100, 'pid': 123},
++            'p2': {'id': 'p2', 'command': 'second'}}, 'evidence': {},
++            'gateway': 'gateway', 'local_profile': 'default'}
++    if family == 'turn':
++        return {'live': {'root'}, 'leases': {}, 'gateway': 'gateway'}
++    if family == 'subagent':
++        return {'by_profile': {'default': ([('child', 'root', now - 1, now - 20)], None)},
++                'gateway': 'gateway'}
++    return {'messages': {'root': (100, [('owner', 'repo', 17)]), 's': (99, [])},
++            'reviews': [(('owner', 'repo', 17), {'open': True, 'review_required': True,
++                'viewer': 'reviewer', 'author': 'author', 'requested': ['user:reviewer'],
++                'requested_at': now - 100})]}
++
++
++def canonical(family, module, rows, value, now):
++    if family == 'kanban':
++        from hermes_cli.kanban_activity_projection import project_kanban_activity
++        from hermes_cli.kanban_external_activity import stamp_replica_counts
++        from hermes_cli.kanban_activity_identity import row_ids
++        project_kanban_activity(rows, **value, now=now)
++        stamp_replica_counts(rows, value['parts'][8], row_ids)
++    else:
++        project = {
++            'background': lambda: module.project_background_activity(rows, **value, now=now),
++            'turn': lambda: module.project_turn_activity(rows, **value, now=now),
++            'subagent': lambda: module.project_subagent_activity(rows, **value, now=now),
++            'review': lambda: module.project_review_row(rows[0], reviews=value['reviews'], now=now),
++        }[family]
++        project()
++    return rows
++
++
++@pytest.mark.parametrize('family,module_name,entry_name', FAMILIES)
++def test_every_native_family_reuses_canonical_serializers_and_real_entry(
++        family, module_name, entry_name, monkeypatch):
++    now = time.time()
++    monkeypatch.setattr(time, 'time', lambda: now)
++    module = importlib.import_module('hermes_cli.' + module_name)
++    scope = Scope('native-families', 'default')
++    store = FactStore()
++    engine = ReducerEngine(store, scope)
++    engine.register(view_reducer(projections()))
++    row = {'id': 's', 'profile': 'default', '_lineage_ids': ['root'], 'title': 'keep'}
++    selector = selector_for(scope, row)
++    key = view_key(scope, 'annotations.' + family, selector)
++    engine.bind(key)
++    value = captured(family, now)
++    source = SourceId(scope, 'annotations.' + family, 'local')
++    fact = Fact(FactKey(scope, 'AnnotationInput', family), value, health='fresh',
++                source_vector=((source, 'capture-1'),), observed_at=now, valid_until=now + 90)
++    local = InProcessFacts(store, {scope}, demand=lambda *args: pytest.fail('unexpected demand'))
++    life = IncrementalLifecycle({(scope, 'annotations')})
++    handle = local.acquire(scope, lifecycle=life)
++    consumer = annotations.AnnotationFacts(handle, scope, stop_legacy=lambda: None,
++                                          start_legacy=lambda: None, view_facts=True)
++    try:
++        with request_guard():
++            projection = next(p for p in projections() if p.name == 'annotations.' + family)
++            projection.render(selector, {fact.key: fact}, now)
++            engine.publish([fact], now=now)
++        projected = store.snapshot(scope).get(key)
++        assert projected.health == 'fresh', projected.error_code
++        assert projected.source_vector == ((source, 'capture-1'),)
++        expected = canonical(family, module, [deepcopy(row)], value, now)
++        assert set(expected[0]) - set(row), 'nonempty family required'
++        life.report_ready('annotations', scope)
++        life.transition('annotations', scope, 'facts', 1)
++        entry = getattr(module, entry_name)
++        with annotations.use(consumer), request_guard():
++            actual = entry([deepcopy(row)])
++        assert actual == expected
++        # Explicit JSON nulls and ordered arrays survive immutable capture and thaw.
++        assert actual[0]['title'] == 'keep'
++        assert fact.value == store.snapshot(scope).get(fact.key).value
++        life.transition('annotations', scope, 'legacy', 2)
++    finally:
++        consumer.close()
++        handle.close()
++        local.close()
++
++
++@pytest.mark.parametrize('missing', ['lineage', 'provider'])
++def test_review_unhydrated_or_provider_unknown_is_not_fresh_empty(missing):
++    scope = Scope('review-readiness', 'default')
++    row = {'id': 's', '_lineage_ids': ['root']}
++    value = captured('review', time.time())
++    if missing == 'lineage':
++        del value['messages']['root']
++    else:
++        value['reviews'][0] = (value['reviews'][0][0], None)
++    key = FactKey(scope, 'AnnotationInput', 'review')
++    fact = Fact(key, value, health='fresh')
++    projection = next(p for p in projections() if p.name == 'annotations.review')
++    with pytest.raises(ValueError), request_guard():
++        projection.render(selector_for(scope, row), {key: fact}, time.time())
++
++
++def test_quiet_review_clock_boundary_reduces_even_with_identical_input(monkeypatch):
++    from hermes_cli.fact_annotation_membership import MembershipCapture
++    from hermes_cli.fact_annotation_sources import NativeAnnotationSource
++    clock = [1000.0]
++    monkeypatch.setattr(time, 'time', lambda: clock[0])
++    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
++    scope = Scope('quiet-review-clock', 'default')
++    store = FactStore()
++    engine = ReducerEngine(store, scope)
++    engine.register(view_reducer(projections()))
++    row = {'id': 's', '_lineage_ids': ['root']}
++    key = view_key(scope, 'annotations.review', selector_for(scope, row))
++    engine.bind(key)
++    value = captured('review', clock[0])
++    info = value['reviews'][0][1]
++    info.update(viewer='author', requested=['user:someone'], requested_at=1001 - 86400)
++    source = NativeAnnotationSource(engine, SourceId(scope, 'annotations.review', 'local'), [], None)
++    source.commit(MembershipCapture(value, 'unchanged', 1000, 1001))
++    assert store.snapshot(scope).get(key).value['payload']['review_wait'] == 'parked'
++    # A no-content hint cannot push the outstanding clock boundary back.
++    clock[0] = 1000.5
++    source.commit(MembershipCapture(value, 'unchanged', 1000.5, 1001))
++    assert source._next_wall == 1001
++    clock[0] = 1001
++    source.commit(MembershipCapture(value, 'unchanged', 1001, 1031))
++    assert store.snapshot(scope).get(key).value['payload']['review_wait'] == 'stuck'
+diff --git a/tests/hermes_cli/test_annotation_native_sources.py b/tests/hermes_cli/test_annotation_native_sources.py
+new file mode 100644
+index 0000000000..4eb21808c6
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_native_sources.py
+@@ -0,0 +1,143 @@
++"""Real persisted inputs on the shared feed, through decorated annotation calls."""
++import json
++from types import SimpleNamespace
++import threading
++import time
++
++import pytest
++
++from hermes_cli import fact_annotation_capture as capture
++from hermes_cli import kanban_annotation_facts as annotations
++from hermes_cli.fact_annotation_sources import NativeAnnotationOwner, NativeAnnotationSource
++from hermes_cli.fact_annotation_views import projections, selector_for
++from hermes_cli.fact_capture import CaptureBudget, CaptureBudgetExceeded
++from hermes_cli.fact_contract import FactKey, Scope, SourceId
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++from hermes_cli.fact_materializers import view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore, view_key
++from tests.hermes_cli import test_fact_session_source as helpers
++from tests.hermes_cli.annotation_fact_processes import request_guard
++from tests.waiting import wait_until
++
++store = helpers.store
++
++
++def empty_registry(monkeypatch):
++    import tools.process_registry as registry
++    monkeypatch.setattr(registry, 'process_registry', SimpleNamespace(_running={}, _lock=threading.Lock()))
++
++
++def test_native_four_families_actual_mutation_and_quiet_recovery(store, tmp_path, monkeypatch):
++    from hermes_cli import process_session_activity as process
++    from hermes_cli import turn_session_activity as turn
++    from hermes_cli import subagent_session_activity as child
++    from hermes_cli import review_session_activity as review
++    db, _, path = store
++    now = time.time()
++    db.create_session('root', 'cli')
++    db.create_session('child', 'subagent')
++    db._execute_write(lambda conn: conn.execute(
++        "UPDATE sessions SET parent_session_id='root',started_at=?,last_activity_at=? WHERE id='child'", (now, now)))
++    db._execute_write(lambda conn: conn.execute(
++        'INSERT INTO session_turn_leases(conversation_id,holder,acquired_at,expires_at) VALUES (?,?,?,?)',
++        ('root', 'opaque-live-holder', now, now + 60)))
++    db._execute_write(lambda conn: conn.execute(
++        "INSERT INTO messages(session_id,role,content,timestamp) VALUES ('root','assistant',?,?)",
++        ('https://github.com/owner/repo/pull/17', now)))
++    checkpoint = tmp_path / 'processes.json'
++    checkpoint.write_text(json.dumps([{'session_id': 'proc', 'parent_session_id': 'root', 'pid': 123,
++                                       'host_start_time': 11, 'command': 'bounded fixture'}]))
++    empty_registry(monkeypatch)
++    monkeypatch.setattr(process, '_live', lambda pid, start: pid == 123 and start == 11)
++    monkeypatch.setattr(review, '_pr_info', lambda key: {'open': True, 'review_required': True,
++        'viewer': 'reviewer', 'author': 'author', 'requested': ['user:reviewer'], 'requested_at': now})
++    scope = Scope('native-four', 'default')
++    facts = FactStore()
++    engine = ReducerEngine(facts, scope)
++    engine.register(view_reducer(projections()))
++    funcs = {'background': capture.processes, 'turn': capture.turns, 'subagent': capture.children}
++    sources = []
++    for family, fn in funcs.items():
++        p = checkpoint if family == 'background' else path
++        def read(budget, wall, ids, fn=fn, p=p):
++            return fn(p, budget, profile='default', gateway='gateway', now=wall)
++        sources.append(NativeAnnotationSource(engine, SourceId(scope, 'annotations.' + family, 'local'), [p], read))
++    review_source = NativeAnnotationSource(engine, SourceId(scope, 'annotations.review', 'local'), [path],
++        lambda budget, wall, ids: capture.reviews(path, budget, ids=ids, now=wall))
++    sources.append(review_source)
++    owner = NativeAnnotationOwner({scope: engine}, [], operational=sources, budget=CaptureBudget(max_seconds=2))
++    local = InProcessFacts(facts, {scope}, demand=owner.demand)
++    life = IncrementalLifecycle({(scope, 'annotations')})
++    handle = local.acquire(scope, lifecycle=life)
++    consumer = annotations.AnnotationFacts(handle, scope, stop_legacy=lambda: None,
++                                          start_legacy=lambda: None, view_facts=True)
++    row = {'id': 's', '_lineage_ids': ['root']}
++    selector = selector_for(scope, row)
++    entries = {'background': process.annotate_background_activity, 'turn': turn.annotate_turn_activity,
++               'subagent': child.annotate_subagent_activity, 'review': review.annotate_review_wait}
++    keys = {family: view_key(scope, 'annotations.' + family, selector) for family in entries}
++    def ready():
++        return all((f := facts.snapshot(scope).get(key)) is not None and f.health == 'fresh' for key in keys.values())
++    try:
++        life.report_ready('annotations', scope)
++        life.transition('annotations', scope, 'facts', 1)
++        with annotations.use(consumer), request_guard():
++            for entry in entries.values():
++                with pytest.raises(annotations.AnnotationUnavailable):
++                    entry([dict(row)])
++        assert wait_until(ready, timeout=10)
++        with annotations.use(consumer), request_guard():
++            initial = {family: entry([dict(row)])[0] for family, entry in entries.items()}
++        assert initial['background']['background_active'] == 1
++        assert initial['background']['execution_observations']
++        assert initial['turn']['turn_live'] is True
++        assert initial['turn']['execution_observations']
++        assert initial['subagent']['execution_observations']
++        assert initial['review']['review_wait'] == 'stuck'
++        before = facts.snapshot(scope)
++        checkpoint.write_text('{broken')
++        assert wait_until(lambda: facts.snapshot(scope).get(keys['background']).health == 'stale', timeout=10)
++        with annotations.use(consumer), pytest.raises(annotations.AnnotationUnavailable):
++            process.annotate_background_activity([dict(row)])
++        checkpoint.write_text('[]')
++        db._execute_write(lambda conn: conn.execute("UPDATE sessions SET ended_at=? WHERE id='child'", (now,)))
++        db._execute_write(lambda conn: conn.execute("DELETE FROM session_turn_leases WHERE conversation_id='root'"))
++        db._execute_write(lambda conn: conn.execute(
++            "INSERT INTO messages(session_id,role,content,timestamp) VALUES ('root','assistant','no PR',?)", (now + 1,)))
++        def cleared():
++            snap = facts.snapshot(scope)
++            return ready() and not snap.get(keys['background']).value['payload'].get('background_active') and not (
++                snap.get(keys['turn']).value['payload'].get('turn_live')) and not (
++                snap.get(keys['subagent']).value['payload'].get('execution_observations')) and not (
++                snap.get(keys['review']).value['payload'].get('review_wait'))
++        assert wait_until(cleared, timeout=10)
++        assert before.get(keys['turn']).value['payload']['turn_live'] is True
++        assert facts.snapshot(scope).get(FactKey(scope, 'AnnotationInput', 'review')).source_vector
++        life.transition('annotations', scope, 'legacy', 2)
++    finally:
++        consumer.close()
++        owner.close()
++        handle.close()
++        local.close()
++
++
++def test_real_capture_bounds_and_no_create_on_missing(store, tmp_path, monkeypatch):
++    db, _, path = store
++    empty_registry(monkeypatch)
++    budget = CaptureBudget(max_seconds=2)
++    absent = tmp_path / 'missing.db'
++    import sqlite3
++    with pytest.raises(sqlite3.Error):
++        capture.children(absent, budget, profile='default', gateway='gateway', now=time.time())
++    assert not absent.exists()
++    bad = tmp_path / 'processes.json'
++    bad.write_text('[' + ' ' * 200 + ']')
++    with pytest.raises(CaptureBudgetExceeded):
++        capture.processes(bad, CaptureBudget(max_bytes=100), profile='default', gateway='gateway', now=time.time())
++    db.create_session('p', 'cli')
++    db.create_session('a', 'subagent')
++    db.create_session('b', 'subagent')
++    db._execute_write(lambda conn: conn.execute("UPDATE sessions SET parent_session_id='p' WHERE id IN ('a','b')"))
++    with pytest.raises(CaptureBudgetExceeded):
++        capture.children(path, CaptureBudget(max_keys=1, max_seconds=2), profile='default', gateway='gateway', now=time.time())
+diff --git a/tests/hermes_cli/test_annotation_startup_lookup.py b/tests/hermes_cli/test_annotation_startup_lookup.py
+new file mode 100644
+index 0000000000..ea2926d590
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_startup_lookup.py
+@@ -0,0 +1,82 @@
++"""Authorized mixed-profile annotation lookup, without request-side resolution."""
++from copy import deepcopy
++import time
++
++import pytest
++
++from hermes_cli import kanban_annotation_facts as annotations
++from hermes_cli.fact_annotation_startup import AnnotationRegistry, binding_for
++from hermes_cli.fact_annotation_views import projections, selector_for
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++from hermes_cli.fact_materializers import view_reducer
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore, view_key
++from hermes_cli.goal_session_activity import annotate_goal_activity
++from tests.hermes_cli.annotation_fact_processes import request_guard
++
++
++def test_real_mixed_profile_automatic_lookup_order_atomic_failure_and_custody():
++    now = time.time()
++    store = FactStore()
++    scopes = {name: Scope('mixed-startup', name) for name in ('default', 'named')}
++    engines = {name: ReducerEngine(store, scope) for name, scope in scopes.items()}
++    life = IncrementalLifecycle({(scope, 'annotations') for scope in scopes.values()})
++    local = InProcessFacts(store, set(scopes.values()), demand=lambda *args: None)
++    handles, bindings = {}, {}
++    rows = [{'id': 's', 'profile': 'named'}, {'id': 's', 'profile': 'default'}, {'id': 's', 'profile': 'named'}]
++    for name, scope in scopes.items():
++        engines[name].register(view_reducer(projections()))
++        engines[name].bind(view_key(scope, 'annotations.goal', selector_for(scope, {'id': 's', 'profile': name})))
++        engines[name].publish([Fact(FactKey(scope, 'AnnotationInput', 'goal'),
++            {'active': ['s'] if name == 'default' else []}, health='fresh', observed_at=now,
++            valid_until=now + 90)], now=now)
++        handles[name] = local.acquire(scope, lifecycle=life)
++        bindings[name] = annotations.AnnotationFacts(handles[name], scope, stop_legacy=lambda: None,
++            start_legacy=lambda: None, view_facts=True)
++        life.report_ready('annotations', scope)
++        life.transition('annotations', scope, 'facts', 1)
++    registry = AnnotationRegistry(bindings, 'default').install()
++    try:
++        with request_guard():
++            assert binding_for('named') is bindings['named']
++            assert binding_for() is bindings['default']
++            assert binding_for('foreign') is None
++            result = annotate_goal_activity(deepcopy(rows))
++        assert [row.get('goal_active', False) for row in result] == [False, True, False]
++        assert [row['profile'] for row in result] == ['named', 'default', 'named']
++        with pytest.raises(RuntimeError):
++            AnnotationRegistry(bindings, 'default').install()
++        # A failed named profile cannot leave a successful default patch behind.
++        engines['named'].publish([Fact(FactKey(scopes['named'], 'AnnotationInput', 'goal'), {}, health='unknown')], now=now)
++        pending = [dict(rows[1]), dict(rows[0])]
++        original = deepcopy(pending)
++        with request_guard(), pytest.raises(annotations.AnnotationUnavailable):
++            annotate_goal_activity(pending)
++        assert pending == original
++        with request_guard(), pytest.raises(annotations.AnnotationUnavailable):
++            annotate_goal_activity([{'id': 's', 'profile': 'foreign'}])
++        registry.close()
++        successor = AnnotationRegistry(bindings, 'default').install()
++        try:
++            registry.close()
++            assert binding_for() is bindings['default']
++        finally:
++            successor.close()
++    finally:
++        registry.close()
++        for name, scope in scopes.items():
++            life.transition('annotations', scope, 'legacy', 2)
++            bindings[name].close()
++            handles[name].close()
++        local.close()
++    assert binding_for() is None
++
++
++def test_registry_rejects_mismatched_profile_handle():
++    from types import SimpleNamespace
++    binding = SimpleNamespace(scope=Scope('scope', 'named'))
++    with pytest.raises(ValueError):
++        AnnotationRegistry({'default': binding}, 'default')
++    with pytest.raises(ValueError):
++        AnnotationRegistry({'named': binding}, 'absent')
+-- 
+2.43.0
+

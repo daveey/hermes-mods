@@ -1,0 +1,277 @@
+From 4252743d44bef7fb852ca145bb861ac8e4a47225 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:44:08 +0000
+Subject: [PATCH] [daveey] Recover unbound owner-refused submitters without
+ mounting a viewer
+
+Check owner availability before worker binding and move submission off the
+event loop. An admitted but unbound submission could otherwise outlive an
+unavailable owner while the claim remained running. Keep worker-bound exit
+recovery, claim identity and ownership checks intact. Retain updater fencing
+and do not infer a lost worker solely from missing binding evidence.
+
+Regression coverage exercises owner-unavailable/unbound and bound control paths,
+responsiveness during submission, and viewer resume behavior. Performance and
+natural live recovery remain separate acceptance gates.
+
+---
+ gateway/session_kanban.py                     | 15 ++--
+ hermes_cli/kanban_owner_recovery.py           | 19 ++++-
+ ...st_kanban_admission_loop_responsiveness.py | 74 +++++++++++++++++++
+ .../test_session_kanban_restart_resume.py     |  2 +-
+ .../test_session_kanban_run_off_loop.py       |  2 +-
+ .../test_kanban_unbound_submitter_refusal.py  | 58 +++++++++++++++
+ 6 files changed, 161 insertions(+), 9 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_admission_loop_responsiveness.py
+ create mode 100644 tests/hermes_cli/test_kanban_unbound_submitter_refusal.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 385a93ee58..fe57d89fbf 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -100,9 +100,9 @@ async def run_task(connection, params):
+     from hermes_state_local import local_receipt
+     from gateway.session_kanban_capsule import require_capsule_transport
+     authority = connection.authority
+-    # Resolved off-loop up front: no await separates the saved-claim check from session
+-    # creation. The Kanban claim check and its marker share one off-loop transaction; a
+-    # concurrent retry of the same attempt meets that marker (same session) or a stale claim.
++    # Resolve off-loop. Session creation uses the durable request identity below;
++    # the Kanban claim check and its marker share one off-loop transaction, so a
++    # concurrent retry meets that marker (same session) or a stale claim.
+     owner_db = str(await asyncio.to_thread(Path(authority.db.db_path).resolve))
+     # The dispatcher attempt is the durable request identity, including after the
+     # task closes. Retry checks the saved claim, never reinterprets updated cards.
+@@ -120,7 +120,9 @@ async def run_task(connection, params):
+         from gateway.session_local_recovery import restore_local_session
+         ref = restore_local_session(authority, sid)
+     else:
+-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
++        # Context construction reads the board, recovery history and routing policy.
++        # Cold/contended reads must not starve this owner's receipt/control RPCs.
++        policy, private = await asyncio.to_thread(build_kanban_policy, connection, params, _load_gateway_config())
+         # [daveey] Capsule-required card without live run-bound transport refuses before session creation.
+         await asyncio.to_thread(require_capsule_transport, policy)
+         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
+@@ -168,7 +170,10 @@ async def run_task(connection, params):
+         if checkpoint is not None:
+             await tracked_write(authority, partial(cont.prepare, authority, principal_id=connection.actor.subject,
+                 session_id=ref.session_id, context=context, checkpoint=checkpoint, request_id=target, owner_db=owner_db))
+-    await connection.resume(ref, {})
++    # The dispatcher only submits and polls receipts; it is not a transcript viewer.
++    # create/restore already mounted the route. A viewer resume here blocks admission
++    # on history, profile-hook refresh and inventory, even though the client discards
++    # those events. Managed execution lifetime is fenced by _watch_submitter instead.
+     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
+     # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
+     # A retry of an attempt admitted before cards were finite resubmits its committed payload,
+diff --git a/hermes_cli/kanban_owner_recovery.py b/hermes_cli/kanban_owner_recovery.py
+index 501331b82a..2126883d5c 100644
+--- a/hermes_cli/kanban_owner_recovery.py
++++ b/hermes_cli/kanban_owner_recovery.py
+@@ -158,8 +158,10 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_dispatch import _worker_alive
+-    if _latest_run_event(conn, task_id, 'worker_bound'):
+-        return False  # a bound run is the crash sweep's to book (bound_interpreter_gone)
++    if conn.execute("SELECT 1 FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
++                    "WHERE t.id=? AND e.task_id=t.id AND e.kind='worker_bound' LIMIT 1",
++                    (task_id,)).fetchone() is not None:
++        return False  # even an unreadable binding is execution custody, not proof of absence
+     receipt = _owner_receipt(conn, task_id)
+     if receipt is None:
+         return False  # no receipt: this pause did not come from an owner attempt
+@@ -171,6 +173,19 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
+     pids = _run_worker_pids(conn, row, task_id)
+     if any(_worker_alive(pid, fingerprint) for pid, fingerprint in pids):
+         return False
++    # The owner can commit its marker and lose the RPC answer before any interpreter
++    # binds. Its live/queued admission is not execution evidence: bind_worker_context
++    # checks this exact claim under the same board write lock before permitting tools.
++    # A dead submitter's own refusal therefore ends this never-bound attempt even
++    # when the long-lived owner cannot settle its ledger. Never infer this from logs.
++    from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++    result = _latest_run_event(conn, task_id, 'worker_result')
++    if (result.get('submitter') is True and type(result.get('exit_code')) is int
++            and result['exit_code'] == KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++            and result.get('claim_lock') == row['claim_lock']
++            and type(result.get('pid')) is int and result['pid'] > 0
++            and result['pid'] == row['worker_pid']):
++        return True
+     admission = _admission_row(receipt)
+     settled = admission is not None and admission[0] == 'terminal'
+     if settled and pids:
+diff --git a/tests/gateway/test_kanban_admission_loop_responsiveness.py b/tests/gateway/test_kanban_admission_loop_responsiveness.py
+new file mode 100644
+index 0000000000..218e57a868
+--- /dev/null
++++ b/tests/gateway/test_kanban_admission_loop_responsiveness.py
+@@ -0,0 +1,74 @@
++"""Cold board policy reads must not prevent the owner answering its submitters."""
++import asyncio
++import threading
++
++from tests.gateway import test_kanban_finite_admission as helpers
++
++kanban_owner = helpers.kanban_owner
++
++
++def test_policy_construction_is_off_owner_loop_and_replay_has_one_admission(kanban_owner, monkeypatch):
++    from gateway import session_kanban as sk
++
++    async def scenario():
++        owner = kanban_owner(helpers._CONFIG)
++        loop_thread = threading.get_ident()
++        original = sk.build_kanban_policy
++        calls = []
++
++        async def viewer_resume(*_args):
++            raise TimeoutError('viewer history/inventory must not gate a dispatcher receipt')
++
++        monkeypatch.setattr(owner.connection, 'resume', viewer_resume)
++
++        def build(*args):
++            calls.append(threading.get_ident())
++            assert threading.get_ident() != loop_thread, 'board policy construction blocks admission RPCs'
++            return original(*args)
++
++        monkeypatch.setattr(sk, 'build_kanban_policy', build)
++        try:
++            first = await sk.run_task(owner.connection, owner.params)
++            # The first answer can be lost in transport; retry must return its original receipt.
++            second = await sk.run_task(owner.connection, owner.params)
++            assert second['session_id'] == first['session_id']
++            assert second['receipt']['admission_id'] == first['receipt']['admission_id']
++            assert len(calls) == 1
++        finally:
++            await owner.close()
++
++    asyncio.run(scenario())
++
++
++def test_slow_policy_does_not_time_out_an_owner_control_request(kanban_owner, monkeypatch):
++    from gateway import session_kanban as sk
++
++    async def scenario():
++        owner = kanban_owner(helpers._CONFIG)
++        loop = asyncio.get_running_loop()
++        entered = asyncio.Event()
++        release = threading.Event()
++        original = sk.build_kanban_policy
++
++        def build(*args):
++            loop.call_soon_threadsafe(entered.set)
++            if not release.wait(2):
++                raise TimeoutError('owner loop could not answer while policy was reading')
++            return original(*args)
++
++        monkeypatch.setattr(sk, 'build_kanban_policy', build)
++        admission = asyncio.create_task(sk.run_task(owner.connection, owner.params))
++        try:
++            await asyncio.wait_for(entered.wait(), 1)
++            answered = loop.create_future()
++            loop.call_soon(answered.set_result, True)
++            assert await asyncio.wait_for(answered, .5)
++            assert not admission.done()
++        finally:
++            release.set()
++            try:
++                await admission
++            finally:
++                await owner.close()
++
++    asyncio.run(scenario())
+diff --git a/tests/gateway/test_session_kanban_restart_resume.py b/tests/gateway/test_session_kanban_restart_resume.py
+index a0b41eadb2..d090a72792 100644
+--- a/tests/gateway/test_session_kanban_restart_resume.py
++++ b/tests/gateway/test_session_kanban_restart_resume.py
+@@ -136,7 +136,7 @@ def _admit_next(env, task_id):
+     from gateway import session_kanban
+     env.monkeypatch.setattr(session_kanban, 'asdict', lambda r: {'state': r.state})
+     asyncio.run(session_kanban.run_task(connection, params))
+-    assert [c[0] for c in calls] == ['resume', 'submit']
++    assert [c[0] for c in calls] == ['submit']  # transcript viewers are not part of admission
+     context = json.loads(created['policy'].kanban_json)
+     with _connect() as conn:
+         events = {kind: json.loads(payload or 'null') for kind, payload in conn.execute(
+diff --git a/tests/gateway/test_session_kanban_run_off_loop.py b/tests/gateway/test_session_kanban_run_off_loop.py
+index f77cc08839..80548d5951 100644
+--- a/tests/gateway/test_session_kanban_run_off_loop.py
++++ b/tests/gateway/test_session_kanban_run_off_loop.py
+@@ -84,7 +84,7 @@ def test_run_task_kanban_write_never_blocks_the_loop(tmp_path, monkeypatch):
+         await asyncio.to_thread(writer.join, 10)
+         return max(b - a for a, b in pairwise(ticks))
+     gap = asyncio.run(scenario())
+-    assert calls == ['resume', 'submit']
++    assert calls == ['submit']  # dispatcher admission does not mount a transcript viewer
+     with closing(connect(board='owned')) as conn:
+         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 1
+     assert gap < HOLD_S / 2, f'the owner loop stalled {gap:.2f}s behind a held Kanban writer'
+diff --git a/tests/hermes_cli/test_kanban_unbound_submitter_refusal.py b/tests/hermes_cli/test_kanban_unbound_submitter_refusal.py
+new file mode 100644
+index 0000000000..da66e87315
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_unbound_submitter_refusal.py
+@@ -0,0 +1,58 @@
++"""A lost admission reply must not keep a dead, never-bound attempt claimed."""
++import os
++
++import pytest
++
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_owner_recovery import owner_attempt_provably_over
++from tests.hermes_cli import test_kanban_owner_receipt_reclaim as helpers
++
++board = helpers.board
++
++
++def _refusal(board, tid, run, **changes):
++    row = board.state(tid)
++    payload = dict(pid=row['worker_pid'], claim_lock=row['claim_lock'], exit_code=69, submitter=True)
++    payload.update(changes)
++    board.event(tid, run, 'worker_result', payload, helpers.NOW)
++    board.conn.commit()
++
++
++@pytest.mark.parametrize('admission', [('queued', None), None, ('unknown', None)])
++def test_dead_unbound_submitter_releases_even_with_live_owner(board, admission):
++    run = board.dead_attempt('t_refusal', owner_pid=os.getpid(), admission=admission,
++                             worker_fingerprint=dispatch._process_fingerprint(os.getpid()),
++                             expires_age_seconds=-900)
++    _refusal(board, 't_refusal', run)
++    assert owner_attempt_provably_over(board.conn, 't_refusal')
++    assert dispatch.detect_crashed_workers(board.conn) == ['t_refusal']
++    row = board.state('t_refusal')
++    assert (row['status'], row['claim_lock'], row['current_run_id']) == ('ready', None, None)
++    assert dispatch.detect_crashed_workers(board.conn) == []
++
++
++@pytest.mark.parametrize('changes', [
++    {'pid': 1}, {'claim_lock': 'foreign:123'}, {'submitter': False}, {'exit_code': 1},
++    {'exit_code': True},
++])
++def test_unattributable_refusal_keeps_claim(board, changes):
++    run = board.dead_attempt('t_refusal', owner_pid=os.getpid(), admission=('queued', None))
++    _refusal(board, 't_refusal', run, **changes)
++    assert not owner_attempt_provably_over(board.conn, 't_refusal')
++    assert dispatch.detect_crashed_workers(board.conn) == []
++
++
++@pytest.mark.parametrize('variant', ['bound', 'malformed-bound', 'live', 'foreign', 'old-run'])
++def test_refusal_does_not_override_execution_custody(board, variant):
++    options = dict(owner_pid=os.getpid(), admission=('queued', None))
++    if variant == 'bound':
++        options['worker_bound'] = True
++    elif variant == 'live':
++        options.update(worker_pid=os.getpid(), worker_fingerprint=dispatch._process_fingerprint(os.getpid()))
++    elif variant == 'foreign':
++        options['lock_host'] = 'other-host'
++    run = board.dead_attempt('t_refusal', **options)
++    if variant == 'malformed-bound':
++        board.event('t_refusal', run, 'worker_bound', {}, helpers.NOW)
++    _refusal(board, 't_refusal', run + 100 if variant == 'old-run' else run)
++    assert not owner_attempt_provably_over(board.conn, 't_refusal')
+-- 
+2.43.0
+
