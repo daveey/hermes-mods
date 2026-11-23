@@ -175,8 +175,12 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   card before filing a fault. Free slots but nothing starting: after the queue line, grep the home gateway.log for `kanban dispatch held: <board>/<id>: start_gate:token_throttle` (the throughput plugin's fleet-wide token budget; `throttle.status()` shows rate vs cap): that is pacing, not a fault, and the card starts in the next gap under the cap, so don't bump or move it. Then check `~/.hermes/core-update/drain-hold` (a
   core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
   shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it. Pool
-  workers hold the same way: `hub-worker-exec all -- bash -lc 'ls ~/.hermes/core-update/drain-hold'`. When every
-  worker holds at once, no claims happen while the scaler still reports free slots, so do the step here or wait. Otherwise
+  workers hold the same way: `hub-worker-exec all -- bash -lc 'test -e ~/.hermes/core-update/drain-hold && echo HELD; grep "kanban dispatcher \[" ~/.hermes/logs/gateway.log | tail -2'`.
+  The path is a symlink to `.drain-hold.<pid>.*.json` and is left dangling after the drain ends, so `ls` lists it
+  and a hold looks live when it isn't; `test -e` follows the link. Recent `spawned=N` dispatcher lines mean there
+  is no hold: the card is being passed over, so read the dispatcher's skip reason instead of reporting a hold.
+  When every worker really holds at once, no claims happen while the scaler still reports free slots, so do the
+  step here or wait. Otherwise
   move the card to a pool worker or do it here; before doing a fix card's work, `git log origin/main -- <file>`,
   since another PR may already have landed it) and `uptime` (admission refuses spawns while hub CPU is
   above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job. A `python3 -` with ppid 1 is an ssh-piped probe that outlived its client,
