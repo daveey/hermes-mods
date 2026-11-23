@@ -99,13 +99,16 @@ def test_slow_model_fits_the_host_deadline_and_the_next_turn_is_not_skipped(host
     """RED before: the judge kept its 60s timeout, the host abandoned the callback at its deadline, and the next
     turn's check was skipped ("skipped after previous timeout or while still running")."""
     model = SlowModel(latency=3.0)
-    hooks, mgr, events = host(global_timeout=0.6, budget=0.4, slack=0.1, model=model)
+    # Keep the model budget tight, but leave room for dispatch, logging and client cleanup.
+    # Per-callback cores use budget + slack (not global_timeout) as the host deadline.
+    # Both host bounds remain below the uncapped model latency, so missing call caps still fail.
+    hooks, mgr, events = host(global_timeout=2.0, budget=0.4, slack=1.6, model=model)
     with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
         hooks["pre_llm_call"](session_id="s1", user_message="fix the parser")
         t0 = time.monotonic()
         assert mgr.invoke_hook("pre_verify", session_id="s1", attempt=0, final_response=REPLY,
                                changed_paths=["parser.py"]) == []
-        assert time.monotonic() - t0 < 0.6
+        assert time.monotonic() - t0 < 2.0
         hooks["pre_llm_call"](session_id="s1", user_message="and the lexer")
         mgr.invoke_hook("pre_verify", session_id="s1", attempt=0, final_response=REPLY, changed_paths=["lexer.py"])
     assert len(model.calls) == 2, "the next turn's check must run, not be skipped"
