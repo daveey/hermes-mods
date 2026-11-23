@@ -973,7 +973,8 @@ export function Lanes({ ctx }) {
   const toggle = () => setOpen((value) => !value)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
-      // Lane pills wrap inside their own box; the chip, global filters and toggle stay top-right.
+      // Lane pills wrap inside their own box (min width = widest pill) so the chip, global filters and
+      // toggle sit top-right whenever they fit beside one pill, and wrap below it (never overlap) when not.
       h('div', { className: 'hermes-lanes-pills', 'data-slot': 'lanes-pills' },
         shown.map((row) => h(MiniPill, {
           key: row.name, row, onToggle: toggleLane, scale: tokenScale(list),
@@ -1001,8 +1002,8 @@ export function Lanes({ ctx }) {
 
 const CSS = `
 .hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
-.hermes-lanes-mini{display:flex;align-items:flex-start;gap:8px;flex-wrap:nowrap;padding:4px 8px;min-height:28px}
-.hermes-lanes-pills{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;flex:1 1 auto;min-width:0}
+.hermes-lanes-mini{display:flex;align-items:flex-start;gap:4px 8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
+.hermes-lanes-pills{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;flex:1 1 0;min-width:min-content}
 .hermes-lanes-pills>.hermes-lanes-pill{flex:none}
 .hermes-lanes-mini>.hermes-lanes-strip-right,.hermes-lanes-mini>.hermes-lanes-status,.hermes-lanes-mini>.hermes-lanes-toggle,.hermes-lanes-mini>small{flex:none}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}

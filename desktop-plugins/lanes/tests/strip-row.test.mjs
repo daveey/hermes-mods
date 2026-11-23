@@ -24,9 +24,9 @@ test('global filters stay on the strip row, right of the lane pills, however man
     assert.ok(kids.indexOf('hermes-lanes-strip-right') < kids.indexOf('hermes-lanes-status'))
   } finally { await view.close() }
   const css = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
-  assert.match(css, /\.hermes-lanes-mini\{[^}]*flex-wrap:nowrap/)
-  assert.doesNotMatch(css, /\.hermes-lanes-mini\{[^}]*flex-wrap:wrap/)
-  assert.match(css, /\.hermes-lanes-pills\{[^}]*flex-wrap:wrap;[^}]*flex:1 1 auto;min-width:0/)
+  assert.match(css, /\.hermes-lanes-mini\{[^}]*flex-wrap:wrap/)
+  assert.match(css, /\.hermes-lanes-pills\{[^}]*min-width:min-content/)
+  assert.match(css, /\.hermes-lanes-pills\{[^}]*flex-wrap:wrap;[^}]*flex:1 1 0;min-width:min-content/)
   assert.match(css, /\.hermes-lanes-mini\{[^}]*align-items:flex-start/)
   assert.match(css, /\.hermes-lanes-mini>\.hermes-lanes-strip-right,\.hermes-lanes-mini>\.hermes-lanes-status,\.hermes-lanes-mini>\.hermes-lanes-toggle[^{]*\{flex:none\}/)
 })
