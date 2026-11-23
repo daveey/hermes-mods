@@ -42,10 +42,15 @@ def test_real_board_view_and_status_push(tmp_path, monkeypatch, slow_pr, request
         import threading
         from hermes_cli import kanban_lanes_flow_pr as prs
         started = threading.Event()
+        release_pr = threading.Event()
+        finished_pr = threading.Event()
+        # Registered after the observation join, so LIFO teardown unblocks it first.
+        request.addfinalizer(release_pr.set)
         class Slow:
             def prefetch(self, urls):
                 started.set()
-                time.sleep(4)
+                release_pr.wait(20)  # safety ceiling, not the delivery oracle
+                finished_pr.set()
             def get(self, url):
                 return {}
         monkeypatch.setattr(prs, 'Reader', Slow)
@@ -77,4 +82,8 @@ def test_real_board_view_and_status_push(tmp_path, monkeypatch, slow_pr, request
                 conn.commit()
             frame = ws.receive_json()
             assert frame['view']['totals']['running'] == 2
-            assert time.monotonic() - start < 3
+            # A status change immediately after the initial frame may wait the
+            # configured start-to-start floor, plus a watch tick and scheduling.
+            assert time.monotonic() - start < api.MIN_PROJECT_GAP_S + api.WATCH_S + 2
+            if slow_pr:
+                assert not finished_pr.is_set(), 'status delivery waited for PR I/O'
