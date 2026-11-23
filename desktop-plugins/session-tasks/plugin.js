@@ -61,6 +61,7 @@ const STATE_COLOR = {
   triage: '#f85149', // unfinished agent triage, not an implied human ask
   // [daveey] Wait looks (backend `wait.wait_state`), which override the status colour of a parked card:
   waiting: '#8b949e', // parked on a named producer, or not yet stalled: grey
+  delivery: '#38bdf8', // parked on CI or a deploy: light blue (something is producing it, nothing is wrong)
   stalled: '#d29922', // agent-owned wait over 2 h, nothing producing it: amber
   'needs-you': '#f85149' // a visible human ask: red
 }
@@ -284,9 +285,11 @@ export function sinceClock(sec, nowMs = Date.now()) {
   return `${day} ${d.getDate()} ${hm}`
 }
 
-/** The card's wait look from the backend `wait` object: 'stalled' | 'waiting' | 'needs-you' | null. */
+/** The card's wait look from the backend `wait` object: 'stalled' | 'delivery' | 'waiting' | 'needs-you' | null.
+ *  `delivery` = a non-stalled wait the backend names as CI or a deploy (`waiting_on` starts with `ci`/`deploy`). */
 export function waitLook(wait) {
   const state = wait && typeof wait === 'object' ? str(wait.wait_state) : ''
+  if ((state === 'waiting' || state === 'external_running') && /^(ci|deploy)\b/i.test(str(wait.waiting_on))) return 'delivery'
   return state === 'stalled' ? 'stalled' : state === 'human' ? 'needs-you' : state === 'waiting' ? 'waiting' : null
 }
 
@@ -336,7 +339,7 @@ export function subagentChips(subagents) {
     })
 }
 
-const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, todo: 5 }
+const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, delivery: 4, todo: 5 }
 
 /** The card's structured ask (`human_request`) as trimmed plain strings, or null when it names no action. The hub
  *  replica stores it as JSON text, so a string is decoded. Exported for tests. */
@@ -380,7 +383,7 @@ function taskChip(t, status) {
   const rawLook = t.stale ? null : waitLook(wait)
   // Grey 'waiting' only recolours a scheduled card: a blocked/triage card keeps its own (red/amber) status colour,
   // so a dependency block or an unvalidated ask never turns grey. The wait line still names what it waits on.
-  const look = rawLook === 'waiting' && status !== 'scheduled' ? null : rawLook
+  const look = (rawLook === 'waiting' || rawLook === 'delivery') && status !== 'scheduled' ? null : rawLook
   const waitingOn = rawLook ? str(wait.waiting_on) : ''
   const waitingSince = rawLook ? Number(wait.waiting_since) || 0 : 0
   const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''

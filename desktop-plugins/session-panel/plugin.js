@@ -368,10 +368,16 @@ export const validModel = model => model?.version === 1 && !!model.header?.count
 // state (header pips and row markers read as one legend), red-edged ask cards, accent-filled recommended option.
 // Text colours keep >= 4.5:1 contrast on both themes via light-dark(); ACCENT_FILL carries white text.
 export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: '#3b82f6', waiting: '#d29922', ready: '#3fb950', done: '#8b949e' }
+// Light blue: work waiting on CI or a deploy (row `wait_kind`, status reason `linked_work_delivery`). Not amber
+// (nothing is wrong) and not grey (something is actively producing the result).
+export const DELIVERY_COLOR = '#38bdf8'
+/** Backend-selected delivery wait: the canonical envelope's reason code says every open item waits on CI/deploy. */
+export const deliveryWait = status => status?.presentation?.stripe === 'waiting' && Array.isArray(status?.presentation?.reason_codes) &&
+  status.presentation.reason_codes.includes('linked_work_delivery') && status?.kind !== 'running'
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
-const box = section => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
-  ...(section === 'waiting' ? { border: `1.5px solid ${SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
+  ...(section === 'waiting' ? { border: `1.5px solid ${row?.wait_kind === 'ci' || row?.wait_kind === 'deploy' ? DELIVERY_COLOR : SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -434,7 +440,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const stripe = status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
-    blocked: 'var(--color-zinc-400)', waiting: 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
+    blocked: 'var(--color-zinc-400)', waiting: deliveryWait(status) ? DELIVERY_COLOR : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
@@ -494,8 +500,8 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const own = ownCard(row)
     return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
-      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
-        style: { ...box(section), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
+        style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
           jsx('strong', { 'data-ask-title': '', title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
@@ -566,7 +572,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
       ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
-        jsx('span', { 'aria-hidden': true, style: box(pip.section) }),
+        // The waiting pip goes light blue only when every waiting row is a CI/deploy wait.
+        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip.section === 'waiting' && model.sections.waiting.length > 0 &&
+          model.sections.waiting.every(row => row.wait_kind === 'ci' || row.wait_kind === 'deploy') ? { wait_kind: 'ci' } : null) }),
         `${pip.count} ${pip.label}`
       ] }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.

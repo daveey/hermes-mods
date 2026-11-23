@@ -258,6 +258,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
         "parent": {"type": ["string", "null"]},
         "depth": {"type": "integer", "minimum": 0, "maximum": 4},
         "nested_detail": {"type": "string"},
+        "wait_kind": {"enum": ["ci", "deploy"]},
         "status": {"type": "string"},
         "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
         "gateway": {"type": "string"}, "profile": {"type": "string"}, "board": {"type": "string"},

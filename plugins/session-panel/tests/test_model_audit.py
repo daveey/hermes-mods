@@ -155,6 +155,14 @@ def test_ci_wait_is_short_with_pr_and_a_link_action():
 def test_ci_wait_without_a_pr_or_url():
     r = waiting('ci local:worker-a4:2658784')
     assert r['detail'] == 'waiting on CI · 2m on remote' and not [a for a in r['actions'] if a['kind'] == 'open_url']
+    assert r['wait_kind'] == 'ci'
+
+
+def test_delivery_wait_kind_only_on_ci_and_deploy_rows():
+    assert waiting('deploy hermes-hub mods-pull')['wait_kind'] == 'deploy'
+    assert waiting('ci run 1')['wait_kind'] == 'ci'
+    assert 'wait_kind' not in waiting('the result of a review')
+    assert 'wait_kind' not in waiting('cinema tickets')
 
 
 def test_deploy_wait_hides_hashes():

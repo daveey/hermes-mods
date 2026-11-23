@@ -94,6 +94,26 @@ test('a canonical answered-ask header preserves the backend label and row status
   assert.doesNotMatch(text(), /unresolved|Delivering|Recorded choice|Check status|Retry/)
 })
 
+test('CI/deploy waits paint light blue: row box, waiting pip and header dot (David 2026-11-23)', async () => {
+  const status = reason => ({ status_version: 1, kind: 'waiting', revision: 7, generation: 3,
+    identity: { gateway: 'gateway', profile: 'default', session_id: 'session', owner_epoch: 'epoch' },
+    coverage: { state: 'complete', reasons: [] }, presentation: { stripe: 'waiting', reason_codes: reason } })
+  const blue = /rgb\(56, 189, 248\)|#38bdf8/i
+  const pips = [{ section: 'waiting', count: 1, label: 'waiting' }]
+  await paint(m.renderModel(model({ waiting: [row('a', { wait_kind: 'deploy', detail: 'waiting on deploy' })] },
+    { state: 'waiting', status: status(['linked_work_open', 'linked_work_delivery']), pips })))
+  assert.match(document.querySelector('[data-row-pip]').style.border, blue)
+  assert.equal(document.querySelector('[data-row-pip]').dataset.waitKind, 'deploy')
+  assert.match(document.querySelector('[data-model-pip="waiting"] span').style.border, blue)
+  assert.match(document.querySelector('[data-panel-status-stripe]').style.background, blue)
+  // An ordinary park keeps the amber outline and the grey header dot.
+  await paint(m.renderModel(model({ waiting: [row('b', { detail: 'waiting on parent card' })] },
+    { state: 'waiting', status: status(['linked_work_open']), pips })))
+  assert.doesNotMatch(document.querySelector('[data-row-pip]').style.border, blue)
+  assert.doesNotMatch(document.querySelector('[data-model-pip="waiting"] span').style.border, blue)
+  assert.doesNotMatch(document.querySelector('[data-panel-status-stripe]').style.background, blue)
+})
+
 test('defect 1: showsDecision tells the decision queue the panel already carries the answered ask', async () => {
   assert.equal(typeof m.showsDecision, 'function')
   assert.equal(m.showsDecision('nope'), false)

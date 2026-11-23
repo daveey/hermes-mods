@@ -275,6 +275,7 @@ def wait_info(row, now, *, wire=False):
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
     age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
+    kind = head[1].lower() if head else ''
     if head and head[1].lower() == 'ci':
         pr = _pr_number(row, urls, on)
         phrase = 'waiting on CI' + (f' · PR #{pr}' if pr else '')
@@ -290,7 +291,7 @@ def wait_info(row, now, *, wire=False):
         if len(body) > WAIT_MAX:
             body = body[:WAIT_MAX - 1].rstrip() + '…'
         phrase = f'waiting on {body}' if body else 'waiting'
-    return {'text': phrase + age, 'raw': on, 'urls': urls[:1]}
+    return {'text': phrase + age, 'raw': on, 'urls': urls[:1], **({'kind': kind} if kind else {})}
 
 
 def wait_target(row, bundle, detail):
@@ -663,6 +664,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 wi['text'] = dependency_text
             v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})
         on = wi['text']
+        if wi.get('kind') and on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
+            # Delivery waits (CI, deploy) paint light blue, not the amber/grey of an ordinary park.
+            v['wait_kind'] = wi['kind']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
         v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if wi['text'].startswith('waiting on CI') else 'Open link', 'url': u} for u in wi['urls'])
