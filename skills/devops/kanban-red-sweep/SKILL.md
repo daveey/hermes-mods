@@ -131,6 +131,10 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   A triaged or failed card that a live card still lists as a parent gates that child forever: verify the outcome
   yourself (for a lander: log tail `bb land: exit 0`, `compare/<sha>...main` behind=0, equal source/landed trees),
   comment it on the child, `kanban_unlink` the dead parent, then archive it on its home gateway.
+  A hub `todo` child whose parent is a worker-homed card that finished (completion notice in chat, or the
+  worker's own board) stays gated while the hub copy lags: `promote` refuses `unsatisfied parent dependencies`.
+  Comment the parent's verified outcome on the child, then `hermes kanban unlink <parent> <child>`; it goes `ready`
+  at once. A REQUEST_CHANGES review parent counts as finished too: unlink it, or the author waits on a done review.
   A `triage` card whose newest lifecycle event is `contained` ends most "N on parent" chains with no parent visibly
   running or blocked (the panel counts it as "other"): walk open ancestors to it. Unblock/promote can't release it; only
   a live run of its event's `policy.authority` (or a new completed `policy.producer` run) can, via
@@ -170,7 +174,9 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   or a worker repeats it. `no_machine` for a worker usually means a Board hold; read its owner
   card before filing a fault. Free slots but nothing starting: after the queue line, grep the home gateway.log for `kanban dispatch held: <board>/<id>: start_gate:token_throttle` (the throughput plugin's fleet-wide token budget; `throttle.status()` shows rate vs cap): that is pacing, not a fault, and the card starts in the next gap under the cap, so don't bump or move it. Then check `~/.hermes/core-update/drain-hold` (a
   core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
-  shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it, so
+  shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it. Pool
+  workers hold the same way: `hub-worker-exec all -- bash -lc 'ls ~/.hermes/core-update/drain-hold'`. When every
+  worker holds at once, no claims happen while the scaler still reports free slots, so do the step here or wait. Otherwise
   move the card to a pool worker or do it here; before doing a fix card's work, `git log origin/main -- <file>`,
   since another PR may already have landed it) and `uptime` (admission refuses spawns while hub CPU is
   above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job. A `python3 -` with ppid 1 is an ssh-piped probe that outlived its client,
