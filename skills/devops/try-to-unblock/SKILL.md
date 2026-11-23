@@ -62,7 +62,11 @@ means an unreleased link of any kind (`created` counts) to a session with recent
 `promote <id> --seen <newest comment id>`. It is run by the card's owning chat, a human terminal, or its creator task.
 The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
 renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
-that chat's own terminal; a worker or relayed command is refused.
+that chat's own terminal; a worker or relayed command is refused. In the mandate, name the stop refusals: Board,
+kanban, renewal, lease, and ship or landing guards. Workers read "any authority refusal" literally and retain when
+the tool policy refuses a single call (e.g. `execute_code` blocked in unattended mode). A tool-policy refusal means
+switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Never edit the mandate
+after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
 Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
