@@ -973,10 +973,12 @@ export function Lanes({ ctx }) {
   const toggle = () => setOpen((value) => !value)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
-      shown.map((row) => h(MiniPill, {
-        key: row.name, row, onToggle: toggleLane, scale: tokenScale(list),
-        selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
-      })),
+      // Lane pills wrap inside their own box; the chip, global filters and toggle stay top-right.
+      h('div', { className: 'hermes-lanes-pills', 'data-slot': 'lanes-pills' },
+        shown.map((row) => h(MiniPill, {
+          key: row.name, row, onToggle: toggleLane, scale: tokenScale(list),
+          selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
+        }))),
       h(StripRight),
       h(StatusTotals, {
         status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
@@ -999,7 +1001,10 @@ export function Lanes({ ctx }) {
 
 const CSS = `
 .hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
-.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
+.hermes-lanes-mini{display:flex;align-items:flex-start;gap:8px;flex-wrap:nowrap;padding:4px 8px;min-height:28px}
+.hermes-lanes-pills{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;flex:1 1 auto;min-width:0}
+.hermes-lanes-pills>.hermes-lanes-pill{flex:none}
+.hermes-lanes-mini>.hermes-lanes-strip-right,.hermes-lanes-mini>.hermes-lanes-status,.hermes-lanes-mini>.hermes-lanes-toggle,.hermes-lanes-mini>small{flex:none}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-pill-name{font-weight:600;font-size:12px}
 .hermes-lanes-pill{gap:7px;white-space:nowrap}
