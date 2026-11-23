@@ -302,6 +302,30 @@ def test_own_letter_ask_eve_shape_and_canonical_ids():
     assert m['header']['counts']['needs_you'] == 1
 
 
+def test_source_unknown_label_is_not_an_interruption():
+    outcome = canonical_outcome('unresolved')
+    outcome['status'].update(reason='source_unknown', coverage={'state': 'unknown', 'reasons': ['cards:card_read_failed:LinksUnavailable']})
+    outcome['status']['presentation'] = {'stripe': 'none', 'reason_codes': ['source_unknown']}
+    b = bundle(task(status='running', stale=True), outcome_json=outcome)
+    value = model.reduce_panel(b, now=NOW)
+    assert value['header']['label'] == "status unknown · couldn't read linked cards"
+    assert value['header']['status'] == outcome['status']
+    assert value['header']['counts']['running'] == 0
+    row = value['sections']['waiting'][0]
+    assert row['evidence_state'] == 'unknown'
+    assert 'not a request for you' in row['details'][-1]
+    assert 'remote' in row['detail']
+
+
+def test_running_precedence_explains_independent_own_turn():
+    outcome = canonical_outcome('running')
+    outcome['status']['presentation']['reason_codes'] = ['own_turn_active']
+    value = model.reduce_panel(bundle(task(status='running', stale=True), outcome_json=outcome), now=NOW)
+    assert value['header']['state'] == 'running'
+    assert value['header']['label'] == 'running · this chat’s agent is replying'
+    assert value['header']['counts']['running'] == 0
+
+
 def test_canonical_header_never_rederived_from_rows():
     m = model.reduce_panel(bundle(task(status='running'), outcome_json=canonical_outcome('decision')), now=NOW)
     assert m['header']['state'] == 'decision'
