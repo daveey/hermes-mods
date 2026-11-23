@@ -1,0 +1,3 @@
+# Provisional decision receipts
+
+Fence provisional decision presentation and every background refresh cleanup by the exact operationId, source route, owner, requestId, expectedRevision and frozen idempotencyKey. Shared request IDs can cross owners or revisions; an older success/failure must never clear another receipt or restore its ask with the wrong error. Test owner/revision/distinct-request interleavings on both refresh success and failure, including stale active scope and Check status/retry identity. Keep canonical status/model untouched; a durable receipt permits provisional Waiting, not executor Running.
