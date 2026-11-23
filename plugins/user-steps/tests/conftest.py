@@ -8,6 +8,25 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def stop_fixture_outbox_workers(monkeypatch):
+    """Join test-owned delivery before patched homes/receivers are restored."""
+    yield
+    runtime = sys.modules.get('_user_steps_outbox')
+    if runtime is not None:
+        with runtime._LOCK:
+            workers = list(runtime._WORKERS.values())
+            for worker in workers:
+                worker.owners.clear()
+                worker.wake.set()
+        for worker in workers:
+            worker.thread.join(timeout=6)
+            assert not worker.thread.is_alive(), 'fixture left delivery in flight'
+
+
 try:
     import hermes_cli  # noqa: F401
 except ImportError:

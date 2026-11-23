@@ -103,7 +103,9 @@ def test_default_api_does_not_report_passive_inbox_as_delivered(tmp_path, monkey
     client = TestClient(app)
     body = dict(session=OWNER['storedSessionId'], expectedRevision=1, choiceId='approve', idempotencyKey='api')
     result = client.post('/requests/' + r['requestId'] + '/decisions', json=body).json()
-    assert result['operation']['dispatchState'] == 'failed'
+    from async_receipt_support import await_operation
+    assert result['operation']['dispatchState'] == 'pending'
+    result = await_operation(s, OWNER, key='api', state='failed')
     assert result['request']['state'] == 'open'
     assert s.operation(OWNER, key='api')['operation']['operationId'] == result['operation']['operationId']
 

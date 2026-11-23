@@ -176,7 +176,11 @@ def test_api_owner_isolation_and_retry(tmp_path):
     assert client.post('/requests/'+r['requestId']+'/decisions', json=dict(body, owner=OWNER)).status_code == 422
     response = client.post('/requests/'+r['requestId']+'/decisions', json=body)
     assert response.status_code == 200
-    data = response.json(); assert data['operation']['dispatchState'] == 'delivered'
+    from async_receipt_support import await_operation
+    receipt = response.json()
+    assert receipt['operation']['dispatchState'] == 'pending'
+    data = await_operation(s, OWNER, key='api')
+    assert data['operation']['operationId'] == receipt['operation']['operationId']
     assert client.post('/requests/'+r['requestId']+'/decisions', json=body).json() == data
     assert client.get('/operations', params={'session':'session-a','idempotencyKey':'api'}).json() == data
     assert client.get('/operations/'+data['operation']['operationId'], params={'session':'session-a'}).json() == data
@@ -653,7 +657,11 @@ def test_busy_session_is_classified_and_background_retry_delivers_same_operation
     app = FastAPI(); app.include_router(router); client = TestClient(app)
     body = dict(session='session-a', expectedRevision=1, choiceId='approve', idempotencyKey='busy')
     first = client.post('/requests/' + r['requestId'] + '/decisions', json=body).json()
-    assert first['operation']['dispatchState'] == 'failed'
+    from async_receipt_support import await_operation
+    assert first['operation']['dispatchState'] == 'pending'
+    recorded_id = first['operation']['operationId']
+    first = await_operation(s, OWNER, key='busy', state='failed')
+    assert first['operation']['operationId'] == recorded_id
     assert first['operation']['error'] == core.BUSY_ERROR
     assert first['request']['state'] == 'open'
     assert router.retry_pending() == 1  # still busy: attempted, stays failed

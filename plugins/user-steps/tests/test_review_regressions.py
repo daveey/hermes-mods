@@ -117,7 +117,9 @@ def test_startup_recovers_crashed_pending_and_checks_owner(tmp_path):
     receiver = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=runs)
     with TestClient(router_app(tmp_path, store(tmp_path), receiver)) as client:
         result = client.get('/operations/' + op['operationId'], params={'session': OWNER['storedSessionId']}).json()
-        assert result['operation']['dispatchState'] == 'delivered'
+        from async_receipt_support import await_operation
+        assert result['operation']['operationId'] == op['operationId']
+        await_operation(s, OWNER, oid=op['operationId'])
         assert len(runs.rows) == 1
     assert s.operation(foreign, oid=foreign_op['operationId'])['operation']['attempts'] == 0
 
@@ -132,7 +134,8 @@ def test_manual_recovery_after_busy_startup_and_session_isolation(tmp_path):
             return super().deliver(op)
     runs = Runtime(); receiver = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=runs)
     with TestClient(router_app(tmp_path, s, receiver)) as client:
-        assert s.operation(OWNER, oid=op['operationId'])['operation']['dispatchState'] == 'failed'
+        from async_receipt_support import await_operation
+        await_operation(s, OWNER, oid=op['operationId'], state='failed')
         url = '/operations/' + op['operationId'] + '/retry'
         assert client.post(url, params={'session': 'sibling'}).status_code == 404
         runs.busy = False
