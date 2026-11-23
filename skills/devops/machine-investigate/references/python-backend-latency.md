@@ -19,8 +19,12 @@ post-restart backlog.
 
 ## 2. Test for a GIL convoy
 
-- Per-thread context switches: sum the `voluntary_ctxt_switches` deltas from `/proc/<pid>/task/*/status` over 5 s,
-  ranked by thread `comm`, and compare with the whole box. Tens of thousands per second per thread, each thread
+- Per-thread context switches: `python3 <skill>/scripts/thread_cs.py <pid> 30` (deltas of
+  `/proc/<pid>/task/*/status` switches and CPU, ranked, with thread `comm`); keep it in the skill, not scratch,
+  which is pruned daily. Compare with the whole box.
+- Measure the serve Desktop is actually routed to: list every `serve --isolated` pid with start time and port,
+  and check which one the proxy forwards to. The updater replaces serves naturally, and a newer serve can run
+  different threads at a very different total, so record pid and start time with every number. Tens of thousands per second per thread, each thread
   well under 100% CPU, means a convoy.
 - User vs sys time: read `/proc/<pid>/stat` fields 14/15 over 5 s. Sys time close to user time means kernel
   overhead.
