@@ -318,7 +318,10 @@ def test_core_rejection_is_reported(plugin, fake, monkeypatch):
 
 # ---- provider -----------------------------------------------------------------------------------------
 
-def test_provider_returns_open_steps(plugin, fake):
+def test_provider_returns_open_steps(plugin, fake, monkeypatch):
+    us = plugin._user_steps()
+    monkeypatch.setattr(us, 'server_owner', lambda sid: dict(
+        gatewayId='example-install', profile='default', storedSessionId=sid))
     prov = fake.providers["user-steps"]
     assert prov("S1") is None
     call(plugin, {"kind": "decide", "items": [{"question": "Which region?", "choices": [
