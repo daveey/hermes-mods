@@ -39,6 +39,54 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+for (const name of ['tree_direct', 'tree_multihop', 'tree_cross_section', 'tree_group', 'tree_single', 'tree_cycle', 'tree_depth']) {
+ test(`real reducer ${name}: outline order, guides and exactly-once rows`, async () => {
+  const { model, now } = cases[name]
+  const entries = Object.values(model.sections).flat()
+  const all = [...entries, ...model.groups]
+  await paint(m.renderModel(model, { now }))
+  const drawn = [...document.querySelectorAll('[data-panel-row]')].map(n => n.dataset.panelRow)
+  assert.equal(drawn.length, all.length)
+  assert.equal(new Set(drawn).size, all.length)
+  for (const row of all) {
+   const node = [...document.querySelectorAll('[data-tree-node]')].find(n => n.dataset.treeNode === row.key)
+   assert.ok(node)
+   const article = [...document.querySelectorAll('[data-panel-row]')].find(n => n.dataset.panelRow === row.key)
+   assert.equal(article.querySelector('[data-ask-title]').textContent, row.title)
+   const expectedDetail = row.parent ? row.nested_detail ?? row.detail : row.detail
+   if (expectedDetail) assert.ok(article.textContent.includes(expectedDetail))
+   assert.equal(Number(node.dataset.treeDepth), row.depth)
+   if (row.parent) {
+    assert.equal(node.parentElement.dataset.treeGuide, '')
+    assert.equal(node.parentElement.style.paddingLeft, '15px')
+    assert.equal(node.parentElement.parentElement.dataset.treeNode, row.parent)
+    assert.ok(drawn.indexOf(row.parent) < drawn.indexOf(row.key))
+   }
+  }
+  assert.equal(document.querySelectorAll('[data-tree-guide]').length, new Set(entries.map(r => r.parent).filter(Boolean)).size)
+  if (name === 'tree_group') {
+   assert.equal(document.querySelectorAll('[data-open-own-card]').length, 4)
+   assert.equal(document.querySelector('[data-model-count="waiting"]').textContent, '3')
+   for (const n of document.querySelectorAll('[data-row-detail]')) assert.ok(!n.textContent.includes('waiting on:'))
+  }
+  if (name === 'tree_cross_section') {
+   assert.equal(document.querySelector('[data-model-section="running"] [data-tree-depth="1"] [data-row-pip]').dataset.rowPip, 'waiting')
+  }
+  await paint(m.renderModel(model, { now, collapsed: true }))
+  assert.equal(document.querySelectorAll('[data-panel-row]').length, 0)
+ })
+}
+
+test('old flat models render without parent fields', async () => {
+ const model = structuredClone(cases.tree_direct.model)
+ delete model.groups
+ for (const row of Object.values(model.sections).flat()) { delete row.parent; delete row.depth; delete row.nested_detail }
+ await paint(m.renderModel(model))
+ assert.equal(document.querySelectorAll('[data-panel-row]').length, 2)
+ assert.equal(document.querySelectorAll('[data-tree-guide]').length, 0)
+ assert.ok(document.body.textContent.includes('waiting on:'))
+})
+
 test('absolute timestamps render 38m and started 38 min ago at the local clock', async () => {
  const { model, now } = cases.relative_clock
  const before = JSON.stringify(model)
@@ -220,7 +268,7 @@ for (const [name, fixture] of Object.entries(publicCases).filter(([name]) => nam
  })
 }
 
-for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_'))) {
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_') && !name.startsWith('tree_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')

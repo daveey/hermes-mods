@@ -24,6 +24,10 @@ assert _spec_time is not None and _spec_time.loader is not None
 _relative = importlib.util.module_from_spec(_spec_time)
 _spec_time.loader.exec_module(_relative)
 relative = _relative.relative
+_spec_tree = importlib.util.spec_from_file_location('_panel_hierarchy', Path(__file__).with_name('hierarchy.py'))
+assert _spec_tree is not None and _spec_tree.loader is not None
+_hierarchy = importlib.util.module_from_spec(_spec_tree)
+_spec_tree.loader.exec_module(_hierarchy)
 
 SECTIONS = ('needs_you', 'stuck', 'running', 'waiting', 'ready', 'done')
 TERMINAL = {'done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'}
@@ -333,6 +337,34 @@ def wait_target(row, bundle, detail):
     return None
 
 
+def wait_parents(dep, bundle):
+    """Hydrated next hops shared by the wait label and outline; no source reads."""
+    hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
+    if text(obj(dep.get('wait')).get('waiting_on')):
+        primary = wait_target(dep, bundle, hydration)
+        return [primary] if primary else []
+    primary = wait_target(dep, bundle, hydration)
+    if primary:
+        return [primary]
+    linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
+    result = []
+    for pid in obj(hydration.get('links')).get('parents') or []:
+        rec = obj(obj(bundle.get('cards')).get(pid))
+        detail = obj(rec.get('detail'))
+        task = {**obj(linked.get(pid)), **obj(detail.get('task'))}
+        if not task.get('title') or task.get('status') in TERMINAL:
+            continue
+        owner = detail.get('owner')
+        task.update(id=pid, board=task.get('board') or rec.get('board') or dep.get('board'),
+                    gateway=task.get('home_gateway') or task.get('gateway') or
+                    (owner if isinstance(owner, str) else None) or
+                    (bundle.get('gateway') if detail.get('source') == 'live' else None),
+                    profile=task.get('profile') or dep.get('profile'))
+        if task.get('gateway') and task.get('profile'):
+            result.append(task)
+    return sorted(result, key=key)
+
+
 def wait_leaf(dependency, bundle):
     """Deepest unfinished hydrated parent; bounded, cycle-safe, and deterministic on ties."""
     best, best_depth = dependency, 0
@@ -346,29 +378,7 @@ def wait_leaf(dependency, bundle):
             continue
         if depth > best_depth:
             best, best_depth = dep, depth
-        hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
-        if text(obj(dep.get('wait')).get('waiting_on')):
-            # Each producer owns its own current wait, not merely the root row.
-            primary = wait_target(dep, bundle, hydration)
-            if primary:
-                pending.append((primary, depth + 1, visited | {identity}))
-            continue
-        parents = obj(hydration.get('links')).get('parents') or []
-        linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
-        for pid in parents:
-            rec = obj(obj(bundle.get('cards')).get(pid))
-            detail = obj(rec.get('detail'))
-            task = {**obj(linked.get(pid)), **obj(detail.get('task'))}
-            if not task.get('title') or task.get('status') in TERMINAL:
-                continue
-            owner = detail.get('owner')
-            task.update(id=pid, board=task.get('board') or rec.get('board') or dep.get('board'),
-                        gateway=task.get('home_gateway') or task.get('gateway') or
-                        (owner if isinstance(owner, str) else None) or
-                        (bundle.get('gateway') if detail.get('source') == 'live' else None),
-                        profile=task.get('profile') or dep.get('profile'))
-            if task.get('gateway') and task.get('profile'):
-                pending.append((task, depth + 1, visited | {identity}))
+        pending.extend((task, depth + 1, visited | {identity}) for task in wait_parents(dep, bundle))
     return best
 
 
@@ -574,6 +584,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     """Return JSON-safe PanelModel v1. Inputs are snapshots, and are never mutated."""
     sections = {s: [] for s in SECTIONS}
     rows_by_key = {}
+    dependency_prefixes = {}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
     # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
@@ -643,7 +654,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
             dep_state = f' ({dep_status})' if dep_status else ''
-            dependency_text = f'waiting on: {title}{dep_state}{location}' + (f' · {why}' if why else '') + age
+            dependency_prefix = f'waiting on: {title}{dep_state}{location}'
+            dependency_prefixes[k] = (key(dependency), dependency_prefix)
+            dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
                 wi['text'] = dependency_text
@@ -796,6 +809,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         result = clean(row.get('result'))
         v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
         sections['done'].append(v)
+    groups = _hierarchy.project(sections, rows_by_key, bundle, key=key, row_view=row_view,
+                                successors=lambda row: wait_parents(row, bundle),
+                                terminal=TERMINAL, prefixes=dependency_prefixes)
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
@@ -812,7 +828,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     label = HEADER_LABELS.get(state, state).replace('needs-you', 'needs you')
     source = 'canonical' if status else 'derived'
     result = {'version': 1, 'header': {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
-              'diagnostics': list(bundle.get('input_errors') or [])}
+              'groups': groups, 'diagnostics': list(bundle.get('input_errors') or [])}
     if wire:
         result = _relative.encode(result)
     result['revision'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
