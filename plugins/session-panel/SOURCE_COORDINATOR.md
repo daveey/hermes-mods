@@ -16,8 +16,17 @@ than supplement, four per-chat hydration slots:
 - one strict external acquisition slot: canonical `capture_external` with frozen
   ScopeDemands, never joined by local admission or full/catch-up consumers;
 - two pure projection slots, shared by board, `compute`, `_compute_all`, `_tick`,
-  full and catch-up routes. These call B2a `project_board` / `publish_projections`,
+  full, catch-up and keyed refresh routes. These call B2a `project_board` / `publish_projections`,
   not SQL, external capture or per-chat detail hydration.
+
+`Feed.queue_keyed` admits through the composed owner's `_admit` seam before
+recording `_keyed_pending`. A refusal leaves that pending set unchanged. The
+coordinator queues only registered watches, retaining first-unserved monotonic
+age and existing projection/source retry budgets; its reserved local slot
+registers new watches and reacquires changed input. `refresh_keyed` uses the same
+`full` tickets and publication fences, while Feed retains canonical producer
+ownership. The actual file watcher's fixed recovery branch uses this seam too;
+composition must not terminate that watcher or silently use legacy hydration.
 
 The optional completion service is a scheduler, not a fifth hydration slot.
 Manual construction and composition start no thread. `step()` starts requested

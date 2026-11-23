@@ -125,6 +125,21 @@ class SourceCoordinator:
                 if not self._projection_ready(s):
                     self._cancel_tickets(s, 'snapshot projection retry is pending or exhausted')
 
+    def _admit(self, sessions, at):
+        """Legacy keyed-hint seam; acquisition and projection keep one owner.
+
+        `at` belongs to the legacy lane's timing. This owner retains its existing
+        monotonic first-unserved ages and exact-source retry budgets instead.
+        Newly watched sessions are registered by the reserved local slot.
+        """
+        with self.lock:
+            if self.closed or self.feed.stopped.is_set():
+                raise RuntimeError('snapshot coordinator is closed')
+            self._queue(sessions)
+            self._local_requested = self._external_requested = True
+        self.service_wake.set()
+        self.feed._board.set()
+
     def _projection_ready(self, session):
         attempt = self.projection_attempts[session]
         return (not attempt.count or
