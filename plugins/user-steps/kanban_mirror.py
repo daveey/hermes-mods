@@ -53,6 +53,11 @@ def _mark_remote_fresh(key, started):
             del _REMOTE_FRESH[next(iter(_REMOTE_FRESH))]
 
 
+def _clear_remote_fresh(key):
+    with _REMOTE_FRESH_LOCK:
+        _REMOTE_FRESH.pop(key, None)
+
+
 def _remote_fresh(key, within_s):
     with _REMOTE_FRESH_LOCK:
         started = _REMOTE_FRESH.get(key)
@@ -787,9 +792,14 @@ class Mirror:
             logging.getLogger('user-steps').warning('Remote card reconciliation unavailable: %s', exc)
         # Local cards are mirrored whether or not the remote projection answered. A strict caller
         # learns of the deferred remote work afterwards, never instead of the local pass.
-        self._reconcile_local(owner, strict)
-        if strict and deferred is not None:
-            raise deferred
+        try:
+            self._reconcile_local(owner, strict)
+            if strict and deferred is not None:
+                raise deferred
+        except BaseException:
+            if strict:  # the last strict pass failed: polls reconcile in full until a clean one
+                _clear_remote_fresh(key)
+            raise
         if strict:  # both halves clean (a strict local pass raises when it is not)
             _mark_remote_fresh(key, started)
 

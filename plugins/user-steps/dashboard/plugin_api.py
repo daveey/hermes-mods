@@ -68,8 +68,10 @@ async def _on_decision(fn, *args):
 RETRY_INTERVAL_S = float(os.environ.get('HERMES_USER_STEPS_RETRY_S', '15'))
 RETRY_MAX_ATTEMPTS = 240
 # GET /requests skips the remote card pass for an owner whose strict feed pass finished cleanly within this window
-# (``Mirror.reconcile_poll``); 0 turns the skip off. Matches the linked-card projection's max age.
-FEED_FRESH_S = float(os.environ.get('HERMES_USER_STEPS_FEED_FRESH_S', '15'))
+# (``Mirror.reconcile_poll``); 0 turns the skip off. The session-panel feed re-runs that pass whenever its sources
+# (boards, hub replica, origin stores) move and at least every 60 s (``PRODUCER_FULL_EVERY_S``), so a quiet chat
+# stays covered between passes; a change the feed's sources don't see shows at most this late.
+FEED_FRESH_S = float(os.environ.get('HERMES_USER_STEPS_FEED_FRESH_S', '60'))
 
 
 _LOAD_LOCK = threading.Lock()

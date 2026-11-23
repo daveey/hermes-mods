@@ -107,3 +107,23 @@ def test_requests_route_skips_remote_only_when_fresh(tmp_path):
     assert second.status_code == 200
     assert len(calls) == before  # fresh: the poll skipped the remote pass
     assert second.json()['requests'] == first.json()['requests']
+
+
+def test_a_failed_strict_pass_clears_an_earlier_fresh_mark():
+    self, remote, _ = fake()
+    mirror_mod.Mirror.reconcile(self, OWNER, strict=True)  # clean: fresh
+    failing, failing_remote, _ = fake(remote_result=False)  # the next feed pass defers
+    with pytest.raises(RuntimeError):
+        mirror_mod.Mirror.reconcile(failing, OWNER, strict=True)
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 60)
+    assert len(remote) == 2  # the poll ran the remote pass itself
+
+
+def test_a_failed_local_strict_pass_clears_an_earlier_fresh_mark():
+    self, remote, _ = fake()
+    mirror_mod.Mirror.reconcile(self, OWNER, strict=True)
+    failing, _, _ = fake(local_clean=False)
+    with pytest.raises(RuntimeError):
+        mirror_mod.Mirror.reconcile(failing, OWNER, strict=True)
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 60)
+    assert len(remote) == 2
