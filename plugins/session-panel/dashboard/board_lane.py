@@ -280,7 +280,7 @@ class BoardLane:
             changed = f._publish({session: bundle}, watch_tokens={session: token})
             with f.lock:
                 error = bool(f.bundles.get(session, {}).get('source_stale'))
-                if not error and session not in self.pending:
+                if not error and session not in self.pending and session not in f._board_dirty:
                     f._board_failures.discard(session)
             finished = time.time()
             entry = {'session': session, 'admitted_at': admitted_at, 'pass_started_at': started,

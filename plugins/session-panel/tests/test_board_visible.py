@@ -1,5 +1,6 @@
 """Only mounted panels create BoardLane hydration demand (sidebar interest does not)."""
 import time
+import threading
 
 from test_feed import Readers, feedmod
 
@@ -97,4 +98,39 @@ def test_flag_off_restores_hidden_admission(monkeypatch):
         settle(lane)
         assert sorted(reads) == ['S1', 'S2']
     finally:
+        lane.close()
+
+
+def test_old_visible_read_cannot_vouch_for_new_hidden_dirty_work(monkeypatch):
+    f, lane, reads = setup(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    compute = f.compute
+    pushed = []
+    f.emit = pushed.append
+    def slow(session, **kw):
+        bundle = compute(session, **kw)  # snapshot predates the later board event
+        entered.set()
+        assert release.wait(2)
+        return bundle
+    f.compute = slow
+    try:
+        f.changes_bytes([], subscriber='window', visible_session='S1')
+        lane.service()
+        lane._admit({'S1'}, time.time())
+        lane.service()
+        assert entered.wait(1)
+        f.changes_bytes([], subscriber='window', visible_session=None)
+        lane.service()
+        lane._admit({'S1'}, time.time())  # newer delta after panel detached
+        release.set()
+        settle(lane)
+        assert f._board_dirty == {'S1'}
+        assert 'S1' in f._board_failures
+        pushed.clear()
+        f.last_emit = 0
+        f._publish({}, heartbeat=True)
+        assert len(pushed) == 1
+        assert 'S1' not in pushed[-1]['fresh']
+    finally:
+        release.set()
         lane.close()
