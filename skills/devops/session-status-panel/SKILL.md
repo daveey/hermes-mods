@@ -108,6 +108,8 @@ When the panel disagrees with the board ("nothing running", missing dependency, 
 
 ## Pitfalls and verification
 
+Before claiming BoardLane load reduction, read `references/aggregate-board-load.md` (per-session versus global duty; churn-complete thread measurement).
+
 - In live DB-open samplers, trace attachment can precede source-write observation by a warmup interval. Exclude trace opens outside the measured interval (or observe source stamps before attachment), and keep no-history opens unknown rather than inventing a >2 s lag. Report the raw orphan field and the boundary correction separately. A timing file updated only after completed passes is right-censored during a slow pass: retain its eventual completion and distinguish overlapping-pass statistics from completed publications inside the CPU window.
 
 - Match JavaScript safe-integer wire semantics in Python status-envelope validators: JSON round-trips may decode integer-valued numbers as floats, so accept finite, nonnegative integer-valued `int`/`float` values up to `9007199254740991`, but reject booleans, strings, fractions, negative/non-finite and unsafe values. Test real JSON round-trips and all three numeric fields. When testing a missing canonical status, assert the derived header source and null status separately from row text; preserve answered-ask one-line recovery/dedup assertions. Test legacy-envelope rejection separately from canonical backend-authored labels, and run the whole Desktop-plugin glob, not only producer-to-DOM fixtures.
