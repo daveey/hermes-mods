@@ -280,12 +280,29 @@ export function attentionStore(ctx) {
   return store
 }
 
+// Match the sidebar's canonicalOutcomeStatus validation and live-row boundary.
+// The SDK has no canonical selector export. Fail closed on unknown envelopes:
+// needs_you is evidence of an ask, not proof that its session actually paints red.
+export function hasRedAskCoverage(session) {
+  if (session.archived || session.offline_cached) return false
+  const status = session.outcome?.status
+  const strings = value => Array.isArray(value) && value.every(item => typeof item === 'string')
+  const count = value => Number.isSafeInteger(value) && value >= 0
+  return Boolean(status && status.status_version === 1 &&
+    ['done', 'unresolved', 'muted', 'decision', 'waiting', 'running'].includes(status.kind) &&
+    count(status.revision) && count(status.generation) && status.identity &&
+    ['gateway', 'profile', 'session_id', 'owner_epoch'].every(key =>
+      typeof status.identity[key] === 'string' && status.identity[key].length > 0) &&
+    ['complete', 'unknown'].includes(status.coverage?.state) && strings(status.coverage?.reasons) &&
+    status.presentation?.stripe === 'stuck' && strings(status.presentation?.reason_codes))
+}
+
 export function uncoveredAsks(view, sessions, match = () => true) {
   if (!view?.attention?.available) return []
   // SDK rows precede plugin filters. Apply the very same registered matcher
   // before treating a chat as coverage; otherwise a lane-hidden ask disappears.
   return view.attention.rows.filter(row => sessions == null ? row.unlinked :
-    !sessions.some(session => match(session) && (session.needs_you || []).some(ask =>
+    !sessions.some(session => match(session) && hasRedAskCoverage(session) && (session.needs_you || []).some(ask =>
       ask.kind === 'card' && ask.ref === `${row.target?.board || 'default'}/${row.id}`)))
 }
 
