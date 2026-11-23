@@ -70,6 +70,10 @@ never ending in a catch-all such as "any other guard refusal": workers then stop
 (`scripts/check` health, lint, tests) fail on lines their round just wrote. Allow a bounded number of such
 own-line fixes inside the round instead. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
+After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
+after `respawn_guarded` `active_pr` is held by the duplicate-PR guard, because `promoted_manual` is not a handoff.
+Run `hermes kanban resume <id> --reason <why this owner continues THAT PR>`. It records one continuation, and the
+next tick claims the card.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
 Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
