@@ -1247,10 +1247,22 @@ def steps_payload(ledger: "Ledger", session: str) -> dict:
 
 def _canonical_open(step: dict) -> bool:
     """False only when the step's canonical request is provably decided or retired; any doubt keeps it open."""
-    if not step.get("requestId") or not (home() / "user-steps" / "actions.sqlite3").is_file():
+    if not (home() / "user-steps" / "actions.sqlite3").is_file():
         return True
     try:
-        r = ActionStore().get(server_owner(step.get("session") or ""), step["requestId"])
+        owner = server_owner(step.get("session") or "")
+        store = ActionStore()
+        if step.get("requestId"):
+            r = store.get(owner, step["requestId"])
+        else:
+            # Explicit session_outcome steps can be migrated without writing a
+            # requestId into the legacy ledger. Only a qualified alias of this
+            # exact owner establishes identity; equal text/id elsewhere cannot.
+            ref = dict(gatewayId=owner['gatewayId'], profile=owner['profile'],
+                       type='user_step', id=step.get('id'))
+            r = next((r for r in store.requests(owner) if ref in r.get('aliases', [])), None)
+            if r is None:
+                return True
         return r["state"] in ("open", "needs_context") and not r.get("resolution")
     except Exception:
         return True

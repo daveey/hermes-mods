@@ -439,6 +439,44 @@ def test_alternating_busy_closed_chat_delivers_all_on_next_turn(turn_delivery):
     assert not any(panel.recorded(r) for r in s.requests(OWNER))
 
 
+@pytest.mark.parametrize('choice,state,text', [('approve', 'resolved', None),
+                                             ('revise', 'superseded', 'Need another plan'),
+                                             ('decline', 'cancelled', None)])
+def test_aliased_step_without_request_id_follows_terminal_request(turn_delivery, choice, state, text):
+    plugin, s = turn_delivery
+    lg = plugin.core.Ledger()
+    step = plugin.core.add_step('session-a', 'Choose the example configuration', ['One', 'Two'], ledger=lg)
+    assert not step.get('requestId')
+    ref = dict(gatewayId=OWNER['gatewayId'], profile=OWNER['profile'], type='user_step', id=step['id'])
+    r = s.create(OWNER, request(aliases=[ref]))
+    assert plugin.core.open_steps('session-a', lg)
+    oid = s.decide(OWNER, decision(r, choice=choice, text=text))['operation']['operationId']
+    s.dispatch(OWNER, oid, plugin.cards_mod.DecisionInbox())
+    assert s.get(OWNER, r['requestId'])['state'] == state
+    assert plugin.core.open_steps('session-a', lg) == []
+    # Projection only: no synthetic resolution is written to the raw ledger.
+    assert lg.read('session-a')['steps'][0]['status'] == 'open'
+
+
+@pytest.mark.parametrize('mismatch', ['session', 'profile', 'gateway', 'alias-profile', 'alias-gateway', 'source-only'])
+def test_alias_projection_never_closes_unrelated_step(turn_delivery, mismatch):
+    plugin, s = turn_delivery
+    lg = plugin.core.Ledger()
+    step = plugin.core.add_step('session-a', 'Choose the example configuration', ['One', 'Two'], ledger=lg)
+    own = OWNER.copy()
+    if mismatch in ('session', 'profile', 'gateway'):
+        own[{'session': 'storedSessionId', 'profile': 'profile', 'gateway': 'gatewayId'}[mismatch]] = 'other'
+    ref = dict(gatewayId=OWNER['gatewayId'], profile=OWNER['profile'], type='user_step', id=step['id'])
+    if mismatch == 'alias-profile': ref['profile'] = 'other'
+    if mismatch == 'alias-gateway': ref['gatewayId'] = 'other'
+    body = request(aliases=[] if mismatch == 'source-only' else [ref]); body['owner'] = own
+    if mismatch == 'source-only': body['scope']['sourceRefs'] = [ref]
+    r = s.create(own, body)
+    oid = s.decide(own, decision(r))['operation']['operationId']
+    s.dispatch(own, oid, plugin.cards_mod.DecisionInbox())
+    assert step['id'] in [v['id'] for v in plugin.core.open_steps('session-a', lg)]
+
+
 class BusyReceiver:
     """Models the owning runtime refusing admission while the session is mid-turn."""
     def __init__(self): self.busy = True; self.delivered = []

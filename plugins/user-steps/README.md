@@ -784,7 +784,12 @@ failures are not acknowledged. Kanban aliases remain on their qualified delivery
 path. Existing canonical receipts stay visible without duplicate inbox rows or
 repeat delivery. Tests in `test_decisions.py` cover alternating busy/closed owners,
 all decisions in one turn, owner isolation, both lease directions and interrupted
-retry recovery. The hook omits recorded decisions from its unanswered-request list
+retry recovery. `open_steps` also follows an exact owner-qualified `user_step`
+alias when a legacy session-outcome ledger step lacks `requestId`: a decided or
+retired canonical request no longer leaves that step in the outcome's human asks.
+This is read-only projection, not a synthetic model decision or ledger mutation;
+foreign owners/aliases and scope citations alone never close a step. The hook
+omits recorded decisions from its unanswered-request list
 so an admitted approval is not contradicted before the composite commit.
 Live packaged Desktop/end-to-end runtime acceptance remains outstanding.
 
