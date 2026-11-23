@@ -59,7 +59,12 @@ retries via the existing Feed backoff. A changed source or changed exact demand
 renews only the corresponding budget. Adding another chat does not reset an
 exhausted peer. Partial/failed acquisitions keep held known rows and explicit
 unknown coverage. Registration and pure-projection failures have finite retries
-as well; full/heartbeat do not clear failed strict capture custody. Basic Feed
+as well; full/heartbeat do not clear failed strict capture custody. A source
+retry deadline is bounded by its reader role's eligibility; an exhausted role
+cannot busy-spin on an older source deadline. Unchanged full/catch-up reads
+settle their tickets with a retry error, rather than spending extra pure attempts
+while backoff is pending or exhausted. A genuinely changed acquired source or
+exact demand can renew that projection budget. Basic Feed
 resume retains the failed-capture exclusion from `fresh`.
 
 ## Lifecycle, rollback and next acceptance

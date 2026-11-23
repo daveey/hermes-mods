@@ -90,8 +90,16 @@ class SourceCoordinator:
 
     def retry_at(self):
         with self.lock:
-            ats = [a.retry_at for s, a in self.attempts.items() if a.retry_at is not None
-                   and ('external' if s == self.external else 'local') not in self.acquiring]
+            ats = []
+            for source, attempt in self.attempts.items():
+                role = 'external' if source == self.external else 'local'
+                owner = self.role_attempts[role]
+                if (attempt.retry_at is None or role in self.acquiring
+                        or (owner.count and owner.retry_at is None)):
+                    continue
+                # A source deadline cannot wake earlier than its owning reader
+                # role can actually run, or spin behind an exhausted role.
+                ats.append(max(attempt.retry_at, owner.retry_at or attempt.retry_at))
             ats += [a.retry_at for s, a in self.projection_attempts.items()
                     if a.retry_at is not None and s not in self.active]
             ats += [a.retry_at for role, a in self.role_attempts.items()
@@ -114,6 +122,13 @@ class SourceCoordinator:
                     self.projection_attempts[s] = Attempt(demands=signature)
                 self.pending.setdefault(s, time.monotonic_ns())
                 self.feed._board_failures.add(s)
+                if not self._projection_ready(s):
+                    self._cancel_tickets(s, 'snapshot projection retry is pending or exhausted')
+
+    def _projection_ready(self, session):
+        attempt = self.projection_attempts[session]
+        return (not attempt.count or
+                (attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at))
 
     def _register(self, rd):
         # Runs only in the single local acquisition slot. Lineage is source
@@ -351,13 +366,16 @@ class SourceCoordinator:
             for s, attempt in self.projection_attempts.items():
                 if attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at:
                     self.pending.setdefault(s, time.monotonic_ns())
-                    attempt.retry_at = None
             for s in sorted(self.pending, key=lambda s: (self.pending[s], s)):
                 if len(self.active) >= self.capacity:
                     break
                 if s in self.active or s not in self.chats:
                     continue
+                if not self._projection_ready(s):
+                    self._cancel_tickets(s, 'snapshot projection retry is pending or exhausted')
+                    continue
                 self.pending.pop(s)
+                self.projection_attempts[s].retry_at = None
                 worker = threading.Thread(target=self._project, args=(s,),
                                           name='session-panel-projection-' + s[:12], daemon=True)
                 self.active[s] = worker
