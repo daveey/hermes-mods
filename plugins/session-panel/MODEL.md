@@ -243,7 +243,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
         "source": {"enum": ["canonical", "derived"]},
         "state": {"type": "string"},
         "status": {"type": ["object", "null"], "description": "Validated core status_version=1 envelope, preserved with identity, revision, generation, coverage and presentation."},
-        "wait_kind": {"enum": ["ci", "deploy"], "description": "Set when the header is waiting and every waiting row waits on CI or a deploy: the header dot paints light blue."},
+        "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "Set when every waiting row has known custody: producer waits paint light blue; agent decisions paint blue. Mixed agent/producer waits use agent blue."},
         "counts": {
           "type": "object",
           "required": ["needs_you", "stuck", "running", "waiting", "ready", "done"],
@@ -254,7 +254,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
           "properties": {
             "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
             "count": {"type": "integer", "minimum": 1}, "label": {"type": "string"},
-            "wait_kind": {"enum": ["ci", "deploy"]}
+            "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]}
           }
         }}
       }
@@ -281,7 +281,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
         "parent": {"type": ["string", "null"]},
         "depth": {"type": "integer", "minimum": 0, "maximum": 4},
         "nested_detail": {"type": "string"},
-        "wait_kind": {"enum": ["ci", "deploy"]},
+        "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]},
         "status": {"type": "string"},
         "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
         "gateway": {"type": "string"}, "profile": {"type": "string"}, "board": {"type": "string"},
@@ -374,7 +374,13 @@ Order matters, matching Desktop `classify`:
    requests. Retired/resolved requests do not re-open decisions; a still-blocked
    owner remains discoverable as status. **Never infer a human wait from preserved
    `block_kind` alone**. Scheduled external watches without requests stay Waiting.
-4. Blocked upstream -> Waiting, unless core says stalled. Core stalled verdict
+4. Nonhuman triage/administratively held blocked cards -> Waiting, blue (`wait_kind=agent`),
+   naming the chat agent and its current decision reason. Retained next steps, spend holds and
+   creator decisions are presentation evidence, never permission to resume. Canonical nonhuman
+   wait ownership suppresses preserved old human fields; a currently open owner-bound request
+   remains an ask. Named CI/deploy/clock and running-card producers take precedence and paint
+   light blue. Shared off-list held blockers use the same palette and actor wording.
+   Blocked upstream -> Waiting, unless core says stalled. Core stalled verdict
    precedes unknown execution evidence and fresh parked lifecycle.
 5. Fresh (<=60s) parked board lifecycle may explain ready/todo/review/triage/
    scheduled/blocked without proving executor liveness. Expired/missing/ambiguous
