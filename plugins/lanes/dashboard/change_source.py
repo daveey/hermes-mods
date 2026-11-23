@@ -12,6 +12,7 @@ class Source:
         self.paths = ()
         self.fallback = False
         self.stamp = None
+        self.pending = True  # only a completed capture may consume invalidation
 
     def _stamp(self):
         from pathlib import Path
@@ -40,8 +41,9 @@ class Source:
                 if self.events is None:
                     from hermes_cli.annotation_file_events import FileEvents
                     self.events = FileEvents()
-                elif not self.events.wait(0):
+                elif not self.events.wait(0) and not self.pending:
                     return self.value
+                self.pending = True
                 # Install before capture, preserving arrivals during SQL for a
                 # trailing read. First capture discovers source paths, then reads
                 # again with coverage installed so discovery cannot swallow a write.
@@ -53,6 +55,7 @@ class Source:
                     self.paths = paths
                     self.events.replace(paths)
                     self.value, _ = capture()
+                self.pending = False
                 return self.value
             except (ImportError, NotImplementedError, OSError):
                 self.fallback = True

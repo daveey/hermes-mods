@@ -769,6 +769,7 @@ class Feed:
                                    and s not in self._retry and s not in self._carried
                                    and s not in self._decision_failures
                                    and s not in self._board_failures
+                                   and s not in self._board_dirty
                                    and s not in self._board_capture_failures
                                    and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (

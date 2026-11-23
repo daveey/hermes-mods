@@ -211,7 +211,9 @@ class BoardLane:
                         visible = {s for s, expires in f._panel_subscribers.values() if expires > f.clock()}
                         # External inputs were not captured for hidden panels. Retain
                         # dirty demand so attachment hydrates a current snapshot.
-                        f._board_dirty.update(set(held) - visible)
+                        hidden = set(held) - visible
+                        f._board_dirty.update(hidden)
+                        f._board_failures.update(hidden)  # stale until attach hydration succeeds
                         held = {s: b for s, b in held.items() if s in visible}
                 captured = self.external_captures
                 external_dirty = set()

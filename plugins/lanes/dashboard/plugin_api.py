@@ -418,6 +418,10 @@ def _capture_cursor():
     kbc, _, cli = mods
     cursors, paths = [], []
     with kbc.connect_closing() as conn:
+        from hermes_cli import kanban_worker_node as wn
+        # Cover configured replica creation/replacement even when opening it
+        # fails transiently. Recovery must not depend on a local board write.
+        paths.append(str(wn._replica_path(conn)))
         replica = cli._fleet(conn, local=False)
         try:
             for db in (conn, replica):
