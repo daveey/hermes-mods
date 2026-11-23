@@ -22,6 +22,8 @@ Remote cards are commented and unblocked on their own host; `cross_task` only re
 "For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
 - Workers: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+  A `foreign_card: ... was created on worker-aN and lives there` refusal on archive/edit is the same route:
+  `hub-worker-exec worker-aN -- 'hermes kanban archive <id>'` (the `--` is required).
 - Live counts across gateways (the inventory printed `unreachable ...`, or the report needs this turn's statuses):
   one read-only sqlite script looping over `kanban.db` and `kanban/boards/*/kanban.db`, copied to the hub and run
   there, on every online worker with `~/.hermes/bin/hub-worker-exec all --timeout 60 -- /tmp/<script>` (offline ones
