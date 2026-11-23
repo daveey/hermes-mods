@@ -192,11 +192,18 @@ def board_factory(fleet_root, containment):
                 level: [dict(route, model=model)] for level, model in (
                     ("fast", "fake-model"), ("standard", "fake-model"),
                     ("deep", "fake-model"))}}
-            with (self.hermes_home / "config.yaml").open("a", encoding="utf-8") as config:
-                config.write("\nmodel_routing: " + json.dumps(policy) + "\n")
-                config.write("custom_providers: " + json.dumps([{
-                    "name": "fleet-fixture", "base_url": self.base_url,
-                    "api_key": "sk-fake-e2e"}]) + "\n")
+            from ruamel.yaml import YAML
+            yaml = YAML(typ="safe")
+            config_path = self.hermes_home / "config.yaml"
+            config = yaml.load(config_path.read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                raise TypeError("fixture config must be a YAML mapping")
+            config["model_routing"] = policy
+            config["custom_providers"] = [{
+                "name": "fleet-fixture", "base_url": self.base_url,
+                "api_key": "sk-fake-e2e"}]
+            with config_path.open("w", encoding="utf-8") as stream:
+                yaml.dump(config, stream)
             # Preserve the generated fixture config, but avoid HOME/.hermes/state.db
             # (correctly rejected as a default home by the core test guard).
             self.hermes_home.rename(self.root / "runtime")
