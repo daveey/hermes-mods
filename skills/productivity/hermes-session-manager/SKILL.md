@@ -186,6 +186,16 @@ say what's running, never what needs the user.
   needs a new ask) and whether the credential scope is auto-tier. If so, do it and skip the ask.
   `choices[].recommended` accepts only `true`: put it on the choice that is the safe default (decline/keep for
   irreversible deletes), and omit the field on the others.
+- "Spend budget decision: <title>" cards (body "Card X has stopped. No chat owns its decision") are administrative wrappers. The system raises them as asks to David, but they are not his decisions.
+  1. Read the source card's stop reason and the cards it names.
+  2. If the premise is gone (the named cards moved on, or the source says its premises are superseded), comment that on the source, then archive both the source and the wrapper.
+  3. Otherwise comment the disposition on the source (held, no new spend) and archive only the wrapper.
+  4. Check `task_links` for children first, then withdraw the ask with `action_request`.
+  5. If David asks what one means, explain the source work in plain words: what it builds, why it stopped, what fixing it would take.
+  Don't relay the wrapper's "Unblock = promote" line. A source held by a safety refusal ignores `promote`, which prints success without applying it.
+- A scope-stopped card owned by another chat: that owner often posts its renewal mandate comment minutes before (or without) running `renew-scope` and `promote`.
+  - After the mandate comment, read `task_events` for `scope_renewed` or `promoted`; a mandate comment alone releases nothing.
+  - If neither has run, or `cross_session` to the owner is refused ("active in another window"), file one 1-run pool card. It re-checks the card, and only if the card is still stopped posts a single hub comment to the owner naming the exact `renew-scope --episode <uid> --mandate-comment <id>` command, then reads it back. Owners answer such comments, so no second card or chat relay is needed.
 - When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
   pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
