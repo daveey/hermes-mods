@@ -3263,6 +3263,7 @@ class ActionStore:
                     continue
                 op = self.operation(owner, oid)['operation']
                 if (op['dispatchState'] not in ('failed', 'pending')
+                        or op.get('uncertainAttempts')
                         or op.get('error') not in (BUSY_ERROR, OWNER_WAIT_ERROR)
                         or any(ref['type'] == 'kanban' for ref in op['intent']['request']['aliases'])):
                     continue
@@ -3298,10 +3299,25 @@ class ActionStore:
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            if 'uncertainAttempts' not in op and op.get('attempts', 0):
+                refused = op.get('error') in (BUSY_ERROR, OWNER_WAIT_ERROR)
+                if op['dispatchState'] == 'pending':
+                    started = op.get('dispatchStartedAt')
+                    at = (op.get('lastError') or {}).get('at')
+                    refused = refused and bool(started and at and at >= started)
+                if not refused:
+                    # Preserve pre-upgrade I/O uncertainty across a later busy
+                    # retry too; only a canonical receipt can discharge it.
+                    op['uncertainAttempts'] = ['legacy-uncertain']
             op['attempts'] += 1
             from datetime import datetime, timezone
             op['dispatchStartedAt'] = datetime.now(timezone.utc).isoformat()
             op['dispatchState'] = 'pending'
+            # Shared dispatch leases allow overlapping retries. Track each I/O
+            # separately: another attempt's refusal cannot discharge this one's
+            # crash/transport uncertainty, regardless of completion order.
+            attempt_id = str(uuid.uuid4())
+            op['uncertainAttempts'] = [*op.get('uncertainAttempts', []), attempt_id]
             # The previous refusal says nothing about this attempt's external
             # I/O. A crash must leave uncertainty, not reusable refusal evidence.
             op.pop('error', None); op.pop('lastError', None)
@@ -3335,6 +3351,9 @@ class ActionStore:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            if busy or owner_wait:
+                op['uncertainAttempts'] = [key for key in op.get('uncertainAttempts', [])
+                                           if key != attempt_id]
             if terminal_refused:
                 return self._retire_operation(c, owner, oid, by='system',
                     reason='Remote card answer retired', evidence='Authenticated owner terminal refusal')
@@ -3347,6 +3366,7 @@ class ActionStore:
             if confirmed:
                 cancelled = receipt.get('terminalCancelled') is True
                 op.update(dispatchState='cancelled' if cancelled else 'delivered', receipt=receipt)
+                op.pop('uncertainAttempts', None)
                 if early_tool_call_id and early_binding is not None:
                     op['clarifyBinding'] = early_binding  # the exact question this early answer was bound to
                 op.pop('error', None); op.pop('lastError', None)
