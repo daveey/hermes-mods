@@ -128,6 +128,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
   function subscribe(initial, onView, onLive, timers = globalThis) {
     let params = initial, disposed = false, socket, off, poll, watchdog, retry
     let epoch = 0, frames = 0, live = false, attempt = 0, connections = 0, started = false
+    let warmingPoll
     const bounded = (promise) => new Promise((resolve, reject) => {
       const timer = timers.setTimeout(() => reject(Error('Lanes socket bridge timed out')), REQUEST_TIMEOUT_MS)
       Promise.resolve(promise).then(resolve, reject).finally(() => timers.clearTimeout(timer))
@@ -139,6 +140,8 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
         const view = await read(params.hours, params.window, params.expanded)
         if (!disposed && at === epoch && before === frames) {
           onView(view)
+          timers.clearTimeout(warmingPoll)
+          if (view?.warming) warmingPoll = timers.setTimeout(() => { if (!disposed) void fetch() }, 1000)
           if (redial && started && previousTarget !== chosen?.connectionId) {
             epoch += 1; off?.(); off = undefined; socket?.close(); socket = undefined
             timers.clearTimeout(watchdog); timers.clearTimeout(retry)
@@ -164,6 +167,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       if (!live) { live = true; onLive(true); timers.clearInterval(poll); poll = undefined }
       attempt = 0
       if (frame?.view) {
+        timers.clearTimeout(warmingPoll)
         frames += 1; onView(frame.view)
         // version 1 is a new connection: refresh once, not on ordinary updates.
         if (frame.version === 1 && connections++ > 0) void fetch()
@@ -223,7 +227,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     start()
     const stop = () => {
       disposed = true; epoch += 1; off?.(); socket?.close()
-      timers.clearInterval(poll); timers.clearTimeout(watchdog); timers.clearTimeout(retry)
+      timers.clearInterval(poll); timers.clearTimeout(watchdog); timers.clearTimeout(retry); timers.clearTimeout(warmingPoll)
     }
     stop.update = (next) => {
       params = next
@@ -645,7 +649,7 @@ export function Floor({ list, flow, flowError, draft, saving, edit, onOpen }) {
 
 /** Mockup B: sources → lanes → flowing steps or dams, a dam labelled with what clears it. */
 export function Flow({ flow, flowError, by, onBy, list, onEditLimits }) {
-  if (!flow || flow.configured === false) return h('div', { className: 'hermes-lanes-note', 'data-view': 'flow' }, flowError ? `Flow unavailable: ${flowError}` : 'Loading…')
+  if (!flow || flow.warming || flow.configured === false) return h('div', { className: 'hermes-lanes-note', 'data-view': 'flow' }, flow?.warming ? 'Loading…' : flowError ? `Flow unavailable: ${flowError}` : 'Loading…')
   const graph = flowGraph(flow, by)
   const geo = sankey(graph)
   const color = Object.fromEntries(list.map((r) => [r.name, r.color]))
@@ -698,7 +702,7 @@ export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, s
   const [draft, setDraft] = useState({})
   const [tab, setTabState] = useState(() => loadTab(storage))
   const [by, setByState] = useState(() => loadBy(storage))
-  if (!snap) return h('div', { className: 'hermes-lanes-note' }, error ? `Unavailable: ${error}` : 'Loading…')
+  if (!snap || snap.warming) return h('div', { className: 'hermes-lanes-note' }, snap?.warming ? 'Loading…' : error ? `Unavailable: ${error}` : 'Loading…')
   if (!snap.configured) return h('div', { className: 'hermes-lanes-note' }, snap.reason || 'No lanes are configured.')
   const list = rows(snap, draft)
   const pending = changes(snap, draft, flow)
@@ -942,6 +946,7 @@ export function Lanes({ ctx }) {
       return false
     } finally { setSaving(false) }
   }
+  if (snap?.warming) return h('div', { className: 'hermes-lanes-note', 'data-view': 'warming' }, 'Loading…')
   if (!working) return null
   const list = rows(snap)
   // A lane pill selects/deselects that lane for the totals on the right; only the arrow expands or collapses.

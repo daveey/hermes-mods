@@ -151,12 +151,12 @@ def test_get_flow_returns_the_same_expanded_view(monkeypatch):
     api = load()
     view = {'configured': True, 'totals': {'open': 9}, 'floor': {'cells': []}, 'flow': {'graphs': {}}}
     monkeypatch.setattr(api, '_lane_view', lambda *args: view)
-    expected = dict(view, stale_seconds=0.)
     app = FastAPI()
     app.include_router(api.router)
     with TestClient(app) as client:
         first = client.get('/v1/lanes?hours=6&window=6h&expanded=true').json()
         second = client.get('/v1/lanes/flow?window=6h').json()
-        assert first == expected
+        assert first.pop('stale_seconds') >= 0.
+        assert first == view
         assert second.pop('stale_seconds') >= 0.
         assert second == view

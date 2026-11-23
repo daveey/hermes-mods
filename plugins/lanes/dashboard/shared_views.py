@@ -10,43 +10,47 @@ class SharedViews:
         self.busy = set()
         self.values = {}  # legal (hours, window, expanded) keys only: at most 32
 
-    def get_stale(self, key, epoch, compute):
+    def warm(self, key, epoch, compute):
+        """Start one exact-key compute without lending the caller's thread."""
+        with self.condition:
+            if key in self.busy:
+                return
+            self.busy.add(key)
+            try:
+                worker = threading.Thread(target=self._refresh, args=(key, epoch, compute),
+                                          name='lanes-view-refresh', daemon=True)
+                worker.start()
+                return worker
+            except RuntimeError:
+                import logging
+                logging.getLogger(__name__).exception('lanes view refresh could not start')
+                self.busy.remove(key)
+                self.condition.notify_all()
+
+    def get_stale(self, key, epoch, compute, *, max_age=120., cold_wait=1.):
         """Return a completed view immediately; refresh one exact key off-request.
 
-        A key with no previous view uses the normal single-flight cold path.
-        Age is measured from completion, never from refresh start, and response
-        metadata is copied so readers cannot mutate the stored view.
+        Cold/over-age keys wait at most cold_wait seconds, then expose only a
+        warming marker. Never serve an arbitrarily old value behind a blocked
+        refresh, and never start duplicate workers to replace an uncancellable
+        Python thread. Use a real monotonic deadline even with an injected clock.
         """
+        deadline = time.monotonic() + cold_wait
         with self.condition:
+            old = self.values.get(key)
+            age = max(0., self.clock() - old[1]) if old is not None else float('inf')
+            if old is None or old[0] != epoch or age >= min(self.ttl, max_age):
+                self.warm(key, epoch, compute)
             while True:
                 old = self.values.get(key)
                 if old is not None:
                     age = max(0., self.clock() - old[1])
-                    if (old[0] != epoch or age >= self.ttl) and key not in self.busy:
-                        self.busy.add(key)
-                        try:
-                            threading.Thread(target=self._refresh, args=(key, epoch, compute),
-                                             name='lanes-view-refresh', daemon=True).start()
-                        except RuntimeError:
-                            self.busy.remove(key)
-                            self.condition.notify_all()
-                    return dict(old[2], stale_seconds=age)
-                if key not in self.busy:
-                    self.busy.add(key)
-                    break
-                # A cold waiter accepts the first completed exact-key view,
-                # even if it belongs to another board epoch. Never fall into
-                # the strict synchronous get() path after dropping this lock.
-                self.condition.wait()
-        try:
-            value = compute()
-            with self.condition:
-                self.values[key] = (epoch, self.clock(), value)
-            return dict(value, stale_seconds=0.)
-        finally:
-            with self.condition:
-                self.busy.remove(key)
-                self.condition.notify_all()
+                    if age < max_age:
+                        return dict(old[2], stale_seconds=age)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or key not in self.busy:
+                    return {'configured': True, 'warming': True}
+                self.condition.wait(remaining)
 
     def _refresh(self, key, epoch, compute):
         try:

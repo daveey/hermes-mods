@@ -11,8 +11,9 @@ Without lanes: ``GET /v1/lanes`` answers ``{"configured": false, "reason": ...}`
 with no lanes configured, so the panel can say why it is empty; every other route answers 409 in both cases.
 Reads are cached for 10 s per window; a write starts a new cache generation, so a read that began before it
 cannot be stored after it. REST views retain the last completed exact-parameter snapshot across revisions
-and expiry, return its age as ``stale_seconds``, and refresh single-flight in the background. A never-seen
-parameter key waits for its own initial snapshot. `blocked_on_you` is whatever core's snapshot reports (human-request parks); older
+and expiry up to 120s, return its age as ``stale_seconds``, and refresh single-flight in the background.
+Cold or older keys wait at most 1s, then return ``{configured: true, warming: true}`` without lane data.
+Router startup warms the default (6, 6h, collapsed) key. `blocked_on_you` is whatever core's snapshot reports (human-request parks); older
 cores omit it and the Desktop strip treats a missing count as 0.
 """
 from __future__ import annotations
@@ -263,6 +264,8 @@ def _current_view(mods, hours, window, expanded, *, variants=False):
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
             return _project_evidence(mods, conn, evidence, hours, window, expanded, variants=variants)
     except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception('lanes view computation failed')
         snap = {'configured': False, 'reason': f'lanes view is unavailable: {exc}'}
         if variants:
             return {name: _view_module().project(snap, None, flag)
@@ -313,6 +316,8 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
                 six_hour = snap if hours == 6 else mods[2].snapshot(conn, hours=6, evidence=evidence)
                 raw['strip_actual'] = {name: row['actual'] for name, row in six_hour['lanes'].items()}
         except Exception as exc:
+            import logging
+            logging.getLogger(__name__).exception('lanes flow computation failed')
             raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
     if variants:
         # Only presentation differs: read/project source evidence once on the hub.
@@ -386,17 +391,34 @@ def rest_view(hours, window, expanded):
         lambda: _lane_view(hours, window, expanded))
 
 
+def start_legacy():
+    """Trusted router mount hook: custom app lifespans skip on_event startup."""
+    worker = _shared_views().warm((6., '6h', False), (_generation, _observation_cursor()),
+                                  lambda: _lane_view(6., '6h', False))
+    class WarmHandle:
+        def close(self):
+            if worker is not None:
+                worker.join(timeout=4.)
+                if worker.is_alive():
+                    raise RuntimeError('lanes warm compute still draining')
+    return WarmHandle()
+
+
 @router.get("/v1/lanes")
 async def get_lanes(hours: float = Query(6.0), window: str = Query("6h"), expanded: bool = Query(False)) -> Dict[str, Any]:
     _validate_view(hours, window, expanded)
-    return await asyncio.to_thread(rest_view, hours, window, expanded)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(rest_view, hours, window, expanded), timeout=4.)
+    except asyncio.TimeoutError:
+        # Also bound threadpool queueing during backend bootstrap contention.
+        return {'configured': True, 'warming': True}
 
 
 @router.get("/v1/lanes/flow")
 async def get_flow(window: str = Query("6h")) -> Dict[str, Any]:
     if window not in FLOW_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {', '.join(FLOW_WINDOWS)}")
-    return await asyncio.to_thread(rest_view, dict(zip(FLOW_WINDOWS, WINDOWS))[window], window, True)
+    return await get_lanes(dict(zip(FLOW_WINDOWS, WINDOWS))[window], window, True)
 
 
 @router.put("/v1/lanes/{lane}")
