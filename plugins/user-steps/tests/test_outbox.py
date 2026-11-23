@@ -50,3 +50,49 @@ def test_workers_retain_distinct_profile_contexts():
     finally:
         for worker, token in zip(workers, tokens):
             assert runtime.release(worker, token)
+
+
+def test_module_reload_reuses_process_custody_and_current_callbacks():
+    import importlib.util
+    key = 'outbox_reload_control'
+    old = load_module(key, ROOT / 'outbox.py')
+    a, b = old.Token(), old.Token()
+    held, release, updated = threading.Event(), threading.Event(), threading.Event()
+    def recover():
+        held.set()
+        assert release.wait(3)
+    first = old.acquire('profile', a, recover, lambda: None, 1)
+    assert held.wait(2)
+    # Execute the new generation as the API's mtime loader does (not import reload).
+    spec = importlib.util.spec_from_file_location(key, ROOT / 'outbox.py')
+    assert spec is not None and spec.loader is not None
+    new = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(new)
+    second = new.acquire('profile', b, lambda: None, updated.set, 1)
+    try:
+        assert second is first
+        assert new._WORKERS is old._WORKERS
+        first.wake.set()
+    finally:
+        release.set()
+    assert updated.wait(2)
+    old.release(first, a)
+    assert new.release(second, b)
+    assert not new._WORKERS
+
+
+def test_failed_thread_start_does_not_poison_registry(monkeypatch):
+    import pytest
+    runtime = load_module('outbox_start_failure', ROOT / 'outbox.py')
+    token = runtime.Token()
+    with monkeypatch.context() as patch:
+        def fail_start(self):
+            raise RuntimeError('fixture thread limit')
+        patch.setattr(threading.Thread, 'start', fail_start)
+        with pytest.raises(RuntimeError, match='fixture thread limit'):
+            runtime.acquire('profile', token, lambda: None, lambda: None, 1)
+    assert not runtime._WORKERS
+    recovered = threading.Event()
+    worker = runtime.acquire('profile', token, recovered.set, lambda: None, 1)
+    assert recovered.wait(2)
+    assert runtime.release(worker, token)

@@ -1295,6 +1295,11 @@ class Mirror:
 class Delivery:
     """Route only server-bound projections; ordinary requests retain their receiver."""
 
+    # The wrapper can route to Mirror, whose terminal refusal must share exclusive
+    # custody with dispatch and retirement. Serialize ordinary delivery too rather
+    # than choosing weaker custody before the operation's route is known.
+    exclusive_dispatch = True
+
     def __init__(self, mirror, ordinary):
         self.mirror, self.ordinary = mirror, ordinary
 

@@ -306,7 +306,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # Key by home, not process launch identity: each served profile owns an outbox.
         key = str(_load('core').home().resolve())
         with recovery_lock:
-            if key in recovered:
+            if key in recovered and retriers[key].thread.is_alive():
                 return
             # Register one coalescing outbox worker for this served profile.
             # Recovery may contact an executor: it must never run on the HTTP
@@ -392,7 +392,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 try:
                     own = owner(recorded_owner['storedSessionId'])
                     if own == recorded_owner:
-                        st.reconcile(own, delivery())
+                        st.reconcile(own, delivery(), min_retry_interval=max(1.0, RETRY_INTERVAL_S or 15.0))
                 except Exception:
                     logging.getLogger('user-steps').warning('Startup reconciliation deferred for an unavailable owner')
         except Exception:
@@ -404,7 +404,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         except Exception:
             logging.getLogger('user-steps').warning('Legacy request backfill deferred')
 
-    def retry_pending(max_attempts=RETRY_MAX_ATTEMPTS):
+    def retry_pending(max_attempts=RETRY_MAX_ATTEMPTS, *, min_retry_interval=0.0):
         # Re-dispatch failed/pending operations (same operation + idempotency key) for owners this profile serves.
         # A decision made while its session was mid-turn lands here once the turn ends; nobody has to click Retry.
         st = store(); done = 0
@@ -412,7 +412,8 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             try:
                 own = owner(recorded_owner['storedSessionId'])
                 if own == recorded_owner:
-                    done += len(st.reconcile(own, delivery(), max_attempts=max_attempts))
+                    done += len(st.reconcile(own, delivery(), max_attempts=max_attempts,
+                                             min_retry_interval=min_retry_interval))
             except Exception:
                 continue
         return done
@@ -426,13 +427,16 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
 
     def start_retrier(key):
         scope = (key, str(ledger_dir), str(state_db), id(action_store) if action_store is not None else None)
-        retriers[key] = runtime.acquire(scope, token, recover, retry_pending, RETRY_INTERVAL_S)
+        def autonomous_retry():
+            return retry_pending(min_retry_interval=max(1.0, RETRY_INTERVAL_S or 15.0))
+        retriers[key] = runtime.acquire(scope, token, recover, autonomous_retry, RETRY_INTERVAL_S)
 
     def hint_delivery():
         # Notification failure cannot turn a committed decision into HTTP failure.
         # The process worker's periodic scan retains custody even if this hint is lost.
         try:
             key = str(_load('core').home().resolve())
+            recover_once()  # restart a dead worker; never strand a committed hint
             retriers[key].wake.set()
         except Exception:
             logging.getLogger('user-steps').exception('Committed decision delivery hint deferred')

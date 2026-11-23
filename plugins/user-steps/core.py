@@ -3445,13 +3445,25 @@ class ActionStore:
                                             (_json([gateway_id, profile]),))
                     if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')]
 
-    def reconcile(self, owner, receiver, *, max_attempts=None):
+    def reconcile(self, owner, receiver, *, max_attempts=None, min_retry_interval=0):
+        # Durable cadence belongs to operations, not lossy hints or router lifetime.
+        # Fresh operations have no dispatchStartedAt and are immediately eligible.
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        def due(op):
+            if min_retry_interval <= 0 or not op.get('dispatchStartedAt'):
+                return True
+            try:
+                started = datetime.fromisoformat(op['dispatchStartedAt'])
+                return (now - started).total_seconds() >= min_retry_interval
+            except (ValueError, TypeError):
+                return False  # malformed clocks do not accelerate automatic retries
         with self._tx() as c:
             ids = [row['id'] for row in c.execute(
                 'SELECT id,body FROM operations WHERE namespace=? AND session=? ORDER BY rowid',
                 (self._ns(owner), owner['storedSessionId']))
                 if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')
-                and (max_attempts is None or op.get('attempts', 0) < max_attempts)]
+                and (max_attempts is None or op.get('attempts', 0) < max_attempts) and due(op)]
         return [self.dispatch(owner, oid, receiver) for oid in ids]
 
     # ---- lifecycle: withdrawal (a moot ask leaves the queue; NOT a decision) ----------------------------
