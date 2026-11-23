@@ -104,12 +104,16 @@ def test_materialized_remote_presentation_preserves_binding_and_delivery(tmp_pat
             c.execute("UPDATE kanban_projections SET request='{}'")
     expected = [mirror.present(r) for r in store.views(OWNER, include_withdrawn=True)]
     mirror.store = core.ActionStore(store.path, read_only=True)
+    import threading
+
     original = sqlite3.connect
+    owner_thread = threading.get_ident()
     handles = []
 
     def connect(*args, **kwargs):
         c = original(*args, **kwargs)
-        handles.append(c)
+        if threading.get_ident() == owner_thread:
+            handles.append(c)
         return c
 
     monkeypatch.setattr(core.sqlite3, 'connect', connect)
@@ -122,6 +126,17 @@ def test_materialized_remote_presentation_preserves_binding_and_delivery(tmp_pat
         return present(*args, **kwargs)
 
     monkeypatch.setattr(mirror, 'present', checked)
+    # sqlite3 is process-global: unrelated producer threads may open databases
+    # while this presentation-only connection spy is installed.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def foreign_open():
+        with sqlite3.connect(':memory:') as c:
+            assert c.execute('SELECT 1').fetchone() == (1,)
+        c.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(foreign_open).result(timeout=5)
     actual = mirror.views([OWNER], include_withdrawn=True)
     assert actual == expected
     assert len(handles) == 1

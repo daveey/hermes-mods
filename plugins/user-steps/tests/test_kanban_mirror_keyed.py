@@ -14,6 +14,9 @@ from test_kanban_mirror import fixture, decide, OWNER, core
 @pytest.fixture
 def keyed(tmp_path, monkeypatch):
     """The fixture's mirror with the production resolvers (only those are keyed) over a real sessions table."""
+    # Core's origin-work reader is independent of the mirror's injected board.
+    # Keep it off the account's real snapshot, including during CPU replays.
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     state = tmp_path / "state.db"
     with sqlite3.connect(state) as c:
         c.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, "
