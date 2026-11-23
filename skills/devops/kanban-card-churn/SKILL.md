@@ -114,9 +114,19 @@ four of these at once.
 | Coordinator fan-out | one card created 100+ child cards, linked each as a parent, and has one `blocked: await linked X` run per child | state file with position and wait chain; no restructuring | batch obstacles found in one pass into one child; link a child only while it gates; wake on its completion |
 | Poll-and-repark | runs that only reread state and reschedule | wake on the real producer event only | spend budget; wake checks on events, not timers |
 | Terminal wait on own contained producer | watcher waits for done/archived, but that producer is contained under the watcher’s release authority | supersede the contradictory scope with one bounded authority-disposition run; retain independent spend gates | before replacing polling with a terminal event wait, verify the waiter does not still own an unresolved containment release required for that event |
-| Ask parked on a dormant orchestrator | a card parked "awaiting the owning orchestrator's decision" for days; its question is only in a comment, nobody answered | answer it on the card (David's words quoted), or put it to David | the platform now does it: `awaiting={kind:'chat', why:<question>}` (or an orchestrator wait written as `external`) posts `decision_requested`, which wakes the orchestrator chat even when dormant, and goes to David as `needs_input` after 2 h unanswered (core #3647); verify with the card's events |
+| Ask parked on a dormant orchestrator | a card parked awaiting its owner's decision; delivery may be delayed or superseded | read current status and newer owner decisions first; answer only an outstanding question, without manufacturing user authority | `awaiting={kind:'chat', why:<question>}` posts `decision_requested`; after 2 h unanswered the platform records agent-owned recovery, preserving the schedule and answer probe, never an automatic human request. Verify `decision_unanswerable` and current state; only a concrete human-only action justifies `needs_input` |
 
 ## 3. Clean up the card
+
+Before prescribing a lifecycle operation, verify the target's board mode, current run versus ended run,
+goal mode and applicable custody/decision episode together. A private board is not necessarily local/off.
+Use the existing rejected-retain-custody guidance; a definitive refusal is not a successful terminal receipt.
+Check the proposed producer is still open before naming it as future work. When reads are isolated, request
+one consolidated authorized export rather than discovering each prerequisite through another waking comment.
+For delayed decision notices, reconcile newer owner decisions before posting: an answered notice needs no
+new waking comment or repeated architecture choice. Report three separate facts: chat turn activity,
+administrative task execution, and changed product acceptance. A claimed repair proves only the second;
+lead with the remaining delivery gate, not “running again.” These checks grant no release or retry authority.
 
 Before editing and again before promotion, re-read the newest body, budget events and comments. For a foreign spend-held card, preflight `kanban_supervisor_request` operator `spend_promote` with `dry_run=true` against the current episode before preparing a release. Its `spend_budget_decision_ready.producer` must name this decision card; a producer of `chats` is not delegated by prose in a cleanup card. A `spend_scope` refusal requires disposition by that authenticated managing owner, not ordinary unblock, a new relay card, or a copied approval. Keep prepared state explicitly unapplied until body, attachment and finite allowance are read back on the owner.
 
