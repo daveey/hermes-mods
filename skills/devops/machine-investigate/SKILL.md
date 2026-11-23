@@ -66,7 +66,7 @@ For a stack sample use `sample <pid> 5` on macOS or
 `py-spy dump --nonblocking --pid <pid>` on Linux, under `sudo -n` for a process that isn't your descendant (Yama
 ptrace_scope refuses it otherwise). Do not substitute a signal if sampling is unavailable.
 A `py-spy dump` is one instant: enough to see what a hung process waits on, but a single dump can name a function
-that isn't the hot path. To attribute CPU to code, record instead:
+that isn't the hot path. On Linux, dump headers may omit Python thread names: join each numeric TID to `/proc/<pid>/task/<tid>/comm` before filtering named threads, tolerate threads exiting during that read, and assert nonzero selected-thread coverage. Do not equate voluntary context switches with loop iterations: repeated stacks blocked on an Event, Condition or strict-reader lock require separate wake/pass evidence before a timer-loop patch. To attribute CPU to code, record instead:
 `sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
 `frame;frame;… count`), then rank functions by their inclusive share of samples (count each function once per stack).
 To measure time a thread spends blocked on a lock or event, add `--idle`: without it py-spy drops sleeping threads' samples, so lock waits never show up. Never combine `--native` with `--nonblocking`: py-spy rejects that combination before sampling. If production may not be paused, retain nonblocking mode and mark native attribution unknown; do not drop nonblocking to obtain native frames. Under a bounded capture budget preserve failed attempts and correct options/privilege inside the original elapsed budget, never reset its admission time.
