@@ -155,15 +155,19 @@ def _scaled(col: str, k: int) -> str:
 
 def _batch_query(sql: str, width: int) -> str:
     cols = [f'c{i}' for i in range(width)]
-    flags = "''||" + '||'.join(f"(typeof({c})='real')" for c in cols)  # '0010': column 2 is REAL
+    # Per column: '1' REAL (sent as 'K:m'), '2' BLOB (never handed to a JSON function: SQLite 3.45+ reads some BLOBs
+    # as JSONB, x'00' would come back as null; any BLOB sends the whole result row by row), '0' other.
+    flags = "''||" + '||'.join(f"(CASE typeof({c}) WHEN 'real' THEN '1' WHEN 'blob' THEN '2' ELSE '0' END)"
+                               for c in cols)
 
     def real(c):  # 'K:m' with c == m * 2**-K exactly, or NULL
         return 'COALESCE(' + ', '.join(f"CASE WHEN {_scaled(c, k)} = CAST({_scaled(c, k)} AS INTEGER) "
                                        f"THEN '{k}:' || CAST({_scaled(c, k)} AS INTEGER) END"
                                        for k in _REAL_SCALES) + ')'
-    values = ','.join(f"CASE WHEN typeof({c})='real' THEN {real(c)} ELSE {c} END" for c in cols)
+    values = ','.join(f"CASE typeof({c}) WHEN 'real' THEN {real(c)} WHEN 'blob' THEN NULL ELSE {c} END" for c in cols)
     vs = ','.join(f'v{i}' for i in range(width))
-    unsent = ' OR '.join(f"(substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)" for i in range(width))
+    unsent = ' OR '.join(f"substr(f, {i + 1}, 1) = '2' OR (substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)"
+                         for i in range(width))
     return (f"WITH data({','.join(cols)}) AS ({sql}), enc(f, {vs}) AS (SELECT {flags}, {values} FROM data) "
             f"SELECT CASE WHEN MAX({unsent}) THEN NULL ELSE json_group_array(json_array(f, {vs})) END FROM enc")
 
@@ -182,24 +186,27 @@ def _batch_rows(conn: sqlite3.Connection, sql: str, width: int, parameters=()) -
     SELECT runs unchanged inside ``json_group_array``; INTEGER, TEXT and NULL keep their JSON values. No decimal
     text carries a REAL (JSON keeps 15 digits; SQLite 3.50.4's printf misrenders ~10 % of doubles): it travels as
     integers ``K:m`` with ``x == m * 2**-K``, found with exact operations only. A REAL that fits no K (|x| >= 2**63,
-    infinities, bits below 2**-90), a BLOB, or SQLite without JSON functions sends the whole result row by row.
-    A REAL -0.0 reads as 0.0 (REAL-affinity columns already store it as 0; the forecast only compares and
-    subtracts these values)."""
+    infinities, bits below 2**-90), any BLOB, SQLite without JSON functions, or a batch that cannot be read back
+    (an encoding or decode error) sends the whole result row by row, which then answers (or fails) exactly as a
+    plain fetchall; other SQLite errors propagate without a retry. A REAL -0.0 reads as 0.0 (REAL-affinity columns
+    already store it as 0; the forecast only compares and subtracts these values)."""
     try:
         encoded = conn.execute(_batch_query(sql, width), parameters).fetchone()[0]
-        if encoded is None:
-            return conn.execute(sql, parameters).fetchall()
+        if encoded is not None:
+            out = []
+            for flags, *values in json.loads(encoded):
+                if '1' in flags:
+                    values = [v if f != '1' else _real(v) for f, v in zip(flags, values)]
+                out.append(values)
+            return out
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
-        if not (message.startswith('no such function: json_') or 'json cannot hold blob values' in message):
+        if not (message.startswith('no such function: json_') or 'json cannot hold blob values' in message
+                or 'could not decode to utf-8' in message or 'malformed json' in message):
             raise
-        return conn.execute(sql, parameters).fetchall()
-    out = []
-    for flags, *values in json.loads(encoded):
-        if '1' in flags:
-            values = [v if f != '1' else _real(v) for f, v in zip(flags, values)]
-        out.append(values)
-    return out
+    except (ValueError, TypeError):  # json.loads / decode of an unexpected batch value
+        pass
+    return conn.execute(sql, parameters).fetchall()
 
 
 def read_samples(home: Path, provider: str, since: float) -> list[tuple[float, str, float, Optional[float]]]:

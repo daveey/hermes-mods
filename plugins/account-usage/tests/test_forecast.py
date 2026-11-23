@@ -231,6 +231,31 @@ class PacingTransferTests(unittest.TestCase):
         # query_only PRAGMA returns no row; the samples cross as one batched row.
         self.assertEqual(len(transferred), 1)
 
+    def test_any_blob_reads_row_by_row(self):
+        """SQLite 3.45+ reads some BLOBs as JSONB (x'00' -> null, x'14f3' -> 0) or fails on others (invalid UTF-8):
+        a BLOB never reaches a JSON function, the whole result is read row by row."""
+        since = NOW - 24 * H
+        for blob in (b'\x00', b'\x14\xf3', b'\xc3\x28', b'\xff\xfe', b'[1]'):
+            with self.subTest(blob=blob):
+                with sqlite3.connect(self.home / fc.PACING_DB) as db:
+                    db.execute("DELETE FROM samples WHERE account_hash = 'blob'")
+                    db.execute("INSERT INTO samples VALUES (?, 'anthropic', 'blob', 'seven_day', 1.0, ?)",
+                               (NOW - H, blob))
+                db.close()
+                expected = self.plain('anthropic', since)
+                self.assertIn(blob, [r[3] for r in expected])
+                self.assertEqual(fc.read_samples(self.home, 'anthropic', since), expected)
+                with sqlite3.connect(self.home / fc.PACING_DB) as db:
+                    self.assertEqual(fc._batch_rows(db, 'SELECT reset_at FROM samples WHERE reset_at = ?', 1, (blob,)),
+                                     [(blob,)])
+                db.close()
+
+    def test_undecodable_batch_falls_back(self):
+        with sqlite3.connect(self.home / fc.PACING_DB) as db:
+            with mock.patch.object(fc.json, 'loads', side_effect=json.JSONDecodeError('bad', '', 0)):
+                self.assertEqual(fc._batch_rows(db, 'SELECT 1, ?', 2, ('x',)), [(1, 'x')])
+        db.close()
+
     def test_a_real_without_an_exact_scale_reads_row_by_row(self):
         with sqlite3.connect(self.home / fc.PACING_DB) as db:
             db.execute("INSERT INTO samples VALUES (?, 'anthropic', 'h', 'seven_day', 1.0, 1e300)", (NOW - H,))
