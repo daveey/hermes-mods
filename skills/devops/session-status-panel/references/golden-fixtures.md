@@ -2,6 +2,8 @@
 
 Public structural cases live in `plugins/session-panel/tests/test_model.py`; `desktop-plugins/session-panel/test/hub-model-fixtures.py` serializes the **real reducer** into `hub-model.test.mjs`. Extend both sides, not a hand-built JavaScript imitation of PanelModel.
 
+Shared blocker groups must apply the same owner-qualified canonical request retirement precedence as ordinary rows before consulting preserved `human_request`/`wait_state=human`. Test dismissed, answered and withdrawn requests plus a live-open positive control through the real reducer and renderer; an off-list parent must never turn red again after its ask retires. Run the compatible-core panel suite as well as no-core CI: no-core skips can hide stale real-core triage assertions. Give shared-group fixtures nested DOM assertions rather than applying the flat-row golden count contract.
+
 Through `terminal`, run:
 
 ```sh
