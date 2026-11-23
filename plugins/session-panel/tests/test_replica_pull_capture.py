@@ -77,7 +77,7 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
         settle(lane)
     def advance():
         if lane is not None:
-            settle(lane)
+            settle(lane, timeout=5)  # default-on completion cooldown is three seconds
         else:
             f.tick()
     initial = copy.deepcopy(f.bundles['S1']['bundle'])
