@@ -110,7 +110,7 @@ unless it is a timed hold whose `until` has passed. Otherwise, by core's queue v
 skips via `kanban_show` on that worker, skill hermes-workers). **Done when:** the card is claimed, or its queue
 note names a real reason (pacing, quota, placement).
 
-**Hand fix for a long ready wait:**
+**Hand fix for a long ready wait** (first rule out a stale hub view: `references/ready-wait-verification.md`):
 1. Why nothing claims it: the per-pass refusal journal on each machine that could claim it,
    `cd ~/.hermes/hermes-agent && .venv/bin/python -m hermes_cli.kanban_candidate_receipts --db ~/.hermes/kanban.db
    --task-id <id> --limit 2000` (tally `worker`/`gate`/`reason`). Only `labels_mismatch` while every machine with
