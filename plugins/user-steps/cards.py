@@ -213,6 +213,12 @@ class DecisionInbox:
                 + '\n'.join(self._encode({'operationId': oid, **json.loads(intent)}) for oid, intent in rows))
 
 
+class TurnContextInbox(DecisionInbox):
+    """Receipt for a decision attached to the owner's current turn, never a new turn."""
+    def deliver(self, operation):
+        return dict(super().deliver(operation), destination='turn_context')
+
+
 class QualifiedCardDelivery:
     """Explicit producer-bound decisions, committed with core write_txn.
 

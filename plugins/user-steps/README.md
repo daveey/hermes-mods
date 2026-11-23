@@ -771,8 +771,20 @@ The router lifespan reconciles persisted operations at startup, checking each
 owner against the mounted runtime identity. Cold/busy/rotated owners remain
 unconfirmed; manual recovery can run after the exact owner becomes available.
 Hot-mounted routers and isolated plugin hosts may not run startup lifespan, so
-the explicit recovery endpoints remain necessary. Neither reads nor `pre_llm_call`
-start recovery. The hook omits recorded decisions from its unanswered-request list
+the explicit recovery endpoints remain necessary. Reads never start recovery.
+For non-Kanban chat decisions refused specifically because the owner was busy or
+not live, `pre_llm_call` attaches all such operations to that exact gateway,
+profile and stored session's next turn. It takes an exclusive delivery lease
+(conflicting with in-flight admission), records the existing operation identity in
+the durable inbox, verifies readback and uses dispatch's request-state transition
+with `destination=turn_context`. No second turn is admitted. An interrupted pending
+retry is eligible only after its lease is released and only if it retains the
+busy/owner-wait classification; fresh pending operations and unrelated transport
+failures are not acknowledged. Kanban aliases remain on their qualified delivery
+path. Existing canonical receipts stay visible without duplicate inbox rows or
+repeat delivery. Tests in `test_decisions.py` cover alternating busy/closed owners,
+all decisions in one turn, owner isolation, both lease directions and interrupted
+retry recovery. The hook omits recorded decisions from its unanswered-request list
 so an admitted approval is not contradicted before the composite commit.
 Live packaged Desktop/end-to-end runtime acceptance remains outstanding.
 
