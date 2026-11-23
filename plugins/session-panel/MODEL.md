@@ -213,6 +213,16 @@ This fallback neither asserts canonical coverage nor authorizes execution or gre
 Desktop renders the backend state/label only for canonical or explicitly derived
 headers; older unmarked missing-status models retain the conservative unknown label.
 
+Canonical `unresolved` is not synonymous with interruption: the backend labels
+`reason=source_unknown` as unavailable status, and only `reason=interrupted` as
+interrupted. Retained stale/partial card rows carry `evidence_state=unknown`, remain
+Waiting, identify the observation owner and do not request user action. The core
+adapter must preserve these availability flags before interpreting status or asks;
+unknown evidence cannot establish running or completion. Independent own-turn
+activity can justify a running header while remote rows remain unknown: the header
+then explicitly says this chat’s agent is replying. Source health recovery is a
+canonical-outcome invalidation, not permission for Desktop to reclassify the header.
+
 ## Dependency outline (additive v1)
 
 Counted rows remain in their original section arrays, with optional `parent`
