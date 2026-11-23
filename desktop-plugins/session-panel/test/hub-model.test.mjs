@@ -690,4 +690,77 @@ test('owner lookup retries a restarting gateway, then explains a real outage in 
  await assert.rejects(m.modelRequestRoute(action, current, async () => { tries404++; throw Error('404: {"detail":"Unknown stored session on this profile"}') }, { delays: [0, 1, 1] }))
  assert.equal(tries404, 2) // a definitive 4xx is not retried
 })
+test('bound decision bypasses a two-second background owner read and leaves needs you under one second', async () => {
+ m.resetFeedForTests()
+ const model = structuredClone(publicCases.bound_source.model)
+ const q = model.sections.needs_you[0]; q.request_revision += 1000
+ const a = q.actions.find(a => a.kind === 'decide'); a.revision = q.request_revision
+ assert.equal(a.source_owner, true)
+ assert.equal(a.admission.scope_complete, true)
+ const route = { connectionId: 'bound-fast', profile: 'default', session: 'bound-chat' }
+ let release, backgroundDone = false
+ const background = new Promise(r => { release = () => { backgroundDone = true; r() } })
+ const timer = setTimeout(release, 2000)
+ const calls = []
+ const call = async (path, opts) => {
+   calls.push(path)
+   if (!path.endsWith('/decisions')) { await background; return { request: { requestId: q.request_id, revision: q.request_revision,
+     owner: a.owner, state: 'open', scope: { complete: true, markdown: 'scope' }, choices: a.admission.choices } } }
+   return { request: { requestId: q.request_id, revision: q.request_revision, owner: a.owner, resolution: { operationId: 'bound-op' } },
+     operation: { operationId: 'bound-op', dispatchState: 'pending', idempotencyKey: opts.body.idempotencyKey } }
+ }
+ try {
+   let submitted
+   await paint(m.renderModel(model, { onChoose: (row, option) => { submitted = m.chooseModelOption(row, option, route, { call }) } }))
+   const started = performance.now()
+   await React.act(async () => { document.querySelector('[data-choice-letter]').click(); await submitted })
+   await paint(m.renderModel(m.decisionPresentation(model, route)))
+   assert.ok(performance.now() - started < 1000, 'click must not await background owner GET')
+   assert.equal(backgroundDone, false)
+   assert.ok(document.querySelector('[data-model-section="needs_you"]') === null, 'receipt moved the ask')
+   assert.equal(calls.filter(p => p.includes('?session=')).length, 0)
+   assert.equal(calls.filter(p => p.endsWith('/decisions')).length, 1)
+ } finally { clearTimeout(timer); release(); await paint(null); m.resetFeedForTests() }
+})
+test('canonical click admission preserves foreign routing and rejects incomplete or changed bindings without owner reads', async () => {
+ let index = 0
+ for (const variant of ['foreign', 'disconnected', 'scope', 'state', 'resolved', 'choice', 'effect', 'malformed', 'revision', 'server-stale', 'lost-post']) {
+   window.localStorage.clear()
+   const q = structuredClone(publicCases.bound_foreign.model.sections.needs_you[0])
+   q.request_revision += 2000 + index++
+   const a = q.actions.find(a => a.kind === 'decide'); a.revision = q.request_revision
+   assert.equal(a.source_owner, false)
+   window.__sessionTasks = { connectionForHubGateway: gateway => variant !== 'disconnected' && gateway === a.owner.gatewayId ? 'exact-foreign' : null }
+   if (variant === 'scope') a.admission.scope_complete = false
+   if (variant === 'state') a.admission.state = 'withdrawn'
+   if (variant === 'resolved') a.admission.resolved = true
+   if (variant === 'choice') a.admission.choices = []
+   if (variant === 'effect') a.admission.choices[0].effect = 'invented'
+   if (variant === 'malformed') a.admission = null
+   if (variant === 'revision') a.revision--
+   const posts = []
+   const call = async (path, opts) => {
+     if (path.endsWith('/decision-refresh')) return {}
+     assert.ok(path.endsWith('/decisions'), 'no network discovery for new producer')
+     posts.push(opts)
+     if (variant === 'server-stale') throw Error('409: Request revision changed')
+     if (variant === 'lost-post') throw Error('Response lost')
+     return { request: { owner: a.owner, requestId: q.request_id, revision: q.request_revision, resolution: { operationId: 'foreign-op' } },
+       operation: { operationId: 'foreign-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey } }
+   }
+   if (variant === 'revision') await assert.rejects(m.chooseModelOption(q, q.options[0], current, { call }), /No canonical decision binding/)
+   else await m.chooseModelOption(q, q.options[0], current, { call })
+   const sent = ['foreign', 'server-stale', 'lost-post'].includes(variant)
+   assert.equal(posts.length, sent ? 1 : 0, variant)
+   if (sent) {
+     assert.equal(posts[0].connectionId, 'exact-foreign')
+     assert.equal(posts[0].body.session, a.owner.storedSessionId)
+     assert.equal(posts[0].body.expectedRevision, a.revision)
+     assert.equal(posts[0].body.revisionText, a.admission.choices[0].label)
+     await m.chooseModelOption(q, q.options[1], current, { call })
+     assert.equal(posts.length, 1, 'never repost uncertain or stale decision')
+   }
+ }
+ delete window.__sessionTasks; window.localStorage.clear(); m.resetFeedForTests()
+})
 test.after(async () => { await React.act(async () => root.unmount()); dom.window.close() })

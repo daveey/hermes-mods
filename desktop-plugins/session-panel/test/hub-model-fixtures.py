@@ -34,6 +34,13 @@ cases['leaf_wait_with_running'] = f.bundle(
                                                            'hostname': 'worker-one-host'},
                              'events': [{'kind': 'scheduled', 'payload': {'awaiting': {
                                  'kind': 'chat', 'why': 'Choose which premise to retain'}}}]}}})
+bound = f.request()
+bound['owner'] = {**bound['owner'], 'gatewayId': 'install:fixture-owner'}
+bound['scope'] = {**bound['scope'], 'complete': True}
+for choice in bound['choices']:
+    choice['effect'] = 'answer'
+cases['bound_source'] = f.bundle(requests=[bound], gateway='source-gateway', gateway_aliases=['install:fixture-owner'])
+cases['bound_foreign'] = f.bundle(requests=[bound], gateway='other-gateway', gateway_aliases=['install:other'])
 approval = f.request()
 approval.update(kind='approval', limits=[{'key': 'Runtime', 'value': 'LIMIT-4-HOURS', 'permissionRequired': True}],
                 exclusions=['EXCLUDED-SPEND'], outcomes={'approve': 'Stage A only', 'decline': 'No execution'})

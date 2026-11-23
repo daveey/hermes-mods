@@ -477,7 +477,10 @@ def ask(row, request=None):
                 out['details'].append(text(choice.get('label')) + ': ' + text(choice.get('explain')))
         out['gateway'] = obj(request.get('owner')).get('gatewayId') or out['gateway']
         out['actions'].append({'kind': 'decide', 'label': 'Answer', 'request_id': request['requestId'],
-                               'revision': request.get('revision'), 'owner': request.get('owner')})
+                               'revision': request.get('revision'), 'owner': request.get('owner'),
+                               'admission': {'state': request.get('state'), 'resolved': bool(request.get('resolution')),
+                                             'scope_complete': scope.get('complete') is True and bool(full_scope.strip()),
+                                             'choices': [{k: obj(c).get(k) for k in ('id', 'effect', 'label')} for c in choices]}})
     return out
 
 
@@ -735,6 +738,17 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             if linked and not any(human_owned(t) for t in linked):
                 continue
             sections['needs_you'].append(ask({}, r))
+    for view in sections['needs_you']:
+        for action in view['actions']:
+            if action.get('kind') == 'decide':
+                # The adapter supplies install-id aliases from trusted local identity.
+                # Never equate a foreign request owner to the serving connection.
+                if same_gateway:
+                    action['source_owner'] = obj(action.get('owner')).get('gatewayId') in same_gateway
+                else:
+                    # Unenrolled/older readers have no trusted route identity.
+                    # Keep their existing verified owner GET, not an ambient route.
+                    action.pop('admission', None)
     views = {x['key']: x for s in SECTIONS for x in sections[s]}
     for r in requests:
         if not recorded(r):
