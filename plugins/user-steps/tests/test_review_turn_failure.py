@@ -79,3 +79,19 @@ def test_marker_fault_is_sticky_after_storage_recovers(tmp_path, monkeypatch, de
     assert not any(r['scope']['complete'] for r in store.requests(OWNER))
     assert not any(c['effect'] == 'approve' for r in store.requests(OWNER) for c in r['choices'])
     assert core.current_publication_turn(ledger, sid) is None
+
+
+def test_sibling_core_loader_shares_successful_turn_custody(tmp_path, desktop_sources):
+    import importlib.util
+    from test_confirm_plan import core, OWNER, directive
+    spec = importlib.util.spec_from_file_location('review_session_outcome_core', core.__file__)
+    sibling = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sibling)
+    ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
+    sid = OWNER['storedSessionId']
+    token = core.begin_publication_turn(ledger, sid)
+    step = sibling.add_step(sid, ASK, ['Go', 'Change plan'], ledger=ledger)
+    assert step['publication_turn'] == token
+    store = core.ActionStore(tmp_path / 'actions.db')
+    core.attach_confirmation_plans(PLAN + '\n\n' + directive(step), sid, ledger, store, OWNER)
+    assert store.requests(OWNER)[0]['scope']['complete']

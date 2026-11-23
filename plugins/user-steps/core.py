@@ -1324,7 +1324,15 @@ def _open_canonical_only(session_id: str, lg: "Ledger", opened: list[dict]) -> l
 
 # Process-local successful-write custody is required in addition to persisted
 # provenance. Disk alone can retain an old token after a failed turn reset.
-_PUBLICATION_TURNS = {}
+# session-outcome loads this file under a different module name: share custody
+# only between aliases of this exact installed source path in this process.
+import sys as _publication_sys
+import types as _publication_types
+_publication_registry_key = '_hermes_confirmation_turns_' + hashlib.sha256(
+    Path(__file__).resolve().as_posix().encode()).hexdigest()
+_publication_registry = _publication_sys.modules.setdefault(
+    _publication_registry_key, _publication_types.ModuleType(_publication_registry_key))
+_PUBLICATION_TURNS = _publication_registry.__dict__.setdefault('turns', {})
 
 
 def _publication_key(ledger, session_id):
