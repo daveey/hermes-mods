@@ -815,7 +815,10 @@ class Feed:
                         if s not in self.interest or 'model' not in held['bundle']:
                             continue
                         base = held['bundle']
-                        if observations is not None:
+                        if observations is not None and not held.get('board_admission'):
+                            # Opted-in clocks have their own vector/parent CAS.
+                            # Legacy observations may only re-age that bundle;
+                            # they cannot mutate its source materialization.
                             observation = observations.get(s)
                             latest = (getattr(self, '_external_observations', None) or {}).get(s)
                             if (observation is None or base.get('computed_seq', 0) > observation[0]

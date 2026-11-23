@@ -256,6 +256,14 @@ def test_real_replica_observation_pull_and_clock_regression_preserve_age_and_fen
             assert next(t for t in after['tasks'] if t['id'] == remote)['synced_at'] == stamp
             for field in ('computed_at', 'computed_seq', 'cards'):
                 assert after[field] == before[field]
+            # A legacy observation captured before opt-in cannot overwrite the
+            # current token-qualified carrier, even with a later sequence.
+            f._publish({}, age_only=True, observations={'S0': (10000, raw)})
+            after_legacy = f.bundles['S0']['bundle']
+            assert next(t for t in after_legacy['tasks'] if t['id'] == remote)['synced_at'] == stamp
+            assert f.bundles['S0']['board_projection'].publication_token is observed.publication_token
+            for field in ('computed_at', 'computed_seq', 'cards'):
+                assert after_legacy[field] == before[field]
         with contextlib.closing(sqlite3.connect(path)) as c, c:
             c.execute("UPDATE tasks SET title='semantic source change' WHERE id=?", (remote,))
         changed = r.external_capture({'S0': {'lineage': {'S0'}, 'refs': set()}})['S0']
