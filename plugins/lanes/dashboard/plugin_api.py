@@ -186,6 +186,17 @@ def _observations():
 
 
 @lru_cache(maxsize=1)
+def _attention_module():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('lanes_attention', Path(__file__).with_name('attention.py'))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(maxsize=1)
 def _view_module():
     # File-loaded by core's plugin loader and by standalone test harnesses.
     import importlib.util
@@ -295,6 +306,7 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
                 reader = _observations().reader(contexts)
             raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
             raw['configured'] = bool(raw.get('lanes'))
+            raw['attention'] = _attention_module().project(raw['cards'], evidence)
             pol = mods[1].policy()
             if pol is not None:
                 raw['strip_tokens'] = token_series(evidence.conn, pol)

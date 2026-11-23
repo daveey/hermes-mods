@@ -13,6 +13,24 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
+## Shared human-attention coverage
+
+With the companion core API, `needs_you(card)` classifies both lane cards and
+session-panel attention. Historical block kinds alone are not current asks.
+The lane snapshot carries `attention.rows` from the same card evidence as
+`status.you`, including active chat subscriptions. The Desktop's **Unlinked asks**
+section shows red, read-only card links for headless asks and for cards whose
+linked chat is not represented by a visible `needs_you` card entry. This last
+coverage partition is necessarily client-local (sidebar filters are local); it
+does not reclassify or change the server total. It never creates decision
+requests, restores retired consent controls, or grants permission to execute.
+
+The sidebar and strip hold one refcounted subscription, so the section works
+without a mounted strip and does not add an independent poller. Blue pill
+numerals show **total running**; `+N over` is a separate borrowing annotation,
+not a subtraction from the blue count. Companion-core or membership failures
+leave attention unavailable rather than fabricating card coverage.
+
 ## REST stale-while-revalidate
 
 GET keeps the newest completed view for each exact `(hours, window, expanded)`

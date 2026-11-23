@@ -107,6 +107,10 @@ def project(snap, raw, expanded):
                       ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done')}
     if raw and raw.get('configured') is not False and 'cards' in raw:
         view['status'] = status_counts(raw['cards'])
+        if 'attention' in raw:
+            view['attention'] = raw['attention']
+            if view['attention'].get('available'):
+                assert len(view['attention']['rows']) == view['status']['you']
         # The same card evidence owns counts and the fleet fair-share denominator.
         fleet_running = sum(c.get('reason') == 'run' for c in raw['cards'])
         idle = [name for name, row in view['lanes'].items() if not row['ready']]

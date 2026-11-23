@@ -236,6 +236,67 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
   return { read, write, flow, subscribe, target: () => chosen }
 }
 
+// Read-only sidebar rows share the strip's pushed snapshot; no second poller.
+const attentionStores = new WeakMap()
+export function attentionStore(ctx) {
+  let store = attentionStores.get(ctx)
+  if (!store) {
+    const listeners = new Set()
+    let subscription
+    const clients = new Map()
+    store = { view: null, publish(view) { store.view = view; for (const fn of listeners) fn(view) },
+      listen(fn) { listeners.add(fn); return () => listeners.delete(fn) },
+      connect(params, onView, onLive = () => {}, primary = false) {
+        const token = {}
+        clients.set(token, { params, onView, onLive })
+        if (!subscription) subscription = sourceFor(ctx).subscribe(params,
+          (view, err) => {
+            if (view) store.publish(view)
+            for (const client of clients.values()) client.onView(view, err)
+          }, live => { for (const client of clients.values()) client.onLive(live) })
+        else if (primary) subscription.update(params)
+        const stop = () => {
+          clients.delete(token)
+          if (!clients.size) { subscription?.(); subscription = undefined }
+        }
+        stop.update = next => { clients.get(token).params = next; subscription?.update(next) }
+        stop.refresh = () => subscription?.refresh()
+        return stop
+      } }
+    attentionStores.set(ctx, store)
+  }
+  return store
+}
+
+export function uncoveredAsks(view, sessions) {
+  if (!view?.attention?.available) return []
+  // A subscription is not proof of a visible red session. In particular an
+  // archived/filtered chat, or a linked legacy device wait, still needs a row.
+  return view.attention.rows.filter(row => sessions == null ? row.unlinked :
+    !sessions.some(session => (session.needs_you || []).some(ask => ask.kind === 'card' &&
+      (ask.ref === row.id || ask.ref?.endsWith('/' + row.id)))))
+}
+
+export function UnlinkedAsks({ ctx }) {
+  const sessions = useSidebarSessions()
+  const store = attentionStore(ctx)
+  const [view, setView] = useState(store.view)
+  const [open, setOpen] = useState(true)
+  useEffect(() => {
+    setView(store.view)
+    const unlisten = store.listen(setView)
+    const disconnect = store.connect({ hours: loadWindow(), window: flowWindow(loadWindow()), expanded: false }, () => {})
+    return () => { unlisten(); disconnect() }
+  }, [store])
+  const rows = uncoveredAsks(view, sessions)
+  if (!rows.length || !sdk.SidebarSection || !sdk.SidebarSectionRow) return null
+  return h('div', { 'data-unlinked-asks': '1', 'data-needs-you-count': rows.length },
+    h(sdk.SidebarSection, { label: 'Unlinked asks', count: rows.length, open, onToggle: () => setOpen(v => !v) },
+      rows.map(row => h(sdk.SidebarSectionRow, { key: row.key, label: row.title,
+        accentColor: CARD_COLORS.you, meta: row.lane, tip: `${row.title}\n${row.id}`,
+        onSelect: () => openCard(row.id, sourceFor(ctx).target()?.connectionId || undefined) }))))
+}
+
 // One source per plugin ctx, not per mount: the status bar remounts contributions often.
 const sources = new WeakMap()
 export function sourceFor(ctx) {
@@ -700,7 +761,7 @@ export function laneTitle(row, selected) {
 export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
   const m = stripMeter(row), s = row.strip || {}
   // Older hubs have neither capacity nor series: retain their counts without inventing an overage.
-  const inside = s.in_share ?? m.running, over = s.over || 0
+  const over = s.over || 0
   return h('button', {
     type: 'button', className: `hermes-lanes-pill${over > 0 ? ' is-over' : ''}`, 'data-lane-pill': row.name,
     title: laneTitle(row, selected),
@@ -712,8 +773,8 @@ export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
     h(LaneSpark, { tokens: s.tokens, scale }),
     m.blocked > 0 ? h('span', { className: 'hermes-lanes-bd sq', 'data-count': 'blocked', style: { background: CARD_COLORS.you } }, m.blocked) : null,
     m.running > 0 ? h('span', { className: 'hermes-lanes-bd cap', 'data-count': 'running' },
-      inside > 0 ? h('span', { style: { background: CARD_COLORS.run }, 'data-part': 'in-share' }, inside) : null,
-      over > 0 ? h('span', { style: { background: '#f59e0b' }, 'data-part': 'over' }, `+${over}`) : null) : null,
+      h('span', { style: { background: CARD_COLORS.run }, 'data-part': 'total-running' }, m.running),
+      over > 0 ? h('span', { style: { background: '#f59e0b' }, 'data-part': 'over', title: `${over} of ${m.running} running borrow idle capacity` }, `+${over} over`) : null) : null,
     m.notReady > 0 ? h('span', { className: 'hermes-lanes-bd sq hollow', 'data-count': 'other' }, m.notReady) : null)
 }
 
@@ -798,8 +859,8 @@ export function Lanes({ ctx }) {
   const [live, setLive] = useState(false)
   const subscription = useRef()
   useEffect(() => {
-    subscription.current = source.subscribe({ hours: windowHours, window: flowWindow(windowHours), expanded: open },
-      (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive)
+    subscription.current = attentionStore(ctx).connect({ hours: windowHours, window: flowWindow(windowHours), expanded: open },
+      (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive, true)
     return () => subscription.current?.()
   }, [source])
   const previous = useRef({ windowHours, open })
@@ -1006,6 +1067,9 @@ export default {
     document.head.append(style)
     ctx.onDispose(() => style.remove())
     ctx.register({ id: 'strip', area: STRIP_AREA, order: 10, render: () => h(Lanes, { ctx }) })
+    if (sdk.SIDEBAR_SECTIONS_AREA && sdk.SidebarSection && sdk.SidebarSectionRow) {
+      ctx.register({ id: 'unlinked-asks', area: sdk.SIDEBAR_SECTIONS_AREA, order: 10, render: () => h(UnlinkedAsks, { ctx }) })
+    }
     ctx.register({
       id: 'show-lanes',
       area: PALETTE_AREA,
