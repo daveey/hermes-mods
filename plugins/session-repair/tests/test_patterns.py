@@ -205,6 +205,13 @@ def test_a_cancelled_parent_does_not_satisfy_core_promotion(env):
     none(env, 'BS-parent-done', F.todo_parent_cancelled(env.conn, env.now))
 
 
+def test_unexplained_containment_hold_never_requests_generic_unblock(env, monkeypatch):
+    from hermes_cli import kanban_containment_connections as containment
+    tid = F.blocked_agent_owned(env.conn, env.now, waited_s=30 * 3600)
+    monkeypatch.setattr(containment, 'held', lambda conn, task_id: task_id == tid)
+    none(env, 'BS-unexplained-wait', tid)
+
+
 def test_core_deliberate_holds_are_not_findings(env, monkeypatch):
     none(env, 'BS-parent-done', F.blocked_dependency_breaker(env.conn, env.now))  # recovery_held (breaker)
     tid = F.todo_parents_done(env.conn, env.now)
@@ -583,6 +590,34 @@ def test_ledger_rows_that_are_not_objects_are_ignored(env):
 
 
 # BS-long-wait: fixed acceptance boundary fixtures.
+@pytest.mark.parametrize('event_kind', ['wake_check_alive', 'external_watch'])
+@pytest.mark.parametrize('happened', [False, True])
+def test_future_healthy_park_is_not_stuck_even_if_pr_is_merged(env, monkeypatch, event_kind, happened):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'merged','happened':happened})
+    tid = F.legacy_probe_wait(env.conn, env.now, waited_s=40000)
+    payload = ({'wake_check':'python3 rollout_ready.py'} if event_kind == 'wake_check_alive' else
+               {'health':'ok','state':'external_running','observed_at':env.now-20,
+                'next_due_at':env.now+880,'every':900,'consecutive_failures':0})
+    F.event(env.conn, tid, event_kind, payload, at=env.now-20)
+    none(env, 'BS-long-wait', tid)
+
+
+@pytest.mark.parametrize('condition', ['missing', 'stale', 'broken', 'wrong_command', 'old_episode', 'overdue'])
+def test_long_wait_without_live_probe_still_nudged(env, monkeypatch, condition):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'not_resolvable','happened':False})
+    tid = F.legacy_probe_wait(env.conn, env.now, waited_s=40000)
+    if condition != 'missing':
+        at = env.now - (30000 if condition == 'stale' else 50000 if condition == 'old_episode' else 20)
+        F.event(env.conn, tid, 'wake_check_alive', {'wake_check':
+                'python3 other.py' if condition == 'wrong_command' else 'python3 rollout_ready.py'}, at=at)
+    if condition == 'broken':
+        F.event(env.conn, tid, 'wake_check_broken', {}, at=env.now-10)
+    if condition == 'overdue':
+        env.conn.execute("UPDATE task_events SET payload=json_set(payload, '$.wake_at', ?) WHERE task_id=? AND kind='scheduled'",
+                         (env.now-1,tid))
+        env.conn.commit()
+    one(env, 'BS-long-wait', tid)
+
 @pytest.mark.parametrize('waited_s,expected', [(3000, 1), (1800, 0)])
 def test_long_wait_ci_boundary(env, monkeypatch, waited_s, expected):
     monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
@@ -710,6 +745,18 @@ def test_nudge_wake_transaction_refuses_changed_or_held_target(env, monkeypatch,
         monkeypatch.setattr(spend,'pending',lambda *a:True)
     elif guard=='owner_event':
         F.event(env.conn,tid,'worker_bound',at=env.now)
+    result=mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)
+    assert result['outcome']=='wake_refused', result
+    assert not env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=1)
+
+
+def test_nudge_transaction_rechecks_health_after_finding(env, monkeypatch):
+    mod,tid,f,text,rec = nudge_target(env,monkeypatch)
+    env.conn.execute("UPDATE task_events SET payload=json_set(payload, '$.wake_check', 'python3 rollout_ready.py') WHERE id=?",
+                     (f['evidence']['park_id'],))
+    env.conn.commit()
+    F.event(env.conn,tid,'wake_check_alive',{'wake_check':'python3 rollout_ready.py'},at=env.now)
+    monkeypatch.setattr(mod.time,'time',lambda:env.now)
     result=mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)
     assert result['outcome']=='wake_refused', result
     assert not env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=1)

@@ -162,7 +162,8 @@ def wake_owner(scan, src, f, rec, text):
             park = scan.current_park(card)
             awaited = scan.wait_producer(card, park, time.time())[0] if park else None
             if (not park or park['id'] != f['evidence']['park_id'] or not awaited
-                    or awaited['kind'] not in scan.LONG_WAIT_S):
+                    or awaited['kind'] not in scan.LONG_WAIT_S
+                    or scan.healthy_future_park(card, park, time.time())):
                 return 'park changed or clock wait'
             baseline = f['evidence']['last_event']['id']
             for ev in scan._events(conn, tid, limit=10000):

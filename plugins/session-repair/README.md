@@ -86,9 +86,18 @@ scanner exceptions and failed turns: `ts` (epoch seconds), `mode`, `chats`, `car
 A separate lock serializes journal appends. Whole segments rotate at 4 MiB, retaining one previous segment
 (about 8 MiB bounded retention; normal 15-minute ticks retain far longer than 24 hours). An unwritable journal
 fails the cron tick rather than claiming an auditable success. No cron output-history retention is needed.
-For rollout, require a full 24-hour same-build shadow window with no errors, no unexplained gaps/skips, and
+For rollout, require a full 24-hour shadow window since the last detection/action change with no errors,
+  no unexplained gaps/skips, and
 adjudicate every would-act row in `actions-shadow.jsonl` (including any still-deduped findings in `last.json`).
-Do not infer clean shadow from a missing journal or from zero repair turns.
+Do not infer clean shadow from a missing journal or from zero repair turns. Test/doc-only changes do not
+restart this window; compare the source diff when a build fingerprint changes, including rule and action
+files, before treating different fingerprints as equivalent.
+
+A scheduled future backstop with a fresh healthy core probe receipt is not a stuck wait. The scanner reads
+same-episode `wake_check_alive` or `external_watch` evidence without executing probes. Health expires at
+its cadence (remote alive receipts are rate-limited to three hours); failures, mismatched commands, stale
+receipts and overdue deadlines remain eligible. A merged PR is not deployment completion when a healthy
+installation probe is still waiting. The owner-wake transaction rechecks this guard as well.
 
 Unexplained-wait detection excludes canonical pending spend decisions in triage, including retained HOLDs:
 these need an explicit owner decision, not a generic unblock. For other waits, an old generic park and the

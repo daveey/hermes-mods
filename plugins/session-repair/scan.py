@@ -778,7 +778,8 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
     # inherited agent-owned block. Use the canonical reader, not comment text
     # matching (a retained HOLD may also carry a monotone scope restriction).
     from hermes_cli import kanban_spend_decision as spend
-    if card.status == 'triage' and spend.pending(c, card.id):
+    from hermes_cli import kanban_containment_connections as containment
+    if containment.held(c, card.id) or spend.pending(c, card.id) or spend.execution_refusal(c, card.id):
         return None
     park = _events(c, card.id, park_kinds)
     # Core's projected wait can predate the current run: its generic park
@@ -1115,6 +1116,47 @@ def wait_producer(card: Card, park: dict, now: float) -> tuple[Optional[dict], d
     return {'kind':kind, 'ref':ref or probe[1]}, wait
 
 
+def healthy_future_park(card: Card, park: dict, now: float) -> bool:
+    """Observe core's probe receipts, never run a command or confuse merge with deployment.
+
+    A future backstop alone is insufficient. Receipts must belong to this park,
+    match its command where recorded, and still be fresh. New failures supersede
+    old health. Core rate-limits remote alive receipts to three hours.
+    """
+    payload = park['payload']
+    if card.status != 'scheduled' or (_num(payload.get('wake_at')) or 0) <= now:
+        return False
+    command = str(payload.get('wake_check') or '').strip()
+    if not command:
+        return False
+    events = _events(card.conn, card.id, ('external_watch', 'wake_check_alive',
+                     'wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met'))
+    if not events:
+        return False
+    event = events[0]
+    if event['id'] <= park['id'] or not park['at'] <= event['at'] <= now:
+        return False
+    data = event['payload']
+    recorded = str(data.get('wake_check') or (data.get('_wake_episode_v1') or {}).get('cmd') or '').strip()
+    if recorded and recorded != command:
+        return False
+    if event['kind'] == 'wake_check_alive':
+        if recorded != command:
+            return False
+        cadence = min(21600, max(10800, _num(payload.get('check_every')) or 900))
+        return now - event['at'] <= cadence + 900
+    if event['kind'] == 'external_watch':
+        observed = _num(data.get('observed_at'))
+        due = _num(data.get('next_due_at'))
+        every = _num(data.get('every'))
+        return (data.get('health') == 'ok' and data.get('state') == 'external_running'
+                and data.get('consecutive_failures') == 0 and observed is not None
+                and every is not None and 0 < every <= 21600 and due is not None
+                and park['at'] <= observed <= now and due <= observed + every + 900
+                and now <= due + 900)
+    return False
+
+
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
         return None
@@ -1125,7 +1167,7 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if _promotion_held(c, card) or pending(c, card.id) or execution_refusal(c, card.id):
         return None  # containment, spend and independent recovery holds are not execution authority
     park = current_park(card)
-    if not park:
+    if not park or healthy_future_park(card, park, src.now):
         return None
     awaited, wait = wait_producer(card, park, src.now)
     if not awaited or awaited['kind'] not in LONG_WAIT_S:
