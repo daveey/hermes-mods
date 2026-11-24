@@ -1034,3 +1034,43 @@ def test_list_snapshot_marks_legacy_authorizing_entries_unanswerable(tmp_path):
 
 def test_prompt_and_hints_say_an_uncertain_reservation_is_left_alone():
     assert 'uncertain' in early_mod.RECEIPT_HINT.lower() and 'not_applied' in early_mod.RECEIPT_HINT
+
+
+def _flagged(s):
+    req = request(); req['limits'] = [dict(key='iam', value='one secret ARN', permissionRequired=True)]
+    return s.create(OWNER, req)
+
+
+def test_numbered_approve_grants_and_every_surface_reports_it(tmp_path):
+    """The numbered-list path grants like the button; the card comment, receipt consumer state and the early
+    clarification view all carry the grant instead of contradicting it (review of the 2026-11-24 grant fix)."""
+    s = store(tmp_path); r = _flagged(s)
+    snap = s.record_list(OWNER, 'msg-g', [dict(requestId=r['requestId'], choiceId='approve')])
+    op = s.answer_numbered(OWNER, 'msg-g', snap['digest'], 1, 'grant-key')['operation']
+    assert op['intent']['permissionGrants'] == [dict(key='iam', value='one secret ARN')]
+    comment = cards.QualifiedCardDelivery._comment(op)
+    assert 'Separate permissions remain required' not in comment and 'Grants the permissionRequired limits' in comment
+    assert core.ActionStore.consumer_state(op, [])['grants'] == [dict(key='iam', value='one secret ARN')]
+    bound = dict(op, binding={'questionKey': 'q', 'scopeDigest': 'd', 'digest': 'x'})
+    assert early_mod.describe(bound)['permissionGrants'] == [dict(key='iam', value='one secret ARN')]
+
+
+def test_operations_without_grants_keep_their_exact_admitted_text(tmp_path):
+    """Pinned digest: an operation recorded before the grant fix (no key, or []) must produce the same admission
+    text, card comment and digest after the deploy, or restart readback fails."""
+    op = {'operationId': '00000000-0000-4000-8000-000000000001', 'revision': 1,
+          'owner': dict(OWNER), 'intent': {'effect': 'approve', 'executionAuthorized': True,
+                                           'request': {'requestId': 'r1'}, 'revisionText': None}}
+    old_text = ('Canonical user decision. Act only on the frozen revision below. Revise means prepare a replacement '
+                'plan ONLY; keep implementation blocked. Approve permits only this exact scope and limits; so does an '
+                'answer with executionAuthorized=true (a go/approve option on a named-action question): start that '
+                'work now, no further confirmation. The selected answer restricts the frozen scope: "Only hermes" '
+                'never authorizes the other named projects. permissionRequired items need independent owner '
+                'permission; no GPU permission is granted here. Never repeat an operation already executed.\n')
+    for grants in (None, []):
+        if grants is not None:
+            op['intent']['permissionGrants'] = grants
+        text = prompt_delivery.PromptAdmission._params(op)['text']
+        assert text == old_text + prompt_delivery.encode({'operationId': op['operationId'], **op['intent']})
+        assert cards.QualifiedCardDelivery._comment(op).startswith(
+            'Approved exact frozen scope, limits and exclusions ONLY. Separate permissions remain required.')

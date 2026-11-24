@@ -55,8 +55,12 @@ class PromptAdmission:
                 'Approve permits only this exact scope and limits; so does an answer with '
                 'executionAuthorized=true (a go/approve option on a named-action question): '
                 'start that work now, no further confirmation. The selected answer restricts '
-                'the frozen scope: "Only hermes" never authorizes the other named projects. permissionRequired items '
-                'need independent owner permission; no GPU permission is granted here. '
+                'the frozen scope: "Only hermes" never authorizes the other named projects. ' +
+                # Grants change the text, so an operation without them keeps its exact admitted text (digest).
+                ('This approval is the owner\'s permission: it grants the permissionRequired limits in '
+                 'permissionGrants, and no other permission. '
+                 if op['intent'].get('permissionGrants') else
+                 'permissionRequired items need independent owner permission; no GPU permission is granted here. ') +
                 'Never repeat an operation already executed.\n' +
                 encode({'operationId': op['operationId'], **op['intent']}))
         if op.get('binding'):

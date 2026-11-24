@@ -49,7 +49,7 @@ def describe(op: dict) -> dict:
     if op.get("binding"):
         out.update(operationId=op["operationId"], revision=op["revision"], scopeDigest=op["binding"]["scopeDigest"],
                    effect=intent["effect"], executionAuthorized=intent.get("executionAuthorized") is True,
-                   permissionGrants=[])
+                   permissionGrants=list(intent.get("permissionGrants") or []))
     return out
 
 

@@ -146,9 +146,23 @@ def _targets(req: dict) -> set[str]:
     return out
 
 
+# Quantifiers that widen a permission without any digit-bearing target ("one secret ARN" -> "all secret ARNs").
+_WIDENERS = frozenset({"all", "every", "any", "each", "unlimited", "unbounded", "*", "everything", "everywhere"})
+
+
+def _wideners(req: dict) -> set[str]:
+    out = set()
+    for x in _limits(req):
+        if x.get("permissionRequired"):
+            out |= {t for t in re.split(r"[\s,;:()\[\]{}\"'`<>=+…|]+", str(x.get("value") or "").lower())
+                    if t.strip("-_.!?") in _WIDENERS}
+    return out
+
+
 def widened_targets(req: dict, prior_req: dict) -> set[str]:
-    """Target tokens in this request's permission limits that the earlier approval did not name."""
-    return _targets(req) - _targets(prior_req)
+    """Target tokens or widening quantifiers in this request's permission limits that the earlier approval did not
+    name. Since 2026-11-24 an Approve grants its permissionRequired limits, so reuse must not stretch one."""
+    return (_targets(req) - _targets(prior_req)) | (_wideners(req) - _wideners(prior_req))
 
 
 def declared_widening(req: dict) -> str | None:

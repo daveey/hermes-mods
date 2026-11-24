@@ -3163,7 +3163,8 @@ class ActionStore:
         phase = ('applied' if 'applied' in phases else 'uncertain' if 'reserved' in phases
                  else 'not_applied' if 'not_applied' in phases
                  else 'acknowledged' if 'acknowledged' in phases else 'unknown')
-        out = {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts, 'grants': []}
+        out = {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts,
+               'grants': list(op.get('intent', {}).get('permissionGrants') or [])}
         keyed = next((r for r in receipts if r.get('applicationKey')), None)
         if keyed:
             out['applicationKey'] = keyed['applicationKey']
@@ -3357,7 +3358,11 @@ class ActionStore:
                              # A go answer to a run question authorizes exactly this frozen scope; free text never.
                              'executionAuthorized': effect == 'approve' or (
                                  effect == 'answer' and choice.get('authorizes') is True and text == choice['label']),
-                             'permissionGrants': []}}
+                             # The person approving is the owner: Approve grants the permissionRequired limits
+                             # this exact revision showed, nothing else. Nothing filled this before 2026-11-24, so
+                             # an approved flagged limit was a gate no surface could ever open.
+                             'permissionGrants': [{'key': x['key'], 'value': x['value']} for x in r.get('limits') or []
+                                                  if effect == 'approve' and x.get('permissionRequired') is True]}}
             if (effect == 'approve' and choice['id'] == 'go' and choice['label'] == 'Go'):
                 op['intent']['userText'] = 'Go'
             bound = self._binding(c, owner, r['requestId'], r['revision'])

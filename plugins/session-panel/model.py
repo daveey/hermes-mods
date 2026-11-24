@@ -703,8 +703,10 @@ def ask(row, request=None):
             out['details'].append(full_scope)
         for limit in request.get('limits') or []:
             limit = obj(limit)
-            out['details'].append('Limit: ' + text(limit.get('key')) + ': ' + str(limit.get('value', '')) +
-                                  ' · permissionRequired: ' + json.dumps(limit.get('permissionRequired'), ensure_ascii=False))
+            flag = limit.get('permissionRequired')
+            out['details'].append('Limit: ' + text(limit.get('key')) + ': ' + str(limit.get('value', '')) + (
+                ' · permission: granted if you approve' if flag is True else
+                ' · permissionRequired: ' + json.dumps(flag, ensure_ascii=False)))
         for exclusion in request.get('exclusions') or []:
             out['details'].append('Not included: ' + text(exclusion))
         for effect, outcome in obj(request.get('outcomes')).items():

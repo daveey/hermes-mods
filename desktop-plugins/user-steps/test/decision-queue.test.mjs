@@ -65,7 +65,7 @@ test('boolean permissionRequired (the backend contract since 4affdc54) is valid 
  assert.match(el().textContent, /Grow the disk further\?/)
  await show(React.createElement(m.DecisionRow, { request: freshRequest({ limits: [{ key: 'size', value: '600 GiB', permissionRequired: true }, { key: 'cost', value: '+$16', permissionRequired: false }] }), route, call: async () => ({}) }))
  const items = [...el().querySelectorAll('[data-action-limits] li')].map(li => li.textContent)
- assert.deepEqual(items, ['size: 600 GiB — needs separate permission', 'cost: +$16'])
+ assert.deepEqual(items, ['size: 600 GiB — permission: granted if you approve', 'cost: +$16'])
  await show(null); delete window.hermesDesktop
 })
 
@@ -1146,7 +1146,7 @@ test('::decision-list shows the frozen plan, limits, exclusions and outcome besi
  await mount(listOf([approveEntry()]))
  const entry=el().querySelector('[data-decision-list-entry]'), text=entry.textContent
  assert.match(text,/Run the canary job/);assert.match(text,/Run canary on staging only; 10 minutes\./)
- assert.match(text,/spend: none — needs separate permission/);assert.match(text,/time: 10 min/)
+ assert.match(text,/spend: none — permission: granted if you approve/);assert.match(text,/time: 10 min/)
  assert.match(text,/No production traffic/);assert.match(text,/Runs exactly this plan/)
  const btn=entry.querySelector('button');assert.ok(btn);assert.equal(btn.disabled,false)
  assert.match(btn.getAttribute('aria-label'),/Run the canary job.*Approve/)

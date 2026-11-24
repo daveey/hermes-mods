@@ -155,6 +155,14 @@ def test_added_target_publishes(gate, tmp_path):
     assert _publish(gate, wider) is None
 
 
+def test_widening_quantifier_publishes(gate, tmp_path):
+    """An Approve now grants its permissionRequired limits, so "all" where he approved a named set is new."""
+    wider = json.loads(json.dumps(RUN3D))
+    wider["limits"][1]["value"] = "All Kanban card fields, " + wider["limits"][1]["value"]
+    _chat(tmp_path, [("user", _decision(RUN3)), ("tool", _receipt("not_applied"))])
+    assert _publish(gate, wider) is None
+
+
 def test_undeclared_wording_only_line_does_not_release(gate, tmp_path):
     """A 'New since' line that names no permission limit (only a new launcher path) is not a widening."""
     same = json.loads(json.dumps(RUN3D))

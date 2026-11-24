@@ -663,7 +663,10 @@ export const sourceKey = r => r?.gatewayId && r?.profile && r?.id && ['message',
 // before that carry a non-empty string naming the permission. Both are valid: a stale contract here rejected the
 // whole queue ("Invalid action request owner or schema") for one flagged row, hiding every ask in that chat.
 const validPermission = p => p === undefined || typeof p === 'boolean' || (typeof p === 'string' && !!p.trim())
-const permissionNote = p => p === true ? ' — needs separate permission' : typeof p === 'string' && p.trim() ? ` — separately requires ${p}` : ''
+// Approve grants a boolean-flagged limit (core.py permissionGrants, 2026-11-24): the card says so. A legacy string flag
+// names a permission outside this request and stays separate.
+// Only an Approve grants; a request with no approve choice (a go answer to a question) grants nothing, so says so.
+const permissionNote = (p, approvable = true) => p === true ? (approvable ? ' — permission: granted if you approve' : ' — needs separate permission') : typeof p === 'string' && p.trim() ? ` — separately requires ${p}` : ''
 export function validRequest(r) {
   const text = s => typeof s === 'string' && !!s.trim()
   return !!requestKey(r) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.requestId) &&
@@ -1210,7 +1213,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
   const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
-  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired)}` }, i)) })] })
+  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired, !!r.choices?.some(c => c?.effect === 'approve'))}` }, i)) })] })
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
   // Nothing for this plugin to draw under the panel: the panel already shows the ask and posts its plain options.
@@ -1439,7 +1442,7 @@ export function DecisionList({ attrs, deps }) {
         return jsxs('div', { 'data-decision-list-entry': e.n, style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }, children: [
           e.title && jsx('strong', { 'data-decision-list-title': '', style: { overflowWrap: 'anywhere' }, children: str(e.title) }),
           d && typeof d.scopeMarkdown === 'string' && d.scopeMarkdown.trim() && jsx('div', { 'data-decision-list-scope': '', tabIndex: 0, 'aria-label': authorizing ? 'Complete plan' : 'Question', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.5, maxHeight: '30vh', overflowY: 'auto' }, children: jsx(MessageTextContent, { media: false, text: d.scopeMarkdown }) }),
-          d && Array.isArray(d.limits) && d.limits.length > 0 && jsxs('div', { 'data-decision-list-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: d.limits.map((l, i) => jsx('li', { children: `${str(l.key)}: ${str(l.value)}${permissionNote(l.permissionRequired)}` }, i)) })] }),
+          d && Array.isArray(d.limits) && d.limits.length > 0 && jsxs('div', { 'data-decision-list-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: d.limits.map((l, i) => jsx('li', { children: `${str(l.key)}: ${str(l.value)}${permissionNote(l.permissionRequired, e.effect === 'approve')}` }, i)) })] }),
           d && Array.isArray(d.exclusions) && d.exclusions.length > 0 && jsxs('div', { 'data-decision-list-exclusions': '', children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: d.exclusions.map((t, i) => jsx('li', { children: str(t) }, i)) })] }),
           outcome && jsx('div', { 'data-decision-list-outcome': '', style: planStyle, children: `If you choose this: ${outcome}` }),
           blocked && jsx('div', { 'data-decision-list-blocked': '', role: 'note', style: { color: AMBER, fontSize: 12 }, children: 'This list does not show the complete request, so this option cannot be answered here. Use the decision queue above the composer.' }),

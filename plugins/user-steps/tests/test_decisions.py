@@ -885,3 +885,35 @@ def test_client_timing_endpoint_logs_one_joinable_line(tmp_path, caplog):
     lines = [r.getMessage() for r in caplog.records if r.name == 'user-steps' and r.getMessage().startswith('Decision client timing ')]
     assert lines[-1].endswith('refresh_ms=2000.0 paint_ms=0.0 total_ms=70.0 visible_ms=70.0')
     assert s.operation(OWNER, op) == before
+
+
+def test_approve_grants_the_permission_required_limits_it_showed(tmp_path):
+    """Nothing ever filled permissionGrants, so an approved request with a permissionRequired limit could never
+    be acted on: the owner chat kept asking for a "separate owner permission" no surface could give, and the
+    Cogamer Tools cards looped for a day (2026-11-24). The person approving IS the owner: Approve grants the
+    flagged limits of the exact revision it approved, nothing else; revise/decline grant nothing."""
+    s = store(tmp_path); req = request()
+    req['limits'] = [dict(key='iam', value='one secret ARN', permissionRequired=True),
+                     dict(key='spend', value='none', permissionRequired=False)]
+    r = s.create(OWNER, req)
+    op = s.decide(OWNER, decision(r))['operation']
+    assert op['intent']['permissionGrants'] == [dict(key='iam', value='one secret ARN')]
+    prompt_delivery = load_module('grant_prompt_delivery', ROOT / 'prompt_delivery.py')
+    text = prompt_delivery.PromptAdmission._params(op)['text']
+    assert 'need independent owner permission' not in text
+    assert 'grants the permissionRequired limits in permissionGrants' in text
+    other = request(); other['limits'] = req['limits']
+    declined = s.create(OWNER, other)
+    op = s.decide(OWNER, decision(declined, key='key-2', choice='decline'))['operation']
+    assert op['intent']['permissionGrants'] == []
+    assert 'need independent owner permission' in prompt_delivery.PromptAdmission._params(op)['text']
+
+
+def test_approve_without_flagged_limits_keeps_the_admitted_text(tmp_path):
+    """An operation without grants keeps its exact admission text: a restarted readback recomputes its digest."""
+    s = store(tmp_path); r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    assert op['intent']['permissionGrants'] == []
+    prompt_delivery = load_module('nogrant_prompt_delivery', ROOT / 'prompt_delivery.py')
+    assert 'permissionRequired items need independent owner permission; no GPU permission is granted here.' in \
+        prompt_delivery.PromptAdmission._params(op)['text']
