@@ -8,8 +8,38 @@ from contextlib import closing
 import hashlib
 import json
 import math
+import threading
+from collections import OrderedDict
 
 
+# An accelerator for decoding, never a membership/absence certificate. Every
+# capture still reads every current publication and hashes its complete bytes.
+# Keep only compact metadata, not task bodies or live SQLite connections.
+_INVENTORY_MAX = 65536
+_INVENTORY = OrderedDict()
+_INVENTORY_LOCK = threading.Lock()
+
+
+def _inventory(raw, key, gateway, profile, linked_sessions):
+    digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+    cache_key = (digest, key, gateway, profile, linked_sessions)
+    with _INVENTORY_LOCK:
+        value = _INVENTORY.get(cache_key)
+        if value is not None:
+            _INVENTORY.move_to_end(cache_key)
+            return value
+    task = _object(raw)
+    parts = key.split('/')
+    if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
+        raise ValueError('unknown replica identity')
+    value = ((parts[-2], parts[-1]), task.get('created_at'),
+             frozenset(linked_sessions(task, gateway, profile)))
+    with _INVENTORY_LOCK:
+        _INVENTORY[cache_key] = value
+        _INVENTORY.move_to_end(cache_key)
+        while len(_INVENTORY) > _INVENTORY_MAX:
+            _INVENTORY.popitem(last=False)
+    return value
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
@@ -173,24 +203,23 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             # selected inventory must see arrivals, removals and legacy twins.
             candidates, direct = [], set()
             for gw, key, raw, version in replica.execute(
-                    "SELECT gw,key,data,version FROM replica WHERE coll='tasks'"):
-                task = _object(raw)
-                parts = key.split('/')
-                if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
-                    raise ValueError('unknown replica identity')
-                identity = (parts[-2], parts[-1])
-                candidates.append((gw, key, task, version, identity))
-                if alias_set.intersection(linked_sessions(task, gateway, profile)):
+                    "SELECT gw,key,CAST(data AS BLOB),version FROM replica WHERE coll='tasks'"):
+                identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions)
+                candidates.append((gw, key, version, identity, created))
+                if alias_set.intersection(sessions):
                     direct.add((gw, key))
             # Retained ledger payloads are not current just because their scope
             # is live. Require the exact owner publication, version AND content,
             # as the canonical projector does before accepting an observation.
             # Missing/re-homed records stay conservatively unknown: this capture
             # must not refresh the ledger or duplicate its release/rehome policy.
-            publications = {(gw, key): (task, version)
-                            for gw, key, task, version, _ in candidates}
+            def publication(gw, key):
+                row = replica.execute("SELECT data,version FROM replica "
+                                      "WHERE gw=? AND coll='tasks' AND key=?", (gw, key)).fetchone()
+                return (_object(row[0]), row[1]) if row is not None else None
+
             for binding, _, task, version, released, _ in obligations:
-                current = publications.get((binding['owner']['gateway'], binding['task_record_key']))
+                current = publication(binding['owner']['gateway'], binding['task_record_key'])
                 if current != (task, version):
                     return None
                 if task['status'] in ('done', 'archived'):
@@ -200,15 +229,15 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                             or task['status'] == 'archived' and evidence):
                         return None
             exact = direct | {(b[0]['owner']['gateway'], b[0]['task_record_key']) for b in obligations}
-            seeds = [(b[0]['owner']['gateway'], b[0]['owner']['board'], b[0]['owner']['task_id'], b[2])
-                     for b in obligations]
-            seeds.extend((gw, identity[0], identity[1], task)
-                         for gw, key, task, _, identity in candidates if (gw, key) in direct)
-            def relevant(gw, key, task, identity):
+            seeds = [(b[0]['owner']['gateway'], (b[0]['owner']['board'], b[0]['owner']['task_id']),
+                      b[2].get('created_at')) for b in obligations]
+            seeds.extend((gw, identity, created)
+                         for gw, key, _, identity, created in candidates if (gw, key) in direct)
+            def relevant(gw, key, identity, created):
                 if (gw, key) in exact:
                     return True
-                for source_gw, board, tid, seed in seeds:
-                    if identity != (board, tid):
+                for source_gw, seed_identity, seed_created in seeds:
+                    if identity != seed_identity:
                         continue
                     # An unqualified twin might carry this chat's link after
                     # canonical folding. Unknown identity must not certify absence.
@@ -216,12 +245,16 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                         return True
                     # Re-homes require the same non-null creation identity, not
                     # merely an ID reused in another gateway/profile's chat.
-                    created = seed.get('created_at')
-                    if created is not None and task.get('created_at') == created:
+                    if seed_created is not None and created == seed_created:
                         return True
                 return False
-            rows = [[gw, key, task, version] for gw, key, task, version, identity in candidates
-                    if relevant(gw, key, task, identity)]
+            rows = []
+            for gw, key, version, identity, created in candidates:
+                if relevant(gw, key, identity, created):
+                    current = publication(gw, key)
+                    if current is None:
+                        return None
+                    rows.append([gw, key, current[0], version])
             for gw, key, task, version in rows:
                 if (len(key.split('/')) != 3 or type(version) is not int or version < 1
                         or not _known_task(task)):
