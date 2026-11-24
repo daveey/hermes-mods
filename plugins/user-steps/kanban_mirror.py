@@ -1686,6 +1686,19 @@ class Mirror:
             c.close()
 
 
+class Presentation:
+    """Captured-store presentation only: no board discovery, runtime or writer initialization."""
+
+    def __init__(self, core, store):
+        if not store.read_only:
+            raise core.ActionError('Presentation requires a read-only action store', 503)
+        self.core, self.store = core, store
+
+    views = Mirror.views
+    present = Mirror.present
+    _present = Mirror._present
+
+
 class Delivery:
     """Route only server-bound projections; ordinary requests retain their receiver."""
 

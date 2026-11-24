@@ -304,7 +304,7 @@ class CoreReaders:
         ctx = self._explicit_home()
         if ctx is None:
             return _snapshot_path()
-        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}-{ctx.namespace()}')
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{self._home_identity()["profile"]}-{ctx.namespace()}')
         return ctx.home / 'session-panel' / f'feed-{safe}.json'
 
     def timing_path(self) -> Path:
@@ -339,7 +339,11 @@ class CoreReaders:
         if links.is_dir():
             found += [(p.stem, p) for p in sorted(links.glob('*.db'))
                       if BOARD_ID_RE.match(p.stem) and p.stem not in local]
-        return found
+        config = _explicit_home_mod().parse_home_sync_config(home)
+        selected = [(slug, path) for slug, path in found if kanban_db_sync.board_selected(str(path), config)]
+        if any(not path.resolve().is_relative_to(home.resolve()) for _, path in selected):
+            self._refuse('outside_home_store')
+        return selected
 
     # files
     def boards(self) -> list[tuple[str, Path]]:
@@ -377,6 +381,9 @@ class CoreReaders:
         self._local.conns = {}
 
     def conn(self, path: Path) -> Optional[sqlite3.Connection]:
+        ctx = self._explicit_home()
+        if ctx is not None and not Path(path).resolve().is_relative_to(ctx.home.resolve()):
+            self._refuse('outside_home_store')
         conns = getattr(self._local, 'conns', None)
         if conns is None:
             conns = self._local.conns = {}
@@ -558,7 +565,7 @@ class CoreReaders:
                 ids, gateway,
                 tuple(ksa.LISTED_STATUSES) + ('done', 'archived'),
                 replicas=shadows, stale_ok=False, origin_cards=cards,
-                unreadable_out=unreadable, profile=profile)
+                unreadable_out=unreadable, profile=profile, stale_after_s=_explicit_home_mod().stale_after(cfg))
             rows.extend(replica)
             if unreadable:
                 raise RuntimeError('session-panel external replica capture unavailable')
@@ -998,7 +1005,8 @@ class CoreReaders:
             origin = [row for row in self._origin_rows() if not row.get('released')]
             return links.replica_cards(
                 list(ids), ident['gateway'], statuses, replicas=shadows,
-                stale_ok=True, origin_cards=origin, profile=ident.get('profile'))
+                stale_ok=True, origin_cards=origin, profile=ident.get('profile'),
+                stale_after_s=_explicit_home_mod().stale_after(cfg))
         rows = self._origin_rows()
         wanted = set(ids)
         return [row for row in rows if not row.get('released')
@@ -1176,9 +1184,9 @@ class CoreReaders:
                 self._refuse('user_steps')
             # Presentation never reconciles. The canonical producer lane still requires a
             # home-local Mirror; until that adapter exists, do not call process-home Mirror.
-            self.reconcile_unreached = []
+            self.reconcile_unreached = list(sessions)
             self.reconcile_timings = []
-            return set()
+            return set(self.reconcile_unreached)
         self.require_scope('user_steps')
         api = self._user_step_api()
         deferred = set()
@@ -1352,9 +1360,12 @@ class CoreReaders:
         if task is None:
             return None
         d = dataclasses.asdict(task)
+        explicit = self._explicit_home() is not None
+        if explicit and parent_connection is ...:
+            parent_connection = None  # never discover a process-home replica for contained parents
         try:
             from hermes_cli.kanban_session_wait_rows import _local_wait_info
-            d['wait'] = (_local_wait_info(c, [card_id]) if snapshot_at is None else
+            d['wait'] = (_local_wait_info(c, [card_id]) if snapshot_at is None and not explicit else
                          _local_wait_info(c, [card_id], now=snapshot_at,
                                           replica=parent_connection)).get(card_id, {})
         except (ImportError, sqlite3.Error):
@@ -1403,6 +1414,9 @@ class CoreReaders:
                 out['owner'] = None if owner is kfc._UNSET else owner
             except Exception:
                 out['owner'] = None
+        elif explicit:
+            # Queue diagnostics are not a captured-home reader yet. Report that gap, never call its ambient resolver.
+            out['queue_unavailable'] = {'state': 'unavailable', 'reason': 'explicit_home_adapter_unavailable'}
         elif not _mitigation('HERMES_PANEL_SKIP_QUEUE_POSITION'):
             try:
                 from hermes_cli import kanban_queue_position as kqp

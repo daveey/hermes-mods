@@ -1,15 +1,10 @@
-"""Home-local identity and origin projection for explicit-home panel reads.
-
-Never consult process HERMES_HOME, kanban_home, sync_config, load_identity, or
-get_install_id. Installation identity is either a server-trusted mapping or
-files under the authorized home.
-"""
+"""Explicit-home config and identity inputs; never resolve process-home state."""
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
-
 
 _INSTALL_ID = re.compile(r'^[0-9a-f]{32}$')
 
@@ -22,59 +17,73 @@ def profile_label(home: Path) -> str:
 def read_install_id(home: Path) -> str | None:
     path = Path(home) / 'install_id'
     try:
-        text = path.read_text(encoding='utf-8').strip().lower()
-    except OSError:
+        text = path.read_text(encoding='utf-8-sig').strip().lower()
+    except FileNotFoundError:
         return None
-    return text if _INSTALL_ID.fullmatch(text) else None
+    if not _INSTALL_ID.fullmatch(text):
+        raise ValueError('Invalid explicit install identity')
+    return text
 
 
 def parse_home_sync_config(home: Path) -> dict:
     path = Path(home) / 'config.yaml'
-    if not path.is_file():
-        return {}
     try:
-        text = path.read_text(encoding='utf-8')
-    except OSError:
-        return {}
-    data = None
+        text = path.read_text(encoding='utf-8-sig')
+    except FileNotFoundError:
+        return {}  # missing configuration disables optional sources; unreadable is not missing
     try:
         data = json.loads(text)
     except ValueError:
-        try:
-            from ruamel.yaml import YAML
-            data = YAML(typ='safe').load(text)
-        except Exception:
-            return {}
+        from ruamel.yaml import YAML
+        data = YAML(typ='safe').load(text)
     if not isinstance(data, dict):
-        return {}
-    kanban = data.get('kanban')
+        raise ValueError('Explicit configuration must be a mapping')
+    kanban = data.get('kanban', {})
     if not isinstance(kanban, dict):
-        return {}
-    sync = kanban.get('sync')
-    return sync if isinstance(sync, dict) else {}
+        raise ValueError('Explicit kanban configuration must be a mapping')
+    sync = kanban.get('sync', {})
+    if not isinstance(sync, dict):
+        raise ValueError('Explicit sync configuration must be a mapping')
+    if 'enabled' in sync and not isinstance(sync['enabled'], bool):
+        raise ValueError('Explicit sync enabled must be boolean')
+    if 'gateway' in sync and (not isinstance(sync['gateway'], str) or not sync['gateway'].strip()):
+        raise ValueError('Explicit sync gateway must be a nonempty string')
+    stale_after(sync)  # validate a supplied interval even when the optional source is disabled
+    return sync
+
+
+def stale_after(sync: dict) -> float:
+    from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
+    period = sync.get('interval_seconds', 0)
+    if isinstance(period, bool) or not isinstance(period, (int, float)) or not math.isfinite(period) or period < 0:
+        raise ValueError('Explicit sync interval_seconds must be finite and nonnegative')
+    return max(HUB_STALE_AFTER_S, 3 * period)
 
 
 def identity(home: Path, installation=None) -> dict:
-    inst = installation if isinstance(installation, dict) else {}
+    if installation is not None and not isinstance(installation, dict):
+        raise ValueError('Explicit installation must be a mapping')
+    inst = installation or {}
     home = Path(home)
     gateway = inst.get('gateway')
-    profile = inst.get('profile')
+    profile = inst.get('profile', profile_label(home))
     install_id = inst.get('install_id')
-    if profile is None:
-        profile = profile_label(home)
+    if not isinstance(profile, str) or not profile.strip():
+        raise ValueError('Explicit profile must be a nonempty string')
     if gateway is None:
-        raw = parse_home_sync_config(home).get('gateway')
-        gateway = raw.strip() if isinstance(raw, str) and raw.strip() else None
+        gateway = parse_home_sync_config(home).get('gateway')
+    if gateway is not None and (not isinstance(gateway, str) or not gateway.strip()):
+        raise ValueError('Explicit gateway must be a nonempty string')
     if install_id is None:
         install_id = read_install_id(home)
-    elif isinstance(install_id, str):
+    elif not isinstance(install_id, str) or not _INSTALL_ID.fullmatch(install_id.strip().lower()):
+        raise ValueError('Invalid explicit install identity')
+    else:
         install_id = install_id.strip().lower()
-        if not _INSTALL_ID.fullmatch(install_id):
-            install_id = None
     return {'gateway': gateway, 'profile': profile, 'install_id': install_id}
 
 
 def origin_rows(home: Path, *, gateway: str, profile: str) -> list:
     from hermes_cli.kanban_origin_ledger import project
     path = Path(home) / 'kanban' / 'origin-ledger.db'
-    return project(path, replica=None, gateway=gateway or '', profile=profile or 'default')
+    return project(path, replica=None, gateway=gateway or '', profile=profile, home=Path(home))
