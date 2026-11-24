@@ -181,6 +181,7 @@ def test_cold_reader_a_pending_retry_and_the_off_switch_skip_the_rest(monkeypatc
     clock[0] = 100.0
     f, ticks, _ = _duty_feed(api, monkeypatch, clock, cold=False)
     f._retry = {'chat-b'}  # a failed pass or a chat left to retry: recovery is not held
+    f._hydrate_retry_at = 110.1  # ...while its budgeted retry clock is armed (Feed._spend)
     api._run(f)
     assert ticks[1] - ticks[0] < 30.0, ticks
     monkeypatch.setenv('HERMES_PANEL_DUTY', '0')
@@ -212,8 +213,67 @@ def test_a_deferred_reconcile_is_not_held(monkeypatch):
     clock = [100.0]
     f, ticks, _ = _duty_feed(api, monkeypatch, clock, cold=False)
     f._reconcile_deferred = {'chat-c'}  # the producer could not finish this chat; its backoff retry is due
+    f._reconcile_retry_at = 110.1
     api._run(f)
     assert ticks[1] - ticks[0] < 30.0, ticks
+
+
+@pytest.mark.parametrize('owed', ['_reconcile_deferred', '_retry'])
+def test_a_chat_out_of_retries_does_not_keep_the_rest_off(monkeypatch, owed):
+    """The hub wake storm (2026-11-24): four chats whose remote reconciliation defers on every pass stayed in
+    `_reconcile_deferred` with no retry clock armed (out of retries, still owed: test_selective_producer pins
+    that Feed state), and the non-empty set alone switched the rest off, so 6-21 s passes ran back to back."""
+    api = _api(monkeypatch)
+    clock = [100.0]
+    f, ticks, _ = _duty_feed(api, monkeypatch, clock, cold=False)
+    setattr(f, owed, {'chat-c'})
+    f._admission_retry_at = f._hydrate_retry_at = f._reconcile_retry_at = None  # every budget spent
+    api._run(f)
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert len(ticks) >= 3 and all(30.0 <= g <= 33.0 for g in gaps), ticks
+    assert f.timing['duty_deferrals'] > 0
+
+
+def test_a_write_during_the_rest_of_an_exhausted_chat_is_not_lost_and_a_new_failure_is_retried_at_once(monkeypatch):
+    """Notification loss: the write that lands while the feed rests still gets its pass (once, after the rest),
+    and a chat whose retry clock is armed again by that pass is retried without waiting out another rest."""
+    api = _api(monkeypatch)
+    clock = [100.0]
+    f, ticks, _ = _duty_feed(api, monkeypatch, clock, cold=False)
+    f._reconcile_deferred = {'chat-c'}
+    f._reconcile_retry_at = None
+    real_tick = f.tick
+    def tick():
+        real_tick()
+        f._wake.clear()  # as Feed._tick does
+        if len(ticks) == 2:
+            f._retry = {'chat-d'}  # the second pass leaves a fresh failure with retries left
+            f._hydrate_retry_at = clock[0] + 0.1
+            f._wake.set()
+        elif len(ticks) == 3:
+            f._retry, f._hydrate_retry_at = set(), None  # the retry succeeded
+    f.tick = tick
+    beats = []
+    def beat():
+        beats.append(clock[0])
+        if len(beats) == 3 and len(ticks) == 1:
+            f._wake.set()  # exactly one source write, in the middle of the first pass's rest
+    f.beat = beat
+    api._run(f)
+    assert len(ticks) == 3, ticks
+    assert ticks[1] - ticks[0] >= 30.0, ticks  # the write waited out the rest, and was served
+    assert ticks[2] - ticks[1] < 15.0, ticks   # the armed retry ran on the floor, not after a 20 s rest
+
+
+def test_recovery_due_needs_owed_work_and_an_armed_clock(monkeypatch):
+    api = _api(monkeypatch)
+    due = lambda **kw: api._recovery_due(SimpleNamespace(**kw))
+    assert not due()
+    assert not due(_retry={'a'}) and not due(_reconcile_deferred={'a'})
+    assert not due(_retry=set(), _reconcile_deferred=set(), _hydrate_retry_at=5.0)  # a stale clock alone
+    assert due(_retry={'a'}, _hydrate_retry_at=5.0)
+    assert due(_reconcile_deferred={'a'}, _reconcile_retry_at=5.0)
+    assert due(_retry={'a'}, _admission_retry_at=5.0)
 
 
 def test_rest_without_the_coalesce_floor(monkeypatch):
