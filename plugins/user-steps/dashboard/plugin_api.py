@@ -195,6 +195,19 @@ def _server_owner(core, session, *, install_id=None, profile=None):
     return core.server_owner(session, install_id=install_id, profile=profile)
 
 
+def _bound_identity(core, install_id, profile):
+    import re
+    if not isinstance(install_id, str) or not re.fullmatch(r'[0-9a-f]{32}', install_id):
+        raise core.ActionError('Explicit install identity unavailable', 503)
+    if not isinstance(profile, str) or not profile.strip():
+        raise core.ActionError('Explicit profile unavailable', 503)
+
+
+def _panel_presenter(core, store, *, bound):
+    module = _load('kanban_mirror')
+    return module.Presentation(core, store) if bound else module.Mirror(core, store)
+
+
 def panel_owners(home: Path, session: str, lineage, *, install_id=None, profile=None, bound=False) -> list:
     """Capture stored membership once, closing SQL before owner derivation.
 
@@ -203,6 +216,8 @@ def panel_owners(home: Path, session: str, lineage, *, install_id=None, profile=
     ``bound=True`` uses the authorized home and explicit install identity only.
     """
     core = _load('core')
+    if bound:
+        _bound_identity(core, install_id, profile)
     if not bound:
         if core.home().resolve() != Path(home).resolve():
             raise core.ActionError('Panel profile does not match current profile', 409)
@@ -245,6 +260,8 @@ def panel_requests_many(home: Path, lineages, *, install_id=None, profile=None, 
     """
     import copy
     core = _load('core')
+    if bound:
+        _bound_identity(core, install_id, profile)
     if not bound:
         if core.home().resolve() != Path(home).resolve():
             raise core.ActionError('Panel profile does not match current profile', 409)
@@ -259,7 +276,7 @@ def panel_requests_many(home: Path, lineages, *, install_id=None, profile=None, 
     st = core.ActionStore(path=store_path, read_only=True) if store_path is not None else core.ActionStore(read_only=True)
     by_session = {sid: [] for sid in owners}
     if owners and st.path.exists():
-        producer = _load('kanban_mirror').Mirror(core, st)
+        producer = _panel_presenter(core, st, bound=bound)
         for row in producer.views(list(owners.values()), include_withdrawn=True):
             by_session[row['owner']['storedSessionId']].append(row)
     return {sid: group if isinstance(group, Exception) else
@@ -282,6 +299,8 @@ def panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profi
     core = _load('core')
     try:
         owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
+        if bound:
+            raise core.ActionError('Explicit-home reconciliation adapter unavailable', 503)
     except core.ActionError as exc:
         if exc.status != 404:
             raise
@@ -309,6 +328,8 @@ def panel_requests(home: Path, session: str, lineage, *, reconcile=True,
     path or source reference into write authority for a different profile.
     """
     core = _load('core')
+    if bound and reconcile:
+        raise core.ActionError('Explicit-home reconciliation adapter unavailable', 503)
     owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
     store_path = Path(home) / 'user-steps' / 'actions.sqlite3' if bound else None
     if store_path is not None:
@@ -317,7 +338,7 @@ def panel_requests(home: Path, session: str, lineage, *, reconcile=True,
         st = core.ActionStore() if reconcile else core.ActionStore(read_only=True)
     if not reconcile and not st.path.exists():
         return []  # a fresh profile has no producer store; readers must not create it
-    producer = _load('kanban_mirror').Mirror(core, st)
+    producer = _panel_presenter(core, st, bound=bound)
     for own in owners:
         if reconcile:
             producer.reconcile(own)

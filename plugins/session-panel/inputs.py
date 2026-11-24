@@ -45,6 +45,8 @@ def read(reader, session, lineage):
         try:
             canonical = reader.user_step_requests(session, lineage)
         except Exception:
+            if getattr(reader, 'home_context', None) is not None:
+                raise  # explicit refusal cannot become a raw-store fallback
             out['input_errors'].append('user-steps requests unavailable')
             log.debug('panel canonical requests unavailable', exc_info=True)
     store = reader.conn(home / 'user-steps' / 'actions.sqlite3') if canonical is None else None
@@ -89,7 +91,11 @@ def read(reader, session, lineage):
             log.debug('panel requests unavailable', exc_info=True)
     profile = home.name if home.parent.name == 'profiles' else 'default'
     annotated = {'id': session, 'profile': profile, '_lineage_ids': list(lineage)}
-    if getattr(reader, 'home_context', None) is None:
+    if explicit:
+        out['input_errors'].extend(['subagent inventory adapter unavailable',
+                                    'process inventory adapter unavailable',
+                                    'rental inventory adapter unavailable'])
+    else:
         for module_name, fn_name in (('hermes_cli.subagent_session_activity', 'annotate_subagent_activity'),
                                       ('hermes_cli.process_session_activity', 'annotate_background_activity')):
             try:
