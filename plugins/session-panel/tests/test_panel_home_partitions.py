@@ -315,6 +315,79 @@ def test_lifecycle_installation_is_the_hermes_root_of_the_served_home(monkeypatc
         assert str(lifecycle.installation) == str(twins['a'].parents[1])
     finally:
         lifecycle.stop_watching()
+        assert api._retire_legacy_panel()
+
+
+def test_factory_preserves_explicit_binding_without_resolving_again(api, twins, tmp_path, monkeypatch):
+    bound = binding(twins['a'])
+    def forbidden(*args):
+        pytest.fail('explicit binding must not be resolved from ambient state')
+    monkeypatch.setattr(api, 'current_binding', forbidden)
+    relay = api.make_panel_relay(tmp_path, tmp_path / 'runtime', 'g', binding=bound)
+    assert relay.partition_identity == bound.identity
+    assert relay.config['initial']['body']['_partition'] == bound.wire()
+
+
+def test_request_state_is_retained_for_background_checks_and_stateless_calls(served, tmp_path):
+    api_mod = served.api
+    relay = make_relay(api_mod, tmp_path, api_mod.current_binding(served.state))
+    api_mod._LOADER.external_projection = relay
+    api_mod._bound_external(served.request)
+    assert api_mod._LOADER.app_state is served.state
+    before = relay.partition_identity
+    api_mod._bound_external(None)
+    assert api_mod._LOADER.app_state is served.state  # absent request never clears the authority
+    assert relay.partition_identity == before
+    assert api_mod._partition_still_current(before)
+    served.authority.retiring = True
+    assert not api_mod._partition_still_current(before)
+    api_mod._bound_external(None)
+    assert relay.partition_identity is None
+
+
+@pytest.mark.parametrize('config', [None, [], 'bad', {}, {'provider': None}, {'provider': []}])
+def test_unpartitioned_nonmapping_config_is_safe(provider_mod, monkeypatch, config):
+    sentinel = object()
+    monkeypatch.setattr(provider_mod, 'PanelProducer', lambda *args, **kwargs: sentinel)
+    assert provider_mod.open_provider(config) is sentinel
+
+
+def test_bare_body_dispatch_and_malformed_payloads(provider_mod, api, twins):
+    pset, made = stub_set(provider_mod, api)
+    bound = binding(twins['a'])
+    pset({'_partition': bound.wire(), 'sessions': ['chat']})
+    assert made[0][1].seen == [{'sessions': ['chat']}]
+    for bad in (None, [], 'bad', {'body': None}, {'body': []}):
+        with pytest.raises(ValueError, match='partition required'):
+            pset(bad)
+
+
+def test_noncanonical_claim_revokes_only_its_own_home(provider_mod, api, twins):
+    pset, made = stub_set(provider_mod, api)
+    a, b = binding(twins['a']), binding(twins['b'])
+    pset(request_payload(a))
+    pset(request_payload(b))
+    forged = homes.HomeBinding(str(twins['alias']), a.lifecycle_generation, a.authorization_generation)
+    with pytest.raises(RuntimeError, match='stale home generation'):
+        pset(request_payload(forged))
+    assert pset.partitions() == [a.identity, b.identity]
+    # Revoking a itself must not close the unrelated b partition.
+    stale = homes.HomeBinding(a.home, 'wrong-life', a.authorization_generation)
+    with pytest.raises(RuntimeError, match='stale home generation'):
+        pset(request_payload(stale))
+    assert pset.partitions() == [b.identity]
+    assert made[0][1].closed and not made[1][1].closed
+
+
+def test_new_generation_replaces_only_its_own_home(provider_mod, api, twins):
+    pset, made = stub_set(provider_mod, api)
+    a, b = binding(twins['a']), binding(twins['b'])
+    pset(request_payload(a))
+    pset(request_payload(b))
+    newer = binding(twins['a'], epoch=2)
+    pset(request_payload(newer))
+    assert pset.partitions() == [b.identity, newer.identity]
+    assert made[0][1].closed and not made[1][1].closed
 
 
 # ---- real exec: ONE shared child serves two equal-label homes through two serves ----
