@@ -59,6 +59,8 @@ log = logging.getLogger(PLUGIN_ID)
 
 
 _FEED_KEY = '_session_panel_feed_core'
+# Effective source-mode switches that change what the producer emits (_mitigation: unset == enabled).
+_MANIFEST_MODES = ('HERMES_PANEL_COALESCE', 'HERMES_PANEL_DUTY', 'HERMES_PANEL_SKIP_QUEUE_POSITION')
 _FEED_PATH = Path(__file__).resolve().parent / 'feed.py'
 # Process-wide (not per plugin_api generation: a hot reload re-imports this file while the old generation's threads
 # may still call their own _load_feed): one lock and a generation counter for loading feed.py.
@@ -1600,10 +1602,21 @@ def _panel_provider_spec() -> dict:
     """Exact producer-safe manifest: the provider and every sibling file it loads, by digest."""
     import hashlib
     base = Path(__file__).resolve().parent
-    names = sorted(p.name for p in base.glob('*.py'))
-    return {'path': str(base / 'producer_provider.py'),
-            'sha256': hashlib.sha256((base / 'producer_provider.py').read_bytes()).hexdigest(),
-            'files': {n: hashlib.sha256((base / n).read_bytes()).hexdigest() for n in names}}
+    def digest(name: str) -> str:
+        return hashlib.sha256((base / name).read_bytes()).hexdigest()
+
+    # plugin_api.py is the legacy registration module: the producer never loads it, and if it ever
+    # did, the post-import check refuses because it is deliberately not declared.
+    names = sorted(p.name for p in base.glob('*.py') if p.name != 'plugin_api.py')
+    return {'path': str(base / 'producer_provider.py'), 'sha256': digest('producer_provider.py'),
+            'manifest': {
+                'version': 1,
+                'providers': {Path(n).stem: {'path': n, 'sha256': digest(n)} for n in names},
+                # This producer registers no done/waiting callbacks: both sections are present and
+                # empty, which is a declared fact, not an omitted (refusing) section.
+                'callbacks': {'done': [], 'waiting': []},
+                'modes': {name: _mitigation(name) for name in _MANIFEST_MODES},
+                'facts': {'HERMES_FACTS_PANEL': _mitigation('HERMES_FACTS_PANEL')}}}
 
 
 def _retire_legacy_panel() -> bool:
