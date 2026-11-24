@@ -67,6 +67,19 @@ _LOADER.__dict__.setdefault('lock', threading.Lock())
 _LOADER.__dict__.setdefault('generation', 0)
 
 
+def _home_context_mod():
+    path = Path(__file__).with_name('home_context.py')
+    key = '_session_panel_home_context'
+    mod = sys.modules.get(key)
+    if mod is None or not hasattr(mod, 'UnsupportedHomeAdapter'):
+        spec = importlib.util.spec_from_file_location(key, path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def _external_projection():
     """Dormant pre-import selection; never hand over an existing legacy owner."""
     external = getattr(_LOADER, 'external_projection', None)
@@ -199,23 +212,82 @@ class CoreReaders:
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
     file was replaced (another inode) and dropped when the file is gone."""
 
-    def __init__(self, state_db: Optional[Path] = None):
+    def __init__(self, state_db: Optional[Path] = None, *, home_context=None):
         from hermes_cli import kanban_sync_client as ksc
         self.ksc = ksc
         self._local = threading.local()
         self._boards: list[tuple[str, Path]] = []
         self._boards_at = 0.0
         self._boards_lock = threading.Lock()
-        if state_db is None:
-            from hermes_constants import get_hermes_home
-            state_db = Path(get_hermes_home()) / 'state.db'
+        self.home_context = home_context
+        if home_context is not None and state_db is not None:
+            raise TypeError('state_db is not combined with home_context')
+        if home_context is not None:
+            state_db = Path(home_context.home) / 'state.db'
+            self.unavailable_scopes = frozenset({'hub_db', 'mail_config'})
+        else:
+            self.unavailable_scopes = frozenset()
+            if state_db is None:
+                from hermes_constants import get_hermes_home
+                state_db = Path(get_hermes_home()) / 'state.db'
         self._state_db = Path(state_db)
+
+    def _explicit_home(self):
+        return getattr(self, 'home_context', None)
+
+    def cache_identity(self):
+        ctx = self._explicit_home()
+        if ctx is None:
+            return ('legacy', str(self._state_db))
+        return ctx.identity
+
+    def require_scope(self, scope: str):
+        if scope in getattr(self, 'unavailable_scopes', frozenset()):
+            raise _home_context_mod().UnsupportedHomeAdapter(scope)
+
+    def snapshot_path(self) -> Path:
+        ctx = self._explicit_home()
+        if ctx is None:
+            return _snapshot_path()
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}-{ctx.namespace()}')
+        return ctx.home / 'session-panel' / f'feed-{safe}.json'
+
+    def _shadow_path(self, slug: str) -> Path:
+        ctx = self._explicit_home()
+        if ctx is None:
+            return Path(self.ksc.shadow_path(slug))
+        from hermes_cli import kanban_db_sync
+        return ctx.home / 'kanban' / kanban_db_sync.SHADOW_DIR / f'{slug}.db'
+
+    def _explicit_boards(self) -> list[tuple[str, Path]]:
+        home = self._explicit_home().home
+        from hermes_cli.kanban_sync_client import BOARD_ID_RE
+        from hermes_cli import kanban_db_sync
+        found: list[tuple[str, Path]] = []
+        default = home / 'kanban.db'
+        if default.exists():
+            found.append(('default', default))
+        boards_root = home / 'kanban' / 'boards'
+        if boards_root.is_dir():
+            for child in sorted(boards_root.iterdir(), key=lambda p: p.name):
+                db = child / 'kanban.db'
+                if BOARD_ID_RE.match(child.name) and db.is_file():
+                    found.append((child.name, db))
+        local = {slug for slug, _ in found}
+        links = home / 'kanban' / kanban_db_sync.LINKS_DIR
+        if links.is_dir():
+            found += [(p.stem, p) for p in sorted(links.glob('*.db'))
+                      if BOARD_ID_RE.match(p.stem) and p.stem not in local]
+        return found
 
     # files
     def boards(self) -> list[tuple[str, Path]]:
         with self._boards_lock:
             if not self._boards_at:
-                self._boards = list(self.ksc.board_paths())
+                if self._explicit_home() is not None:
+                    self._boards = self._explicit_boards()
+                else:
+                    self._boards = list(self.ksc.board_paths())
                 self._boards_at = time.monotonic()
             return list(self._boards)
 
@@ -226,7 +298,7 @@ class CoreReaders:
     def board_paths(self) -> list[Path]:
         boards = self.boards()
         return list(dict.fromkeys([Path(p) for _, p in boards] +
-                                  [Path(self.ksc.shadow_path(s)) for s, _ in boards]))
+                                  [self._shadow_path(s) for s, _ in boards]))
 
     def files(self) -> list[Path]:
         return [p for p in self.board_paths() if p.exists()]
@@ -517,7 +589,7 @@ class CoreReaders:
         fresh = {}
         out = BoardChanges()
         paths = {str(p): slug for slug, p in self.boards()}
-        paths.update({str(self.ksc.shadow_path(slug)): slug for slug, _ in self.boards()})
+        paths.update({str(self._shadow_path(slug)): slug for slug, _ in self.boards()})
         present = {str(p) for p in self.files()}
         if set(previous) - present:
             out.full = True  # removal can retract rows; never retain a vanished source cursor
@@ -828,26 +900,34 @@ class CoreReaders:
 
     def external_paths(self) -> list[Path]:
         """Origin receipts and hub replicas are inputs, not task-event boards."""
+        if self._explicit_home() is not None:
+            home = self._explicit_home().home
+            return [home / 'kanban' / 'origin-ledger.db', home / 'origin-work.db']
         from hermes_constants import get_hermes_home
         from hermes_cli.kanban_db import kanban_home
         from hermes_cli.kanban_capability_registry import hub_db_path
         return [hub_db_path(), Path(get_hermes_home()) / 'kanban' / 'origin-ledger.db',
                 kanban_home() / 'origin-work.db']
 
-    @staticmethod
-    def publication_paths():
+    def publication_paths(self):
         # remote_snapshot is a derived output of the canonical reader itself,
         # not a new input. Keep it on older-core watches, but with keyed recovery
         # its cache-only arrivals are covered by the existing 30s reconciliation.
+        if self._explicit_home() is not None:
+            return {self._explicit_home().home / 'origin-work.db'}
         from hermes_cli.kanban_db import kanban_home
         return {kanban_home() / 'origin-work.db'}
 
     def watch_directories(self):
         from hermes_cli import kanban_db, kanban_db_sync
-        root = kanban_db.kanban_home()
+        if self._explicit_home() is not None:
+            root = self._explicit_home().home
+            boards = root / 'kanban' / 'boards'
+        else:
+            root = kanban_db.kanban_home()
+            boards = kanban_db.boards_root()
         # Directory-entry events discover new named/link-only boards. Their
         # writes are then watched by exact file name; unrelated logs don't wake us.
-        boards = kanban_db.boards_root()
         roots = [root, boards, root / 'kanban' / kanban_db_sync.LINKS_DIR,
                  root / 'kanban' / kanban_db_sync.SHADOW_DIR]
         if boards.is_dir():
@@ -1027,7 +1107,7 @@ class CoreReaders:
         """A slim `/api/plugins/kanban/tasks/<id>` answer: `{detail, board}`, or None when no board has it."""
         paths = dict(self.boards())
         for slug in dict.fromkeys([board or 'default', 'default']):
-            for path, replica in ((paths.get(slug), False), (self.ksc.shadow_path(slug), True)):
+            for path, replica in ((paths.get(slug), False), (self._shadow_path(slug), True)):
                 if path is None or not Path(path).exists():
                     continue
                 c = self.conn(Path(path))
