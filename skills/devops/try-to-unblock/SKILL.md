@@ -65,8 +65,14 @@ even in David's terminal, and a recorded For-you choice is not a mandate. Relay 
 (cross_session); after a home move it renews through the authenticated foreign-comment route on its own gateway.
 The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
 renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
-that chat's own terminal; a worker or relayed command is refused. In the mandate, name the stop refusals: Board,
-kanban, renewal, lease, and ship or landing guards. Workers read "any authority refusal" literally and retain when
+that chat's own terminal; a worker or relayed command is refused. When David asks in chat to unblock, the desk may
+write the mandate AND renew from his terminal in one `run_in_user_terminal` window (`ssh ubuntu@hermes-hub` script:
+comment, read its id, renew-scope, promote --seen); the mandate says the desk drafted it on his request.
+Write the mandate for the goal ("land PR N and complete"), not the next step: a step-sized mandate stopped one PR
+13 times as each new ship gate appeared. Ship's documented follow-ups (kanban_attach a proof, post review replies,
+re-run ship, ship's own rebase) are inside the round, and transient infra errors (OperationalError, 5xx, locked)
+get 3 retries. Stop only on: CHANGES_REQUESTED, red required CI needing code, safety refusal, the same error 3
+times, budget. Workers read "any authority refusal" literally and retain when
 the tool policy refuses a single call (e.g. `execute_code` blocked in unattended mode). A tool-policy refusal means
 switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Make the list closed,
 never ending in a catch-all such as "any other guard refusal": workers then stop when the repo's own checks
