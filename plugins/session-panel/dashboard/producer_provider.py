@@ -22,13 +22,17 @@ def open_provider(config):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return PanelProducer(module)
+    home_context = config.get('home_context') if isinstance(config, dict) else None
+    return PanelProducer(module, home_context=home_context)
 
 
 class PanelProducer:
-    def __init__(self, api):
+    def __init__(self, api, *, home_context=None):
         self.api = api
-        self.readers = api.CoreReaders()
+        if home_context is None:
+            self.readers = api.CoreReaders()
+        else:
+            self.readers = api.CoreReaders(home_context=home_context)
         self.feed = api._load_feed().Feed(self.readers, emit=lambda event: None)
 
     def __call__(self, payload):
