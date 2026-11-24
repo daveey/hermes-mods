@@ -1468,26 +1468,34 @@ class Mirror:
             raise self.core.ActionError('Source card ask changed or transition refused', 409)
         return recorded
 
-    def _release(self, api, c, binding, op, comment, receipt, fence):
-        """The default Unblock on a card a spend or scope stop holds (or on the decision card filed for one)
-        releases that card to finish through core's ``hermes kanban release``, as the human act the
-        authenticated Desktop operation is. None when this core has no release or the card is not held that
-        way: the caller then applies today's unblock unchanged.
+    def _release(self, api, c, binding, op, comment, receipt, fence, ask):
+        """The default Unblock on an ask that offered a release frees the stopped card through core's
+        ``hermes kanban release``, as the human act the authenticated Desktop operation is. None otherwise:
+        the caller then applies today's unblock unchanged.
 
-        Core's unblock refuses such a card (a spend decision is pending), so the click released nothing. A
-        refused release (provider safety, containment) leaves the ask in place with the reason as a comment.
+        The offer is the ``release_target`` stamp core's stranded-park brief writes on its own ask; no agent,
+        tool or CLI request can carry it, and core checks it is still true (``kanban_release.offered``: the
+        card still held, the same pending stop, and for a decision card the stop it was filed for). So an
+        agent-written ask, an ask filed before the stamp existed, a stale decision card, a card no stop holds
+        and a core without release all keep the plain unblock, which core refuses on a pending spend decision.
+
+        A refused release (provider safety, containment) leaves the ask in place with the reason as a comment.
+        ``fence`` is checked here and again by core inside the transaction that records the release decision.
         The receipt is a ``user_steps_answer`` event on the bound card, written with the choice comment after
         the release lands; a retry finds it and returns it. A retry after a crash between the release and
-        that write finds the card already released by this operation's note (``released_by``) and records
-        the receipt then, instead of refusing a click that worked."""
+        that write finds the card already released by this operation's note (``released_by``, read from
+        core's ``stop_released`` event) on an ask that carried the offer for that card, and records the
+        receipt then, instead of refusing a click that worked."""
         core_release = getattr(api, "release", None)
-        if core_release is None:
+        offered = getattr(core_release, "offered", None)
+        if offered is None:
             return None
         operation = op["operationId"]
         note = "Desktop Unblock, operation " + operation
-        if core_release.held(c, binding["task"]) is None:
-            done = getattr(core_release, "released_by", lambda *a: None)(c, binding["task"], note)
-            if done is None:
+        if offered(c, binding["task"], ask) is None:
+            done = core_release.released_by(c, binding["task"], note)
+            stamp = ask.get("release_target") if isinstance(ask, dict) else None
+            if done is None or not isinstance(stamp, dict) or stamp.get("task") != done:
                 return None
             out = dict(outcome="released", target=done)
         else:
@@ -1499,7 +1507,10 @@ class Mirror:
                 writer=core_release.human_writer("desktop-operation:" + operation),
                 author="user-steps",
                 note=note,
+                precondition=fence,
             )
+        if out["outcome"] == "refused" and out["refusal"] == "ask_changed":
+            raise self.core.ActionError("Source card ask changed or transition refused", 409)
         if out["outcome"] == "refused":
             reason = (
                 f"Desktop Unblock did not release {out['target']} ({out['refusal']}): "
@@ -1509,7 +1520,7 @@ class Mirror:
                 "SELECT 1 FROM task_comments WHERE task_id=? AND author='user-steps' AND body=?",
                 (binding["task"], reason),
             ).fetchone():  # a redelivery of the same operation says it once
-                api.add_comment(c, binding["task"], "user-steps", reason)
+                api.add_comment(c, binding["task"], "user-steps", reason, system=True)
             raise self.core.ActionError(
                 f"Release refused ({out['refusal']}): {out['message']}", 409
             )
@@ -1602,7 +1613,7 @@ class Mirror:
 
             archive = not other and not hr.get("choices") and choice["value"] == "archive"
             if not other and not hr.get("choices") and choice["value"] == "unblock":
-                released = self._release(api, c, binding, op, comment, receipt, fence)
+                released = self._release(api, c, binding, op, comment, receipt, fence, hr)
                 if released is not None:
                     return released
             # Core owns the transaction (and post-commit archive cleanup). Its event

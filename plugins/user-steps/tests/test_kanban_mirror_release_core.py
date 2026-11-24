@@ -41,15 +41,47 @@ def real(tmp_path, monkeypatch):
         reset_hermes_home_override(token)
 
 
-def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK):
-    """A card held in triage by a stop, carrying the stranded-park ask when ``ask`` is given."""
+def offer(c, task, ask=ASK):
+    """``ask`` as core's stranded-park brief files it: stamped with the release it offers."""
+    from hermes_cli import kanban_release
+    stamp = kanban_release.offer(c, task)
+    assert stamp is not None
+    return dict(ask, release_target=stamp)
+
+
+def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamped=True):
+    """A card held in triage by a stop, carrying the stranded-park ask when ``ask`` is given. ``stamped=False``
+    is an ask the brief did not file: an agent's, or one from before the release offer existed."""
     task = kb.create_task(c, title="Synthetic stopped card", assignee="default", session_id=session)
     with kb.write_txn(c):
-        c.execute("UPDATE tasks SET status='triage', human_request=? WHERE id=?",
-                  (json.dumps(ask) if ask else None, task))
+        c.execute("UPDATE tasks SET status='triage' WHERE id=?", (task,))
         kb._append_event(c, task, "spend_budget_triaged",
                          {"reason": "stop", **({"cause": cause} if cause else {})})
+        if ask:
+            c.execute("UPDATE tasks SET human_request=? WHERE id=?",
+                      (json.dumps(offer(c, task, ask) if stamped else ask), task))
     return task
+
+
+def decision_card(kb, c, root, *, stamped=True):
+    """The decision card filed for ``root``'s pending stop, blocked on the brief's ask in session-a."""
+    from hermes_cli import kanban_spend_decision as decision
+    decision.ensure_producer(c, root)
+    card = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
+    with kb.write_txn(c):
+        c.execute("UPDATE tasks SET status='blocked', session_id='session-a', human_request=? WHERE id=?",
+                  (json.dumps(offer(c, card) if stamped else ASK), card))
+    return card
+
+
+@pytest.fixture(autouse=True)
+def no_instant_review(monkeypatch):
+    """The spend reviewer would take an ownerless budget stop before a decision card is filed."""
+    try:
+        from hermes_cli import kanban_spend_reviewer as reviewer
+    except ImportError:
+        return
+    monkeypatch.setattr(reviewer, "queue", lambda *a, **kw: False)
 
 
 def click(mod, store, path, label="Unblock"):
@@ -103,11 +135,7 @@ def test_default_unblock_on_a_decision_card_releases_its_root(real):
     c = connect(path)
     try:
         root = stopped(kb, c, cause=None, session=None, ask=None)
-        decision.ensure_producer(c, root)
-        card = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
-        with kb.write_txn(c):
-            c.execute("UPDATE tasks SET status='blocked', session_id='session-a', human_request=? WHERE id=?",
-                      (json.dumps(ASK), card))
+        card = decision_card(kb, c, root)
         mirror, op = click(mod, store, path)
         receipt = mirror.deliver(op)
         assert receipt["released"] == root and mirror.readback(op, receipt)
@@ -134,15 +162,23 @@ def test_custom_choice_ask_is_unchanged(real, monkeypatch):
         c.close()
 
 
+def _without_release(real_api, monkeypatch, package):
+    """The mirror's core API as an older core gives it: the release import fails inside _api."""
+    with monkeypatch.context() as patch:
+        patch.delattr(package, "kanban_release", raising=False)
+        patch.setitem(sys.modules, "hermes_cli.kanban_release", None)
+        return real_api()
+
+
 def test_core_without_release_keeps_todays_unblock(real, monkeypatch):
     kb, connect, path, store, mod = real
     import hermes_cli
-    monkeypatch.delattr(hermes_cli, "kanban_release", raising=False)
-    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_release", None)  # the import fails, as on an older core
     c = connect(path)
     try:
         task = stopped(kb, c)
         mirror, op = click(mod, store, path)
+        # From here the import fails, as on a core that predates release: the mirror must not need it.
+        mirror._api = lambda real=mirror._api: _without_release(real, monkeypatch, hermes_cli)
         assert mirror._api().release is None
         with pytest.raises(core.ActionError):
             mirror.deliver(op)
@@ -156,8 +192,9 @@ def test_safety_refusal_leaves_the_ask_and_records_the_reason(real):
     kb, connect, path, store, mod = real
     c = connect(path)
     try:
-        task = stopped(kb, c)
-        kb._append_event(c, task, "decision_hold_restricted", {"cause": "safety_refusal"})
+        task = stopped(kb, c)  # the ask offered the release; the provider refusal arrived afterwards
+        episode = offer(c, task)["release_target"]["episode"]
+        kb._append_event(c, task, "decision_hold_restricted", {"cause": "safety_refusal", "episode": episode})
         c.commit()
         mirror, op = click(mod, store, path)
         for _ in range(2):  # a redelivery of the same operation does not repeat the comment
@@ -196,11 +233,7 @@ def test_retry_after_a_crash_between_release_and_receipt_records_the_receipt(rea
     try:
         if on_decision_card:
             root = stopped(kb, c, cause=None, session=None, ask=None)
-            decision.ensure_producer(c, root)
-            bound = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
-            with kb.write_txn(c):
-                c.execute("UPDATE tasks SET status='blocked', session_id='session-a', human_request=? WHERE id=?",
-                          (json.dumps(ASK), bound))
+            bound = decision_card(kb, c, root)
         else:
             root = bound = stopped(kb, c)
         mirror, op = click(mod, store, path)
@@ -215,5 +248,60 @@ def test_retry_after_a_crash_between_release_and_receipt_records_the_receipt(rea
         assert len(mandates(c, root)) == 1  # nothing was released twice
         # Another operation's note is not this click's release: no receipt is invented for it.
         assert kanban_release.released_by(c, bound, "Desktop Unblock, operation someone-else") is None
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("author", ["agent", "old_text"])
+def test_an_ask_that_did_not_offer_a_release_keeps_the_plain_unblock(real, monkeypatch, author):
+    """An agent-written no-choices ask and an ask filed before the release offer existed carry no stamp: the
+    click is today's unblock (core refuses it on a pending spend decision) and nothing is released."""
+    kb, connect, path, store, mod = real
+    from hermes_cli import kanban_release
+    monkeypatch.setattr(kanban_release, "release",
+                        lambda *a, **kw: pytest.fail("an ask without the offer must not release"))
+    ask = dict(ASK, action="Unblock = I archive the root card." if author == "agent" else
+               "Decide how to handle: stopped work. Unblock = ask the owner to record a bounded decision; "
+               "the button cannot release this hold")
+    c = connect(path)
+    try:
+        task = stopped(kb, c, ask=ask, stamped=False)
+        mirror, op = click(mod, store, path)
+        with pytest.raises(core.ActionError):
+            mirror.deliver(op)
+        assert status(c, task) == "triage" and not mandates(c, task)
+    finally:
+        c.close()
+
+
+def test_a_stamp_an_agent_block_supplies_is_dropped_by_core(real):
+    kb, connect, path, store, mod = real
+    c = connect(path)
+    try:
+        held = stopped(kb, c, ask=None)
+        forged = dict(ASK, release_target=offer(c, held)["release_target"])
+        card = kb.create_task(c, title="Agent ask", assignee="default", session_id="session-a")
+        assert kb.block_task(c, card, kind="needs_input", reason=ASK["action"], human_request=forged)
+        stored = json.loads(c.execute("SELECT human_request FROM tasks WHERE id=?", (card,)).fetchone()[0])
+        assert "release_target" not in stored
+    finally:
+        c.close()
+
+
+def test_a_stale_decision_card_does_not_release_a_later_stop(real):
+    kb, connect, path, store, mod = real
+    from hermes_cli import kanban_spend_decision as decision
+    c = connect(path)
+    try:
+        root = stopped(kb, c, cause=None, session=None, ask=None)
+        card = decision_card(kb, c, root)
+        with kb.write_txn(c):  # promoted, then stopped again: the first stop's decision card is stale
+            kb._append_event(c, root, "promoted_manual", {"actor": "someone", "reason": "one more"})
+            kb._append_event(c, root, "spend_budget_triaged", {"reason": "stop again"})
+        assert decision.pending(c, root)
+        mirror, op = click(mod, store, path)
+        receipt = mirror.deliver(op)  # today's plain unblock of the decision card itself
+        assert "released" not in receipt and status(c, card) != "blocked"
+        assert status(c, root) == "triage" and not mandates(c, root) and decision.pending(c, root)
     finally:
         c.close()

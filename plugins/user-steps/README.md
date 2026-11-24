@@ -263,18 +263,24 @@ core's normal dependency gating. The fallback Archive abandons it. These are not
 commands: a `user_terminal` ask still needs authentication in its terminal window;
 Unblock means resume without that terminal result.
 
-On a card a spend or scope stop holds in triage, or on the `Spend budget decision:` card filed
-for one, the fallback Unblock releases the stopped card to finish through core's
-`hermes kanban release` (`hermes_cli.kanban_release.release`), recorded as the human act the
-authenticated Desktop operation is and noted `Desktop Unblock, operation <operationId>`: one
+On an ask that offered a release, the fallback Unblock releases the stopped card to finish
+through core's `hermes kanban release` (`hermes_cli.kanban_release.release`), recorded as the human
+act the authenticated Desktop operation is and noted `Desktop Unblock, operation <operationId>`: one
 goal-level mandate comment, the scope renewal, a spend budget of the runs already counted plus
-`kanban.release_runs`, and the promotion. Core's plain unblock refuses such a card, so before this
-the click released nothing. A release core refuses (provider safety, containment) leaves the ask in
-place with the reason as a comment. A retry of an operation whose release landed before its
-receipt was written finds the card released by that operation's note and records the receipt.
-Asks with explicit choices, cards no stop holds and a core without `kanban_release` keep the plain
-unblock. An ask on another gateway's card goes through the remote courier to core's
-`kanban_card_answer`, which makes the same release on the card's home.
+`kanban.release_runs`, and the promotion. The offer is the `release_target` stamp core's
+stranded-park brief writes on the ask it files for a held card, or for the decision card of its
+pending stop. No agent, tool or CLI request can carry the stamp (core's `validate_human_request`
+drops it), and core confirms it is still true before the click releases (`kanban_release.offered`).
+An agent-written ask, an ask with explicit choices, an ask filed before the stamp existed, a stale
+decision card, a card no stop holds and a core without `kanban_release` keep the plain unblock,
+which core refuses on a pending spend decision. A release core refuses (provider safety,
+containment) leaves the ask in place with the reason as a comment. A retry of an operation whose
+release landed before its receipt was written finds the card released by that operation's note and
+records the receipt. An ask on another gateway's card goes through the remote courier to core's
+`kanban_card_answer`, which applies the same rule on the card's home.
+
+These cases run only against a real core: `tests/test_kanban_mirror_release_core.py` skips in the
+standalone suite and runs under `run-core-integration.sh <core worktree with kanban_release>`.
 
 The source is the creating user session, or the earliest stored local user-surface
 subscriber (including legacy custom-source chats). Presentation follows core's
