@@ -202,6 +202,42 @@ def test_setter_moves_one_serve_legacy_external_legacy_without_restart(served, m
     assert threading.active_count() >= 1
 
 
+def test_facts_callback_checks_fence_before_any_core_load(served, monkeypatch):
+    api = load_api('_facts_fence_entry_api')
+    loads = []
+    monkeypatch.setattr(api, '_load_feed', lambda: loads.append('load') or (_ for _ in ()).throw(RuntimeError('core entry')))
+    monkeypatch.setattr(api, '_legacy_fenced', lambda: True)
+    api._facts_mode_changed('legacy', 1)
+    assert loads == []
+    monkeypatch.setattr(api, '_legacy_fenced', lambda: False)
+    with pytest.raises(RuntimeError, match='core entry'):
+        api._facts_mode_changed('legacy', 1)
+    assert loads == ['load']
+
+
+def test_publication_external_fence_independent_of_legacy_fence(served, monkeypatch):
+    api = load_api('_publication_fence_api')
+    monkeypatch.setattr(api, '_legacy_fenced', lambda: False)
+    monkeypatch.setattr(api, '_external_projection', lambda: object())
+    assert api.start_publication() is False
+    assert api._LOADER.__dict__.get('starting') is None
+
+
+def test_master_only_environment_initializes_same_mode(served, monkeypatch):
+    api = load_api('_master_only_api')
+    monkeypatch.setattr(api, 'start_publication', lambda: True)
+    write_mode(served, external=True)
+    lifecycle = api.install_panel_lifecycle({'HERMES_SERVE_PRODUCERS_EXTERNAL': '0'})
+    try:
+        assert read_mode(served) == {'external': False, 'revision': 2}
+        assert lifecycle.state == 'off' and lifecycle.relay is None
+    finally:
+        lifecycle.stop_watching()
+        if lifecycle.relay is not None:
+            api.detach_external(lifecycle.relay)
+            lifecycle.relay.close(timeout=10)
+
+
 def test_master_off_start_publishes_off_and_installs_no_child(served, monkeypatch):
     api = load_api('_mode_master_api')
     monkeypatch.setattr(api, 'start_publication', lambda: True)
