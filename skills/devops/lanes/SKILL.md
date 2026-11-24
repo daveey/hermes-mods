@@ -32,8 +32,12 @@ hermes kanban lanes show --json          # target vs actual share, running, read
 hermes kanban lanes show --hours 24      # a different trailing window, in hours
 hermes kanban lanes held --json          # cards waiting at a gate
 hermes kanban lanes unclassified --json  # open cards nothing placed in a lane
-hermes kanban lanes explain <card>       # one card: its lane, where that came from, why it waits
+hermes kanban lanes explain <card>       # one card: its lane, where that came from, gate state (~10 s)
 ```
+
+`lanes explain` does not say why a ready card isn't starting: lanes only reorder/pause/gate, and every other governor (pacing, labels, host slots, walls, spend…) runs after lane order. For "why is this ready card idle" read the newest `dispatch_skipped` event and `worker_queue_reason` (`kanban_dispatch_skip.latest` / `kanban_queue_reason.latest`, milliseconds) or the `queue_note` in a `cross_task` read.
+
+Scope: `scope: fleet` means one board's replica across gateways, not every board. Other hub boards are separate DBs, and the mini's Baby Bear board is a separate Hermes install (read it via `tailnet_exec` host `mini`) that no hub lane counts, so a hub `babybear` pill omits its cards.
 
 A lane over its target: sum `task_runs` hours by `tasks.tenant` over 48 h, group that lane's cards by `created_by`
 and title topic, and `explain` a few. Source `unclassified` means no match rule caught it and it fell to the default
@@ -41,7 +45,7 @@ lane (typically chat-filed cards); fix classification, not shares, and `reclassi
 
 A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
 
-For lane-accounting repairs, distinguish scopes: `show` uses the fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. A successful `lanes assign` message can accompany a `lane_assigned` event while a protected contained triage row retains its old tenant: verify the persisted tenant, record the unsuccessful move separately, and never release containment or repeatedly reassign it to make a migration count look complete. Resume a timed-out multi-card apply from per-card readbacks, skipping terminal/already-moved cards; persist receipts on disk before aggregating. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
+For lane-accounting repairs, distinguish scopes: `show` uses the current board's fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. A successful `lanes assign` message can accompany a `lane_assigned` event while a protected contained triage row retains its old tenant: verify the persisted tenant, record the unsuccessful move separately, and never release containment or repeatedly reassign it to make a migration count look complete. Resume a timed-out multi-card apply from per-card readbacks, skipping terminal/already-moved cards; persist receipts on disk before aggregating. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
 
 For a semantic-classifier live proof after deployment, use a fresh hidden scratch chat with no explicit lane, parents, skills or deterministic rule metadata; an older worker process still imports its pre-deploy classifier. Read back `lanes explain` for `source=classified`, archive the exact unclaimed fixture immediately, delete the scratch chat, and independently verify both cleanups. A direct helper replay proves model routing, not the chat-create transaction path.
 
