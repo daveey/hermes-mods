@@ -496,12 +496,15 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const status = freshness.stale ? null : model.header.status
   const hasHeader = status || model.header.source === 'derived'
   const state = !freshness.stale && hasHeader ? str(model.header.state) : 'unknown'
-  // A model that is merely older than its ttl (or restored, not yet re-vouched) still says what the board last
-  // reported: its running/waiting header with an age suffix. A failed vouch (`vouched === false`), a missing or
-  // future clock, or any other state stays "status unknown".
-  const lastSeen = freshness.stale && vouched !== false && Number.isFinite(freshness.age) && freshness.age >= 0 && model.header.source && ['running', 'waiting'].includes(str(model.header.state))
-  const staleBase = lastSeen ? (model.header.state === 'waiting' ? `waiting · ${(model.header.counts?.waiting || 0) + (model.header.counts?.ready || 0)} cards` : str(model.header.label) || 'running') : 'status unknown'
-  const label = freshness.stale ? `${staleBase} (stale${freshness.age === null ? '' : ` · ${formatClockText([{ timestamp: model.freshness.computed_at, format: 'elapsed' }], now)} old`})` : hasHeader ? str(model.header.label) || state : 'unknown'
+  // Vouch exclusion/TTL expiry remove current trust, not the last backend-authored state.
+  // This is historical display only: effective state/stripe stay unknown/neutral. Never
+  // describe a missing or future source clock as a successful sync (including "0s ago").
+  const dated = Number.isFinite(freshness.age) && freshness.age >= 0 && model.freshness?.computed_at > 0
+  const lastSeen = freshness.stale && dated && model.header.source && str(model.header.state) && model.header.state !== 'unknown'
+  const ageText = dated ? formatClockText([{ timestamp: model.freshness.computed_at, format: 'elapsed' }], now) : null
+  const label = freshness.stale
+    ? lastSeen ? `${str(model.header.label) || model.header.state} · synced ${ageText} ago` : `status unknown (stale${ageText === null ? '' : ` · ${ageText} old`})`
+    : hasHeader ? str(model.header.label) || state : 'unknown'
   const stripe = freshness.stale ? 'none' : status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',

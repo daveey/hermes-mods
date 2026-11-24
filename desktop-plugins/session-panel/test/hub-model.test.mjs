@@ -81,28 +81,47 @@ test('mounted legacy cached running header fails closed before any heartbeat', a
 })
 for (const [name, trusted, age, vouched] of [
  ['restored', false, 0, null], ['expired', true, 61, true],
+ ['excluded-55s', true, 55, false], ['excluded-30m', true, 1800, false],
  ['unvouched', true, 0, false], ['future', true, -3600, true], ['fresh', true, 0, true]
 ]) {
  test(`running header ${name} uses source freshness, not transport age`, async () => {
   const base = Object.values(cases).find(c => c.model?.sections?.running?.length)
   assert.ok(base)
-  const now = 1000
+  const now = 1795281000
   const model = { ...base.model, header: { ...base.model.header, source: 'derived', state: 'running', label: 'running', status: null },
    freshness: { trusted, computed_at: now - age, ttl_s: 60 } }
   const before = JSON.stringify(model)
   await paint(m.renderModel(model, { now, vouched }))
   const stale = name !== 'fresh'
   const text = document.querySelector('[data-session-status]').textContent
-  // Merely old or restored: the last reported state with an age suffix. A failed vouch is a real contradiction.
-  assert.equal(text.includes('status unknown (stale'), name === 'unvouched' || name === 'future')
-  assert.equal(text.includes('running (stale'), name === 'restored' || name === 'expired')
+  // Vouch exclusion removes current trust, not historical knowledge of the cached state.
+  const ageText = m.formatClockText([{ timestamp: model.freshness.computed_at, format: 'elapsed' }], now)
+  assert.equal(text, name === 'future' ? 'status unknown (stale)' : stale ? `running · synced ${ageText} ago` : 'running')
   if (stale) {
    assert.equal(document.querySelector('[data-panel-status-stripe]').dataset.panelStatusStripe, 'none')
    assert.equal(document.querySelector('[data-session-status]').title, 'unknown')
    assert.ok(document.querySelector('[data-panel-status-stripe]').style.background.includes('muted-foreground'))
   } else assert.equal(document.querySelector('[data-session-status]').textContent, 'running')
-  if (age > 0) assert.ok(document.querySelector('[data-session-status]').textContent.includes('1m old'))
+  if (age > 0) assert.ok(text.includes(`synced ${ageText} ago`))
   assert.equal(JSON.stringify(model), before)
+ })
+}
+for (const [name, expected] of Object.entries({ fresh: 'running', stale55: 'running · synced 55s ago',
+ stale30m: 'running · synced 30m ago', future: 'status unknown (stale)', no_state: 'status unknown (stale · 55s old)' })) {
+ test(`real Python header clock ${name} renders without renewing evidence`, async () => {
+  const { model, now, vouched } = publicCases['header_clock_' + name]
+  const before = JSON.stringify(model)
+  await paint(m.renderModel(model, { now, vouched }))
+  assert.equal(document.querySelector('[data-session-status]').textContent, expected)
+  assert.equal(document.querySelector('[data-session-status]').title, name === 'fresh' ? 'running' : 'unknown')
+  assert.equal(JSON.stringify(model), before)
+ })
+}
+for (const clock of [null, NaN, Infinity, '1795281000', 0]) {
+ test(`invalid header clock ${clock} cannot report a sync`, async () => {
+  const { model, now } = publicCases.header_clock_stale55
+  await paint(m.renderModel({ ...model, freshness: { ...model.freshness, computed_at: clock } }, { now, vouched: false }))
+  assert.equal(document.querySelector('[data-session-status]').textContent, 'status unknown (stale)')
  })
 }
 for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
@@ -511,7 +530,7 @@ for (const [name, fixture] of Object.entries(publicCases).filter(([name]) => nam
  })
 }
 
-for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_') && !name.startsWith('tree_') && !name.startsWith('shared_human_'))) {
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('header_clock_') && !name.startsWith('retiring_') && !name.startsWith('tree_') && !name.startsWith('shared_human_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')
