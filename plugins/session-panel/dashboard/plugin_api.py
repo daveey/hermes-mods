@@ -2659,7 +2659,10 @@ def _run_decisions(f) -> None:
 
 def _run_board(f, lane_type) -> None:
     """Source admission stays responsive while reconciliation or another chat blocks."""
-    lane = lane_type(f, CoreReaders)
+    explicit = _explicit_readers(f)  # an explicit-home feed never falls back to ambient readers on this lane
+    factory = CoreReaders if explicit is None else (
+        lambda: CoreReaders(home_context=explicit.home_context, installation=explicit.installation))
+    lane = lane_type(f, factory)
     lane.start_service()
     first = True
     last = None

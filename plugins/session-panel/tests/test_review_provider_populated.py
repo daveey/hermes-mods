@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 import pytest
 from test_explicit_home_acquisition import (api, worlds, tripwires, ctx_for, load_module,
-    ROOT, payload_for, launch_label_read)
+    ROOT, payload_for, launch_label_read, populated)
 
 
 @pytest.mark.parametrize('remote', [False, 'pending', 'retiring', 'delivered'])
@@ -54,7 +54,7 @@ def test_actual_populated_provider_poisoned_process_home(api, worlds, tripwires,
         if remote:
             assert requests and requests[0]['title'] == 'Choose remotely'
             assert ('delivery' in requests[0]) == (remote == 'retiring')
-        wire = produced(payload_for(['chat']))
+        wire = populated(produced, lambda: payload_for(['chat']))
         assert tripwires == []
         text = wire.decode() if isinstance(wire, bytes) else str(wire)
         if remote == 'retiring':

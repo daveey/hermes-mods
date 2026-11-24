@@ -366,6 +366,21 @@ def payload_for(sessions, **extra):
     return {'body': body, 'accepted': time.monotonic() - 1}
 
 
+def populated(produced, make_payload, timeout=60):
+    """Lanes own computation: the first answer can precede the bundle, so poll until a chat bundle is present."""
+    import json as _json
+    deadline = time.monotonic() + timeout
+    while True:
+        wire = produced(make_payload())
+        try:
+            has = bool(_json.loads(wire).get('bundles'))
+        except ValueError:
+            has = True
+        if has or time.monotonic() > deadline:
+            return wire
+        time.sleep(0.05)
+
+
 def test_provider_produced_payload_is_complete_home_data_and_never_ambient(api, worlds, tripwires):
     """The produced(payload) entry with a browser-shaped body: populated COMPLETE wire, not unavailable."""
     provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_explicit_acquisition_provider')
@@ -374,7 +389,7 @@ def test_provider_produced_payload_is_complete_home_data_and_never_ambient(api, 
     with launch_label_read(tripwires):
         produced = provider.open_provider({'home_context': ctx})  # import-time launch label: retained, see inventory
     try:
-        wire = produced(payload_for(['chat']))
+        wire = populated(produced, lambda: payload_for(['chat']))
         assert tripwires == []
         assert produced.readers.home_context.home == ctx.home
         text = blob(wire)
@@ -553,7 +568,7 @@ def test_panel_producer_returns_populated_complete_wire(api, worlds, tripwires):
     with launch_label_read(tripwires):
         produced = provider.open_provider({'home_context': ctx})
     try:
-        wire = produced(payload_for(['chat']))
+        wire = populated(produced, lambda: payload_for(['chat']))
     finally:
         produced.close()
     assert tripwires == []
