@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import queue
+from collections import OrderedDict
 
 
 class EventRing:
@@ -63,7 +64,90 @@ def open_provider(config):
     spec.loader.exec_module(module)
     home_context = config.get('home_context') if isinstance(config, dict) else None
     installation = config.get('installation') if isinstance(config, dict) else None
+    spec = config.get('provider') if isinstance(config, dict) else None
+    if isinstance(spec, dict) and spec.get('partitioned'):
+        return PanelProducerSet(module)
     return PanelProducer(module, home_context=home_context, installation=installation)
+
+
+class PanelProducerSet:
+    """One child, several canonical homes: a bounded set of explicit-home producers keyed by the server-bound
+    (home, lifecycle generation, authorization generation). A request without a valid claim is refused; a stale
+    or revoked claim closes that home's producers before anything is answered."""
+
+    MAX_PARTITIONS = 8
+
+    def __init__(self, api, *, factory=None):
+        self.api = api
+        self._factory = factory or self._make
+        self._lock = threading.Lock()
+        self._parts = OrderedDict()  # identity -> PanelProducer, least recently used first
+
+    def _make(self, binding):
+        ctx = self.api._home_context_mod().PanelHomeContext.from_authorized_home(
+            binding.home, lifecycle_generation=binding.lifecycle_generation,
+            authorization_generation=binding.authorization_generation)
+        return PanelProducer(self.api, home_context=ctx)
+
+    def _close_home(self, home):
+        with self._lock:
+            old = [self._parts.pop(ident) for ident in [i for i in self._parts if i[0] == home]]
+        for producer in old:
+            producer.close()
+
+    def _producer(self, wire):
+        from hermes_cli import serve_producer_home as homes
+        binding = homes.HomeBinding.from_wire(wire)
+        try:
+            path, life = homes.lifecycle_generation(binding.home)
+        except homes.HomeRevoked as exc:
+            self._close_home(binding.home)
+            raise RuntimeError('home revoked') from exc
+        if str(path) != binding.home or life != binding.lifecycle_generation:
+            self._close_home(binding.home)
+            raise RuntimeError('stale home generation')
+        closing = []
+        with self._lock:
+            found = self._parts.get(binding.identity)
+            if found is not None:
+                self._parts.move_to_end(binding.identity)
+                return found
+            # An older generation of this very home is revoked by the arrival of the newer one.
+            closing.extend(self._parts.pop(i) for i in [i for i in self._parts if i[0] == binding.home])
+            while len(self._parts) >= self.MAX_PARTITIONS:
+                closing.append(self._parts.popitem(last=False)[1])
+            producer = self._factory(binding)
+            self._parts[binding.identity] = producer
+        for old in closing:
+            old.close()
+        return producer
+
+    def __call__(self, payload):
+        body = payload['body'] if isinstance(payload, dict) and 'body' in payload else payload
+        wire = body.get('_partition') if isinstance(body, dict) else None
+        if wire is None:
+            raise ValueError('home partition required')
+        producer = self._producer(wire)
+        clean = {key: value for key, value in body.items() if key != '_partition'}
+        if isinstance(payload, dict) and 'body' in payload:
+            return producer(dict(payload, body=clean))
+        return producer(clean)
+
+    def events_since(self, after, limit=64, partition=None):
+        if partition is None:
+            raise ValueError('home partition required')
+        return self._producer(partition).events_since(after, limit)
+
+    def partitions(self):
+        with self._lock:
+            return list(self._parts)
+
+    def close(self):
+        with self._lock:
+            old = list(self._parts.values())
+            self._parts.clear()
+        for producer in old:
+            producer.close()
 
 
 class PanelProducer:

@@ -1624,6 +1624,7 @@ def _panel_provider_spec() -> dict:
     # Include those actual bootstrap bytes; the child checks loaded digests AFTER the factory returns.
     names = sorted(p.name for p in base.glob('*.py'))
     return {'path': str(base / 'producer_provider.py'), 'sha256': digest('producer_provider.py'),
+            'partitioned': True,  # one child serves several canonical homes, each bound server-side
             'manifest': {
                 'version': 1,
                 'providers': {Path(n).stem: {'path': n, 'sha256': digest(n)} for n in names},
@@ -1659,23 +1660,66 @@ def _retire_legacy_panel(timeout: float = 25.0) -> bool:
     return True
 
 
-def panel_initial_payload():
-    """Mandatory first publication: complete status wire, not an empty mailbox."""
-    return {
-        'body': {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}},
-        'accepted': time.monotonic(),
-    }
+def panel_initial_payload(binding=None):
+    """Mandatory first publication: complete status wire, not an empty mailbox. A partitioned child needs the
+    home claim the owner will publish READY for, so the spawning serve's own binding rides in the initial."""
+    body = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+    if binding is not None:
+        body['_partition'] = binding.wire()
+    return {'body': body, 'accepted': time.monotonic()}
 
 
-def make_panel_relay(home, runtime, generation=None):
-    """Production factory: one shared owner, complete initial before broker READY."""
+def _serve_home():
+    """The one home this process is authorized to serve: its own launch home, never a request label."""
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
+
+
+def current_binding(app_state=None):
+    """Server-derived (canonical home, lifecycle, authorization) binding for THIS serve; HomeRevoked if none."""
+    from hermes_cli import serve_producer_home as homes
+    return homes.bind(_serve_home(), app_state)
+
+
+def _partition_still_current(identity) -> bool:
+    from hermes_cli import serve_producer_home as homes
+    return homes.is_current(homes.HomeBinding(*identity), getattr(_LOADER, 'app_state', None))
+
+
+def make_panel_relay(home, runtime, generation=None, *, binding=None):
+    """Production factory: one shared owner, complete initial before broker READY, bound to one served home."""
     import secrets
     from hermes_cli.serve_producer_runtime import ProjectionRelay
-    return ProjectionRelay(
+    if binding is None:
+        binding = current_binding()  # HomeRevoked: this serve has no authorized home, so no relay exists
+    relay = ProjectionRelay(
         _panel_provider_spec(), home=home, runtime=runtime,
         generation=generation or secrets.token_hex(16),
-        initial=panel_initial_payload(),
+        initial=panel_initial_payload(binding),
     )
+    relay.partition_check = _partition_still_current
+    relay.bind_partition(binding)
+    return relay
+
+
+def _bound_external(request=None):
+    """The external relay with its home binding re-derived for THIS request, or None when not external.
+
+    Authorization and generation checks only (stat/in-memory): a changed or revoked binding is revoked in the
+    relay (queued work, outputs, ACKs, events) before any reply; an unauthorized serve leaves the relay unbound,
+    so the route answers 503 rather than another home's or a stale generation's bytes."""
+    external = _external_projection()
+    if external is None or not getattr(external, 'partitioned', False):
+        return external
+    from hermes_cli import serve_producer_home as homes
+    state = getattr(getattr(request, 'app', None), 'state', None)
+    if state is not None:
+        _LOADER.app_state = state
+    try:
+        external.bind_partition(current_binding(state if state is not None else getattr(_LOADER, 'app_state', None)))
+    except (homes.HomeRevoked, OSError, ValueError):
+        external.unbind_partition()
+    return external
 
 
 def install_panel_lifecycle(environ=None):
@@ -1692,7 +1736,10 @@ def install_panel_lifecycle(environ=None):
         from hermes_constants import get_hermes_home
     except ImportError:
         return None  # an older core has no seam: legacy only
-    installation = Path(get_hermes_home())
+    from hermes_constants import get_default_hermes_root
+    # The installation is the Hermes root this serve's home belongs to, so every compatible serve of one
+    # installation joins the same broker/child; the served home itself is bound per request, not here.
+    installation = Path(get_default_hermes_root(home=get_hermes_home()))
     runtime = installation / 'serve-producers' / 'runtime'
     if env.get('HERMES_SERVE_PANEL_EXTERNAL') is not None or env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is not None:
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1707,7 +1754,7 @@ def install_panel_lifecycle(environ=None):
         return lifecycle_mod.default_admit(runtime, installation, root=installation)
 
     def publish_initial(relay, timeout=60.0):
-        key = relay.submit(panel_initial_payload())
+        key = relay.submit(panel_initial_payload())  # the relay stamps its own home binding
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if relay.read(key) is not None:
@@ -2907,7 +2954,7 @@ async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    external = _external_projection()
+    external = _bound_external(request)
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
         command = body.model_dump()
@@ -2929,8 +2976,8 @@ async def changes(body: ChangesBody, request: Request):
 
 
 @router.get('/status')
-def status():
-    external = _external_projection()
+def status(request: Request):
+    external = _bound_external(request)
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
         command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
@@ -2954,13 +3001,13 @@ class DecisionRefreshBody(BaseModel):
 
 
 @router.post('/decision-refresh')
-async def decision_refresh(body: DecisionRefreshBody):
+async def decision_refresh(body: DecisionRefreshBody, request: Request):
     # Server reads canonical state; the caller cannot submit a model or receipt
     # as presentation authority. Never join the background sweep or feed lane.
     from fastapi import HTTPException
     if _request_profile() != LAUNCH_PROFILE:
         raise HTTPException(409, 'Panel profile unavailable')
-    external = _external_projection()
+    external = _bound_external(request)
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
         command = {'_verb': 'decision-refresh', 'session': body.session,

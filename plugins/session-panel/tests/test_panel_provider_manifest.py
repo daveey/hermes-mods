@@ -98,13 +98,17 @@ def _complete_cut(gate, installation):
                         errors=(), _acquisition=gate._acquisition)
 
 
-def test_make_panel_relay_supplies_complete_status_initial(tmp_path):
+def test_make_panel_relay_supplies_complete_status_initial(tmp_path, monkeypatch):
+    _scratch_home(tmp_path, monkeypatch)
     api = load_api()
     relay = api.make_panel_relay(tmp_path, tmp_path / 'runtime')
     initial = relay.config['initial']
     assert initial['body']['_verb'] == 'status'
     assert set(initial['body']['_wire_identity']) == {'feed', 'profile'}
     assert isinstance(initial['accepted'], float)
+    # The initial carries the spawning serve's server-derived home claim, the same one the relay is bound to.
+    assert initial['body']['_partition'] == relay._partition
+    assert relay.partitioned and relay.partition_identity == tuple(relay._partition.values())
 
 
 def test_declared_missing_callback_file_refuses_before_import():

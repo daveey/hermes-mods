@@ -43,3 +43,25 @@ def _mounted_panels_for_existing_lane_scenarios(request, monkeypatch):
         feed._panel_subscribers.update({s: (s, float('inf')) for s in feed.interest})
         original(lane, feed, *args, **kwargs)
     monkeypatch.setattr(feedmod.BoardLane, '__init__', mounted)
+
+
+@pytest.fixture(autouse=True)
+def _stop_mode_watchers(monkeypatch):
+    """A lifecycle's OFF-mode watcher is a daemon thread that reads ambient home; one a test forgot to stop would
+    run inside a later test's armed ambient-resolver tripwires. Every watcher started in a test ends with it."""
+    try:
+        from hermes_cli import serve_producer_lifecycle as lifecycle
+    except ImportError:
+        yield
+        return
+    started = []
+    original = lifecycle.PanelLifecycle.start_watching
+
+    def recording(self, *args, **kwargs):
+        started.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle.PanelLifecycle, 'start_watching', recording)
+    yield
+    for item in started:
+        item.stop_watching()
