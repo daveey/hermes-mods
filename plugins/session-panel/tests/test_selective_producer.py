@@ -379,7 +379,8 @@ def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched
     monkeypatch.setattr(ksa, '_board_db_paths', lambda: [path])  # session_tasks reads this board, not the host's
     calls = []
     monkeypatch.setattr(r, 'reconcile_sources', lambda sessions: calls.append(sorted(sessions)) or set())
-    f = feedmod.Feed(r, emit=lambda payload: None, clock=time.time)
+    now = {'value': time.time()}
+    f = feedmod.Feed(r, emit=lambda payload: None, clock=lambda: now['value'])
     try:
         f.watch(chats)
         f.tick()
@@ -389,6 +390,7 @@ def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched
             f.tick()
         calls.clear()
         for n in range(3):
+            now['value'] += 3  # independent writes outside the production reconcile floor
             kanban_db.add_comment(conn, cards['S3'], 'tester', f'comment {n}')
             f.tick()
             r.release()

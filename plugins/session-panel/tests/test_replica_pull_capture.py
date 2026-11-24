@@ -42,6 +42,7 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     monkeypatch.setattr(links, 'replica_cards', lambda ids, gateway, statuses, **kw:
                         original(ids, gateway, statuses, replicas=[('default', path)], now=clock['now'], **kw))
     adapter = object.__new__(api_module().CoreReaders)
+    adapter._state_db = tmp_path / 'state.db'
     adapter.ksc = SimpleNamespace(load_identity=lambda: SimpleNamespace(gateway='local'))
     held = {s: {'lineage': {s}, 'refs': set()} for s in ('S1', 'S2')}
     r.external_stamps = lambda: 1 if board_only else r.stamp

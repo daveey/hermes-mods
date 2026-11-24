@@ -422,6 +422,33 @@ class CoreReaders:
         self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints)
 
+    def _links_inventory(self, ksa):
+        """Reuse strict origin rows only while their pre-read source certificate holds.
+
+        Core's fingerprint includes board change cursors and ledger/hub inputs.
+        State is separate because compression aliases are deliberately omitted
+        from that fingerprint. A 15 s renewal retains core's clock/alias bound.
+        Thread-local ownership prevents cross-lane publication races; scope in
+        the key prevents lending a profile's inventory to another profile.
+        """
+        from copy import deepcopy
+        fingerprint = getattr(ksa, '_links_fingerprint', None)
+        scope = getattr(ksa, '_origin_scope', None)
+        if not callable(fingerprint) or not callable(scope):
+            return ksa.remote_links_and_origin_rows(stale_ok=False)
+        key = (scope(), fingerprint(), self._stat(self.state_db()))
+        now = time.monotonic()
+        hit = getattr(self._local, 'links_inventory', None)
+        if hit is not None and hit[0] == key and 0 <= now - hit[1] < 15.0:
+            return deepcopy(hit[2])
+        rows = ksa.remote_links_and_origin_rows(stale_ok=False)
+        # Never absorb an input write racing the projection as answered.
+        if key == (scope(), fingerprint(), self._stat(self.state_db())):
+            self._local.links_inventory = (key, now, deepcopy(rows))
+        else:
+            self._local.links_inventory = None
+        return rows
+
     def external_capture(self, held, *, include_inventory=False):
         """Materialize canonical external inputs once, then partition by chat.
 
@@ -433,7 +460,7 @@ class CoreReaders:
             return {}  # hidden panels do not admit a global ledger projection
         from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
         from hermes_cli import kanban_chat_links as links
-        cards, history = ksa.remote_links_and_origin_rows(stale_ok=False)
+        cards, history = self._links_inventory(ksa)
         rows = list(cards) + list(history)
         replica, gateway, profile = None, None, None
         if sync.sync_config().get('links_reader') == 'replica':
@@ -999,6 +1026,8 @@ class CoreReaders:
 
     # The feed admits the producer per chat (inputs that moved), not for every chat on any source write.
     reconcile_scoped = True
+    reconcile_min_interval_s = 3.0
+    reconcile_safety_s = 30.0
 
     def reconciliation_stamp(self):
         """Source admission only: action-store writes cannot trigger their producer."""
