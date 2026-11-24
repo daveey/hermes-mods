@@ -617,6 +617,32 @@ def test_run_meta_pool_class_model_and_quiet():
     assert model.run_meta({'id': 't_y'}, 'review', 0, NOW)['detail'] == 'in review'
 
 
+def test_running_row_shows_failure_count_only_when_positive():
+    """`N failures` follows the run time; zero, missing, bool or unreadable counts add nothing. [daveey]"""
+    row = {'id': 't_x', 'run_machine': 'worker-a4', 'started_at': NOW - 750}
+    assert model.run_meta({**row, 'failed_runs': 3}, 'running', NOW - 30, NOW)['detail'] == 'worker-a4 · 12m · 3 failures'
+    assert model.run_meta({**row, 'failed_runs': 1}, 'running', NOW - 30, NOW)['detail'] == 'worker-a4 · 12m · 1 failure'
+    for n in (0, None, True, '2', -1):
+        assert model.run_meta({**row, 'failed_runs': n}, 'running', NOW - 30, NOW)['detail'] == 'worker-a4 · 12m'
+    assert model.run_meta({**row, 'failed_runs': 2}, 'review', NOW - 1500, NOW)['detail'] == 'in review · worker-a4 · quiet 25m · 2 failures'
+
+
+def test_failure_count_reaches_running_and_stuck_rows_from_card_detail():
+    """The count rides in the hydrated card detail (`cards[id].detail.task`), on running and stuck rows. [daveey]"""
+    running = task(status='running', run_machine='worker-a4', current_run_started_at=NOW - 750, activity_at=NOW - 30)
+    b = bundle(observed(running))
+    b['cards'] = {running['id']: {'detail': {'task': {'id': running['id'], 'failed_runs': 2}}}}
+    m = model.reduce_panel(b, now=NOW, projector=project)
+    assert m['sections']['running'][0]['detail'] == 'worker-a4 · 12m · 2 failures'
+    stuck = task(status='running', current_run_started_at=NOW - 7200, activity_at=NOW - model.STUCK_S - 60)
+    b = bundle(observed(stuck))
+    b['cards'] = {stuck['id']: {'detail': {'task': {'id': stuck['id'], 'failed_runs': 5}}}}
+    m = model.reduce_panel(b, now=NOW, projector=project)
+    assert m['sections']['stuck'][0]['detail'].endswith(' · 5 failures')
+    b['cards'] = {}
+    assert 'failure' not in model.reduce_panel(b, now=NOW, projector=project)['sections']['stuck'][0]['detail']
+
+
 def test_card_rows_carry_open_session_only_for_another_chat():
     other = task('t_other', session_id='other-chat')
     mine = task('t_mine', session_id='chat-root')

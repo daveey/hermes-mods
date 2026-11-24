@@ -52,6 +52,8 @@ async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
 
 PLUGIN_ID = 'session-panel'
 TICK_S = float(os.environ.get('HERMES_SESSION_PANEL_FEED_TICK_S', '1'))
+# Run outcomes that count as a failure in a card's "N failures" (not reclaims, rate limits or host reboots).
+FAILED_RUN_OUTCOMES = ('crashed', 'spawn_failed', 'oom_killed', 'timed_out', 'gave_up', 'failed', 'signaled')
 EVENTS_KEPT = 40   # newest events per card record (heartbeats left out): the park reader needs the newest park and what followed
 log = logging.getLogger(PLUGIN_ID)
 
@@ -1077,6 +1079,14 @@ class CoreReaders:
         runs = [dataclasses.asdict(latest)] if latest is not None else []
         for r in runs:
             r.pop('last_heartbeat_at', None)
+        # Count of this card's runs that ended in a failure (the panel shows "N failures" beside the run time).
+        # Unlike consecutive_failures, an unblock does not reset it. None = the run table could not be read.
+        try:
+            marks = ','.join('?' for _ in FAILED_RUN_OUTCOMES)
+            d['failed_runs'] = int(c.execute(f'SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND outcome IN ({marks})',
+                                             (card_id, *FAILED_RUN_OUTCOMES)).fetchone()[0])
+        except sqlite3.Error:
+            d['failed_runs'] = None
         out = {'task': d, 'events': events, 'runs': runs, 'links': {'parents': parents, 'children': []},
                'link_tasks': link_tasks, 'source': 'replica' if replica else 'live', 'slim': True}
         if replica:

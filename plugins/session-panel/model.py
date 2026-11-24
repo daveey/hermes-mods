@@ -155,8 +155,16 @@ def model_text(row):
     return ', '.join(p for p in (re.sub(r'^(class:|claude-)', '', s.strip()) for s in text(row.get('run_model')).split(',')) if p)
 
 
+def failures_text(row):
+    """`3 failures` when the card's failed-run count is a positive integer, else '' (missing/unreadable shows nothing)."""
+    n = row.get('failed_runs')
+    if type(n) is not int or n <= 0:
+        return ''
+    return f'{n} failure' + ('' if n == 1 else 's')
+
+
 def run_meta(row, state, progress, now, *, wire=False):
-    """Running/review row detail: `worker-a4 · opus-5-5 · 12m` (or `quiet 25m`), plus full-word details lines."""
+    """Running/review row detail: `worker-a4 · opus-5-5 · 12m · 2 failures` (or `quiet 25m`), plus full-word details lines."""
     where, model = where_text(row), model_text(row)
     since = seconds(row.get('current_run_started_at')) or seconds(row.get('started_at'))
     quiet = bool(progress) and now - progress >= QUIET_S
@@ -164,7 +172,7 @@ def run_meta(row, state, progress, now, *, wire=False):
     run_for = (relative(since, 'elapsed') if wire else short_dur(now - since)) if 0 < since <= now else ''
     last = (f'last event{" " + row["activity_kind"] if row.get("activity_kind") else ""} {age(progress)}' if progress else 'last event unknown')
     head = ['in review'] if state == 'review' else []
-    detail = ' · '.join(p for p in [*head, where, model, f'quiet {relative(progress, "elapsed") if wire else short_dur(now - progress)}' if quiet else run_for or (age(progress) if progress else '')] if p) or 'running'
+    detail = ' · '.join(p for p in [*head, where, model, f'quiet {relative(progress, "elapsed") if wire else short_dur(now - progress)}' if quiet else run_for or (age(progress) if progress else ''), failures_text(row)] if p) or 'running'
     details = [' · '.join(p for p in [f'card {row.get("id")}' if row.get('id') else '', f'assignee {row["assignee"]}' if row.get('assignee') else '',
                                       f'model {row["run_model"]}' if row.get('run_model') else '', f'on {where}' if where else '',
                                       f'board {row["board"]}' if row.get('board') not in (None, '', 'default') else ''] if p),
@@ -938,7 +946,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
         if state == 'running' and progress and now - progress >= STUCK_S:
-            v.update(reason='no-progress', last_at=progress, detail=f'running, no progress since {pacific(progress)} ({relative(progress, "ago") if wire else ago(progress, now)})' + (f' · last event: {row["activity_kind"]}' if row.get('activity_kind') else ''))
+            v.update(reason='no-progress', last_at=progress, detail=f'running, no progress since {pacific(progress)} ({relative(progress, "ago") if wire else ago(progress, now)})' + (f' · last event: {row["activity_kind"]}' if row.get('activity_kind') else '') + (f' · {failures_text(row)}' if failures_text(row) else ''))
             sections['stuck'].append(v)
         elif state in ('running', 'review'):
             v.update(run_meta(row, state, progress, now, wire=wire))

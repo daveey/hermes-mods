@@ -489,6 +489,7 @@ Order matters, matching Desktop `classify`:
 - Answered-but-undelivered asks are one `decision: {request_id, text}` line on the card they unblock (own row
   if card-less) and vanish when the request resolves; header `label` never reads "unresolved" for them.
 - Running rows without `run_model` use the current run's `run_route`, else `model_tier`, event model.
+- Running, review and stuck rows append `N failure(s)` to `detail` when the hydrated card detail's `task.failed_runs` (count of the card's runs ending crashed/spawn_failed/oom_killed/timed_out/gave_up/failed/signaled; reclaims and rate limits excluded) is a positive integer. Missing, null (unreadable run table), zero or non-integer adds nothing.
 - Titles lose emoji-presentation glyphs; Done rows carry no redundant `done` detail.
 
 ## Optional actionability v1 diagnostics

@@ -583,3 +583,18 @@ def test_card_detail_reads_only_the_newest_events_and_latest_run(api, board, mon
     # source-kind-filtered per-task history, whose volume bound is not ours.
     event_reads = [s for s in sql if 'FROM task_events WHERE task_id' in s and "kind != 'heartbeat'" in s]
     assert event_reads and all('LIMIT' in s for s in event_reads), event_reads
+
+
+def test_card_detail_counts_failed_runs_for_the_panel(api, board, monkeypatch):
+    """`failed_runs` counts every failed run of the card, not reclaims or successes, and 0 for a clean card. [daveey]"""
+    path, conn = board
+    cid = kanban_db.create_task(conn, title='Flaky card', initial_status='running', session_id='S1')
+    clean = kanban_db.create_task(conn, title='Clean card', initial_status='running', session_id='S1')
+    other = kanban_db.create_task(conn, title='Other card', initial_status='running', session_id='S1')
+    with conn:
+        for outcome in ('crashed', 'timed_out', 'spawn_failed', 'oom_killed', 'reclaimed', 'completed', 'rate_limited', None):
+            conn.execute('INSERT INTO task_runs(task_id, status, outcome, started_at) VALUES (?,?,?,?)', (cid, 'done', outcome, 5))
+        conn.execute('INSERT INTO task_runs(task_id, status, outcome, started_at) VALUES (?,?,?,?)', (other, 'done', 'crashed', 5))
+    r = readers_for(api, path, monkeypatch)
+    assert r.card(cid, 'default')['detail']['task']['failed_runs'] == 4
+    assert r.card(clean, 'default')['detail']['task']['failed_runs'] == 0
