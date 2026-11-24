@@ -67,7 +67,7 @@ def open_provider(config):
 
 
 class PanelProducer:
-    def __init__(self, api, *, home_context=None, installation=None):
+    def __init__(self, api, *, home_context=None, installation=None, start_lanes=True):
         self.api = api
         if home_context is None:
             self.readers = api.CoreReaders()
@@ -79,7 +79,8 @@ class PanelProducer:
         self._leases = {}
         self.feed = api._load_feed().Feed(self.readers, emit=self._emit)
         self._threads = []
-        self._start_lanes()
+        if start_lanes:
+            self._start_lanes()
 
     def _emit(self, payload):
         """Child-side producer events go to a bounded ordered ring, never straight to a socket."""
@@ -142,7 +143,11 @@ class PanelProducer:
             return prefix + wire[1:]
         if verb == 'decision-refresh':
             session = body['session']
-            result = f.refresh_decision(session, readers=self.readers)
+            try:
+                result = f.refresh_decision(session, readers=self.readers)
+            except ValueError as exc:
+                # Canonical conflict semantics travel as a publication, not a transport failure.
+                return json.dumps({'_conflict': str(exc)}, ensure_ascii=False, separators=(',', ':')).encode()
             result['bundle'] = f.decision_projection(result['bundle'])
             wire = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode()
             return prefix + wire[1:]

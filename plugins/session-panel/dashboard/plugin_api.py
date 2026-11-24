@@ -1576,6 +1576,93 @@ def detach_external(relay) -> None:
         _LOADER.external_projection = None
 
 
+def _panel_provider_spec() -> dict:
+    """Exact producer-safe manifest: the provider and every sibling file it loads, by digest."""
+    import hashlib
+    base = Path(__file__).resolve().parent
+    names = sorted(p.name for p in base.glob('*.py'))
+    return {'path': str(base / 'producer_provider.py'),
+            'sha256': hashlib.sha256((base / 'producer_provider.py').read_bytes()).hexdigest(),
+            'files': {n: hashlib.sha256((base / n).read_bytes()).hexdigest() for n in names}}
+
+
+def _retire_legacy_panel() -> bool:
+    """Positive retirement of this process's legacy owner: True only when its threads are gone and the
+    process feed slot is cleared (the pre-import guard then admits the lifecycle-authorized attach)."""
+    core = sys.modules.get(_FEED_KEY)
+    starting = _LOADER.__dict__.get('starting')
+    if starting is not None and starting.is_alive():
+        starting.join(10)
+        if starting.is_alive():
+            return False
+    f = getattr(core, 'PROCESS_FEED', None)
+    if f is not None:
+        f.stopped.set()
+        for attr in ('_wake', '_decide', '_board'):
+            event = getattr(f, attr, None)
+            if event is not None:
+                event.set()
+        for attr in ('_feed_thread', '_decision_thread', '_board_thread'):
+            thread = getattr(f, attr, None)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(10)
+                if thread.is_alive():
+                    return False
+        if getattr(_LOADER, 'facts_registration', None) is not None:
+            return False  # FACTS custody is not ours to drop here
+        core.PROCESS_FEED = None
+    return True
+
+
+def install_panel_lifecycle(environ=None):
+    """Join the one installation-local mode/custody seam. Returns the lifecycle, or None when neither
+    HERMES_SERVE_PANEL_EXTERNAL nor HERMES_SERVE_PRODUCERS_EXTERNAL is set (legacy serves are untouched).
+
+    Dormant: nothing selects external mode on a real serve until the activation owner sets it."""
+    env = os.environ if environ is None else environ
+    if env.get('HERMES_SERVE_PANEL_EXTERNAL') is None and env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is None:
+        return None
+    try:
+        from hermes_cli import serve_producer_lifecycle as lifecycle_mod
+        from hermes_cli import serve_producer_mode as mode_mod
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return None  # an older core has no seam: legacy only
+    import secrets
+    installation = Path(get_hermes_home())
+    runtime = installation / 'serve-producers' / 'runtime'
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode_mod.initialize_mode(installation, dict(env))
+    external = mode_mod.effective_external(installation, dict(env))
+
+    def make_relay():
+        from hermes_cli.serve_producer_runtime import ProjectionRelay
+        return ProjectionRelay(_panel_provider_spec(), home=installation, runtime=runtime,
+                               generation=secrets.token_hex(16))
+
+    def publish_initial(relay, timeout=60.0):
+        command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+        key = relay.submit({'body': command, 'accepted': time.monotonic()})
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if relay.read(key) is not None:
+                return True
+            time.sleep(0.05)
+        return False
+
+    lifecycle = lifecycle_mod.PanelLifecycle(
+        installation,
+        admit=lambda: lifecycle_mod.default_admit(runtime, installation, root=installation),
+        retire_legacy=_retire_legacy_panel, start_legacy=start_publication, make_relay=make_relay,
+        publish_initial=publish_initial, attach=attach_external, detach=detach_external,
+        environ=dict(env), legacy_running=not external)
+    if not external:
+        start_publication()  # OFF serves run the legacy owner and watch the mode
+    _LOADER.panel_lifecycle = lifecycle
+    lifecycle.start_watching()
+    return lifecycle
+
+
 def _launch_profile() -> str:
     """The profile this process serves when no request scopes it: read on a fresh thread (no request context)."""
     out = ['default']
@@ -2736,7 +2823,9 @@ def _serves_desktop(name: str = __name__, role: str = FEED_ROLE) -> bool:
 if _serves_desktop():
     # The producer runs before the first click: a restarted backend restores its saved bundles and recomputes them
     # while Desktops reconnect, instead of starting on (and making wait) the first request.
-    start_publication()
+    # A serve that names its panel mode (stage selector / master override) joins the mode seam instead.
+    if install_panel_lifecycle() is None:
+        start_publication()
 
 
 @router.post('/changes')
@@ -2798,9 +2887,11 @@ async def decision_refresh(body: DecisionRefreshBody):
         from hermes_cli.serve_producer_runtime import projection_response
         command = {'_verb': 'decision-refresh', 'session': body.session,
                    '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
-        response = projection_response(external, command)
+        response = projection_response(external, command, consume=True)
         if response.status_code == 503:
             raise HTTPException(503, 'Session panel decision pending', headers={'Retry-After': '1'})
+        if response.body.startswith(b'{"_conflict":'):
+            raise HTTPException(409, json.loads(response.body)['_conflict'])
         return response
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or f.stopped.is_set():
