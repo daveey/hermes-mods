@@ -647,7 +647,7 @@ test('canonical approval plan, limits, permissions, exclusions and outcomes rema
  const row = document.querySelector('[data-ask-row]')
  assert.ok(row.querySelector('button[data-choice-letter]:not(:disabled)'))
  const details = row.querySelector('details')
- for (const text of ['CANONICAL-PLAN distinct from the card brief', 'LIMIT-4-HOURS', 'permissionRequired: true', 'EXCLUDED-SPEND', 'Stage A only', 'No execution', 'Only the bounded stage is authorized']) {
+ for (const text of ['CANONICAL-PLAN distinct from the card brief', 'LIMIT-4-HOURS', 'permission: granted if you approve', 'EXCLUDED-SPEND', 'Stage A only', 'No execution', 'Only the bounded stage is authorized']) {
   assert.ok(details.textContent.includes(text), `missing consent boundary: ${text}`)
  }
 })
