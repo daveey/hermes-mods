@@ -324,6 +324,7 @@ def test_resume_retains_exhausted_role_and_projection_budgets(api, board, monkey
     def unavailable(*args, **kwargs):
         calls.append(failure_kind)
         raise RuntimeError('fixture unchanged ' + failure_kind + ' failure')
+    queued_age = None
     if failure_kind == 'registration':
         monkeypatch.setattr(current, 'lineage', unavailable)
         monkeypatch.setattr(current, 'board_stamps', lambda: ('changed registration stamp',))
@@ -331,10 +332,13 @@ def test_resume_retains_exhausted_role_and_projection_budgets(api, board, monkey
         monkeypatch.setattr(feedmod.Feed, 'project_board', unavailable)
         with previous.lock:
             previous._queue(['S'])
+            queued_age = previous.pending['S']
     for _ in range(6):
         drain(previous)
         now[0] += 31
     assert len(calls) == 4
+    if failure_kind == 'projection':
+        assert previous._active_ages.get('S') == queued_age, 'retry renewed the first-unserved FIFO age'
     prior = (previous.role_attempts['local'] if failure_kind == 'registration'
              else previous.projection_attempts['S'])
     assert prior.count == 4 and prior.retry_at is None
@@ -346,11 +350,73 @@ def test_resume_retains_exhausted_role_and_projection_budgets(api, board, monkey
         held = (owner.role_attempts['local'] if failure_kind == 'registration'
                 else owner.projection_attempts['S'])
         assert held.count == 4 and held.retry_at is None
+        if failure_kind == 'projection':
+            assert owner._active_ages['S'] == queued_age
+            assert 'S' not in owner.pending
         for _ in range(5):
             drain(owner)
             now[0] += 31
         assert len(calls) == 4, 'reload reset exhausted unchanged-input retry custody'
         assert not new._bundle_fresh('S', now[0])
+    finally:
+        old.stopped.set(); previous.close(); new.stopped.set()
+        if getattr(new, '_source_coordinator', None):
+            new._source_coordinator.close()
+        current.release(); conn.close()
+
+
+def test_resume_after_finished_projection_before_completion_service(api, board, monkeypatch):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    with previous.lock:
+        previous._queue(['S'])
+    previous.service()
+    worker = previous.active['S']
+    worker.join(5)
+    assert not worker.is_alive()
+    assert 'S' in previous.active and 'S' not in previous.projection_attempts
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: current)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None)
+    try:
+        new.resume(old)
+        owner = new._source_coordinator
+        owner.service()
+        assert 'S' not in owner.pending, 'already finished projection was recreated as unserved work'
+        drain(owner)
+        assert not owner.active
+    finally:
+        old.stopped.set(); previous.close(); new.stopped.set()
+        if getattr(new, '_source_coordinator', None):
+            new._source_coordinator.close()
+        current.release(); conn.close()
+
+
+def test_transfer_capacity_failure_does_not_consume_predecessor(api, board, monkeypatch):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    watches, _, tokens, receipts = previous.store._limits
+    previous.store._limits = (watches, 2, tokens, receipts)
+    original_boards = current.boards
+    monkeypatch.setattr(current, 'boards', lambda: [*original_boards(), ('extra', path)])
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: current)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None)
+    try:
+        new.resume(old)
+        assert new._snapshot_install_pending
+        assert not getattr(previous.store, '_transferred', False)
+        monkeypatch.setattr(current, 'boards', original_boards)
+        owner = new.ensure_snapshot_service('recovered coordinates', lambda: current)
+        assert not new._snapshot_install_pending
+        assert owner.store.epoch == previous.store.epoch
+        drain(owner)
     finally:
         old.stopped.set(); previous.close(); new.stopped.set()
         if getattr(new, '_source_coordinator', None):
