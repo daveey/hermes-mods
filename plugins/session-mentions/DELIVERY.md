@@ -69,6 +69,11 @@ Fix:
   `reply_wait_note`. A stopped turn or abandoned call
   (core's thread interrupt bit, `tools.interrupt.is_interrupted`) withdraws an unclaimed send and marks a claimed
   one cancelled.
+- Steering is different from Stop: the relay polls `tools.interrupt.consume_yield` on its worker thread and
+  returns `status: "pending"` with the request ID when a new chat message needs the turn. The outbox or claimed
+  request remains live; yielding does not cancel courier delivery or prove that the send was accepted. Read the
+  target before resending. `tests/test_send_retry_ttl.py` covers both send/read waits, preserved courier custody,
+  and the core thread-local yield bit; the existing Stop tests still require withdrawal/cancellation.
 - Known limit: a retried message can land AFTER a later message from the same sender to the same chat (the later
   one is submitted once the turn has ended, or queues first). Nothing reorders them; a sender that needs order
   waits for each send's result before the next.
