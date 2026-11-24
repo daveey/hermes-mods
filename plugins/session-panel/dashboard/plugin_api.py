@@ -2077,6 +2077,34 @@ def _coalesce(f, last_start: float | None) -> None:
         f.stopped.wait(max(0.0, 3.0 - (time.monotonic() - last_start)))
 
 
+# A full pass recomputes the watched chats whose inputs moved (about 2 s each on a busy host), and a write to any
+# source file makes the next one due. Source files are written once or twice a second even when idle, so the feed
+# thread ran back to back (41% of a core in the MacBook gateway, 2026-11-23): the 3 s floor above is measured from
+# a pass's start and does nothing once a pass outlasts it. After a full pass that took T the next one now rests for
+# DUTY_REST_RATIO * T, but never so long that a held bundle would pass its trust window. A bundle's age when the
+# next pass replaces it is the pass that read it, the rest, and the next pass: T + rest + T. So the rest is bounded
+# by full_every_s - DUTY_TRUST_MARGIN_S - 2T, and a pass of 25 s or more earns none at the default 60 s window.
+# This holds for passes of similar length: the margin covers the 3 s floor grid and a next pass up to about 7 s
+# longer; a much longer one can show a chat untrusted once, after which its own length earns no rest. Not held: keyed refreshes, a cold reader waiting for its first bundle, a
+# pending retry (`_retry` or a deferred reconcile) and the board and decision lanes. One chat that fails every
+# pass keeps `_retry` non-empty and so keeps the rest off: `timing.duty_deferrals` staying at 0 shows it.
+# HERMES_PANEL_DUTY=0 turns the rest off.
+DUTY_REST_RATIO = 2.0
+DUTY_TRUST_MARGIN_S = 10.0
+
+
+def _duty_owed(f) -> float:
+    """Seconds the next full pass still has to rest after the last one (0 when none is owed)."""
+    if not _mitigation('HERMES_PANEL_DUTY'):
+        return 0.0
+    ended, took = f.__dict__.get('_full_pass', (None, 0.0))
+    if ended is None:
+        return 0.0
+    window = float(getattr(f, 'full_every_s', 60.0))
+    rest = min(DUTY_REST_RATIO * took, max(0.0, window - DUTY_TRUST_MARGIN_S - 2 * took))
+    return max(0.0, rest - (time.monotonic() - ended))
+
+
 def _settle(f, last_start: float) -> None:
     """Before a pass: coalesce demand, without allowing cold readers to bypass the floor."""
     if _mitigation('HERMES_PANEL_COALESCE'):
@@ -2188,7 +2216,22 @@ def _run(f) -> None:
                 if keyed:
                     f.refresh_keyed(keyed)
                 if not keyed_only:
-                    f.tick()
+                    # getattr: the pacing tests' feed doubles carry only what their case needs.
+                    urgent = (getattr(f._cold, 'is_set', lambda: True)() or bool(getattr(f, '_retry', None))
+                              or bool(getattr(f, '_reconcile_deferred', None)))
+                    if not urgent and _duty_owed(f) > 0:
+                        # The full pass stays due: the wake is still set (so the loop returns after the floor)
+                        # and a keyed batch arriving meanwhile must not clear it as a keyed-only iteration.
+                        with f.lock:
+                            f._legacy_wake = True
+                        timing = f.__dict__.setdefault('timing', {})
+                        timing['duty_deferrals'] = timing.get('duty_deferrals', 0) + 1
+                    else:
+                        tick_started = time.monotonic()
+                        f.__dict__['_full_pass'] = (tick_started, 0.0)  # a pass that raises earns no rest
+                        f.tick()
+                        ended = time.monotonic()
+                        f.__dict__['_full_pass'] = (ended, ended - tick_started)
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
             with f.lock:
@@ -2198,7 +2241,7 @@ def _run(f) -> None:
             readiness = getattr(f, '_facts_readiness', None)
             if readiness is not None:
                 readiness.set()
-            write_timing(f)  # after every pass (at most one per MIN_GAP_S): the 1 s freshness target is read from it
+            write_timing(f)  # after every loop iteration, a deferred pass included (at most one per MIN_GAP_S): the 1 s freshness target is read from it
             with f.lock:
                 state = (f.rev, frozenset(f.interest))
             if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:

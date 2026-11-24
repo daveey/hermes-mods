@@ -78,6 +78,21 @@ visible sessions. Hidden sessions retain dirty demand; attachment still hydrates
 current data. Set it to `0` to capture external inputs for all watched sessions.
 Canonical decision reconciliation is not visibility-gated.
 
+`HERMES_PANEL_DUTY` is default-on (same off values). After a full feed pass
+that took T seconds, the next full pass rests for 2T, bounded by
+`full_every_s - 10 - 2T` so a held bundle is replaced inside its 60 s trust
+window when consecutive passes are of similar length: 20 s of rest after a 10 s pass, 10 s after a 20 s pass, none from 25 s.
+Keyed refreshes, a cold reader, a pending retry (including a deferred
+reconcile) and the board and decision lanes are not held. Any chat, visible or
+not, whose change arrives as an unkeyed source write waits for the rest: up to
+25 s more, plus the 3 s floor. In exchange the feed thread no longer runs back
+to back under continuous source writes while passes are short; with many
+watched chats (passes of 25 s or more) nothing changes. `timing.duty_deferrals`
+counts loop iterations that deferred a due pass; it stops rising while any
+chat sits in the retry set (a failing chat, or rows read through the busy
+fallback). Set the flag to `0` before a normal plugin reload to restore
+back-to-back passes.
+
 `HERMES_PANEL_BOARD_COALESCE` is default-on (unset or any value except
 `0`, `false`, `off`, `no`, case-insensitive). BoardLane runs one hydration
 worker at a time and retains each session's pending change until at least
