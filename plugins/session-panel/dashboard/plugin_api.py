@@ -213,6 +213,8 @@ class CoreReaders:
     file was replaced (another inode) and dropped when the file is gone."""
 
     def __init__(self, state_db: Optional[Path] = None, *, home_context=None):
+        if home_context is not None and state_db is not None:
+            raise TypeError('state_db is not combined with home_context')
         from hermes_cli import kanban_sync_client as ksc
         self.ksc = ksc
         self._local = threading.local()
@@ -220,8 +222,6 @@ class CoreReaders:
         self._boards_at = 0.0
         self._boards_lock = threading.Lock()
         self.home_context = home_context
-        if home_context is not None and state_db is not None:
-            raise TypeError('state_db is not combined with home_context')
         if home_context is not None:
             state_db = Path(home_context.home) / 'state.db'
             self.unavailable_scopes = frozenset({'hub_db', 'mail_config'})
