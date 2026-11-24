@@ -106,7 +106,7 @@ def panel_fixture(tmp_path, monkeypatch):
     # Isolate this producer's clock, not the interpreter-wide time module.
     glob = mirror.reconcile.__func__.__globals__
     monkeypatch.setitem(glob, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(mirror.remote, 'input_stamp', lambda _: stamp[0], raising=False)
+    monkeypatch.setattr(mirror, '_panel_stamp', lambda _: stamp[0])
     monkeypatch.setattr(mirror.remote, 'reconcile', lambda owner: calls.append(owner))
     def run():
         fn = getattr(mirror, 'reconcile_panel', None)
