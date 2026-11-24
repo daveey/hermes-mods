@@ -435,3 +435,62 @@ test('cross-gateway send without retry_busy keeps the single forward-then-direct
   assert.deepEqual(log.map(x => x[0]), ['forward', 'direct'])
   assert.equal(res.status, 'refused'); assert.equal(res.retry_safe, true)
 })
+
+// ── reply wait: min(asked, what is left of the sender's whole wait once the submit is accepted) ──────────────
+/** A host whose chat stays busy with its own turn after accepting (so no reply ever correlates). */
+function waitingHost(answer, at) {
+  return { state, connections: async () => localConns,
+    request: async method => {
+      if (method === 'session.resume') return { session_id: 'live', running: true }
+      at.push(Date.now() - T0)
+      return answer(at.length)
+    } }
+}
+
+test('accepted at once with wait_for_reply 200: the reply is waited for the full 200 s, nothing is shortened', async t => {
+  fakeTime(t)
+  bridge(() => ({ state: 'claimed', age: (Date.now() - T0) / 1000 }))
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 200, total_wait_seconds: 400 }), 'local', localConns))
+  assert.deepEqual(at, [0])
+  assert.equal(res.ok, true); assert.equal(res.reply, null); assert.equal('reply_wait_seconds' in res, false)
+  assert.match(res.note, /within 200s/)
+  const waited = (Date.now() - T0) / 1000
+  assert.equal(waited >= 200 && waited <= 203, true, `waited ${waited}`)
+})
+
+test('accepted after 250 s of busy retry with wait_for_reply 200: the reply wait is shortened to what is left', async t => {
+  fakeTime(t)
+  bridge(() => ({ state: 'claimed', age: (Date.now() - T0) / 1000 }))
+  const at = []
+  const m = await load(waitingHost(() => { if (Date.now() - T0 < 250_000) throw busy(); return { status: 'queued', user_row_id: 3 } }, at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 200, total_wait_seconds: 400 }), 'local', localConns))
+  const accepted = at.at(-1) / 1000
+  assert.equal(accepted >= 250 && accepted <= 280, true, `accepted at ${accepted}`)
+  assert.equal(res.ok, true); assert.equal(res.status, 'queued')
+  assert.equal(res.reply_wait_seconds, 400 - 10 - accepted)
+  assert.equal(res.reply_wait_seconds <= 150, true)
+  assert.match(res.note, new RegExp(`within ${res.reply_wait_seconds}s`))
+  const ended = (Date.now() - T0) / 1000
+  assert.equal(ended <= 400, true, `ended at ${ended}: inside the sender's whole wait`)
+  assert.equal(at.filter(x => x / 1000 > accepted).length, 0, 'no submit after the accepted one')
+})
+
+test('a slow pickup counts: the gateway-clock age shortens the reply wait even when this Desktop just claimed', async t => {
+  fakeTime(t)
+  bridge(() => ({ state: 'claimed', age: 300 + (Date.now() - T0) / 1000 }))
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 200, total_wait_seconds: 400 }), 'local', localConns))
+  assert.equal(res.reply_wait_seconds, 90); assert.equal(res.ok, true)
+})
+
+test('a send without total_wait_seconds (older tool, other senders) keeps its asked reply wait', async t => {
+  fakeTime(t)
+  bridge()
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 30 }), 'local', localConns))
+  assert.equal('reply_wait_seconds' in res, false); assert.match(res.note, /within 30s/)
+})

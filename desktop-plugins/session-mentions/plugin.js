@@ -79,6 +79,9 @@ export const OWNER_RETRY_MAX_MS = 30_000
 // A re-submit's own RPC timeout: started at the window's end at the latest, it still answers inside the
 // sender's grace (`SEND_RETRY_GRACE`, 60 s).
 const OWNER_RETRY_SUBMIT_TIMEOUT_MS = 45_000
+// A send's reply wait ends this long before the sender's whole wait (`total_wait_seconds`) does: the last
+// 3 s poll, reading the transcript and posting the result.
+export const REPLY_MARGIN_S = 10
 
 // One per register(): dispose ends its waits, so a disabled or reloaded plugin stops re-submitting.
 const newInstance = () => ({ disposed: false, wake: new Set() })
@@ -714,6 +717,20 @@ export function sendRetryUntil(req, claimedAt = Date.now()) {
   return seconds ? claimedAt + seconds * 1000 : 0
 }
 
+/** How many seconds of a send's whole wait (`total_wait_seconds`, set by the cross_session tool; null without it)
+ *  are left for a reply. Time spent is the request's age on its gateway's clock (`GET /status/<id>`), or at
+ *  least the time since THIS Desktop claimed it when the gateway cannot say. */
+export const replyBudgetOf = (origin, req, claimedAt) => {
+  const total = Number(req?.total_wait_seconds)
+  if (!(total > 0)) return null
+  return async () => {
+    let spent = (Date.now() - claimedAt) / 1000
+    const st = await relay(origin, `/status/${enc(req.id)}`, { timeoutMs: 5_000 }).catch(() => null)
+    if (Number.isFinite(st?.age)) spent = Math.max(spent, st.age)
+    return total - REPLY_MARGIN_S - spent
+  }
+}
+
 /** Asks the request's gateway whether its sender still waits (`GET /status/<id>`): true = stop re-submitting.
  *  The sender marks the request cancelled when its wait ends; a request the gateway no longer holds, or one
  *  older than its window on the GATEWAY's clock, is over too. Throws when the gateway cannot be asked. */
@@ -765,8 +782,10 @@ function refusedNote(why, tries, started) {
 /** Deliver `text` as a new user turn into `target`. Optionally wait for the reply. `retryUntil` (epoch ms): keep
  *  re-submitting after core's ownership refusal until then (5 s, doubling to 30 s); without it one refusal is final.
  *  `stop` (async, true = the sender gave up) is asked before every re-submit; when it cannot answer, that round
- *  submits nothing. A disposed plugin instance stops too. Every such end is `refused, retry_safe: true`. */
-export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, stop = null, submitTimeoutMs = 60_000 } = {}) {
+ *  submits nothing. A disposed plugin instance stops too. Every such end is `refused, retry_safe: true`.
+ *  `replyBudget` (async, seconds the sender still waits, asked once the submit is accepted) shortens the reply
+ *  wait of a send that spent time reaching a busy chat; the result then carries `reply_wait_seconds`. */
+export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, stop = null, submitTimeoutMs = 60_000, replyBudget = null } = {}) {
   const inst = instance
   // The primary socket already owns open Desktop chats. A pooled profile route may
   // spawn another serve process over the SAME store: resume there is not attachment.
@@ -835,6 +854,13 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, s
     const out = { ok: ['streaming', 'queued'].includes(sub?.status), delivered: sub?.status === 'streaming', queued: sub?.status === 'queued', status: sub?.status || 'unknown', live_session_id: live, user_row_id: sub?.user_row_id || null, retry_safe: false }
     if (!out.ok) return { ...out, error: `Unexpected submit status: ${out.status}; inspect the target before retrying` }
     if (!waitSeconds) return out
+    if (replyBudget) {
+      const left = Math.max(0, Math.floor(await replyBudget()))
+      if (left < waitSeconds) {
+        out.reply_wait_seconds = waitSeconds = left
+        if (!left) return { ...out, reply: null, note: 'Accepted, but reaching the chat used up the whole wait: no time was left to wait for a reply. Read the target later; do not resend.' }
+      }
+    }
 
     const after = Number(sub?.user_row_id || 0)
     if (!after) return { ...out, reply: null, note: 'Accepted, but this backend supplied no user row for reply correlation. Inspect the target transcript; do not resend.' }
@@ -1477,9 +1503,10 @@ export async function performRequest(req, origin, conns) {
     const viaForward = !req.forwarded && target.connectionId !== (home?.id || 'local')
     const retryUntil = sendRetryUntil(req, claimedAt)
     const stop = senderGone(origin, req)
+    const replyBudget = replyBudgetOf(origin, req, claimedAt)
     let res
     if (!viaForward) {
-      res = await deliver(target, text, wait, { retryUntil, stop })
+      res = await deliver(target, text, wait, { retryUntil, stop, replyBudget })
     } else {
       // Each round asks the target gateway's own courier first, then this Desktop's direct route. A round only
       // moves on from a route that answered `refused` (never admitted) or took nothing (forwardSend null), and
@@ -1489,7 +1516,10 @@ export async function performRequest(req, origin, conns) {
       for (let round = 1; ; round++) {
         // A forward round can take FORWARD_ROUND_MS; late in the window only the direct route still answers in time.
         const forward = round === 1 || retryUntil - Date.now() >= FORWARD_ROUND_MS - OWNER_RETRY_SUBMIT_TIMEOUT_MS
-        let forwarded = forward ? await forwardSend(target, text, wait) : null
+        // The home courier cannot see this request's budget: hand it the reply wait that is left now.
+        const farWait = replyBudget && wait ? Math.max(0, Math.min(wait, Math.floor(await replyBudget()))) : wait
+        let forwarded = forward ? await forwardSend(target, text, farWait) : null
+        if (forwarded?.ok && farWait < wait) forwarded = { ...forwarded, reply_wait_seconds: farWait }
         // Refused there = never admitted, and the chat may be open in THIS Desktop (its backend on
         // that gateway owns it): the direct route is then the owning one.
         if (forwarded?.status === 'refused') {
@@ -1499,7 +1529,7 @@ export async function performRequest(req, origin, conns) {
           }
           forwarded = null
         }
-        res = forwarded || (await deliver(target, text, wait, { submitTimeoutMs: round === 1 ? 60_000 : OWNER_RETRY_SUBMIT_TIMEOUT_MS }))
+        res = forwarded || (await deliver(target, text, wait, { submitTimeoutMs: round === 1 ? 60_000 : OWNER_RETRY_SUBMIT_TIMEOUT_MS, replyBudget }))
         if (res.status !== 'refused' || !res.retry_safe || res.not_sent) break
         const why = await nextTry(inst, state, retryUntil, stop)
         if (why) {

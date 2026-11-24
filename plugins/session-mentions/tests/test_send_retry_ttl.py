@@ -111,9 +111,11 @@ def test_send_wait_ends_at_window_plus_grace_and_marks_the_request_cancelled(sm,
     assert status["age"] == pytest.approx(waited, abs=1)
 
 
-def test_wait_for_reply_extends_the_wait_as_before(sm, monkeypatch):
-    _, _, waited, _ = _run(sm, monkeypatch, "send", wait=120)
-    assert sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE + 120 <= waited <= sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE + 121
+def test_wait_for_reply_extends_the_wait_up_to_the_whole_budget(sm, monkeypatch):
+    _, _, waited, _ = _run(sm, monkeypatch, "send", wait=20)
+    assert sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE + 20 <= waited <= sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE + 21
+    _, _, waited, _ = _run(sm, monkeypatch, "send", wait=200)
+    assert sm.SEND_TOTAL_WAIT_MAX <= waited <= sm.SEND_TOTAL_WAIT_MAX + sm.SEND_REPLY_MARGIN + 1 < CORE_TOOL_CUT_S
 
 
 def test_read_keeps_its_short_wait_and_is_not_marked_cancelled(sm, monkeypatch):
@@ -123,38 +125,57 @@ def test_read_keeps_its_short_wait_and_is_not_marked_cancelled(sm, monkeypatch):
     assert "cancelled" not in after
 
 
-@pytest.mark.parametrize("asked, used", [(600, 40), (41, 40), (40, 40), (15, 15), (0, 0)])
-def test_reply_wait_is_shortened_so_the_whole_wait_stays_under_the_tool_cut(sm, monkeypatch, asked, used):
+def _handle_send(sm, monkeypatch, asked, result):
     seen = {}
 
     def relay(action, args, session_id, wait, **_kw):
         seen["wait"] = wait
-        return json.dumps({"ok": True, "status": "queued", "reply": None})
+        return json.dumps(result)
 
     monkeypatch.setattr(sm, "_relay", relay)
     monkeypatch.setattr(sm.rf, "worker_send_refusal", lambda *_a, **_k: None)
     out = json.loads(sm.handle({"action": "send", "target": "@session:default/abc", "message": "hi",
                                 "wait_for_reply": asked}, "s1"))
-    assert seen["wait"] == used
-    assert sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE + seen["wait"] <= sm.SEND_TOTAL_WAIT_MAX == 400 < CORE_TOOL_CUT_S
-    if used < asked:
-        assert out["reply_wait_seconds"] == used
-        assert f"shortened from {asked} s to {used} s" in out["reply_wait_note"]
-    else:
-        assert "reply_wait_seconds" not in out and "reply_wait_note" not in out
-    assert out["ok"] is True and out["status"] == "queued"
+    return out, seen["wait"]
 
 
-def test_shortened_reply_wait_bounds_the_real_wait(sm, monkeypatch):
-    """Through the handler and the real `_relay`: the longest a send can block, with the longest reply wait."""
+@pytest.mark.parametrize("asked", [0, 15, 200, 270, 390])
+def test_reply_wait_is_kept_when_the_send_is_accepted_at_once(sm, monkeypatch, asked):
+    out, wait = _handle_send(sm, monkeypatch, asked, {"ok": True, "status": "replied", "reply": "yes"})
+    assert wait == asked
+    assert "reply_wait_seconds" not in out and "reply_wait_note" not in out
+
+
+def test_reply_wait_shortened_by_the_courier_after_a_busy_retry_is_reported(sm, monkeypatch):
+    """The courier accepted the send after 250 s of retry and had 140 s left for the reply (delivery.test.mjs)."""
+    out, wait = _handle_send(sm, monkeypatch, 200, {"ok": True, "status": "queued", "reply": None, "reply_wait_seconds": 140})
+    assert wait == 200
+    assert out["reply_wait_seconds"] == 140 <= 150
+    assert "shortened from 200 s to 140 s" in out["reply_wait_note"]
+    assert out["ok"] is True
+
+
+def test_reply_wait_longer_than_the_whole_budget_is_capped_and_reported(sm, monkeypatch):
+    out, wait = _handle_send(sm, monkeypatch, 600, {"ok": True, "status": "queued", "reply": None})
+    assert wait == sm.SEND_TOTAL_WAIT_MAX - sm.SEND_REPLY_MARGIN == 390
+    assert out["reply_wait_seconds"] == 390 and "shortened from 600 s to 390 s" in out["reply_wait_note"]
+
+
+def _handle_on_clock(sm, monkeypatch, asked, answer_at=None, result=None):
+    """The handler and the real `_relay` on a fake clock, with a courier that claims at once."""
     clock = _Clock()
     base = sm.rf.root()
     for sub in ("outbox", "claimed", "results"):
         (base / sub).mkdir(parents=True, exist_ok=True)
+    seen: dict = {}
 
     def courier():
         for path in (base / "outbox").glob("*.json"):
+            seen["req"] = json.loads(path.read_text())
             path.rename(base / "claimed" / path.name)
+        if "req" in seen and answer_at is not None and clock.now - T0 >= answer_at and "answered" not in seen:
+            seen["answered"] = True
+            sm.rf.write_result(seen["req"]["id"], result, base)
 
     clock.on_sleep = courier
     monkeypatch.setattr(sm, "time", clock)
@@ -162,9 +183,22 @@ def test_shortened_reply_wait_bounds_the_real_wait(sm, monkeypatch):
     monkeypatch.setattr(sm, "_sender_info", lambda _sid: {})
     monkeypatch.setattr(sm.rf, "worker_send_refusal", lambda *_a, **_k: None)
     out = json.loads(sm.handle({"action": "send", "target": "@session:default/abc", "message": "hi",
-                                "wait_for_reply": 600}, "s1"))
-    assert "Timed out" in out["error"] and out["reply_wait_seconds"] == 40
-    assert 400 <= clock.now - T0 <= 401 < CORE_TOOL_CUT_S
+                                "wait_for_reply": asked}, "s1"))
+    return out, seen["req"], clock.now - T0
+
+
+def test_send_accepted_at_once_with_wait_200_is_waited_for_200(sm, monkeypatch):
+    replied = {"ok": True, "status": "replied", "reply": "done"}
+    out, req, waited = _handle_on_clock(sm, monkeypatch, 200, answer_at=205, result=replied)
+    assert req["wait_for_reply"] == 200 and req["total_wait_seconds"] == sm.SEND_TOTAL_WAIT_MAX == 400
+    assert out == replied and 205 <= waited <= 206
+
+
+def test_the_longest_send_ends_under_the_tool_cut(sm, monkeypatch):
+    out, req, waited = _handle_on_clock(sm, monkeypatch, 600)
+    assert req["wait_for_reply"] == 390
+    assert "Timed out" in out["error"]
+    assert sm.SEND_TOTAL_WAIT_MAX <= waited <= sm.SEND_TOTAL_WAIT_MAX + sm.SEND_REPLY_MARGIN + 1 < CORE_TOOL_CUT_S
 
 
 def test_interrupted_send_marks_its_claimed_request_cancelled(sm, monkeypatch):
@@ -247,7 +281,7 @@ const source = await fs.readFile(process.argv[2], 'utf8')
 globalThis.__smHost = { state: {} }
 const code = source.replace("import { COMPOSER_AREAS, host } from '@hermes/plugin-sdk'", 'const host = globalThis.__smHost; const COMPOSER_AREAS = {}')
 const m = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
-console.log(JSON.stringify({ window: m.OWNER_RETRY_WINDOW_S, asked: m.busyRetrySeconds(JSON.parse(process.argv[3])) }))
+console.log(JSON.stringify({ window: m.OWNER_RETRY_WINDOW_S, asked: m.busyRetrySeconds(JSON.parse(process.argv[3])), margin: m.REPLY_MARGIN_S }))
 """
 
 
@@ -263,5 +297,5 @@ def test_courier_and_tool_agree_on_the_window(sm, tmp_path):
     run = subprocess.run([node, str(script), str(_JS), json.dumps(req)], capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr[-2000:]
     got = json.loads(run.stdout)
-    assert got == {"window": sm.SEND_BUSY_RETRY, "asked": sm.SEND_BUSY_RETRY}
+    assert got == {"window": sm.SEND_BUSY_RETRY, "asked": sm.SEND_BUSY_RETRY, "margin": sm.SEND_REPLY_MARGIN}
     assert sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE < CORE_TOOL_CUT_S

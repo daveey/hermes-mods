@@ -42,10 +42,12 @@ MAX_REPLY_WAIT = 600
 # on a message that still lands. When the wait ends the request is marked cancelled and the courier stops.
 SEND_BUSY_RETRY = 300
 SEND_RETRY_GRACE = 60  # the last re-submit's own 45 s timeout + posting the result
-# A send's whole wait (busy retry + grace + reply wait) stays under core's 420 s cut, so `wait_for_reply` is
-# shortened to what is left; the result says so when it was.
+# A send's whole wait (reaching the chat + waiting for its reply) stays under core's 420 s cut. The request
+# carries it as `total_wait_seconds`; the courier, once the submit is accepted, waits for the reply
+# min(wait_for_reply, what is left of it minus SEND_REPLY_MARGIN) and reports a shortened wait as
+# `reply_wait_seconds` (plugin.js `replyBudgetOf`). A send accepted at once keeps up to 390 s.
 SEND_TOTAL_WAIT_MAX = 400
-SEND_REPLY_WAIT_MAX = SEND_TOTAL_WAIT_MAX - SEND_BUSY_RETRY - SEND_RETRY_GRACE
+SEND_REPLY_MARGIN = 10  # plugin.js REPLY_MARGIN_S: the last poll, the transcript read, posting the result
 
 SCHEMA = {
     "name": "cross_session",
@@ -60,8 +62,9 @@ SCHEMA = {
         "- action=send: deliver `message` into `target` as a new user turn, attributed to this "
         "session. A Kanban worker (HERMES_KANBAN_TASK set) cannot send into a human chat "
         "(desktop/cli source); that send is refused and names the card to place instead. "
-        "With `wait_for_reply` (seconds, at most 40: longer waits are shortened and the result says so; "
-        "read the target later for a slow reply) it waits for that session's next reply "
+        "With `wait_for_reply` (seconds; the whole call, reaching the chat included, is held to 400 s, so "
+        "the wait is at most 390 and shorter after a busy-chat retry: the result then says so in "
+        "`reply_wait_note`) it waits for that session's next reply "
         "and returns it; otherwise it returns once delivered.\n"
         "While another Hermes window holds the target's turn the send is retried for up to 5 minutes; "
         "`status: refused` with `retry_safe: true` after that means nothing was delivered.\n"
@@ -189,18 +192,21 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
             asked = max(0, min(MAX_REPLY_WAIT, int(args.get("wait_for_reply") or 0)))
         except (TypeError, ValueError):
             asked = 0
-        wait = min(asked, SEND_REPLY_WAIT_MAX)
+        wait = min(asked, SEND_TOTAL_WAIT_MAX - SEND_REPLY_MARGIN)
     out = _relay(action, args, session_id, wait)
-    if wait < asked:
+    if asked:
         try:
             data = json.loads(out)
         except ValueError:
             return out
-        if isinstance(data, dict):
-            data["reply_wait_seconds"] = wait
+        # The courier reports the reply wait it really used when reaching the chat took part of the budget.
+        used = data.get("reply_wait_seconds") if isinstance(data, dict) else None
+        used = wait if not isinstance(used, (int, float)) or isinstance(used, bool) else min(wait, max(0, int(used)))
+        if isinstance(data, dict) and used < asked:
+            data["reply_wait_seconds"] = used
             data["reply_wait_note"] = (
-                f"wait_for_reply was shortened from {asked} s to {wait} s: a send may spend up to "
-                f"{SEND_BUSY_RETRY + SEND_RETRY_GRACE} s reaching a busy chat and a tool call is cut at 420 s. "
+                f"wait_for_reply was shortened from {asked} s to {used} s: the whole call, reaching the chat "
+                f"included, is held to {SEND_TOTAL_WAIT_MAX} s (a tool call is cut at 420 s). "
                 "No reply here does not mean none will come: read the target (action=read) later.")
             out = json.dumps(data)
     return out
@@ -479,7 +485,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         "ttl": 600,
     }
     if action == "send":  # opt in: other writers of send requests (Slack follower, close-out) want the first refusal
-        req.update(retry_busy=True, retry_busy_seconds=SEND_BUSY_RETRY)
+        req.update(retry_busy=True, retry_busy_seconds=SEND_BUSY_RETRY, total_wait_seconds=SEND_TOTAL_WAIT_MAX)
     rf.atomic_write(base / "outbox" / f"{rid}.json", req)
     if hasattr(rf, "notify_outbox"):
         rf.notify_outbox(base)  # wake the Desktop courier now (no-op outside `hermes serve`)
@@ -489,7 +495,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
     deadline_pickup = time.time() + PICKUP_TIMEOUT
     deadline = time.time() + PICKUP_TIMEOUT + 120 + wait  # a forwarded send adds one hop
     if action == "send":  # the courier may retry a refused send for the whole TTL before it answers
-        deadline = max(deadline, time.time() + SEND_BUSY_RETRY + SEND_RETRY_GRACE + wait)
+        deadline = time.time() + min(SEND_BUSY_RETRY + SEND_RETRY_GRACE + wait, SEND_TOTAL_WAIT_MAX + SEND_REPLY_MARGIN)
     if timeout_seconds is not None:
         deadline = min(deadline, time.time() + max(0, timeout_seconds))
 
