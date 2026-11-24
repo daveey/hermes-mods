@@ -185,3 +185,35 @@ def test_default_unblock_on_a_card_no_stop_holds_is_todays_unblock(real):
         assert c.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='unblocked'", (task,)).fetchone()
     finally:
         c.close()
+
+
+@pytest.mark.parametrize("on_decision_card", [False, True])
+def test_retry_after_a_crash_between_release_and_receipt_records_the_receipt(real, on_decision_card):
+    kb, connect, path, store, mod = real
+    from hermes_cli import kanban_release
+    from hermes_cli import kanban_spend_decision as decision
+    c = connect(path)
+    try:
+        if on_decision_card:
+            root = stopped(kb, c, cause=None, session=None, ask=None)
+            decision.ensure_producer(c, root)
+            bound = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
+            with kb.write_txn(c):
+                c.execute("UPDATE tasks SET status='blocked', session_id='session-a', human_request=? WHERE id=?",
+                          (json.dumps(ASK), bound))
+        else:
+            root = bound = stopped(kb, c)
+        mirror, op = click(mod, store, path)
+        # The first delivery released the card and died before its receipt was written.
+        out = kanban_release.release(c, bound, writer=kanban_release.human_writer("desktop-operation:x"),
+                                     author="user-steps", note="Desktop Unblock, operation " + op["operationId"])
+        assert out["outcome"] == "released" and status(c, root) == "ready"
+        assert mirror._receipt(c, mirror._bound(op), op) is None
+        receipt = mirror.deliver(op)
+        assert receipt["released"] == root and receipt["outcome"] == "released"
+        assert mirror.readback(op, receipt) and mirror.deliver(op) == receipt
+        assert len(mandates(c, root)) == 1  # nothing was released twice
+        # Another operation's note is not this click's release: no receipt is invented for it.
+        assert kanban_release.released_by(c, bound, "Desktop Unblock, operation someone-else") is None
+    finally:
+        c.close()

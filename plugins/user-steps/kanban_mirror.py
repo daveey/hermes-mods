@@ -1477,20 +1477,29 @@ class Mirror:
         Core's unblock refuses such a card (a spend decision is pending), so the click released nothing. A
         refused release (provider safety, containment) leaves the ask in place with the reason as a comment.
         The receipt is a ``user_steps_answer`` event on the bound card, written with the choice comment after
-        the release lands; a retry finds it and returns it."""
+        the release lands; a retry finds it and returns it. A retry after a crash between the release and
+        that write finds the card already released by this operation's note (``released_by``) and records
+        the receipt then, instead of refusing a click that worked."""
         core_release = getattr(api, "release", None)
-        if core_release is None or core_release.held(c, binding["task"]) is None:
+        if core_release is None:
             return None
-        if fence(c):
-            raise self.core.ActionError("Source card ask changed or transition refused", 409)
         operation = op["operationId"]
-        out = core_release.release(
-            c,
-            binding["task"],
-            writer=core_release.human_writer("desktop-operation:" + operation),
-            author="user-steps",
-            note="Desktop Unblock, operation " + operation,
-        )
+        note = "Desktop Unblock, operation " + operation
+        if core_release.held(c, binding["task"]) is None:
+            done = getattr(core_release, "released_by", lambda *a: None)(c, binding["task"], note)
+            if done is None:
+                return None
+            out = dict(outcome="released", target=done)
+        else:
+            if fence(c):
+                raise self.core.ActionError("Source card ask changed or transition refused", 409)
+            out = core_release.release(
+                c,
+                binding["task"],
+                writer=core_release.human_writer("desktop-operation:" + operation),
+                author="user-steps",
+                note=note,
+            )
         if out["outcome"] == "refused":
             reason = (
                 f"Desktop Unblock did not release {out['target']} ({out['refusal']}): "

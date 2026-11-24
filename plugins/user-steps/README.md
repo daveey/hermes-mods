@@ -270,9 +270,11 @@ authenticated Desktop operation is and noted `Desktop Unblock, operation <operat
 goal-level mandate comment, the scope renewal, a spend budget of the runs already counted plus
 `kanban.release_runs`, and the promotion. Core's plain unblock refuses such a card, so before this
 the click released nothing. A release core refuses (provider safety, containment) leaves the ask in
-place with the reason as a comment. Asks with explicit choices, cards no stop holds, a core without
-`kanban_release`, and asks on another gateway's cards (the remote courier, core's
-`kanban_card_answer`) keep the plain unblock.
+place with the reason as a comment. A retry of an operation whose release landed before its
+receipt was written finds the card released by that operation's note and records the receipt.
+Asks with explicit choices, cards no stop holds and a core without `kanban_release` keep the plain
+unblock. An ask on another gateway's card goes through the remote courier to core's
+`kanban_card_answer`, which makes the same release on the card's home.
 
 The source is the creating user session, or the earliest stored local user-surface
 subscriber (including legacy custom-source chats). Presentation follows core's
