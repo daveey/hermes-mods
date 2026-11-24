@@ -4,10 +4,8 @@ POST /changes {sessions, since, epoch} -> {feed, profile, epoch, rev, reset, bun
 Pushes: `plugin.session-panel.changed` {feed, profile, epoch, prev, rev, bundles | heartbeat} on the gateway stream.
 GET /status: the feed's revision, watched chats, failures and last recompute time.
 
-The feed thread starts on the first request, so only the process that serves the Desktop (`hermes serve`, where
-plugin routers run and `broadcast_plugin_event` reaches the windows) ever runs it. It serves the process's own
-(launch) profile only: a request scoped to another profile is answered `profile_unsupported`, and the Desktop keeps
-its own reads for that profile.
+The feed is launch-profile scoped; other profiles return profile_unsupported.
+Production starts on the serving process, never by computing on a request.
 """
 from __future__ import annotations
 
@@ -2280,14 +2278,15 @@ def _save_running() -> bool:
     return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=EXIT_SAVE_TIMEOUT_S)
 
 
-# Loading changed feed bytes may immediately launch feed() on another thread;
-# register only after both lane targets and snapshot helpers are defined.
-_load_feed().RESTART = feed
-_load_feed().INSTALL_FACTS = install_facts
-_load_feed().STOP_FACTS = stop_facts
-_binding = sys.modules.get('_session_panel_facts_binding')
-if _binding is not None:
-    install_facts(_binding.v1, _binding.scope, _binding.handle)
+# Legacy reload callbacks are excluded from the producer-only import.
+_PRODUCER_ONLY = __name__ == '_session_panel_producer_api_v1'
+if not _PRODUCER_ONLY:
+    _load_feed().RESTART = feed
+    _load_feed().INSTALL_FACTS = install_facts
+    _load_feed().STOP_FACTS = stop_facts
+    _binding = sys.modules.get('_session_panel_facts_binding')
+    if _binding is not None:
+        install_facts(_binding.v1, _binding.scope, _binding.handle)
 
 
 class ChangesBody(BaseModel):
@@ -2333,8 +2332,10 @@ async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    # Do not call _load_feed here: source fingerprinting and hot handover also
-    # belong to the producer, not this byte-read path.
+    external = getattr(_LOADER, 'external_projection', None)
+    if external is not None:
+        from hermes_cli.serve_producer_runtime import projection_response
+        return projection_response(external, body.model_dump())
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this
