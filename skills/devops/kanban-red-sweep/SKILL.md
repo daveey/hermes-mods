@@ -121,13 +121,18 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
-  Spend-triaged card (`spend_budget_triaged`): re-scope comment, then `hermes kanban promote <id> --seen <newest comment id> <reason>`;
-  `unblock` only re-triages it. Read back status.
-  Scope-stopped card (`scope_stopped`/`decision_retained`, "promotion ... do not release it"): comment the renewed
-  scope, take the stop uid from `hermes kanban show <id> --json | jq -r '[.events[]|select(.kind=="decision_retained")][-1].payload.episode_uid'`
-  (not `.uid`, which is null), `hermes kanban renew-scope <id> --episode <uid> --mandate-comment <cid> --reason ...`, then
-  `promote`; its refusal prints the `--seen <id>` to rerun with. Only the owning chat or creator task may renew: a card
-  with no owning session (`origin_session` null) is refused `not_scope_authority` from any chat.
+  Spend-held or scope-stopped card: from its owning chat, one step on its home gateway:
+  `hermes kanban release <id> [--runs N] [--seen <newest comment id>] --note "<user's words + goal>"`, then read back status.
+  Re-read events first: the board's spend reviewer may already have re-granted it, and release then refuses `not_held`.
+  Plain `triage` (no hold) also refuses `not_held`: use `hermes kanban [--board B] promote <id> "<reason>"`.
+  A card you expect to stop again (a narrow run override against a multi-run rollout) gets a wider
+  `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
+  `unblock` only re-triages a spend hold. Fallback without `release`: re-scope comment, `renew-scope --episode <stop
+  uid> --mandate-comment <cid>`, then `promote --seen <cid>`.
+  Release on a worker-homed card this chat created (run via `hub-worker-exec <w>`) is refused `not_scope_authority`
+  until a human grants the chat rights there: run `hermes kanban delegate grant --session <this session id> --gateway
+  <w> --profile default --reason "..."` through `run_in_user_terminal` (the user's blanket unblock permission covers it), then release.
+  A card with no owning session (`origin_session` null) needs that grant or an operator.
   A triaged or failed card that a live card still lists as a parent gates that child forever: verify the outcome
   yourself (for a lander: log tail `bb land: exit 0`, `compare/<sha>...main` behind=0, equal source/landed trees),
   comment it on the child, `kanban_unlink` the dead parent, then archive it on its home gateway.
