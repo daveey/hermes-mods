@@ -72,7 +72,9 @@ own-line fixes inside the round instead. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
 If a renewal's landing path ends in `hermes-core-wt ship`, name filing ship's reviewer card in the mandate
 (`core-wt-review-request.json`, linked as the card's parent). Ship rejects a same-card review with exit 3,
-and a nearby "no new cards" line will otherwise stall the worker on a decision request.
+and a nearby "no new cards" line will otherwise stall the worker on a decision request. Name ship's proof upload
+too: from a worker, ship exits 1 until its emitted pre-land proof is uploaded with the `kanban_attach` tool (CLI
+attachment writes are fenced), so list that upload plus the identical ship rerun under "not stops".
 Measure a dollar cap from the comment that set it: sum `usage.cost_usd` over the card's `worker_result` events
 created after that comment. The spend-budget window and older totals start earlier, so they overstate it.
 After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
