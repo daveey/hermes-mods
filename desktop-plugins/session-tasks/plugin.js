@@ -534,7 +534,7 @@ export function hubLinkChips(tasks, liveKeys = new Set()) {
     if (liveKeys.has(k) || seen.has(k)) continue
     seen.add(k)
     const chip = taskChip(t, status)
-    out.push({ ...chip, replica: true, key: `kb:${k}`, gateway, board, title: `${chip.title}\non ${gateway} · ${syncedAgo(t.synced_at)} (hermes-hub replica)` })
+    out.push({ ...chip, replica: true, syncedAt: Number(t.synced_at) || null, key: `kb:${k}`, gateway, board, title: `${chip.title}\non ${gateway} · ${syncedAgo(t.synced_at)} (hermes-hub replica)` })
   }
   return byRank(out)
 }
@@ -1433,7 +1433,10 @@ export function openTaskChip(chip) {
 // An older producer (no observations array at all) cannot prove live or queued card work: such a card renders
 // explicit unknown with its last known state, never the running pulse. Its waits and asks keep their look.
 const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
-const legacyLiveCard = c => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
+// A synced worker-homed replica in a parked state (ready/todo/review) is the owner's board report, not an unobserved run:
+// its title already says where and how long ago it synced, so it is not forced to "status unknown".
+const PARKED_REPORT = new Set(['ready', 'todo', 'review'])
+const legacyLiveCard = c => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state)) && !(c.replica && Number.isFinite(c.syncedAt) && PARKED_REPORT.has(str(c.state)))
 
 export function Chip({ chip: rawChip, now }) {
   // Owner-qualified PanelModel text is authoritative, including historical ages.
