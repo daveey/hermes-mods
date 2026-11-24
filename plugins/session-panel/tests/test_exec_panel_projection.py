@@ -35,7 +35,8 @@ def load_api():
     return mod
 
 
-def test_real_panel_projection_served_without_readers_in_request_process(tmp_path, monkeypatch):
+@pytest.mark.parametrize('slot,profile', [('desktop-a', 'default'), ('desktop-b', 'researcher')])
+def test_real_panel_projection_served_without_readers_in_request_process(tmp_path, monkeypatch, slot, profile):
     from hermes_cli.kanban_db_connect import connect
     from hermes_cli import kanban_db
 
@@ -51,7 +52,10 @@ def test_real_panel_projection_served_without_readers_in_request_process(tmp_pat
     provider = ROOT / 'dashboard' / 'producer_provider.py'
     manifest = {'path': str(provider), 'sha256': hashlib.sha256(provider.read_bytes()).hexdigest()}
     relay = core_runtime.ProjectionRelay(manifest, home=tmp_path, runtime=tmp_path / 'runtime', generation='panel-fixture')
+    monkeypatch.setattr(sys, 'argv', ['hermes', 'serve', '--ssh-session-token-file', f'/slots/{slot}/token'])
     api = load_api()
+    monkeypatch.setattr(api, 'LAUNCH_PROFILE', profile)
+    monkeypatch.setattr(api, '_request_profile', lambda: profile)
     try:
         relay.start_for_fixture()
         monkeypatch.setattr(api._LOADER, 'external_projection', relay, raising=False)
@@ -61,7 +65,8 @@ def test_real_panel_projection_served_without_readers_in_request_process(tmp_pat
         app = FastAPI()
         app.include_router(api.router)
         with TestClient(app) as client:
-            body = {'sessions': ['chat']}
+            body = {'sessions': ['chat'],
+                    '_wire_identity': {'feed': 'untrusted:other-slot', 'profile': 'other'}}
             def ready():
                 response = client.post('/changes', json=body)
                 assert response.status_code in (200, 503)
@@ -70,6 +75,10 @@ def test_real_panel_projection_served_without_readers_in_request_process(tmp_pat
             response = client.post('/changes', json=body)
             assert response.status_code == 200
             wire = response.json()
+            assert wire['feed'] == api.FEED_ID
+            assert wire['feed'].endswith(f':serve-{slot}')
+            assert wire['profile'] == profile
+            assert {'epoch', 'rev', 'reset', 'bundles'} <= wire.keys()
             task = wire['bundles']['chat']['tasks'][0]
             assert task['id'] == tid
             assert task['title'] == 'Real exec panel work'
@@ -99,7 +108,9 @@ def test_provider_drains_legacy_visibility_queue_and_bounds_subscribers(tmp_path
     direct.feed.clock = lambda: wall[0]
     monkeypatch.setattr(direct.feed, 'tick', lambda: None)
     def call(subscriber):
-        return direct({'body': {'sessions': [], 'subscriber': subscriber}, 'accepted': time.monotonic()})
+        return direct({'body': {'sessions': [], 'subscriber': subscriber,
+                               '_wire_identity': {'feed': 'fixture:serve', 'profile': 'default'}},
+                       'accepted': time.monotonic()})
     try:
         for _ in range(300):
             call('one')
