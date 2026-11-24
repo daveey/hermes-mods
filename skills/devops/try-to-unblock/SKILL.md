@@ -60,19 +60,22 @@ means an unreleased link of any kind (`created` counts) to a session with recent
 `ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A `scope_stopped` hold is released only by
 `hermes kanban renew-scope <id> --episode <stop event uid> --mandate-comment <integer comment id> --reason …`, then
 `promote <id> --seen <newest comment id>`. It is run by the card's owning chat or its creator task. A human
-terminal counts only with a mandate comment a human wrote: an agent-written mandate is refused `mandate_authority`
-even in David's terminal, and a recorded For-you choice is not a mandate. Relay David's choice to the owning chat
+terminal counts only with a mandate comment written by a clean (non-agent) process: a comment the agent posted
+earlier is refused `mandate_authority` even when renewed from David's terminal, and a recorded For-you choice is
+not a mandate. Relay David's choice to the owning chat
 (cross_session); after a home move it renews through the authenticated foreign-comment route on its own gateway.
 The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
 renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
-that chat's own terminal; a worker or relayed command is refused. When David asks in chat to unblock, the desk may
-write the mandate AND renew from his terminal in one `run_in_user_terminal` window (`ssh ubuntu@hermes-hub` script:
-comment, read its id, renew-scope, promote --seen); the mandate says the desk drafted it on his request.
-Write the mandate for the goal ("land PR N and complete"), not the next step: a step-sized mandate stopped one PR
-13 times as each new ship gate appeared. Ship's documented follow-ups (kanban_attach a proof, post review replies,
-re-run ship, ship's own rebase) are inside the round, and transient infra errors (OperationalError, 5xx, locked)
-get 3 retries. Stop only on: CHANGES_REQUESTED, red required CI needing code, safety refusal, the same error 3
-times, budget. Workers read "any authority refusal" literally and retain when
+that chat's own terminal; a worker or relayed command is refused. When David asks in chat to unblock, write the
+mandate AND renew in ONE `run_in_user_terminal` window: `ssh ubuntu@hermes-hub` running a staged script that, per
+card, posts the comment (`hermes kanban comment`), reads its id (`max(id)` from `task_comments`), then
+`renew-scope` and `promote --seen <id>`. The comment is then human-written by ancestry; the mandate states the desk
+drafted it on his request. Print the mandate files first so the window shows what is posted.
+Write the mandate for the goal ("land PR N and complete this card"), never the next step: each ship gate is new,
+so a step-sized mandate stops at every one and costs a full owner round-trip per gate. Put ship's follow-ups
+(below) inside the round, give transient infra errors (OperationalError, 5xx, database locked) 3 retries, and stop
+only on: CHANGES_REQUESTED, red required CI needing code, safety refusal, the same error 3 times, budget, or a
+finding that changes the design. Workers read "any authority refusal" literally and retain when
 the tool policy refuses a single call (e.g. `execute_code` blocked in unattended mode). A tool-policy refusal means
 switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Make the list closed,
 never ending in a catch-all such as "any other guard refusal": workers then stop when the repo's own checks
