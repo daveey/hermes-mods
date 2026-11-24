@@ -1569,6 +1569,24 @@ def _emit(payload: dict) -> None:
     broadcast_plugin_event(PLUGIN_ID, 'changed', push_payload(payload))
 
 
+def _emit_with_receipt(payload: dict) -> tuple[bytes, int, int]:
+    """Exact post-transform callback custody, labelled server emission only.
+
+    This is not an authenticated client receipt or proof of Desktop presentation.
+    The generic callback return, without these exact bytes/clocks, cannot settle
+    an acquisition. Invalidation-only emission still requires scoped catch-up.
+    """
+    from hermes_cli.plugin_events import broadcast_plugin_event
+    body = push_payload(payload)
+    encoded = json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
+    started = time.monotonic_ns()
+    broadcast_plugin_event(PLUGIN_ID, 'changed', body)
+    return encoded, started, time.monotonic_ns()
+
+
+setattr(_emit, 'with_receipt', _emit_with_receipt)
+
+
 def _launch_profile() -> str:
     """The profile this process serves when no request scopes it: read on a fresh thread (no request context)."""
     out = ['default']
@@ -2784,6 +2802,22 @@ async def changes(body: ChangesBody, request: Request):
         start_publication()
         return Response(b'{"detail":"Session panel starting"}', status_code=503,
                         media_type='application/json', headers={'Retry-After': '1'})
+    current = f._current() if getattr(f, '_successor', None) is not None else f
+    if getattr(current, 'receipt_log', None) is not None:
+        # Private inclusion telemetry uses core's actual route-local admission,
+        # not a client body flag/header assertion. No token/principal is logged.
+        from hermes_cli.plugin_host_http_auth import admitted_for_sensitive_route
+        from fastapi import HTTPException
+        from uuid import uuid4
+        request_id = uuid4().hex
+        if not admitted_for_sensitive_route(request):
+            current.receipt_log.record('catchup_error', request_id=request_id, authenticated=False,
+                                       error='core_http_admission_refused')
+            raise HTTPException(401, 'Unauthorized')
+        wire, custody = current.changes_packet(body.sessions, since=body.since, epoch=body.epoch,
+                            subscriber=body.subscriber, visible_session=body.visible_session)
+        return current.receipt_module.completed_response(_WIRE_PREFIX + wire[1:], log=current.receipt_log,
+            stored=custody, authenticated=True, request_id=request_id)
     wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch,
                            subscriber=body.subscriber, visible_session=body.visible_session)
     return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')

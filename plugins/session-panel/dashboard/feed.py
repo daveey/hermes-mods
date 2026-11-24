@@ -293,6 +293,7 @@ class Feed:
         self._focus: list[str] = []          # ...and of those, the ones that led their request (a focused chat)
         self._decision_seen: dict[str, tuple] = {}  # decision lane only: session -> (inputs stamp, read at)
         self._wire_sources = {}
+        self.receipt_log = self.receipt_module = None  # explicit private measurement only; never default activation
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
         self._publish_wire()
 
@@ -313,6 +314,20 @@ class Feed:
                               'ttl_s': self.full_every_s}}}
         return out
 
+    def install_receipts(self, log):
+        """Explicit in-process measurement seam; no source/reader activation.
+
+        The caller owns log flush/close after producer retirement. A running
+        measurement cannot silently swap sinks and lose predecessor custody.
+        """
+        module = sys.modules[type(log).__module__]
+        with self.compute_lock, self.lock:
+            if self.receipt_log is not None and self.receipt_log is not log:
+                raise ValueError('receipt log already installed')
+            self.receipt_log, self.receipt_module = log, module
+            self._wire_sources = {}  # stamp the exact current immutable bytes
+            self._publish_wire()
+
     def _publish_wire(self):
         """Writer-only: freeze JSON bytes before swapping the complete revision view.
 
@@ -331,7 +346,14 @@ class Feed:
             if old and isinstance(source, tuple) and source[0] is held['bundle'] and source[1] == fresh and old[0] == held['rev']:
                 entries[s] = old
             else:
-                entries[s] = (held['rev'], self._encode(s), self._encode(self._client_bundle(s, held['bundle'], fresh)))
+                encoded = self._encode(self._client_bundle(s, held['bundle'], fresh))
+                entry = (held['rev'], self._encode(s), encoded)
+                if self.receipt_log is not None:
+                    custody = self.receipt_module.stored_model(self, s, held, encoded)
+                    entry += (custody,)
+                    self.receipt_log.record('model_stored', publication=custody.publication,
+                                            **self.receipt_module.payload_fields(encoded))
+                entries[s] = entry
         self._wire_sources = sources
         header = b'{"epoch":' + self._encode(self.epoch) + b',"rev":' + str(self.rev).encode()
         self._wire = (self.epoch, self.rev, MappingProxyType(entries), header)
@@ -352,14 +374,19 @@ class Feed:
         return json.dumps(safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
 
     def changes_bytes(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None):
-        """No locks, readers, computation or JSON conversion on the HTTP path.
+        return self.changes_packet(sessions, since=since, epoch=epoch, subscriber=subscriber,
+                                   visible_session=visible_session)[0]
 
-        Cold sessions return no bundle until a background tick publishes one.
-        Registration is an enqueue, not a synchronous interest-lock acquisition.
+    def changes_packet(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None):
+        """One immutable wire snapshot plus its exact private custody sidecars.
+
+        No locks, readers, computation or JSON conversion on the HTTP read path.
+        Cold sessions return no bundle until background publication. Sidecars are
+        private bytes, never source certificates added to the client protocol.
         """
         if self._successor is not None:
-            return self._current().changes_bytes(sessions, since=since, epoch=epoch,
-                                                 subscriber=subscriber, visible_session=visible_session)
+            return self._current().changes_packet(sessions, since=since, epoch=epoch,
+                                                  subscriber=subscriber, visible_session=visible_session)
         if subscriber:
             self._panel_updates.put((subscriber, visible_session, self.clock() + 75.0))
             self._board.set()
@@ -382,10 +409,11 @@ class Feed:
         if any(s not in entries for s in wanted):
             self._cold.set()  # the producer computes it on its own thread, at once
             self._wake.set()
-        parts = [entries[s][1] + b':' + entries[s][2] for s in wanted
-                 if s in entries and (reset or entries[s][0] > since)]
-        return (header + b',"reset":' + (b'true' if reset else b'false')
-                + b',"bundles":{' + b','.join(parts) + b'}}')
+        selected = [entries[s] for s in wanted if s in entries and (reset or entries[s][0] > since)]
+        parts = [entry[1] + b':' + entry[2] for entry in selected]
+        payload = (header + b',"reset":' + (b'true' if reset else b'false')
+                   + b',"bundles":{' + b','.join(parts) + b'}}')
+        return payload, tuple(entry[3] for entry in selected if len(entry) == 4)
 
     def resume(self, prev: 'Feed') -> 'Feed':
         """Carry a stopped feed of this process into this one, so clients see no reset.
@@ -1121,6 +1149,7 @@ class Feed:
                             if did_change:
                                 changed[s] = self.bundles[s]['bundle']
                 self._publish_wire()
+                receipt_entries = self._wire[2] if self.receipt_log is not None else None
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
                 with self.lock:
@@ -1128,9 +1157,30 @@ class Feed:
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
                     fresh = sorted(s for s in self.interest if self._bundle_fresh(s, now))
                 try:
-                    self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev,
+                    payload = {'epoch': self.epoch, 'prev': prev, 'rev': self.rev,
                                'bundles': {s: self._client_bundle(s, b, s in fresh) for s, b in changed.items()}, 'fresh': fresh,
-                               **({} if changed else {'heartbeat': True})})
+                               **({} if changed else {'heartbeat': True})}
+                    if self.receipt_log is None:
+                        self.emit(payload)
+                    else:
+                        assert receipt_entries is not None
+                        custody = [receipt_entries[s][3].publication for s in changed
+                                   if s in receipt_entries and len(receipt_entries[s]) == 4
+                                   and json.loads(receipt_entries[s][2]) == payload['bundles'].get(s)]
+                        emitter = getattr(self.emit, 'with_receipt', None)
+                        if emitter is None:
+                            self.emit(payload)
+                            self.receipt_log.record('emit_error', error='no_exact_transformed_payload_adapter',
+                                                    sessions=list(changed))
+                        else:
+                            actual, callback_started, callback_completed = emitter(payload)
+                            transformed = json.loads(actual)
+                            included = [p for p in custody if p['session'] in (transformed.get('bundles') or {})]
+                            self.receipt_log.record('emit_success', publications=included,
+                                callback_started_ns=callback_started, callback_completed_ns=callback_completed,
+                                observation='server_emission',
+                                kind='model' if transformed.get('bundles') else 'invalidation_only' if transformed.get('sessions') else 'heartbeat',
+                                **self.receipt_module.payload_fields(actual))
                     self.last_emit = now
                     if _results is not None:
                         for s in changed:
@@ -1140,7 +1190,9 @@ class Feed:
                                     True, prior_result.revision)
                     if changed:
                         self._note_publish(changed)
-                except Exception:  # no client / transport down: clients catch up, and see no heartbeat meanwhile
+                except Exception as exc:  # no client / transport down: catch-up remains possible
+                    if self.receipt_log is not None:
+                        self.receipt_log.record('emit_error', error=type(exc).__name__, sessions=list(changed))
                     log.debug('session-panel feed: push failed', exc_info=True)
             return changed
 
