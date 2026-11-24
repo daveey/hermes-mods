@@ -11,10 +11,12 @@ def fixture(tmp_path, monkeypatch):
     calls = []
     def read(**kwargs):
         calls.append(dict(state))
-        return ([{'id': str(state['cursor'])}], [{'alias': state['alias']}])
+        rows = ([{'id': str(state['cursor'])}], [{'alias': state['alias']}])
+        ksa._links_cache = {state['scope']: (state['now'] + 15, state['scope'], state['cursor'], *rows)}
+        return rows
     ksa = SimpleNamespace(_origin_scope=lambda: state['scope'],
                           _links_fingerprint=lambda: state['cursor'],
-                          remote_links_and_origin_rows=read)
+                          _links_cache={}, remote_links_and_origin_rows=read)
     monkeypatch.setattr(r, '_stat', lambda path: state['alias'])
     monkeypatch.setattr(api.time, 'monotonic', lambda: state['now'])
     return r, ksa, state, calls
@@ -42,6 +44,24 @@ def test_inventory_does_not_certify_a_racing_write(tmp_path, monkeypatch):
     ksa.remote_links_and_origin_rows = racing
     r._links_inventory(ksa)
     ksa.remote_links_and_origin_rows = original
+    assert r._links_inventory(ksa)[0][0]['id'] == '2'
+    assert len(calls) == 2
+
+
+def test_inventory_does_not_borrow_a_racing_replacement_expiry(tmp_path, monkeypatch):
+    r, ksa, state, calls = fixture(tmp_path, monkeypatch)
+    original = ksa.remote_links_and_origin_rows
+    def racing(**kwargs):
+        old = original(**kwargs)
+        # A newer projection may be published between public read and cache peek.
+        ksa._links_cache = {state['scope']: (1000, state['scope'], state['cursor'],
+                                            [{'id': 'new'}], [{'alias': 2}])}
+        return old
+    ksa.remote_links_and_origin_rows = racing
+    assert r._links_inventory(ksa)[0][0]['id'] == '1'
+    assert r._local.links_inventory is None
+    ksa.remote_links_and_origin_rows = original
+    state['cursor'] = 2
     assert r._links_inventory(ksa)[0][0]['id'] == '2'
     assert len(calls) == 2
 
