@@ -59,7 +59,10 @@ because two asks split David's answer. A live owner chat holds release: message 
 means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
 `ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A `scope_stopped` hold is released only by
 `hermes kanban renew-scope <id> --episode <stop event uid> --mandate-comment <integer comment id> --reason …`, then
-`promote <id> --seen <newest comment id>`. It is run by the card's owning chat, a human terminal, or its creator task.
+`promote <id> --seen <newest comment id>`. It is run by the card's owning chat or its creator task. A human
+terminal counts only with a mandate comment a human wrote: an agent-written mandate is refused `mandate_authority`
+even in David's terminal, and a recorded For-you choice is not a mandate. Relay David's choice to the owning chat
+(cross_session); after a home move it renews through the authenticated foreign-comment route on its own gateway.
 The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
 renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
 that chat's own terminal; a worker or relayed command is refused. In the mandate, name the stop refusals: Board,
@@ -74,7 +77,8 @@ If a renewal's landing path ends in `hermes-core-wt ship`, name filing ship's re
 (`core-wt-review-request.json`, linked as the card's parent). Ship rejects a same-card review with exit 3,
 and a nearby "no new cards" line will otherwise stall the worker on a decision request. Name ship's proof upload
 too: from a worker, ship exits 1 until its emitted pre-land proof is uploaded with the `kanban_attach` tool (CLI
-attachment writes are fenced), so list that upload plus the identical ship rerun under "not stops".
+attachment writes are fenced), so list that upload plus the identical ship rerun under "not stops". Likewise ship
+exits 1 on unanswered non-blocking review points until rerun with `--review-reply "<answers>"`; list that too.
 Measure a dollar cap from the comment that set it: sum `usage.cost_usd` over the card's `worker_result` events
 created after that comment. The spend-budget window and older totals start earlier, so they overstate it.
 After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
