@@ -25,8 +25,17 @@ BATCH_MAX = 16
 
 class BoardLane:
     def __new__(cls, feed, reader_factory, **kwargs):
-        owner = getattr(feed, '_source_coordinator', None)
-        return owner if owner is not None else super().__new__(cls)
+        with feed.lock:
+            owner = getattr(feed, '_source_coordinator', None)
+            if owner is not None:
+                # A genuine saved predecessor entry never calls today's startup
+                # helpers. Registration itself must establish the opted-in owner;
+                # manual BoardLane probes still start no service.
+                if (getattr(feed, '_board_service_required', False)
+                        or getattr(feed, '_board_thread', None) is threading.current_thread()):
+                    owner.start_service()
+                return owner
+        return super().__new__(cls)
 
     def __init__(self, feed, reader_factory, *, capacity=None):
         self.feed, self.reader_factory = feed, reader_factory

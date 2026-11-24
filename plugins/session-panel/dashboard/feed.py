@@ -93,6 +93,7 @@ def wire_bundle(bundle):
 PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
 PROCESS_LOCK = threading.Lock()
 RESTART = None               # plugin_api.feed: a plugin reload restarts (resumes) the feed at once
+SNAPSHOT_READER_FACTORY = None  # current API registration, never a saved predecessor's factory
 log = logging.getLogger('session-panel')
 _MODEL_PATH = Path(__file__).resolve().parents[1] / 'model.py'
 # Content-addressed module generation: model/brief changes cannot leave a hot
@@ -393,6 +394,13 @@ class Feed:
         request started a new epoch with no bundles (4 resets in 15 min on the hub), and every Desktop dropped its
         trust and re-read. The revision space, held bundles and interest carry over; every held chat is recomputed
         before a push vouches for it again. `prev` emits nothing after this (its in-flight push finishes first)."""
+        predecessor = getattr(prev, '_source_coordinator', None)
+        retirement = None
+        if predecessor is not None:
+            # Withdraw source authority without joining under either writer lock.
+            # The successor is attached before saved predecessor loops can start;
+            # its four roles stay gated until retiring workers release readers.
+            retirement = self._source_module().RetiringOwner(predecessor)
         with prev.compute_lock, prev.lock:
             # First: whatever follows, the old object pushes nothing more under the revision space handed over here.
             prev.emit = lambda payload: None
@@ -416,6 +424,8 @@ class Feed:
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
             self._board_capture_failures = set(getattr(prev, '_board_capture_failures', ())) & set(self.interest)
+            self._board_failures = set(getattr(prev, '_board_failures', ())) & set(self.interest)
+            self._decision_failures = set(getattr(prev, '_decision_failures', ())) & set(self.interest)
             # Restored from another process and not recomputed yet: still re-issued on its recompute.
             self._reissue = set(getattr(prev, '_reissue', ())) & set(bundles)
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
@@ -429,6 +439,15 @@ class Feed:
             prev._publish = lambda computed, **kwargs: {}
             prev.watch = self.watch
             prev.changes = self.changes
+        if predecessor is not None:
+            factory = SNAPSHOT_READER_FACTORY
+            if factory is None:
+                loader = sys.modules.get('_session_panel_feed_loader')
+                factory = getattr(loader, 'snapshot_reader_factory', None)
+            if factory is None:
+                factory = predecessor.reader_factory
+            self.compose_board_sources(factory, gateway=predecessor.gateway,
+                                       profile=predecessor.profile, _predecessor=retirement)
         return self
 
     def _current(self) -> 'Feed':
@@ -489,19 +508,26 @@ class Feed:
     def reducer(bundle, *, now):
         return _model().reduce_panel(bundle, now=now, wire=True)
 
-    def compose_board_sources(self, reader_factory, *, gateway, profile):
+    def _source_module(self):
+        import importlib
+        modules = self.readers.snapshot_modules()
+        return importlib.import_module(modules.__package__ + '.source_coordinator')
+
+    def compose_board_sources(self, reader_factory, *, gateway, profile, _predecessor=None):
         """Explicit disposable composition only; normal startup remains UNACTIVATED.
 
         All board/full/catch-up routes share this owner once composed. No thread
         starts until step/full/start_service. Rollback must close it first.
         """
-        if getattr(self, '_source_coordinator', None) is not None:
-            return self._source_coordinator
-        modules = self.readers.snapshot_modules()
-        import importlib
-        module = importlib.import_module(modules.__package__ + '.source_coordinator')
-        owner = module.SourceCoordinator(self, reader_factory, gateway=gateway, profile=profile)
-        self._source_coordinator = self._board_lane = owner
+        with self.lock:
+            if getattr(self, '_source_coordinator', None) is not None:
+                return self._source_coordinator
+            module = self._source_module()
+            owner = module.SourceCoordinator(self, reader_factory, gateway=gateway, profile=profile)
+            owner.predecessor = _predecessor
+            if _predecessor is not None:
+                _predecessor.bind(owner)
+            self._source_coordinator = self._board_lane = owner
         return owner
 
     def project_board(self, store, chat, *, canonical_base, pin=None, seq=None, external_capture=()):
@@ -1023,16 +1049,16 @@ class Feed:
         """Tick thread: take in what readers registered since the last look. A chat with no bundle goes to the head
         of the urgent list (the newest request first; inside one request the client's own order, focused chat
         first)."""
-        for _ in range(MAX_WATCHED):
-            try:
-                wanted = self.watch(self._registrations.get_nowait())
-            except queue.Empty:
-                break
-            with self.lock:
+        with self.lock:
+            for _ in range(MAX_WATCHED):
+                try:
+                    wanted = self.watch(self._registrations.get_nowait())
+                except queue.Empty:
+                    break
                 cold = [s for s in wanted if s in self.interest and s not in self.bundles]
-            self._urgent = cold + [s for s in self._urgent if s not in cold]
-            if cold and cold[0] == wanted[0]:  # the chat its client is looking at leads the request
-                self._focus = [cold[0]] + [s for s in self._focus if s != cold[0]]
+                self._urgent = cold + [s for s in self._urgent if s not in cold]
+                if cold and cold[0] == wanted[0]:  # the chat its client is looking at leads the request
+                    self._focus = [cold[0]] + [s for s in self._focus if s != cold[0]]
 
     def _panel_dirty(self, watched: list[str]) -> set[str]:
         """The watched chats whose outcome/request stamp moved: one batched read when the readers have one."""

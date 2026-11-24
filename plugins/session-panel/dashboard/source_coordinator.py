@@ -37,6 +37,49 @@ class Ticket:
     error: Exception | None = None
 
 
+class RetiringOwner:
+    """Compatibility fence for a genuinely older coordinator implementation.
+
+    It need not know today's retire/drained methods. Its completion queue already
+    marks work after reader release. Keep every occupied role until that marker,
+    including ancestors still draining across consecutive reloads.
+    """
+    def __init__(self, owner):
+        self.owner = owner
+        self.drained = threading.Event()
+        with owner.lock:
+            self.parent = getattr(owner, 'predecessor', None)
+            self.remaining = {('acquisition_done', key) for key in owner.acquiring}
+            self.remaining.update(('projection_done', key) for key in owner.active)
+            owner.closed = True
+            owner.store.close(owner.store.epoch)
+            owner.service_stop.set()
+            owner.pending.clear()
+            for session in list(owner.tickets):
+                owner._cancel_tickets(session, 'snapshot owner stopped')
+        owner.service_wake.set()
+
+    def ready(self):
+        with self.owner.lock:
+            while True:
+                try:
+                    kind, key, value = self.owner.completed.get_nowait()
+                except queue.Empty:
+                    break
+                self.remaining.discard((kind, key))
+            parent_ready = self.parent is None or self.parent.ready()
+            if not self.remaining and parent_ready:
+                self.drained.set()
+        return self.drained.is_set()
+
+    def bind(self, successor):
+        # Wake the old scheduler on its original event before handing worker
+        # completion notifications to the successor. No watcher thread or poll.
+        with self.owner.lock:
+            self.owner.successor = successor
+            self.owner.service_wake = successor.service_wake
+
+
 class SourceCoordinator:
     capacity = 2
     visible_only = False
@@ -70,6 +113,30 @@ class SourceCoordinator:
         self._local_stamp = self._external_stamp = None
         self._local_requested = self._external_requested = True
         self.closed = False
+        self.drained = threading.Event()
+        self.drained.set()
+        self._workers = 0
+        self.predecessor = None
+        self.successor = None
+
+    def _available(self):
+        return self.predecessor is None or self.predecessor.ready()
+
+    def _worker_started(self):
+        self._workers += 1
+        self.drained.clear()
+
+    def _worker_finished(self):
+        # After reader release and all result bookkeeping: transfer capacity,
+        # never connections or source authority, to a waiting successor.
+        with self.lock:
+            self._workers -= 1
+            if not self._workers:
+                self.drained.set()
+            successor = self.successor
+        if successor is not None:
+            successor.service_wake.set()
+            successor.feed._board.set()
 
     def start_service(self):
         with self.lock:
@@ -254,7 +321,7 @@ class SourceCoordinator:
         self.service()
 
     def _launch(self, role, requested, target):
-        if role in self.acquiring:
+        if self.closed or not self._available() or role in self.acquiring:
             return
         reg = self.role_attempts[role]
         if reg.count and (reg.retry_at is None or self.feed.clock() < reg.retry_at):
@@ -275,6 +342,7 @@ class SourceCoordinator:
         worker = threading.Thread(target=self._acquisition, args=(role, target, stamp),
                                   name='session-panel-source-' + role, daemon=True)
         self.acquiring[role] = worker
+        self._worker_started()
         worker.start()
 
     def _acquisition(self, role, target, stamp):
@@ -287,8 +355,9 @@ class SourceCoordinator:
             rd.release()
             rd = None
             with self.lock:
-                self.role_attempts[role].count = 0
-                self.role_attempts[role].retry_at = None
+                if not self.closed:
+                    self.role_attempts[role].count = 0
+                    self.role_attempts[role].retry_at = None
         except Exception as exc:
             log.warning('session-panel %s acquisition failed', role, exc_info=True)
             self.completed.put(('registration_error', role, exc))
@@ -301,6 +370,7 @@ class SourceCoordinator:
             self.completed.put(('acquisition_done', role, None))
             self.service_wake.set()
             self.feed._board.set()
+            self._worker_finished()
 
     def _capture_one(self, rd, source, stamp):
         with self.lock:
@@ -331,6 +401,8 @@ class SourceCoordinator:
                 part = rd.capture_local(source, previous, demands, hint)
                 _, admissions = self.store.accept_local(part, prior)
             with self.lock:
+                if self.closed:
+                    return
                 # Success does not renew a failure budget; only changed source /
                 # exact demand does. Unknown returned coverage is failed work.
                 unknown = self.store.pending(source)
@@ -360,9 +432,42 @@ class SourceCoordinator:
     def _acquire_external(self, rd, stamp):
         self._capture_one(rd, self.external, stamp)
 
+    def _drain_interest(self):
+        # HTTP remains an enqueue-only path. The composed service must consume
+        # these queues even when canonical reconciliation is blocked. Never hold
+        # the coordinator lock while taking Feed.lock (keyed admission reverses
+        # that order). Demand leases do not renew source retry/coverage authority.
+        f = self.feed
+        with f.lock:
+            if self.closed or f.stopped.is_set():
+                return
+            f._drain()
+            now = f.clock()
+            while True:
+                try:
+                    subscriber, session, expires = f._panel_updates.get_nowait()
+                except queue.Empty:
+                    break
+                if session and expires > now:
+                    f._panel_subscribers[subscriber] = (session, expires)
+                else:
+                    f._panel_subscribers.pop(subscriber, None)
+            f._panel_subscribers = {k: v for k, v in f._panel_subscribers.items() if v[1] > now}
+            while True:
+                try:
+                    sessions, expires = f._board_demands.get_nowait()
+                except queue.Empty:
+                    break
+                if expires > now:
+                    f._board_requested.update({s: expires for s in sessions})
+            f._board_requested = {s: end for s, end in f._board_requested.items() if end > now}
+
     def service(self):
+        self._drain_interest()
         with self.lock:
             if self.closed or self.feed.stopped.is_set():
+                return
+            if not self._available():
                 return
             while True:
                 try:
@@ -398,6 +503,7 @@ class SourceCoordinator:
                 worker = threading.Thread(target=self._project, args=(s,),
                                           name='session-panel-projection-' + s[:12], daemon=True)
                 self.active[s] = worker
+                self._worker_started()
                 worker.start()
 
     def _base(self, s, lineage):
@@ -438,6 +544,10 @@ class SourceCoordinator:
             result = results[s]
             bundle = BoardBundle(projection, self.module)
             with self.lock:
+                if self.closed:
+                    for ticket in tickets:
+                        ticket.error = RuntimeError('snapshot owner stopped')
+                    return
                 if result.disposition == 'superseded':
                     if self.tokens.get(s) is self.feed._watch_tokens.get(s) and s in self.feed.interest:
                         self.tickets.setdefault(s, []).extend(tickets)
@@ -470,11 +580,12 @@ class SourceCoordinator:
                 elif ticket.error is None:
                     ticket.error = RuntimeError('snapshot publication refused: ' + result.disposition)
         except Exception as exc:
-            self.feed._board_failures.add(s)
             with self.lock:
-                attempt = self.projection_attempts.setdefault(s, Attempt())
-                attempt.count += 1
-                attempt.retry_at = self.feed._backoff(attempt.count)
+                if not self.closed:
+                    self.feed._board_failures.add(s)
+                    attempt = self.projection_attempts.setdefault(s, Attempt())
+                    attempt.count += 1
+                    attempt.retry_at = self.feed._backoff(attempt.count)
             for ticket in tickets:
                 ticket.error = exc
             log.warning('session-panel pure projection failed: %s', s, exc_info=True)
@@ -484,6 +595,7 @@ class SourceCoordinator:
             self.completed.put(('projection_done', s, None))
             self.service_wake.set()
             self.feed._board.set()
+            self._worker_finished()
 
     def _settle_local(self, sessions):
         """Finish the owned local turn, including a registration admitted mid-turn."""
@@ -587,16 +699,23 @@ class SourceCoordinator:
         finally:
             rd.release()
 
-    def close(self):
+    def retire(self):
+        """Nonjoining authority withdrawal, safe under the Feed writer fence."""
         with self.lock:
             self.closed = True
+            # Withdraw immutable publication authority before any potentially
+            # blocked join. A late projection may keep its pin, never its lease.
+            self.store.close(self.store.epoch)
             self.service_stop.set()
             self.pending.clear()
             for s in list(self.tickets):
                 self._cancel_tickets(s, 'snapshot owner stopped')
-            workers = [*self.acquiring.values(), *self.active.values()]
         self.service_wake.set()
+
+    def close(self):
+        self.retire()
+        with self.lock:
+            workers = [*self.acquiring.values(), *self.active.values()]
         for worker in [self.service_worker, *workers]:
             if worker is not None and worker is not threading.current_thread():
                 worker.join(2)
-        self.store.close(self.store.epoch)
