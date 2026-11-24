@@ -41,6 +41,51 @@ def test_composed_tick_keeps_leading_trailing_floor_and_quiet_safety(acquisition
         f.stopped.set(); lane.close(); r.release()
 
 
+def test_composed_tick_drains_already_stamped_budget_carry(acquisition, monkeypatch):
+    r, *_ = acquisition
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    source, now, budget = {'revision': 1}, {'t': 1000.0}, {'enabled': False}
+    monkeypatch.setattr(r, 'reconciliation_stamp', lambda: source['revision'])
+    monkeypatch.setattr(r, 'reconcile_scoped', True)
+    monkeypatch.setattr(r, 'reconcile_budgeted', True)
+    monkeypatch.setattr(r, 'reconcile_safety_s', 0.0)
+    monkeypatch.setattr(r, 'reconcile_min_interval_s', 0.0)
+    calls = []
+
+    def reconcile(sessions, deadline=None):
+        assert deadline is not None
+        calls.append(list(sessions))
+        r.reconcile_unreached = list(sessions)[1:] if budget['enabled'] else []
+        return set()
+
+    monkeypatch.setattr(r, 'reconcile_sources', reconcile)
+    f = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now['t'])
+    f.watch(['A', 'B'])
+    lane = compose(f, r)
+    try:
+        drain(lane); f.tick()
+        assert set(f._reconcile_stamps) == {'A', 'B'}
+        assert not f._producer_carry
+        # Both chats already have successful stamps. A later source change past
+        # the canonical safety ceiling admits them; the budget reaches only one.
+        now['t'] += 61.0
+        source['revision'] += 1
+        budget['enabled'] = True
+        f.tick()
+        assert len(calls) == 2 and set(calls[1]) == {'A', 'B'}
+        carry = set(calls[1][1:])
+        assert f._producer_carry == carry
+        assert carry <= set(f._reconcile_stamps), 'never-stamped admission must not conceal missing carry'
+        assert {'A', 'B'} <= set(f.bundles), 'budget carry must not hold presentation'
+        f.tick()
+        assert len(calls) == 3 and set(calls[2]) == carry
+        assert not f._producer_carry
+        f.tick()
+        assert len(calls) == 3, 'unchanged settled sources do not rerun'
+    finally:
+        f.stopped.set(); lane.close(); r.release()
+
+
 def test_composed_tick_drains_budget_carry_without_another_source_write(acquisition, monkeypatch):
     r, *_ = acquisition
     monkeypatch.setattr(r, 'external_capture', strict_empty)
