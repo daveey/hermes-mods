@@ -250,7 +250,11 @@ one-shot checks, not another long-lived shell loop.
 ## Kanban card parked on an external PR
 
 Use the runtime's read-only terminal-state probe as the `wake_check`, not a `gh ... --jq .state` test (that
-treats API failures as pending and never wakes for a superseded PR). Graphite merge queues close the
+treats API failures as pending and never wakes for a superseded PR). The same applies to a chat background loop
+that waits for PR A to merge and then ships PR B: use the probe (exit 2 = stop and report), and before the ship step
+re-read B's head and confirm it equals the approved sha. If a credential outage hits while the loop runs, every
+poll looks pending until the loop times out. If B's head moves while the loop waits, the loop ships a stale
+approval. Graphite merge queues close the
 original PRs they land: CLOSED, never MERGED. The `kanban-pr-wake-guard` plugin now refuses raw gh PR
 state/merge wake checks on `kanban_block` and `kanban_schedule`, and warns on non-terminal probes such as
 `reviewDecision` that may never become true after closure. Use:
