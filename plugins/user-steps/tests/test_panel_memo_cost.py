@@ -4,6 +4,8 @@ import json
 import sqlite3
 import time
 
+import pytest
+
 from test_panel_replica_membership import replica_panel  # noqa: F401
 from test_panel_membership import sources  # noqa: F401
 
@@ -56,6 +58,45 @@ def test_production_inventory_memo_cost_and_same_version_changes(replica_panel, 
     with closing(sqlite3.connect(p.s.paths['replica'])) as c, c:
         c.execute("UPDATE replica SET data=? WHERE key=?", ('{', key))
     assert p.stamp() is None
+    p.run()
+    assert not p.mirror.panel_remote_unchanged
+
+
+@pytest.mark.parametrize('raw', [
+    b'\xef\xbb\xbf{"id":"t_odd"}',
+    b'{"id":"t_odd","title":"\xed\xa0\x80"}',
+])
+def test_text_inventory_preserves_strict_decode_fence(replica_panel, raw):
+    p = replica_panel
+    p.s.obligation()
+    p.link()
+    assert p.stamp() is not None
+    # BLOBs historically reach json.loads(bytes); TEXTs reach strict SQLite
+    # UTF-8 decoding then json.loads(str). Warm a valid BLOB cache entry first
+    # so identical bytes cannot hide the stronger TEXT fence after a type change.
+    p.s.sql('replica', 'INSERT INTO replica VALUES (?,?,?,?,1)',
+            ('remote', 'tasks', 'default/default/t_odd', raw))
+    assert p.stamp() is not None
+    p.s.sql('replica', "UPDATE replica SET data=CAST(data AS TEXT) WHERE key=?",
+            ('default/default/t_odd',))
+    for _ in range(2):
+        assert p.stamp() is None
+        p.run()
+        assert not p.mirror.panel_remote_unchanged
+
+
+def test_same_version_inventory_arrival_invalidates(replica_panel):
+    p = replica_panel
+    p.s.obligation()
+    p.link()
+    p.s.put(p.s.task('t_arrival', session='other-chat'))
+    before = p.stamp()
+    assert before is not None
+    p.run()
+    p.run()
+    assert p.mirror.panel_remote_unchanged
+    p.s.put(p.s.task('t_arrival'))  # same version, newly links this chat
+    assert p.stamp() != before
     p.run()
     assert not p.mirror.panel_remote_unchanged
 
