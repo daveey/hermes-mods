@@ -464,12 +464,17 @@ class Mirror:
         from hermes_cli.kanban_db_connect import connect
         from types import SimpleNamespace
 
+        try:  # core's one-step release of a spend/scope stop; absent on an older core
+            from hermes_cli import kanban_release
+        except ImportError:
+            kanban_release = None
         return SimpleNamespace(
             connect=connect,
             write_txn=kanban_db.write_txn,
             add_comment=kanban_db.add_comment,
             unblock_task=kanban_db.unblock_task,
             archive_task=kanban_db.archive_task,
+            release=kanban_release,
         )
 
     def _path(self, board):
@@ -1463,6 +1468,64 @@ class Mirror:
             raise self.core.ActionError('Source card ask changed or transition refused', 409)
         return recorded
 
+    def _release(self, api, c, binding, op, comment, receipt, fence):
+        """The default Unblock on a card a spend or scope stop holds (or on the decision card filed for one)
+        releases that card to finish through core's ``hermes kanban release``, as the human act the
+        authenticated Desktop operation is. None when this core has no release or the card is not held that
+        way: the caller then applies today's unblock unchanged.
+
+        Core's unblock refuses such a card (a spend decision is pending), so the click released nothing. A
+        refused release (provider safety, containment) leaves the ask in place with the reason as a comment.
+        The receipt is a ``user_steps_answer`` event on the bound card, written with the choice comment after
+        the release lands; a retry finds it and returns it."""
+        core_release = getattr(api, "release", None)
+        if core_release is None or core_release.held(c, binding["task"]) is None:
+            return None
+        if fence(c):
+            raise self.core.ActionError("Source card ask changed or transition refused", 409)
+        operation = op["operationId"]
+        out = core_release.release(
+            c,
+            binding["task"],
+            writer=core_release.human_writer("desktop-operation:" + operation),
+            author="user-steps",
+            note="Desktop Unblock, operation " + operation,
+        )
+        if out["outcome"] == "refused":
+            reason = (
+                f"Desktop Unblock did not release {out['target']} ({out['refusal']}): "
+                f"{out['message']}\nOperation: {operation}"
+            )
+            if not c.execute(
+                "SELECT 1 FROM task_comments WHERE task_id=? AND author='user-steps' AND body=?",
+                (binding["task"], reason),
+            ).fetchone():  # a redelivery of the same operation says it once
+                api.add_comment(c, binding["task"], "user-steps", reason)
+            raise self.core.ActionError(
+                f"Release refused ({out['refusal']}): {out['message']}", 409
+            )
+        receipt = dict(receipt, released=out["target"], outcome=out["outcome"])
+        with api.write_txn(c):
+            old = self._receipt(c, binding, op)
+            if old:
+                return old
+            api.add_comment(
+                c,
+                binding["task"],
+                "user-steps",
+                comment + f"\nReleased {out['target']}: {out['outcome']}",
+            )
+            c.execute(
+                "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+                (
+                    binding["task"],
+                    "user_steps_answer",
+                    encoded(dict(user_steps_projection=receipt)),
+                    int(time.time()),
+                ),
+            )
+        return self._receipt(c, binding, op)
+
     def deliver(self, op):
         binding = self._bound(op)
         if json.loads(binding['snapshot']).get('remote'):
@@ -1529,6 +1592,10 @@ class Mirror:
                 )
 
             archive = not other and not hr.get("choices") and choice["value"] == "archive"
+            if not other and not hr.get("choices") and choice["value"] == "unblock":
+                released = self._release(api, c, binding, op, comment, receipt, fence)
+                if released is not None:
+                    return released
             # Core owns the transaction (and post-commit archive cleanup). Its event
             # is the durable receipt, committed together with the choice comment.
             (api.archive_task if archive else api.unblock_task)(

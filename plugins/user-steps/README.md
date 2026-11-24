@@ -263,6 +263,17 @@ core's normal dependency gating. The fallback Archive abandons it. These are not
 commands: a `user_terminal` ask still needs authentication in its terminal window;
 Unblock means resume without that terminal result.
 
+On a card a spend or scope stop holds in triage, or on the `Spend budget decision:` card filed
+for one, the fallback Unblock releases the stopped card to finish through core's
+`hermes kanban release` (`hermes_cli.kanban_release.release`), recorded as the human act the
+authenticated Desktop operation is and noted `Desktop Unblock, operation <operationId>`: one
+goal-level mandate comment, the scope renewal, a spend budget of the runs already counted plus
+`kanban.release_runs`, and the promotion. Core's plain unblock refuses such a card, so before this
+the click released nothing. A release core refuses (provider safety, containment) leaves the ask in
+place with the reason as a comment. Asks with explicit choices, cards no stop holds, a core without
+`kanban_release`, and asks on another gateway's cards (the remote courier, core's
+`kanban_card_answer`) keep the plain unblock.
+
 The source is the creating user session, or the earliest stored local user-surface
 subscriber (including legacy custom-source chats). Presentation follows core's
 compression continuation, not branches, resets or delegates. A recorded decision
