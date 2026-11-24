@@ -21,6 +21,9 @@ from pydantic import BaseModel
 
 API_VERSION = 1
 BUG_BOARD = "hermes"
+# Kanban's user label for cards a person files from a dashboard surface (hermes_cli.kanban_lanes.USER_CREATORS):
+# the creator gate skips the person's own cards (daily lane limits still apply).
+BOARD_CREATOR = "dashboard"
 
 
 def bug_board(kb=None) -> Optional[str]:
@@ -120,8 +123,15 @@ def create_router(llm=None, db_path=None, kb=None, store_root=None):
         if b.get("error"):
             return {"board": body.board, "cards": [], "error": b["error"]}
         task = {"title": b["title"], "message": b["message"]}
+        # Only the panel's "Move to board" click reaches this route, so the card is the person's own chat work
+        # moved out of the chat: file it under a user label. As "coach" (a hermes-lane `creators` match) every
+        # such card landed in the hermes lane and was held at its creator gate; a request sat in triage with
+        # workers idle (t_01a20fa0dacc3605, 2026-11-24). Now its lane comes from its repo/title/classifier and
+        # the creator gate skips it (a lane's daily card/spend limits still apply). It also leaves the coach
+        # fixer's spend count (created_by='coach'). The key prefix and the brief's "[coach] moved to the board"
+        # line keep the provenance.
         return core.spin_out_core().kanban_cards([task], body.session_id, body.profile or b["profile"], b["cwd"],
-                                                 body.board, kb=kb, created_by="coach", key_prefix="coach-board")
+                                                 body.board, kb=kb, created_by=BOARD_CREATOR, key_prefix="coach-board")
 
     @router.post("/file-bug")
     def file_bug(body: BugBody):

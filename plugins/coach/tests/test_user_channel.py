@@ -148,8 +148,16 @@ def test_tenth_subagent_or_long_job_offers_move_to_board(tmp_path):
     out = post(c, "/board", session_id="s1")
     assert out["cards"] == [{"title": "Fix login", "task_id": "t_1"}]
     kw = kb.created[0]
-    assert kw["created_by"] == "coach" and kw["session_id"] == "s1" and "@session:default/s1" in kw["body"]
-    assert kw["idempotency_key"].startswith("coach-board:s1:")
+    # A user label, so the creator gate skips the person's own moved work (t_01a20fa0dacc3605).
+    assert kw["created_by"] == "dashboard" and kw["session_id"] == "s1" and "@session:default/s1" in kw["body"]
+    assert kw["idempotency_key"].startswith("coach-board:s1:") and "[coach] moved to the board" in kw["body"]
+
+
+def test_board_creator_is_a_core_user_label():
+    """The label only skips the lane gate while core counts it as the person's (kanban_lanes.USER_CREATORS)."""
+    lanes = pytest.importorskip("hermes_cli.kanban_lanes")
+    assert api.BOARD_CREATOR in lanes.USER_CREATORS
+    assert lanes._by_user({"created_by": api.BOARD_CREATOR, "creator_task_id": None, "_stored_card": True})
 
 
 def test_long_job_triggers_board_nudge(tmp_path):
@@ -171,6 +179,7 @@ def test_same_hermes_bug_in_two_sessions_offers_file_it_once(tmp_path):
     assert n["rule"] == "hermes_bug" and n["button"] == "File it once" and n["data"]["sig"] == sig
     out = post(c, "/file-bug", session_id="s1", sig=sig)
     assert out["cards"][0]["task_id"] == "t_1" and kb.created[0]["board"] == "hermes"
+    assert kb.created[0]["created_by"] == "coach"  # Hermes self-work: stays under the gated creator
     assert "@session:default/other" in kb.created[0]["body"]
     assert core.bug_hits(st, ["s1"]) is None  # filed: never offered again
 
