@@ -1,5 +1,11 @@
 """Standing report lifecycle: daily rotation, one clock-only schedule per card, never re-scheduled."""
+import argparse
+import json
+import time
+from contextlib import closing
 from types import SimpleNamespace
+
+import pytest
 
 from test_self_heal_one_card import sh, env, NOW
 
@@ -26,8 +32,12 @@ def test_same_day_drains_edit_but_never_reschedule(env, monkeypatch):
 
 def test_horizon_is_next_midnight_plus_48h(env):
     assert sh.refresh_backlog_report(env.store, NOW, runner=env.board)["ok"]
-    assert "--clock-only" in env.board.schedules[0]
-    assert sh._iso(_day_start(NOW) + 86400 + 48 * 3600) in env.board.schedules[0][1]
+    sched = env.board.schedules[0]
+    assert "--clock-only" in sched
+    assert "--awaiting" in sched and "clock:" in sched
+    assert "--awaiting-why" in sched
+    assert "drain dead-man alarm: runs only if the self-heal backlog drain stops refreshing it" in sched
+    assert sh._iso(_day_start(NOW) + 86400 + 48 * 3600) in sched[1]
     assert env.board.rows()[-1][2] == f"selfheal-backlog:default:{sh._utc_day(NOW)}"
 
 
@@ -91,3 +101,84 @@ def test_closed_by_hand_report_gets_numbered_replacement(env):
     assert result["card"] != "t_000000ff"
     assert env.board.rows()[-1][2] == f"selfheal-backlog:default:{day}:2"
     assert sh.cards_created_today("default", NOW) == 0
+
+
+def test_schedule_parser_lifecycle_retry_rotation(tmp_path, monkeypatch):
+    """Create/edit/archive transport is local; schedule uses real argparse + lifecycle.
+
+    In particular, do not mock awaiting validation: the old payload must be refused.
+    No dispatcher, remote board, paid model or production card is used.
+    """
+    pytest.importorskip("hermes_cli.kanban_parser")
+    from hermes_cli import kanban_parser, kanban_db as kb
+    from hermes_cli.kanban_cli_park import _cli_awaiting, _cli_wake_check
+    from hermes_cli.kanban_db_connect import connect
+    from agent.delegation_context import kanban_path_is_fenced
+    from test_self_heal_one_card import core
+
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    db = home / "kanban.db"
+    assert kb.kanban_db_path() == db and not kanban_path_is_fenced(db)
+    parser = argparse.ArgumentParser()
+    kanban_parser.build_parser(parser.add_subparsers(dest="cmd"))
+    store = core.Store(home / "coach")
+    calls = []
+    fail_schedule = False
+    now = time.time()
+
+    with closing(connect(db)) as conn:
+        def runner(argv, **kwargs):
+            nonlocal fail_schedule
+            args = parser.parse_args(list(argv[1:]))
+            calls.append(list(argv))
+            ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args.kanban_action == "create":
+                tid = f"t_{len(calls):016x}"
+                # Fixture-only create seam. The schedule writer sees the migrated real schema.
+                conn.execute("INSERT INTO tasks (id,title,body,status,created_by,created_at) "
+                             "VALUES (?,?,'','ready','self-heal',?)", (tid, args.title, int(now)))
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"id": tid}), stderr="")
+            if args.kanban_action == "schedule":
+                if fail_schedule:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="injected transport failure")
+                wake = _cli_wake_check(args)
+                awaiting, wake = _cli_awaiting(args, wake)
+                try:
+                    accepted = kb.schedule_task(conn, args.task_id, reason=" ".join(args.reason),
+                                                awaiting=awaiting, wake_check=wake[0],
+                                                check_every=wake[1], clock_only=wake[2])
+                except ValueError as exc:
+                    return SimpleNamespace(returncode=1, stdout="", stderr=str(exc))
+                assert accepted and kb.get_task(conn, args.task_id).status == "scheduled"
+            if args.kanban_action == "archive":
+                # Retirement is allowed only after the actual successor park has committed.
+                successor = sh._json_state(store, sh.BACKLOG_REPORT_STATE)["default"]["card"]
+                assert kb.get_task(conn, successor).status == "scheduled"
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (argv[argv.index("archive") + 1],))
+            return ok
+
+        first = sh.refresh_backlog_report(store, now, runner=runner)
+        assert first["ok"], first
+        fail_schedule = True
+        failed = sh.refresh_backlog_report(store, now + 86400, runner=runner)
+        assert not failed["ok"]
+        slot = sh._json_state(store, sh.BACKLOG_REPORT_STATE)["default"]
+        assert slot["prev"] == first["card"] and slot["scheduled"] is False
+        assert kb.get_task(conn, first["card"]).status == "scheduled"
+        assert not any("archive" in a for a in calls)
+        fail_schedule = False
+        recovered = sh.refresh_backlog_report(store, now + 86400 + 60, runner=runner)
+        assert recovered["ok"] and recovered["card"] == failed["card"], recovered
+        assert kb.get_task(conn, first["card"]).status == "archived"
+        slot = sh._json_state(store, sh.BACKLOG_REPORT_STATE)["default"]
+        assert slot["scheduled"] is True and slot["prev"] is None
+        payloads = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='scheduled'", (recovered["card"],))]
+        assert len(payloads) == 1
+        assert payloads[0]["clock_only"] is True
+        assert payloads[0]["awaiting"] == {
+            "kind": "clock", "why": "drain dead-man alarm: runs only if the self-heal backlog drain stops refreshing it"}

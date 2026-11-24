@@ -3968,7 +3968,9 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
             raise RuntimeError("report edit failed: " + (err or out)[-300:])
         if not slot.get("scheduled"):
             rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
-                f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only"], runner)
+                f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only",
+                "--awaiting", "clock:", "--awaiting-why",
+                "drain dead-man alarm: runs only if the self-heal backlog drain stops refreshing it"], runner)
             if rc:
                 raise RuntimeError("report schedule failed: " + (err or out)[-300:])
             slot["scheduled"] = True
