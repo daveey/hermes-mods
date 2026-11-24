@@ -1647,6 +1647,25 @@ def _retire_legacy_panel() -> bool:
     return True
 
 
+def panel_initial_payload():
+    """Mandatory first publication: complete status wire, not an empty mailbox."""
+    return {
+        'body': {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}},
+        'accepted': time.monotonic(),
+    }
+
+
+def make_panel_relay(home, runtime, generation=None):
+    """Production factory: one shared owner, complete initial before broker READY."""
+    import secrets
+    from hermes_cli.serve_producer_runtime import ProjectionRelay
+    return ProjectionRelay(
+        _panel_provider_spec(), home=home, runtime=runtime,
+        generation=generation or secrets.token_hex(16),
+        initial=panel_initial_payload(),
+    )
+
+
 def install_panel_lifecycle(environ=None):
     """Join the one installation-local mode/custody seam. Returns the lifecycle, or None when neither
     HERMES_SERVE_PANEL_EXTERNAL nor HERMES_SERVE_PRODUCERS_EXTERNAL is set (legacy serves are untouched).
@@ -1661,7 +1680,6 @@ def install_panel_lifecycle(environ=None):
         from hermes_constants import get_hermes_home
     except ImportError:
         return None  # an older core has no seam: legacy only
-    import secrets
     installation = Path(get_hermes_home())
     runtime = installation / 'serve-producers' / 'runtime'
     runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1669,13 +1687,10 @@ def install_panel_lifecycle(environ=None):
     external = mode_mod.effective_external(installation, dict(env))
 
     def make_relay():
-        from hermes_cli.serve_producer_runtime import ProjectionRelay
-        return ProjectionRelay(_panel_provider_spec(), home=installation, runtime=runtime,
-                               generation=secrets.token_hex(16))
+        return make_panel_relay(installation, runtime)
 
     def publish_initial(relay, timeout=60.0):
-        command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
-        key = relay.submit({'body': command, 'accepted': time.monotonic()})
+        key = relay.submit(panel_initial_payload())
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if relay.read(key) is not None:

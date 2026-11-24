@@ -81,30 +81,80 @@ def test_real_provider_loads_only_declared_modules(tmp_path):
     assert done.returncode == 0 and done.stdout.strip().endswith('OK'), done.stderr
 
 
-def test_real_provider_boots_through_the_shared_owner_with_the_manifest(tmp_path, monkeypatch):
-    """Real exec: manifest verified before import and after, two serves attach to ONE exec child."""
+def _scratch_home(tmp_path, monkeypatch):
     import sqlite3
-    import time
-    from hermes_cli.serve_producer_admission import REQUIRED_COLLECTORS, AdmissionCut, CollectorEvidence, LaunchGate
-    from hermes_cli.serve_producer_runtime import ProjectionRelay
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
     with sqlite3.connect(tmp_path / 'state.db') as db:
         db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
+
+
+def _complete_cut(gate, installation):
+    from hermes_cli.serve_producer_admission import REQUIRED_COLLECTORS, AdmissionCut, CollectorEvidence
+    collectors = tuple((n, CollectorEvidence((f'{n}:ok',), ())) for n in sorted(REQUIRED_COLLECTORS))
+    return AdmissionCut(boot_id='boot', generation='a' * 64, installation=str(installation), census=None,
+                        collectors=collectors, classifications=(), legacy_candidates=(), retired=(),
+                        errors=(), _acquisition=gate._acquisition)
+
+
+def test_make_panel_relay_supplies_complete_status_initial(tmp_path):
+    api = load_api()
+    relay = api.make_panel_relay(tmp_path, tmp_path / 'runtime')
+    initial = relay.config['initial']
+    assert initial['body']['_verb'] == 'status'
+    assert set(initial['body']['_wire_identity']) == {'feed', 'profile'}
+    assert isinstance(initial['accepted'], float)
+
+
+def test_declared_missing_callback_file_refuses_before_import():
+    protocol = pytest.importorskip('hermes_cli.serve_producer_protocol')
+    manifest = copy.deepcopy(load_api()._panel_provider_spec()['manifest'])
+    manifest['callbacks']['done'] = [{'name': 'done', 'path': 'missing_done.py', 'sha256': 'a' * 64}]
+    with pytest.raises(protocol.ProtocolError):
+        manifest_mod.verify_declared(manifest, DASH)
+
+
+def test_panel_factory_does_not_call_plugin_register():
+    src = (DASH / 'producer_provider.py').read_text()
+    assert 'def register(' not in src
+    assert 'hermes_cli.cron' not in src
+    assert 'import notifications' not in src
+    api = load_api()
+    assert api._panel_provider_spec()['manifest']['callbacks'] == {'done': [], 'waiting': []}
+
+
+def test_missing_initial_refuses_real_provider_before_ready(tmp_path, monkeypatch):
+    from hermes_cli.serve_producer_admission import LaunchGate
+    from hermes_cli.serve_producer_runtime import ProjectionRelay
+    _scratch_home(tmp_path, monkeypatch)
     spec = load_api()._panel_provider_spec()
+    runtime = tmp_path / 'runtime'
+    relay = ProjectionRelay(spec, home=tmp_path, runtime=runtime, generation='unused')
+    gate = LaunchGate.acquire(runtime)
+    try:
+        with pytest.raises(broker.OwnerUnavailable):
+            relay.start_for_production(cut=_complete_cut(gate, tmp_path), gate=gate, ready_timeout=8)
+    finally:
+        gate.close()
+        relay.close(timeout=5)
+    assert broker.read_owner(runtime) is None
+
+
+def test_real_provider_boots_through_the_shared_owner_with_the_manifest(tmp_path, monkeypatch):
+    """Real exec: complete initial status before READY; two serves attach to ONE exec child."""
+    from hermes_cli.serve_producer_admission import LaunchGate
+    from tests.waiting import wait_until
+    _scratch_home(tmp_path, monkeypatch)
+    api = load_api()
     runtime = tmp_path / 'runtime'
     relays = []
 
     def attach():
-        relay = ProjectionRelay(spec, home=tmp_path, runtime=runtime, generation='unused')
+        relay = api.make_panel_relay(tmp_path, runtime)
         gate = LaunchGate.acquire(runtime)
         try:
-            collectors = tuple((n, CollectorEvidence((f'{n}:ok',), ())) for n in sorted(REQUIRED_COLLECTORS))
-            cut = AdmissionCut(boot_id='boot', generation='a' * 64, installation=str(tmp_path), census=None,
-                               collectors=collectors, classifications=(), legacy_candidates=(), retired=(),
-                               errors=(), _acquisition=gate._acquisition)
-            relay.start_for_production(cut=cut, gate=gate, ready_timeout=90)
+            relay.start_for_production(cut=_complete_cut(gate, tmp_path), gate=gate, ready_timeout=90)
         finally:
             gate.close()
         relays.append(relay)
@@ -115,6 +165,11 @@ def test_real_provider_boots_through_the_shared_owner_with_the_manifest(tmp_path
         assert first.broker_pid == second.broker_pid != os.getpid()
         assert first.ping()['child_pid'] == second.ping()['child_pid']
         assert broker.read_owner(runtime)['pid'] == first.broker_pid
+        key = first.submit(api.panel_initial_payload())
+        assert wait_until(lambda: first.read(key) is not None, timeout=30)
+        wire = first.read(key)
+        text = wire.decode() if isinstance(wire, (bytes, bytearray)) else wire
+        assert '"running"' in text
     finally:
         for relay in relays[1:]:
             relay.close(timeout=10)
