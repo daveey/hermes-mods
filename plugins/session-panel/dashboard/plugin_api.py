@@ -106,6 +106,26 @@ def _external_projection():
     return external
 
 
+def _legacy_http_unavailable() -> bool:
+    """Missing relay during selected external custody is unavailable, never legacy authority.
+
+    Observe only already-published lifecycle state here: requests must not read the mode file,
+    wait for admission, or start a successor. The original ON environment must not defeat a
+    completed rollback; after installation the lifecycle, not that environment, owns the mode.
+    """
+    lifecycle = getattr(_LOADER, 'panel_lifecycle', None)
+    if lifecycle is not None:
+        return lifecycle.state != 'off' or not lifecycle._legacy_running
+    return (os.environ.get('HERMES_SERVE_PRODUCERS_EXTERNAL') != '0'
+            and os.environ.get('HERMES_SERVE_PANEL_EXTERNAL', '').strip().lower()
+            in ('1', 'true', 'yes', 'on'))
+
+
+def _panel_unavailable_response():
+    return Response(b'{"detail":"Session panel unavailable"}', status_code=503,
+                    media_type='application/json', headers={'Retry-After': '1'})
+
+
 def _feed_stamp() -> tuple:
     try:
         st = os.stat(_FEED_PATH)
@@ -2842,6 +2862,8 @@ async def changes(body: ChangesBody, request: Request):
         command = body.model_dump()
         command['_wire_identity'] = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
         return projection_response(external, command)
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this
@@ -2862,6 +2884,8 @@ def status():
         from hermes_cli.serve_producer_runtime import projection_response
         command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
         return projection_response(external, command)
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None:
         return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'running': False}
@@ -2896,6 +2920,8 @@ async def decision_refresh(body: DecisionRefreshBody):
         if response.body.startswith(b'{"_conflict":'):
             raise HTTPException(409, json.loads(response.body)['_conflict'])
         return response
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or f.stopped.is_set():
         raise HTTPException(503, 'Session panel starting')
