@@ -282,6 +282,16 @@ test('cold focus bounds failed reads, stops on unmount and does not reread a cac
  assert.equal(await m.feedFocus(route()), true)
  assert.equal(calls.length, 4)
 })
+test('a peek timeout falls through to a full catch-up the same way a missing feed does', async () => {
+ await m.feedCatchUp(target(['S1', 'warm']))
+ reply = req => {
+  if (req.timeoutMs === 5_000) throw Error('timeout')
+  return answer({ bundles: { S1: bundle() } })
+ }
+ assert.equal(await m.feedFocus(route(), { wait: async () => {} }), true)
+ assert.equal(m.cachedModel(route())?.revision, 'r1')
+ assert.ok(calls.some(c => c.timeoutMs === 15_000 && c.body.since === 0), 'timeout must not skip catch-up')
+})
 test('cold focus does not retry unsupported feeds', async () => {
  reply = () => { throw Error('404: plugin missing') }
  assert.equal(await m.feedFocus(route(), { wait: async () => {} }), false)

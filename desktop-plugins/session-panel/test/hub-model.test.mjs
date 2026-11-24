@@ -457,6 +457,71 @@ test('mounted cold panel offers explicit Retry after its bounded attempts, then 
  }
 })
 
+test('mounted focused panel paints after two peek timeouts without a Retry click', async () => {
+ await paint(null); m.resetFeedForTests()
+ current = { connectionId: 'peek-to', profile: 'default', session: 'peek-chat' }
+ const model = cases.named_parent.model
+ let peeks = 0, catchUps = 0
+ window.hermesDesktop = { api: async req => {
+   if (req.body?.subscriber) return {}
+   if (req.timeoutMs === 5_000) { peeks++; throw Error('timeout') }
+   catchUps++
+   if (catchUps <= 2) return { feed: 'peek-feed', epoch: 'peek-epoch', rev: catchUps, bundles: {} }
+   return { feed: 'peek-feed', epoch: 'peek-epoch', rev: 3, bundles: { 'peek-chat': { session: 'peek-chat', model } } }
+ } }
+ try {
+   await m.feedCatchUp({ connectionId: 'peek-to', profile: 'default', sessions: ['peek-chat'] })
+   assert.equal(catchUps, 1)
+   await paint(J.jsx(m.Panel, {}))
+   await React.act(async () => { await new Promise(r => setTimeout(r, 1100)) })
+   assert.equal(peeks, 2)
+   assert.equal(catchUps, 3)
+   assert.ok(document.querySelector('[data-session-panel]'), 'catch-up after peek timeouts paints the model')
+   assert.ok(document.querySelector('[data-hub-model-pending]') === null)
+   assert.equal(document.querySelector('[role="status"] button'), null, 'no Retry click required')
+ } finally {
+   await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+   current = { connectionId: 'conn', profile: 'default', session: 'chat' }
+ }
+})
+
+test('mounted focused panel keeps retrying after Retry is shown and cancels on focus change', async () => {
+ await paint(null); m.resetFeedForTests()
+ current = { connectionId: 'persist', profile: 'default', session: 'first-chat' }
+ const model = cases.named_parent.model
+ const savedRetry = m.FEED_FOCUS ? [...m.FEED_FOCUS.retryMs] : null
+ if (m.FEED_FOCUS) m.FEED_FOCUS.retryMs.splice(0, m.FEED_FOCUS.retryMs.length, 40, 40, 40, 40)
+ const reads = {}
+ window.hermesDesktop = { api: async req => {
+   if (req.body?.subscriber) return {}
+   const session = req.body?.sessions?.[0]
+   if (session) reads[session] = (reads[session] || 0) + 1
+   if (session === 'second-chat' && reads[session] >= 4) {
+     return { feed: 'persist-feed', epoch: 'persist-epoch', rev: 4, bundles: { 'second-chat': { session: 'second-chat', model } } }
+   }
+   throw Error('timeout')
+ } }
+ try {
+   await paint(J.jsx(m.Panel, {}))
+   await React.act(async () => { await new Promise(r => setTimeout(r, 1100)) })
+   assert.ok((reads['first-chat'] || 0) >= 3, `expected the bounded attempts, got ${reads['first-chat']}`)
+   assert.match(document.querySelector('[role="status"]').textContent, /taking longer than usual/)
+   assert.ok(document.querySelector('[role="status"] button'), 'Retry stays visible')
+   const firstAfterRetry = reads['first-chat']
+   current = { ...current, session: 'second-chat' }
+   await paint(J.jsx(m.Panel, {}))
+   await React.act(async () => { await new Promise(r => setTimeout(r, 200)) })
+   assert.equal(reads['first-chat'], firstAfterRetry, 'focus change cancels the first chat loop')
+   await React.act(async () => { await new Promise(r => setTimeout(r, 1300)) })
+   assert.ok(document.querySelector('[data-session-panel]'), 'later auto-retry paints without a click')
+   assert.ok(document.querySelector('[data-hub-model-pending]') === null)
+ } finally {
+   if (m.FEED_FOCUS && savedRetry) m.FEED_FOCUS.retryMs.splice(0, m.FEED_FOCUS.retryMs.length, ...savedRetry)
+   await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+   current = { connectionId: 'conn', profile: 'default', session: 'chat' }
+ }
+})
+
 test('named dependency paints human title; its card opens from the row menu, not a button', async () => {
  const model = cases.named_parent.model
  await paint(m.renderModel(model))

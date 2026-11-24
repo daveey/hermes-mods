@@ -363,12 +363,15 @@ export function feedReconcile(route) {
   if (!route?.connectionId || !route?.session || !cachedModel(route) || feedVouches(route)) return null
   return feedPeek({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] })
 }
+export const FEED_FOCUS = { delays: [0, 250, 750], retryMs: [2_000, 5_000, 10_000, 15_000] }
 /** Hydrate the focused model, not every warm chat. Registration is not proof of a model:
  *  a failed backend read may return an empty bundle map after successfully recording interest.
- *  Retry that cold path at most three times; transport serialization still bounds one request per connection. */
-export async function feedFocus(route, { wait = ms => new Promise(r => setTimeout(r, ms)), active = () => true } = {}) {
+ *  Retry that cold path a few times; a peek timeout or missing feed falls through to a full catch-up.
+ *  The panel keeps retrying with backoff while focused. Transport serialization still bounds one request
+ *  per connection. */
+export async function feedFocus(route, { wait = ms => new Promise(r => setTimeout(r, ms)), active = () => true, delays = FEED_FOCUS.delays } = {}) {
   if (!route?.connectionId || !route?.session) return false
-  for (const delay of [0, 250, 750]) {
+  for (const delay of delays) {
     if (delay) await wait(delay)
     if (!active()) return false
     if (cachedModel(route)) return true
@@ -377,9 +380,9 @@ export async function feedFocus(route, { wait = ms => new Promise(r => setTimeou
     // One chat, read beside the shared cursor (never advancing it, never queued behind a sidebar-wide catch-up). A
     // gateway that holds no bundle yet answers empty at once, computes it first and pushes it. With no feed
     // registered yet (or a changed one) this is a full catch-up: the cursor is shared by every watched chat, so
-    // its coverage is preserved at execution time.
+    // its coverage is preserved at execution time. A peek timeout is not proof the chat has no bundle.
     const target = { connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }
-    if ((await feedPeek(target)) === null) await feedCatchUp(target, { full: true, preserveCoverage: true })
+    if ((await feedPeek(target)) !== true) await feedCatchUp(target, { full: true, preserveCoverage: true })
     if (cachedModel(route)) return true
   }
   return false
@@ -1022,9 +1025,17 @@ export function Panel() {
     noteRecent(route)
     setPending({ scope, waiting: true })
     void feedReconcile(route)
-    void feedFocus(route, { active: () => active }).then(() => {
-      if (active) setPending({ scope, waiting: false })
-    })
+    const wait = ms => new Promise(r => setTimeout(r, ms))
+    void (async () => {
+      await feedFocus(route, { active: () => active, wait })
+      if (!active) return
+      setPending({ scope, waiting: false })
+      for (let i = 0; active && !cachedModel(route); i++) {
+        await wait(FEED_FOCUS.retryMs[Math.min(i, FEED_FOCUS.retryMs.length - 1)])
+        if (!active || cachedModel(route)) break
+        await feedFocus(route, { active: () => active, wait, delays: [0] })
+      }
+    })()
     return () => { active = false }
   }, [scope, retry])
   const model = decisionPresentation(cachedModel(route), route)
