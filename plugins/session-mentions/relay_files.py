@@ -720,11 +720,41 @@ def request_status(req_id: Any, base: Path | None = None) -> dict:
             except OSError:
                 pass
         return {"state": "done", "result": data}
-    if (base / "claimed" / f"{rid}.json").exists():
-        return {"state": "claimed"}
+    claimed = base / "claimed" / f"{rid}.json"
+    if claimed.exists():
+        out: dict = {"state": "claimed"}
+        try:
+            req = json.loads(claimed.read_text())
+            if req.get("cancelled"):
+                out["cancelled"] = True
+            if req.get("retry_busy") and req.get("created_at") is not None:
+                # For the courier's busy retry: how old the request is on THIS gateway's clock (both ends).
+                out["age"] = max(0.0, time.time() - float(req["created_at"]))
+        except Exception:
+            pass  # mid-write or gone: plain "claimed", the courier asks again
+        return out
     if (base / "outbox" / f"{rid}.json").exists():
         return {"state": "pending"}
     return {"state": "unknown"}
+
+
+def mark_cancelled(req_id: Any, base: Path | None = None) -> bool:
+    """The sender of a CLAIMED request stopped waiting: flag it, so ``request_status`` says ``cancelled`` and the
+    courier stops re-submitting a send the target keeps refusing. Stops nothing already submitted. False when the
+    request is not claimed (unclaimed ones are withdrawn with ``cancel`` / ``take_back``) or cannot be rewritten."""
+    base = base or root()
+    rid = safe_id(req_id)
+    if not rid or rid == HOME_COURIER_ID:
+        return False
+    claimed = base / "claimed" / f"{rid}.json"
+    try:
+        req = json.loads(claimed.read_text())
+        if not isinstance(req, dict):
+            return False
+        atomic_write(claimed, {**req, "cancelled": True})
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def cancel(req_id: Any, base: Path | None = None) -> bool:

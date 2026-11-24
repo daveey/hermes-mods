@@ -68,10 +68,35 @@ const OWNER_REFUSAL_RE = /(?:open|active) in another Hermes window|SESSION_NOT_O
 // data.reason values that say nothing was admitted. NOT the code alone: 4090 also carries
 // SESSION_OWNER_UNCONFIRMED ("may already be queued there"), which must never be re-sent.
 const OWNER_REFUSAL_REASONS = new Set(['SESSION_NOT_OWNED', 'SESSION_OWNER_BUSY'])
-// A refused send is re-submitted while its request is still alive (relay TTL, plugins/session-mentions
-// `SEND_TTL`): the other backend's turn usually ends within minutes.
+// A refused send that asked for it (`retry_busy`) is re-submitted for a while: the other backend's turn usually
+// ends within minutes. The window is the sender's (plugins/session-mentions `SEND_BUSY_RETRY`, sent as
+// `retry_busy_seconds`), capped here; core cuts a tool call at 420 s, so the sender cannot wait much longer.
+export const OWNER_RETRY_WINDOW_S = 300
 export const OWNER_RETRY_FIRST_MS = 5_000
 export const OWNER_RETRY_MAX_MS = 30_000
+// A re-submit's own RPC timeout: started at the window's end at the latest, it still answers inside the
+// sender's grace (`SEND_RETRY_GRACE`, 60 s).
+const OWNER_RETRY_SUBMIT_TIMEOUT_MS = 45_000
+
+// One per register(): dispose ends its waits, so a disabled or reloaded plugin stops re-submitting.
+const newInstance = () => ({ disposed: false, wake: new Set() })
+let instance = newInstance()
+const disposeInstance = inst => {
+  inst.disposed = true
+  for (const wake of [...inst.wake]) wake()
+}
+/** Sleep `ms`, or until `inst` is disposed. */
+const pause = (inst, ms) =>
+  new Promise(resolve => {
+    if (inst.disposed) return resolve()
+    const done = () => {
+      clearTimeout(timer)
+      inst.wake.delete(done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    inst.wake.add(done)
+  })
 
 /** True when a `prompt.submit` rejection is core's ownership refusal (the turn was never admitted). The host
  *  rejects with core's JsonRpcGatewayError (`code`, `data.reason`); a structured reason decides alone, and
@@ -669,16 +694,31 @@ export async function readAuthorityTranscript({ connectionId, profile, sessionId
   return { ok: false, error: `transcript longer than ${AUTHORITY_PAGE * AUTHORITY_MAX_PAGES} rows` }
 }
 
-/** Until when (epoch ms) a relayed send may be re-submitted after core's ownership refusal: the request's own
- *  TTL counted from its `created_at`, never longer than one TTL from now (a skewed gateway clock). 0 = one try:
- *  a forwarded request answers its refusal at once, because the forwarding Desktop then tries its own route
- *  (and retries there) and only waits FORWARD_PICKUP_MS + 90 s for this answer. */
-export function sendRetryUntil(req, now = Date.now()) {
-  if (!req || req.forwarded) return 0
-  const ttl = Math.min(600, Math.max(0, Number(req.ttl) || 0)) * 1000
-  const created = Number(req.created_at) * 1000
-  if (!ttl || !Number.isFinite(created) || created <= 0) return 0
-  return Math.min(created + ttl, now + ttl)
+/** The busy-retry window (seconds) a relayed send asked for: only a request that opts in (`retry_busy`, set by the
+ *  cross_session tool) has one, capped at OWNER_RETRY_WINDOW_S and at the request's TTL. 0 = answer the first
+ *  refusal at once: other senders (the Slack follower, chat close-out) have their own fallback, and a forwarded
+ *  request's forwarding Desktop tries its own route next and only waits FORWARD_PICKUP_MS + 90 s. */
+export function busyRetrySeconds(req) {
+  if (!req || req.retry_busy !== true || req.forwarded) return 0
+  const asked = Number(req.retry_busy_seconds)
+  const ttl = Number(req.ttl)
+  return Math.max(0, Math.min(OWNER_RETRY_WINDOW_S, asked > 0 ? asked : OWNER_RETRY_WINDOW_S, ttl > 0 ? ttl : OWNER_RETRY_WINDOW_S))
+}
+
+/** Until when (epoch ms) a relayed send may be re-submitted after core's ownership refusal, counted from when
+ *  THIS Desktop claimed it (its own clock; the gateway's `created_at` is another machine's). */
+export function sendRetryUntil(req, claimedAt = Date.now()) {
+  const seconds = busyRetrySeconds(req)
+  return seconds ? claimedAt + seconds * 1000 : 0
+}
+
+/** Asks the request's gateway whether its sender still waits (`GET /status/<id>`): true = stop re-submitting.
+ *  The sender marks the request cancelled when its wait ends; a request the gateway no longer holds, or one
+ *  older than its window on the GATEWAY's clock, is over too. Throws when the gateway cannot be asked. */
+export const senderGone = (origin, req) => async () => {
+  const st = await relay(origin, `/status/${enc(req.id)}`, { timeoutMs: 8_000 })
+  if (st?.state !== 'claimed' || st.cancelled) return true
+  return Number.isFinite(st.age) && st.age > busyRetrySeconds(req)
 }
 
 async function sessionTitle(target) {
@@ -687,8 +727,11 @@ async function sessionTitle(target) {
 }
 
 /** Deliver `text` as a new user turn into `target`. Optionally wait for the reply. `retryUntil` (epoch ms): keep
- *  re-submitting after core's ownership refusal until then (5 s, doubling to 30 s); without it one refusal is final. */
-export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0 } = {}) {
+ *  re-submitting after core's ownership refusal until then (5 s, doubling to 30 s); without it one refusal is final.
+ *  `stop` (async, true = the sender gave up) is asked before every re-submit; when it cannot answer, that round
+ *  submits nothing. A disposed plugin instance stops too. Every such end is `refused, retry_safe: true`. */
+export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, stop = null } = {}) {
+  const inst = instance
   // The primary socket already owns open Desktop chats. A pooled profile route may
   // spawn another serve process over the SAME store: resume there is not attachment.
   const primaryConnection = async () => {
@@ -706,7 +749,7 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0 } 
   if (!primary && !route) throw new Error(`no exact route to ${target.profile || 'default'} on ${target.connectionId}`)
   const request = async (method, params, timeout) => {
     if (primary) {
-      if (await primaryConnection() !== primaryId || host.state.profile?.get?.() !== primaryProfile) throw new Error('Gateway changed during delivery; no automatic retry')
+      if (await primaryConnection() !== primaryId || host.state.profile?.get?.() !== primaryProfile) throw Object.assign(new Error('Gateway changed during delivery; no automatic retry'), { notSent: true })
       return host.request(method, { ...params, profile: target.profile || 'default' }, timeout)
     }
     // A cloud gateway serves every profile from one backend: without `profile` the RPC lands in
@@ -716,36 +759,64 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0 } 
   }
   const release = !primary && typeof host.retainProfile === 'function' ? await host.retainProfile(route) : null
   try {
-    const resumed = await request('session.resume', { session_id: target.sessionId, omit_messages: true }, 60_000)
+    // Nothing was admitted: core refused the turn, or this Desktop never sent it.
+    const refused = (live, error, attempts, note) => ({ ok: false, delivered: false, status: 'refused', retry_safe: true, live_session_id: live, error, attempts, note })
+    const SWITCHED = 'Nothing was delivered: this Desktop switched gateway or profile before the message was sent. Safe to retry.'
+    let resumed
+    try {
+      resumed = await request('session.resume', { session_id: target.sessionId, omit_messages: true }, 60_000)
+    } catch (error) {
+      if (error?.notSent) return refused(null, String(error.message), 0, SWITCHED)
+      throw error
+    }
     const live = resumed?.session_id
     if (!live) throw new Error(`could not open session ${target.sessionId} on that gateway`)
     let sub
     let attempts = 0
     let backoff = OWNER_RETRY_FIRST_MS
     const started = Date.now()
-    for (;;) {
+    submitting: for (;;) {
       attempts++
+      let msg
       try {
-        sub = await request('prompt.submit', { session_id: live, text, queued: true }, 60_000)
+        sub = await request('prompt.submit', { session_id: live, text, queued: true }, attempts === 1 ? 60_000 : OWNER_RETRY_SUBMIT_TIMEOUT_MS)
         break
       } catch (error) {
-        const msg = String(error?.message || error)
+        msg = String(error?.message || error)
+        // The check that guards the primary socket threw before the RPC left this Desktop.
+        if (error?.notSent) return refused(live, msg, attempts, SWITCHED)
         // The server may have accepted the turn before the socket/response failed.
         // Never try another route or submit again on an uncertain acknowledgement.
         if (!isOwnerRefusal(error)) {
           return { ok: false, delivered: null, status: 'unknown', retry_safe: false, live_session_id: live, error: msg, attempts, note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' }
         }
-        // A lease refusal happens before the turn is admitted: definitely not delivered, so the same
-        // submit may go again once the other backend's turn ends. Only an accepted submit ends the loop.
+      }
+      // A lease refusal happens before the turn is admitted: definitely not delivered, so the same submit
+      // may go again once the other backend's turn ends. Only an accepted submit ends the outer loop.
+      const over = () => {
+        const waited = Math.round((Date.now() - started) / 1000)
+        return refused(live, msg, attempts, attempts > 1
+          ? `Nothing was delivered: another Hermes backend held that chat for the whole retry window (${waited} s, ${attempts} tries). Safe to retry.`
+          : 'Nothing was delivered: another Hermes backend holds that chat open. Safe to retry.')
+      }
+      for (;;) {
         const left = retryUntil - Date.now()
-        if (left <= 0) {
-          const waited = Math.round((Date.now() - started) / 1000)
-          return { ok: false, delivered: false, status: 'refused', retry_safe: true, live_session_id: live, error: msg, attempts, note: attempts > 1
-            ? `Nothing was delivered: another Hermes backend held that chat for the whole ${waited} s retry window (${attempts} tries). Safe to retry.`
-            : 'Nothing was delivered: another Hermes backend holds that chat open. Safe to retry.' }
-        }
-        await sleep(Math.min(backoff, left))
+        if (left <= 0) return over()
+        await pause(inst, Math.min(backoff, left))
         backoff = Math.min(backoff * 2, OWNER_RETRY_MAX_MS)
+        if (inst.disposed) return refused(live, msg, attempts, 'Nothing was delivered: the Desktop plugin was reloaded or disabled while that chat was busy. Safe to retry.')
+        // A late timer (a sleeping Mac, a throttled window) must not re-submit past the window.
+        if (Date.now() > retryUntil) return over()
+        if (!stop) continue submitting
+        let gone
+        try {
+          gone = await stop()
+        } catch {
+          continue // the sender cannot be asked right now: submit nothing this round
+        }
+        if (gone) return refused(live, msg, attempts, 'Nothing was delivered: the sender stopped waiting while that chat was busy. Safe to retry.')
+        if (inst.disposed || Date.now() > retryUntil) continue // answered late: the checks above end it
+        continue submitting
       }
     }
     const out = { ok: ['streaming', 'queued'].includes(sub?.status), delivered: sub?.status === 'streaming', queued: sub?.status === 'queued', status: sub?.status || 'unknown', live_session_id: live, user_row_id: sub?.user_row_id || null, retry_safe: false }
@@ -1327,6 +1398,7 @@ const lastPingAt = new Map() // connectionId -> last successful drain or courier
 export const RESULT_RETRY_MS = [1_000, 3_000, 5_000, null]
 
 export async function performRequest(req, origin, conns) {
+  const claimedAt = Date.now() // this Desktop's clock: the busy-retry window of a send starts here
   const args = req?.args || {}
   const action = req?.action
 
@@ -1393,7 +1465,7 @@ export async function performRequest(req, origin, conns) {
     // Refused there = never admitted, and the chat may be open in THIS Desktop (its backend on
     // that gateway owns it): the direct route is then the owning one.
     if (forwarded?.status === 'refused') forwarded = null
-    const res = forwarded || (await deliver(target, text, wait, { retryUntil: sendRetryUntil(req) }))
+    const res = forwarded || (await deliver(target, text, wait, { retryUntil: sendRetryUntil(req, claimedAt), stop: senderGone(origin, req) }))
     return { ...res, gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns) }
   }
 
@@ -1838,6 +1910,8 @@ export default {
   id: PLUGIN_ID,
   name: 'Session Mentions',
   register(ctx) {
+    const inst = (instance = newInstance())
+    ctx.onDispose?.(() => disposeInstance(inst))
     rowCache.clear()
     taskCache.clear()
     courierState.clear()

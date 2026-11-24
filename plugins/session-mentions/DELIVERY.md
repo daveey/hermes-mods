@@ -47,10 +47,21 @@ Fix:
 - 2026-11-23: that refusal is recognised by the error's `data.reason` (`SESSION_NOT_OWNED`, `SESSION_OWNER_BUSY`;
   never by code 4090 alone, which `SESSION_OWNER_UNCONFIRMED` shares) and, without one, by both wordings ("open in
   another" / "active in another Hermes window"). Core had reworded it, so a busy chat's refusal was reported as
-  `unknown, retry_safe: false` and senders gave up. A relayed send now re-submits after a refusal (5 s, doubling to
-  30 s) until the request's TTL (600 s from `created_at`) and answers `refused, retry_safe: true` only then; the
-  tool's wait covers the TTL (`SEND_TTL + SEND_RETRY_GRACE`). A forwarded request and `/tell` still answer the first
-  refusal at once. Tests: `tests/delivery.test.mjs` (fake timers) and `tests/test_send_retry_ttl.py`.
+  `unknown, retry_safe: false` and senders gave up.
+- Busy retry: a cross_session send marks its request `retry_busy` (`retry_busy_seconds: 300`), and the courier then
+  re-submits after a refusal (5 s, doubling to 30 s) for 300 s counted from its own claim of the request, never
+  past the request TTL, and answers `refused, retry_safe: true` only then. The tool waits 300 + 60 s
+  (`SEND_BUSY_RETRY + SEND_RETRY_GRACE`, under core's 420 s tool cut), then marks the request cancelled
+  (`relay_files.mark_cancelled`); the courier asks `GET /status/<id>` before every re-submit and stops on
+  `cancelled`, on a request the gateway no longer holds, or past the window on the gateway's clock (`age`), and
+  submits nothing in a round where it cannot ask. A late timer never re-submits past the window, and a disposed
+  plugin instance stops and answers `refused`. Requests without `retry_busy` (Slack follower, chat close-out),
+  forwarded requests and `/tell` get the first refusal back at once. A gateway or profile switch caught before
+  anything was sent is `refused, retry_safe: true` too. Tests: `tests/delivery.test.mjs` (fake timers) and
+  `tests/test_send_retry_ttl.py`.
+- Known limit: a retried message can land AFTER a later message from the same sender to the same chat (the later
+  one is submitted once the turn has ended, or queues first). Nothing reorders them; a sender that needs order
+  waits for each send's result before the next.
 
 Deploying: the Desktop half hot-reloads on save. The dashboard routes are mounted once per backend, so a backend keeps
 the old outbox until it restarts. The gate only needs the NEW code in the remote-facing (SSH-isolated) backends another
