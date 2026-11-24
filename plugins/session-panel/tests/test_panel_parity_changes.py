@@ -149,6 +149,44 @@ def test_acceptance_clock_75_900_runs_from_original_http_acceptance(home, age, e
         provider.close()
 
 
+def test_prepared_wire_read_is_side_effect_free_but_cold_http_wakes_the_lane(home):
+    api = load('_parity_cold_wire_api', 'plugin_api.py')
+    provider = provider_for(api)
+    f = provider.feed
+    try:
+        f._cold.clear()
+        f._wake.clear()
+        f.prepared_changes_bytes(['chat'])
+        assert not f._cold.is_set() and not f._wake.is_set()
+        assert f._registrations.empty() and f._board_demands.empty()
+        f.changes_bytes(['chat'])
+        assert f._cold.is_set() and f._wake.is_set()
+        f._drain()
+        f.tick()
+        assert 'chat' in f._wire[2]
+        f._cold.clear()
+        f._wake.clear()
+        f.changes_bytes(['chat'])
+        assert not f._cold.is_set() and not f._wake.is_set(), 'warm reads do not force cold recompute'
+    finally:
+        provider.close()
+
+
+def test_legacy_queue_clock_stays_distinct_from_explicit_acceptance_clock(home):
+    api = load('_parity_registration_clock_api', 'plugin_api.py')
+    provider = provider_for(api)
+    f = provider.feed
+    try:
+        f.changes_bytes(['legacy'])
+        f.changes_bytes(['external'], accepted_at=WALL - 70)
+        f.clock = lambda: WALL + 100
+        f._drain()
+        assert f.interest['legacy'] == WALL + 100 + 900
+        assert f.interest['external'] == WALL - 70 + 900
+    finally:
+        provider.close()
+
+
 def test_delayed_board_demand_keeps_original_75_second_deadline(home, monkeypatch):
     api = load('_parity_board_delay_api', 'plugin_api.py')
     provider = provider_for(api)
