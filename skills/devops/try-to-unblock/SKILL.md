@@ -57,20 +57,20 @@ Before writing an ask, look for one that already exists. A decision card the own
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
 because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
 means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
-`ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A `scope_stopped` hold is released only by
-`hermes kanban renew-scope <id> --episode <stop event uid> --mandate-comment <integer comment id> --reason …`, then
-`promote <id> --seen <newest comment id>`. It is run by the card's owning chat or its creator task. A human
-terminal counts only with a mandate comment written by a clean (non-agent) process: a comment the agent posted
-earlier is refused `mandate_authority` even when renewed from David's terminal, and a recorded For-you choice is
-not a mandate. Relay David's choice to the owning chat
-(cross_session); after a home move it renews through the authenticated foreign-comment route on its own gateway.
-The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
-renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
-that chat's own terminal; a worker or relayed command is refused. When David asks in chat to unblock, write the
-mandate AND renew in ONE `run_in_user_terminal` window: `ssh ubuntu@hermes-hub` running a staged script that, per
-card, posts the comment (`hermes kanban comment`), reads its id (`max(id)` from `task_comments`), then
-`renew-scope` and `promote --seen <id>`. The comment is then human-written by ancestry; the mandate states the desk
-drafted it on his request. Print the mandate files first so the window shows what is posted.
+`ended_at`: `ws_orphan_reap` leaves it set on chats still in use.
+
+For an authorized continuation, run `hermes kanban release <id> --runs <allowance> --note '<goal and boundaries>' --json`
+from the owning chat; it records the mandate, renews applicable scope/budget and promotes. Read the stop and ledger
+first, preserve historical usage, and verify the resulting state. Do not escalate to a human terminal merely because
+a worker could not renew: the owning chat can release under its existing mandate. If this chat lacks authority,
+route to the recorded owner; use `run_in_user_terminal` only when the supported owner route cannot perform the
+user-authorized release. The explicit alternative is a fresh owner mandate comment, `renew-scope` for the exact
+episode, then `promote`; neither comments alone nor recorded UI choices substitute for that transition.
+
+On `budget_decision_unread`, read the listed comments and retry with the exact `--seen` ID requested by the refusal.
+Do not use your newer handoff comment or the maximum comment ID: the gate acknowledges the newest qualifying
+foreign decision, not necessarily the newest comment on the card. A refused call has not released the card; after
+success, read back state before retrying anything.
 Write the mandate for the goal ("land PR N and complete this card"), never the next step: each ship gate is new,
 so a step-sized mandate stops at every one and costs a full owner round-trip per gate. Put ship's follow-ups
 (below) inside the round, give transient infra errors (OperationalError, 5xx, database locked) 3 retries, and stop
