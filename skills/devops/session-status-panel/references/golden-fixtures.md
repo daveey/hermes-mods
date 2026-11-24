@@ -10,6 +10,8 @@ Shared blocker groups must apply the same owner-qualified canonical request reti
 
 A per-card fact (a count, a run property) belongs in `dashboard/plugin_api.py:_detail` as a key of `detail['task']`. It is the single card-detail producer (board capture calls it too), and `reduce_panel` merges `cards[id].detail.task` under each row; core's session-task rows carry only `_TASK_FIELDS`, so adding the field there needs a core change. Guard the SQL with `except sqlite3.Error` -> `None` (unreadable, not zero) and render nothing for missing/None/non-int. Test both ends: `tests/test_core_readers.py` (`r.card(id, 'default')['detail']['task'][field]` on a real board with `task_runs` rows) and a `test_model.py` case whose bundle carries hydrated `cards={id: {'detail': {'task': {...}}}}`. A detail-only append needs no Desktop change: the renderer prints `detail` verbatim.
 
+Done rows are the exception: `Feed.compute` hydrates cards only by walking from open linked rows and stops at terminal status, so `bundle['done']` rows never get `cards[id]`. Attach a done-row field to the row itself in both producers: `CoreReaders.done` (copy rows; core's listed rows can be memoized) and `board_capture.capture_local` for refreshed rows (the snapshot path never calls `done`). Per-run cost data: tokens come from each run's newest `worker_result` event `usage` (`cost_usd` is present only on some runs); the model is that run_id's `run_route` event. `agent.usage_pricing.estimate_usage_cost` returns `included` for `openai-codex` and `unknown` for `xai-oauth`: price those at `openai`/`xai` list rates. Class-routed runs record `class:*` and have no priceable model: say so, never a guessed figure.
+
 ## Running the suites
 
 Through `terminal`, run:
