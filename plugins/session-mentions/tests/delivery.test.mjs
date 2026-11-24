@@ -354,3 +354,84 @@ test('/tell (composer middleware) answers the first refusal at once and never re
   assert.equal(at.length, 1)
   plugin.dispose()
 })
+
+// ── a send into ANOTHER gateway: every retry round asks that gateway's own courier first, then the direct route ──
+const twoConns = [...localConns, { id: 'macbook', label: 'macbook', key: 'macbook', kind: 'ssh', primary: false }]
+/** `forward(n)` is the home courier's answer to the n-th forwarded send; `direct(n)` answers the n-th direct submit. */
+function crossHost(forward, direct, log) {
+  globalThis.window = { hermesDesktop: { api: async req => {
+    if (req.path.endsWith('/ping')) return { ok: true, home_courier: true, forwarding: true }
+    if (req.path.endsWith('/enqueue')) { log.push(['forward', Date.now() - T0]); return { ok: true } }
+    if (req.path.includes('/status/fwd-')) return { state: 'done', result: forward(log.filter(x => x[0] === 'forward').length) }
+    if (req.path.includes('/status/')) return { state: 'claimed', age: 1 }
+    return {}
+  } } }
+  return { state, connections: async () => twoConns,
+    profileRoutes: async () => [{ connectionId: 'macbook', profile: 'default', targetProfile: 'default' }],
+    requestProfile: async (_route, method) => {
+      if (method === 'session.resume') return { session_id: 'live' }
+      log.push(['direct', Date.now() - T0])
+      return direct(log.filter(x => x[0] === 'direct').length)
+    } }
+}
+const farSend = (extra = {}) => toolSend({ args: { target: '@session:default@macbook/x', message: 'hi' }, ...extra })
+const REFUSED = { ok: false, delivered: false, status: 'refused', retry_safe: true }
+
+test('cross-gateway retry alternates forward then direct each round; the forward route lands it once', async t => {
+  fakeTime(t)
+  const log = []
+  const m = await load(crossHost(n => (n <= 2 ? REFUSED : { ok: true, status: 'queued', queued: true, user_row_id: 4 }), () => { throw busy() }, log))
+  const res = await onFakeTime(t, m.performRequest(farSend(), 'local', twoConns))
+  assert.deepEqual(log.map(x => x[0]), ['forward', 'direct', 'forward', 'direct', 'forward'])
+  assert.equal(res.ok, true); assert.equal(res.status, 'queued'); assert.equal(res.forwarded, true)
+  t.mock.timers.tick(600_000); await flush()
+  assert.equal(log.length, 5, 'nothing after the accepted send')
+})
+
+test('cross-gateway retry: the direct route lands it once when the forward route keeps refusing', async t => {
+  fakeTime(t)
+  const log = []
+  let landed = 0
+  const m = await load(crossHost(() => REFUSED, n => { if (n <= 2) throw busy(); landed++; return { status: 'streaming', user_row_id: 8 } }, log))
+  const res = await onFakeTime(t, m.performRequest(farSend(), 'local', twoConns))
+  assert.deepEqual(log.map(x => x[0]), ['forward', 'direct', 'forward', 'direct', 'forward', 'direct'])
+  assert.equal(landed, 1); assert.equal(res.ok, true); assert.equal(res.status, 'streaming')
+  t.mock.timers.tick(600_000); await flush()
+  assert.equal(log.length, 6)
+})
+
+test('cross-gateway retry stops at an uncertain forward answer: no direct submit after it', async t => {
+  fakeTime(t)
+  const log = []
+  const m = await load(crossHost(n => (n === 1 ? REFUSED : { ok: false, delivered: null, status: 'unknown', retry_safe: false }), () => { throw busy() }, log))
+  const res = await onFakeTime(t, m.performRequest(farSend(), 'local', twoConns))
+  assert.deepEqual(log.map(x => x[0]), ['forward', 'direct', 'forward'])
+  assert.equal(res.status, 'unknown'); assert.equal(res.retry_safe, false)
+  t.mock.timers.tick(600_000); await flush()
+  assert.equal(log.length, 3)
+})
+
+test('cross-gateway retry refused on both routes for the whole window: refused, nothing past the window', async t => {
+  fakeTime(t)
+  const log = []
+  const m = await load(crossHost(() => REFUSED, () => { throw busy() }, log))
+  const res = await onFakeTime(t, m.performRequest(farSend(), 'local', twoConns))
+  assert.equal(res.status, 'refused'); assert.equal(res.retry_safe, true); assert.equal(res.delivered, false)
+  assert.match(res.note, /whole retry window/)
+  assert.equal(Math.max(...log.map(x => x[1])) <= WINDOW_MS, true)
+  // Late in the window a forward round could outlast the sender's wait: only the direct route is tried then.
+  const late = log.filter(x => x[1] > WINDOW_MS - 65_000)
+  assert.equal(late.length > 0 && late.every(x => x[0] === 'direct'), true)
+  const n = log.length
+  t.mock.timers.tick(600_000); await flush()
+  assert.equal(log.length, n)
+})
+
+test('cross-gateway send without retry_busy keeps the single forward-then-direct try', async t => {
+  fakeTime(t)
+  const log = []
+  const m = await load(crossHost(() => REFUSED, () => { throw busy() }, log))
+  const res = await onFakeTime(t, m.performRequest(farSend({ retry_busy: undefined }), 'local', twoConns))
+  assert.deepEqual(log.map(x => x[0]), ['forward', 'direct'])
+  assert.equal(res.status, 'refused'); assert.equal(res.retry_safe, true)
+})

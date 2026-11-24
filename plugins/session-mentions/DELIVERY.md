@@ -59,6 +59,14 @@ Fix:
   forwarded requests and `/tell` get the first refusal back at once. A gateway or profile switch caught before
   anything was sent is `refused, retry_safe: true` too. Tests: `tests/delivery.test.mjs` (fake timers) and
   `tests/test_send_retry_ttl.py`.
+- A send into ANOTHER gateway retries in rounds: each round asks that gateway's own courier first (forward), then
+  this Desktop's direct route. A round only moves on from a route that answered `refused` or took nothing; any
+  other answer (accepted, `unknown`) ends the send, so at most one submit is accepted. In the last ~65 s of the
+  window only the direct route is tried, because a forward round can take 110 s.
+- `wait_for_reply` on a send is shortened to 40 s (`SEND_REPLY_WAIT_MAX`: 300 + 60 + 40 = 400 s, under the 420 s
+  cut); the result carries `reply_wait_seconds` and `reply_wait_note` when it was. A stopped turn or abandoned call
+  (core's thread interrupt bit, `tools.interrupt.is_interrupted`) withdraws an unclaimed send and marks a claimed
+  one cancelled.
 - Known limit: a retried message can land AFTER a later message from the same sender to the same chat (the later
   one is submitted once the turn has ended, or queues first). Nothing reorders them; a sender that needs order
   waits for each send's result before the next.
