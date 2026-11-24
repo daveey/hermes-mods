@@ -113,3 +113,39 @@ def test_children_of_an_escalated_parent_agree_with_it():
          'cards': {parent['id']: {'detail': {'task': parent, 'events': events}}}}
     row = model.reduce_panel(b, now=NOW)['sections']['stuck'][0]
     assert 'the reviewer escalated' in row['detail']
+
+
+def _shared_parent(age=1900, extra_events=(), **parent_kw):
+    from test_model import task
+    parent = task('t_abcdef', status='triage', title='Shared stage', **parent_kw)
+    events = [{'kind': 'spend_budget_triaged', 'created_at': NOW - 3600, 'payload': {'limit': 'runs'}},
+              {'kind': 'spend_review_escalated', 'created_at': NOW - age, 'payload': {'reason': 'Same wait.'}},
+              *extra_events]
+    return {'computed_at': NOW, 'tasks': [task('t_111111', status='todo', upstream=parent),
+                                          task('t_222222', status='todo', upstream=parent)],
+            'done': [], 'cards': {parent['id']: {'detail': {'task': parent, 'events': events}}}}
+
+
+def _all_rows(m):
+    rows = [v for s in ('needs_you', 'stuck', 'waiting', 'ready') for v in m['sections'][s]]
+    return rows + list(m.get('groups') or [])
+
+
+def test_a_shared_escalated_parent_turns_its_group_red():
+    m = model.reduce_panel(_shared_parent(), now=NOW)
+    groups = [g for g in m.get('groups') or [] if g.get('section') == 'stuck']
+    assert groups and 'the reviewer escalated' in groups[0]['detail']
+    assert not model.reduce_panel(_shared_parent(age=600), now=NOW)['sections']['stuck']
+
+
+def test_an_unreadable_parent_never_turns_its_children_or_group_red():
+    m = model.reduce_panel(_shared_parent(partial_source_unknown=True), now=NOW)
+    assert not m['sections']['stuck']
+    assert not [g for g in m.get('groups') or [] if g.get('section') == 'stuck']
+
+
+def test_core_rerouting_after_an_escalation_keeps_the_escalation():
+    b = _escalated(1900)
+    b['cards']['t_abc123']['detail']['events'].append(
+        {'kind': 'spend_budget_decision_ready', 'created_at': NOW - 1890, 'payload': {'episode': 'e'}})
+    assert model.reduce_panel(b, now=NOW)['sections']['stuck']
