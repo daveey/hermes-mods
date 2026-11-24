@@ -1,5 +1,6 @@
 """Exercise the real remote stamp adapter through panel memoization."""
 from contextlib import closing
+import gc
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -10,7 +11,8 @@ import pytest
 from test_kanban_mirror import OWNER, fixture
 
 
-def setup_adapter(tmp_path, monkeypatch):
+@pytest.fixture
+def adapter(tmp_path, monkeypatch):
     mirror, store, _, _ = fixture(tmp_path)
     remote_globals = mirror.remote.input_stamp.__func__.__globals__
     hub = tmp_path / 'hub.db'
@@ -37,11 +39,19 @@ def setup_adapter(tmp_path, monkeypatch):
     monkeypatch.setattr(mirror.remote, 'reconcile', lambda owner: calls.append(owner))
     mirror.reconcile(OWNER)  # settle initial local ActionStore projection first
     calls.clear()
-    return mirror, hub, state, revision, calls
+    # Keep SQLite's WAL identity stable for the no-source-change assertions.
+    # ActionStore initialization can leave a connection awaiting cyclic GC; its
+    # last-close checkpoint otherwise changes DB/WAL metadata midway through a
+    # panel call. That is real invalidation, not a spurious remote invocation.
+    # An idle (not in-transaction) keeper prevents only last-close housekeeping;
+    # real commits, missing/stat errors and their recovery remain observable.
+    with closing(sqlite3.connect(store.path)) as keeper:
+        keeper.execute('SELECT count(*) FROM requests').fetchone()
+        yield mirror, hub, state, revision, calls
 
 
-def test_panel_real_stamp_absent_wal_is_valid_and_changes_invalidate(tmp_path, monkeypatch):
-    mirror, hub, state, revision, calls = setup_adapter(tmp_path, monkeypatch)
+def test_panel_real_stamp_absent_wal_is_valid_and_changes_invalidate(adapter, tmp_path, monkeypatch):
+    mirror, hub, state, revision, calls = adapter
     mirror.reconcile_panel(OWNER)
     mirror.reconcile_panel(OWNER)
     assert len(calls) == 1
@@ -53,8 +63,8 @@ def test_panel_real_stamp_absent_wal_is_valid_and_changes_invalidate(tmp_path, m
 
 
 @pytest.mark.parametrize('source', ['hub', 'state', 'store'])
-def test_panel_real_stamp_missing_required_db_and_recovery(tmp_path, monkeypatch, source):
-    mirror, hub, state, revision, calls = setup_adapter(tmp_path, monkeypatch)
+def test_panel_real_stamp_missing_required_db_and_recovery(adapter, tmp_path, monkeypatch, source):
+    mirror, hub, state, revision, calls = adapter
     path = {'hub': hub, 'state': state, 'store': mirror.store.path}[source]
     # Avoid removing an open ActionStore: emulate exactly its missing stat.
     original = Path.stat
@@ -70,14 +80,49 @@ def test_panel_real_stamp_missing_required_db_and_recovery(tmp_path, monkeypatch
     assert not mirror.panel_remote_unchanged
     missing[0] = False
     mirror.reconcile_panel(OWNER)
+    gc.collect()  # force the CI last-close/checkpoint trigger inside the fixture
     mirror.reconcile_panel(OWNER)
     assert len(calls) == 3
     assert mirror.panel_remote_unchanged
 
 
+def test_panel_real_store_commit_still_invalidates_with_keeper(adapter):
+    mirror, hub, state, revision, calls = adapter
+    mirror.reconcile_panel(OWNER)
+    mirror.reconcile_panel(OWNER)
+    assert len(calls) == 1
+    with closing(sqlite3.connect(mirror.store.path)) as writer:
+        writer.execute('CREATE TABLE source_change(value INTEGER)')
+        writer.commit()
+    mirror.reconcile_panel(OWNER)
+    assert len(calls) == 2
+    assert not mirror.panel_remote_unchanged
+
+
+def test_panel_real_checkpoint_is_a_source_stamp_change(adapter, monkeypatch):
+    mirror, hub, state, revision, calls = adapter
+    with closing(sqlite3.connect(hub)) as conn:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('CREATE TABLE source(value INTEGER)')
+        conn.commit()
+        before = mirror.remote.input_stamp(mirror.store.path)
+        def checkpoint(owner):
+            calls.append(owner)
+            if len(calls) == 1:
+                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        monkeypatch.setattr(mirror.remote, 'reconcile', checkpoint)
+        mirror.reconcile_panel(OWNER)
+        assert mirror.remote.input_stamp(mirror.store.path) != before
+        mirror.reconcile_panel(OWNER)
+        assert len(calls) == 2  # metadata changed during the prior pass: revisit
+        mirror.reconcile_panel(OWNER)
+        assert len(calls) == 2
+        assert mirror.panel_remote_unchanged
+
+
 @pytest.mark.parametrize('wal', [False, True])
-def test_panel_real_stamp_stat_error_cannot_vouch_unchanged(tmp_path, monkeypatch, wal):
-    mirror, hub, state, revision, calls = setup_adapter(tmp_path, monkeypatch)
+def test_panel_real_stamp_stat_error_cannot_vouch_unchanged(adapter, tmp_path, monkeypatch, wal):
+    mirror, hub, state, revision, calls = adapter
     target = Path(str(hub) + '-wal') if wal else hub
     target.write_bytes(b'first')
     original = Path.stat
@@ -93,8 +138,8 @@ def test_panel_real_stamp_stat_error_cannot_vouch_unchanged(tmp_path, monkeypatc
     assert not mirror.panel_remote_unchanged
 
 
-def test_panel_real_sqlite_wal_update_survives_stat_failure(tmp_path, monkeypatch):
-    mirror, hub, state, revision, calls = setup_adapter(tmp_path, monkeypatch)
+def test_panel_real_sqlite_wal_update_survives_stat_failure(adapter, tmp_path, monkeypatch):
+    mirror, hub, state, revision, calls = adapter
     with closing(sqlite3.connect(hub)) as conn:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('CREATE TABLE source(value INTEGER)')
@@ -120,8 +165,8 @@ def test_panel_real_sqlite_wal_update_survives_stat_failure(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize('unknown', [None, (), (None,), ('revision', (None, 1))])
-def test_panel_real_stamp_unknown_activity_is_not_success(tmp_path, monkeypatch, unknown):
-    mirror, hub, state, revision, calls = setup_adapter(tmp_path, monkeypatch)
+def test_panel_real_stamp_unknown_activity_is_not_success(adapter, tmp_path, monkeypatch, unknown):
+    mirror, hub, state, revision, calls = adapter
     revision[0] = unknown
     mirror.reconcile_panel(OWNER)
     mirror.reconcile_panel(OWNER)
