@@ -42,10 +42,7 @@ reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix re
 Every `::user-step` marker opens a For-you request, so wrap only a current ask, and only once. Never wrap a status
 headline or summary that asks nothing: it opens a request with nothing to answer, which reads as a duplicate of the
 real ask until withdrawn. Never wrap an ask you already published with `action_request`: that opens a second,
-plan-less request. A confirm-to-proceed ask ("go?") after a plan is a one-click choice: `session_outcome(kind=decide)`
-with choices `Go` / `Change plan`, or `action_request` approve carrying the full plan. Never a `::user-step` reading
-"Say go": user-steps files it as a plan-less `needs_context` approval with no approve button, so the user must type.
-One "go" covers the whole plan; never ask for it again. When revising a request that was published with `decisionCard`, resend
+plan-less request. When revising a request that was published with `decisionCard`, resend
 `aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
 `scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
@@ -58,16 +55,20 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 
 ## Confirming a plan: one click, not a typed reply
 
-When only yes/go confirmation remains, publish `action_request` with kind `approval`,
+When only yes/go confirmation remains and no standing approval covers the plan, publish `action_request` with kind `approval`,
 the **full exact plan** in `scope.markdown`, `scope.complete: true`, and choices
 `{id: "go", label: "Go", effect: "approve"}` and
 `{id: "change-plan", label: "Change plan", effect: "revise"}`.
 Include all limits, exclusions and expected outcomes. Go approves only that frozen
-revision; Change plan grants no execution permission. Never ask the user to type
-“say go” or use a free-text `::user-step` / `session_outcome(kind=decide)` as an
-approval substitute. Do not wrap the published ask in another user-step: that
-creates a duplicate. If a plan is missing, supply it yourself before asking.
-The runtime same-message recovery is a backstop, not the publication contract.
+revision; Change plan grants no execution permission. One go covers the whole plan;
+never ask for it again. Never ask the user to type “say go”: user-steps files a free-text
+`::user-step` as a plan-less `needs_context` approval with no approve button, and a
+`session_outcome(kind=decide)` choice authorizes nothing. Do not wrap the published
+ask in another user-step: that creates a duplicate. If a plan is missing, supply it
+yourself before asking. The runtime same-message recovery is a backstop, not the
+publication contract. A runtime notice asking you to publish a draft's plan does not
+check standing approvals. When one covers the plan, do the work instead: a request you
+publish and then withdraw has already reached the user's For-you queue.
 
 ## Physical and sign-in asks
 
