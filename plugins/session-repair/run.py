@@ -358,7 +358,8 @@ def _lock(sd: Path):
 def _row(now: float, m: str, f: dict, **extra) -> dict:
     return {'at': now, 'mode': m, 'fingerprint': f['fingerprint'], 'rule': f['id'], 'variant': f.get('variant'),
             'card': f.get('card'), 'board': f.get('board'), 'chat': f.get('chat'), 'area': f.get('area'),
-            'commands': (f.get('fix') or {}).get('commands'), 'summary': f.get('summary'), **extra}
+            'commands': (f.get('fix') or {}).get('commands'), 'summary': f.get('summary'),
+            'evidence': f.get('evidence') or {}, **extra}
 
 
 def _ordinary_tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
