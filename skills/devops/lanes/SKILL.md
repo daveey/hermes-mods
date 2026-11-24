@@ -62,6 +62,9 @@ Use the smallest applicable command below, then read back the result: `show` for
 | "run this card now" | `hermes kanban lanes admit <card> --reason "<their words>"` |
 | "leave this card's priority alone" | `hermes kanban lanes pin <card>` |
 | "this card belongs to X" | `hermes kanban lanes assign <card> X --reason "<why>"` |
+| "this chat's/project's work belongs to X" | assign every open card of the chat, then add a match rule (below) |
+
+Whole chat or project: list the cards with `hermes kanban chat-tasks <session_id>` (drop done/archived), then loop `assign` + `explain` in a `background=true, notify=true` terminal job that prints `<id> <lane>` per card. Each call takes several seconds, so a foreground loop over dozens of cards times out partway; resume from the printed readbacks and only re-run the cards that weren't moved. To make the project's future cards land there too, extend the lane's match with `hermes config set kanban.admission.lanes.<X>.match.<repos|title_patterns|key_prefixes> '[...full list...]'` (re-list the existing entries; the "not a recognized config key" warning is harmless). Direct file edits to config.yaml are refused. Test the rule with `.venv/bin/python` in `~/.hermes/hermes-agent`: `kanban_lanes._rule_lane(kanban_lanes.policy(), {"title": ...})`. A rule beats an inherited lane but not one the user set explicitly, so `reclassify` showing no changes after a manual move is expected.
 
 Shares are relative, so raising one lane lowers every other lane's target. State the resulting targets from
 `show`, not your own arithmetic. To undo, set the previous values back.
