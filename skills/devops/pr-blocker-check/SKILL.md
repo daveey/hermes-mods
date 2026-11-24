@@ -32,6 +32,8 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 
 Graphite merge queue (e.g. softmax-universe/softmax) pushes a squash `… (#N)` to the base branch and closes the PR: state CLOSED, mergedAt null. The checker reports merged with the landed sha; by hand, look for the `(#N)` commit on the base branch near closedAt.
 
+GitHub native merge queue: enqueue with `gh pr merge N --match-head-commit <sha>` and no method flag, because the queue sets the method. Then confirm the enqueue with `gh api graphql -f query='{repository(owner:"O",name:"R"){pullRequest(number:N){isInMergeQueue mergeQueueEntry{position state}}}}'`, since the command can exit 0 without enqueuing. Its most common cause is a required context that never reported, for example a workflow made required on main after the PR branched. The rollup's `isRequired` only marks contexts that ran, so "all required green" looks true. Compare the reported contexts with `gh api repos/O/R/branches/main/protection/required_status_checks -q '[.checks[].context]'`, then rebase so the new workflow runs. A queued PR that another landing has made obsolete (for example a quarantine entry the fix PR already removed) would undo that landing: take it out with the `dequeuePullRequest(input:{id:<PR node id>})` mutation before you close it.
+
 `ready` still waits on unresolved review threads, which the script's `gh pr view` fields omit; a Graphite queue
 label just sits on such a PR ("will be added once it meets the requirements"). List them:
 `gh api graphql -f query='{repository(owner:"O",name:"R"){pullRequest(number:N){reviewThreads(first:50){nodes{id isResolved comments(first:1){nodes{author{login} body}}}}}}}'`.
