@@ -20,7 +20,8 @@ def test_plan_apply_and_idempotence(tmp_path, monkeypatch, capsys):
         (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps(
             {'jobs': [{'id': 'j1', 'name': 'session-repair', 'failure_deliver': 'bot-chat'}]}))
         return subprocess.CompletedProcess(argv, 0, stdout='created', stderr='')
-    monkeypatch.setattr(inst.subprocess, 'run', fake_run)
+    # Installer-local binding only: a global patch also captures core's background provider workers.
+    monkeypatch.setattr(inst, 'subprocess', types.SimpleNamespace(run=fake_run))
     monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
 
     assert inst.main([]) == 0
@@ -110,8 +111,8 @@ def test_rerun_reconciles_an_existing_jobs_failure_target(tmp_path, monkeypatch,
     (tmp_path / 'session-repair').mkdir()
     (tmp_path / 'session-repair' / 'config.json').write_text('{"mode": "shadow"}')
     calls = []
-    monkeypatch.setattr(inst.subprocess, 'run', lambda argv, **kw: calls.append(argv) or
-                        subprocess.CompletedProcess(argv, 0, stdout='ok', stderr=''))
+    monkeypatch.setattr(inst, 'subprocess', types.SimpleNamespace(
+        run=lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')))
     monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
     assert inst.main(['--apply']) == 0
     assert calls == [inst.edit_argv('j9', 'bot-chat')] and calls[0][-4:] == ['edit', 'j9', '--failure-deliver', 'bot-chat']
