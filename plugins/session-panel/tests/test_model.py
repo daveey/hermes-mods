@@ -61,6 +61,36 @@ def held_bundle(status='triage', remote=False, kind='decision_retained', **kw):
     return bundle(row, cards={row['id']: {'detail': {'task': dict(row), 'events': [{'kind': kind, 'payload': payload}]}}})
 
 
+def header_clock_cases():
+    """Real producer headers: transport age must not erase the cached protocol state."""
+    result = {}
+    for name, age, vouched in [('fresh', 0, True), ('stale55', 55, False),
+                              ('stale30m', 1800, False), ('future', -60, True),
+                              ('no_state', 55, False)]:
+        b = bundle(task(status='running'), computed_at=NOW - age,
+                   outcome_json={} if name == 'no_state' else canonical_outcome('running'),
+                   input_errors=['cards unavailable'] if name == 'no_state' else [])
+        m = model.reduce_panel(b, now=NOW, wire=True)
+        # Feed transport metadata is separate from the semantic reducer revision.
+        m['freshness'] = {'trusted': True, 'computed_at': b['computed_at'], 'ttl_s': 60}
+        result[name] = {'model': m, 'now': NOW, 'vouched': vouched}
+    return result
+
+
+def test_header_clock_cases_preserve_last_known_canonical_state():
+    cases = header_clock_cases()
+    for name, case in cases.items():
+        h = case['model']['header']
+        if name == 'no_state':
+            assert h['state'] == 'unknown' and h['status'] is None
+            assert h['source'] == 'derived'
+        else:
+            assert h['state'] == h['label'] == 'running'
+            assert h['status'] == canonical_outcome('running')['status']
+            assert h['source'] == 'canonical'
+    assert len({c['model']['revision'] for n, c in cases.items() if n != 'no_state'}) == 1
+
+
 def test_held_cards_name_agent_not_human_even_without_execution_evidence():
     for status in ('triage', 'blocked'):
         for remote in (False, True):

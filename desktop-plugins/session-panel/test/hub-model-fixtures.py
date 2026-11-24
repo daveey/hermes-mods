@@ -112,5 +112,6 @@ for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service')
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
-print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
-    wire=name in ('relative_clock', 'aged_parked') or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()}))
+print(json.dumps({**{name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
+    wire=name in ('relative_clock', 'aged_parked') or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()},
+    **{'header_clock_' + name: case for name, case in f.header_clock_cases().items()}}))

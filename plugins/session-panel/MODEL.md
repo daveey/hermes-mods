@@ -69,9 +69,13 @@ Wire models carry additive `freshness: {trusted, computed_at, ttl_s}` transport
 metadata. It is outside the reducer's semantic revision: `computed_at` is the
 actual board snapshot clock, never a decision refresh or heartbeat receipt.
 The same source-trust predicate supplies heartbeat `fresh` membership. Restored
-and carried bundles are untrusted until recomputed. Desktop renders an unknown,
-grey header with an age label when not vouched for by the latest heartbeat or
-past the 60-second row-source TTL; a live transport cannot revive old running.
+and carried bundles are untrusted until recomputed. Desktop keeps the header's
+last-known backend label with `· synced <age> ago` when its source clock is
+finite, positive and not in the future, including heartbeat exclusion and TTL
+expiry. This is historical text only: effective state is unknown and the stripe
+stays neutral; no execution trust, action or model revision is renewed. Missing
+state, missing/invalid clocks and future clocks retain the unknown fallback.
+A live transport cannot revive old running evidence.
 The local display timer may expire trust, never infer a new execution state.
 `/status` exposes `oldest_bundle_age_s` and owner-session-keyed
 `visible_chats: {session: {age_s, computed_at}}`; missing bundles have null age.
