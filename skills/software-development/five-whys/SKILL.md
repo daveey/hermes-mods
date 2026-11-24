@@ -128,6 +128,8 @@ For a new durable restriction, distinguish mutation fencing from maintenance eli
 
 For bounded GC cursor/atomicity proof, read `references/gc-cursor-proof.md`.
 
+For new restriction kinds, read `references/restriction-event-writers.md`.
+
 Before held-task transfer classification, read `references/transfer-classification.md` (resend write sets and recovery boundaries).
 
 ### 3. Branch where causes split
