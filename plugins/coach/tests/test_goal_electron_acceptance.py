@@ -51,7 +51,7 @@ def test_real_electron_guard(tmp_path, control):
     with errors.open('w') as err, (home/'serve-stdout.log').open('w') as out:
         process = subprocess.Popen([sys.executable,str(Path(__file__).with_name('test_goal_serve_acceptance.py')),'--child'],env=env,cwd=home,stdout=out,stderr=err)
         try:
-            port = _ready(home/'ready.json',process,errors)
+            port = _ready(home/'ready.json',process,errors,token)
             env.update(HERMES_DESKTOP_HERMES_ROOT=str(core),HERMES_DESKTOP_PYTHON=sys.executable,HERMES_DESKTOP_ISOLATED_BACKEND='1')
             driver=Path(__file__).with_name('electron_guard_driver.mjs')
             result=subprocess.run(['xvfb-run','-a','node',str(driver),str(core),str(home),f'http://127.0.0.1:{port}',token,control],env=env,cwd=home,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=260)

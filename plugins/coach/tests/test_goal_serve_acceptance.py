@@ -71,14 +71,30 @@ class Model(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(chunk).encode())
 
 
-def _ready(path, process, errors):
+def _ready(path, process, errors, token):
+    from urllib.parse import urlencode
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import connect
+
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         assert process.poll() is None, errors.read_text()
         if path.exists():
-            return json.loads(path.read_text())['port']
+            port = json.loads(path.read_text())['port']
+            # ready.json means the listener is bound, not that service warmup
+            # has finished. Wait through only its documented retryable close;
+            # auth and all other protocol failures must still fail the test.
+            try:
+                with connect(f'ws://127.0.0.1:{port}/api/ws?' + urlencode({'token': token}),
+                             open_timeout=5) as ws:
+                    frame = json.loads(ws.recv(timeout=5))
+                    assert frame.get('params', {}).get('type') == 'gateway.ready', frame
+                    return port
+            except ConnectionClosed as exc:
+                if exc.rcvd is None or exc.rcvd.code != 1013:
+                    raise
         threading.Event().wait(.05)
-    raise AssertionError(errors.read_text())
+    raise AssertionError('Serve services did not become ready: ' + errors.read_text())
 
 
 def _turn(frames, sid, text=None, *, start=None):
@@ -142,7 +158,7 @@ def test_production_serve_auth_and_next_turn(tmp_path, queued):
         process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--child'],
             env=env, cwd=home, stdout=out, stderr=err, text=True)
         try:
-            port = _ready(home / 'ready.json', process, errors)
+            port = _ready(home / 'ready.json', process, errors, token)
             url = f'ws://127.0.0.1:{port}/api/ws'
             for suffix in ('', '?token=incorrect-synthetic-token'):
                 with pytest.raises(InvalidStatus) as rejected:

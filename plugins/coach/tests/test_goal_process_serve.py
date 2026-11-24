@@ -119,7 +119,7 @@ def test_process_ownership_over_production_serve(tmp_path):
         process = subprocess.Popen([sys.executable, str(child), "--child"], env=env, cwd=home,
                                    stdout=out, stderr=err, text=True)
         try:
-            port = _ready(home / "ready.json", process, errors)
+            port = _ready(home / "ready.json", process, errors, token)
             with connect(f"ws://127.0.0.1:{port}/api/ws?token={token}", open_timeout=30) as ws:
                 frames = object.__new__(FixtureFrames)
                 frames.commands = provider.commands
