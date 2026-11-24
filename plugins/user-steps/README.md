@@ -254,7 +254,26 @@ Deferred remote owners retry after 5, 10, 20, … seconds, capped at 300 seconds
 even if unrelated sources keep changing. Local reconciliation still runs during
 backoff, and the deferred result stays visible to the feed. Producer timing rows
 include an exact completion `at` and conservative `unchanged` flag for live latency
-measurement (only clean, identical input keys qualify). Both project a
+measurement (only clean, identical input keys qualify).
+
+`Remote.membership_capture(owner)` is the separate owner-scoped semantic input
+contract for the successor panel memo. It reads canonical compression aliases,
+complete replica membership (including arrivals/removals, legacy twins and
+creation-identity-matched re-homes), and ledger-only obligations and receipts.
+The digest includes only the selected chat's semantic rows, not DB/WAL metadata
+or global write revisions. Healthy pull/owner-heartbeat refreshes do not churn it;
+expiry, missing/unknown inputs, unqualified ownership, local-authority ledger
+bindings, or the unsupported alternate `links_reader=replica` shadow path return
+`None`. `panel_membership.unchanged(previous, current)` treats even `None` → `None`
+as changed. Reads never initialize absent stores or project/refresh the ledger.
+This API alone is **not** permission to skip reconciliation: the consuming memo
+must also cover ActionStore requests/bindings/operations and namespace-wide
+historical dependencies, retain single-flight/backoff and the non-sliding full
+pass ceiling, and capture its key before work. It is deliberately not wired to
+`input_stamp` in this change. No live latency reduction is claimed by this input
+contract alone.
+
+Both project a
 blocked or triage work card's `human_request` into one server-bound `choice`
 request. Block-loop escalation events are part of the generation fence. Explicit `{label, value}` choices retain their
 exact values; absent choices produce **Unblock / Archive**. Selecting a supplied
