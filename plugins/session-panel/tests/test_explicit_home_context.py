@@ -55,19 +55,27 @@ def seed_home(home: Path, *, session: str, marker: str):
     home.mkdir(parents=True, exist_ok=True)
     (home / 'install_id').write_text('a' * 32)
     (home / 'config.yaml').write_text(json.dumps({'kanban': {'sync': {'gateway': 'gw-explicit'}}}))
-    with sqlite3.connect(home / 'state.db') as db:
-        db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
-        db.execute(
-            'INSERT INTO sessions VALUES (?,?,?)',
-            (session, None, json.dumps({'marker': marker, 'kind': 'outcome'})),
-        )
     kanban_db = pytest.importorskip('hermes_cli.kanban_db')
+    from hermes_state import SessionDB
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    db = SessionDB(db_path=home / 'state.db')
+    try:
+        db.create_session(session, source='desktop')
+    finally:
+        db.close()
+    with sqlite3.connect(home / 'state.db') as db:
+        db.execute('UPDATE sessions SET outcome_json=? WHERE id=?',
+                   (json.dumps({'marker': marker, 'kind': 'outcome'}), session))
     from hermes_cli.kanban_db_connect import connect
+    # Core creation resolves authority in the owning profile, not the ambient
+    # process home. Keep this multi-home fixture honest at the writer too.
+    token = set_hermes_home_override(home)
     conn = connect(home / 'kanban.db')
     try:
         tid = kanban_db.create_task(conn, title=marker, session_id=session, initial_status='running')
     finally:
         conn.close()
+        reset_hermes_home_override(token)
     ledger = home / 'kanban' / 'origin-ledger.db'
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(ledger) as db:

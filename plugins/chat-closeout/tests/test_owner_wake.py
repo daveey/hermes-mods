@@ -229,6 +229,14 @@ def test_integration_parked_card_wakes_chat_and_archived_chat_gets_a_supervisor_
     from hermes_cli import kanban_session_activity as ksa
     from hermes_cli.kanban_db_connect import connect_closing
     ksa._reset_cache_for_tests()
+    # The real creator must exist; an unknown ID now receives a producer owner.
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    try:
+        for sid in ('s_live', 's_arch'):
+            db.create_session(sid, source='desktop')
+    finally:
+        db.close()
     with connect_closing() as conn:
         live = kb.create_task(conn, title='scratch live', session_id='s_live')
         orphan = kb.create_task(conn, title='scratch orphan', session_id='s_arch')
@@ -447,6 +455,14 @@ def test_integration_supervisor_card_names_a_card_parked_on_the_orphan(tmp_path,
     from hermes_cli import kanban_session_activity as ksa
     from hermes_cli.kanban_db_connect import connect_closing
     ksa._reset_cache_for_tests()
+    # The real creator must exist; an unknown ID now receives a producer owner.
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    try:
+        for sid in ('s_live', 's_arch'):
+            db.create_session(sid, source='desktop')
+    finally:
+        db.close()
     with connect_closing() as conn:
         orphan = kb.create_task(conn, title='scratch orphan', session_id='s_arch')
         live = kb.create_task(conn, title='scratch live', session_id='s_live')

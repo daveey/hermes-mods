@@ -284,7 +284,10 @@ def test_wait_on_a_card_links_it_to_the_waiting_chat(real, monkeypatch):
     kb.init_db()
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="repair the forwarder", assignee="default")
-        assert kbn.list_notify_subs(conn, tid) == []
+        # A system card may already have its standing producer owner. The wait
+        # must add this chat without displacing any existing subscription.
+        before = kbn.list_notify_subs(conn, tid)
+        assert all(s['chat_id'] != 'chat' for s in before)
     out = plugin.handle({"kind": "wait", "on": [{"kind": "card", "id": tid}, {"kind": "card", "id": "t_nowhere"}]},
                         session_id="chat")
     import json as _json
@@ -292,9 +295,11 @@ def test_wait_on_a_card_links_it_to_the_waiting_chat(real, monkeypatch):
     assert res.get("declared") is True, res
     with kbc.connect_closing() as conn:
         subs = kbn.list_notify_subs(conn, tid)
-    assert [(s["platform"], s["chat_id"]) for s in subs] == [("tui", "chat")], subs
-    assert subs[0]["delivery_metadata"]["reason"] == "shepherd"
-    assert subs[0]["delivery_metadata"]["via"] == "outcome-wait"
+    assert {(s['platform'], s['chat_id']) for s in subs} == {
+        (s['platform'], s['chat_id']) for s in before} | {('tui', 'chat')}
+    waiting = next(s for s in subs if s['chat_id'] == 'chat')
+    assert waiting["delivery_metadata"]["reason"] == "shepherd"
+    assert waiting["delivery_metadata"]["via"] == "outcome-wait"
     assert res["linked"] == [tid]
     assert "t_nowhere" in " ".join(res.get("not_linked", [])), res
 
@@ -314,10 +319,11 @@ def test_wait_from_a_headless_session_reports_not_linked(real, monkeypatch):
     kb.init_db()
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="repair", assignee="default")
+        before = kbn.list_notify_subs(conn, tid)
     headless = "local-" + "a" * 64
     res = plugin._link_wait_cards(headless, [tid])
     with kbc.connect_closing() as conn:
-        assert kbn.list_notify_subs(conn, tid) == []
+        assert kbn.list_notify_subs(conn, tid) == before
     assert res[0] == [] and "not linked" in res[1][0], res
 
 

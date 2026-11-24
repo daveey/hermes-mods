@@ -37,6 +37,14 @@ def board(tmp_path, monkeypatch):
     core._structural_reads.clear()
 
     def park(title, session):
+        # A bare session_id is not durable ownership: core otherwise adds a
+        # standing producer owner, yielding two parked-chat projections.
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / 'state.db')
+        try:
+            db.create_session(session, source='desktop')
+        finally:
+            db.close()
         with connect() as conn:
             tid = kb.create_task(conn, title=title, session_id=session)
             conn.execute("UPDATE tasks SET status='blocked', block_kind='capability' WHERE id=?", (tid,))

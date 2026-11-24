@@ -106,13 +106,17 @@ def test_handoff_incident_links_the_handoff_chat(board):
         _assert_owned_by(conn, tid, 'chat_h')
 
 
-def test_relink_backfills_an_open_legacy_card_and_its_unresolved_child(board):
+def test_relink_backfills_an_open_legacy_card_and_its_unresolved_child(board, monkeypatch):
     """A card filed before the fix: no link, and a worker child already marked unresolved. The relink pass binds the
     card to its chat with the cursor at its latest event (no replay) and re-resolves the child; other cards and done
     closeout cards are left alone."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     key = 'chat-closeout:unseen:chat_old:1700000000'
+    # Reproduce the historical ownerless shape, not today's automatically
+    # owned system cards. The repair itself still runs against real core.
+    from hermes_cli import kanban_owner_chat
+    monkeypatch.setattr(kanban_owner_chat, 'enabled', lambda: False)
     with connect_closing() as conn:
         tid = kb.create_task(conn, title='chat-closeout: Kanban results stuck for chat chat_old', assignee='default',
                              created_by='chat-closeout', idempotency_key=key)
