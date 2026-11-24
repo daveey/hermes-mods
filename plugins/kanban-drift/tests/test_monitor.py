@@ -588,3 +588,30 @@ def test_core_hub_placement_never_reaches_judge(tmp_path, monkeypatch, cfg, repo
     assert judged == [], out  # never a hub slot, so never a model call
     assert out.get("runs_on") or out.get("placement_policy"), out  # it joins the worker pool
     assert "hub:write" not in (out.get("requires") or []), out  # portable: any pool worker may take it
+
+
+def test_board_size_counters_alone_are_not_new_evidence(tmp_path):
+    tools = Tools()
+    m = monitor.Monitor(tmp_path / "state.json", tools)
+    base = {"clean": False, "rejected_ops": 6, "checked": 16983, "foreign_cards": 6016}
+    m.sample("hub/default", base)
+    assert m.sample("hub/default", base)["card"]
+    m.sample("hub/default", {**base, "checked": 16995, "foreign_cards": 6021})
+    m.sample("hub/default", {**base, "checked": 17000, "foreign_cards": 6029})
+    assert sum(n == "kanban_comment" for n, _ in tools.calls) == 0
+    m.sample("hub/default", {**base, "checked": 17001, "child_mismatch": {"task_comments": 1}})
+    assert sum(n == "kanban_comment" for n, _ in tools.calls) == 1
+
+
+def test_restart_from_old_state_with_counters_posts_nothing(tmp_path):
+    tools = Tools()
+    path = tmp_path / "state.json"
+    old = {"clean": False, "rejected_ops": 6, "checked": 100, "foreign_cards": 10}
+    m = monitor.Monitor(path, tools)
+    m.sample("hub/default", old)
+    assert m.sample("hub/default", old)["card"]
+    m = monitor.Monitor(path, tools)  # reload the persisted last_report, counters included
+    m.sample("hub/default", {**old, "checked": 250, "foreign_cards": 40})
+    assert sum(n == "kanban_comment" for n, _ in tools.calls) == 0
+    m.sample("hub/default", {**old, "checked": 250, "foreign_cards": 40, "rejected_ops": 7})
+    assert sum(n == "kanban_comment" for n, _ in tools.calls) == 1

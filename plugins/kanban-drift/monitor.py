@@ -25,6 +25,14 @@ import uuid
 EVIDENCE_OPEN = "<!-- placement:evidence -->"
 EVIDENCE_CLOSE = "<!-- /placement:evidence -->"
 _MARKER = re.compile(r"<!--\s*/?\s*placement:evidence\s*-->", re.IGNORECASE)
+# Board-size counters that grow with every new card. They are not drift evidence, so a report that differs only in
+# them is the same finding and gets no new comment (otherwise every sample re-posted an unchanged report).
+VOLATILE = ("checked", "foreign_cards")
+
+
+def finding(report):
+    """The part of a report that says what drifted: everything but the board-size counters."""
+    return {k: v for k, v in report.items() if k not in VOLATILE}
 
 
 def fence_evidence(text):
@@ -104,7 +112,7 @@ class Monitor:
             card = self.tool("kanban_show", {"task_id": row["card"], "board": self.board})["task"]
             if card["id"] != row["card"]:
                 raise RuntimeError("Kanban readback identity mismatch")
-        elif row.get("last_report") != report:
+        elif finding(row.get("last_report") or {}) != finding(report):
             self.tool("kanban_comment", {"task_id": row["card"], "board": self.board, "body": body})
         row["last_report"] = report
         self.save()
