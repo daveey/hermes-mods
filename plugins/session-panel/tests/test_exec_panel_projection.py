@@ -57,7 +57,10 @@ def test_real_panel_projection_served_without_readers_in_request_process(tmp_pat
     monkeypatch.setattr(api, 'LAUNCH_PROFILE', profile)
     monkeypatch.setattr(api, '_request_profile', lambda: profile)
     try:
-        relay.start_for_fixture()
+        # READY includes two execs and cold core/provider imports. Shared CI
+        # runners can exceed the runtime's 10-second fixture default here;
+        # retain a finite startup bound without relaxing projection assertions.
+        relay.start_for_fixture(ready_timeout=60)
         monkeypatch.setattr(api._LOADER, 'external_projection', relay, raising=False)
         monkeypatch.setattr(api, 'CoreReaders', lambda *a, **k: pytest.fail('request-side CoreReaders'))
         monkeypatch.setattr(api, 'start_publication', lambda: pytest.fail('request-side producer start'))
