@@ -92,6 +92,25 @@ reload to restore the legacy four-worker, no-cooldown behavior.
 
 `desktop-plugins/session-panel` runs the client (its README, "Pushed from the gateway"). A gateway without this plugin answers 404 and the Desktop keeps its own reads for it, asking again after 10 min.
 
+## Dormant exec projection fixture
+
+`producer_provider.py` is a panel-only exec fixture, not production registration
+or an activation API. Its paired core relay only starts under pytest. A selector
+preinstalled on the process-wide feed loader before API import excludes legacy
+feed loading, import/reload startup and direct publication. Any retained legacy
+Feed (including stopped but not proven drained), pending start or facts
+registration refuses external selection rather than handing ownership over.
+This is not a supported live mode switch; full broker custody and COMPLETE
+admission remain prerequisites for a production bootstrap.
+
+The serving endpoint binds `feed` and `profile` into the relay-keyed command.
+The child prepares the complete wire envelope from that identity, not its own
+argv; browser input cannot override it. Tests `test_exec_panel_projection.py`
+exercise real exec/HTTP/stored-byte parity across two serving slots and bound
+profile identities. `test_external_panel_ownership.py` covers import/reload,
+legacy-custody refusal and unchanged absent-selector startup. These tests need
+the paired core branch; no-core CI skips the exec module.
+
 ## Tests
 
 ```sh

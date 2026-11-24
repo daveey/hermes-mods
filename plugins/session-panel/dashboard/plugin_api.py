@@ -65,6 +65,19 @@ _LOADER.__dict__.setdefault('lock', threading.Lock())
 _LOADER.__dict__.setdefault('generation', 0)
 
 
+def _external_projection():
+    """Dormant pre-import selection; never hand over an existing legacy owner."""
+    external = getattr(_LOADER, 'external_projection', None)
+    if external is not None:
+        starting = getattr(_LOADER, 'starting', None)
+        legacy = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+        if legacy is not None or (starting is not None and starting.is_alive()):
+            raise RuntimeError('external projection conflicts with legacy panel custody')
+        if getattr(_LOADER, 'facts_registration', None) is not None:
+            raise RuntimeError('external projection conflicts with legacy facts custody')
+    return external
+
+
 def _feed_stamp() -> tuple:
     try:
         st = os.stat(_FEED_PATH)
@@ -85,6 +98,8 @@ def _load_feed():
     loaded and the running feed handed over: it is stopped and resumed under the new code at once (same epoch and
     revisions). [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py, so a feed
     fix did not take effect until the backend process restarted."""
+    if _external_projection() is not None:
+        raise RuntimeError('external projection excludes legacy feed loading')
     stamp = _feed_stamp()
     old = sys.modules.get(_FEED_KEY)
     # Current, or feed.py unreadable (keep what runs). A module loaded by older code carries no stamp: checked.
@@ -1414,6 +1429,8 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -
 
 def feed():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
+    if _external_projection() is not None:
+        raise RuntimeError('external projection excludes legacy feed startup')
     while True:
         core = _load_feed()
         with core.PROCESS_LOCK:
@@ -2228,7 +2245,7 @@ def _save_running() -> bool:
 
 # Legacy reload callbacks are excluded from the producer-only import.
 _PRODUCER_ONLY = __name__ == '_session_panel_producer_api_v1'
-if not _PRODUCER_ONLY:
+if not _PRODUCER_ONLY and _external_projection() is None:
     _load_feed().RESTART = feed
     _load_feed().INSTALL_FACTS = install_facts
     _load_feed().STOP_FACTS = stop_facts
@@ -2253,6 +2270,8 @@ _WIRE_PREFIX = json.dumps({'feed': FEED_ID, 'profile': LAUNCH_PROFILE},
 def start_publication() -> bool:
     """Start (or resume) the process's feed on its own thread; True when a start was launched. Disk restore and the
     feed lifecycle locks never run on an interactive request. One start in flight per process."""
+    if _external_projection() is not None:
+        return False
     running = _LOADER.__dict__.get('starting')
     if running is not None and running.is_alive():
         return False
@@ -2280,10 +2299,12 @@ async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    external = getattr(_LOADER, 'external_projection', None)
+    external = _external_projection()
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
-        return projection_response(external, body.model_dump())
+        command = body.model_dump()
+        command['_wire_identity'] = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+        return projection_response(external, command)
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this

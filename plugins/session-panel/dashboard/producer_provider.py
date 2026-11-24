@@ -6,6 +6,7 @@ manifest. It is intentionally unreachable from normal plugin registration.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import time
@@ -32,6 +33,12 @@ class PanelProducer:
 
     def __call__(self, payload):
         body = payload['body']
+        # Bound by the serving endpoint, not child argv or browser input. The
+        # relay keys the entire command, isolating serving slots/profiles.
+        identity = body['_wire_identity']
+        if set(identity) != {'feed', 'profile'} or not all(isinstance(v, str) for v in identity.values()):
+            raise ValueError('invalid serving identity')
+        prefix = json.dumps(identity, ensure_ascii=False, separators=(',', ':')).encode()[:-1] + b','
         sessions = body.get('sessions', [])
         accepted = payload['accepted']
         now = time.monotonic()
@@ -67,7 +74,7 @@ class PanelProducer:
                 f._registrations.get_nowait()
             if any(session in f.failures for session in sessions):
                 raise RuntimeError('panel source capture unavailable')
-            return self.api._WIRE_PREFIX + wire[1:]
+            return prefix + wire[1:]
         finally:
             self.readers.release()
 
