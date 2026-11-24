@@ -1000,7 +1000,9 @@ class Mirror:
         Keys are captured BEFORE reconciliation so a concurrent write is owed.
         """
         self.core.validate_owner(owner)
-        stamp = self._panel_stamp(owner)
+        with _accounted_pass('user_steps.panel_stamp') as acct:
+            stamp = self._panel_stamp(owner)
+            acct.fallback(stamp is None)
         key = _local_key(self, owner)
         now = time.monotonic()
         with _PANEL_REMOTE_LOCK:
@@ -1011,11 +1013,19 @@ class Mirror:
                 run, error = True, None
                 _PANEL_REMOTE[key] = (stamp, float('inf'), 0, 'Remote card reconciliation in progress')
         self.panel_remote_unchanged = not run and error is None
+        if not run:
+            with _accounted_pass('user_steps.panel_remote') as acct:
+                acct.skip()
+                acct.fallback(error is not None)
         if run:
             failures = hit[2] if hit else 0
             try:
-                if self.remote.reconcile(owner) is False:
-                    error = 'Remote card reconciliation deferred'
+                with _accounted_pass('user_steps.panel_remote') as acct:
+                    acct.change(stamp is not None and (hit is None or stamp != hit[0]))
+                    acct.fallback(stamp is None or (hit is not None and stamp == hit[0]))
+                    if self.remote.reconcile(owner) is False:
+                        acct.fallback()
+                        error = 'Remote card reconciliation deferred'
             except Exception as exc:
                 error = f'{type(exc).__name__}: {exc}'[:300]
             except BaseException:

@@ -58,6 +58,35 @@ PRODUCER_FULL_EVERY_S = 60.0 # source-event ceiling for canonical time/courier a
 PRODUCER_PASS_BUDGET_S = 5.0 # producer time per pass before hydration; chats not reached carry to the next pass
 
 
+class _NoAccounting:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def skip(self):
+        pass
+
+    def change(self, changed=True):
+        pass
+
+    def fallback(self, fell_back=True):
+        pass
+
+    def rows(self, n):
+        pass
+
+
+def accounted_pass(name):
+    """Optional core telemetry; nested passes do not double-count thread CPU."""
+    try:
+        from hermes_cli.loop_accounting import pass_
+    except ImportError:
+        return _NoAccounting()
+    return pass_(name)
+
+
 def _takes_deadline(readers: Any) -> bool:
     """The reader's reconcile_sources accepts a pass deadline (a replaced callable may not)."""
     fn = getattr(readers, 'reconcile_sources', None)
@@ -715,6 +744,15 @@ class Feed:
         return flight.bundle
 
     def _compute_all(self, sessions: Iterable[str], *, refresh: bool = False) -> dict[str, dict]:
+        with accounted_pass('session_panel.compute_all') as acct:
+            result = self._compute_all_inner(sessions, refresh=refresh)
+            acct.rows(len(result))
+            acct.change(bool(result))
+            if not result:
+                acct.skip()
+            return result
+
+    def _compute_all_inner(self, sessions: Iterable[str], *, refresh: bool = False) -> dict[str, dict]:
         """One owner per session, shared by requests and ticks; disjoint owners never wait on each other.
 
         Reserve each session immediately before its reads, never queued behind unrelated sessions.
@@ -1157,7 +1195,15 @@ class Feed:
 
     def _run_producer(self, sessions, **kwargs):
         try:
-            return self.readers.reconcile_sources(sessions, **kwargs)
+            with accounted_pass('session_panel.reconcile_sources') as acct:
+                left = self.readers.reconcile_sources(sessions, **kwargs)
+                timings = getattr(self.readers, 'reconcile_timings', ())
+                acct.rows(len(timings))
+                acct.change(any(not row.get('unchanged') for row in timings))
+                acct.fallback(bool(left))
+                if timings and all(row.get('unchanged') for row in timings):
+                    acct.skip()
+                return left
         finally:
             # Rollback of a failed capture must not undo the writer's floor.
             with self.lock:
@@ -1311,6 +1357,16 @@ class Feed:
         return set()
 
     def tick(self) -> int:
+        with accounted_pass('session_panel.feed_tick') as acct:
+            result = self._tick_transaction()
+            acct.rows(result)
+            if result:
+                acct.change()
+            else:
+                acct.skip()
+            return result
+
+    def _tick_transaction(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
