@@ -261,7 +261,12 @@ contract for the successor panel memo. It reads canonical compression aliases,
 complete replica membership (including arrivals/removals, legacy twins and
 creation-identity-matched re-homes), and ledger-only obligations and receipts.
 The digest includes only the selected chat's semantic rows, not DB/WAL metadata
-or global write revisions. Healthy pull/owner-heartbeat refreshes do not churn it;
+or global write revisions. A ledger-only obligation still requires its exact
+current owner publication (matching version and payload), even though that task
+has no direct chat link. Missing/re-homed or mismatched retained observations
+remain unknown, without running the writeful ledger projector. Terminal ledger
+rows also require canonical owner evidence; this capture is not release policy.
+Healthy pull/owner-heartbeat refreshes do not churn it;
 expiry, missing/unknown inputs, unqualified ownership, local-authority ledger
 bindings, or the unsupported alternate `links_reader=replica` shadow path return
 `None`. `panel_membership.unchanged(previous, current)` treats even `None` → `None`
