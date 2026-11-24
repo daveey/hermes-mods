@@ -202,4 +202,6 @@ a paraphrase). The next agent and the ask-gate judge read it; without it they re
 - [ ] The blocker is one concrete sentence, and its premise was re-read live this turn.
 - [ ] Every rung a–f was considered; the comment says why each one that applies failed.
 - [ ] Readback proves either release, a valid filed human request, or removal of the stale ask while an
-      independent hold remains. Distinguish metadata correction from execution authorization.
+      independent hold remains. Distinguish metadata correction from execution authorization. Release means a
+      `claimed` event after the promote: `ready` followed by `respawn_guarded active_pr` sits unclaimed until
+      `hermes kanban resume` (a desk renewal read `ready` as done and the card idled 7 minutes).
