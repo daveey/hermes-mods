@@ -684,3 +684,22 @@ def test_card_rows_carry_open_session_only_for_another_chat():
     # The panel's own chat (or a compression ancestor of it) is never offered.
     assert not [a for a in views['t_mine']['actions'] if a['kind'] == 'open_session']
     assert any(a['kind'] == 'open_card' and a['label'] == 'Open card' for a in views['t_mine']['actions'])
+
+
+def test_done_row_shows_completion_age_as_wire_clock_without_revision_churn():
+    stats = {'runs': 2, 'run_seconds': 3420, 'priced_runs': 1, 'usage_runs': 1, 'cost_usd': 5.21}
+    row = task(status='done', completed_at=NOW - 3 * 3600, run_stats=stats)
+    plain = model.reduce_panel(bundle(done=[row]), now=NOW)['sections']['done'][0]
+    assert plain['detail'] == '3 h ago · 57m · 1 restart · $5.21'
+    assert plain['details'][0].startswith('completed ')
+    bare = model.reduce_panel(bundle(done=[task(status='done', completed_at=NOW - 120, result='shipped')]), now=NOW)['sections']['done'][0]
+    assert bare['detail'] == '2 min ago · shipped'
+    none = model.reduce_panel(bundle(done=[task(status='done', result='shipped')]), now=NOW)['sections']['done'][0]
+    assert none['detail'] == 'shipped'
+    a = model.reduce_panel(bundle(done=[row]), now=NOW, wire=True)
+    b = model.reduce_panel(bundle(done=[row]), now=NOW + 7200, wire=True)
+    assert a['revision'] == b['revision']
+    d = a['sections']['done'][0]
+    assert d['clock_text']['detail'][0] == {'timestamp': float(NOW - 3 * 3600), 'format': 'ago'}
+    assert d['clock_text']['detail'][1] == ' · 57m · 1 restart · $5.21'
+    assert d['detail'] == '57m · 1 restart · $5.21'  # legacy static fallback drops the age

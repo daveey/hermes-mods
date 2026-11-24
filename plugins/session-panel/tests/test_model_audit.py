@@ -461,7 +461,8 @@ def test_no_row_ends_with_a_board_status_provenance_tail():
 def test_done_rows_carry_no_redundant_done_label():
     done = task(status='done', completed_at=NOW - 3)
     m = model.reduce_panel(bundle(done=[done, {**done, 'id': 't_two', 'result': 'Merged as abc'}]), now=NOW)
-    assert [r['detail'] for r in m['sections']['done']] == ['', 'Merged as abc'] or sorted(r['detail'] for r in m['sections']['done']) == ['', 'Merged as abc']
+    # The section says done; rows carry only when (age) and what (result), never a 'done' status word.
+    assert sorted(r['detail'] for r in m['sections']['done']) == ['just now', 'just now · Merged as abc']
 
 
 # ---- 7. run model fallback -------------------------------------------------------------------------------------

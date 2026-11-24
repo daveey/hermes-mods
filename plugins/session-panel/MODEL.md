@@ -473,7 +473,10 @@ Order matters, matching Desktop `classify`:
    their API provider). `~$` marks runs with usage it could not price
    (class-routed runs name no model); no priced run shows the token count, never
    a guessed dollar figure. Rows without `run_stats` (origin history, old
-   producers) keep the result text.
+   producers) keep the result text. Any row with `completed_at` leads with its
+   completion age (`3 h ago · 42m · 2 restarts · $3.10`) as a wire `ago` clock
+   part, so the age ticks locally without changing the revision; details start
+   with `completed <Pacific time>`.
 
 ### Deliberate shape/presentation differences
 

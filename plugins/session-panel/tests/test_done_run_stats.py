@@ -99,9 +99,10 @@ def test_done_row_detail_shows_duration_restarts_and_dollars():
     m = reduce(done_row('t_a', {'runs': 3, 'run_seconds': 2520, 'cost_usd': 3.1, 'priced_runs': 3, 'usage_runs': 3,
                                 'tokens': 9_400_000}, result='merged PR'))
     row = m['sections']['done'][0]
-    assert row['detail'] == '42m · 2 restarts · $3.10'
-    assert row['details'][0].startswith('3 runs · run time 42m · 9.4M tokens · $3.10 for 3 of 3 runs')
-    assert row['details'][1] == 'merged PR'
+    assert row['detail'] == '1 min ago · 42m · 2 restarts · $3.10'
+    assert row['details'][0].startswith('completed ')
+    assert row['details'][1].startswith('3 runs · run time 42m · 9.4M tokens · $3.10 for 3 of 3 runs')
+    assert row['details'][2] == 'merged PR'
 
 
 def test_done_row_partial_and_unpriced_and_single_run():
@@ -110,15 +111,15 @@ def test_done_row_partial_and_unpriced_and_single_run():
                done_row('t_c', {'runs': 5, 'run_seconds': 4828, 'cost_usd': 0.0, 'priced_runs': 0, 'usage_runs': 1,
                                 'tokens': 18_837_815}))
     by_id = {r['id']: r for r in m['sections']['done']}
-    assert by_id['t_a']['detail'] == '5m · $1.00'  # no restarts: none shown
-    assert by_id['t_b']['detail'] == '1m · 1 restart · ~$1.00'  # one run could not be priced
-    assert by_id['t_c']['detail'] == '1h 20m · 4 restarts · 18.8M tokens'  # never a made-up dollar figure
-    assert by_id['t_c']['details'][0].endswith('cost unknown')
+    assert by_id['t_a']['detail'] == '1 min ago · 5m · $1.00'  # no restarts: none shown
+    assert by_id['t_b']['detail'] == '1 min ago · 1m · 1 restart · ~$1.00'  # one run could not be priced
+    assert by_id['t_c']['detail'] == '1 min ago · 1h 20m · 4 restarts · 18.8M tokens'  # never a made-up dollar figure
+    assert by_id['t_c']['details'][1].endswith('cost unknown')
 
 
 def test_done_row_without_stats_keeps_result_detail():
     m = reduce(done_row('t_a', None, result='landed'), done_row('t_b', {'runs': 'x'}, result='kept'))
-    assert [r['detail'] for r in m['sections']['done']] == ['landed', 'kept']
+    assert [r['detail'] for r in m['sections']['done']] == ['1 min ago · landed', '1 min ago · kept']
 
 
 def test_done_stats_revision_is_deterministic():

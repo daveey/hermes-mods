@@ -1121,11 +1121,16 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         v = row_view(row)
         result = clean(row.get('result'))
         meta = done_meta(row)
+        finished = seconds(row.get('completed_at'))
+        done_age = (relative(finished, 'ago') if wire else ago(finished, now)) if finished > 0 else ''
         if meta:
-            v['detail'] = meta['detail']
+            v['detail'] = ' · '.join(p for p in [done_age, meta['detail']] if p)
             v['details'] = [*meta['details'], *([result] if result else [])]
         else:
-            v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
+            clipped = result if len(result) <= 80 else result[:79].rstrip() + '…'
+            v['detail'] = ' · '.join(p for p in [done_age, clipped] if p)
+        if done_age:
+            v['details'].insert(0, f'completed {pacific(finished)}')
         sections['done'].append(v)
         diagnostic_rows[k] = row
     for views in sections.values():
