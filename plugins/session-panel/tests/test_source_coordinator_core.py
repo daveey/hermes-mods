@@ -98,6 +98,9 @@ def test_real_stale_full_route_later_sequence_cannot_resurrect_waiting(api, boar
     r = readers_for(api, path, monkeypatch)
     monkeypatch.setattr(r, 'external_capture', strict_empty)
     task = kanban_db.create_task(conn, title='Waiting work', session_id='S')
+    # Ready cards have their own section; use an actual clock wait instead.
+    assert kanban_db.schedule_task(conn, task, reason='Fixture release window', clock_only=True,
+                                   awaiting={'kind': 'clock', 'why': 'Fixture release window'})
     f = feedmod.Feed(r, emit=lambda _: None)
     f.watch(['S'])
     lane = compose(f, r)

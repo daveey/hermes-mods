@@ -274,7 +274,9 @@ def test_unseen_counts_equal_core_all_counts_on_a_real_board(tmp_path, monkeypat
             kb._append_event(conn, done, 'completed', {})
             conn.commit()
         expected = dict(ksa._all_counts()[2])
-        assert expected == {'s1': 1}
+        # Core may also subscribe the system producer's standing owner. The
+        # optimized reader must preserve that subscriber, not filter it away.
+        assert expected['s1'] == 1 and 's2' not in expected
         assert plugin._unseen_counts() == expected
     finally:
         ksa._reset_cache_for_tests()

@@ -26,7 +26,10 @@ def board(tmp_path):
     path = tmp_path / 'kanban.db'
     from hermes_cli.kanban_db_connect import connect
     conn = connect(path)
-    return path, conn
+    try:
+        yield path, conn
+    finally:
+        conn.close()
 
 
 def readers_for(api, path, monkeypatch):
@@ -69,6 +72,12 @@ def test_changed_cards_reports_cards_with_new_events_and_their_chat(api, board, 
 
 def test_semantic_board_changes_include_unevented_writes_and_new_subscribers(api, board, monkeypatch):
     path, conn = board
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=path.parent / 'state.db')
+    try:
+        db.create_session('S1', source='desktop')
+    finally:
+        db.close()
     a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
     r = readers_for(api, path, monkeypatch)
     changes, cursor = r.board_changes(None)

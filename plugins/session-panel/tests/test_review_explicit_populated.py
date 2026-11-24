@@ -50,12 +50,16 @@ def test_producer_lane_cannot_certify_skipped_reconciliation(api, worlds, monkey
 def test_persisted_subagent_is_not_silently_empty(api, worlds, tripwires):
     home = worlds['explicit']
     now = time.time()
+    from hermes_state import SessionDB
+    with tripwires.disarmed():
+        db = SessionDB(db_path=home / 'state.db')
+        try:
+            db.create_session('explicit-child', source='subagent', parent_session_id='chat')
+        finally:
+            db.close()
     with sqlite3.connect(home / 'state.db') as db:
-        for col, typ in [('source','TEXT'),('last_activity_at','REAL'),('started_at','REAL'),('ended_at','REAL'),('title','TEXT')]:
-            db.execute(f'ALTER TABLE sessions ADD COLUMN {col} {typ}')
-        db.execute('CREATE INDEX idx_sessions_parent ON sessions(parent_session_id)')
-        db.execute('INSERT INTO sessions(id,parent_session_id,source,last_activity_at,started_at,title) VALUES (?,?,?,?,?,?)',
-                   ('explicit-child','chat','subagent',now,now,'Real child'))
+        db.execute('UPDATE sessions SET last_activity_at=?, started_at=?, title=? WHERE id=?',
+                   (now, now, 'Real child', 'explicit-child'))
     from hermes_cli import subagent_session_activity as sub
     assert sub._children(home / 'state.db', now, {'chat'})[0][0] == 'explicit-child'
     readers = api.CoreReaders(home_context=ctx_for(home))
