@@ -1076,15 +1076,20 @@ class Feed:
                              ('_admission_retry_at', '_hydrate_retry_at', '_reconcile_retry_at')) if at is not None]
         retry_wait = max(0.0, min(ats) - now) if ats else None
         with self.lock:
-            producer_ats = [at for s, at in self._producer_pending.items() if s in self.interest]
-            safety = float(getattr(self.readers, 'reconcile_safety_s', 0))
-            if safety:
-                producer_ats.extend(self._producer_at[s] + safety for s in self.interest
-                                    if s in self._producer_at)
+            # Failed admission owns its finite retry clock. Keep pending work
+            # and successful timestamps intact, but never let an overdue safety
+            # or trailing deadline bypass backoff (including exhaustion).
+            producer_ats = []
+            if not getattr(self, '_admission_failures', 0):
+                producer_ats = [at for s, at in self._producer_pending.items() if s in self.interest]
+                safety = float(getattr(self.readers, 'reconcile_safety_s', 0))
+                if safety:
+                    producer_ats.extend(self._producer_at[s] + safety for s in self.interest
+                                        if s in self._producer_at)
         if producer_ats:
             wait = max(0.0, min(producer_ats) - now)
             retry_wait = wait if retry_wait is None else min(retry_wait, wait)
-        if getattr(self, '_producer_carry', None):
+        if getattr(self, '_producer_carry', None) and not getattr(self, '_admission_failures', 0):
             retry_wait = 0.0  # producer work a budgeted pass did not reach runs next, not on a source write
         decide_at = getattr(self, '_decision_retry_at', None)
         return (0.0 if missing else retry_wait), (None if decide_at is None else max(0.0, decide_at - now))

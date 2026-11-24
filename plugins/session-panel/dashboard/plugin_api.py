@@ -427,24 +427,33 @@ class CoreReaders:
 
         Core's fingerprint includes board change cursors and ledger/hub inputs.
         State is separate because compression aliases are deliberately omitted
-        from that fingerprint. A 15 s renewal retains core's clock/alias bound.
+        from that fingerprint. Inherit the strict core entry's ORIGINAL expiry:
+        a fresh outer read must never renew an already-aged inner answer.
         Thread-local ownership prevents cross-lane publication races; scope in
         the key prevents lending a profile's inventory to another profile.
         """
         from copy import deepcopy
         fingerprint = getattr(ksa, '_links_fingerprint', None)
         scope = getattr(ksa, '_origin_scope', None)
-        if not callable(fingerprint) or not callable(scope):
+        cache = getattr(ksa, '_links_cache', None)
+        if not callable(fingerprint) or not callable(scope) or not isinstance(cache, dict):
             return ksa.remote_links_and_origin_rows(stale_ok=False)
         key = (scope(), fingerprint(), self._stat(self.state_db()))
         now = time.monotonic()
         hit = getattr(self._local, 'links_inventory', None)
-        if hit is not None and hit[0] == key and 0 <= now - hit[1] < 15.0:
+        if hit is not None and hit[0] == key and now < hit[1]:
             return deepcopy(hit[2])
         rows = ksa.remote_links_and_origin_rows(stale_ok=False)
+        # Core returns shallow list copies. Only borrow expiry when the published
+        # entry still contains these exact row objects; a racing replacement or
+        # an annotation-pinned older answer must not borrow a newer certificate.
+        entry = ksa._links_cache.get(key[0])
+        certified = (entry is not None and entry[1:3] == key[:2]
+                     and all(len(a) == len(b) and all(x is y for x, y in zip(a, b))
+                             for a, b in zip(rows, entry[3:5])))
         # Never absorb an input write racing the projection as answered.
-        if key == (scope(), fingerprint(), self._stat(self.state_db())):
-            self._local.links_inventory = (key, now, deepcopy(rows))
+        if certified and key == (scope(), fingerprint(), self._stat(self.state_db())):
+            self._local.links_inventory = (key, min(entry[0], now + 15.0), deepcopy(rows))
         else:
             self._local.links_inventory = None
         return rows
