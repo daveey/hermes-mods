@@ -80,20 +80,97 @@ class RetiringOwner:
             self.owner.service_wake = successor.service_wake
 
 
+class AwaitingReaders:
+    """No input authority while current API registration is unavailable."""
+    decision_inputs = None
+
+    def release(self):
+        pass
+
+    def __getattr__(self, name):
+        raise RuntimeError('current session-panel reader registration unavailable: ' + name)
+
+
+class PendingSourceOwner:
+    """Explicit intent without a current registered reader; no legacy fallback.
+
+    Saved predecessor board loops can retain this handle. Once registration
+    installs the real owner, it forwards to that owner without a second loop.
+    """
+    capacity = 2
+    visible_only = False
+    pending_install = True
+    service_worker = None
+
+    def __init__(self, feed, *, gateway, profile, predecessor):
+        self.feed, self.gateway, self.profile = feed, gateway, profile
+        self.predecessor = predecessor
+        self.closed = False
+        self.service_wake = feed._board
+        self.reader_factory = None
+        self.api_generation = None
+
+    def _current(self):
+        owner = getattr(self.feed, '_source_coordinator', None)
+        return owner if owner is not self else None
+
+    def start_service(self):
+        with self.feed.lock:
+            self.feed._board_service_required = True
+            owner = self._current()
+        if owner is not None:
+            owner.start_service()
+
+    def retry_at(self):
+        owner = self._current()
+        return owner.retry_at() if owner is not None else None
+
+    def step(self):
+        owner = self._current()
+        if owner is None and not self.closed and self.reader_factory is not None:
+            self.feed.ensure_snapshot_service(self.api_generation, self.reader_factory)
+            owner = self._current()
+        if owner is not None:
+            return owner.step()
+
+    service = step
+
+    def tick(self):
+        owner = self._current()
+        return owner.tick() if owner is not None else 0
+
+    def full(self, sessions):
+        owner = self._current()
+        return owner.full(sessions) if owner is not None else {}
+
+    def _admit(self, sessions, at):
+        owner = self._current()
+        if owner is not None:
+            return owner._admit(sessions, at)
+
+    def close(self):
+        with self.feed.lock:
+            self.closed = True
+            owner = self._current()
+        if owner is not None:
+            owner.close()
+
+
 class SourceCoordinator:
     capacity = 2
     visible_only = False
 
-    def __init__(self, feed, reader_factory, *, gateway, profile):
+    def __init__(self, feed, reader_factory, *, gateway, profile, readers=None):
         self.feed, self.reader_factory = feed, reader_factory
         self.gateway, self.profile = gateway, profile
-        modules = feed.readers.snapshot_modules()
+        rd = feed.readers if readers is None else readers
+        modules = rd.snapshot_modules()
         self.capture, self.module = modules, modules.snapshot
         self.store = self.module.SnapshotStore()
         self.sources = tuple(self.module.SourceKey(gateway, profile, board, 'local', str(path))
-                             for board, path in feed.readers.boards())
+                             for board, path in rd.boards())
         self.external = self.module.SourceKey(gateway, profile, 'default', 'hub-links',
-                                             str(feed.readers.state_db().parent))
+                                             str(rd.state_db().parent))
         for source in (*self.sources, self.external):
             self.store.add_source(source)
         self.lock = threading.RLock()

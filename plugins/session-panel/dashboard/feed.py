@@ -429,7 +429,8 @@ class Feed:
             # Withdraw source authority without joining under either writer lock.
             # The successor is attached before saved predecessor loops can start;
             # its four roles stay gated until retiring workers release readers.
-            retirement = self._source_module().RetiringOwner(predecessor)
+            retirement = (predecessor.predecessor if getattr(predecessor, 'pending_install', False)
+                          else self._source_module().RetiringOwner(predecessor))
         with prev.compute_lock, prev.lock:
             # First: whatever follows, the old object pushes nothing more under the revision space handed over here.
             prev.emit = lambda payload: None
@@ -469,14 +470,17 @@ class Feed:
             prev.watch = self.watch
             prev.changes = self.changes
         if predecessor is not None:
-            factory = SNAPSHOT_READER_FACTORY
-            if factory is None:
-                loader = sys.modules.get('_session_panel_feed_loader')
-                factory = getattr(loader, 'snapshot_reader_factory', None)
-            if factory is None:
-                factory = predecessor.reader_factory
-            self.compose_board_sources(factory, gateway=predecessor.gateway,
-                                       profile=predecessor.profile, _predecessor=retirement)
+            module = self._source_module()
+            self._source_coordinator = self._board_lane = module.PendingSourceOwner(self,
+                gateway=predecessor.gateway, profile=predecessor.profile, predecessor=retirement)
+            self._snapshot_install_pending = True
+            # The saved API constructed this object on the restart thread; release
+            # its unused reader on that same thread. No old connection transfers.
+            unused, self.readers = self.readers, module.AwaitingReaders()
+            unused.release()
+            loader = sys.modules.get('_session_panel_feed_loader')
+            factory = SNAPSHOT_READER_FACTORY or getattr(loader, 'snapshot_reader_factory', None)
+            self.ensure_snapshot_service(getattr(loader, 'generation', None), factory)
         return self
 
     def _current(self) -> 'Feed':
@@ -537,10 +541,105 @@ class Feed:
     def reducer(bundle, *, now):
         return _model().reduce_panel(bundle, now=now, wire=True)
 
-    def _source_module(self):
-        import importlib
-        modules = self.readers.snapshot_modules()
-        return importlib.import_module(modules.__package__ + '.source_coordinator')
+    @staticmethod
+    def _source_module():
+        # Lifetime fences must work before current readers are registered. Never
+        # ask a saved predecessor reader to discover its successor implementation.
+        path = Path(__file__).with_name('source_coordinator.py')
+        name = '_panel_source_' + hashlib.sha256(path.read_bytes()).hexdigest()
+        with _PROJECTION_LOCK:
+            if name not in sys.modules:
+                spec = importlib.util.spec_from_file_location(name, path)
+                assert spec is not None and spec.loader is not None
+                mod = importlib.util.module_from_spec(spec)
+                # Dataclasses resolves the defining module during execution;
+                # the lock prevents a second caller observing a partial module.
+                sys.modules[name] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                except BaseException:
+                    sys.modules.pop(name, None)
+                    raise
+            return sys.modules[name]
+
+    def ensure_snapshot_service(self, api_generation, reader_factory):
+        """Complete only an existing opt-in, idempotently; manual owners stay inert.
+
+        Reader construction/capability discovery is outside the publication lock.
+        Revalidate the pending identity after construction, including stop/reload.
+        A missing registration never borrows predecessor readers or hydrators.
+        """
+        with self.lock:
+            pending = getattr(self, '_source_coordinator', None)
+            if pending is None or self.stopped.is_set():
+                return None
+            if not getattr(pending, 'pending_install', False):
+                return pending
+            if pending.closed or reader_factory is None:
+                return pending
+            pending.reader_factory = reader_factory
+            pending.api_generation = api_generation
+            registration = (api_generation, reader_factory)
+            if getattr(pending, 'installing', False) or getattr(pending, 'failed_registration', None) == registration:
+                return pending
+            if pending.predecessor is not None and not pending.predecessor.ready():
+                # Even current metadata discovery can open SQLite. Hold it behind
+                # the same four-role retirement fence as capture/projection.
+                pending.predecessor.bind(pending)
+                return pending
+            pending.installing = True
+        candidate = None
+        release_attempted = False
+        owner = None
+        try:
+            candidate = reader_factory()
+            for name in ('snapshot_modules', 'capture_local', 'capture_external', 'panel_inputs', 'release'):
+                if not callable(getattr(candidate, name, None)):
+                    raise RuntimeError('current snapshot reader capability unavailable: ' + name)
+            # The constructor reads source coordinates through the current reader,
+            # never through the Feed's not-yet-installed canonical component.
+            owner = self._source_module().SourceCoordinator(self, reader_factory,
+                gateway=pending.gateway, profile=pending.profile, readers=candidate)
+            release_attempted = True
+            candidate.release()
+            with self.lock:
+                if (self.stopped.is_set() or self._source_coordinator is not pending
+                        or pending.closed
+                        or (pending.api_generation, pending.reader_factory) != registration):
+                    owner.retire()
+                    return getattr(self, '_source_coordinator', None)
+                self.readers = candidate
+                owner.predecessor = pending.predecessor
+                if owner.predecessor is not None:
+                    owner.predecessor.bind(owner)
+                self._source_coordinator = self._board_lane = owner
+                self._snapshot_install_pending = False
+                self._snapshot_api_generation = api_generation
+                if getattr(self, '_board_service_required', False):
+                    owner.start_service()
+                self._wake.set(); self._decide.set(); self._board.set()
+                return owner
+        except Exception:
+            if owner is not None:
+                owner.retire()
+            with self.lock:
+                pending.failed_registration = registration
+            log.warning('session-panel current reader installation unavailable', exc_info=True)
+            return pending
+        finally:
+            try:
+                if candidate is not None and not release_attempted:
+                    # Construction/capability failures release on the caller thread.
+                    release = getattr(candidate, 'release', None)
+                    if callable(release):
+                        release()
+            except Exception:
+                log.warning('session-panel candidate reader release failed', exc_info=True)
+            finally:
+                with self.lock:
+                    pending.installing = False
+                    if (pending.api_generation, pending.reader_factory) != registration:
+                        self._board.set()
 
     def compose_board_sources(self, reader_factory, *, gateway, profile, _predecessor=None):
         """Explicit disposable composition only; normal startup remains UNACTIVATED.
@@ -699,6 +798,19 @@ class Feed:
             return {'bundle': held['bundle'], 'epoch': self.epoch, 'rev': self.rev}
 
     def refresh_decisions(self, *, readers=None) -> int:
+        if getattr(self, '_source_coordinator', None) is not None:
+            # Genuine saved decision loops pass their own old CoreReaders. The
+            # opted-in successor owns current canonical readers as well as board
+            # readers; thread-local connections are released by this caller.
+            if getattr(self, '_snapshot_install_pending', False):
+                return 0
+            try:
+                return self._refresh_decisions(readers=self.readers)
+            finally:
+                self.readers.release()
+        return self._refresh_decisions(readers=readers)
+
+    def _refresh_decisions(self, *, readers=None) -> int:
         """Read canonical decisions without board hydration during a long full sweep.
 
         Never reconcile mirrors or refresh board trust clocks here. Independent board

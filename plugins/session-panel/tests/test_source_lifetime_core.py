@@ -3,6 +3,7 @@ import json
 import importlib.util
 import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -159,8 +160,9 @@ def test_close_retires_snapshot_before_joining_old_projection(api, board, monkey
 
 @pytest.mark.parametrize('before_registration', [True, False])
 @pytest.mark.parametrize('frozen_owner', [True, False])
+@pytest.mark.parametrize('current_registered', [True, False])
 def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
-        api, board, monkeypatch, before_registration, frozen_owner):
+        api, board, monkeypatch, before_registration, frozen_owner, current_registered):
     path, conn = board
     r = readers_for(api, path, monkeypatch)
     monkeypatch.setattr(r, 'external_capture', strict_empty)
@@ -208,14 +210,16 @@ def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
         if any(row.get('title') == 'After natural reload' for row in value.get('tasks', ())):
             published.set()
 
+    retired = RetiredReaders()
     ns = dict(current_api.__dict__)
-    ns.update(CoreReaders=lambda: r, _emit=emit, write_timing=lambda _: None,
+    ns.update(CoreReaders=lambda: retired, _emit=emit, write_timing=lambda _: None,
               _run=lambda feed: feed.stopped.wait(5),
               _run_decisions=lambda feed: feed.stopped.wait(5))
     source = (Path(__file__).parent / 'fixtures/board_entry_before_service.py').read_text()
     exec(compile(source, 'board_entry_before_service.py', 'exec'), ns)
     monkeypatch.setattr(core, 'BoardLane', PausedLane)
-    monkeypatch.setattr(core, 'SNAPSHOT_READER_FACTORY', lambda: r, raising=False)
+    monkeypatch.setattr(core, 'SNAPSHOT_READER_FACTORY', (lambda: r) if current_registered else None, raising=False)
+    monkeypatch.setattr(current_api._LOADER, 'snapshot_reader_factory', None, raising=False)
     core.PROCESS_FEED, core.RESTART = old, ns['feed']
     new = None
     try:
@@ -229,7 +233,15 @@ def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
             assert owner.service_worker is None
             register.set()
         assert entered.wait(2)
+        if not current_registered:
+            assert owner.pending_install and not owner.service_worker
+            assert current_api.register_snapshot_readers(lambda: r) is new._source_coordinator
+            owner = new._source_coordinator
         assert owner.service_worker is not None and owner.service_worker.is_alive()
+        assert new.readers is r and not retired.accesses and retired.released == 1
+        # A genuine old decision loop must not recover its retired factory either.
+        new.refresh_decisions(readers=retired)
+        assert not retired.accesses
         conn.execute('UPDATE tasks SET title=? WHERE id=?', ('After natural reload', task)); conn.commit()
         owner.service_wake.set()
         assert published.wait(3), 'no current API traffic repairs the predecessor entry'
@@ -244,6 +256,171 @@ def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
                 new._source_coordinator.close()
         old.stopped.set(); previous.close(); r.release(); conn.close()
         _restore(current_api, core)
+
+
+class RetiredReaders:
+    """A genuinely saved API may construct readers with no current capability."""
+    def __init__(self):
+        self.released = 0
+        self.accesses = []
+
+    def release(self):
+        self.released += 1
+
+    def __getattr__(self, name):
+        self.accesses.append(name)
+        raise AssertionError('retired canonical reader used: ' + name)
+
+
+@pytest.mark.parametrize('registered', [True, False])
+def test_successor_uses_current_readers_or_waits_without_old_factory(
+        api, board, monkeypatch, registered):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    kanban_db.create_task(conn, title='Current reader only', session_id='S')
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    calls = []
+    def poison():
+        calls.append('old factory')
+        raise AssertionError('saved reader factory is not registration authority')
+    previous.reader_factory = poison
+    loader = sys.modules.get('_session_panel_feed_loader')
+    if loader is not None:
+        monkeypatch.setattr(loader, 'snapshot_reader_factory', None, raising=False)
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', (lambda: current) if registered else None)
+    retired = RetiredReaders()
+    new = feedmod.Feed(retired, emit=lambda _: None)
+    try:
+        new.resume(old)
+        assert not calls and not retired.accesses
+        assert retired.released == 1, 'unused saved-API reader was not released on its owning thread'
+        if not registered:
+            pending = new._source_coordinator
+            assert new._snapshot_install_pending
+            assert pending.full(['S']) == {} and pending.tick() == 0
+            pending.step()
+            assert not new._bundle_fresh('S', new.clock())
+            assert not calls and not retired.accesses
+            # Registration repairs the existing opted-in Feed, not a new API read.
+            api.ensure_snapshot_service(new, 'current-generation', lambda: current)
+        assert new.readers is current
+        owner = new._source_coordinator
+        assert not getattr(new, '_snapshot_install_pending', False)
+        assert api.ensure_snapshot_service(new, 'current-generation', lambda: current) is owner
+        assert owner.service_worker is None, 'manual resume/registration started a service'
+        drain(owner)
+        assert any(row['title'] == 'Current reader only' for row in new.bundles['S']['bundle']['tasks'])
+        assert not calls and not retired.accesses
+    finally:
+        old.stopped.set(); previous.close(); new.stopped.set()
+        owner = getattr(new, '_source_coordinator', None)
+        if owner is not None:
+            owner.close()
+        current.release(); conn.close()
+
+
+@pytest.mark.parametrize('during_install', ['stop', 'close', 'new_registration'])
+def test_reader_install_revalidates_stop_and_registration_without_duplicate_roles(
+        api, board, monkeypatch, during_install):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', None)
+    loader = sys.modules.get('_session_panel_feed_loader')
+    if loader is not None:
+        monkeypatch.setattr(loader, 'snapshot_reader_factory', None, raising=False)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None).resume(old)
+    pending = new._source_coordinator
+    entered, release = threading.Event(), threading.Event()
+    calls, releases, answers = [], [], []
+    original_release = current.release
+    def release_reader():
+        assert not new.lock._is_owned(), 'reader release ran under Feed writer lock'
+        releases.append(threading.get_ident())
+        original_release()
+    monkeypatch.setattr(current, 'release', release_reader)
+    def factory():
+        calls.append(threading.get_ident())
+        entered.set(); assert release.wait(5)
+        return current
+    caller = threading.Thread(target=lambda: answers.append(api.ensure_snapshot_service(new, 'first', factory)))
+    try:
+        caller.start(); assert entered.wait(2)
+        # The same registration cannot construct a second candidate or add slots.
+        assert api.ensure_snapshot_service(new, 'first', factory) is pending
+        assert len(calls) == 1 and not hasattr(pending, 'acquiring')
+        if during_install == 'stop':
+            new.stopped.set()
+        elif during_install == 'close':
+            pending.close()
+        else:
+            api.ensure_snapshot_service(new, 'second', lambda: current)
+        release.set(); caller.join(3)
+        assert not caller.is_alive()
+        assert new._source_coordinator is pending and answers == [pending]
+        assert len(releases) == 1 and not pending.service_worker
+        if during_install == 'new_registration':
+            pending.step()
+            assert new._source_coordinator is not pending
+            assert new._snapshot_api_generation == 'second'
+            assert not new._source_coordinator.service_worker
+        else:
+            assert api.ensure_snapshot_service(new, 'second', lambda: current) in (None, pending)
+            assert new._source_coordinator is pending
+    finally:
+        release.set(); caller.join(3)
+        new.stopped.set(); new._source_coordinator.close()
+        old.stopped.set(); previous.close(); current.release(); conn.close()
+
+
+def test_unsupported_registration_is_unknown_and_not_retried_by_beat_full_or_step(api, board, monkeypatch):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', None)
+    loader = sys.modules.get('_session_panel_feed_loader')
+    if loader is not None:
+        monkeypatch.setattr(loader, 'snapshot_reader_factory', None, raising=False)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None).resume(old)
+    pending = new._source_coordinator
+    unsupported = types.SimpleNamespace(release=lambda: None)
+    calls = []
+    def factory():
+        calls.append('unsupported')
+        return unsupported
+    try:
+        assert api.ensure_snapshot_service(new, 'unsupported', factory) is pending
+        for _ in range(8):
+            pending.step(); pending.tick(); pending.full(['S'])
+            new.refresh_decisions(readers=RetiredReaders())
+        assert calls == ['unsupported'] and not new._bundle_fresh('S', new.clock())
+        assert new._carried == {'S'} and new._snapshot_install_pending
+        assert api.ensure_snapshot_service(new, 'replacement', lambda: current) is not pending
+        drain(new._source_coordinator)
+    finally:
+        new.stopped.set(); new._source_coordinator.close()
+        old.stopped.set(); previous.close(); current.release(); conn.close()
+
+
+def test_registration_never_opts_in_normal_feed(api, board, monkeypatch):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    f = feedmod.Feed(current, emit=lambda _: None)
+    calls = []
+    try:
+        assert api.ensure_snapshot_service(f, 'unused', lambda: calls.append('factory')) is None
+        assert not calls and not hasattr(f, '_source_coordinator')
+    finally:
+        f.stopped.set(); current.release(); conn.close()
 
 
 def test_successor_reserves_all_four_roles_until_old_readers_and_projections_release(
@@ -297,12 +474,14 @@ def test_successor_reserves_all_four_roles_until_old_readers_and_projections_rel
         # Retirement does not join under the writer lock or borrow any new role.
         for key in ('local', 'external', 'A'):
             owner.step()
-            assert not factories and not owner.acquiring and not owner.active
+            assert not factories and not getattr(owner, 'acquiring', {}) and not getattr(owner, 'active', {})
             release[key].set(); old_workers[key].join(3)
             assert not old_workers[key].is_alive()
             assert not owner.predecessor.ready(), 'remaining old projection lost its slot custody'
         release['B'].set(); old_workers['B'].join(3)
         assert not old_workers['B'].is_alive() and owner.predecessor.ready()
+        owner.step()
+        owner = new._source_coordinator
         drain(owner)
         assert factories and owner.drained.is_set()
         assert all(not worker.is_alive() for worker in old_workers.values())
