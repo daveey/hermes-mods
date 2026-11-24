@@ -191,6 +191,7 @@ uv run --with pytest python -m pytest -q -p no:cacheprovider skills/devops/kanba
 
 ## Pitfalls
 
+- Before any "waiting on you" row or decide prompt, reconcile it against his latest chat text: an instruction he typed ("cancel X", "close that card") is the decision, so carry it out that turn and withdraw the open prompt it answers. Re-listing it as his ask, or re-posting its buttons, repeats a question he already answered.
 - Never write a bare code ("A", "Option 2") as a `human_request.choices`/`action_request`/`clarify` label: put the meaning in the label, add one plain `explain` line and set `recommended` on your pick. The For you tile shows only the labels, and the letters' definitions sit in a message he can't see.
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
