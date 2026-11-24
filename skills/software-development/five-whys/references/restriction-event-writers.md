@@ -1,5 +1,7 @@
 # Restriction-event writer inventory
 
+For local SQL restriction fences, exercise real push → acknowledgement → pull with both previously acknowledged and pending run rows. A server acknowledgement advances run sync_version, and a later event echo can add origin_gateway after its outbox row has been deleted; byte-identity-only allowances can wedge the entire board. Keep lifecycle evidence immutable, narrowly separate monotonic transport metadata, and consume already-accepted frozen-row feed changes without rolling back unrelated rows or the cursor. Test late rewrites and deletes in both dependency directions. Check UPDATE of task identity and INSERT OR REPLACE conflicting on an old run ID/UID, not only the incoming task identity.
+
 For a new restriction-event kind, test lease-before-marker ordering, renewal, already-held grant shortcuts, home task deletion, event GC on old terminal tasks, and cleanup after a rejected request. A refusal can still be followed by a separate placement-writing transaction. Refuse publication over outstanding custody rather than silently revoking it unless revocation is explicitly part of the contract.
 
 Cache held-task classification once per bounded GC batch: repeating a task-history scan for every candidate can turn retained-history maintenance quadratic even when the candidate query stays bounded. Exercise large retained histories and unrelated collectible controls, not only a single held row.
