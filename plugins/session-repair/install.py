@@ -3,6 +3,9 @@
     python3 install.py                 # show what would change
     python3 install.py --apply         # write the wrapper script + config, create the cron job if missing
     python3 install.py --apply --mode live   # also switch the tick to live (default: shadow)
+    python3 install.py --apply --mode live --live-rules BS-overdue-wake:clock_overdue,BS-parent-done:awaited_done
+                                             # partial go-live: only these findings act, the rest stay shadow
+                                             # (--live-rules all removes the limit)
     python3 install.py --apply --failure-deliver telegram   # where a failed tick shows (default: bot-chat)
 
 What it does:
@@ -143,6 +146,8 @@ def main(argv=None) -> int:
     p.add_argument('--apply', action='store_true')
     p.add_argument('--mode', choices=('off', 'shadow', 'live'))
     p.add_argument('--nudge-mode', choices=('shadow', 'live'), help='independent nudge lane only')
+    p.add_argument('--live-rules', metavar='RULE:VARIANT,...',
+                   help="live mode acts only on these findings, the rest stay shadow; 'all' removes the limit")
     p.add_argument('--failure-deliver', default=None,
                    help='cron --failure-deliver target for failed ticks (default bot-chat; never local)')
     args = p.parse_args(argv)
@@ -154,6 +159,11 @@ def main(argv=None) -> int:
     steps = plan(h, args.mode, args.failure_deliver, explicit_target=explicit)
     if args.nudge_mode:
         steps.append(('nudge_config', args.nudge_mode))
+    if args.live_rules is not None:
+        rules = [] if args.live_rules.strip() == 'all' else [r.strip() for r in args.live_rules.split(',') if r.strip()]
+        if any(r.count(':') != 1 for r in rules):
+            p.error('--live-rules takes <rule id>:<variant> entries, comma-separated, or all')
+        steps.append(('live_rules', None if args.live_rules.strip() == 'all' else rules))  # type: ignore[arg-type]
     if not steps:
         print('session-repair: already installed')
         return 0
@@ -175,6 +185,15 @@ def main(argv=None) -> int:
             cfg.parent.mkdir(parents=True, exist_ok=True)
             data = json.loads(cfg.read_text()) if cfg.exists() else {'mode':'shadow'}
             data['mode' if kind == 'config' else 'nudge_mode'] = what
+            cfg.write_text(json.dumps(data) + '\n')
+        elif kind == 'live_rules':
+            cfg = h / 'session-repair' / 'config.json'
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            data = json.loads(cfg.read_text()) if cfg.exists() else {'mode':'shadow'}
+            if what is None:
+                data.pop('live_rules', None)
+            else:
+                data['live_rules'] = what
             cfg.write_text(json.dumps(data) + '\n')
         elif kind in ('cron', 'reconcile'):
             argv = (cron_argv(args.failure_deliver) if kind == 'cron'

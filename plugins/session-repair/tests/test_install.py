@@ -137,3 +137,23 @@ def test_a_chosen_failure_target_is_kept_unless_passed_explicitly(tmp_path, monk
     for missing in (None, '', 'local'):
         setup(missing)
         assert [k for k, _ in inst.plan(tmp_path, None) if k == 'reconcile'] == ['reconcile'], missing
+
+
+def test_live_rules_flag_writes_and_clears_the_allowlist(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    (tmp_path / 'plugins' / 'session-repair').mkdir(parents=True)
+    (tmp_path / 'plugins' / 'session-repair' / 'run.py').write_text('')
+    (tmp_path / 'cron').mkdir()
+    (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps(
+        {'jobs': [{'id': 'j1', 'name': 'session-repair', 'failure_deliver': 'bot-chat'}]}))
+    monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
+    cfg = tmp_path / 'session-repair' / 'config.json'
+    assert inst.main(['--apply', '--mode', 'live', '--nudge-mode', 'shadow', '--live-rules',
+                      'BS-overdue-wake:clock_overdue, BS-parent-done:awaited_done']) == 0
+    assert json.loads(cfg.read_text()) == {'mode': 'live', 'nudge_mode': 'shadow', 'live_rules': [
+        'BS-overdue-wake:clock_overdue', 'BS-parent-done:awaited_done']}
+    assert inst.main(['--apply', '--live-rules', 'all']) == 0
+    assert json.loads(cfg.read_text()) == {'mode': 'live', 'nudge_mode': 'shadow'}
+    with pytest.raises(SystemExit):
+        inst.main(['--live-rules', 'BS-overdue-wake'])

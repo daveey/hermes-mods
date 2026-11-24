@@ -370,3 +370,65 @@ def test_only_created_cards_are_recorded_as_filed(tmp_path):
     run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=h, now=1000.0, run_mode='live')
     row = lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')[0]
     assert row['filed'] is None and row['commented_on'] == 't_target'
+
+
+def _cfg(home, **data):
+    d = home / 'session-repair'
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'config.json').write_text(json.dumps({'mode': 'live', **data}))
+
+
+def _variant(i, rule, variant, kind='auto'):
+    f = finding(i, kind, rule)
+    f['variant'] = variant
+    return f
+
+
+def test_live_rules_limit_live_to_the_allowlist_and_keep_the_rest_in_shadow(tmp_path):
+    _cfg(tmp_path, live_rules=['BS-overdue-wake:clock_overdue', 'BS-parent-done:awaited_done'])
+    allowed = [_variant(1, 'BS-overdue-wake', 'clock_overdue'), _variant(2, 'BS-parent-done', 'awaited_done')]
+    held = [_variant(3, 'BS-ready-worker-free', 'free_worker', 'card'), _variant(4, 'BS-overdue-wake', 'probe_overdue', 'card')]
+    hermes = FakeHermes()
+    out = run.tick(home=tmp_path, scanner=scanner(allowed + held), runner=hermes, now=1000.0)
+    assert len(hermes.chats()) == 1
+    prompt = (tmp_path / 'session-repair' / 'last-prompt.md').read_text()
+    for f in allowed:
+        assert f['fingerprint'] in prompt
+    for f in held:
+        assert f['fingerprint'] not in prompt, 'a non-allowlisted finding never reaches the live repair turn'
+    assert sorted(out['handed']) == sorted(f['fingerprint'] for f in allowed)
+    assert sorted(out['shadowed']) == sorted(f['fingerprint'] for f in held)
+    shadow = lines(tmp_path / 'session-repair' / 'actions-shadow.jsonl')
+    assert sorted(r['fingerprint'] for r in shadow) == sorted(f['fingerprint'] for f in held)
+    assert sorted(r['outcome'] for r in lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')) == ['fixed', 'fixed']
+
+
+def test_live_rules_with_nothing_allowlisted_starts_no_turn(tmp_path):
+    _cfg(tmp_path, live_rules=['BS-overdue-wake:clock_overdue'])
+    hermes = FakeHermes()
+    out = run.tick(home=tmp_path, scanner=scanner([_variant(1, 'BS-stuck-run', 'quiet', 'card')]), runner=hermes, now=1000.0)
+    assert hermes.chats() == [] and out['handed'] == [] and len(out['shadowed']) == 1
+
+
+def test_live_rules_absent_keeps_every_finding_live(tmp_path):
+    _cfg(tmp_path)
+    hermes = FakeHermes()
+    out = run.tick(home=tmp_path, scanner=scanner([_variant(1, 'BS-stuck-run', 'quiet', 'card')]), runner=hermes, now=1000.0)
+    assert len(hermes.chats()) == 1 and len(out['handed']) == 1
+
+
+@pytest.mark.parametrize('bad', ['BS-overdue-wake:clock_overdue', {'x': 1}, [1, 2], None])
+def test_live_rules_malformed_fails_closed_to_nothing_live(tmp_path, bad):
+    _cfg(tmp_path, live_rules=bad)
+    assert run.live_rules(tmp_path) == frozenset()
+    hermes = FakeHermes()
+    run.tick(home=tmp_path, scanner=scanner([_variant(1, 'BS-overdue-wake', 'clock_overdue')]), runner=hermes, now=1000.0)
+    assert hermes.chats() == []
+
+
+def test_live_rules_do_not_apply_in_shadow(tmp_path):
+    d = tmp_path / 'session-repair'
+    d.mkdir(parents=True)
+    (d / 'config.json').write_text(json.dumps({'mode': 'shadow', 'live_rules': []}))
+    out = run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=FakeHermes(), now=1000.0)
+    assert out['mode'] == 'shadow' and len(out['handed']) == 1

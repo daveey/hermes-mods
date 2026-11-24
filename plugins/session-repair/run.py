@@ -81,6 +81,26 @@ def mode(home: Optional[Path] = None) -> str:
     return m if m in MODES else DEFAULT_MODE
 
 
+def live_rules(home: Optional[Path] = None) -> Optional[frozenset]:
+    """config.json `live_rules`: the `<rule id>:<variant>` findings live mode may act on. None (key absent) = every
+    finding, as before. Any other value that is not a list of strings fails closed to the empty set (nothing live):
+    a partial go-live never widens because its allowlist was unreadable."""
+    try:
+        data = json.loads(((home or hermes_home()) / 'session-repair' / 'config.json').read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or 'live_rules' not in data:
+        return None
+    value = data['live_rules']
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        return frozenset()
+    return frozenset(x.strip() for x in value)
+
+
+def rule_key(f: dict) -> str:
+    return f'{f.get("id")}:{f.get("variant")}'
+
+
 def load_scan():
     key = '_session_repair_scan'
     if key not in sys.modules:
@@ -462,8 +482,18 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
             nudges,home=home,now=now,scan=load_scan(),runner=runner,argv=hermes_argv(),
             read_json=_read_json,write_json=_write_json,append=_append)
         ordinary = [f for f in findings if (f.get('fix') or {}).get('kind')!='nudge']
+        held_back = []
+        allowed = live_rules(home) if m == 'live' else None
+        if allowed is not None:  # partial go-live: only allowlisted rule:variant findings act; the rest stay shadow
+            held_back = [f for f in ordinary if rule_key(f) not in allowed]
+            ordinary = [f for f in ordinary if rule_key(f) in allowed]
         out = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':ordinary+(escalations if nm==m else [])},
                              now=now,run_mode=m,runner=runner)
+        if held_back:
+            shadow = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':held_back},now=now,
+                                    run_mode='shadow',runner=runner)
+            out['line'] += ('; ' if out['line'] and shadow['line'] else '') + shadow['line']
+            out['shadowed'] = shadow['handed']
         if escalations and nm != m:
             extra = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':escalations},now=now,run_mode=nm,runner=runner)
             out['handed'] += extra['handed']
