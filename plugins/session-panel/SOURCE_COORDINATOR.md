@@ -87,6 +87,48 @@ while backoff is pending or exhausted. A genuinely changed acquired source or
 exact demand can renew that projection budget. Basic Feed
 resume retains the failed-capture exclusion from `fresh`.
 
+## Single strict-capture observations (UNACTIVATED)
+
+The external role first calls `board_capture.capture_external_raw` once for the
+whole exact demand union. Its frozen `ExternalCapture` binds the source, demands,
+CaptureHints (owner/version), pre-read stamp, read-start clock, raw encoded rows
+and inventory. `capture_external(..., raw=...)` materializes that same input; it
+validates provenance and never performs a second union read. Existing callers
+omitting `raw` retain the strict acquisition path. This is an internal acquisition
+input, not another SnapshotStore/PanelModel schema or a source certificate.
+
+The coordinator retains per-scope raw rows against the accepted scope receipt
+version and supplies them to every pure projection. Only an exact current,
+covered, published parent with equal canonical `external_semantic` is eligible for
+clock carriage. All scopes in the union must qualify. Missing/changed coverage,
+watch/epoch or semantic rows take strict materialization instead. Raw provenance
+is never inherited across owners; compatible store transfer alone cannot attest
+that a current owner performed a strict capture.
+
+A clock-only pass uses B2a `carry_board_observations` and `publish_projections`,
+without hydration, `project_board`, canonical-dirty admission or a second read.
+CoreReaders owns the producer/owner/session/origin/binding-qualified identity:
+replica rows, source-less origin rows and origin-obligation rows retain distinct
+clocks, including legitimate regression. The store accepts an unchanged part with
+a new source CAS revision but unchanged scoped receipts; this admits no semantic
+work and renews no acquisition/computation/execution clock. A strict capture begun
+before that acceptance cannot later acquire authority. A losing CAS never marks
+the source failed; unknown scopes still receive the existing finite retry schedule
+unless a newer attempt already owns that signature.
+
+A publication-parent race retains captured rows and queues bounded pure retry;
+it does not recapture to repair presentation. Local/full retries carry the most
+recent raw clocks onto their computed board bundle. Both a delayed full candidate
+and a delayed observation candidate lose to a newer exact parent under Feed's
+existing publication fences. Canonical inputs are overlaid independently.
+
+`tests/test_coordinator_observation.py` executes real replica SQL, actual
+CoreReaders linked/done -> session_tasks origin selection in hub and replica
+modes, regressing clocks, single-capture/no-hydration controls, owner resume,
+local-after-observation, semantic title/status controls, immutable provenance,
+finite lost-CAS retry and both older projection branches with event barriers.
+These are source behavior tests, not authenticated inclusion or activation proof.
+
 ## Lifecycle, rollback and next acceptance
 
 `close()` marks this owner closed, stops/wakes service, cancels pending work,

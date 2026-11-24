@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import logging
 import queue
+import sys
 import threading
 import time
 from typing import Any
@@ -207,6 +208,9 @@ class SourceCoordinator:
         self.role_attempts = {'local': self.registration_attempt, 'external': Attempt()}
         self.projection_attempts = {}
         self.chats, self.tokens, self.bases, self.tickets = {}, {}, {}, {}
+        # Exact per-scope raw provenance, keyed by the accepted scope receipt.
+        # Not inherited across reload: a new owner must perform its own strict read.
+        self.external_raw = {}
         self.canonical_dirty = {}
         self._change_seq = 0
         self.service_wake = threading.Event()
@@ -417,6 +421,8 @@ class SourceCoordinator:
                 if changed:
                     self._queue([s])
                     self._changed([s])
+            demands = self.store.demands(self.external)
+            self.external_raw = {sid: value for sid, value in self.external_raw.items() if sid in demands}
 
     def require(self, session, refs):
         """Exact owner-qualified dependency expansion, never an ID-only lookup."""
@@ -548,6 +554,69 @@ class SourceCoordinator:
             self.feed._board.set()
             self._worker_finished()
 
+    def _remember_external(self, snapshot, raw):
+        part = snapshot.parts[self.external]
+        current = self.store.demands(self.external)
+        self.external_raw = {sid: value for sid, value in self.external_raw.items() if sid in current}
+        for sid, encoded in raw.captured.items():
+            receipt = part.scope_receipts.get(sid)
+            if (current.get(sid) == raw.demands[sid] and receipt is not None
+                    and receipt.coverage.captured_demands.get(sid) == raw.demands[sid]):
+                self.external_raw[sid] = (receipt.version, tuple(encoded))
+
+    def _observe_external(self, rd, raw, previous, prior):
+        """Clock-only strict read, no hydration, acquisition age or new coverage.
+
+        The unchanged part CAS advances the capture sequence while preserving all
+        scoped receipts. It fences an older in-flight strict read even when a pull
+        legitimately regresses. Feed's exact parent-token CAS separately orders
+        presentation. Neither fence is based on timestamp ordering.
+        """
+        if (previous is None or previous.receipt.owner_token != raw.hints.owner_token
+                or previous.receipt.version.store_epoch_uuid != prior.store_epoch_uuid
+                or previous.receipt.version.source_generation != prior.source_generation
+                or previous.receipt.coverage.captured_demands != raw.demands
+                or set(previous.scope_receipts) != set(raw.demands)
+                or previous.tombstones or previous.invalidated_keys):
+            return False
+        with self.feed.lock:
+            projections = {sid: (self.feed.bundles.get(sid.chat.session_id) or {}).get('board_projection')
+                           for sid in raw.demands}
+        observations = {}
+        for sid, captured in raw.captured.items():
+            p = projections[sid]
+            if (p is None or not p.external_capture or self.external not in p.covered_scopes
+                    or p.feed_epoch != self.feed.epoch or p.feed_owner is not self.feed._projection_owner
+                    or p.watch_token is not self.tokens.get(sid.chat.session_id)
+                    or sid not in self.external_raw
+                    or p.covered_scopes[self.external] != raw.demands[sid]
+                    or not self.store.current(p.admission)
+                    or rd.external_semantic(captured) != rd.external_semantic(p.external_capture)):
+                return False
+            observations[sid.chat.session_id] = self.feed.carry_board_observations(self.store, p, captured)
+        with self.lock:
+            if self.closed:
+                raise self.module.StaleCapture('source owner retired')
+            if self.store.demands(self.external) != raw.demands:
+                raise self.module.StaleCapture('external scope changed during strict read')
+            # No new certificate: every receipt/row/detail/execution clock stays
+            # exactly as before. Only the store's acceptance sequence changes.
+            part = replace(previous, receipt=replace(previous.receipt,
+                version=replace(prior, source_revision=prior.source_revision + 1)))
+            snapshot, admissions = self.store.accept_external(part, prior)
+            if admissions:
+                raise RuntimeError('observation-only carriage unexpectedly admitted semantic work')
+            self._remember_external(snapshot, raw)
+        results = self.feed.publish_projections(self.store, observations)
+        with self.lock:
+            if not self.closed:
+                # A concurrent writer may win the parent token after strict read.
+                # Retain the raw capture and retry through existing pure slots;
+                # never reacquire merely to recover this presentation race.
+                self._queue(s for s, result in results.items()
+                            if result.disposition not in {'stored', 'no_change'})
+        return True
+
     def _capture_one(self, rd, source, stamp):
         with self.lock:
             if self.closed or not self._eligible(source, stamp):
@@ -570,9 +639,16 @@ class SourceCoordinator:
                     attempt.retry_at = None
         try:
             if source == self.external:
-                parts = rd.capture_external(demands, {}, snapshot.parts, hints={source: hint})
+                raw = self.capture.capture_external_raw(rd, demands, {}, {source: hint})
+                if self._observe_external(rd, raw, previous, prior):
+                    with self.lock:
+                        self._settle_attempts(source, attempted, self.store.pending(source))
+                    return
+                parts = rd.capture_external(demands, {}, snapshot.parts, hints={source: hint}, raw=raw)
                 part, = parts
-                _, admissions = self.store.accept_external(part, prior)
+                with self.lock:
+                    accepted, admissions = self.store.accept_external(part, prior)
+                    self._remember_external(accepted, raw)
             else:
                 part = rd.capture_local(source, previous, demands, hint)
                 _, admissions = self.store.accept_local(part, prior)
@@ -588,6 +664,16 @@ class SourceCoordinator:
                 self._queue(ad.chat.session_id for ad in admissions)
                 self._changed(ad.chat.session_id for ad in admissions)
                 self.completed.put(('source', source, part))
+        except self.module.StaleCapture:
+            # A losing CAS must not poison a newer accepted source. A reset or
+            # demand change can also refuse the capture without a replacement
+            # success, however: settle still-unknown work on the existing finite
+            # retry schedule rather than stranding it with retry_at=None. Do not
+            # mutate a newer attempt's signature/budget.
+            with self.lock:
+                if not self.closed and self.attempts[source].stamp == stamp:
+                    self._settle_attempts(source, attempted, self.store.pending(source))
+            return
         except Exception as exc:
             with self.lock:
                 if not self.closed:
@@ -713,8 +799,34 @@ class SourceCoordinator:
                     raise RuntimeError('snapshot watch was replaced')
                 pin = self.store.pin(chat)
                 lineage = pin[0].watches[chat].lineage_tuple
+                demand = pin[1].required_scopes[self.external]
+                raw = self.external_raw.get(demand.id)
+                captured = (raw[1] if raw is not None
+                            and raw[0] == pin[1].required_versions.get(self.external) else ())
             base = self._base(s, lineage)
-            projection = self.feed.project_board(self.store, chat, canonical_base=base, pin=pin)
+            with self.feed.lock:
+                held = (self.feed.bundles.get(s) or {}).get('board_projection')
+            if (held is not None and held.admission == pin[1]
+                    and held.feed_epoch == self.feed.epoch and held.feed_owner is self.feed._projection_owner
+                    and held.watch_token is token and captured and held.external_capture
+                    and self.feed.readers.external_semantic(captured)
+                        == self.feed.readers.external_semantic(held.external_capture)):
+                # Reuse exact board computation on a canonical/full retry. The
+                # writer independently overlays newer canonical authority. Do not
+                # erase an observation or renew computation clocks at this seam.
+                projection = self.feed.carry_board_observations(self.store, held, captured)
+                if base.get('canonical_seq', 0) > held.bundle.get('canonical_seq', 0):
+                    bundle = sys.modules[type(held).__module__].canonical_overlay(
+                        self.module.thaw(projection.bundle), base)
+                    bundle['model'] = self.feed.reducer(bundle, now=self.feed.clock())
+                    projection = replace(projection, bundle=self.module.freeze(bundle))
+            else:
+                projection = self.feed.project_board(self.store, chat, canonical_base=base, pin=pin,
+                                                     external_capture=captured)
+                if captured:
+                    bundle = self.feed.readers.advance_external(self.module.thaw(projection.bundle), captured)
+                    bundle['model'] = self.feed.reducer(bundle, now=self.feed.clock())
+                    projection = replace(projection, bundle=self.module.freeze(bundle))
             # Bind to the watch that owned this pin, never a same-name watch
             # installed while base selection or pure projection was in flight.
             projection = replace(projection, watch_token=token)
