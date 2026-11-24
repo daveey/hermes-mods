@@ -236,8 +236,7 @@ def test_core_production_adapter_and_canonical_compression(sources, monkeypatch)
         assert captured is not None
         s.put(s.task('t_tip', session='tip', title='changed'))
         assert mirror.remote.membership_capture(OWNER) != captured
-        monkeypatch.setattr(kanban_db_sync, 'sync_config', lambda: {'links_reader': 'replica'})
-        assert mirror.remote.membership_capture(OWNER) is None
+    # Alias/membership input errors are exercised separately in replica mode.
     finally:
         state.close()
 

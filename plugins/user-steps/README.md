@@ -266,11 +266,20 @@ current owner publication (matching version and payload), even though that task
 has no direct chat link. Missing/re-homed or mismatched retained observations
 remain unknown, without running the writeful ledger projector. Terminal ledger
 rows also require canonical owner evidence; this capture is not release policy.
-Healthy pull/owner-heartbeat refreshes do not churn it;
-expiry, missing/unknown inputs, unqualified ownership, local-authority ledger
-bindings, or the unsupported alternate `links_reader=replica` shadow path return
-`None`. `panel_membership.unchanged(previous, current)` treats even `None` → `None`
-as changed. Reads never initialize absent stores or project/refresh the ledger.
+Healthy pull/owner-heartbeat refreshes do not churn it. In `links_reader=replica`
+mode the key also covers every configured board's complete chat-link shadow
+inventory for this origin gateway/profile and compression lineage, including
+arrivals, removals, releases and associated task content. Empty boards must also
+be readable and fresh. Selected foreign shadows need an exact current ledger
+binding; guessed owner/profile labels are not evidence. The effective sync-reader
+gateway and active profile must match the capture scope. The retained origin
+facts/cache projection consumed by `stale_ok` readers is keyed independently, so
+its later publication cannot be swallowed by a successful source-store memo.
+Expiry, missing/unknown inputs, unqualified ownership or local-authority ledger
+bindings return `None`. `panel_membership.unchanged(previous, current)` treats even
+`None` → `None` as changed. A known arrival/removal changes the digest; it is not
+an unknown-source verdict. Reads never initialize absent stores or project/refresh
+the ledger (the production display adapter may schedule its normal cache refresh).
 This API alone is **not** permission to skip reconciliation. The panel's
 `Mirror._panel_stamp(owner)` composes it with semantic ActionStore requests,
 revisions, bindings, withdrawals and operations in a closed read snapshot.
