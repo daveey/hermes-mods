@@ -42,6 +42,10 @@ MAX_REPLY_WAIT = 600
 # on a message that still lands. When the wait ends the request is marked cancelled and the courier stops.
 SEND_BUSY_RETRY = 300
 SEND_RETRY_GRACE = 60  # the last re-submit's own 45 s timeout + posting the result
+# A send's whole wait (busy retry + grace + reply wait) stays under core's 420 s cut, so `wait_for_reply` is
+# shortened to what is left; the result says so when it was.
+SEND_TOTAL_WAIT_MAX = 400
+SEND_REPLY_WAIT_MAX = SEND_TOTAL_WAIT_MAX - SEND_BUSY_RETRY - SEND_RETRY_GRACE
 
 SCHEMA = {
     "name": "cross_session",
@@ -56,7 +60,8 @@ SCHEMA = {
         "- action=send: deliver `message` into `target` as a new user turn, attributed to this "
         "session. A Kanban worker (HERMES_KANBAN_TASK set) cannot send into a human chat "
         "(desktop/cli source); that send is refused and names the card to place instead. "
-        "With `wait_for_reply` (seconds, max 600) it waits for that session's next reply "
+        "With `wait_for_reply` (seconds, at most 40: longer waits are shortened and the result says so; "
+        "read the target later for a slow reply) it waits for that session's next reply "
         "and returns it; otherwise it returns once delivered.\n"
         "While another Hermes window holds the target's turn the send is retried for up to 5 minutes; "
         "`status: refused` with `retry_safe: true` after that means nothing was delivered.\n"
@@ -178,13 +183,27 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
             return _err(refusal)
         args["message"] = tag_standing(str(args["message"]))
 
-    wait = 0
+    wait = asked = 0
     if action == "send":
         try:
-            wait = max(0, min(MAX_REPLY_WAIT, int(args.get("wait_for_reply") or 0)))
+            asked = max(0, min(MAX_REPLY_WAIT, int(args.get("wait_for_reply") or 0)))
         except (TypeError, ValueError):
-            wait = 0
-    return _relay(action, args, session_id, wait)
+            asked = 0
+        wait = min(asked, SEND_REPLY_WAIT_MAX)
+    out = _relay(action, args, session_id, wait)
+    if wait < asked:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return out
+        if isinstance(data, dict):
+            data["reply_wait_seconds"] = wait
+            data["reply_wait_note"] = (
+                f"wait_for_reply was shortened from {asked} s to {wait} s: a send may spend up to "
+                f"{SEND_BUSY_RETRY + SEND_RETRY_GRACE} s reaching a busy chat and a tool call is cut at 420 s. "
+                "No reply here does not mean none will come: read the target (action=read) later.")
+            out = json.dumps(data)
+    return out
 
 
 TASK_SCHEMA = {
@@ -494,6 +513,14 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
                             + (" " + HUB_HINT if action.startswith("task_") else ""))
             return _err("The Hermes Desktop app did not pick up the request — it must be running with the "
                         "session-mentions plugin enabled to reach other gateways.")
+        if action == "send" and _interrupted():
+            # The turn was stopped or this call abandoned: nobody reads the answer, so stop the courier's retry.
+            if rf.take_back(outbox):
+                return _err("Interrupted before the Desktop picked the send up: nothing was sent.")
+            if hasattr(rf, "mark_cancelled"):
+                rf.mark_cancelled(rid, base)
+            return _err("Interrupted while the Desktop was delivering the send: its retry was cancelled, "
+                        "but a submit already under way may still land. Read the target before resending.")
         time.sleep(0.5)
     if timeout_seconds is not None:
         rf.take_back(outbox)  # withdraw unclaimed bounded read requests
@@ -507,6 +534,17 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         except (OSError, ValueError):
             pass
     return _err("Timed out waiting for the Desktop to finish the request (it may still complete).")
+
+
+def _interrupted() -> bool:
+    """Core's per-thread interrupt bit (tools.interrupt): set on this tool's worker thread when the turn is
+    stopped or the call is abandoned. False where core is not importable (tests, older core)."""
+    try:
+        from tools.interrupt import is_interrupted  # type: ignore
+
+        return bool(is_interrupted())
+    except Exception:
+        return False
 
 
 _QUALIFIED_REF = None
