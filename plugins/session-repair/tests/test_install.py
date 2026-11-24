@@ -1,6 +1,7 @@
 """install.py: the plan, --apply (wrapper, config, cron create through a fake), and idempotence."""
 import json
 import subprocess
+import types
 
 from sr_helpers import PLUGIN, load
 
@@ -71,7 +72,9 @@ def test_plan_refuses_a_bot_chat_that_cannot_show_failures(tmp_path, monkeypatch
     from tools import bot_live_delivery
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     calls = []
-    monkeypatch.setattr(inst.subprocess, 'run', lambda argv, **kw: calls.append(argv))
+    # Patch only the installer's subprocess binding: core imported here starts background
+    # provider workers (`python -m providers.<x> --worker`) through the global subprocess.run.
+    monkeypatch.setattr(inst, 'subprocess', types.SimpleNamespace(run=lambda argv, **kw: calls.append(argv)))
     state = {'owner': {'session_id': 'B1'}, 'enabled': True}
 
     def owner(home):
