@@ -57,6 +57,28 @@ Source workers release their per-acquisition readers. Canonical reader objects
 use thread-local connections released after each owned canonical pass. Reader
 objects may persist; handles and connections never transfer between owners.
 
+## Compatible custody transfer
+
+After every predecessor role drains, `SourceCoordinator.inherit` consumes the
+existing B1 `SnapshotStore.transfer` exactly once. Same-schema content-qualified
+module generations rebind immutable dataclass keys/values into the current
+snapshot module; different field layouts fail closed without consuming the old
+store. Store epoch, exact versions/receipts/demands, watch identities, missing
+coverage, failures and first-unserved admission ages remain. Acquisition owner
+tokens rotate: an old capture cannot acquire authority on the new store.
+
+FIFO pending ages (including current active projection ages) and source/scope,
+reader-role and projection retry signatures/counts/deadlines carry independently.
+Late queued reader-role failures are included before installation. An interrupted
+capture retains its already consumed attempt and gets a finite backoff; reload
+is not a new source event or fresh retry budget. A real changed stamp or changed
+exact demand continues to be the retry recovery boundary.
+
+Canonical input bases/readers are not transferred. Carried bundles remain
+unvouched; metadata/current scope checks and current canonical reads still own
+subsequent publication. Transfer does not renew capture, computation, execution
+or authenticated-inclusion clocks, and does not acknowledge any admission.
+
 ## Rollback and downstream receipt
 
 Before activation, rollback is leaving composition uncalled. After authorized
@@ -69,6 +91,6 @@ API/reader generation, Feed/store epochs, retired ancestors, thread/role identit
 and current source/watch/demand vectors. Source tests, callbacks and cached hashes
 do not establish activation or authenticated exact inclusion.
 
-This lifetime slice alone does not establish admission-age/retry transfer, single
-strict-capture observation carriage, authenticated inclusion, native pixels,
-latency, performance or CPU gates. Those obligations remain unchanged.
+This implementation slice alone does not establish the complete population/race
+matrix, single strict-capture observation carriage, authenticated inclusion,
+native pixels, latency, performance or CPU gates. Those obligations remain unchanged.

@@ -284,6 +284,34 @@ class SnapshotCapacity(RuntimeError):
     """Explicit custody refusal; no cursor or certificate was advanced."""
 
 
+def rehome(value) -> Any:
+    """Rebind compatible detached v1 values across content-qualified modules.
+
+    Same-schema module generations have distinct dataclass identity. Copying
+    their keys verbatim silently orphans demands. Validate exact field layouts;
+    never migrate a different schema or accept a mutable/unknown object.
+    """
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return freeze({rehome(k): rehome(v) for k, v in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(rehome(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(rehome(v) for v in value)
+    allowed = {cls.__name__: cls for cls in (SourceKey, CardKey, ChatKey, Watch,
+        SourceVersion, ScopeId, ScopeDemand, Coverage, Receipt, Membership, SourcePart,
+        Snapshot, Admission)}
+    target = allowed.get(type(value).__name__)
+    if target is None or not hasattr(value, '__dataclass_fields__'):
+        raise StaleCapture('incompatible detached transfer value: ' + type(value).__name__)
+    if tuple(f.name for f in fields(value)) != tuple(f.name for f in fields(target)):
+        raise StaleCapture('incompatible transfer field layout: ' + target.__name__)
+    if type(value) is target:
+        return freeze(value)
+    return target(**{f.name: rehome(getattr(value, f.name)) for f in fields(target)})
+
+
 class SnapshotStore:
     _schema = 'board-snapshot/1'
 
@@ -694,7 +722,7 @@ class SnapshotStore:
                       max_tokens=stopped_owner._limits[2], max_pending_receipts=stopped_owner._limits[3])
             new.epoch, new._sequence = stopped_owner.epoch, stopped_owner._sequence
             for name in ('_parts', '_watches', '_refs', '_refs_gen', '_versions', '_failures', '_admissions'):
-                setattr(new, name, dict(getattr(stopped_owner, name)))
+                setattr(new, name, dict(rehome(getattr(stopped_owner, name))))
             new._used_tokens = set(stopped_owner._used_tokens)
             new._owners = {source: uuid4().hex for source in new._versions}
             stopped_owner._transferred = True
