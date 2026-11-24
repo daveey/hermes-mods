@@ -117,7 +117,8 @@ def test_detached_chat_admission_does_not_wait_or_kill_owner(tmp_path,monkeypatc
     def popen(argv,**kw):
         spawned.append((argv,kw))
         return SimpleNamespace(pid=123,poll=lambda:None)
-    monkeypatch.setattr(nudge.subprocess,'Popen',popen)
+    # Nudge-local binding only: a global Popen patch also captures core's background provider workers.
+    monkeypatch.setattr(nudge,'subprocess',SimpleNamespace(run=subprocess.run,Popen=popen,DEVNULL=subprocess.DEVNULL))
     monkeypatch.setattr(nudge,'receipt',lambda *a:{'message_id':12})
     result=nudge.process([f],home=tmp_path,now=10000,scan=SimpleNamespace(Sources=lambda:None),runner=subprocess.run,
                          argv=['hermes'],read_json=run._read_json,write_json=run._write_json,append=run._append)
