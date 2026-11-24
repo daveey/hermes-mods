@@ -81,6 +81,103 @@ def test_unavailable_preserves_incident_and_closed_card_starts_new(tmp_path):
     assert len(tools.cards) == 2
 
 
+class OverlapTools(Tools):
+    """Core's create_overlap refusal for any create that does not declare the open cards distinct."""
+    def __init__(self, open_cards, refuse_always=False):
+        super().__init__()
+        self.open_cards, self.refuse_always = open_cards, refuse_always
+        for card in open_cards:
+            self.cards[card["id"]] = {"id": card["id"], "status": "blocked"}
+
+    def __call__(self, name, args):
+        if name == "kanban_create" and (self.refuse_always or not args.get("distinct_from")):
+            self.calls.append((name, args))
+            return {"ok": False, "created": False, "code": "create_overlap", "matches": self.open_cards}
+        return super().__call__(name, args)
+
+
+def dirty_twice(m, key):
+    m.sample(key, DIRTY)
+    return m.sample(key, DIRTY)
+
+
+def test_overlap_with_another_targets_card_retries_distinct(tmp_path):
+    hub_decision = {"id": "t_hub", "title": "Spend budget decision: Repair persistent Kanban sync drift: hub/default"}
+    tools = OverlapTools([hub_decision])
+    row = dirty_twice(monitor.Monitor(tmp_path / "state.json", tools), "macbook/default")
+    creates = [args for name, args in tools.calls if name == "kanban_create"]
+    assert len(creates) == 2 and "distinct_from" not in creates[0]
+    assert creates[1]["distinct_from"] == ["t_hub"] and "macbook/default" in creates[1]["distinct_reason"]
+    assert creates[1]["idempotency_key"] == creates[0]["idempotency_key"]
+    assert row["card"].startswith("t_fixture_") and row["card"] != "t_hub"
+
+
+@pytest.mark.parametrize("same_title", [
+    "Spend budget decision: Repair persistent Kanban sync drift: macbook/default",
+    "Repair persistent Kanban sync drift: macbook/default (retry)"])
+def test_overlap_with_a_same_target_card_keeps_the_guard(tmp_path, same_title):
+    same = {"id": "t_same", "title": same_title}
+    tools = OverlapTools([same, {"id": "t_hub", "title": "Repair persistent Kanban sync drift: hub/default"}])
+    m = monitor.Monitor(tmp_path / "state.json", tools)
+    m.sample("macbook/default", DIRTY)
+    with pytest.raises(RuntimeError, match="create_overlap"):
+        m.sample("macbook/default", DIRTY)
+    assert len([1 for name, _ in tools.calls if name == "kanban_create"]) == 1
+    assert m.state["targets"]["macbook/default"]["card"] is None
+
+
+@requires_core
+def test_real_core_overlap_refusal_is_resolved_with_distinct_from(tmp_path, monkeypatch):
+    """Core's own create_overlap check: a keyless decision card quoting hub/default's repair title refuses the
+    macbook/default create; the monitor's retry covers every shown match and core admits it."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    (tmp_path / "mail.json").write_text(json.dumps({"gateway": "fixture-gw"}))
+    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
+    kbc.connect(kb.kanban_db_path()).close()
+    decision = monitor.native_tool("kanban_create", {
+        "title": "Spend budget decision: Repair persistent Kanban sync drift: hub/default",
+        "body": "fixture decision card", "assignee": "default", "requires": ["terminal"], "placement": "auto",
+        "board": "default", "completion_contract": "local-only"})
+    decision_id = decision.get("task_id") or decision.get("id")
+    assert decision_id
+    calls = []
+
+    def tool(name, args):
+        result = monitor.native_tool(name, args)
+        calls.append((name, args, result))
+        return result
+
+    card = dirty_twice(monitor.Monitor(tmp_path / "drift.json", tool), "macbook/default")["card"]
+    creates = [(args, result) for name, args, result in calls if name == "kanban_create"]
+    assert creates[0][1].get("code") == "create_overlap"
+    assert decision_id in creates[1][0]["distinct_from"]
+    assert set(creates[1][0]["distinct_from"]) == {m["id"] for m in creates[0][1]["matches"]}
+    shown = monitor.native_tool("kanban_show", {"task_id": card, "board": "default"})["task"]
+    assert shown["title"] == "Repair persistent Kanban sync drift: macbook/default" and card != decision_id
+
+
+def test_overlap_key_prefix_of_another_target_is_not_same_target(tmp_path):
+    tools = OverlapTools([{"id": "t_other", "title": "Repair persistent Kanban sync drift: mini/default-2"}])
+    row = dirty_twice(monitor.Monitor(tmp_path / "state.json", tools), "mini/default")
+    assert row["card"].startswith("t_fixture_")
+
+
+def test_overlap_refused_again_fails_loudly(tmp_path):
+    tools = OverlapTools([{"id": "t_hub", "title": "Repair persistent Kanban sync drift: hub/default"}],
+                         refuse_always=True)
+    m = monitor.Monitor(tmp_path / "state.json", tools)
+    m.sample("macbook/default", DIRTY)
+    with pytest.raises(RuntimeError, match="create_overlap"):
+        m.sample("macbook/default", DIRTY)
+    assert len([1 for name, _ in tools.calls if name == "kanban_create"]) == 2
+
+
 def test_crash_after_create_retries_same_identity(tmp_path):
     tools = Tools()
     path = tmp_path / "state.json"

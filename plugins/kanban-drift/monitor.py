@@ -88,12 +88,15 @@ class Monitor:
             # placement "auto", never "local": on the hub "local" is a hub slot that core's admission judge must
             # admit, and it denies routine repair work (pool workers have hub ssh + hub-admin), so the create was
             # refused and no repair card was ever filed (cron-0d63c0cf26). "auto" joins the worker pool.
-            result = self.tool("kanban_create", {
-                "title": f"Repair persistent Kanban sync drift: {key}", "body": body,
-                "assignee": self.assignee, "requires": ["terminal", "file", "kanban"],
-                "placement": "auto", "board": self.board,
-                "idempotency_key": "kanban-drift:" + key + ":" + row["incident"],
-                "completion_contract": "local-only"})
+            title = f"Repair persistent Kanban sync drift: {key}"
+            create = {"title": title, "body": body,
+                      "assignee": self.assignee, "requires": ["terminal", "file", "kanban"],
+                      "placement": "auto", "board": self.board,
+                      "idempotency_key": "kanban-drift:" + key + ":" + row["incident"],
+                      "completion_contract": "local-only"}
+            result = self.tool("kanban_create", create)
+            if result.get("code") == "create_overlap":
+                result = self._resolve_overlap(key, create, result)
             row["card"] = result.get("task_id") or result.get("id") or result.get("task", {}).get("id")
             if not row["card"]:
                 raise RuntimeError("Kanban create returned no card: " + json.dumps(result))
@@ -106,6 +109,23 @@ class Monitor:
         row["last_report"] = report
         self.save()
         return row
+
+    def _resolve_overlap(self, key, create, refusal):
+        """Core refuses a create whose title shares words with an open card. It already skips this monitor's own
+        cards (same idempotency-key prefix), but not cards without that key: a decision card quoting another
+        target's repair title matches, e.g. macbook/default was refused against hub/default's "Spend budget
+        decision: ..." card on every pass. When every match is about another target, retry once declaring them
+        distinct. A match about this same target (": <key>" in its title) keeps the guard: the refusal is
+        returned unchanged and fails loudly in the caller, as does a second refusal."""
+        matches = refusal.get("matches") or []
+        ids = [m.get("id") for m in matches]
+        same_target = re.compile(r":\s*" + re.escape(key) + r"(?![\w/.-])")
+        if not matches or not all(ids) or any(same_target.search(m.get("title") or "") for m in matches):
+            return refusal
+        return self.tool("kanban_create", dict(
+            create, distinct_from=ids,
+            distinct_reason=f"The drift monitor files one repair card per target; this one is {key}, "
+                            "and every matched card is about a different target."))
 
 
 def collect(argv, timeout=90):
