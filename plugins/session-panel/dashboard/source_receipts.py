@@ -26,7 +26,7 @@ IDENTITY_FIELDS = ('boot_id', 'pid', 'process_birth_ticks', 'runtime_sha', 'mods
 EVENTS = frozenset(('source_received', 'source_error', 'capture_start', 'capture_end',
     'admitted', 'projection_start', 'projection_end', 'model_stored', 'emit_callback', 'emit_success',
     'emit_error', 'catchup_success', 'catchup_error', 'no_change', 'superseded',
-    'forgotten', 'window_end'))
+    'forgotten', 'writer_request', 'writer_acquire', 'writer_release', 'window_end'))
 
 
 def detached(value):
@@ -41,6 +41,8 @@ def detached(value):
         return [detached(v) for v in value]
     if isinstance(value, (set, frozenset)):
         return sorted((detached(v) for v in value), key=encode)
+    if isinstance(value, bytes):
+        return {'type': 'bytes', 'base64': base64.b64encode(value).decode('ascii')}
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise TypeError(f'unsupported receipt value: {type(value).__name__}')
@@ -78,6 +80,7 @@ class ReceiptLog:
         self.lock = threading.Lock()
         self.queued_bytes = self.dropped_records = 0
         self.write_errors = []
+        self.encoding_errors = []
         self.closed = False
         self.thread = threading.Thread(target=self._run, name='panel-source-receipts', daemon=True)
         self.thread.start()
@@ -108,9 +111,13 @@ class ReceiptLog:
             raise ValueError('receipt payload cannot override custody identity')
         try:
             raw = encode(self._value(event, data)) + b'\n'
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
             with self.lock:
                 self.dropped_records += 1
+                # Exception text here contains only the unsupported type or JSON
+                # encoding category, not the rejected private value itself.
+                if len(self.encoding_errors) < 25:
+                    self.encoding_errors.append(str(exc))
             return False
         with self.lock:
             if self.closed or len(raw) > self.max_record_bytes or self.queued_bytes + len(raw) > self.queue_bytes:
@@ -154,7 +161,8 @@ class ReceiptLog:
                 terminal = item is None
                 if terminal:
                     with self.lock:
-                        counts = {'dropped_records': self.dropped_records, 'write_errors': list(self.write_errors)}
+                        counts = {'dropped_records': self.dropped_records, 'write_errors': list(self.write_errors),
+                                  'encoding_errors': list(self.encoding_errors)}
                     item = encode(self._value('window_end', counts)) + b'\n'
                     with self.lock:
                         self.queued_bytes += len(item)
@@ -199,6 +207,7 @@ def publication(feed, session, held):
     return detached({'publication_id': uuid4().hex, 'feed_epoch': feed.epoch,
         'chat': p.admission.chat if p is not None else None, 'session': session,
         'chat_rev': held['rev'], 'model_revision': (b.get('model') or {}).get('revision'),
+        'writer': getattr(feed._writer_context, 'current', None),
         'canonical_seq': b.get('canonical_seq'), 'computed_seq': b.get('computed_seq'),
         'computed_at': b.get('computed_at'), 'board_observed_at': b.get('board_observed_at'),
         'admission': p.admission if p is not None else None,

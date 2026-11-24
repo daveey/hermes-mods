@@ -13,8 +13,55 @@ import sys
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 log = logging.getLogger('session-panel')
+
+
+class StageCost:
+    """Explicit thread-local CPython C-boundary counter, not a syscall tracer.
+
+    Counts SQLite connection/execute and socket/SSL I/O attempts in this thread.
+    Existing/replaced profilers remain untouched and produce unavailable evidence,
+    never zero costs. Rows/VM steps are supplied only by actual capture adapters.
+    """
+    def __init__(self):
+        self.counters = dict(db_opens=0, sql_calls=0, network_calls=0)
+        self.hook = self._profile
+        self.reason = 'not_started'
+
+    def start(self):
+        if sys.getprofile() is not None:
+            self.reason = 'preexisting_profiler'
+            return
+        self.reason = None
+        sys.setprofile(self.hook)
+
+    def _profile(self, frame, event, function):
+        if event != 'c_call':
+            return
+        name = getattr(function, '__name__', '')
+        module = getattr(function, '__module__', '')
+        if name == 'connect' and module in ('sqlite3', '_sqlite3'):
+            self.counters['db_opens'] += 1
+        owner = getattr(function, '__self__', None)
+        bases = type(owner).__mro__
+        if name in ('execute', 'executemany', 'executescript') and any(
+                base.__module__ == 'sqlite3' and base.__name__ in ('Connection', 'Cursor') for base in bases):
+            self.counters['sql_calls'] += 1
+        if name in ('connect', 'connect_ex', 'send', 'sendall', 'sendto', 'sendmsg',
+                    'recv', 'recv_into', 'recvfrom', 'recvfrom_into', 'recvmsg', 'recvmsg_into',
+                    'read', 'write', 'do_handshake') and any(
+                base.__module__ in ('_socket', '_ssl') for base in bases):
+            self.counters['network_calls'] += 1
+
+    def finish(self):
+        if self.reason is not None:
+            return dict(available=False, reason=self.reason)
+        if sys.getprofile() is not self.hook:
+            return dict(available=False, reason='profiler_replaced')
+        sys.setprofile(None)
+        return dict(available=True, **self.counters)
 
 
 class BoardBundle(dict):
@@ -202,6 +249,7 @@ class SourceCoordinator:
         self.completed = queue.SimpleQueue()
         self.pending, self.active, self.acquiring = {}, {}, {}
         self._active_ages = {}
+        self._queue_generations = {}  # local worker fence, never source authority
         self.attempts = {s: Attempt() for s in (*self.sources, self.external)}
         self.scope_attempts = {s: {} for s in self.attempts}
         self.registration_attempt = Attempt()
@@ -224,6 +272,21 @@ class SourceCoordinator:
         self._workers = 0
         self.predecessor = None
         self.successor = None
+
+    def _receipt_log(self):
+        return getattr(self.feed, 'receipt_log', None)
+
+    def _record(self, event, **data):
+        recorder = self._receipt_log()
+        if recorder is not None:
+            # Called after source/store locks; never flush/close from this seam.
+            recorder.record(event, feed_epoch=self.feed.epoch,
+                            coordinator_epoch=self.store.epoch, **data)
+
+    def _admission_receipts(self, admissions, *, current_state, **data):
+        for admission in admissions:
+            self._record('admitted', admission=admission, chat=admission.chat,
+                         current_state=current_state, **data)
 
     def inherit(self, retirement):
         """Use B1's compatible stopped-store transfer; never copy live workers.
@@ -360,6 +423,7 @@ class SourceCoordinator:
     def _queue(self, sessions):
         for s in sessions:
             if s in self.chats:
+                self._queue_generations[s] = self._queue_generations.get(s, 0) + 1
                 admission = self.store.pin(self.chats[s])[1]
                 signature = (admission.required_versions, admission.required_scopes,
                              admission.required_failures, admission.missing_versions)
@@ -397,6 +461,7 @@ class SourceCoordinator:
         with self.feed.lock:
             wanted = dict(self.feed._watch_tokens)
         lineages = {s: tuple(rd.lineage(s) or [s]) for s in wanted}
+        forgotten, registered = [], []
         with self.lock:
             if self.closed:
                 return
@@ -405,10 +470,12 @@ class SourceCoordinator:
                     chat = self.chats.pop(s)
                     watch = self.store.pin(chat)[0].watches[chat]
                     self.store.forget(chat, watch.opaque_watch_token)
+                    forgotten.append(watch)
                     self.tokens.pop(s, None)
                     self.bases.pop(s, None)
                     self.pending.pop(s, None)
                     self._active_ages.pop(s, None)
+                    self._queue_generations.pop(s, None)
                     self.projection_attempts.pop(s, None)
                     self._cancel_tickets(s, 'snapshot watch was forgotten or replaced')
             for s, token in wanted.items():
@@ -419,10 +486,17 @@ class SourceCoordinator:
                 changed = self.store.register([self.module.Watch(chat, '', ids, 0)])
                 self.chats[s], self.tokens[s] = chat, token
                 if changed:
+                    registered.append(chat)
                     self._queue([s])
                     self._changed([s])
             demands = self.store.demands(self.external)
             self.external_raw = {sid: value for sid, value in self.external_raw.items() if sid in demands}
+            state = self.store.receipt_state() if self._receipt_log() is not None else None
+        if state is not None:
+            for watch in forgotten:
+                self._record('forgotten', chat=watch.chat, watch=watch, current_state=state)
+            self._admission_receipts((state['admissions'][c] for c in registered),
+                                     current_state=state, reason='registration')
 
     def require(self, session, refs):
         """Exact owner-qualified dependency expansion, never an ID-only lookup."""
@@ -431,6 +505,10 @@ class SourceCoordinator:
             if changed:
                 self._queue([session])
                 self._local_requested = self._external_requested = True
+            state = self.store.receipt_state() if changed and self._receipt_log() is not None else None
+            chat = self.chats[session]
+        if state is not None:
+            self._admission_receipts([state['admissions'][chat]], current_state=state, reason='refs_changed')
         self.service_wake.set()
         self.feed._board.set()
         return changed
@@ -637,12 +715,26 @@ class SourceCoordinator:
                     attempted.add(sid)
                     attempt.count += 1
                     attempt.retry_at = None
+        measured = self._receipt_log() is not None
+        receipt_data = dict(capture_attempt_id=uuid4().hex, source=source,
+            domain='external' if source == self.external else 'local',
+            frozen_demands=demands, input_stamp=stamp, prior_version=prior,
+            owner_token=hint.owner_token) if measured else {}
+        started = time.monotonic_ns() if measured else 0
+        cpu = time.thread_time_ns() if measured else 0
+        disposition, part, failure, raw = 'error', None, None, None
+        cost = StageCost() if measured else None
+        if measured:
+            self._record('capture_start', **receipt_data)
+            assert cost is not None
+            cost.start()
         try:
             if source == self.external:
                 raw = self.capture.capture_external_raw(rd, demands, {}, {source: hint})
                 if self._observe_external(rd, raw, previous, prior):
                     with self.lock:
                         self._settle_attempts(source, attempted, self.store.pending(source))
+                    disposition = 'observation_only'
                     return
                 parts = rd.capture_external(demands, {}, snapshot.parts, hints={source: hint}, raw=raw)
                 part, = parts
@@ -651,7 +743,8 @@ class SourceCoordinator:
                     self._remember_external(accepted, raw)
             else:
                 part = rd.capture_local(source, previous, demands, hint)
-                _, admissions = self.store.accept_local(part, prior)
+                accepted, admissions = self.store.accept_local(part, prior)
+            disposition = 'accepted'
             with self.lock:
                 if self.closed:
                     return
@@ -664,7 +757,24 @@ class SourceCoordinator:
                 self._queue(ad.chat.session_id for ad in admissions)
                 self._changed(ad.chat.session_id for ad in admissions)
                 self.completed.put(('source', source, part))
+                state = self.store.receipt_state() if measured else None
+            if measured:
+                changed = set(part.tombstones) | set(part.invalidated_keys)
+                for name in ('rows', 'details', 'edges'):
+                    old = getattr(previous, name) if previous is not None else {}
+                    new = getattr(part, name)
+                    changed.update(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+                if previous is not None and previous.remote_parents != part.remote_parents:
+                    changed.update(previous.rows)
+                self._record('source_received', **receipt_data, receipt=part.receipt,
+                    current_state=state, metrics=part.metrics, changed_keys=frozenset(changed),
+                    old_membership=previous.memberships if previous is not None else (),
+                    new_membership=accepted.parts[source].memberships,
+                    elapsed_ns=time.monotonic_ns() - started,
+                    thread_cpu_ns=time.thread_time_ns() - cpu)
+                self._admission_receipts(admissions, current_state=state, **receipt_data)
         except self.module.StaleCapture:
+            disposition = 'superseded'
             # A losing CAS must not poison a newer accepted source. A reset or
             # demand change can also refuse the capture without a replacement
             # success, however: settle still-unknown work on the existing finite
@@ -675,6 +785,8 @@ class SourceCoordinator:
                     self._settle_attempts(source, attempted, self.store.pending(source))
             return
         except Exception as exc:
+            failure = type(exc).__name__
+            failed_admissions, state = (), None
             with self.lock:
                 if not self.closed:
                     accepted = self.store.fail(source, prior.source_generation, exc, demands, prior_version=prior)
@@ -683,7 +795,31 @@ class SourceCoordinator:
                         self._queue(d.id.chat.session_id for d in demands.values())
                         if source == self.external:
                             self.feed._board_capture_failures.update(d.id.chat.session_id for d in demands.values())
+                        if measured:
+                            state = self.store.receipt_state()
+                            failed_admissions = tuple(state['admissions'][sid.chat] for sid in demands
+                                                      if sid.chat in state['admissions'])
+            if state is not None:
+                self._record('source_error', **receipt_data, current_state=state, error=failure)
+                self._admission_receipts(failed_admissions, current_state=state, **receipt_data)
             log.warning('session-panel source capture failed: %s', source.producer, exc_info=True)
+        finally:
+            if measured:
+                assert cost is not None
+                io_cost = cost.finish()
+                if io_cost.get('available') is True and part is not None:
+                    # These are actual adapter counters, not inferred zeros for
+                    # adapters which cannot supply rows/VM-step observations.
+                    io_cost.update({k: part.metrics[k] for k in ('rows_returned', 'vm_steps')
+                                    if k in part.metrics})
+                self._record('capture_end', **receipt_data, disposition=disposition, error=failure,
+                    receipt=part.receipt if part is not None else None,
+                    strict_capture=raw,
+                    metrics=part.metrics if part is not None else {},
+                    io_cost=io_cost,
+                    current_state=self.store.receipt_state(),
+                    elapsed_ns=time.monotonic_ns() - started,
+                    thread_cpu_ns=time.thread_time_ns() - cpu)
 
     def _acquire_local(self, rd, stamp):
         for source in self.sources:
@@ -790,6 +926,14 @@ class SourceCoordinator:
 
     def _project(self, s):
         tickets = []
+        measured = self._receipt_log() is not None
+        projection_attempt_id = uuid4().hex if measured else None
+        started = time.monotonic_ns() if measured else 0
+        cpu = time.thread_time_ns() if measured else 0
+        pin, projection = None, None
+        disposition, failure = 'error', None
+        cost = StageCost() if measured else None
+        io_cost, computation_end, computation_cpu = None, None, None
         try:
             with self.lock:
                 chat = self.chats[s]
@@ -798,11 +942,19 @@ class SourceCoordinator:
                 if token is not self.feed._watch_tokens.get(s):
                     raise RuntimeError('snapshot watch was replaced')
                 pin = self.store.pin(chat)
+                queued_generation = self._queue_generations.get(s, 0)
                 lineage = pin[0].watches[chat].lineage_tuple
                 demand = pin[1].required_scopes[self.external]
                 raw = self.external_raw.get(demand.id)
                 captured = (raw[1] if raw is not None
                             and raw[0] == pin[1].required_versions.get(self.external) else ())
+            if measured:
+                self._record('projection_start', projection_attempt_id=projection_attempt_id,
+                    chat=chat, admission=pin[1], pinned_versions=pin[1].required_versions,
+                    frozen_demands=pin[1].required_scopes,
+                    current_state=self.store.receipt_state())
+                assert cost is not None
+                cost.start()
             base = self._base(s, lineage)
             with self.feed.lock:
                 held = (self.feed.bundles.get(s) or {}).get('board_projection')
@@ -830,8 +982,15 @@ class SourceCoordinator:
             # Bind to the watch that owned this pin, never a same-name watch
             # installed while base selection or pure projection was in flight.
             projection = replace(projection, watch_token=token)
+            if measured:
+                # Publication has its own complete writer clocks/costs. Network
+                # I/O in the existing emit callback is NOT projection I/O.
+                assert cost is not None
+                io_cost = cost.finish()
+                computation_end, computation_cpu = time.monotonic_ns(), time.thread_time_ns()
             results = self.feed.publish_projections(self.store, {s: projection})
             result = results[s]
+            disposition = result.disposition
             bundle = BoardBundle(projection, self.module)
             with self.lock:
                 if self.closed:
@@ -850,8 +1009,20 @@ class SourceCoordinator:
                       and self.store.current(projection.admission)):
                     self.feed._board_failures.discard(s)
                     self.feed._retry.discard(s)
-                if (result.disposition != 'superseded' and s not in self.pending
-                        and self.store.current(projection.admission)):
+                if (result.disposition != 'superseded'
+                        and self.store.current(projection.admission)
+                        and self._queue_generations.get(s, 0) == queued_generation
+                        and not self.tickets.get(s)
+                        and self.bases.get(s, {}).get('canonical_seq', 0)
+                            <= projection.bundle.get('canonical_seq', 0)):
+                    # A request/source change can requeue a worker after slot
+                    # admission but BEFORE its immutable pin. If this successful
+                    # publication covers that current pin/canonical base, the
+                    # queued work is served too. Keeping it would retain the old
+                    # episode age forever, letting two hot chats starve FIFO.
+                    # Later source versions, canonical reads or tickets remain
+                    # owed and preserve their original first-unserved age.
+                    self.pending.pop(s, None)
                     self.projection_attempts.pop(s, None)
             for ticket in tickets:
                 if result.disposition in {'stored', 'no_change'}:
@@ -870,6 +1041,7 @@ class SourceCoordinator:
                 elif ticket.error is None:
                     ticket.error = RuntimeError('snapshot publication refused: ' + result.disposition)
         except Exception as exc:
+            failure = type(exc).__name__
             with self.lock:
                 if not self.closed:
                     self.feed._board_failures.add(s)
@@ -880,6 +1052,38 @@ class SourceCoordinator:
                 ticket.error = exc
             log.warning('session-panel pure projection failed: %s', s, exc_info=True)
         finally:
+            if measured:
+                assert cost is not None
+                if io_cost is None:
+                    io_cost = cost.finish()
+                    computation_end, computation_cpu = time.monotonic_ns(), time.thread_time_ns()
+                state = self.store.receipt_state()
+                if state['closed']:
+                    disposition = 'retired'
+                elif pin is not None and state['watches'].get(pin[1].chat) != pin[0].watches.get(pin[1].chat):
+                    disposition = 'forgotten' if pin[1].chat not in state['watches'] else 'lineage_changed'
+                assert computation_end is not None and computation_cpu is not None
+                self._record('projection_end', projection_attempt_id=projection_attempt_id,
+                    session=s, admission=pin[1] if pin is not None else None,
+                    current_state=state, disposition=disposition, error=failure,
+                    covered_scopes=projection.covered_scopes if projection is not None else None,
+                    missing_scopes=projection.missing_scopes if projection is not None else None,
+                    dependencies=projection.dependencies if projection is not None else None,
+                    io_cost=io_cost,
+                    elapsed_ns=computation_end - started, thread_cpu_ns=computation_cpu - cpu,
+                    total_worker_elapsed_ns=time.monotonic_ns() - started)
+                if disposition in {'no_change', 'superseded'} and pin is not None:
+                    successor = state['admissions'].get(pin[1].chat)
+                    self._record(disposition, chat=pin[1].chat, admission=pin[1],
+                        current_state=state, successor=successor,
+                        predecessor_admission_id=pin[1].id,
+                        successor_admission_id=(successor.id if successor is not None
+                            and successor.id != pin[1].id else None),
+                        # This outcome is not an inclusion receipt. The analyzer
+                        # may fulfill only via exact emission/response custody.
+                        inclusion='not_established',
+                        covered_scopes=projection.covered_scopes if projection is not None else None,
+                        missing_scopes=projection.missing_scopes if projection is not None else None)
             for ticket in tickets:
                 ticket.ready.set()
             self.completed.put(('projection_done', s, None))

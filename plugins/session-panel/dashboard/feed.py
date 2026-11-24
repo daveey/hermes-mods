@@ -28,7 +28,7 @@ import hashlib
 import importlib.util
 import inspect
 from pathlib import Path
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import itertools
 import json
@@ -273,6 +273,7 @@ class Feed:
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
         self.lock = threading.RLock()        # interest / bundles / failures
         self.compute_lock = threading.Lock() # store + revision + emit, in order
+        self._writer_context = threading.local()  # private measurement, never runtime authority
         self.stopped = _Stop(self)
         self.last_emit = clock()          # the heartbeat clock starts with the feed
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
@@ -342,6 +343,38 @@ class Feed:
                 'freshness': {'trusted': bool(fresh), 'computed_at': bundle['computed_at'],
                               'ttl_s': self.full_every_s}}}
         return out
+
+    @contextmanager
+    def _writer(self, producer_kind, *, timeout=None):
+        """The existing fence, with explicit-only queue/acquire/release custody.
+
+        Synchronous receipt enqueue is measured work. Sink flush/close never runs
+        here. A timed-out snapshot retains a request and refusal, not a fictitious
+        acquisition. No admission scheduling or fairness behavior is changed.
+        """
+        recorder = self.receipt_log
+        trace = None
+        if recorder is not None:
+            trace = dict(writer_id=uuid.uuid4().hex, feed_epoch=self.epoch,
+                         producer_kind=producer_kind, requested_ns=time.monotonic_ns(), acquired_ns=None)
+            cpu = time.thread_time_ns()
+            recorder.record('writer_request', **trace)
+        acquired = self.compute_lock.acquire(timeout=-1 if timeout is None else timeout)
+        prior = getattr(self._writer_context, 'current', None)
+        try:
+            if acquired and trace is not None:
+                trace = {**trace, 'acquired_ns': time.monotonic_ns()}
+                self._writer_context.current = trace
+                recorder.record('writer_acquire', **trace)
+            yield acquired
+        finally:
+            if acquired:
+                self._writer_context.current = prior
+                self.compute_lock.release()
+            if trace is not None:
+                recorder.record('writer_release', **trace, acquired=acquired,
+                    end_feed_epoch=self.epoch, released_ns=time.monotonic_ns(),
+                    thread_cpu_ns=time.thread_time_ns() - cpu)
 
     def install_receipts(self, log):
         """Explicit in-process measurement seam; no source/reader activation.
@@ -995,13 +1028,11 @@ class Feed:
         """What a later process of this gateway needs to carry this feed on (Feed.restore): the revision space, the
         held bundles and the interest. Taken under the publish lock, so it is one consistent revision. With a
         `timeout`, None when the lock was not free in time (an exit must not hang on a stuck push)."""
-        if not self.compute_lock.acquire(timeout=-1 if timeout is None else timeout):
-            return None
-        try:
+        with self._writer('snapshot', timeout=timeout) as acquired:
+            if not acquired:
+                return None
             with self.lock:
                 return self._snapshot_locked()
-        finally:
-            self.compute_lock.release()
 
     def _snapshot_locked(self) -> dict:
         return {'version': SNAPSHOT_VERSION, 'epoch': self.epoch, 'rev': self.rev, 'saved_at': self.clock(),
@@ -1031,7 +1062,7 @@ class Feed:
             bundles[str(s)] = {'rev': int(held['rev']), 'hash': str(held['hash']), 'bundle': bundle,
                                'refs': set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')},
                                'lineage': set(bundle['lineage']), 'source_stale': False}
-        with self.compute_lock, self.lock:
+        with self._writer('restore'), self.lock:
             self.epoch = snap['epoch']
             self.rev = int(snap['rev']) + RESTORE_REV_GAP
             self.bundles = bundles
@@ -1121,7 +1152,9 @@ class Feed:
         # lock. Only immutable inputs and loaded pure helpers enter that borrow.
         projection_module = _projection() if _projections is not None else None
         projection_reducer = _model().reduce_panel if _projections is not None else None
-        with self.compute_lock:
+        kind = ('decisions' if canonical_only else 'age' if age_only else 'heartbeat' if heartbeat
+                else 'board_projection' if _projections is not None else 'full')
+        with self._writer(kind):
             if self.stopped.is_set():
                 if _results is not None:
                     _results.update({s: projection_module.PublishResult('stopped') for s in _projections})
@@ -1790,7 +1823,7 @@ class Feed:
                     release()  # request threads keep no connections between catch-ups
         if self._successor is not None:  # resumed while this request computed: what it watched lives there
             return self._current().changes(sessions, since=since, epoch=epoch)
-        with self.compute_lock, self.lock:
+        with self._writer('catchup_selection'), self.lock:
             out = {s: self.bundles[s]['bundle'] for s in wanted
                    if s in self.bundles and (reset or self.bundles[s]['rev'] > since)}
             return {'epoch': self.epoch, 'rev': self.rev, 'reset': reset, 'bundles': out}
