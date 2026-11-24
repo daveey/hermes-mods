@@ -138,6 +138,7 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - For decision-click timing, an empty `needs_you` section is not departure evidence when canonical user-steps requests are unavailable. Retain the pending timing until a mounted Panel commits a model with known canonical requests; test outage → recovered still-open ask → departed ask with real reducer fixtures. Consume once before fire-and-forget telemetry, and label React committed-render observation separately from GPU presentation.
 - Before changing provisional receipt presentation or cleanup, read `references/provisional-decision-receipts.md`.
 - Before changing hierarchy guides, read `references/tree-guide-styles.md`; attribute presence is not computed-border proof.
+- Before owner-scoped reconciliation keys, read `references/membership-capture.md` (complete inputs, source modes, unknown fences and memo composition).
 - Passing jsdom proves structure, not native pixels; screenshots prove pixels, not that a click was recorded.
 - Before changing waiting-row layout, read `references/waiting-row-legibility.md` (native elapsed-suffix visibility).
 
