@@ -1593,8 +1593,23 @@ class Mirror:
 
     def deliver(self, op):
         binding = self._bound(op)
-        if json.loads(binding['snapshot']).get('remote'):
+        snapshot = json.loads(binding['snapshot'])
+        if snapshot.get('remote'):
             return self.remote.deliver(op, binding)
+        # Authority-bearing local offers must never fall through to plain unblock,
+        # including on a core version that does not implement this adapter.
+        if ('selfwork_exception_target' in snapshot.get('ask', {})
+                and op.get('decision', {}).get('choiceId') != 'card-1'):
+            try:
+                from hermes_cli import kanban_selfwork_local
+            except ImportError:
+                raise self.core.ActionError('Local authority adapter unavailable', 409) from None
+            if getattr(kanban_selfwork_local, 'VERSION', None) != 1:
+                raise self.core.ActionError('Local authority adapter version mismatch', 409)
+            try:
+                return kanban_selfwork_local.deliver(op['operationId'])
+            except (ValueError, RuntimeError) as exc:
+                raise self.core.ActionError('Local authority delivery refused: ' + str(exc), 409) from exc
         api = self._api()
         c = api.connect(self._path(binding["board"]))
         try:
