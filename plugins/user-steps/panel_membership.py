@@ -129,6 +129,23 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                 candidates.append((gw, key, task, version, identity))
                 if alias_set.intersection(linked_sessions(task, gateway, profile)):
                     direct.add((gw, key))
+            # Retained ledger payloads are not current just because their scope
+            # is live. Require the exact owner publication, version AND content,
+            # as the canonical projector does before accepting an observation.
+            # Missing/re-homed records stay conservatively unknown: this capture
+            # must not refresh the ledger or duplicate its release/rehome policy.
+            publications = {(gw, key): (task, version)
+                            for gw, key, task, version, _ in candidates}
+            for binding, _, task, version, released, _ in obligations:
+                current = publications.get((binding['owner']['gateway'], binding['task_record_key']))
+                if current != (task, version):
+                    return None
+                if task['status'] in ('done', 'archived'):
+                    from hermes_cli.kanban_origin_ledger import _owner_evidence
+                    evidence = _owner_evidence(task)
+                    if not (released and evidence.get('verified') is True
+                            or task['status'] == 'archived' and evidence):
+                        return None
             exact = direct | {(b[0]['owner']['gateway'], b[0]['task_record_key']) for b in obligations}
             seeds = [(b[0]['owner']['gateway'], b[0]['owner']['board'], b[0]['owner']['task_id'], b[2])
                      for b in obligations]

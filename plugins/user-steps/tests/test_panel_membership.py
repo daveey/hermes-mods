@@ -57,8 +57,12 @@ def sources(tmp_path):
                        origin=dict(gateway=GW, profile=OWNER['profile'], session=session or OWNER['storedSessionId']),
                        owner=dict(gateway='remote', profile='default', board='default', task_id=tid),
                        task_record_key='default/default/' + tid)
+        record = dict(id=tid, status='blocked')
+        # Ledger-only membership has no chat link in its current owner record.
+        # A retained observation without that record is unknown, not healthy.
+        put(record)
         sql('ledger', 'INSERT INTO origin_obligations VALUES (?,?,?,?,?,1,0)',
-            (tid, tid, json.dumps(binding), session or OWNER['storedSessionId'], json.dumps(dict(id=tid, status='blocked'))))
+            (tid, tid, json.dumps(binding), session or OWNER['storedSessionId'], json.dumps(record)))
     def capture(**kw):
         args = dict(gateway=GW, state_path=paths['state'], replica_path=paths['replica'], ledger_path=paths['ledger'],
                     connect=core._ro_connect, step_sql=STEP, chain_cap=1000, linked_sessions=linked,
@@ -262,3 +266,82 @@ def test_unknown_ledger_observation_is_changed(sources, column, value):
     s.sql('ledger', 'UPDATE origin_obligations SET ' + column + '=?', (value,))
     assert s.capture() is None
     assert not membership.unchanged(s.capture(), s.capture())
+
+
+@pytest.mark.parametrize('mutation', [
+    "DELETE FROM replica WHERE coll='tasks'",
+    "UPDATE replica SET version=2 WHERE coll='tasks'",
+    "UPDATE replica SET data='{\"id\":\"t_ledger\",\"status\":\"running\"}' WHERE coll='tasks'",
+])
+def test_retained_ledger_requires_exact_current_owner_record(sources, mutation):
+    s = sources
+    s.obligation()
+    before = s.capture()
+    assert before
+    s.sql('replica', mutation)
+    assert s.capture() is None
+    assert not membership.unchanged(before, s.capture())
+    assert not membership.unchanged(s.capture(), s.capture())
+
+
+def test_missing_ledger_owner_record_matches_real_canonical_unknown(sources):
+    ledger = pytest.importorskip('hermes_cli.kanban_origin_ledger')
+    from hermes_cli.kanban_scope_heartbeat import scope_heartbeats
+    s = sources
+    s.obligation()
+    args = dict(validate_binding=ledger.validate_binding, scope_heartbeats=scope_heartbeats)
+    assert s.capture(**args)
+    s.sql('replica', "DELETE FROM replica WHERE coll='tasks'")
+    # Canonical projection is writeful; call it only as an independent fixture oracle.
+    projected = ledger.project(s.paths['ledger'], replica=s.paths['replica'],
+                               gateway=GW, profile=OWNER['profile'], now=NOW)
+    assert [(r['status'], r['stale']) for r in projected] == [('unknown', True)]
+    assert s.capture(**args) is None
+    s.put(dict(id='t_ledger', status='blocked'))
+    projected = ledger.project(s.paths['ledger'], replica=s.paths['replica'],
+                               gateway=GW, profile=OWNER['profile'], now=NOW)
+    assert [(r['status'], r['stale']) for r in projected] == [('blocked', False)]
+    assert s.capture(**args)
+
+
+@pytest.mark.parametrize('status,released,verified,known', [
+    ('done', 0, False, False), ('done', 1, False, False),
+    ('done', 1, True, True), ('archived', 0, False, True),
+])
+def test_terminal_ledger_eligibility_uses_canonical_evidence(sources, status, released, verified, known):
+    ledger = pytest.importorskip('hermes_cli.kanban_origin_ledger')
+    from hermes_cli.kanban_scope_heartbeat import scope_heartbeats
+    import hashlib
+    s = sources
+    s.obligation()
+    task = dict(id='t_ledger', status=status)
+    if status == 'archived' or verified:
+        task['origin_observation'] = dict(schema=1, verified=verified, observed_at=NOW,
+            task_hash=hashlib.sha256(ledger._json(task).encode()).hexdigest())
+    s.put(task)
+    s.sql('ledger', 'UPDATE origin_obligations SET task_json=?,released=?', (json.dumps(task), released))
+    projected = ledger.project(s.paths['ledger'], replica=s.paths['replica'],
+                               gateway=GW, profile=OWNER['profile'], now=NOW)
+    assert (projected[0]['status'] != 'unknown') is known
+    assert bool(s.capture(validate_binding=ledger.validate_binding, scope_heartbeats=scope_heartbeats)) is known
+
+
+@pytest.mark.parametrize('mutation', [
+    "UPDATE replica SET version=2 WHERE coll='tasks'",
+    "UPDATE replica SET data='{\"id\":\"t_ledger\",\"status\":\"running\"}' WHERE coll='tasks'",
+])
+def test_busy_ledger_retained_mismatch_matches_canonical_unknown(sources, mutation):
+    ledger = pytest.importorskip('hermes_cli.kanban_origin_ledger')
+    from hermes_cli.kanban_scope_heartbeat import scope_heartbeats
+    import sqlite3
+    s = sources
+    s.obligation()
+    s.sql('replica', mutation)
+    # Real writer contention prevents canonical refresh; retained observations
+    # must fail closed without capture trying a write of its own.
+    with closing(sqlite3.connect(s.paths['ledger'])) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        projected = ledger.project(s.paths['ledger'], replica=s.paths['replica'],
+                                   gateway=GW, profile=OWNER['profile'], now=NOW)
+        assert [(r['status'], r['stale']) for r in projected] == [('unknown', True)]
+        assert s.capture(validate_binding=ledger.validate_binding, scope_heartbeats=scope_heartbeats) is None
