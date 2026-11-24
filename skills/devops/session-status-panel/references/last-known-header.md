@@ -1,0 +1,3 @@
+# Last-known header freshness
+
+Preserve a backend-authored last-known header label when the current bundle is unvouched as well as when its TTL expires; `vouched=false` removes current execution trust, not historical display evidence. Render `<label> · synced <age> ago` only with a positive finite nonfuture source timestamp, retaining unknown effective state and a neutral stale stripe. Missing/invalid/future clocks must not invent a zero-second sync age. Test fresh, 55-second unvouched, 30-minute, future-clock and no-state cases through the real Python reducer and mounted Desktop renderer; the header is painted by session-panel, not session-tasks.
