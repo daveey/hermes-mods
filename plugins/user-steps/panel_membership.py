@@ -69,9 +69,62 @@ def _fresh(value, now, window):
             and value > 0 and 0 <= now - value <= window)
 
 
+def _shadows(paths, *, connect, gateway, profile, aliases, obligations, now, window):
+    """Complete origin-scoped shadow inventory, not the reader's last-good cache.
+
+    Owner labels are ledger-derived in replica_cards. Only an exact, current
+    binding can vouch for a selected shadow; default-profile guesses cannot.
+    Every configured board must be readable and fresh, including empty boards.
+    """
+    captured = []
+    for board, path in paths:
+        with closing(connect(path, timeout=.5)) as conn:
+            conn.execute('BEGIN')
+            pulled = conn.execute('SELECT pulled_at FROM kanban_sync_state').fetchall()
+            if len(pulled) != 1 or not _fresh(pulled[0][0], now, window):
+                raise ValueError('unknown shadow freshness')
+            conn.execute('SELECT id,title,status,assignee,created_at,started_at,priority,'
+                         'block_kind,human_request,created_on FROM tasks LIMIT 0')
+            conn.execute('SELECT task_id,chat_gateway,chat_profile,chat_session,kind,released '
+                         'FROM task_chat_links LIMIT 0')
+            links = conn.execute(
+                'SELECT * FROM task_chat_links WHERE chat_gateway=? AND chat_profile=? '
+                'AND chat_session IN (SELECT value FROM json_each(?))',
+                (gateway, profile, _json(aliases)))
+            names = [col[0] for col in links.description]
+            links = [dict(zip(names, row)) for row in links.fetchall()]
+            tasks = []
+            for link in links:
+                if link.get('released') not in (0, 1) or not link.get('task_id'):
+                    raise ValueError('unknown shadow link')
+                row = conn.execute('SELECT * FROM tasks WHERE id=?', (link['task_id'],))
+                names = [col[0] for col in row.description]
+                raw = row.fetchone()
+                task = dict(zip(names, raw)) if raw is not None else None
+                tasks.append(task)
+                # Local cards do not enter replica_cards' remote membership.
+                if task is not None and task.get('created_on') == gateway:
+                    continue
+                if link['released']:
+                    continue
+                if task is None or not _known_task(task):
+                    raise ValueError('unknown shadow task')
+                matches = [b for b, resolved, _, _, released, _ in obligations
+                           if not released and b['owner']['board'] == board
+                           and b['owner']['task_id'] == link['task_id']
+                           and (b['origin']['session'] == link['chat_session']
+                                or resolved == link['chat_session'])]
+                owners = {(b['owner']['gateway'], b['owner']['profile']) for b in matches}
+                if len(owners) != 1 or next(iter(owners))[0] != task.get('created_on'):
+                    raise ValueError('shadow owner/binding mismatch')
+            captured.append([board, sorted(links, key=_json), sorted(tasks, key=_json)])
+    return sorted(captured, key=_json)
+
+
 def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             step_sql, chain_cap, linked_sessions, validate_binding,
-            scope_heartbeats, now):
+            scope_heartbeats, now, shadow_paths=None, shadow_window=180.0,
+            display_cards=None):
     """Return a stable digest, or None when complete inputs cannot be vouched for.
 
     Each database is read in a bounded read transaction and closed before return.
@@ -203,9 +256,30 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                     if (scope.get('profile'), scope.get('board')) in wanted:
                         selected.append({k: v for k, v in scope.items() if k != 'observed_at'})
                 info_inputs.append([gw, selected])
-        payload = [1, gateway, profile, session, aliases, edges,
+        shadows = None if shadow_paths is None else _shadows(
+            shadow_paths, connect=connect, gateway=gateway, profile=profile,
+            aliases=aliases, obligations=obligations, now=now, window=shadow_window)
+        display = None
+        if shadow_paths is not None:
+            # linked_cards uses stale_ok=True. Its retained origin projection can
+            # lag the stores above, so its own semantic input must also be keyed:
+            # a later cache/facts publication must not be swallowed by a memo hit.
+            if not isinstance(display_cards, list) or any(not isinstance(c, dict) for c in display_cards):
+                return None
+            identities = {(b[0]['owner']['board'], b[0]['owner']['task_id']) for b in obligations}
+            identities.update((board, link['task_id']) for board, links, _ in shadows for link in links)
+            display = []
+            for card in display_cards:
+                if (card.get('session') not in alias_set and card.get('origin_session') not in alias_set
+                        and (card.get('board'), card.get('id')) not in identities):
+                    continue
+                if not _known_task(card):
+                    return None
+                display.append({k: v for k, v in card.items() if k != 'synced_at'})
+            display.sort(key=_json)
+        payload = [2, gateway, profile, session, aliases, edges,
                    sorted(obligations, key=_json), sorted(receipts, key=_json),
-                   sorted(rows, key=_json), sorted(info_inputs, key=_json)]
+                   sorted(rows, key=_json), sorted(info_inputs, key=_json), shadows, display]
         return hashlib.sha256(_json(payload).encode()).hexdigest()
     except Exception:
         # Optional core/version differences and every unavailable input fail closed.
@@ -222,19 +296,29 @@ def for_remote(remote, owner, *, now, view):
     """Production adapter, resolving stores from trusted local installation state."""
     try:
         from hermes_cli import kanban_db_sync
+        shadow_paths, shadow_window, display_cards = None, 180.0, None
+        gateway = remote.gateway()
         if kanban_db_sync.sync_config().get('links_reader') == 'replica':
-            # That mode also consumes chat-link shadows; not covered here.
-            return None
+            from hermes_cli import kanban_sync_client, kanban_chat_links, kanban_session_activity
+            from hermes_cli.profiles import get_active_profile_name
+            if (kanban_sync_client.load_identity().gateway != gateway
+                    or get_active_profile_name() != owner['profile']):
+                return None
+            shadow_paths = [(board, kanban_sync_client.shadow_path(board))
+                            for board, _ in kanban_sync_client.board_paths()]
+            shadow_window = kanban_chat_links._stale_after_s()
+            display_cards = kanban_session_activity._remote_links(stale_ok=True)
         from hermes_constants import get_hermes_home
         from hermes_state_compression import _CHAIN_STEP_SQL, _CHAIN_CAP
         from hermes_cli.kanban_replica_projection import linked_sessions
         from hermes_cli.kanban_origin_ledger import validate_binding
         from hermes_cli.kanban_scope_heartbeat import scope_heartbeats
-        return capture(owner, gateway=remote.gateway(),
+        return capture(owner, gateway=gateway,
                        state_path=remote.mirror.core._state_db(), replica_path=view.db_path(),
                        ledger_path=get_hermes_home() / 'kanban' / 'origin-ledger.db',
                        connect=remote.mirror.core._ro_connect, step_sql=_CHAIN_STEP_SQL,
                        chain_cap=_CHAIN_CAP, linked_sessions=linked_sessions,
-                       validate_binding=validate_binding, scope_heartbeats=scope_heartbeats, now=now)
+                       validate_binding=validate_binding, scope_heartbeats=scope_heartbeats, now=now,
+                       shadow_paths=shadow_paths, shadow_window=shadow_window, display_cards=display_cards)
     except Exception:
         return None
