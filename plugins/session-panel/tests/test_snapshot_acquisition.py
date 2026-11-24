@@ -36,6 +36,9 @@ def acquire(values, previous=None):
 def test_real_union_acquisition_shared_materialization_and_999_bindings(acquisition, chats, monkeypatch):
     r, mod, m, source, store, conn = acquisition
     task = kanban_db.create_task(conn, title='Shared work', session_id='S0', initial_status='running')
+    # Core connect is autocommit: keep bulk fixture setup out of acquisition
+    # timing without paying one durable transaction per subscription.
+    conn.execute('BEGIN')
     conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task,))
     conn.executemany("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,created_at) VALUES (?,'tui',?,1)",
                      [(task, f'S{i}') for i in range(1, chats)])
