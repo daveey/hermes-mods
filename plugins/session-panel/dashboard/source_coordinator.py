@@ -51,8 +51,10 @@ class RetiringOwner:
         with owner.lock:
             self.parent = getattr(owner, 'predecessor', None)
             self.state = {
-                'pending': {**getattr(owner, '_active_ages', {}),
-                            **getattr(owner, '_retired_pending', owner.pending)},
+                'pending': {s: age for s, age in getattr(owner, '_retired_pending', owner.pending).items()
+                            if s in owner.projection_attempts},
+                'ages': {s: age for s, age in getattr(owner, '_active_ages', {}).items()
+                         if s in owner.projection_attempts},
                 'active': set(owner.active),
                 'acquiring': set(owner.acquiring),
                 'chats': dict(owner.chats), 'tokens': dict(owner.tokens),
@@ -248,7 +250,11 @@ class SourceCoordinator:
                   for k, group in state['scope_attempts'].items()}
         roles = {k: attempt(a) for k, a in state['role_attempts'].items()}
         projections = {k: attempt(a) for k, a in state['projection_attempts'].items()}
-        store = self.module.SnapshotStore.transfer(retirement.owner.store)
+        stopped = retirement.owner.store
+        prior_sources = self.module.rehome(tuple(stopped._versions))
+        if len(set(prior_sources) | set(self.sources) | {self.external}) > stopped._limits[1]:
+            raise self.module.SnapshotCapacity('compatible transfer source capacity exceeded')
+        store = self.module.SnapshotStore.transfer(stopped)
         # Newly discovered sources are missing, not inferred from transferred
         # coverage. Unchanged source keys retain their exact immutable versions.
         for source in (*self.sources, self.external):
@@ -275,9 +281,14 @@ class SourceCoordinator:
                 retries = [a.retry_at for a in group.values() if a.retry_at is not None]
                 attempts[source].retry_at = min(retries) if retries else None
         self.pending = dict(state['pending'])
-        for s in state['active']:
+        self._active_ages = dict(state['ages'])
+        for s in projections:
             if s in self.chats:
-                self.pending.setdefault(s, store.pin(self.chats[s])[1].first_admitted_mono_ns)
+                age = self.pending.get(s, self._active_ages.get(s,
+                    store.pin(self.chats[s])[1].first_admitted_mono_ns))
+                self._active_ages[s] = age
+                if s in state['active']:
+                    self.pending.setdefault(s, age)
         # Forget/rewatch still wins over copied identities; _register handles its
         # exact token/lineage transition before any capture can claim coverage.
         self.canonical_dirty = {s: i for i, s in enumerate(self.chats, 1)}
@@ -393,6 +404,7 @@ class SourceCoordinator:
                     self.tokens.pop(s, None)
                     self.bases.pop(s, None)
                     self.pending.pop(s, None)
+                    self._active_ages.pop(s, None)
                     self.projection_attempts.pop(s, None)
                     self._cancel_tickets(s, 'snapshot watch was forgotten or replaced')
             for s, token in wanted.items():
@@ -642,7 +654,8 @@ class SourceCoordinator:
                     self.acquiring.pop(key, None)
                 elif kind == 'projection_done':
                     self.active.pop(key, None)
-                    self._active_ages.pop(key, None)
+                    if key not in self.projection_attempts:
+                        self._active_ages.pop(key, None)
                 elif kind == 'registration_error':
                     self.feed._board_capture_failures.update(self.feed.interest)
                     attempt = self.role_attempts[key]
