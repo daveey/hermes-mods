@@ -230,7 +230,37 @@ def capture_local(readers, source, prior_part, demands, hints):
                       scope_keys=per_scope, metrics=metrics, invalidated_keys=invalidated)
 
 
-def capture_external(readers, demands, refs, prior_parts, hints):
+@dataclass(frozen=True)
+class ExternalCapture:
+    """One strict union read, bound to exact demands/owner/version before hydration.
+
+    Private in-process acquisition input, not a source certificate or wire schema.
+    Inventory and raw rows are detached and frozen together; neither may be read
+    again during materialization or observation-only carriage.
+    """
+    source: object
+    demands: object
+    external_demands: object
+    hints: CaptureHints
+    before_stamp: object
+    read_started_ns: int
+    captured: object
+    inventory: object
+
+    def __post_init__(self):
+        for name in ('demands', 'external_demands', 'before_stamp', 'captured', 'inventory'):
+            object.__setattr__(self, name, freeze(getattr(self, name)))
+
+
+def capture_external(readers, demands, refs, prior_parts, hints, *, raw=None):
+    raw = capture_external_raw(readers, demands, refs, hints) if raw is None else raw
+    source, hint = next(iter(hints.items()))
+    if (raw.source != source or raw.demands != demands or raw.hints != hint):
+        raise ValueError('strict external capture provenance does not match materialization')
+    return materialize_external(readers, raw, prior_parts)
+
+
+def capture_external_raw(readers, demands, refs, hints):
     """Strict canonical union input, certified only for its frozen demands.
 
     All strict adapters remain one external failure domain. This adapter never
@@ -264,6 +294,18 @@ def capture_external(readers, demands, refs, prior_parts, hints):
     captured, inventory = readers.external_capture(held, include_inventory=True)
     if not isinstance(captured, dict) or set(captured) != set(demands):
         raise ValueError('incomplete canonical external acquisition')
+    if any(not isinstance(encoded, (tuple, list)) for encoded in captured.values()):
+        raise ValueError('invalid canonical external collection')
+    return ExternalCapture(source, demands, external_demands, hint, before, start, captured, inventory)
+
+
+def materialize_external(readers, raw, prior_parts):
+    _require_adapter(readers)
+    source, hint, demands = raw.source, raw.hints, raw.demands
+    captured, inventory = raw.captured, thaw(raw.inventory)
+    external_demands = raw.external_demands
+    start, before = raw.read_started_ns, raw.before_stamp
+    deadline = start / 1e9 + hint.deadline_s
     rows, memberships, scope_keys, scoped_rows, decoded, scoped_memberships = {}, set(), {}, {}, {}, {}
     for sid, encoded in captured.items():
         if not isinstance(encoded, (tuple, list)):

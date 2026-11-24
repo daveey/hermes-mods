@@ -461,10 +461,10 @@ class CoreReaders:
             self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_local(self, source, prior_part, demands, hints)
 
-    def capture_external(self, demands, refs, prior_parts, *, hints):
+    def capture_external(self, demands, refs, prior_parts, *, hints, raw=None):
         if self._explicit_home() is None:
             self.require_scope('snapshot_capture')
-        return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints)
+        return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints, raw=raw)
 
     def _links_inventory(self, ksa):
         """Reuse strict origin rows only while their pre-read source certificate holds.
