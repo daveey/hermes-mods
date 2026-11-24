@@ -124,6 +124,10 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   Spend-held or scope-stopped card: from its owning chat, one step on its home gateway:
   `hermes kanban release <id> [--runs N] [--seen <newest comment id>] --note "<user's words + goal>"`, then read back status.
   Re-read events first: the board's spend reviewer may already have re-granted it, and release then refuses `not_held`.
+  A refusal that prints an unread comment (`budget_decision_unread`, "After reading: ... --seen <cid>") wants that
+  comment read and its id passed as `--seen`, not the newest id: an owner may have re-scoped in it.
+  `safety_restricted` (provider safety refusal) has no release route: leave it held, never reword or resubmit the
+  refused brief or switch provider to get past it; file a root-cause card on the release mechanism instead.
   Plain `triage` (no hold) also refuses `not_held`: use `hermes kanban [--board B] promote <id> "<reason>"`.
   A card you expect to stop again (a narrow run override against a multi-run rollout) gets a wider
   `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
