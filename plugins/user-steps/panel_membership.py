@@ -162,6 +162,11 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             for digest, raw in ledger.execute('SELECT binding_hash,receipt_json FROM origin_receipts'):
                 if digest in hashes:
                     receipts.append([digest, _object(raw)])
+        # This verdict needs only the already captured ledger. Do not decode
+        # every remote task for an owner this remote-only key cannot certify.
+        if any((b[0]['owner']['gateway'], b[0]['owner']['profile']) == (gateway, profile)
+               for b in obligations):
+            return None
         with closing(connect(replica_path, timeout=.5)) as replica:
             replica.execute('BEGIN')
             meta = dict(replica.execute("SELECT k,v FROM meta WHERE k IN ('gateway','last_ok','offline_since')"))
@@ -169,6 +174,14 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                 return None
             if not _fresh(float(meta.get('last_ok', 'nan')), now, 180):
                 return None
+            # Cheap exact-owner preflight in this same read transaction. Unknown
+            # retained observations must remain unknown, but need no global scan.
+            for binding, _, task, version, _, _ in obligations:
+                current = replica.execute(
+                    "SELECT data,version FROM replica WHERE coll='tasks' AND gw=? AND key=?",
+                    (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
+                if current is None or (_object(current[0]), current[1]) != (task, version):
+                    return None
             # Read all membership links, not just previously known task IDs. The
             # selected inventory must see arrivals, removals and legacy twins.
             candidates, direct = [], set()
@@ -187,12 +200,7 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             # as the canonical projector does before accepting an observation.
             # Missing/re-homed records stay conservatively unknown: this capture
             # must not refresh the ledger or duplicate its release/rehome policy.
-            publications = {(gw, key): (task, version)
-                            for gw, key, task, version, _ in candidates}
             for binding, _, task, version, released, _ in obligations:
-                current = publications.get((binding['owner']['gateway'], binding['task_record_key']))
-                if current != (task, version):
-                    return None
                 if task['status'] in ('done', 'archived'):
                     from hermes_cli.kanban_origin_ledger import _owner_evidence
                     evidence = _owner_evidence(task)
@@ -226,11 +234,6 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                 if (len(key.split('/')) != 3 or type(version) is not int or version < 1
                         or not _known_task(task)):
                     return None
-            # Local-authority obligations require local-board inputs, which this
-            # remote-only capture cannot certify. Leave them conservatively unkeyed.
-            if any((b[0]['owner']['gateway'], b[0]['owner']['profile']) == (gateway, profile)
-                   for b in obligations):
-                return None
             scopes = {(gw, key.split('/')[0], key.split('/')[1]) for gw, key, _, _ in rows
                       if len(key.split('/')) == 3}
             scopes.update((b[0]['owner']['gateway'], b[0]['owner']['profile'], b[0]['owner']['board'])
