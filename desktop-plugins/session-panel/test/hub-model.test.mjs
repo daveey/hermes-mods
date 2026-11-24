@@ -199,8 +199,8 @@ for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'ov
   if (state === 'normal') assert.equal(document.querySelector('[data-eta-left]').textContent, '12m')
   const wait = {...row.wait_eta, wait_kind:kind, wait_state:'external_running', waiting_on: kind === 'clock' ? 'the clock until 2026-11-24 14:30 UTC' : `${kind} example`}
   const [chip] = tasksEta.sessionTaskChips([{id:row.id, status:'scheduled', wait}])
-  assert.equal(chip.look, 'delivery')
-  assert.equal(tasksEta.chipColor(chip.look), '#38bdf8')
+  assert.equal(chip.look, kind === 'deploy' ? 'deploy' : 'delivery')
+  assert.equal(tasksEta.chipColor(chip.look), kind === 'deploy' ? '#a371f7' : '#38bdf8')
   assert.deepEqual(tasksEta.waitReadout(chip.waitEta, now), m.waitReadout({...row.wait_eta,wait_kind:kind}, now))
   await paint(React.createElement(tasksEta.Chip, { chip, now: now * 1000 }))
   assert.ok(document.querySelector('[data-chip-pip]') === null)
@@ -256,10 +256,11 @@ for (const [name, { model, now, status }] of Object.entries(producerCases)) {
 }
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 for (const kind of ['ci', 'deploy', 'clock']) {
- test(`held canonical ${kind} stays producer light-blue`, async () => {
-  const { model, now } = cases['producer_' + kind]
-  await paint(m.renderModel(model, { now }))
-  assert.equal(window.getComputedStyle(document.querySelector('[data-row-pip]')).borderTopColor, 'rgb(56, 189, 248)')
+ test(`held canonical ${kind} stays producer ${kind === 'deploy' ? 'purple' : 'light-blue'}`, async () => {
+   const { model, now } = cases['producer_' + kind]
+   await paint(m.renderModel(model, { now }))
+   assert.equal(window.getComputedStyle(document.querySelector('[data-row-pip]')).borderTopColor,
+    kind === 'deploy' ? 'rgb(163, 113, 247)' : 'rgb(56, 189, 248)')
   assert.ok(!document.querySelector('[data-row-detail]').textContent.includes('agent to decide'))
  })
 }

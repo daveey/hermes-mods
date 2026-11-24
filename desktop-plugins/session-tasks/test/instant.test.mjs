@@ -238,7 +238,11 @@ test('a parked card shows waiting on <producer> since <time>, amber when stalled
   assert.equal(w.look, 'delivery')
   assert.equal(m.cardRowModel(w, now).wait, `waiting on ci run 40577358595 since ${m.sinceClock(now / 1000 - 600, now)} (10m ago)`)
   assert.equal(m.chipColor(w.look), '#38bdf8', 'light blue')
-  assert.equal(m.waitLook({ wait_state: 'external_running', waiting_on: 'deploy hermes-hub mods-pull' }), 'delivery')
+  // A hub-deploy wait is purple, apart from CI/timer light blue (David 2026-11-24).
+  assert.equal(m.waitLook({ wait_state: 'external_running', waiting_on: 'deploy hermes-hub mods-pull' }), 'deploy')
+  assert.equal(m.waitLook({ wait_state: 'waiting', wait_kind: 'deploy', waiting_on: 'hub mods-pull' }), 'deploy')
+  assert.equal(m.chipColor('deploy'), '#a371f7', 'purple')
+  assert.equal(m.waitLook({ wait_state: 'stalled', waiting_on: 'deploy hermes-hub' }), 'stalled', 'a stalled deploy wait stays amber')
   assert.equal(m.waitLook({ wait_state: 'waiting', waiting_on: 'producer card t_abc (running)' }), 'waiting')
   assert.equal(m.waitLook({ wait_state: 'stalled', waiting_on: 'ci run 1' }), 'stalled', 'a stalled CI wait stays amber')
   const h = [waiting, human].find(c => c.id === 't_ask')

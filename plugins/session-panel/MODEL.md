@@ -6,7 +6,8 @@ Rows may carry `wait_kind: "ci" | "deploy" | "clock"` and
 `wait_eta: {waited_since: number | null, expected_s: number | null,
 estimate_source: string | null}`. Times are Unix seconds and durations in seconds,
 passed through from the producer without estimating in the reducer. The waiting
-header and section pip may also use these three kinds for light blue (`#38bdf8`).
+header and section pip may also use these kinds: `ci`/`clock` paint light blue (`#38bdf8`),
+`deploy` (merged work waiting for a hub deploy) paints purple (`#a371f7`).
 Non-delivery rows omit the fields.
 
 Desktop replaces a delivery row's pip with right-aligned `waited / expected  left`

@@ -35,7 +35,7 @@ export function renderWaitEta(eta, now, props = {}) {
       fontSize: 11, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', flex: 'none', textAlign: 'right', ...props.style },
     children: [jsx('span', { style: { opacity: .75 }, children: r.waited }),
       jsx('span', { style: { color: 'var(--muted-foreground)', textAlign: 'left', paddingLeft: 2 }, children: `/ ${r.expected ?? '?'}` }),
-      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : '#38bdf8' }, children: r.left })] })
+      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : eta.wait_kind === 'deploy' ? '#a371f7' : '#38bdf8' }, children: r.left })] })
 }
 
 const ID = 'session-panel'
@@ -410,9 +410,12 @@ export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: 
 // Light blue: work waiting on CI or a deploy (row `wait_kind`, status reason `linked_work_delivery`). Not amber
 // (nothing is wrong) and not grey (something is actively producing the result).
 export const DELIVERY_COLOR = '#38bdf8'
+// Purple: merged work waiting for a hub deploy (`wait_kind` deploy), so it reads apart from CI/clock/card waits.
+export const DEPLOY_COLOR = '#a371f7'
 /** Backend-selected producer wait; administrative agent decisions use ordinary blue. */
 export const deliveryWait = item => ['ci', 'deploy', 'clock', 'card'].includes(item?.wait_kind)
-export const waitColor = item => item?.wait_kind === 'agent' ? SECTION_COLOR.running : deliveryWait(item) ? DELIVERY_COLOR : SECTION_COLOR.waiting
+export const waitColor = item => item?.wait_kind === 'agent' ? SECTION_COLOR.running : item?.wait_kind === 'deploy' ? DEPLOY_COLOR
+  : deliveryWait(item) ? DELIVERY_COLOR : SECTION_COLOR.waiting
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',

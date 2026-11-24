@@ -68,7 +68,7 @@ export function renderWaitEta(eta, now, props = {}) {
       fontSize: 11, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', flex: 'none', textAlign: 'right', ...props.style },
     children: [jsx('span', { style: { opacity: .75 }, children: r.waited }),
       jsx('span', { style: { color: 'var(--muted-foreground)', textAlign: 'left', paddingLeft: 2 }, children: `/ ${r.expected ?? '?'}` }),
-      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : '#38bdf8' }, children: r.left })] })
+      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : eta.wait_kind === 'deploy' ? '#a371f7' : '#38bdf8' }, children: r.left })] })
 }
 
 const ID = 'session-tasks'
@@ -94,7 +94,8 @@ const STATE_COLOR = {
   triage: '#f85149', // unfinished agent triage, not an implied human ask
   // [daveey] Wait looks (backend `wait.wait_state`), which override the status colour of a parked card:
   waiting: '#8b949e', // parked on a named producer, or not yet stalled: grey
-  delivery: '#38bdf8', // parked on CI or a deploy: light blue (something is producing it, nothing is wrong)
+  delivery: '#38bdf8', // parked on CI or a timer: light blue (something is producing it, nothing is wrong)
+  deploy: '#a371f7', // merged, parked on a hub deploy: purple
   stalled: '#d29922', // agent-owned wait over 2 h, nothing producing it: amber
   'needs-you': '#f85149' // a visible human ask: red
 }
@@ -318,10 +319,14 @@ export function sinceClock(sec, nowMs = Date.now()) {
   return `${day} ${d.getDate()} ${hm}`
 }
 
-/** The card's wait look from the backend `wait` object: 'stalled' | 'delivery' | 'waiting' | 'needs-you' | null.
+/** Producer-wait looks that show a wait ETA: light-blue CI/timer delivery and purple hub deploy. */
+export const deliveryLook = look => look === 'delivery' || look === 'deploy'
+
+/** The card's wait look from the backend `wait` object: 'stalled' | 'delivery' | 'deploy' | 'waiting' | 'needs-you' | null.
  *  `delivery` = a non-stalled wait the backend names as CI or a deploy (`waiting_on` starts with `ci`/`deploy`). */
 export function waitLook(wait) {
   const state = wait && typeof wait === 'object' ? str(wait.wait_state) : ''
+  if ((state === 'waiting' || state === 'external_running') && (wait.wait_kind === 'deploy' || /^deploy\b/i.test(str(wait.waiting_on)))) return 'deploy'
   if ((state === 'waiting' || state === 'external_running') && (/^(ci|deploy)\b/i.test(str(wait.waiting_on)) || wait.wait_kind === 'clock' || /^the clock until\b/i.test(str(wait.waiting_on)))) return 'delivery'
   return state === 'stalled' ? 'stalled' : state === 'human' ? 'needs-you' : state === 'waiting' ? 'waiting' : null
 }
@@ -372,7 +377,7 @@ export function subagentChips(subagents) {
     })
 }
 
-const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, delivery: 4, todo: 5 }
+const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, delivery: 4, deploy: 4, todo: 5 }
 
 /** The card's structured ask (`human_request`) as trimmed plain strings, or null when it names no action. The hub
  *  replica stores it as JSON text, so a string is decoded. Exported for tests. */
@@ -416,7 +421,7 @@ function taskChip(t, status) {
   const rawLook = t.stale ? null : waitLook(wait)
   // Grey 'waiting' only recolours a scheduled card: a blocked/triage card keeps its own (red/amber) status colour,
   // so a dependency block or an unvalidated ask never turns grey. The wait line still names what it waits on.
-  const look = (rawLook === 'waiting' || rawLook === 'delivery') && status !== 'scheduled' ? null : rawLook
+  const look = (rawLook === 'waiting' || deliveryLook(rawLook)) && status !== 'scheduled' ? null : rawLook
   const waitingOn = rawLook ? str(wait.waiting_on) : ''
   const waitingSince = rawLook ? Number(wait.waiting_since) || 0 : 0
   const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''
@@ -430,7 +435,7 @@ function taskChip(t, status) {
     ...(wait && wait.contained ? { contained: wait.contained } : {}),
     waitingOn,
     waitingSince,
-    waitEta: look === 'delivery' ? { waited_since: wait.waited_since, expected_s: wait.expected_s,
+    waitEta: deliveryLook(look) ? { waited_since: wait.waited_since, expected_s: wait.expected_s,
       estimate_source: wait.estimate_source, wait_kind: wait.wait_kind || (/^the clock until\b/i.test(waitingOn) ? 'clock' : /^ci\b/i.test(waitingOn) ? 'ci' : 'deploy') } : null,
     // What the card asks the user to do, in its own words (Needs you shows this, never the card title).
     humanRequest: humanRequestOf(t.human_request),
@@ -1458,7 +1463,7 @@ export function Chip({ chip: rawChip, now }) {
       ? () => window.__computeRentalsShow(chip.id)
       : undefined
   const age = elapsed(chip.since, now)
-  const eta = chip.look === 'delivery' && renderWaitEta(chip.waitEta, now / 1000)
+  const eta = deliveryLook(chip.look) && renderWaitEta(chip.waitEta, now / 1000)
   return jsxs(clickable ? 'button' : 'span', {
     type: clickable ? 'button' : undefined,
     onClick,
@@ -1584,7 +1589,7 @@ export function CardRow({ chip, now }) {
         ]
       }),
       jsxs('span', { style: { display: 'flex', alignItems: 'baseline', gap: 6 }, children: [
-      chip.look === 'delivery' && renderWaitEta(chip.waitEta, now / 1000),
+      deliveryLook(chip.look) && renderWaitEta(chip.waitEta, now / 1000),
       m.prUrl
         ? jsx('a', {
             href: m.prUrl, target: '_blank', rel: 'noreferrer', onClick: e => e.stopPropagation(),
