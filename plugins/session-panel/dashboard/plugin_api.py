@@ -113,9 +113,12 @@ def _feed_stamp() -> tuple:
         extra = lane.stat() if lane.exists() else None
         facts = _FEED_PATH.with_name('fact_subscription.py')
         facts_stat = facts.stat() if facts.exists() else None
+        coordinator = _FEED_PATH.with_name('source_coordinator.py')
+        coordinator_stat = coordinator.stat() if coordinator.exists() else None
         return (st.st_ino, st.st_mtime_ns, st.st_size,
                 (extra.st_ino, extra.st_mtime_ns, extra.st_size) if extra else None,
-                (facts_stat.st_ino, facts_stat.st_mtime_ns, facts_stat.st_size) if facts_stat else None)
+                (facts_stat.st_ino, facts_stat.st_mtime_ns, facts_stat.st_size) if facts_stat else None,
+                (coordinator_stat.st_ino, coordinator_stat.st_mtime_ns, coordinator_stat.st_size) if coordinator_stat else None)
     except OSError:
         return ()
 
@@ -146,8 +149,10 @@ def _load_feed():
             raise
         lane = _FEED_PATH.with_name('board_lane.py')
         facts = _FEED_PATH.with_name('fact_subscription.py')
+        coordinator = _FEED_PATH.with_name('source_coordinator.py')
         digest = hashlib.sha256(source + (lane.read_bytes() if lane.exists() else b'')
-                                + (facts.read_bytes() if facts.exists() else b'')).hexdigest()
+                                + (facts.read_bytes() if facts.exists() else b'')
+                                + (coordinator.read_bytes() if coordinator.exists() else b'')).hexdigest()
         if old is not None and getattr(old, 'SOURCE_SHA', None) == digest:
             old.SOURCE_STAMP = stamp  # touched or rewritten with the same bytes: nothing to load
             return old
@@ -169,6 +174,7 @@ def _load_feed():
             old.SOURCE_STAMP = stamp  # not retried on every call; the next change on disk is
             return old
         mod.SOURCE_STAMP, mod.SOURCE_SHA, mod.RESTART = stamp, digest, feed
+        mod.SNAPSHOT_READER_FACTORY = getattr(_LOADER, 'snapshot_reader_factory', None)
         for hook in ('INSTALL_FACTS', 'STOP_FACTS'):
             if old is not None and hasattr(old, hook):
                 setattr(mod, hook, getattr(old, hook))
@@ -436,7 +442,8 @@ class CoreReaders:
         directory = Path(__file__).resolve().parent
         digest = hashlib.sha256(str(directory).encode() +
                                 (directory / 'board_snapshot.py').read_bytes() +
-                                (directory / 'board_capture.py').read_bytes()).hexdigest()
+                                (directory / 'board_capture.py').read_bytes() +
+                                (directory / 'source_coordinator.py').read_bytes()).hexdigest()
         name = f'_panel_acquisition_{digest}'
         with _LOADER.lock:
             if name not in sys.modules:
@@ -2677,6 +2684,9 @@ def _save_running() -> bool:
 # Legacy reload callbacks are excluded from the producer-only import.
 _PRODUCER_ONLY = __name__ == '_session_panel_producer_api_v1'
 if not _PRODUCER_ONLY and _external_projection() is None:
+    # Publish current readers before a saved predecessor entry can resume a
+    # current Feed. Its legacy factory is not the registration authority.
+    _LOADER.snapshot_reader_factory = CoreReaders
     _load_feed().RESTART = feed
     _load_feed().INSTALL_FACTS = install_facts
     _load_feed().STOP_FACTS = stop_facts

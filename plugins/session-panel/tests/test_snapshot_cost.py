@@ -16,6 +16,7 @@ def test_bounded_tail_and_latest_run_match_full_canonical_history(acquisition, m
     r, cap, m, source, store, conn = acquisition
     tid = kanban_db.create_task(conn, title='Long history', session_id='S')
     # Canonical event writer; keep final timestamps tied to exercise the id tie-break.
+    conn.execute('BEGIN')  # core's connection context alone does not start a transaction
     with conn:
         for n in range(5000):
             kanban_db._append_event(conn, tid, 'heartbeat' if n % 3 else 'note', {'n': n})
