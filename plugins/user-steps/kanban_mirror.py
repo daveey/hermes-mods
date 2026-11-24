@@ -44,6 +44,12 @@ _REMOTE_FRESH: dict = {}  # owner key -> monotonic start of its last clean stric
 _REMOTE_CLEARED: dict = {}  # owner key -> monotonic time a failed strict pass last cleared its fresh mark
 _REMOTE_FRESH_LOCK = threading.Lock()
 _REMOTE_FRESH_MAX = 512
+# Panel producers retry unavailable remote membership independently of the local
+# mirror. Source churn must not reset an unreachable owner's retry deadline.
+_PANEL_REMOTE = {}  # (store path, owner) -> (input key, deadline, failures, error)
+_PANEL_REMOTE_LOCK = threading.Lock()
+PANEL_REMOTE_RETRY_S = 5.0
+PANEL_REMOTE_RETRY_MAX_S = 300.0
 
 
 def _mark_remote_fresh(key, started):
@@ -935,6 +941,62 @@ class Mirror:
             return False
         _mark_remote_fresh(key, started)
         return True
+
+    def reconcile_panel(self, owner):
+        """Strict producer with change-keyed remote reads and bounded failure retry.
+
+        Local changes are never hidden by remote backoff. A skipped failed or
+        in-flight remote pass remains deferred; it cannot certify an empty queue.
+        Keys are captured BEFORE reconciliation so a concurrent write is owed.
+        """
+        self.core.validate_owner(owner)
+        stamp = self.remote.input_stamp(self.store.path)
+        key = _local_key(self, owner)
+        now = time.monotonic()
+        with _PANEL_REMOTE_LOCK:
+            hit = _PANEL_REMOTE.get(key)
+            if hit and now < hit[1] and (hit[3] is not None or (stamp is not None and hit[0] == stamp)):
+                run, error = False, hit[3]
+            else:
+                run, error = True, None
+                _PANEL_REMOTE[key] = (stamp, float('inf'), 0, 'Remote card reconciliation in progress')
+        self.panel_remote_unchanged = not run and error is None
+        if run:
+            failures = hit[2] if hit else 0
+            try:
+                if self.remote.reconcile(owner) is False:
+                    error = 'Remote card reconciliation deferred'
+            except Exception as exc:
+                error = f'{type(exc).__name__}: {exc}'[:300]
+            except BaseException:
+                with _PANEL_REMOTE_LOCK:
+                    _PANEL_REMOTE.pop(key, None)
+                raise
+            failures = min(failures + 1, 16) if error else 0
+            delay = min(PANEL_REMOTE_RETRY_MAX_S, PANEL_REMOTE_RETRY_S * 2 ** (failures - 1)) if error else FULL_EVERY_S
+            with _PANEL_REMOTE_LOCK:
+                _PANEL_REMOTE.pop(key, None)
+                deadline = time.monotonic() + delay if error else now + FULL_EVERY_S
+                _PANEL_REMOTE[key] = (stamp, deadline, failures, error)
+                # Never evict in-flight custody and allow a competing pass.
+                for old, value in list(_PANEL_REMOTE.items()):
+                    if len(_PANEL_REMOTE) <= _REMOTE_FRESH_MAX:
+                        break
+                    if value[1] != float('inf'):
+                        del _PANEL_REMOTE[old]
+        try:
+            self._reconcile_local(owner, True)
+        except BaseException:
+            _clear_remote_fresh(encoded(owner))
+            raise
+        _mark_local_seen(_local_key(self, owner))
+        if error:
+            if run:
+                _clear_remote_fresh(encoded(owner))
+            raise RuntimeError(error)
+        # A memo hit does not renew the canonical remote observation clock.
+        if run:
+            _mark_remote_fresh(encoded(owner), now)
 
     def reconcile(self, owner, *, strict=False):
         self.core.validate_owner(owner)

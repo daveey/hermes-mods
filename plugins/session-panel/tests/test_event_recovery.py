@@ -277,17 +277,22 @@ def test_core_reader_isolates_one_chats_producer_failure():
     cr.lineage = lambda s: [s]
     seen = []
 
+    class Result(list):
+        unchanged = True
+
     class Steps:
         @staticmethod
         def panel_reconcile(home, session, lineage):
             seen.append(session)
             if session == 'bad':
                 raise OSError('Remote ask owner projection unavailable')
-            return ['S: RuntimeError: deferred'] if session == 'late' else []
+            return ['S: RuntimeError: deferred'] if session == 'late' else Result()
 
     cr._user_step_api = lambda: Steps
     assert cr.reconcile_sources(['ok', 'bad', 'late', 'ok2']) == {'bad', 'late'}
     assert seen == ['ok', 'bad', 'late', 'ok2']
+    assert [row['unchanged'] for row in cr.reconcile_timings] == [True, False, False, True]
+    assert all(row['at'] > 0 and row['reconcile_s'] >= 0 for row in cr.reconcile_timings)
 
 
 # ── one retry budget per chat: a chat that fails forever must not spend another chat's retries ──────────────

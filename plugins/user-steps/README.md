@@ -246,7 +246,15 @@ only the last kanban alias is live, earlier cards keep their decided binding.
 ## Blocked work-card asks
 
 The session-panel feed reconciles local card asks before reading its canonical
-requests; the compatibility `/requests` read also reconciles. Both project a
+requests; the compatibility `/requests` read also reconciles. The panel producer
+memoizes clean remote passes by canonical activity revisions plus courier, session
+and action-store file identities. An unchanged key skips remote projection for at
+most 60 seconds from the actual pass start; unknown keys never certify a skip.
+Deferred remote owners retry after 5, 10, 20, … seconds, capped at 300 seconds,
+even if unrelated sources keep changing. Local reconciliation still runs during
+backoff, and the deferred result stays visible to the feed. Producer timing rows
+include an exact completion `at` and conservative `unchanged` flag for live latency
+measurement (only clean, identical input keys qualify). Both project a
 blocked or triage work card's `human_request` into one server-bound `choice`
 request. Block-loop escalation events are part of the generation fence. Explicit `{label, value}` choices retain their
 exact values; absent choices produce **Unblock / Archive**. Selecting a supplied
