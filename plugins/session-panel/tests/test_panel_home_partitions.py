@@ -318,6 +318,18 @@ def test_lifecycle_installation_is_the_hermes_root_of_the_served_home(monkeypatc
         assert api._retire_legacy_panel()
 
 
+def test_initial_and_factory_implicit_binding(api, twins, tmp_path, monkeypatch):
+    assert '_partition' not in api.panel_initial_payload()['body']
+    bound = binding(twins['a'])
+    calls = []
+    monkeypatch.setattr(api, 'current_binding', lambda: calls.append(True) or bound)
+    relay = api.make_panel_relay(tmp_path, tmp_path / 'runtime', 'g')
+    assert calls == [True]
+    assert relay.partition_identity == bound.identity
+    api._LOADER.external_projection = None
+    assert api._bound_external(None) is None
+
+
 def test_factory_preserves_explicit_binding_without_resolving_again(api, twins, tmp_path, monkeypatch):
     bound = binding(twins['a'])
     def forbidden(*args):
