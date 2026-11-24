@@ -870,17 +870,26 @@ class CoreReaders:
         """Source admission only: action-store writes cannot trigger their producer."""
         return self._stamps_of(self.board_paths() + [self.state_db()] + self.external_paths())
 
-    def reconcile_sources(self, sessions):
+    reconcile_budgeted = True  # reconcile_sources honours a deadline and names the chats it did not reach
+
+    def reconcile_sources(self, sessions, deadline=None):
         """Run the canonical writer only for source-admitted sessions, before reads.
 
         This producer is deliberately separate from both presentation lanes. It
         still uses canonical per-owner reconciliation; it is not a batched source
-        capture API.
+        capture API. With a monotonic ``deadline`` it stops starting chats once it
+        has passed (at least one always runs) and lists the rest in
+        ``reconcile_unreached``: the feed carries them to its next pass.
         """
         api = self._user_step_api()
         deferred = set()
         timings = []
-        for session in sessions:
+        sessions = list(sessions)
+        self.reconcile_unreached = []
+        for i, session in enumerate(sessions):
+            if deadline is not None and i and time.monotonic() >= deadline:
+                self.reconcile_unreached = sessions[i:]
+                break
             # One chat's unavailable source must not fail every other chat's pass (this phase runs
             # before all hydration). The feed retries what is returned here; it is never certified.
             began = time.monotonic()

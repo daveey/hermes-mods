@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 from pathlib import Path
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -54,6 +55,18 @@ RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed 
 MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
 RECENT_PUBLISHES = 32        # pushes kept in `Feed.timing['recent']` (rev, time, chats, pass start)
 PRODUCER_FULL_EVERY_S = 60.0 # source-event ceiling for canonical time/courier and unkeyed mirror inputs
+PRODUCER_PASS_BUDGET_S = 5.0 # producer time per pass before hydration; chats not reached carry to the next pass
+
+
+def _takes_deadline(readers: Any) -> bool:
+    """The reader's reconcile_sources accepts a pass deadline (a replaced callable may not)."""
+    fn = getattr(readers, 'reconcile_sources', None)
+    if fn is None or not getattr(readers, 'reconcile_budgeted', False):
+        return False
+    try:
+        return 'deadline' in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
@@ -249,6 +262,7 @@ class Feed:
         # Failed work is retried a few times on a short backoff, then waits for the next source event.
         # It is never an idle timer: with nothing failed there is no retry time at all.
         self._reconcile_deferred: set[str] = set()   # producer work a reader could not finish
+        self._producer_carry: set[str] = set()       # producer work a budgeted pass did not reach
         self._budgets: dict[str, dict[str, int]] = {}  # lane -> chat -> retries spent since it last succeeded
         self._reconcile_retry_at = self._hydrate_retry_at = self._decision_retry_at = None
         self._attempted: set[str] = set()            # chats the current pass tried to hydrate
@@ -455,6 +469,7 @@ class Feed:
         self.__dict__.setdefault('_producer_owed', set()).discard(s)
         self._producer_at.pop(s, None)
         getattr(self, '_reconcile_deferred', set()).discard(s)
+        getattr(self, '_producer_carry', set()).discard(s)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
         self.bundles.pop(s, None)
@@ -1056,6 +1071,8 @@ class Feed:
         ats = [at for at in (getattr(self, n, None) for n in
                              ('_admission_retry_at', '_hydrate_retry_at', '_reconcile_retry_at')) if at is not None]
         retry_wait = max(0.0, min(ats) - now) if ats else None
+        if getattr(self, '_producer_carry', None):
+            retry_wait = 0.0  # producer work a budgeted pass did not reach runs next, not on a source write
         decide_at = getattr(self, '_decision_retry_at', None)
         return (0.0 if missing else retry_wait), (None if decide_at is None else max(0.0, decide_at - now))
 
@@ -1082,6 +1099,17 @@ class Feed:
             self._decide.set()
         return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
+    def _producer_order(self, todo: list[str], wanted: set) -> list[str]:
+        """Producer order under a pass budget: chats on a mounted panel, then chats with fresh source
+        evidence, then work still owed (carried, deferred), oldest producer run first."""
+        now = self.clock()
+        with self.lock:
+            visible = {s for s, expires in self._panel_subscribers.values() if expires > now}
+            owed = set(self._reconcile_deferred) | set(getattr(self, '_producer_carry', ()))
+        at = self._producer_at
+        return sorted(todo, key=lambda s: (s not in visible, s in owed or s not in wanted,
+                                           at.get(s, float('-inf'))))
+
     def _produce(self, watched: list[str], source_seen: Any, admitted: Iterable[str]) -> None:
         """Run the source producer for the admitted chats. A scoped reader's other chats were checked against
         the same source stamp and found unaffected, so they settle on it unreconciled."""
@@ -1094,14 +1122,34 @@ class Feed:
             todo = [s for s in watched if s not in self._reconcile_stamps
                     or self._reconcile_stamps[s] != source_seen or s in wanted]
         left: set = set()
+        unreached: set = set()
+        if self.__dict__.get('_producer_carry') is None:
+            self._producer_carry = set()
+        carry = self._producer_carry
         if todo:
             # A reader that isolates per-chat failures returns the chats it could not finish; one that
             # raises fails the pass (tick() then restores every cursor).
-            left = {s for s in (self.readers.reconcile_sources(todo) or ()) if s in todo}
+            if _takes_deadline(self.readers):
+                # The producer runs before any hydration in a pass. Unbounded, a slow canonical writer
+                # (46 chats at 5-50 s each in a contended serve, 2026-11-24: 900 s) held every panel's
+                # presentation for 20+ min while the row stripe, computed elsewhere, stayed live. Bounded,
+                # the chats not reached carry to the very next pass, most-needed first.
+                todo = self._producer_order(todo, wanted)
+                left = {s for s in (self.readers.reconcile_sources(
+                    todo, deadline=time.monotonic() + PRODUCER_PASS_BUDGET_S) or ()) if s in todo}
+                unreached = set(getattr(self.readers, 'reconcile_unreached', None) or ()) & set(todo)
+                left -= unreached
+            else:
+                left = {s for s in (self.readers.reconcile_sources(todo) or ()) if s in todo}
         with self.lock:
             settle = watched if scoped else todo
-            self._reconcile_stamps.update((s, source_seen) for s in settle if s in self.interest)
-            self._producer_at.update((s, self.clock()) for s in todo if s in self.interest)
+            self._reconcile_stamps.update((s, source_seen) for s in settle
+                                          if s in self.interest and s not in unreached)
+            self._producer_at.update((s, self.clock()) for s in todo
+                                     if s in self.interest and s not in unreached)
+            carry.difference_update(todo)
+            carry.update(s for s in unreached if s in self.interest)
+            todo = [s for s in todo if s not in unreached]
             self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(todo)) | left
                                         if s in self.interest}
             waiting = set(self._reconcile_deferred)
@@ -1164,7 +1212,7 @@ class Feed:
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
                  '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen',
-                 '_producer_lineage', '_producer_owed', '_producer_at')
+                 '_producer_lineage', '_producer_owed', '_producer_at', '_producer_carry')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
@@ -1334,7 +1382,8 @@ class Feed:
             # stamp this pass holds predates it: those chats are admitted whether or not the stamp had moved.
             moved = source_seen != self._producer_seen
             known = self.__dict__.setdefault('_producer_lineage', {})
-            admitted = set(redo) | source_dirty | {s for s in watched if s not in self._reconcile_stamps}
+            admitted = (set(redo) | source_dirty | {s for s in watched if s not in self._reconcile_stamps}
+                        | (getattr(self, '_producer_carry', set()) & set(watched)))
             # A chat whose outcome/request stamp moved is reconciled with the source write behind it. When
             # the stamp this pass holds predates that write, it is owed to the pass that sees the stamp move
             # (a request-store write alone is not a source event and never runs the producer).
