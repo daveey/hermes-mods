@@ -156,6 +156,14 @@ profile identities. `test_external_panel_ownership.py` covers import/reload,
 legacy-custody refusal and unchanged absent-selector startup. These tests need
 the paired core branch; no-core CI skips the exec module.
 
+The parity fixture allows up to 60 seconds for broker READY, including both
+execs and cold core/provider imports. This is a test-only startup allowance,
+not a production activation or latency guarantee. A timeout in
+`start_for_fixture` / `Channel.receive` happens before HTTP projection testing;
+inspect child startup separately rather than weakening wire/identity assertions
+or skipping the core-backed test. HTTP publication readiness still has its own
+30-second bound and cleanup retains its 10-second bound.
+
 ## Dormant explicit-home readers
 
 `dashboard/home_context.py` defines `PanelHomeContext`: a canonical resolved home plus opaque lifecycle and
