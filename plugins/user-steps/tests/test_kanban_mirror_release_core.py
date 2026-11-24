@@ -49,6 +49,16 @@ def offer(c, task, ask=ASK):
     return dict(ask, release_target=stamp)
 
 
+def file_ask(kb, c, card, ask):
+    """Store ``ask`` on ``card`` the way core's stranded-park sweep files it (``_escalate``): the request and,
+    in the same transaction, the board's own ``stranded_park_escalated`` record of the offer. Core releases on
+    a click only when that record matches the stamp; the ask column alone is a synced row any gateway can write.
+    Call inside a write transaction."""
+    c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ask), card))
+    kb._append_event(c, card, "stranded_park_escalated",
+                     {"request": True, "release_target": ask["release_target"]})
+
+
 def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamped=True):
     """A card held in triage by a stop, carrying the stranded-park ask when ``ask`` is given. ``stamped=False``
     is an ask the brief did not file: an agent's, or one from before the release offer existed."""
@@ -57,9 +67,10 @@ def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamp
         c.execute("UPDATE tasks SET status='triage' WHERE id=?", (task,))
         kb._append_event(c, task, "spend_budget_triaged",
                          {"reason": "stop", **({"cause": cause} if cause else {})})
-        if ask:
-            c.execute("UPDATE tasks SET human_request=? WHERE id=?",
-                      (json.dumps(offer(c, task, ask) if stamped else ask), task))
+        if ask and stamped:
+            file_ask(kb, c, task, offer(c, task, ask))
+        elif ask:
+            c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ask), task))
     return task
 
 
@@ -69,8 +80,11 @@ def decision_card(kb, c, root, *, stamped=True):
     decision.ensure_producer(c, root)
     card = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
     with kb.write_txn(c):
-        c.execute("UPDATE tasks SET status='blocked', session_id='session-a', human_request=? WHERE id=?",
-                  (json.dumps(offer(c, card) if stamped else ASK), card))
+        c.execute("UPDATE tasks SET status='blocked', session_id='session-a' WHERE id=?", (card,))
+        if stamped:
+            file_ask(kb, c, card, offer(c, card))
+        else:
+            c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ASK), card))
     return card
 
 
@@ -303,5 +317,25 @@ def test_a_stale_decision_card_does_not_release_a_later_stop(real):
         receipt = mirror.deliver(op)  # today's plain unblock of the decision card itself
         assert "released" not in receipt and status(c, card) != "blocked"
         assert status(c, root) == "triage" and not mandates(c, root) and decision.pending(c, root)
+    finally:
+        c.close()
+
+
+def test_a_stamped_ask_this_board_did_not_file_keeps_the_plain_unblock(real, monkeypatch):
+    """The stamp on the ask column is not enough: without the board's own escalation record of the offer (a row
+    another gateway pushed) the click is today's unblock and releases nothing."""
+    kb, connect, path, store, mod = real
+    from hermes_cli import kanban_release
+    monkeypatch.setattr(kanban_release, "release",
+                        lambda *a, **kw: pytest.fail("an offer this board did not record must not release"))
+    c = connect(path)
+    try:
+        task = stopped(kb, c, ask=None)
+        with kb.write_txn(c):
+            c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(offer(c, task)), task))
+        mirror, op = click(mod, store, path)
+        with pytest.raises(core.ActionError):
+            mirror.deliver(op)
+        assert status(c, task) == "triage" and not mandates(c, task)
     finally:
         c.close()
