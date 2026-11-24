@@ -96,15 +96,40 @@ records after closure fail closed. `server_emitted` and
 `authenticated_catchup` are distinct counters; publications deduplicate by key.
 Unmatched entries are retained, never dropped to improve latency statistics.
 
-## Remaining integration and rollback
+## Opt-in stages and bounded analysis
 
-This slice does not yet wire source-received/capture/admission/projection/
-no-change/superseded/forgotten events, frozen/current demand manifests, stage
-I/O/CPU counters, complete writer request/acquire/release clocks or the C event
-analyzer. Reserved event names do not mean those producers execute. Callback time
-is not the full serialized-publication E budget. B2b-ii must finish this scope and
-its original regression matrix/broad suites/review/CI/canonical landing before
-delivery. Existing failed projection/performance and all B/C gates remain intact.
+With a sink explicitly installed, the coordinator emits source-received,
+capture start/end, admission, projection start/end, no-change, superseded and
+forgotten events. Captures retain frozen demands, raw strict-capture provenance
+and current receipt state; projections retain the immutable admission/vector,
+watch, canonical sequence and first-unserved age. `source_received` names the
+first local observation, not an invented remote mutation timestamp.
+Observation-only carriage does not renew semantic/computation/execution clocks.
+
+`StageCost` counts SQLite connects/statements on new or existing handles and
+socket/SSL I/O attempts at the calling thread's CPython C-call boundary. It is
+not a syscall or byte tracer. Existing/replaced profilers remain untouched and
+produce explicit unavailable evidence. Adapter rows/VM steps are copied only
+when actually provided, never inferred zero. Pure projection clocks/costs stop
+before publication/emit; total worker elapsed is separate. Writer request,
+acquire and release records distinguish queue wait from complete serialized
+publication hold, and from callback duration. File I/O remains on the bounded
+logger thread, outside producer locks.
+
+`dashboard/source_analysis.py` consumes bounded private JSONL and delegates exact
+inclusion to the real receipt validator. It reports P/A/E/T stage statistics,
+budget violations, missing/unmatched/superseded accounting and unavailable costs.
+Bytes, depth, records, joins and inclusion checks have fixed bounds. Malformed,
+incomplete or cross-process evidence fails closed. Semantic expected-row/action/
+absence checks, native Desktop p95 and aggregate CPU remain `NOT_EVALUATED`;
+timings alone never produce C acceptance. Retain the input segments and report.
+
+## Remaining acceptance and rollback
+
+B2b-ii still requires its complete original regression/population matrix, full
+canonical Python/guarded composed/whole affected Desktop suites, independent
+exact-head approval, CI and canonical landing. B3 alone activates; existing failed
+projection/performance and all B/C gates remain intact.
 
 Rollback follows normal reviewed deployment and owner fencing; preserve canonical
 decisions, stop/drain telemetry and retain incomplete evidence. Never reuse log
