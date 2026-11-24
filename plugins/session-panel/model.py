@@ -544,26 +544,45 @@ _REVIEW_PHASE = {'spend_review_queued': 'reviewing', 'spend_review_started': 're
                  'spend_review_escalated': 'escalated'}
 
 
+_REVIEW_ENDS = ('spend_budget_triaged', 'spend_review_granted', 'claimed', 'unblocked', 'completed', 'archived',
+                'decision_retained', 'decision_requested', 'blocked', 'scheduled', 'continued')
+
+
 def spend_review(row, bundle):
     """The current spend stop's review (core ``kanban_spend_reviewer``): `{phase, at, reason}` or None.
 
-    `reviewing` while the reviewer judges the stop; `escalated` once it handed the stop to the owner."""
+    `reviewing` while the reviewer judges the stop; `escalated` once it handed the stop to the owner. A later
+    owner decision (`decision_retained`, ...) ends it. A routing notice after a queued or running review means the
+    reviewer was turned off and the stop went to its usual owner: no review then."""
     detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    routed = False
     for event in reversed(detail.get('events') or []):
         if not isinstance(event, dict):
             continue
         kind = event.get('kind')
-        if kind in _REVIEW_PHASE:
+        if kind == 'spend_budget_decision_ready':
+            routed = True
+        elif kind in _REVIEW_PHASE:
+            if routed and _REVIEW_PHASE[kind] == 'reviewing':
+                return None
             value = event.get('created_at')
             return {'phase': _REVIEW_PHASE[kind], 'at': seconds(value) if type(value) in (int, float) else 0,
-                    'reason': flat(obj(event.get('payload')).get('reason'))}
-        if kind in ('spend_budget_triaged', 'spend_review_granted', 'claimed', 'unblocked', 'completed', 'archived'):
+                    'reason': _row_reason(obj(event.get('payload')).get('reason'))}
+        elif kind in _REVIEW_ENDS:
             return None
     return None
 
 
+def _row_reason(value):
+    """A producer's reason fit for a row line: no URL or hash, at most WAIT_MAX characters."""
+    reason = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', text(value)))
+    return reason[:WAIT_MAX - 1].rstrip() + '…' if len(reason) > WAIT_MAX else reason
+
+
 def spend_escalation_overdue(row, bundle, now):
     """An escalated stop nobody decided for SPEND_ESCALATION_S: the owner is not paying attention."""
+    if row.get('stale') or row.get('partial_source_unknown'):
+        return False  # unreadable evidence never turns a card red
     review = spend_review(row, bundle)
     return bool(review and review['phase'] == 'escalated' and 0 < review['at'] <= now - SPEND_ESCALATION_S)
 
@@ -572,9 +591,7 @@ def spend_overdue_text(row, bundle, now, *, wire=False):
     review = spend_review(row, bundle) or {}
     age = relative(review.get('at'), 'elapsed') if wire else short_dur(now - (review.get('at') or now))
     reason = review.get('reason') or 'no reason recorded'
-    if len(reason) > WAIT_MAX:
-        reason = reason[:WAIT_MAX - 1].rstrip() + '…'
-    return f'out of budget · the reviewer escalated {age} ago and nobody has decided: {reason}'
+    return f'out of budget · the reviewer escalated {age} ago and the owner has not decided yet: {reason}'
 
 
 def agent_hold_text(row, bundle):
@@ -594,7 +611,8 @@ def agent_hold_text(row, bundle):
         return 'out of budget · the spend reviewer is deciding now'
     cause = held_cause(row, bundle)
     if review:
-        return f"out of budget · reviewer escalated: {review['reason'] or reason} · waiting on this chat's agent to decide"
+        return ((cause + ' · ' if cause else '') +
+                f"reviewer escalated: {review['reason'] or reason} · waiting on this chat's agent to decide")
     return (cause + ' · ' if cause else '') + "waiting on this chat's agent to decide: " + reason
 
 
