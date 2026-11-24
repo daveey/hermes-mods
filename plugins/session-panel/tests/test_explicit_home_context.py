@@ -10,6 +10,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -351,9 +352,17 @@ def test_provider_ignores_browser_payload_home_fields(tmp_path, monkeypatch):
             'home': str(decoy),
             '_wire_identity': {'feed': 'fixture:serve', 'profile': 'decoy'},
         }
-        # Construction already bound the trusted home; a browser-shaped payload must not retarget it.
+        env_before = dict(os.environ)
+        # The browser-shaped body actually enters the producer. It cannot retarget the bound home, and the
+        # unsupported acquisition is typed unavailable (not a decoy read, not a fresh-empty success).
+        with pytest.raises(Exception) as raised:
+            produced({'body': body, 'accepted': time.monotonic() - 1})
+        assert type(raised.value).__name__ == 'UnsupportedHomeAdapter', repr(raised.value)
+        assert 'DECOY' not in str(raised.value) and str(decoy) not in str(raised.value)
+        assert dict(os.environ) == env_before
         assert produced.readers.state_db() == ctx.home / 'state.db'
         assert produced.readers.home_context.home == ctx.home
+        assert outcome_marker(produced.readers, 'chat') == 'TRUSTED'
         assert body['home'] == str(decoy)
     finally:
         produced.close()
