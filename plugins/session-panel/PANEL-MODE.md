@@ -1,7 +1,8 @@
 # Panel producer mode (Window2 — dormant, fixture-proven)
 
-Do **not** enable on a real serve from the P/B/R implementation card. Nothing here is selected
-unless a serve is launched with one of the two environment variables below.
+Do **not** enable on a real serve from the P/B/R implementation card. External mode is selected
+only by the installation-local runtime setter below or by explicit environment initialization.
+Every serving process watches the same stored mode even when both variables are unset.
 
 ## Same effective mode
 
@@ -23,11 +24,13 @@ unless a serve is launched with one of the two environment variables below.
 hermes producer-mode --panel-external false     # or: true
 ```
 
-Optional: `--installation <HERMES_HOME>` (default `$HERMES_HOME` or `~/.hermes`).
+Optional: `--installation <root-or-profile-home>` (default: the installation root containing the process
+Hermes home). A named home such as `<root>/profiles/<name>` is canonicalized to `<root>` by both the
+setter and the serving lifecycle, so it never creates a private second mode under the profile.
 Equivalent module dispatcher (used by the subprocess tests):
-`python -m hermes_cli.serve_producer_mode --panel-external false --installation <HOME>`.
+`python -m hermes_cli.serve_producer_mode --panel-external false --installation <root-or-profile-home>`.
 
-It writes `<HERMES_HOME>/serve-producers/panel.mode.json` = `{"external": bool, "revision": int}`
+It writes `<installation-root>/serve-producers/panel.mode.json` = `{"external": bool, "revision": int}`
 atomically under an `flock`ed lock file; the revision strictly increases. There is no second writable
 boolean; the file is the same mode the environment initializes.
 

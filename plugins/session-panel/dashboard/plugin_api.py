@@ -1671,8 +1671,8 @@ def panel_initial_payload(binding=None):
 
 def _serve_home():
     """The one home this process is authorized to serve: its own launch home, never a request label."""
-    from hermes_constants import get_hermes_home
-    return Path(get_hermes_home())
+    from hermes_constants import get_process_hermes_home
+    return Path(get_process_hermes_home())
 
 
 def current_binding(app_state=None):
@@ -2938,7 +2938,8 @@ def _serves_desktop(name: str = __name__, role: str = FEED_ROLE) -> bool:
     """True when core's web server imported this file as the plugin's API in a backend that serves Desktops
     (`hermes serve` / `hermes dashboard`). Core's app runs a lifespan, so a router startup hook never fires, and
     plugin routes may be mounted long after startup: the import is the one moment every such process passes."""
-    return name.startswith('hermes_dashboard_plugin_') and role.split('-', 1)[0] in ('serve', 'dashboard')
+    return name.startswith('hermes_dashboard_plugin_') and (
+        role.split('-', 1)[0] in ('serve', 'dashboard') or os.environ.get('HERMES_PLUGIN_HOST_PROCESS') == '1')
 
 
 if _serves_desktop():

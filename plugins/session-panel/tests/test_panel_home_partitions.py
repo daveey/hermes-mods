@@ -318,6 +318,18 @@ def test_lifecycle_installation_is_the_hermes_root_of_the_served_home(monkeypatc
         assert api._retire_legacy_panel()
 
 
+def test_request_home_override_never_changes_the_serve_home(api, twins, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    monkeypatch.setenv('HERMES_HOME', str(twins['a']))
+    before = api.current_binding()
+    token = set_hermes_home_override(twins['b'])
+    try:
+        assert api.current_binding() == before
+        assert api._serve_home() == twins['a']
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_initial_and_factory_implicit_binding(api, twins, tmp_path, monkeypatch):
     assert '_partition' not in api.panel_initial_payload()['body']
     bound = binding(twins['a'])
