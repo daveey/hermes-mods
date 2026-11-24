@@ -22,6 +22,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def _remote_module():
+    """Load the reducer independently of Mirror's writer/runtime construction."""
+    spec = importlib.util.spec_from_file_location('_user_steps_remote_cards', Path(__file__).with_name('remote_cards.py'))
+    remote = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(remote)
+    return remote
+
+
 MISMATCH = "Request no longer matches its frozen server binding"
 
 # Change-keyed reconcile (design t_01a1d563324d7e8e card L). Desktop polls ``/requests`` per open chat and each
@@ -394,11 +402,7 @@ class Mirror:
         session_present=None,
     ):
         self.core, self.store, self.backend = core, store, backend
-        path = Path(__file__).with_name('remote_cards.py')
-        spec = importlib.util.spec_from_file_location('_user_steps_remote_cards', path)
-        remote = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(remote)
-        self.remote = remote.Remote(self)
+        self.remote = _remote_module().Remote(self)
         board_source = core.kanban_boards if boards is None else boards
         self.boards = dict(board_source() if callable(board_source) else board_source)
         self.session_exists = session_exists or self._user_session
@@ -1652,6 +1656,7 @@ class Presentation:
         if not store.read_only:
             raise core.ActionError('Presentation requires a read-only action store', 503)
         self.core, self.store = core, store
+        self.remote = _remote_module().DeliveryPresentation()
 
     views = Mirror.views
     present = Mirror.present

@@ -48,6 +48,11 @@ def parse_home_sync_config(home: Path) -> dict:
         raise ValueError('Explicit sync enabled must be boolean')
     if 'gateway' in sync and (not isinstance(sync['gateway'], str) or not sync['gateway'].strip()):
         raise ValueError('Explicit sync gateway must be a nonempty string')
+    if 'boards' in sync and (not isinstance(sync['boards'], list)
+                             or any(not isinstance(board, str) or not board.strip() for board in sync['boards'])):
+        raise ValueError('Explicit sync boards must be a list of nonempty strings')
+    if 'links_reader' in sync and not isinstance(sync['links_reader'], str):
+        raise ValueError('Explicit sync links_reader must be a string')
     stale_after(sync)  # validate a supplied interval even when the optional source is disabled
     return sync
 
