@@ -76,6 +76,8 @@ def at(hour, minute, winter=False):
 def add_block(path, when, run_id, payload):
     db, _ = ut._kanban_api()
     with sqlite3.connect(path) as con:
+        # Match core connect(): lifecycle stamping reads task rows by column name.
+        con.row_factory = sqlite3.Row
         # Seed a real lifecycle event, including the core's wake-episode state;
         # a raw event INSERT omits the exit/reset evidence of a blocked card.
         last = con.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
