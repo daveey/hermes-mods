@@ -74,42 +74,77 @@ def _clear_remote_fresh(key):
 # backend". A remote ask now reaches the queue when its owner's background pass finishes (queue wait included).
 BACKGROUND_WORKERS = 2
 _BACKGROUND_LOCK = threading.Condition()
-_BACKGROUND_PENDING: dict = {}  # owner key -> (mirror, owner, the poll's context), waiting for a worker
+_BACKGROUND_PENDING: dict = {}  # owner key -> (mirror, owner, the poll's context, passes wanted), waiting
 _BACKGROUND_RUNNING: set = set()  # owner keys a worker is reconciling now
 _BACKGROUND_WORKERS_ALIVE = 0
+# [daveey] Owners whose local pass already ran in this process. A poll for one of them answers from the action
+# store (the last good result) and queues its local pass here instead of running it on the request thread: the
+# local pass re-reads every card binding (222 on the hub, 2026-11-23) through one kept connection per board, and
+# concurrent polls queued on it for 10-86 s ("Action queue unavailable" at Desktop's 10 s budget). A cold owner
+# still runs it inline, so a newly opened chat never shows an empty queue for want of a first pass.
+_LOCAL_SEEN: dict = {}  # owner key -> None, insertion-ordered for eviction
+_LOCAL_SEEN_MAX = 512
+
+
+def _mark_local_seen(key):
+    with _MEMO_LOCK:
+        _LOCAL_SEEN.pop(key, None)
+        _LOCAL_SEEN[key] = None
+        while len(_LOCAL_SEEN) > _LOCAL_SEEN_MAX:
+            del _LOCAL_SEEN[next(iter(_LOCAL_SEEN))]
+
+
+def _local_key(mirror, owner):
+    """Warm is per action store and owner: another store (a test's, a profile's) has not held this owner's result."""
+    store = getattr(mirror, 'store', None)
+    return encoded([str(getattr(store, 'path', None)), owner])
+
+
+def _local_seen(key):
+    with _MEMO_LOCK:
+        return key in _LOCAL_SEEN
 
 
 def _schedule_remote(mirror, owner):
-    """Queue one background remote pass for *owner*; False when it was already queued or running.
+    """Queue one background remote pass for *owner*; False when it was already queued or running."""
+    return _schedule(mirror, owner, ('remote',))
+
+
+def _schedule(mirror, owner, passes):
+    """Queue one background pass for *owner* doing *passes* ('remote', 'local'); False when one was already
+    queued (its passes are widened to include these) or running (the next poll queues again).
 
     Every call, a duplicate included, starts a worker while passes are queued and a slot is free, so a queued
     pass is never left without one (a worker exiting, dying or failing to start is replaced by the next poll)."""
     global _BACKGROUND_WORKERS_ALIVE
     key = encoded(owner)
     with _BACKGROUND_LOCK:
-        queued = key not in _BACKGROUND_PENDING and key not in _BACKGROUND_RUNNING
+        pending = _BACKGROUND_PENDING.get(key)
+        if pending is not None:
+            _BACKGROUND_PENDING[key] = pending[:3] + (pending[3] | frozenset(passes),)
+        queued = pending is None and key not in _BACKGROUND_RUNNING
         if queued:
             # Threads do not inherit contextvars: the pass must see the poll's profile (multiplexed HERMES_HOME
             # overrides), exactly as the outbox worker runs under its captured context.
-            _BACKGROUND_PENDING[key] = (mirror, owner, contextvars.copy_context())
+            _BACKGROUND_PENDING[key] = (mirror, owner, contextvars.copy_context(), frozenset(passes))
         start = bool(_BACKGROUND_PENDING) and _BACKGROUND_WORKERS_ALIVE < BACKGROUND_WORKERS
         if start:
             _BACKGROUND_WORKERS_ALIVE += 1
     if start:
         try:
-            threading.Thread(target=_drain_remote, name='user-steps-remote-pass', daemon=True).start()
+            threading.Thread(target=_drain_remote, name='user-steps-card-pass', daemon=True).start()
         except BaseException as exc:  # e.g. "can't start new thread": give the slot back; the next poll starts one
             with _BACKGROUND_LOCK:
                 _BACKGROUND_WORKERS_ALIVE -= 1
                 _BACKGROUND_LOCK.notify_all()
             if not isinstance(exc, Exception):
                 raise
-            logging.getLogger('user-steps').warning('Background remote card pass not started', exc_info=True)
+            logging.getLogger('user-steps').warning('Background card pass not started', exc_info=True)
     return queued
 
 
 def _background_idle(timeout):
-    """Wait until no background remote pass is queued or running (tests); True when idle."""
+    """Wait until no background card pass (remote or local) is queued or running (tests); True when idle."""
     with _BACKGROUND_LOCK:
         return _BACKGROUND_LOCK.wait_for(
             lambda: not _BACKGROUND_WORKERS_ALIVE and not _BACKGROUND_PENDING and not _BACKGROUND_RUNNING, timeout)
@@ -129,14 +164,21 @@ def _drain_remote():
                     released = True
                     _BACKGROUND_LOCK.notify_all()
                     return
-                key, (mirror, owner, ctx) = next(iter(_BACKGROUND_PENDING.items()))
+                key, (mirror, owner, ctx, passes) = next(iter(_BACKGROUND_PENDING.items()))
                 del _BACKGROUND_PENDING[key]
                 _BACKGROUND_RUNNING.add(key)
             try:
-                if not ctx.run(mirror._reconcile_remote, owner):
-                    log.debug('Background remote card pass deferred; owner stays stale')
-            except Exception:  # a failed pass stays stale: the next poll queues another
-                log.warning('Background remote card pass failed', exc_info=True)
+                if 'remote' in passes:
+                    try:
+                        if not ctx.run(mirror._reconcile_remote, owner):
+                            log.debug('Background remote card pass deferred; owner stays stale')
+                    except Exception:  # a failed pass stays stale: the next poll queues another
+                        log.warning('Background remote card pass failed', exc_info=True)
+                if 'local' in passes:
+                    try:
+                        ctx.run(mirror._reconcile_local, owner, False)
+                    except Exception:  # the store keeps the last good requests; the next poll queues another
+                        log.warning('Background local card pass failed', exc_info=True)
             finally:
                 with _BACKGROUND_LOCK:
                     _BACKGROUND_RUNNING.discard(key)
@@ -867,11 +909,20 @@ class Mirror:
         if fresh_s <= 0:
             self.reconcile(owner)
             return
-        if not _remote_fresh(encoded(owner), fresh_s):
+        key = encoded(owner)
+        passes = set()
+        if not _remote_fresh(key, fresh_s):
             # Stale: the remote pass runs on a background worker, never on this request thread; a remote ask it
-            # mirrors shows on the first poll after that pass finishes. The local pass still answers this one.
-            _schedule_remote(self, owner)
-        self._reconcile_local(owner, False)
+            # mirrors shows on the first poll after that pass finishes.
+            passes.add('remote')
+        warm = _local_seen(_local_key(self, owner))
+        if warm:
+            passes.add('local')  # answer from the store (last good); a local change shows on a later poll
+        if passes:  # queued before any inline pass: a cold pass that raises must not strand the remote pass
+            _schedule(self, owner, passes)
+        if not warm:
+            self._reconcile_local(owner, False)  # cold owner: its first pass answers this poll
+            _mark_local_seen(_local_key(self, owner))
 
     def _reconcile_remote(self, owner):
         """One remote pass; True (and *owner* marked fresh for polls, as a clean strict pass does) when clean.
@@ -900,6 +951,7 @@ class Mirror:
         # learns of the deferred remote work afterwards, never instead of the local pass.
         try:
             self._reconcile_local(owner, strict)
+            _mark_local_seen(_local_key(self, owner))
             if strict and deferred is not None:
                 raise deferred
         except BaseException:

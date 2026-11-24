@@ -215,11 +215,19 @@ def test_forged_unbound_request_cannot_deliver(tmp_path):
         mirror.deliver(decide(store, request, 0))
 
 
+def settled_requests(client, mirror):
+    """GET /requests, let the background card pass it queued finish, then GET again."""
+    client.get("/requests", params={"session": "session-a"})
+    assert type(mirror).reconcile_poll.__globals__["_background_idle"](10), "background card pass did not finish"
+    return client.get("/requests", params={"session": "session-a"}).json()["requests"]
+
+
 def test_desktop_queue_routes_card_decision_and_withdraws_on_archive(tmp_path):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     mirror, store, path, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: []  # local cards only: never project the host's real linked cards
     api = load_module("mirror_api", ROOT / "dashboard" / "plugin_api.py")
     api.RETRY_INTERVAL_S = 0
     app = FastAPI()
@@ -261,15 +269,13 @@ def test_desktop_queue_routes_card_decision_and_withdraws_on_archive(tmp_path):
         c.execute(
             "INSERT INTO task_events(id,task_id,kind) VALUES (NULL,'t_test','blocked')"
         )
-    requests = client.get("/requests", params={"session": "session-a"}).json()[
-        "requests"
-    ]
+    # A warm owner's poll answers from the store (last good) and reconciles in the background: the re-blocked
+    # card reaches the queue on the poll after that pass (kanban_mirror._LOCAL_SEEN, 2026-11-23).
+    requests = settled_requests(client, mirror)
     assert len([r for r in requests if r["state"] == "open"]) == 1
     with sqlite3.connect(path) as c:
         c.execute("UPDATE tasks SET status='archived'")
-    requests = client.get("/requests", params={"session": "session-a"}).json()[
-        "requests"
-    ]
+    requests = settled_requests(client, mirror)
     assert not any(r["state"] == "open" for r in requests)
 
 

@@ -15,9 +15,11 @@ mirror_mod = load_module('feed_fresh_mirror', ROOT / 'kanban_mirror.py')
 @pytest.fixture(autouse=True)
 def clean():
     mirror_mod._REMOTE_FRESH.clear()
+    mirror_mod._LOCAL_SEEN.clear()
     yield
     assert mirror_mod._background_idle(5), 'background remote pass still running'
     mirror_mod._REMOTE_FRESH.clear()
+    mirror_mod._LOCAL_SEEN.clear()
 
 
 def idle():
@@ -48,6 +50,7 @@ def test_poll_skips_remote_after_a_clean_strict_pass_but_runs_local():
     mirror_mod.Mirror.reconcile(self, OWNER, strict=True)  # the feed producer
     assert len(remote) == 1
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # the poll
+    idle()  # a warm owner's local pass runs in the background (test_warm_poll_answers_from_the_store)
     assert len(remote) == 1  # skipped
     assert local[-1] == (OWNER, False)  # local still ran
 
@@ -222,11 +225,15 @@ def test_poll_never_waits_for_a_slow_remote_pass():
         assert local == [(OWNER, False)]
         assert started.wait(5)
         mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # stale and already running: not queued twice
-        assert remote == [OWNER] and len(local) == 2
+        # warm now: its local pass is not run on the request thread either (answered from the store)
+        assert remote == [OWNER] and len(local) == 1
     finally:
         release.set()
     idle()
     assert remote == [OWNER]
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # the next poll queues the local (and stale remote) pass
+    idle()
+    assert local[-1] == (OWNER, False) and len(local) == 2
 
 
 def test_a_clean_background_pass_marks_fresh_and_a_failed_one_does_not(caplog):
@@ -302,7 +309,7 @@ def test_thread_start_failure_is_retried_by_the_next_poll(monkeypatch, caplog):
     monkeypatch.setattr(mirror_mod.threading, 'Thread', NoThread)
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # the poll itself still answers
     assert local == [(OWNER, False)] and remote == []
-    assert 'Background remote card pass not started' in caplog.text
+    assert 'Background card pass not started' in caplog.text
     assert mirror_mod._BACKGROUND_WORKERS_ALIVE == 0  # no slot leaked
     monkeypatch.setattr(mirror_mod.threading, 'Thread', real_thread)
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # a duplicate poll still starts the missing worker
@@ -336,3 +343,79 @@ def test_the_background_pass_runs_in_the_polls_context():
         profile.reset(token)
     idle()
     assert seen == ['profile-b']
+
+
+def test_warm_poll_answers_from_the_store_and_reconciles_local_in_background():
+    """Hub 2026-11-23: the local pass re-read 222 card bindings through one kept connection per board on every
+    poll; concurrent polls queued 10-86 s and Desktop showed "Action queue unavailable". After an owner's first
+    local pass, a poll returns at once (the store holds the last good requests) and the pass runs on a worker."""
+    import threading
+    self, remote, local = fake()
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # cold: inline
+    assert local == [(OWNER, False)]
+    idle()
+    gate, entered = threading.Event(), threading.Event()
+
+    def slow_local(owner, strict):
+        entered.set()
+        gate.wait(5)
+        local.append((owner, strict))
+    self._reconcile_local = slow_local
+    try:
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # warm: returns while its local pass is blocked
+        assert entered.wait(5), 'the warm poll queued no local pass'
+        assert len(local) == 1, 'the warm poll ran its local pass inline'
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # running: not queued twice, still no inline pass
+        assert len(local) == 1
+    finally:
+        gate.set()
+    idle()
+    assert local[1:] == [(OWNER, False)], 'the background local pass did not run exactly once'
+
+
+def test_a_queued_remote_pass_is_widened_to_local_not_duplicated():
+    self, remote, local = fake()
+    mirror_mod._mark_local_seen(mirror_mod._local_key(self, OWNER))
+    mirror_mod._BACKGROUND_WORKERS_ALIVE, saved = mirror_mod.BACKGROUND_WORKERS, mirror_mod._BACKGROUND_WORKERS_ALIVE
+    try:  # no free worker slot: the passes stay queued so the merge is observable
+        assert mirror_mod._schedule(self, OWNER, ('remote',)) is True
+        assert mirror_mod._schedule(self, OWNER, ('local',)) is False
+        assert mirror_mod._BACKGROUND_PENDING[mirror_mod.encoded(OWNER)][3] == frozenset({'remote', 'local'})
+    finally:
+        mirror_mod._BACKGROUND_WORKERS_ALIVE = saved
+    mirror_mod._schedule(self, OWNER, ())  # a free slot again: a worker drains the queued pass
+    idle()
+    assert remote == [OWNER] and local == [(OWNER, False)]
+
+
+def test_a_failed_background_local_pass_is_logged_and_retried_by_the_next_poll(caplog):
+    self, remote, local = fake()
+    mirror_mod.Mirror.reconcile(self, OWNER, strict=True)  # fresh, warm
+    calls = []
+
+    def failing(owner, strict):
+        calls.append(owner)
+        raise OSError('board busy')
+    self._reconcile_local = failing
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
+    assert 'Background local card pass failed' in caplog.text
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
+    assert len(calls) == 2
+
+
+def test_a_cold_local_pass_that_raises_still_queues_the_remote_pass():
+    """Review 2026-11-23: queue the background pass before the cold inline local pass, so a local pass that keeps
+    failing (busy board) never keeps the owner's remote asks out of the queue."""
+    self, remote, local = fake()
+
+    def failing(owner, strict):
+        local.append((owner, strict))
+        raise OSError('board busy')
+    self._reconcile_local = failing
+    with pytest.raises(OSError):
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
+    assert remote == [OWNER], 'a failed cold local pass stranded the remote pass'
+    assert not mirror_mod._local_seen(mirror_mod._local_key(self, OWNER)), 'a failed cold pass marked the owner warm'
