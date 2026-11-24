@@ -81,7 +81,7 @@ test('mounted legacy cached running header fails closed before any heartbeat', a
 })
 for (const [name, trusted, age, vouched] of [
  ['restored', false, 0, null], ['expired', true, 61, true],
- ['unvouched', true, 0, false], ['fresh', true, 0, true]
+ ['unvouched', true, 0, false], ['future', true, -3600, true], ['fresh', true, 0, true]
 ]) {
  test(`running header ${name} uses source freshness, not transport age`, async () => {
   const base = Object.values(cases).find(c => c.model?.sections?.running?.length)
@@ -94,14 +94,14 @@ for (const [name, trusted, age, vouched] of [
   const stale = name !== 'fresh'
   const text = document.querySelector('[data-session-status]').textContent
   // Merely old or restored: the last reported state with an age suffix. A failed vouch is a real contradiction.
-  assert.equal(text.includes('status unknown (stale'), name === 'unvouched')
+  assert.equal(text.includes('status unknown (stale'), name === 'unvouched' || name === 'future')
   assert.equal(text.includes('running (stale'), name === 'restored' || name === 'expired')
   if (stale) {
    assert.equal(document.querySelector('[data-panel-status-stripe]').dataset.panelStatusStripe, 'none')
    assert.equal(document.querySelector('[data-session-status]').title, 'unknown')
    assert.ok(document.querySelector('[data-panel-status-stripe]').style.background.includes('muted-foreground'))
   } else assert.equal(document.querySelector('[data-session-status]').textContent, 'running')
-  if (age) assert.ok(document.querySelector('[data-session-status]').textContent.includes('1m old'))
+  if (age > 0) assert.ok(document.querySelector('[data-session-status]').textContent.includes('1m old'))
   assert.equal(JSON.stringify(model), before)
  })
 }

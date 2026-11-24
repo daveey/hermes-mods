@@ -482,7 +482,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   // A model that is merely older than its ttl (or restored, not yet re-vouched) still says what the board last
   // reported: its running/waiting header with an age suffix. A failed vouch (`vouched === false`), a missing or
   // future clock, or any other state stays "status unknown".
-  const lastSeen = freshness.stale && vouched !== false && freshness.age !== null && model.header.source && ['running', 'waiting'].includes(str(model.header.state))
+  const lastSeen = freshness.stale && vouched !== false && Number.isFinite(freshness.age) && freshness.age >= 0 && model.header.source && ['running', 'waiting'].includes(str(model.header.state))
   const staleBase = lastSeen ? (model.header.state === 'waiting' ? `waiting · ${(model.header.counts?.waiting || 0) + (model.header.counts?.ready || 0)} cards` : str(model.header.label) || 'running') : 'status unknown'
   const label = freshness.stale ? `${staleBase} (stale${freshness.age === null ? '' : ` · ${formatClockText([{ timestamp: model.freshness.computed_at, format: 'elapsed' }], now)} old`})` : hasHeader ? str(model.header.label) || state : 'unknown'
   const stripe = freshness.stale ? 'none' : status?.presentation?.stripe || 'attention'
