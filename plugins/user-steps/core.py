@@ -2632,14 +2632,20 @@ def validate_action(value):
     return json.loads(_json(value))
 
 
-def server_owner(session: str) -> dict:
+def server_owner(session: str, *, install_id: str | None = None, profile: str | None = None) -> dict:
     """Use the core install identity and task-scoped profile, not launcher/session env.
 
     current_profile_name honors multiplex HERMES_HOME context overrides. The install
     ID is shared with the core hosted-room authority; no plugin-specific provisioning.
     Missing core identity fails closed rather than inventing a local namespace.
+    Pass ``install_id``/``profile`` for an explicit authorized home (never get_install_id).
     """
     try:
+        if install_id:
+            owner = {'gatewayId': f'install:{install_id}', 'profile': profile or 'default',
+                     'storedSessionId': session}
+            validate_owner(owner)
+            return owner
         from hermes_cli.install_identity import get_install_id
         from hermes_cli.profiles import current_profile_name
         install_id = get_install_id()

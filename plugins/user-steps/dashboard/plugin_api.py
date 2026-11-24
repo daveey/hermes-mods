@@ -189,27 +189,36 @@ def _with_terminal_history(tasks, history, ids):
     return out
 
 
-def panel_owners(home: Path, session: str, lineage) -> list:
+def _server_owner(core, session, *, install_id=None, profile=None):
+    if install_id is None and profile is None:
+        return core.server_owner(session)
+    return core.server_owner(session, install_id=install_id, profile=profile)
+
+
+def panel_owners(home: Path, session: str, lineage, *, install_id=None, profile=None, bound=False) -> list:
     """Capture stored membership once, closing SQL before owner derivation.
 
     Absence is a 404; an unreadable source is an error, never an empty snapshot.
     Identity is resolved once in the current profile, not from supplied paths.
+    ``bound=True`` uses the authorized home and explicit install identity only.
     """
     core = _load('core')
-    if core.home().resolve() != Path(home).resolve():
-        raise core.ActionError('Panel profile does not match current profile', 409)
-    result = _panel_owners_many(core, {session: lineage})[session]
+    if not bound:
+        if core.home().resolve() != Path(home).resolve():
+            raise core.ActionError('Panel profile does not match current profile', 409)
+    result = _panel_owners_many(core, {session: lineage}, home=Path(home) if bound else None,
+                                install_id=install_id, profile=profile)[session]
     if isinstance(result, Exception):
         raise result
     return result
 
 
-def _panel_owners_many(core, lineages):
+def _panel_owners_many(core, lineages, *, home=None, install_id=None, profile=None):
     scopes = {sid: list(dict.fromkeys([*lineage, sid])) for sid, lineage in lineages.items()}
     ids = list(dict.fromkeys(s for lineage in scopes.values() for s in lineage))
     if not ids:
         return {}
-    c = core._ro_connect(core._state_db(), timeout=2)
+    c = core._ro_connect(core._state_db(home), timeout=2)
     try:
         c.execute('PRAGMA query_only=ON')
         rows = c.execute('SELECT id FROM sessions WHERE id IN (SELECT value FROM json_each(?))',
@@ -218,7 +227,7 @@ def _panel_owners_many(core, lineages):
         c.close()
     present = {row[0] for row in rows}
     valid = [sid for sid in scopes if sid in present]
-    identity = core.server_owner(valid[0]) if valid else None
+    identity = (_server_owner(core, valid[0], install_id=install_id, profile=profile) if valid else None)
     owners = {sid: dict(identity, storedSessionId=sid) for sid in ids if sid in present} if identity else {}
     for own in owners.values():
         core.validate_owner(own)
@@ -227,7 +236,7 @@ def _panel_owners_many(core, lineages):
             for sid, lineage in scopes.items()}
 
 
-def panel_requests_many(home: Path, lineages) -> dict:
+def panel_requests_many(home: Path, lineages, *, install_id=None, profile=None, bound=False) -> dict:
     """Read all lineage requests with one closed snapshot per source database.
 
     A missing watched session is a per-session 404, never authority inherited
@@ -236,15 +245,18 @@ def panel_requests_many(home: Path, lineages) -> dict:
     """
     import copy
     core = _load('core')
-    if core.home().resolve() != Path(home).resolve():
-        raise core.ActionError('Panel profile does not match current profile', 409)
-    scopes = _panel_owners_many(core, lineages)
+    if not bound:
+        if core.home().resolve() != Path(home).resolve():
+            raise core.ActionError('Panel profile does not match current profile', 409)
+    scopes = _panel_owners_many(core, lineages, home=Path(home) if bound else None,
+                                install_id=install_id, profile=profile)
     owners = {}
     for group in scopes.values():
         if not isinstance(group, Exception):
             for own in group:
                 owners[own['storedSessionId']] = own
-    st = core.ActionStore(read_only=True)
+    store_path = Path(home) / 'user-steps' / 'actions.sqlite3' if bound else None
+    st = core.ActionStore(path=store_path, read_only=True) if store_path is not None else core.ActionStore(read_only=True)
     by_session = {sid: [] for sid in owners}
     if owners and st.path.exists():
         producer = _load('kanban_mirror').Mirror(core, st)
@@ -260,7 +272,7 @@ class PanelReconcileResult(list):
     unchanged = False
 
 
-def panel_reconcile(home: Path, session: str, lineage) -> list:
+def panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profile=None, bound=False) -> list:
     """Source-event producer, separate from read-only panel presentation.
 
     Returns what stayed deferred, one line per owner ([] = every owner reconciled). One owner's
@@ -269,12 +281,14 @@ def panel_reconcile(home: Path, session: str, lineage) -> list:
     """
     core = _load('core')
     try:
-        owners = panel_owners(home, session, lineage)
+        owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
     except core.ActionError as exc:
         if exc.status != 404:
             raise
         return []  # queried absent own session, not failed source or failed reconciliation
-    producer = _load('kanban_mirror').Mirror(core, core.ActionStore())
+    store_path = Path(home) / 'user-steps' / 'actions.sqlite3' if bound else None
+    st = core.ActionStore(path=store_path) if store_path is not None else core.ActionStore()
+    producer = _load('kanban_mirror').Mirror(core, st)
     deferred = PanelReconcileResult()
     deferred.unchanged = bool(owners)
     for own in owners:
@@ -287,15 +301,20 @@ def panel_reconcile(home: Path, session: str, lineage) -> list:
     return deferred
 
 
-def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list:
+def panel_requests(home: Path, session: str, lineage, *, reconcile=True,
+                   install_id=None, profile=None, bound=False) -> list:
     """Reconcile the canonical producer before the feed renders; no legacy GET needed.
 
     The feed's context must be the owning profile. Never turn a supplied filesystem
     path or source reference into write authority for a different profile.
     """
     core = _load('core')
-    owners = panel_owners(home, session, lineage)
-    st = core.ActionStore() if reconcile else core.ActionStore(read_only=True)
+    owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
+    store_path = Path(home) / 'user-steps' / 'actions.sqlite3' if bound else None
+    if store_path is not None:
+        st = core.ActionStore(path=store_path) if reconcile else core.ActionStore(path=store_path, read_only=True)
+    else:
+        st = core.ActionStore() if reconcile else core.ActionStore(read_only=True)
     if not reconcile and not st.path.exists():
         return []  # a fresh profile has no producer store; readers must not create it
     producer = _load('kanban_mirror').Mirror(core, st)
