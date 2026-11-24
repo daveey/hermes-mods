@@ -76,7 +76,15 @@ Changes with no `task_events` row (a chat link adopted or released, a wake probe
 external-ledger reads when no panel is mounted and partitions captures only for
 visible sessions. Hidden sessions retain dirty demand; attachment still hydrates
 current data. Set it to `0` to capture external inputs for all watched sessions.
-Canonical decision reconciliation is not visibility-gated.
+Canonical decision reconciliation is not visibility-gated. Its source producer
+has a per-session three-second floor measured after the previous writer call
+finishes. Changes within that floor retain one trailing reconciliation, due even
+without another file write; they do not spend the failed-source retry budget.
+A failed later capture does not roll back the actual writer's floor. Quiet
+watched sessions receive a safety reconciliation every 30 seconds. Existing
+per-session panel stamps, lineage checks and external-input comparisons still
+select source work; the global state.db stamp remains an admission signal so
+lineage and outcome changes are not silently discarded.
 
 `HERMES_PANEL_BOARD_BATCH` is default-on (same off values) and applies only
 to the serialized lane described below (`HERMES_PANEL_BOARD_COALESCE`). One
