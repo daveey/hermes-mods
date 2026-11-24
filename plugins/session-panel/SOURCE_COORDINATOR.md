@@ -105,8 +105,21 @@ watch/epoch or semantic rows take strict materialization instead. Raw provenance
 is never inherited across owners; compatible store transfer alone cannot attest
 that a current owner performed a strict capture.
 
+Strict membership does not include every detached ancestor's task/result. The raw
+capture therefore also attests semantic shadow-board inputs for its member/ref
+boards (including prior hydrated closure boards). This source-owned SQL work is
+once per board, not per chat. It hashes the canonical activity tables excluding
+core-defined lease/HLC/sync-version/heartbeat bookkeeping; file mtime, WAL/SHM churn
+and activity-counter advances alone are not semantic content. A reverted value
+can still match the published parent while an older strict capture is held.
+Changed dependency content must materialize rather than carry the old detail.
+This conservative whole-board attestation is budgeted inside acquisition; its
+SQL/CPU cost is real, not zero or per-chat projection work. Maximum-population
+and production performance acceptance remain required before activation.
+
 A clock-only pass uses B2a `carry_board_observations` and `publish_projections`,
-without hydration, `project_board`, canonical-dirty admission or a second read.
+without hydration, `project_board`, canonical-dirty admission or a second strict
+union acquisition. The raw source attestation above still performs SQL reads.
 CoreReaders owns the producer/owner/session/origin/binding-qualified identity:
 replica rows, source-less origin rows and origin-obligation rows retain distinct
 clocks, including legitimate regression. The store accepts an unchanged part with
