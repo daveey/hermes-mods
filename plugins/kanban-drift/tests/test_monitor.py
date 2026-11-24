@@ -17,6 +17,18 @@ requires_core = pytest.mark.skipif(importlib.util.find_spec("hermes_cli") is Non
                                    reason="Hermes core (hermes_cli) not importable: core-backed test")
 
 
+def _register_fixture_chat(home, monkeypatch, session="20261124_120000_drift_fixture"):
+    """Use real persisted chat authority; never weaken core's create admission."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.create_session(session, source="desktop")
+    finally:
+        db.close()
+    monkeypatch.setenv("HERMES_SESSION_ID", session)
+
+
 class Tools:
     def __init__(self):
         self.cards, self.keys, self.calls = {}, {}, []
@@ -140,12 +152,16 @@ def test_real_core_overlap_refusal_is_resolved_with_distinct_from(tmp_path, monk
     monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
     kbc.connect(kb.kanban_db_path()).close()
+    _register_fixture_chat(tmp_path, monkeypatch)
     decision = monitor.native_tool("kanban_create", {
         "title": "Spend budget decision: Repair persistent Kanban sync drift: hub/default",
         "body": "fixture decision card", "assignee": "default", "requires": ["terminal"], "placement": "auto",
         "board": "default", "completion_contract": "local-only"})
     decision_id = decision.get("task_id") or decision.get("id")
     assert decision_id
+    # Same-chat fan-out is intentionally exempt from heuristic overlap. The
+    # monitor is a different producer from the decision's owning chat.
+    _register_fixture_chat(tmp_path, monkeypatch, "20261124_120001_drift_monitor")
     calls = []
 
     def tool(name, args):
@@ -221,6 +237,7 @@ def test_native_tools_create_readback_and_restart_dedup(tmp_path, monkeypatch):
     assert not kanban_path_is_fenced(path)
     conn = kbc.connect(path)
     conn.close()
+    _register_fixture_chat(tmp_path, monkeypatch)
     state = tmp_path / "drift.json"
     m = monitor.Monitor(state, monitor.native_tool)
     assert m.sample("fixture/default", DIRTY)["card"] is None
