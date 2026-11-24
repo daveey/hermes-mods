@@ -242,6 +242,29 @@ def test_interrupt_signal_is_cores_thread_bit(sm):
     assert sm._interrupted() is False
 
 
+def test_yield_signal_is_cores_thread_bit(sm):
+    import threading
+    interrupt = pytest.importorskip("tools.interrupt")
+    interrupt.request_yield(threading.get_ident())
+    try:
+        assert sm._yield_requested() is True
+        assert sm._yield_requested() is False
+        assert interrupt.is_interrupted() is False
+    finally:
+        interrupt.consume_yield(threading.get_ident())
+
+
+@pytest.mark.parametrize("action", ["send", "read"])
+def test_yielded_request_keeps_claimed_delivery_live(sm, monkeypatch, action):
+    polls = iter([False, True])
+    monkeypatch.setattr(sm, "_yield_requested", lambda: next(polls), raising=False)
+    out, req, waited, after = _run(sm, monkeypatch, action)
+    assert out["status"] == "pending" and out["request_id"] == req["id"]
+    assert waited < 1
+    assert not (after or {}).get("cancelled")
+    assert "Read the target before resending" in out["message"]
+
+
 def test_mark_cancelled_only_flags_a_claimed_request(sm):
     rf = sm.rf
     base = rf.root()

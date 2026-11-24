@@ -527,6 +527,12 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
                 rf.mark_cancelled(rid, base)
             return _err("Interrupted while the Desktop was delivering the send: its retry was cancelled, "
                         "but a submit already under way may still land. Read the target before resending.")
+        if _yield_requested():
+            # Steering is not Stop: release this tool's wait, but leave courier
+            # custody intact so an in-flight send is not cancelled or repeated.
+            return json.dumps({"ok": True, "status": "pending", "request_id": rid,
+                               "message": "Yielded to a new chat message; the Desktop request remains live. "
+                                          "Read the target before resending."})
         time.sleep(0.5)
     if timeout_seconds is not None:
         rf.take_back(outbox)  # withdraw unclaimed bounded read requests
@@ -540,6 +546,15 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         except (OSError, ValueError):
             pass
     return _err("Timed out waiting for the Desktop to finish the request (it may still complete).")
+
+
+def _yield_requested() -> bool:
+    try:
+        import threading
+        from tools.interrupt import consume_yield
+        return bool(consume_yield(threading.get_ident()))
+    except Exception:
+        return False
 
 
 def _interrupted() -> bool:
