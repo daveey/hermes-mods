@@ -277,15 +277,15 @@ budget recovery into another platform project merely to satisfy this checklist.
   `move --pool` / `move --runs-on`.
 - `wait-comment --contains` matches anywhere in a comment, so a note that quotes a grant/refuse token wakes the
   card waiting on it. Paraphrase tokens in your own comments.
-- A card can move to `triage` under you (spend-budget hold). Check events before blaming your own edit.
+- A card can move to `triage` under you (spend-budget hold). `spend-budget --runs N` counts runs already in the
+  window (`spent: K`): grant K + new runs, or it re-holds at once.
 - For `Downstream review implementer evidence is unavailable`, inspect concrete author evidence before promoting. A class-routed parent's launch may record only `class:standard` while its completed event records concrete `session_models`. When that evidence verifies the author, add the supported `<!-- implementer-models: model-id -->` declaration to the review body, validate it against the worker routing policy, preserve all review gates, then promote. Verify the new run's `model_tier.implementer_models`, independent `run_route`, and worker admission; promotion alone does not prove repair. Never invent author provenance or pin around the independence check.
 - Use the CLI, not the sqlite file; the board database is not where the directory listing suggests.
 - `unlink` takes several seconds per parent; run a long batch in the background.
 - A guard hook may refuse `rm` on a variable path and `mkdir`/`git commit` it believes is in a live checkout: use
   literal absolute paths and `git -C <worktree>`.
 - Filter large `hermes kanban list --json` results inside the command (`| python3 -c '…'`) before returning
-  them to the tool; captured output can be truncated inside a JSON string and become unparsable. Extract bodies
-  from the original stream with Python, not from a truncated transcript or spill.
+  them to the tool; truncated captured JSON is unparsable. Extract bodies from the original stream.
 - The gateway that answers `show` is not always the card's home: when `show` there prints no wake check but the
   events carry one with a `probe_host`, the card is homed on that host. Read the wake check, last probe result and
   your own edits back from the home (skill `hermes-workers` for pool workers).
