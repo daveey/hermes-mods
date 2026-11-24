@@ -88,18 +88,20 @@ def reply(relay, **fields):
 def test_relay_delivers_contiguous_events_in_order_and_resets_on_gap():
     relay, got = relay_with([])
     relay._channel.replies = [
-        reply(relay, seq=5, events=[], reset=False),                       # adopt head
+        reply(relay, seq=5, events=[], reset=True, snapshot={'bundles': {'a': 0}, 'rev': 5}),  # first poll
         reply(relay, seq=7, events=[[6, {'rev': 6}], [7, {'rev': 7}]], reset=False),
         reply(relay, seq=10, events=[[9, {'rev': 9}]], reset=False),       # 8 missing: gap
         reply(relay, seq=10, events=[], reset=True, snapshot={'bundles': {'a': 1}, 'rev': 10}),
         reply(relay, seq=11, events=[[11, {'rev': 11}]], reset=False),
     ]
+    assert relay._event_cursor is None
     relay._poll_events()
-    assert got == [] and relay._event_cursor == 5
+    assert relay._channel.sent[0]['after'] == -1, 'the first poll asks for reset+snapshot, never a silent head adoption'
+    assert got == [{'bundles': {'a': 0}, 'rev': 5, 'reset': True}] and relay._event_cursor == 5
     relay._poll_events()
-    assert got == [{'rev': 6}, {'rev': 7}] and relay._event_cursor == 7
+    assert got[1:] == [{'rev': 6}, {'rev': 7}] and relay._event_cursor == 7
     relay._poll_events()
-    assert got == [{'rev': 6}, {'rev': 7}], 'an out-of-order batch is never delivered'
+    assert got[1:] == [{'rev': 6}, {'rev': 7}], 'an out-of-order batch is never delivered'
     assert relay._event_cursor == -1
     assert relay._channel.sent[-1]['after'] == 7
     relay._poll_events()
@@ -107,7 +109,19 @@ def test_relay_delivers_contiguous_events_in_order_and_resets_on_gap():
     assert relay._channel.sent[-1]['after'] == -1
     relay._poll_events()
     assert got[-1] == {'rev': 11}
-    assert relay.event_resets == 1
+    assert relay.event_resets == 2
+
+
+def test_first_poll_after_attach_never_loses_events_emitted_before_the_sink():
+    relay, got = relay_with([])
+    relay._channel.replies = [
+        reply(relay, seq=3, events=[], reset=True, snapshot={'bundles': {'a': 3}, 'rev': 3}),
+        reply(relay, seq=4, events=[[4, {'rev': 4}]], reset=False),
+    ]
+    relay._poll_events()
+    relay._poll_events()
+    assert [item.get('rev') for item in got] == [3, 4]
+    assert got[0]['reset'] is True and 'reset' not in got[1]
 
 
 def test_relay_revocation_drops_in_flight_events_and_rejects_foreign_generation():

@@ -149,6 +149,41 @@ def test_acceptance_clock_75_900_runs_from_original_http_acceptance(home, age, e
         provider.close()
 
 
+def test_delayed_board_demand_keeps_original_75_second_deadline(home, monkeypatch):
+    api = load('_parity_board_delay_api', 'plugin_api.py')
+    provider = provider_for(api)
+    monkeypatch.setattr(time, 'monotonic', lambda: 170.0)
+    try:
+        body = {'sessions': ['chat'], '_wire_identity': identity(api)}
+        provider({'body': body, 'accepted': 100.0})
+        demands = []
+        while not provider.feed._board_demands.empty():
+            demands.append(provider.feed._board_demands.get_nowait())
+        assert demands and all(until == WALL + 5 for _, until in demands), demands
+        assert provider.feed.interest['chat'] == WALL + 830
+    finally:
+        provider.close()
+
+
+def test_event_reset_does_not_renew_http_interest_or_board_visibility(home):
+    api = load('_parity_reset_clock_api', 'plugin_api.py')
+    provider = provider_for(api)
+    try:
+        body = {'sessions': ['chat'], '_wire_identity': identity(api)}
+        provider({'body': body, 'accepted': time.monotonic()})
+        provider.feed.tick()
+        until = provider.feed.interest['chat']
+        provider.feed.clock = lambda: WALL + 100
+        while not provider.feed._board_demands.empty():
+            provider.feed._board_demands.get_nowait()
+        batch = provider.events_since(-1)
+        assert batch['reset'] is True and 'chat' in batch['snapshot']['bundles']
+        assert provider.feed.interest['chat'] == until, 'transport reset is not browser acceptance'
+        assert provider.feed._board_demands.empty()
+    finally:
+        provider.close()
+
+
 def test_delayed_acceptance_shortens_the_lease_by_the_queue_delay(home):
     api = load('_parity_delay_api', 'plugin_api.py')
     provider = provider_for(api)

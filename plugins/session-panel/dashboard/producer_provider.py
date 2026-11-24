@@ -97,7 +97,7 @@ class PanelProducer:
             f = self.feed
             with f.lock:
                 names = sorted(f.bundles)
-            snap = f.changes(names, since=0)
+            snap = json.loads(f.prepared_changes_bytes(names, since=0))
             pushed = self.api.push_payload(snap)
             pushed.pop('feed', None)
             pushed.pop('profile', None)
@@ -162,7 +162,7 @@ class PanelProducer:
                 raise RuntimeError('subscriber budget')
             if subscriber:
                 self._leases[subscriber] = (visible, lease)
-        f.changes_bytes(sessions)
+        f.changes_bytes(sessions, accepted_at=wall - (now - accepted))
         f._drain()
         if subscriber:
             # The board lane is the single owner of _panel_subscribers.
@@ -171,14 +171,8 @@ class PanelProducer:
             lane = getattr(f, '_board_lane', None)
             if lane is not None:
                 lane.service_wake.set()
-        with f.lock:
-            for session in sessions:
-                if session in f.interest:
-                    f.interest[session] = f.clock() + max(0, accepted + 900 - now)
         try:
-            wire = f.changes_bytes(sessions, since=body.get('since', 0), epoch=body.get('epoch'))
-            while not f._registrations.empty():
-                f._registrations.get_nowait()
+            wire = f.prepared_changes_bytes(sessions, since=body.get('since', 0), epoch=body.get('epoch'))
             if any(session in f.failures for session in sessions):
                 raise self._unavailable_error(sessions) or RuntimeError('panel source capture unavailable')
             return prefix + wire[1:]
