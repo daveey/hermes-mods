@@ -41,6 +41,13 @@ nice ~/.hermes/hermes-agent/.venv/bin/python ~/.hermes/plugins/session-repair/sc
 curl -s localhost:<dashboard port>/api/plugins/session-repair/findings?chat=<session id>   # last cron scan
 ```
 
+When asked why waiting chats aren't being cleared, read `$HERMES_HOME/session-repair/config.json` first: `mode`
+`shadow` means the cron only logs would-act rows (`actions-shadow.jsonl`) and fixes nothing. `live_rules`
+(`["<id>:<variant>", ...]`) limits live mode to those findings; the rest stay shadow; absent = all live,
+malformed = nothing live. Set it with `install.py --apply --mode live --live-rules A:x,B:y` (`--live-rules all`
+clears it). This turns on the safe fixes (`clock_overdue`, `awaited_done`, `free_slot`) without waiting for the
+whole gate.
+
 For a shadow-to-live gate, use `$HERMES_HOME/session-repair/ticks.jsonl` plus its rotated `.1` segment, not
 cron output history (which can retain less than 24 hours). Require a full same-build shadow window with zero
 `error_count`, scanned ticks without unexplained gaps/skips, and adjudicate every would-act row from
@@ -112,23 +119,8 @@ unless it is a timed hold whose `until` has passed. Otherwise, by core's queue v
 skips via `kanban_show` on that worker, skill hermes-workers). **Done when:** the card is claimed, or its queue
 note names a real reason (pacing, quota, placement).
 
-**Hand fix for a long ready wait** (first rule out a stale hub view: `references/ready-wait-verification.md`):
-1. Why nothing claims it: the per-pass refusal journal on each machine that could claim it,
-   `cd ~/.hermes/hermes-agent && .venv/bin/python -m hermes_cli.kanban_candidate_receipts --db ~/.hermes/kanban.db
-   --task-id <id> --limit 2000` (tally `worker`/`gate`/`reason`). Only `labels_mismatch` while every machine with
-   the label is `pinned_only` (`hermes_mail.py admin machines`) means no machine can ever claim it.
-2. Before re-placing it, check that the work is still wanted: read the newest comments on the card and on its
-   parent/implementation card for a "superseded" or "close this" note, and look for a user waiver or a receipt card
-   that already did the check. Re-placing a superseded card starts a worker on live Desktop or checkout work nobody
-   needs.
-3. Re-place it: `kanban move --runs-on machine:<mac>` is refused (`placement_unavailable`) when that machine only
-   picks up its own gateway's cards. Use `kanban_create(placement="<mac>")` with the same body; it is refused as
-   `create_overlap` until you pass `distinct_from=[<old>]` with the reason. Archive the old copy once the new task id
-   appears (`hermes-hub requests` shows the queued create).
-4. A card that lives on another gateway: `kanban_comment` / `kanban_archive` from the hub are refused
-   (`foreign_card`). Run `hermes kanban archive <id>` on its home host (`tailnet_exec`); that also stops its worker.
-5. The systemic gap (labels nothing can claim) is one card: search every board and ask the chat working on it
-   before filing, because another chat may file it within the same minute.
+**Hand fix for a long ready wait:** `references/ready-wait-verification.md` (stale hub view first, then why
+nothing claims it, whether it is still wanted, re-placement, foreign cards).
 
 ## BS-overdue-wake: a park whose wake never fired
 
