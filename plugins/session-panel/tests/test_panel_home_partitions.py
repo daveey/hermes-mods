@@ -56,8 +56,10 @@ def twins(tmp_path):
     second = tmp_path / 'b' / '.hermes' / 'profiles' / 'researcher'
     (first.parent).mkdir(parents=True)
     (second.parent).mkdir(parents=True)
-    seed_home(first, session='chat', marker='MARK-A')
-    seed_home(second, session='chat', marker='MARK-B')
+    # Authority/dispatch tests only need canonical home identities. Seed real databases in the three
+    # real-reader/exec tests below rather than doing SQLite setup for every malformed-input control.
+    first.mkdir()
+    second.mkdir()
     alias = tmp_path / 'alias-of-a'
     alias.symlink_to(first)
     return {'a': first, 'b': second, 'alias': alias}
@@ -191,6 +193,8 @@ def test_partitions_are_bounded_and_least_recently_used_is_evicted(provider_mod,
 
 def test_real_producers_return_only_their_own_homes_data(provider_mod, api, twins):
     """Real PanelProducer partitions: equal-label homes under different roots never share bundles or readers."""
+    seed_home(twins['a'], session='chat', marker='MARK-A')
+    seed_home(twins['b'], session='chat', marker='MARK-B')
     pset = provider_mod.open_provider({'provider': {'partitioned': True}})
     a, b = binding(twins['a']), binding(twins['b'])
     try:
@@ -425,6 +429,8 @@ def _complete_cut(gate, installation):
 
 
 def test_real_exec_shared_child_isolates_equal_label_homes_and_revokes(api, twins, tmp_path, monkeypatch):
+    seed_home(twins['a'], session='chat', marker='MARK-A')
+    seed_home(twins['b'], session='chat', marker='MARK-B')
     from hermes_cli.serve_producer_admission import LaunchGate
     from tests.waiting import wait_until
     install = tmp_path / 'install'
@@ -492,6 +498,8 @@ def test_real_exec_shared_child_isolates_equal_label_homes_and_revokes(api, twin
 
 def test_real_exec_event_attach_is_partitioned_and_revoked_with_the_binding(api, twins, tmp_path, monkeypatch):
     """The first event poll of each serve is reset+snapshot of ITS home only; a binding change stops delivery."""
+    seed_home(twins['a'], session='chat', marker='MARK-A')
+    seed_home(twins['b'], session='chat', marker='MARK-B')
     from hermes_cli.serve_producer_admission import LaunchGate
     from tests.waiting import wait_until
     install = tmp_path / 'install'

@@ -1709,13 +1709,15 @@ def _bound_external(request=None):
     relay (queued work, outputs, ACKs, events) before any reply; an unauthorized serve leaves the relay unbound,
     so the route answers 503 rather than another home's or a stale generation's bytes."""
     external = _external_projection()
-    if external is None or not getattr(external, 'partitioned', False):
+    # getattr(..., False) already covers a missing external; keep one observable authority predicate.
+    if not getattr(external, 'partitioned', False):
         return external
     from hermes_cli import serve_producer_home as homes
     state = getattr(getattr(request, 'app', None), 'state', None)
     if state is not None:
         _LOADER.app_state = state
     try:
+        # Another request can replace the retained slot; this request keeps its own captured authority.
         external.bind_partition(current_binding(state if state is not None else getattr(_LOADER, 'app_state', None)))
     except (homes.HomeRevoked, OSError, ValueError):
         external.unbind_partition()
