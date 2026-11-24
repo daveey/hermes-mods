@@ -156,6 +156,18 @@ If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` 
 
 Before parking CI/release work, read [external-run card contracts](references/external-run-cards.md) for native-versus-shell adapter selection, aggregate typed status, control tests and live probe readback. Asked which cards wait on CI: same file, §Auditing which cards wait on CI.
 
+## Dependency mirror proof portability
+
+Key dependency-only bundles on their real compatibility inputs (pinned toolchains,
+lockfiles, setup logic and normalized actual Maven version), not the whole hosted
+`ImageVersion`. GitHub serves multiple Ubuntu image versions concurrently, even
+between preparation and proof jobs in the same run; whole-image keys can make
+valid independently stored bundles impossible to restore reliably. Strip ANSI
+formatting and installation paths from Maven version identity, retain actual
+version changes as misses, and test both image-rollout stability and tool-version
+invalidation. Never relabel old archives under a new input key to hide a proof
+miss: rerun reviewed preparation and validate new provenance/digests.
+
 ## Optional Python lanes and setup-uv cache cleanup
 
 When an optional job can skip every `uv run`, set setup-uv's `ignore-nothing-to-cache: true` (or disable caching for that leg). setup-uv may otherwise fail in its post step because no cache directory was created, turning an intentional test skip into a red job. Verify the hosted post-step result as well as the skipped test step; local shell gate tests do not exercise action cleanup.
