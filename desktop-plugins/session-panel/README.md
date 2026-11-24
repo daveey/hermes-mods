@@ -17,12 +17,14 @@ Models cache in memory by exact connection/profile/stored-session scope, up to
 feed registration runs separately. A missing model shows **Loading session status…**
 while the focused scope triggers up to three full reads (immediate, then
 250 ms and 750 ms after the preceding attempt). A registered session is not a
-cached model: empty responses and transient failures still retry. Reads retain already-watched
+cached model: empty responses and transient failures still retry. A peek timeout
+falls through to a full catch-up the same way a missing feed does. Reads retain already-watched
 sessions at execution time before advancing the shared cursor, not unrelated sidebar chats. Requests retain
 the existing 15-second bridge deadline and per-connection serialization; this is
 not a five-second availability guarantee under an overloaded backend. After those
-attempts, the placeholder says status is taking longer and offers **Retry**; changing
-focus/unmount stops further attempts. Unsupported feeds stop automatic retries.
+attempts, the placeholder says status is taking longer and offers **Retry**, but the
+panel keeps retrying with backoff (2 s, 5 s, 10 s, then every 15 s) until the model
+arrives; changing focus/unmount stops further attempts. Unsupported feeds stop automatic retries.
 It never borrows another scope's model or derives a substitute from raw task fields.
 A bundle without a supported model invalidates
 only its own cached scope. Cached models are last-known presentation, not proof
