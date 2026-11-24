@@ -778,6 +778,18 @@ def test_gate_bounds_slow_derivation_before_core_drops_callback(plugin, fake, mo
     assert plugin._GATE_SCOPE.get() is None
 
 
+def test_gate_card_read_failure_requests_declaration_before_recovery(plugin, fake):
+    """Unknown cards can mask a negative judgment; recovery must not expose an undeclared reply."""
+    reply = "Not fixed yet; another worker owns the repair."
+    fake.derived["S1"] = {"kind": "unresolved", "reason": "card_read_failed"}
+    held = gate(plugin, reply=reply)
+    assert held and held["hold"] and plugin.TAG in held["nudge"]
+    assert not fake.declared  # unknown sources authorize no done or invented wait
+    fake.derived["S1"] = {"kind": "unresolved", "reason": "no_summary"}
+    assert gate(plugin, reply=reply, msgs=[{"role": "user", "content": held["nudge"]}], attempt=1) is None
+    assert plugin._GATE_SCOPE.get() is None
+
+
 def test_gate_preserves_derivation_errors_fail_open(plugin, fake, monkeypatch):
     def failed(sid, **kwargs):
         raise TimeoutError("provider read failed")

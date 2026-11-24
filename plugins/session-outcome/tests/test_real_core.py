@@ -198,6 +198,36 @@ def test_gate_against_real_core(real, monkeypatch):
     assert gate(plugin, "Hmm?")["hold"]
 
 
+def test_card_read_failure_does_not_mask_declaration_gate(real, monkeypatch):
+    """Exercise core's actual early card-read-failed branch, then the recovered negative judge."""
+    from hermes_state import SessionDB
+
+    so, plugin = real
+    monkeypatch.setattr(so, "_live_turn", lambda *a: False)
+    reply = "Not fixed yet; another worker owns the repair."
+    plugin._llm = lambda *a: "NO"
+
+    def unavailable(*a):
+        raise RuntimeError("card source unavailable")
+
+    monkeypatch.setattr(so, "_card_items", unavailable)
+    before = so.derive_outcome("chat", ignore_live_turn=True, pending_reply=reply)
+    assert before["kind"] == "unresolved" and before["reason"] == "card_read_failed"
+    held = gate(plugin, reply)
+    assert held and held["hold"] and plugin.TAG in held["nudge"]
+    assert so.get_outcome("chat") is None  # the gate never publishes an outcome
+
+    monkeypatch.setattr(so, "_card_items", lambda *a: ([], []))
+    db = SessionDB()
+    try:
+        db.append_message("chat", role="assistant", content=reply)
+    finally:
+        db.close()
+    after = so.refresh_outcome("chat", trigger="manual")
+    assert after["kind"] == "unresolved" and after["reason"] == "no_summary"
+    assert gate(plugin, reply, msgs=[{"role": "user", "content": held["nudge"]}], attempt=1) is None
+
+
 def test_negative_verdict_survives_informational_tail_and_judge_outage(real, monkeypatch):
     from hermes_state import SessionDB
 

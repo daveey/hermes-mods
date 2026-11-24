@@ -1229,7 +1229,10 @@ def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
         return False
     finally:
         _GATE_SCOPE.reset(token)
-    if out.get("kind") == "unresolved" and out.get("reason") == "no_summary":
+    if out.get("kind") == "unresolved" and out.get("reason") in ("no_summary", "card_read_failed"):
+        # An unavailable card source returns before the judge. When it recovers,
+        # the same undeclared reply can become no_summary with no live turn left
+        # to ask. Request the existing one-shot declaration, never invent success.
         return True
     if out.get("kind") == "done" and scope.get("gave_up") and out.get("source", "derived") == "derived":
         log.info("session-outcome gate: judge gave up on %s and only the heuristic said done; asking for the call",
