@@ -24,6 +24,8 @@
 
 ## Producer design rules
 
+- Fail closed in the mounted Panel before the first heartbeat: older cached models can lack source freshness metadata, so an unspecified voucher keeps a legacy running header indefinitely. Test actual Panel with legacy cache and no heartbeat, not only renderModel with an explicit false voucher. Keep restored/expired/excluded and fresh controls; transport heartbeats never renew bundle computed_at.
+
 - Treat ceiling chat count as a work bound, not a latency bound. Preserve a real-loop slow-producer regression plus an event-blocked producer while an unrelated write publishes; fast fakes alone hide head-of-line blocking. When isolating canonical ceiling work, test same-owner/ancestor claims, hot handover, forgotten completions, finite asynchronous retries and wake clear/drain races. Retain other-chat producer obligations when an in-flight stamp read consumes a concurrent outcome write; do not blindly re-admit the producer's own completed writes.
 
 - Test sync-bookkeeping invalidation with real replica SQL and canonical projection adapters. A `pulled_at`-only commit must carry `synced_at` without renewing `computed_at`/execution evidence or hydrating every chat. Admit board-shadow writes even without a hub/ledger write. Canonical hub rows may lack `source='replica'`, and selection may add `source='origin-obligation'`: match observation producer plus owner/profile/board/card/session, not a raw source label or bare card ID. Keep true stale/status/receipt changes semantic, allow legitimate clock regression on source reset, and exercise a real concurrent producer publishing an older capture after a newer observation.
