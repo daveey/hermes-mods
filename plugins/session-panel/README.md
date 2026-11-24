@@ -78,6 +78,28 @@ visible sessions. Hidden sessions retain dirty demand; attachment still hydrates
 current data. Set it to `0` to capture external inputs for all watched sessions.
 Canonical decision reconciliation is not visibility-gated.
 
+`HERMES_PANEL_BOARD_BATCH` is default-on (same off values) and applies only
+to the serialized lane described below (`HERMES_PANEL_BOARD_COALESCE`). One
+worker hydrates up to 16 chats that are due together with one reader and one
+shared hydration scope, visible and demanded chats first; each chat still
+publishes on its own, and all carry the read time taken before the batch's
+first read (a batch whose shared reader cannot be made reads each chat with
+its own reader and read time). A change admitted before a chat's turn in
+the batch (the chat is still demanded, so the change makes it pending again)
+defers that chat: it is not read at its turn and is read fresh when
+the worker ends, with no cooldown and its original place in the queue. A
+change during or after its read gets one trailing read after its cooldown;
+until then the chat stays unvouched. The worker's first chat is always read.
+After that, a visible chat that is due (waiting, or later in the same batch)
+cuts the batch short when the next turn is a hidden chat: the unread chats
+return to pending with their admission time. A stop ends the batch at the
+current chat. The 30 s keyed recovery admits every watched chat, so read one
+at a time they filled the lane (26 chats: 256 reads in 315 s on the MacBook
+gateway). A read-only probe of those chats' linked and done rows in an idle
+process cost 2.7-7.8 s one by one and under 1 s in one scope; the in-gateway
+gain is not yet measured. Set the flag to `0` before a normal plugin reload to
+restore one chat per worker.
+
 `HERMES_PANEL_DUTY` is default-on (same off values). After a full feed pass
 that took T seconds, the next full pass rests for 2T, bounded by
 `full_every_s - 10 - 2T` so a held bundle is replaced inside its 60 s trust

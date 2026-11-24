@@ -6,6 +6,7 @@ No connections, transactions or source snapshots survive a worker invocation.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
@@ -13,6 +14,13 @@ import threading
 import time
 
 log = logging.getLogger('session-panel')
+
+# One worker hydrates every chat that is due together, under one reader and one shared hydration scope
+# (`CoreReaders.batch`). Read one at a time, with a new reader each, the 26 chats a Desktop watches took about 30 s
+# of every 30 s recovery round in the MacBook gateway (2026-11-23: 256 reads in 315 s, 92% published nothing);
+# the same rows read as one batch cost under a second in an idle process. HERMES_PANEL_BOARD_BATCH=0 restores
+# one chat per worker. Only the serialized lane batches (capacity 1): the legacy four-worker lane is unchanged.
+BATCH_MAX = 16
 
 
 class BoardLane:
@@ -22,6 +30,8 @@ class BoardLane:
             'HERMES_PANEL_BOARD_COALESCE', '1').lower() in ('0', 'false', 'off', 'no') else 3.0
         self.capacity = (1 if self.cooldown else 4) if capacity is None else capacity
         self.visible_only = os.environ.get('HERMES_PANEL_BOARD_VISIBLE_ONLY', '1').lower() not in ('0', 'false', 'off', 'no')
+        self.batch_max = 1 if os.environ.get(
+            'HERMES_PANEL_BOARD_BATCH', '1').lower() in ('0', 'false', 'off', 'no') else BATCH_MAX
         self.read_ends = {}
         self.cursor = self.stamp = None
         self.pending, self.active, self.retries = {}, {}, {}
@@ -81,7 +91,7 @@ class BoardLane:
             self.service_worker.join(2)
         with self.feed.lock:
             self.pending.clear()
-            workers = list(self.active.values())
+            workers = set(self.active.values())  # a batch worker holds one entry per chat: join it once
         for worker in workers:
             worker.join(2)
 
@@ -153,8 +163,10 @@ class BoardLane:
                     self.retries[session] = (self.retries[session][0], None)
             self.read_ends = {s: value for s, value in self.read_ends.items()
                               if f._watch_tokens.get(s) is value[0]}
+            batching = self.capacity == 1 and self.batch_max > 1
+            batch = []
             for session in sorted(self.pending, key=lambda s: (s not in visible, s not in demanded, self.pending[s])):
-                if len(self.active) >= self.capacity:
+                if len(self.active) >= self.capacity or len(batch) >= self.batch_max:
                     break
                 if session in self.active:
                     continue
@@ -172,10 +184,23 @@ class BoardLane:
                 if last is not None and time.monotonic() < last[1] + self.cooldown:
                     continue  # Retain oldest pending demand for one trailing read.
                 admitted_at = self.pending.pop(session)
+                if batching:
+                    batch.append((session, token, held['bundle'], admitted_at))
+                    continue
                 worker = threading.Thread(target=self._read,
                     args=(session, token, held['bundle'], admitted_at),
                     name='session-panel-card-' + session[:12], daemon=True)
                 self.active[session] = worker
+                worker.start()
+            if batch:
+                # Visible and demanded chats lead the batch (the sort above), so a watched panel is still served
+                # first. Every chat here was taken from `pending` before the worker's first read, so no read can
+                # predate the event that admitted it. An event during the batch re-admits its chat: before its
+                # turn it is read fresh after the worker ends, during or after its read it gets a trailing read.
+                worker = threading.Thread(target=self._read_batch, args=(batch,),
+                    name='session-panel-card-' + batch[0][0][:12], daemon=True)
+                for item in batch:
+                    self.active[item[0]] = worker
                 worker.start()
 
     def step(self):
@@ -293,14 +318,103 @@ class BoardLane:
                 self.feed._board_failures.add(session)
                 self.retries.pop(session, None)
 
-    def _read(self, session, token, base, admitted_at):
+    def _read_batch(self, items):
+        """Hydrate `items` in order with one reader and one hydration scope; each chat publishes on its own.
+
+        Every item leaves `active` on every path: read (its completion is queued by `_read`), dropped (its watch
+        ended), deferred (re-admitted before its turn: left pending for a fresh read) or handed back to `pending`
+        unread (a visible chat became due and must not wait out the batch; on a stop it is simply released). A
+        deferred or handed-back chat keeps its oldest admission time and takes no cooldown. The worker's first
+        chat is always read, never deferred or cut, so every worker makes progress."""
+        f = self.feed
+        todo = list(items)
+        rd = None
+        reads = 0
+        try:
+            try:
+                rd = self.reader_factory()
+            except Exception:
+                log.warning('session-panel board batch reader unavailable; reading one chat per reader', exc_info=True)
+            # Trust ages from before the first shared read, never from a later chat's turn in the batch.
+            read_at = f.clock() if rd is not None else None
+            with contextlib.ExitStack() as stack:
+                scope = getattr(rd, 'batch', None)
+                if len(todo) > 1 and callable(scope):
+                    try:
+                        stack.enter_context(scope([item[0] for item in todo]))
+                    except Exception:
+                        log.warning('session-panel board batch scope unavailable; reading unshared', exc_info=True)
+                while todo:
+                    session, _token, _base, admitted_at = todo[0]
+                    with f.lock:
+                        if self.service_stop.is_set() or f.stopped.is_set() or (reads and self._visible_waits(todo)):
+                            break
+                        # The bundle and watch token as they are at this chat's turn, not at batch start.
+                        held, token = f.bundles.get(session), f._watch_tokens.get(session)
+                        if session not in f.interest or not held or token is None:
+                            self.active.pop(session, None)  # unwatched: dropped
+                            todo.pop(0)
+                            self.service_wake.set()
+                            continue
+                        if session in self.pending:
+                            if reads:
+                                # Re-admitted by an event since the batch began: its turn here could reuse rows
+                                # the scope cached before that event, so it is left pending (no read, so no
+                                # cooldown), keeps its place, and is read fresh as soon as this worker ends.
+                                self.pending[session] = min(self.pending[session], admitted_at)
+                                self.active.pop(session, None)
+                                todo.pop(0)
+                                self.service_wake.set()
+                                continue
+                            # The worker's first read: nothing is cached yet beyond lineages, so this read
+                            # serves the newer event too.
+                            admitted_at = min(self.pending.pop(session), admitted_at)
+                        base = held['bundle']
+                    todo.pop(0)
+                    reads += 1
+                    self._read(session, token, base, admitted_at, reader=rd, read_at=read_at, batch=len(items))
+        finally:
+            with f.lock:
+                stopping = self.service_stop.is_set() or f.stopped.is_set()
+                for session, _token, _base, admitted_at in todo:
+                    self.active.pop(session, None)
+                    if not stopping:
+                        self.pending[session] = min(self.pending.get(session, admitted_at), admitted_at)
+            if todo:
+                self.service_wake.set()  # before the release: a failing close must not strand the hand-back
+            if rd is not None:
+                rd.release()
+
+    def _visible_waits(self, todo):
+        """(lock held) The next turn is a hidden chat while a visible one is due: cut, so `service()` leads the
+        next worker with it. The visible chat may be waiting in `pending` or sit later in this batch.
+
+        Never when the next turn is itself visible: with more visible chats due than one batch holds, the 17th
+        would otherwise cut every batch. Never for a chat whose read this worker has not yet handed back
+        (`active`): its cooldown is not recorded until `service()` drains the completion."""
+        f = self.feed
+        now, clock = time.monotonic(), f.clock()
+        visible = {session for session, expires in f._panel_subscribers.values() if expires > clock}
+        if todo[0][0] in visible:
+            return False
+        if any(item[0] in visible for item in todo[1:]):
+            return True
+        for session in visible:
+            if session not in self.pending or session in self.active:
+                continue
+            last = self.read_ends.get(session)
+            if last is None or now >= last[1] + self.cooldown:
+                return True
+        return False
+
+    def _read(self, session, token, base, admitted_at, reader=None, read_at=None, batch=1):
         f, rd = self.feed, None
         error = None
         started = time.time()
         stages = {}
         try:
-            rd = self.reader_factory()
-            read_at = f.clock()
+            rd = self.reader_factory() if reader is None else reader
+            read_at = f.clock() if read_at is None else read_at
             bundle = f.compute(session, readers=rd, base=base, stages=stages)
             bundle['computed_at'] = read_at
             # No shared flights: joining a sweep could adopt a pre-event snapshot.
@@ -313,7 +427,8 @@ class BoardLane:
             finished = time.time()
             entry = {'session': session, 'admitted_at': admitted_at, 'pass_started_at': started,
                      'at': finished, 'latency_s': round(finished - admitted_at, 4),
-                     'reader_s': round(finished - started, 4), 'stages': stages, 'published': bool(changed)}
+                     'reader_s': round(finished - started, 4), 'stages': stages, 'published': bool(changed),
+                     'batch': batch}
             with f.lock:
                 f.timing['board_recent'] = (f.timing.get('board_recent', []) + [entry])[-256:]
         except Exception as exc:
@@ -322,8 +437,8 @@ class BoardLane:
                 f._board_failures.add(session)
             log.warning('session-panel board hydration failed: %s', session, exc_info=True)
         finally:
-            if rd is not None:
-                rd.release()
+            if rd is not None and reader is None:
+                rd.release()  # a batch releases its shared reader once, after its last chat
             self.completed.put((session, token, error, time.monotonic()))
             self.service_wake.set()
             f._board.set()

@@ -56,6 +56,36 @@ def test_visible_chat_precedes_forty_older_pending_chats(monkeypatch):
         f.compute = compute
         lane.pending['S2'] = 100
         f.changes_bytes([], subscriber='window', visible_session='S2')
+        served_from = len(reads)
+        lane.service()
+        # The visible chat leads the worker's batch (16 at most); nothing older is read before it.
+        assert next(iter(lane.active)) == 'S2' and len(lane.active) <= lane.batch_max
+        assert len(set(lane.active.values())) == 1
+    finally:
+        lane.pending.clear()
+        gate.set()
+        settle(lane)
+        lane.close()
+    assert reads[served_from] == 'S2'
+
+
+def test_visible_chat_precedes_forty_older_pending_chats_one_per_worker(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_BOARD_BATCH', '0')
+    f, lane, reads = setup(monkeypatch, enabled=False)
+    lane.capacity = 1
+    gate = threading.Event()
+    real = f.compute
+    def compute(session, **kw):
+        assert gate.wait(2)
+        return real(session, **kw)
+    try:
+        for i in range(40):
+            sid = f'A{i:02}'
+            f.changes([sid])
+            lane.pending[sid] = i
+        f.compute = compute
+        lane.pending['S2'] = 100
+        f.changes_bytes([], subscriber='window', visible_session='S2')
         lane.service()
         assert list(lane.active) == ['S2']
     finally:
