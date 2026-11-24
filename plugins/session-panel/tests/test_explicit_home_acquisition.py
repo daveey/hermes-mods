@@ -488,3 +488,19 @@ def test_every_gate_scope_is_declared_and_legacy_never_gates(api, worlds):
     finally:
         from_ctx.release()
         legacy.release()
+
+
+@pytest.mark.parametrize('which', ['capture_local', 'capture_external'])
+def test_board_capture_module_refuses_explicit_readers_when_called_directly(which, api, worlds, tripwires):
+    """The module function is a second entry past the reader methods; it must gate itself."""
+    capture = api.CoreReaders.snapshot_modules()
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    try:
+        call = getattr(capture, which)
+        with pytest.raises(Exception) as raised:
+            call(readers, None, None, None, None) if which == 'capture_local' else call(readers, None, None, None, {})
+    finally:
+        readers.release()
+    assert tripwires == []
+    assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
+    assert raised.value.scope == 'snapshot_capture'

@@ -148,6 +148,24 @@ profile identities. `test_external_panel_ownership.py` covers import/reload,
 legacy-custody refusal and unchanged absent-selector startup. These tests need
 the paired core branch; no-core CI skips the exec module.
 
+## Dormant explicit-home readers
+
+`dashboard/home_context.py` defines `PanelHomeContext`: a canonical resolved home plus opaque lifecycle and
+authorization generations. It is an input from a future lifecycle controller, not an authority: constructing one
+grants nothing. `CoreReaders(home_context=...)` (keyword-only; omitted keeps today's ambient behavior) and
+`open_provider({'home_context': ...})` bind it at construction; browser payload fields and profile labels never
+select a home and no environment variable is read or changed.
+
+Supported with explicit paths (verified to call no ambient home/identity resolver): state.db, board and shadow
+files, stamps, change detection, the live card record, watch paths, and snapshot/timing paths namespaced by
+home plus both generations. Every other scope is refused by `require_scope` BEFORE any ambient resolver runs and
+raises `UnsupportedHomeAdapter`, which the provider reports typed (never fresh-empty): `local_card_scope`,
+`external_inventory`, `origin_history`, `panel_runtime_inputs`, `snapshot_capture`, `user_steps`,
+`replica_card_owner`, `hub_db`, `mail_config`. A feed on an explicit home therefore stays unavailable until those
+adapters exist. This is not projection transport, mode/roster invalidation or activation.
+`tests/test_explicit_home_acquisition.py` arms tripwires on every ambient resolver of core;
+`tests/test_explicit_home_context.py` covers the context, aliases, generations and the legacy control.
+
 ## Tests
 
 ```sh
