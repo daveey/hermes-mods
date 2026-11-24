@@ -92,7 +92,10 @@ for (const [name, trusted, age, vouched] of [
   const before = JSON.stringify(model)
   await paint(m.renderModel(model, { now, vouched }))
   const stale = name !== 'fresh'
-  assert.equal(document.querySelector('[data-session-status]').textContent.includes('status unknown (stale'), stale)
+  const text = document.querySelector('[data-session-status]').textContent
+  // Merely old or restored: the last reported state with an age suffix. A failed vouch is a real contradiction.
+  assert.equal(text.includes('status unknown (stale'), name === 'unvouched')
+  assert.equal(text.includes('running (stale'), name === 'restored' || name === 'expired')
   if (stale) {
    assert.equal(document.querySelector('[data-panel-status-stripe]').dataset.panelStatusStripe, 'none')
    assert.equal(document.querySelector('[data-session-status]').title, 'unknown')

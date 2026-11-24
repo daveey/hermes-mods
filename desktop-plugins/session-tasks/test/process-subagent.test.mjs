@@ -78,3 +78,15 @@ test('an older producer\'s legacy running card chip renders unknown, without the
   const parked = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...legacy, state: 'blocked', look: 'needs-you' }, now: 1001000 }))
   assert.doesNotMatch(parked, /producer sent no observations/)
 })
+
+test('a synced worker-homed parked replica chip reports its board state, not status unknown; unsynced or running stays unknown', () => {
+  const replica = { key: 'kb:w', kind: 'kanban', id: 't_w', label: 'parked', state: 'ready', replica: true, syncedAt: 990, gateway: 'worker-a3', title: 't_w · ready\non worker-a3 · synced 10s ago (hermes-hub replica)', observations: null, since: 0 }
+  const synced = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: replica, now: 1000000 }))
+  assert.doesNotMatch(synced, /status unknown|unknown \(/)
+  assert.match(synced, /synced 10s ago/)
+  const unsynced = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...replica, syncedAt: null }, now: 1000000 }))
+  assert.match(unsynced, /status/)
+  assert.match(unsynced, /unknown/)
+  const running = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...replica, state: 'running' }, now: 1000000 }))
+  assert.match(running, /unknown/)
+})
