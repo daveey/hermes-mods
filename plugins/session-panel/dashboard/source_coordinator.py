@@ -646,7 +646,8 @@ class SourceCoordinator:
             receipt = part.scope_receipts.get(sid)
             if (current.get(sid) == raw.demands[sid] and receipt is not None
                     and receipt.coverage.captured_demands.get(sid) == raw.demands[sid]):
-                self.external_raw[sid] = (receipt.version, tuple(encoded))
+                self.external_raw[sid] = (receipt.version, tuple(encoded),
+                                         raw.inventory.get('dependency_inputs', {}).get(sid))
 
     def _observe_external(self, rd, raw, previous, prior):
         """Clock-only strict read, no hydration, acquisition age or new coverage.
@@ -672,7 +673,8 @@ class SourceCoordinator:
             if (p is None or not p.external_capture or self.external not in p.covered_scopes
                     or p.feed_epoch != self.feed.epoch or p.feed_owner is not self.feed._projection_owner
                     or p.watch_token is not self.tokens.get(sid.chat.session_id)
-                    or sid not in self.external_raw
+                    or sid not in self.external_raw or len(self.external_raw[sid]) != 3
+                    or self.external_raw[sid][2] != raw.inventory.get('dependency_inputs', {}).get(sid)
                     or p.covered_scopes[self.external] != raw.demands[sid]
                     or not self.store.current(p.admission)
                     or rd.external_semantic(captured) != rd.external_semantic(p.external_capture)):
@@ -736,7 +738,9 @@ class SourceCoordinator:
             cost.start()
         try:
             if source == self.external:
-                raw = self.capture.capture_external_raw(rd, demands, {}, {source: hint})
+                raw = self.capture.capture_external_raw(
+                    rd, demands, {}, {source: hint},
+                    previous_keys=previous.scope_keys if previous else {})
                 if self._observe_external(rd, raw, previous, prior):
                     with self.lock:
                         self._settle_attempts(source, attempted, self.store.pending(source))
