@@ -470,7 +470,10 @@ Order matters, matching Desktop `classify`:
   numeric `synced_at` with `0 <= now - synced_at <= 300 s`; no future skew allowance)
   running row is shown In progress with `evidence_state: "reported"` and a Details line saying so; parked
   states show their board state. No `· board status` tail on any row.
-- Named dependency waits use `waiting on: <hydrated title> · age` with an `open_card` action labeled `Open parent card`.
+- Named dependency waits use `waiting on: <hydrated title> · age` with an `open_card` action labeled `Open dependency` (`role:'dependency'`).
+- A card row also carries `open_session` (`target:{session,gateway,profile}`) when its `session_id` names a chat
+  outside this panel's lineage. Desktop shows Open session / Open card / Open dependency only in the row's
+  right-click menu, never as inline links (an ask row keeps its own Open card button; CI/PR links stay buttons).
   Resolve the primary explicit producer first; within that dependency, follow hydrated unfinished parents to the
   deepest blocker (bounded, cycle-safe, deterministic ties). For a pure parent wait, consider all hydrated parents.
   Never link an own-card wake check to itself, reinterpret clock/CI/deploy waits as parents, or substitute a secondary

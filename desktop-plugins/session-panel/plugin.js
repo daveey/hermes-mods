@@ -1,5 +1,7 @@
 /** Session Panel: render the hub's PanelModel v1; no local work-state inference. */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
+// Namespace: ContextMenu* are absent on older hosts (and in test stubs); rows then get no menu.
+import * as sdk from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -37,7 +39,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v24-visible-tree-guides'
+const VERSION = 'session-panel-v25-row-context-menu'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -471,7 +473,22 @@ export function modelFreshness(model, { now = Date.now() / 1000, vouched = null 
   const ttl = Number.isFinite(f.ttl_s) && f.ttl_s > 0 ? Math.min(60, f.ttl_s) : 60
   return { stale: age === null || age < 0 || age > ttl || vouched === false || (vouched !== true && f.trusted !== true), age }
 }
-export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null } = {}) {
+/** The three right-click entries for a row, in order. `action` is null when the row has nothing to open there
+ *  (no owning chat, no dependency, or the owning chat is the one already in focus). */
+export function rowMenuItems(row, currentSession = null) {
+  const actions = Array.isArray(row?.actions) ? row.actions : []
+  const cards = actions.filter(a => a?.kind === 'open_card' && a.target?.id)
+  const own = cards.find(a => str(a.target.id) === str(row.id)) || null
+  // Older producers label the dependency "Open parent card" without a role: any other card target is it.
+  const dependency = cards.find(a => a.role === 'dependency') || cards.find(a => a !== own) || null
+  const session = actions.find(a => a?.kind === 'open_session' && str(a.target?.session)) || null
+  return [
+    { key: 'session', label: 'Open session', action: session && str(session.target.session) !== str(currentSession) ? session : null },
+    { key: 'card', label: 'Open card', action: own },
+    { key: 'dependency', label: 'Open dependency', action: dependency }
+  ]
+}
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null } = {}) {
   if (!validModel(model)) return null
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
@@ -490,13 +507,27 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   ] })
   // A line row's own card opens by double-clicking its state square, so its links skip that action.
   const ownCard = row => row.actions.find(action => action.kind === 'open_card' && str(action.target?.id) === str(row.id))
-  const openLinks = (row, ...skip) => row.actions.filter(action => !skip.includes(action) && (action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url))))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
+  // Card/dependency/session opens live in the row's right-click menu (rowMenuItems); only an ask row keeps its own
+  // Open card button, and web links (CI, PR) stay buttons.
+  const openLinks = (row, ...skip) => row.actions.filter(action => !skip.includes(action) && ((action.kind === 'open_card' && action === ownCard(row)) || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url))))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
     style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
+  // Right-click menu: Open session / Open card / Open dependency. Absent SDK menu (older host) = no menu.
+  const withMenu = (row, element) => {
+    const { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem } = sdk
+    if (!onAction || !ContextMenu || !ContextMenuTrigger || !ContextMenuContent || !ContextMenuItem) return element
+    const items = rowMenuItems(row, currentSession)
+    if (!items.some(item => item.action)) return element
+    return jsxs(ContextMenu, { children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: element }),
+      jsx(ContextMenuContent, { 'data-row-menu': row.key, children: items.map(item => jsx(ContextMenuItem, {
+        'data-row-menu-item': item.key, disabled: !item.action, onSelect: () => item.action && onAction(row, item.action), children: item.label }, item.key)) })
+    ] }, row.key)
+  }
   const askRow = row => {
     const status = decisionStatus(row)
     const enabled = option => !!onChoose && !!row.request_id && !!option.choice_id && row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision) && !status?.locked
     const decision = row.options.length > 0
-    return jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source,
+    return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source,
       style: { border: '1px solid var(--border)', borderLeft: `3px solid ${SECTION_COLOR.needs_you}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
       jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
         jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: decision ? 'Needs your decision' : 'Needs you' }),
@@ -531,7 +562,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       (row.details?.length > 0 || row.actions.some(a => a.kind === 'open_card')) && jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0 }, children: [
         details(row), ...openLinks(row)
       ] })
-    ] }, row.key)
+    ] }, row.key))
   }
   // Every other section: one compact line per row — state box, title, short detail; details/open on the right.
   // In progress keeps the old one-line shape: title, then where · model · how long right-aligned beside it.
@@ -558,7 +589,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         style: { ...askLinkBtn, fontSize: 'inherit', padding: 0, cursor: onAction ? 'pointer' : 'default' }, children: hit.text }, 'inline'),
       detail.slice(hit.index + hit.text.length)] : detail
     const hover = [title, ...(row.details || [])].join('\n')
-    return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
+    return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
       eta ? jsx('span', { 'aria-hidden': true }) : jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
@@ -575,7 +606,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text })
       ] }),
       jsxs('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: [eta, ...openLinks(row, own, hit ? linked : null)] })
-    ] }, row.key)
+    ] }, row.key))
   }
   // The backend owns parent/depth. Keep classification/counts on the original
   // section while drawing each row only once, beneath its published parent.
@@ -909,6 +940,19 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
   } catch (e) { decisionFailed(key, e, retryPost) }
   modelChanged()
 }
+/** Open the chat that owns a card, on that card's gateway (a remote gateway gets an explicit owner route). */
+export async function openSessionAction(action, panel = panelRoute()) {
+  const t = action?.target
+  if (!str(t?.session) || typeof host.openSession !== 'function') return false
+  const profile = str(t.profile) || 'default'
+  const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : panel.connectionId
+  if (!connectionId) { host.notify?.({ kind: 'error', message: 'The gateway that holds this session is not connected.' }); return false }
+  let kind = null
+  try { kind = (host.state?.gateways?.get?.() || []).find(g => g?.id === connectionId)?.kind || null } catch {}
+  const route = { connectionId, mode: kind === 'local' ? 'local' : 'remote', profile, targetProfile: profile }
+  try { await host.openSession(str(t.session), { route }); return true }
+  catch (e) { host.notify?.({ kind: 'error', message: `Couldn’t open session: ${e?.message || e}` }); return false }
+}
 /** Open an http(s) link from a row (CI run, PR) with the OS handler; never a navigation of the Desktop window. */
 export async function openUrl(url) {
   if (!/^https?:\/\//.test(str(url))) return false
@@ -984,11 +1028,13 @@ export function Panel() {
     // Cold/legacy cache has no source clock: absence of a heartbeat is not a voucher.
     vouched: feedVouches(route),
     collapsed,
+    currentSession: route.session,
     onToggle: () => { writeCollapsed(scope, collapsed ? null : attentionKeys(model)); tick(v => v + 1) },
     onChoose: (row, option) => void chooseModelOption(row, option, route),
     decisionStatus: modelDecisionStatus, onCheck: row => void checkModelDecision(row),
     onAction: (row, action) => {
       if (action.kind === 'open_url') { void openUrl(action.url); return }
+      if (action.kind === 'open_session') { void openSessionAction(action, route); return }
       const t = action.target
       if (!t?.id) return
       const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : route.connectionId

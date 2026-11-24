@@ -181,11 +181,25 @@ def target(row):
     return {k: row.get(k) for k in ('id', 'gateway', 'profile', 'board')}
 
 
+def session_target(row):
+    """The chat that owns a card (its `session_id`), on the card's own gateway/profile; None when unknown."""
+    sid = row.get('session_id')
+    if not isinstance(sid, str) or not sid.strip():
+        return None
+    return {'session': sid.strip(), 'gateway': row.get('gateway') or '', 'profile': row.get('profile') or 'default'}
+
+
 def row_view(row, kind='card'):
+    actions = []
+    if kind == 'card':
+        actions.append({'kind': 'open_card', 'label': 'Open card', 'target': target(row)})
+        session = session_target(row)
+        if session:
+            actions.append({'kind': 'open_session', 'label': 'Open session', 'target': session})
     return {'id': str(row.get('id') or ''), 'key': key(row), 'kind': kind,
             'gateway': row.get('gateway') or '', 'profile': row.get('profile') or 'default',
             'board': row.get('board') or 'default', 'title': clean(row.get('title')) or str(row.get('id') or 'task'),
-            'detail': '', 'details': [], 'actions': [{'kind': 'open_card', 'label': 'Open card', 'target': target(row)}] if kind == 'card' else []}
+            'detail': '', 'details': [], 'actions': actions}
 
 
 SKEW_S = 120  # worker clocks run a little ahead of the hub's; core rejects `now < observed_at` outright
@@ -793,7 +807,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
                 wi['text'] = dependency_text
-            v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})
+            v['actions'].append({'kind': 'open_card', 'role': 'dependency', 'label': 'Open dependency', 'target': target(dependency)})
         on = wi['text']
         if wi.get('kind') and (wi['kind'] == 'clock' or on.startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy'))):
             # Delivery waits (CI, deploy, clock) paint light blue.
@@ -1018,6 +1032,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             source_row = diagnostic_rows.get(view['key'], view)
             _actionability.present(view, source_row, obj(obj(bundle.get('cards')).get(view['id'])),
                                    now=now, terminal=TERMINAL, serving=same_gateway)
+    # Open session names the card's own chat; the chat this panel already shows (any compression ancestor) is not one.
+    here = {str(s) for s in [bundle.get('session'), *(bundle.get('lineage') or [])] if s}
+    for view in [v for values in sections.values() for v in values] + groups:
+        view['actions'] = [a for a in view.get('actions') or [] if not (a.get('kind') == 'open_session' and str(obj(a.get('target')).get('session')) in here)]
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]

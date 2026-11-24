@@ -26,7 +26,7 @@ export async function resolve(s,c,n) {
  const m = {
  'react': 'const R=globalThis.hubHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef',
  'react/jsx-runtime': 'const J=globalThis.hubHarness.J;export const jsx=J.jsx,jsxs=J.jsxs',
- '@hermes/plugin-sdk': 'export const host=globalThis.hubHarness.host,Codicon=()=>null,DisclosureCaret=()=>null,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get?.()'
+ '@hermes/plugin-sdk': 'const H=globalThis.hubHarness,R=H.React,F=p=>R.createElement(R.Fragment,null,p.children);export const host=H.host,Codicon=()=>null,DisclosureCaret=()=>null,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get?.(),ContextMenu=F,ContextMenuTrigger=F,ContextMenuContent=p=>H.menus?R.createElement("div",{"data-row-menu":p["data-row-menu"]},p.children):null,ContextMenuItem=p=>R.createElement("button",{type:"button","data-row-menu-item":p["data-row-menu-item"],disabled:p.disabled,onClick:p.onSelect},p.children)'
  }; return m[s]?{url:'data:text/javascript,'+encodeURIComponent(m[s]),shortCircuit:true}:n(s,c)
 }
 export async function load(u,c,n) {
@@ -435,12 +435,15 @@ test('mounted cold panel offers explicit Retry after its bounded attempts, then 
  }
 })
 
-test('named dependency paints human title and a parent-card action', async () => {
+test('named dependency paints human title; its card opens from the row menu, not a button', async () => {
  const model = cases.named_parent.model
  await paint(m.renderModel(model))
  const row = document.querySelector('[data-panel-row]')
  assert.ok(row.textContent.includes('waiting on: Publish the release on remote · 2m'))
- assert.ok([...row.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
+ assert.ok(![...row.querySelectorAll('button')].some(b => /parent card|dependency/i.test(b.textContent)), 'no Open parent card link')
+ const dep = m.rowMenuItems(model.sections.waiting[0]).find(i => i.key === 'dependency').action
+ assert.equal(dep.role, 'dependency')
+ assert.notEqual(dep.target.id, model.sections.waiting[0].id)
  assert.equal(row.querySelector('[data-row-detail]').textContent, 'waiting on: Publish the release on remote · 2m')
 })
 
@@ -467,7 +470,7 @@ test('a line row opens its own card by double-clicking the state square, with no
  await paint(m.renderModel(model, { onAction: (r, a) => opened.push([r.id, a.target.id]) }))
  const el = document.querySelector('[data-line-row]')
  assert.ok(![...el.querySelectorAll('button')].some(b => b.textContent === 'Open card'))
- assert.ok([...el.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
+ assert.ok(![...el.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
  const pip = el.querySelector('[data-row-pip][data-open-own-card]')
  await React.act(async () => pip.click())
  assert.deepEqual(opened, [], 'a single click does not open')
@@ -595,7 +598,8 @@ test('hub renderer is unconditional, registers no settings, and switches cached 
 test('Open card resolves the supplied owner target rather than the focused connection', async () => {
  const model = structuredClone(publicCases.own_letters.model)
  const row = model.sections.needs_you[0]
- row.actions = [{ kind: 'open_card', label: 'Open original', target: { gateway: 'owner-gateway', profile: 'work', board: 'board-a', id: 't_example' } }]
+ // The ask row's own card (a dependency opens from the right-click menu instead).
+ row.actions = [{ kind: 'open_card', label: 'Open original', target: { gateway: 'owner-gateway', profile: 'work', board: 'board-a', id: row.id } }]
  const opened = []
  window.__sessionTasks = {
   connectionForHubGateway: gateway => gateway === 'owner-gateway' ? 'owner-connection' : null,
@@ -606,7 +610,7 @@ test('Open card resolves the supplied owner target rather than the focused conne
  const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Open original')
  assert.ok(button)
  await React.act(async () => button.click())
- assert.deepEqual(opened, [{ id: 't_example', kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
+ assert.deepEqual(opened, [{ id: row.id, kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
  await paint(null)
 })
 test('unmirrored card choices fail closed: no composer draft and no decision POST', async () => {
@@ -1114,3 +1118,48 @@ test('canonical click admission preserves foreign routing and rejects incomplete
  delete window.__sessionTasks; window.localStorage.clear(); m.resetFeedForTests()
 })
 test.after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
+
+test('right-clicking a row offers Open session, Open card, Open dependency in that order', async () => {
+ const model = structuredClone(cases.named_parent.model)
+ const row = model.sections.waiting[0]
+ row.actions = row.actions.filter(a => a.kind !== 'open_session')
+ row.actions.push({ kind: 'open_session', label: 'Open session', target: { session: 'owner-chat', gateway: row.gateway, profile: row.profile } })
+ const opened = []
+ globalThis.hubHarness.menus = true
+ try {
+  await paint(m.renderModel(model, { onAction: (r, a) => opened.push([a.kind, a.target.session || a.target.id]), currentSession: 'chat' }))
+  const menu = document.querySelector(`[data-row-menu="${row.key}"]`)
+  assert.ok(menu, 'the row has a context menu')
+  const items = [...menu.querySelectorAll('[data-row-menu-item]')]
+  assert.deepEqual(items.map(b => b.textContent), ['Open session', 'Open card', 'Open dependency'])
+  assert.ok(items.every(b => !b.disabled))
+  for (const b of items) await React.act(async () => b.click())
+  const dep = row.actions.find(a => a.role === 'dependency')
+  assert.deepEqual(opened, [['open_session', 'owner-chat'], ['open_card', row.id], ['open_card', dep.target.id]])
+  // The chat already in focus is not offered again; a row with no dependency greys that entry out.
+  row.actions = row.actions.filter(a => a.role !== 'dependency')
+  await paint(m.renderModel(model, { onAction: () => {}, currentSession: 'owner-chat' }))
+  const again = [...document.querySelector(`[data-row-menu="${row.key}"]`).querySelectorAll('[data-row-menu-item]')]
+  assert.deepEqual(again.map(b => [b.textContent, b.disabled]), [['Open session', true], ['Open card', false], ['Open dependency', true]])
+ } finally { globalThis.hubHarness.menus = false }
+})
+
+test('an older model labelled Open parent card still fills Open dependency', () => {
+ const row = { id: 'a', actions: [{ kind: 'open_card', label: 'Open card', target: { id: 'a' } }, { kind: 'open_card', label: 'Open parent card', target: { id: 'p' } }] }
+ const items = m.rowMenuItems(row)
+ assert.equal(items.find(i => i.key === 'dependency').action.target.id, 'p')
+ assert.equal(items.find(i => i.key === 'card').action.target.id, 'a')
+ assert.equal(items.find(i => i.key === 'session').action, null)
+})
+
+test('Open session routes to the card owner gateway via host.openSession', async () => {
+ const calls = []
+ host.openSession = async (id, opts) => { calls.push([id, opts]) }
+ window.__sessionTasks = { connectionForHubGateway: g => g === 'hub' ? 'conn-hub' : null }
+ try {
+  assert.equal(await m.openSessionAction({ kind: 'open_session', target: { session: 's1', gateway: 'hub', profile: 'default' } }, current), true)
+  assert.deepEqual(calls, [['s1', { route: { connectionId: 'conn-hub', mode: 'remote', profile: 'default', targetProfile: 'default' } }]])
+  assert.equal(await m.openSessionAction({ kind: 'open_session', target: { session: 's2', gateway: 'gone' } }, current), false)
+  assert.equal(calls.length, 1, 'an unconnected gateway opens nothing')
+ } finally { delete host.openSession; delete window.__sessionTasks }
+})

@@ -615,3 +615,16 @@ def test_run_meta_pool_class_model_and_quiet():
     assert meta['detail'] == 'pool · deep · quiet 25m'
     assert meta['quiet'] is True
     assert model.run_meta({'id': 't_y'}, 'review', 0, NOW)['detail'] == 'in review'
+
+
+def test_card_rows_carry_open_session_only_for_another_chat():
+    other = task('t_other', session_id='other-chat')
+    mine = task('t_mine', session_id='chat-root')
+    out = model.reduce_panel(bundle(other, mine, session='chat', lineage=['chat', 'chat-root']), now=NOW)
+    views = {v['id']: v for values in out['sections'].values() for v in values}
+    session = [a for a in views['t_other']['actions'] if a['kind'] == 'open_session']
+    assert session == [{'kind': 'open_session', 'label': 'Open session',
+                        'target': {'session': 'other-chat', 'gateway': 'remote', 'profile': 'default'}}]
+    # The panel's own chat (or a compression ancestor of it) is never offered.
+    assert not [a for a in views['t_mine']['actions'] if a['kind'] == 'open_session']
+    assert any(a['kind'] == 'open_card' and a['label'] == 'Open card' for a in views['t_mine']['actions'])

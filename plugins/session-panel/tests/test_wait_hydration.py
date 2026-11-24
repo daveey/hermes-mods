@@ -32,7 +32,7 @@ def test_real_hydration_preserves_intermediate_producer(api, board, monkeypatch,
     result = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert 'Unrelated ancestor' not in result['detail']
     expected = primary if kind == 'card' else mid
-    action = next(a for a in result['actions'] if a['label'] == 'Open parent card')
+    action = next(a for a in result['actions'] if a['label'] == 'Open dependency')
     assert action['target']['id'] == expected
     assert action['target']['gateway'] == ('remote' if replica else 'hub')
     assert ('Named primary' if kind == 'card' else 'Actual producer') in result['detail']

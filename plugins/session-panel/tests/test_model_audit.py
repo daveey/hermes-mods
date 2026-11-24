@@ -262,7 +262,8 @@ def test_wait_chain_shows_deepest_parent_location_and_reason():
     assert 'Reconcile cutover' in r['detail']
     assert 'on worker-one (worker-one-host)' in r['detail']
     assert 'asks origin: Choose which cutover premise to retain' in r['detail']
-    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == leaf
+    assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['target']['id'] == leaf
+    assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['role'] == 'dependency'
     # An unrelated completed branch cannot replace the deepest unfinished parent.
     b['cards'][parent]['detail']['links']['parents'].append('t_3333333333333333')
     b['cards']['t_3333333333333333'] = {'detail': {'task': {'id': 't_3333333333333333', 'title': 'Finished', 'status': 'done'}}}
@@ -293,12 +294,12 @@ def test_wait_names_hydrated_parent_and_opens_exact_owner(source, owner, gateway
     b.update(gateway='hub', profile='default')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert r['detail'] == f'waiting on: Publish the release on {gateway} · 2m'
-    action = next(a for a in r['actions'] if a['label'] == 'Open parent card')
+    action = next(a for a in r['actions'] if a['label'] == 'Open dependency')
     assert action['target'] == {'id': cid, 'gateway': gateway, 'profile': 'default', 'board': 'other'}
     assert any(cid in d for d in r['details'])
     b['cards'][cid]['detail'].update(source='replica', owner=None)
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+    assert not any(a['label'] == 'Open dependency' for a in r['actions'])
 
 
 def test_awaited_card_outside_this_chat_shows_its_live_status():
@@ -322,7 +323,7 @@ def test_parent_metadata_does_not_replace_unrelated_waits(on):
     row = task(status='scheduled', upstream={'id': cid, 'title': 'Other work', 'gateway': 'remote', 'profile': 'default'}, wait={'wait_state': 'waiting', 'waiting_on': on})
     r = model.reduce_panel(bundle(row), now=NOW)['sections']['waiting'][0]
     assert r['detail'] == model.wait_phrase(row, NOW) + ' on remote'
-    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+    assert not any(a['label'] == 'Open dependency' for a in r['actions'])
 
 
 def test_own_wait_and_unhydrated_primary_never_link_to_self_or_secondary():
@@ -334,7 +335,7 @@ def test_own_wait_and_unhydrated_primary_never_link_to_self_or_secondary():
         b.update(gateway='hub', profile='default')
         r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
         assert 'Own work' not in r['detail']
-        assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+        assert not any(a['label'] == 'Open dependency' for a in r['actions'])
 
 
 @pytest.mark.parametrize('graph_key', ['upstream', 'blocked_upstream'])
@@ -355,7 +356,7 @@ def test_explicit_primary_never_loses_to_unrelated_graph(graph_key, on):
     if on == 'card t_aaaaaaaaaaaaaaaa':
         assert r['detail'] == 'waiting on an update · 2m on remote'
     assert 'Unrelated work' not in r['detail']
-    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+    assert not any(a['label'] == 'Open dependency' for a in r['actions'])
 
 
 @pytest.mark.parametrize('on', ['', 'card t_bbbbbbbbbbbbbbbb', 'external comments on t_bbbbbbbbbbbbbbbb'])
@@ -369,7 +370,7 @@ def test_primary_and_unpublished_graph_wait_resolve_intended_card(on):
     b.update(gateway='hub', profile='default')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert r['detail'].startswith('waiting on: Intended work')
-    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == primary
+    assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['target']['id'] == primary
 
 
 @pytest.mark.parametrize('on', ['the clock until 2026-11-23 12:00 UTC', 'the clock until 2026-11-21 00:00 UTC', 'ci https://example.com/run', 'deploy release'])
@@ -381,7 +382,7 @@ def test_hydrated_graph_never_replaces_explicit_noncard_wait(on):
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert r['detail'] == model.wait_phrase(row, NOW) + ' on remote'
     assert 'Unrelated work' not in str(r)
-    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+    assert not any(a['label'] == 'Open dependency' for a in r['actions'])
 
 
 @pytest.mark.parametrize('source, expected', [('live', True), ('replica', False)])
@@ -400,7 +401,7 @@ def test_graph_leaf_inherits_serving_gateway_only_for_live_sources(source, expec
         row['wait'] = {'wait_state': 'waiting', 'waiting_on': f'card {mid}'}
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert ('Local leaf' in r['detail']) is expected
-    actions = [a for a in r['actions'] if a['label'] == 'Open parent card']
+    actions = [a for a in r['actions'] if a['label'] == 'Open dependency']
     assert bool(actions) is (expected or depth == 2)
     if expected:
         assert 'Cooldown window' in r['detail'] and 'on hub' in r['detail']
@@ -428,7 +429,7 @@ def test_leaf_traversal_obeys_intermediate_explicit_producer(on):
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert 'Unrelated ancestor' not in r['detail']
     expected = primary if on.startswith('card ') else mid
-    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == expected
+    assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['target']['id'] == expected
 
 
 def test_parent_wait_keeps_identity_in_details_not_status():

@@ -89,7 +89,7 @@ test('waiting rows are one line: no Details disclosure, detail right of the titl
   assert.ok(![...el.querySelectorAll('button')].some(b => b.textContent === 'Open CI'))
   await React.act(async () => links[0].click())
   assert.deepEqual(opened, ['Open CI'])
-  assert.ok([...el.querySelectorAll('[data-open-card]')].some(b => b.textContent === 'Open parent card'), 'other links keep their button')
+  assert.ok(![...el.querySelectorAll('[data-open-card]')].some(b => b.textContent === 'Open parent card'), 'the parent card opens from the row menu, not a button')
   // Older model (no `inline`): the Open CI button stays.
   await paint(m.renderModel(model({ waiting: [row('a', { ...waiting, actions: [{ ...ci, inline: undefined }] })] })))
   assert.deepEqual([...document.querySelectorAll('[data-open-url]')].map(b => b.textContent), ['Open CI'])
