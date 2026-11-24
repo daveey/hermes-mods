@@ -240,6 +240,10 @@ def test_a_write_during_the_rest_of_an_exhausted_chat_is_not_lost_and_a_new_fail
     api = _api(monkeypatch)
     clock = [100.0]
     f, ticks, _ = _duty_feed(api, monkeypatch, clock, cold=False)
+    # The double has no idle_wait, so idle beats are heartbeat_s apart (default 20). At 20 the third beat
+    # lands at 150, after the rest ended at 130, and duty_deferrals stays 0: the write was never inside the
+    # rest (review 6041957164). 5 s puts beat 3 at 120, inside it.
+    f.heartbeat_s = 5.0
     f._reconcile_deferred = {'chat-c'}
     f._reconcile_retry_at = None
     real_tick = f.tick
@@ -263,6 +267,7 @@ def test_a_write_during_the_rest_of_an_exhausted_chat_is_not_lost_and_a_new_fail
     assert len(ticks) == 3, ticks
     assert ticks[1] - ticks[0] >= 30.0, ticks  # the write waited out the rest, and was served
     assert ticks[2] - ticks[1] < 15.0, ticks   # the armed retry ran on the floor, not after a 20 s rest
+    assert f.timing.get('duty_deferrals', 0) > 0, ticks  # the write was inside the rest, not after it
 
 
 def test_recovery_due_needs_owed_work_and_an_armed_clock(monkeypatch):
