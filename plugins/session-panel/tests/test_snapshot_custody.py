@@ -1,5 +1,7 @@
 """Scope-local replacement, immutable payload and publication-vector regressions."""
-from dataclasses import dataclass
+import importlib.util
+import sys
+from dataclasses import dataclass, make_dataclass
 
 import pytest
 
@@ -218,6 +220,47 @@ def test_forget_rewatch_and_reset_fence_old_results(owned):
     with pytest.raises(m.StaleCapture):
         store.accept_local(part, prior)
     assert not store.fail(source, prior.source_generation, 'old', part.receipt.coverage.captured_demands)
+
+
+def test_transfer_rebinds_content_qualified_module_keys_without_new_coverage(owned, monkeypatch):
+    old, store, source, chats, key = owned
+    accept(owned)
+    _, admission = store.pin(chats[0])
+    spec = importlib.util.spec_from_file_location('_snapshot_transfer_successor', old.__file__)
+    assert spec is not None and spec.loader is not None
+    new = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, new)
+    spec.loader.exec_module(new)
+    assert old.SourceKey is not new.SourceKey
+    store.close(store.epoch)
+    resumed = new.SnapshotStore.transfer(store)
+    chat = new.ChatKey(*chats[0].__dict__.values())
+    current_source = new.SourceKey(*source.__dict__.values())
+    snapshot, current = resumed.pin(chat)
+    assert all(type(s) is new.SourceKey for s in snapshot.parts)
+    assert all(type(c) is new.ChatKey for c in snapshot.watches)
+    assert all(type(d) is new.ScopeDemand for group in snapshot.demands.values() for d in group.values())
+    assert current.id == admission.id and current.watch_token == admission.watch_token
+    assert current.first_admitted_mono_ns == admission.first_admitted_mono_ns
+    assert current.receipt_ids == admission.receipt_ids
+    assert not current.missing_scopes
+    assert resumed.current(current)
+    assert new.SnapshotReaders(snapshot, chat).linked(['A']) == [{'title': 'one', 'via': 'subscribed'}]
+    assert snapshot.parts[current_source].receipt.read_finished_ns == 2
+    assert resumed.owner_token(current_source) != store.owner_token(source)
+    assert resumed.version(current_source).source_revision == store.version(source).source_revision
+
+
+def test_transfer_rejects_changed_dataclass_schema_without_consuming_owner(owned):
+    m, store, source, chats, _ = owned
+    store.close(store.epoch)
+    incompatible = make_dataclass('SourceKey', [('unexpected', str)], frozen=True)('wrong schema')
+    store._versions[incompatible] = store._versions[source]
+    with pytest.raises(m.StaleCapture, match='incompatible transfer field layout'):
+        m.SnapshotStore.transfer(store)
+    assert not getattr(store, '_transferred', False)
+    store._versions.pop(incompatible)
+    assert m.SnapshotStore.transfer(store).pin(chats[0])[1].watch_token
 
 
 def test_compatible_transfer_requires_stopped_owner_and_fences_captures(owned):

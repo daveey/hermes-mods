@@ -11,6 +11,7 @@ import logging
 import queue
 import threading
 import time
+from typing import Any
 
 log = logging.getLogger('session-panel')
 
@@ -49,6 +50,23 @@ class RetiringOwner:
         self.drained = threading.Event()
         with owner.lock:
             self.parent = getattr(owner, 'predecessor', None)
+            self.state = {
+                'pending': {**getattr(owner, '_active_ages', {}),
+                            **getattr(owner, '_retired_pending', owner.pending)},
+                'active': set(owner.active),
+                'acquiring': set(owner.acquiring),
+                'chats': dict(owner.chats), 'tokens': dict(owner.tokens),
+                'attempts': {key: Attempt(a.stamp, a.demands, a.count, a.retry_at)
+                             for key, a in owner.attempts.items()},
+                'scope_attempts': {source: {key: Attempt(a.stamp, a.demands, a.count, a.retry_at)
+                    for key, a in attempts.items()} for source, attempts in owner.scope_attempts.items()},
+                'role_attempts': {key: Attempt(a.stamp, a.demands, a.count, a.retry_at)
+                                  for key, a in owner.role_attempts.items()},
+                'projection_attempts': {key: Attempt(a.stamp, a.demands, a.count, a.retry_at)
+                                        for key, a in owner.projection_attempts.items()},
+                'local_stamp': owner._local_stamp, 'external_stamp': owner._external_stamp,
+                'local_requested': owner._local_requested, 'external_requested': owner._external_requested,
+            }
             self.remaining = {('acquisition_done', key) for key in owner.acquiring}
             self.remaining.update(('projection_done', key) for key in owner.active)
             owner.closed = True
@@ -66,6 +84,10 @@ class RetiringOwner:
                     kind, key, value = self.owner.completed.get_nowait()
                 except queue.Empty:
                     break
+                if kind == 'registration_error' and key in self.state['role_attempts']:
+                    attempt = self.state['role_attempts'][key]
+                    attempt.count += 1
+                    attempt.retry_at = self.owner.feed._backoff(attempt.count)
                 self.remaining.discard((kind, key))
             parent_ready = self.parent is None or self.parent.ready()
             if not self.remaining and parent_ready:
@@ -176,6 +198,7 @@ class SourceCoordinator:
         self.lock = threading.RLock()
         self.completed = queue.SimpleQueue()
         self.pending, self.active, self.acquiring = {}, {}, {}
+        self._active_ages = {}
         self.attempts = {s: Attempt() for s in (*self.sources, self.external)}
         self.scope_attempts = {s: {} for s in self.attempts}
         self.registration_attempt = Attempt()
@@ -195,6 +218,70 @@ class SourceCoordinator:
         self._workers = 0
         self.predecessor = None
         self.successor = None
+
+    def inherit(self, retirement):
+        """Use B1's compatible stopped-store transfer; never copy live workers.
+
+        Retry signatures are rehomed with the immutable keys, not reset because
+        the Python module has a new content-qualified identity. Reader objects,
+        role ownership and canonical input bases are deliberately not inherited.
+        """
+        from collections.abc import Mapping
+        from dataclasses import is_dataclass
+        def value(v) -> Any:
+            if is_dataclass(v):
+                return self.module.rehome(v)
+            if isinstance(v, Mapping):
+                return {value(k): value(x) for k, x in v.items()}
+            if isinstance(v, tuple):
+                return tuple(value(x) for x in v)
+            if isinstance(v, (set, frozenset)):
+                return frozenset(value(x) for x in v)
+            # File-stamp primitives and in-process Feed watch-token identities.
+            return v
+        def attempt(a):
+            return Attempt(value(a.stamp), value(a.demands), a.count, a.retry_at)
+        state = retirement.state
+        chats = value(state['chats'])
+        attempts = {value(k): attempt(a) for k, a in state['attempts'].items()}
+        scopes = {value(k): {value(s): attempt(a) for s, a in group.items()}
+                  for k, group in state['scope_attempts'].items()}
+        roles = {k: attempt(a) for k, a in state['role_attempts'].items()}
+        projections = {k: attempt(a) for k, a in state['projection_attempts'].items()}
+        store = self.module.SnapshotStore.transfer(retirement.owner.store)
+        # Newly discovered sources are missing, not inferred from transferred
+        # coverage. Unchanged source keys retain their exact immutable versions.
+        for source in (*self.sources, self.external):
+            store.add_source(source)
+            attempts.setdefault(source, Attempt())
+            scopes.setdefault(source, {})
+        self.store, self.chats = store, chats
+        self.tokens = dict(state['tokens'])
+        self.attempts, self.scope_attempts = attempts, scopes
+        self.role_attempts = roles
+        self.registration_attempt = roles['local']
+        self.projection_attempts = projections
+        self._local_stamp, self._external_stamp = value(state['local_stamp']), value(state['external_stamp'])
+        self._local_requested = state['local_requested'] or 'local' in state['acquiring']
+        self._external_requested = state['external_requested'] or 'external' in state['acquiring']
+        # A fenced in-flight capture has already consumed its attempt. Resume
+        # gives that attempt its existing finite backoff, not a fresh budget.
+        for source, group in scopes.items():
+            role = 'external' if source == self.external else 'local'
+            if role in state['acquiring']:
+                for a in group.values():
+                    if a.count and a.retry_at is None:
+                        a.retry_at = self.feed._backoff(a.count)
+                retries = [a.retry_at for a in group.values() if a.retry_at is not None]
+                attempts[source].retry_at = min(retries) if retries else None
+        self.pending = dict(state['pending'])
+        for s in state['active']:
+            if s in self.chats:
+                self.pending.setdefault(s, store.pin(self.chats[s])[1].first_admitted_mono_ns)
+        # Forget/rewatch still wins over copied identities; _register handles its
+        # exact token/lineage transition before any capture can claim coverage.
+        self.canonical_dirty = {s: i for i, s in enumerate(self.chats, 1)}
+        self._change_seq = len(self.canonical_dirty)
 
     def _available(self):
         return self.predecessor is None or self.predecessor.ready()
@@ -264,7 +351,7 @@ class SourceCoordinator:
                 previous = self.projection_attempts.get(s)
                 if previous is None or previous.demands != signature:
                     self.projection_attempts[s] = Attempt(demands=signature)
-                self.pending.setdefault(s, time.monotonic_ns())
+                self.pending.setdefault(s, self._active_ages.get(s, time.monotonic_ns()))
                 self.feed._board_failures.add(s)
                 if not self._projection_ready(s):
                     self._cancel_tickets(s, 'snapshot projection retry is pending or exhausted')
@@ -555,6 +642,7 @@ class SourceCoordinator:
                     self.acquiring.pop(key, None)
                 elif kind == 'projection_done':
                     self.active.pop(key, None)
+                    self._active_ages.pop(key, None)
                 elif kind == 'registration_error':
                     self.feed._board_capture_failures.update(self.feed.interest)
                     attempt = self.role_attempts[key]
@@ -566,7 +654,7 @@ class SourceCoordinator:
                         self.feed._board_capture_failures.difference_update(completed)
             for s, attempt in self.projection_attempts.items():
                 if attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at:
-                    self.pending.setdefault(s, time.monotonic_ns())
+                    self.pending.setdefault(s, self._active_ages.get(s, time.monotonic_ns()))
             for s in sorted(self.pending, key=lambda s: (self.pending[s], s)):
                 if len(self.active) >= self.capacity:
                     break
@@ -575,7 +663,7 @@ class SourceCoordinator:
                 if not self._projection_ready(s):
                     self._cancel_tickets(s, 'snapshot projection retry is pending or exhausted')
                     continue
-                self.pending.pop(s)
+                self._active_ages[s] = self.pending.pop(s)
                 self.projection_attempts[s].retry_at = None
                 worker = threading.Thread(target=self._project, args=(s,),
                                           name='session-panel-projection-' + s[:12], daemon=True)
@@ -779,6 +867,8 @@ class SourceCoordinator:
     def retire(self):
         """Nonjoining authority withdrawal, safe under the Feed writer fence."""
         with self.lock:
+            if not self.closed:
+                self._retired_pending = dict(self.pending)
             self.closed = True
             # Withdraw immutable publication authority before any potentially
             # blocked join. A late projection may keep its pin, never its lease.

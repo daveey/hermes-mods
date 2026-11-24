@@ -441,7 +441,9 @@ class Feed:
             bundles = getattr(prev, 'bundles', {})
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
-            self._watch_tokens = {s: object() for s in self.interest}
+            old_tokens = getattr(prev, '_watch_tokens', {})
+            self._watch_tokens = {s: old_tokens.get(s, object()) if predecessor is not None else object()
+                                  for s in self.interest}
             self._registrations = getattr(prev, '_registrations', self._registrations)
             self._panel_updates = getattr(prev, '_panel_updates', self._panel_updates)
             self._board_demands = getattr(prev, '_board_demands', self._board_demands)
@@ -608,6 +610,8 @@ class Feed:
                         or (pending.api_generation, pending.reader_factory) != registration):
                     owner.retire()
                     return getattr(self, '_source_coordinator', None)
+                if pending.predecessor is not None:
+                    owner.inherit(pending.predecessor)
                 self.readers = candidate
                 owner.predecessor = pending.predecessor
                 if owner.predecessor is not None:

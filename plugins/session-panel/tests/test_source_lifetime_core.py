@@ -258,6 +258,106 @@ def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
         _restore(current_api, core)
 
 
+def test_resume_transfers_exact_scope_age_and_exhausted_source_budget(api, board, monkeypatch):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    now = [1800000000.]
+    task = kanban_db.create_task(conn, title='Retain exact custody', session_id='S')
+    old = feedmod.Feed(current, emit=lambda _: None, clock=lambda: now[0])
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    ref = previous.module.CardKey('fixture', 'default', 'default', task)
+    previous.require('S', [ref]); drain(previous)
+    calls = []
+    def unavailable(*args, **kwargs):
+        calls.append('strict capture')
+        raise RuntimeError('fixture exact source unavailable')
+    monkeypatch.setattr(current, 'external_capture', unavailable)
+    monkeypatch.setattr(current, 'external_stamps', lambda: ('one changed source',))
+    for _ in range(6):
+        drain(previous)
+        now[0] += 31
+    assert calls == ['strict capture'] * 4
+    prior_pin, prior_admission = previous.store.pin(previous.chats['S'])
+    with previous.lock:
+        previous._queue(['S'])
+        age = previous.pending['S']
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: current)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None, clock=lambda: now[0])
+    try:
+        new.resume(old)
+        owner = new._source_coordinator
+        assert owner.store.epoch == previous.store.epoch, 'resume replaced compatible store identity'
+        assert new._watch_tokens['S'] is old._watch_tokens['S']
+        pin, admission = owner.store.pin(owner.chats['S'])
+        assert admission.watch_token == prior_admission.watch_token
+        assert admission.required_scopes == prior_admission.required_scopes
+        assert admission.first_admitted_mono_ns == prior_admission.first_admitted_mono_ns
+        assert admission.receipt_ids == prior_admission.receipt_ids
+        assert owner.pending['S'] == age
+        assert pin.parts == prior_pin.parts
+        assert owner.store.owner_token(owner.external) != previous.store.owner_token(previous.external)
+        assert 'S' in new._carried and not new._bundle_fresh('S', now[0])
+        for _ in range(5):
+            drain(owner)
+            now[0] += 31
+        assert len(calls) == 4, 'resume reset an exhausted unchanged-source retry budget'
+        assert not new._bundle_fresh('S', now[0])
+    finally:
+        old.stopped.set(); previous.close(); new.stopped.set()
+        if getattr(new, '_source_coordinator', None):
+            new._source_coordinator.close()
+        current.release(); conn.close()
+
+
+@pytest.mark.parametrize('failure_kind', ['registration', 'projection'])
+def test_resume_retains_exhausted_role_and_projection_budgets(api, board, monkeypatch, failure_kind):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    now = [1800000000.]
+    old = feedmod.Feed(current, emit=lambda _: None, clock=lambda: now[0])
+    previous = compose(old, current)
+    old.changes(['S']); drain(previous)
+    calls = []
+    def unavailable(*args, **kwargs):
+        calls.append(failure_kind)
+        raise RuntimeError('fixture unchanged ' + failure_kind + ' failure')
+    if failure_kind == 'registration':
+        monkeypatch.setattr(current, 'lineage', unavailable)
+        monkeypatch.setattr(current, 'board_stamps', lambda: ('changed registration stamp',))
+    else:
+        monkeypatch.setattr(feedmod.Feed, 'project_board', unavailable)
+        with previous.lock:
+            previous._queue(['S'])
+    for _ in range(6):
+        drain(previous)
+        now[0] += 31
+    assert len(calls) == 4
+    prior = (previous.role_attempts['local'] if failure_kind == 'registration'
+             else previous.projection_attempts['S'])
+    assert prior.count == 4 and prior.retry_at is None
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: current)
+    new = feedmod.Feed(RetiredReaders(), emit=lambda _: None, clock=lambda: now[0])
+    try:
+        new.resume(old)
+        owner = new._source_coordinator
+        held = (owner.role_attempts['local'] if failure_kind == 'registration'
+                else owner.projection_attempts['S'])
+        assert held.count == 4 and held.retry_at is None
+        for _ in range(5):
+            drain(owner)
+            now[0] += 31
+        assert len(calls) == 4, 'reload reset exhausted unchanged-input retry custody'
+        assert not new._bundle_fresh('S', now[0])
+    finally:
+        old.stopped.set(); previous.close(); new.stopped.set()
+        if getattr(new, '_source_coordinator', None):
+            new._source_coordinator.close()
+        current.release(); conn.close()
+
+
 class RetiredReaders:
     """A genuinely saved API may construct readers with no current capability."""
     def __init__(self):
@@ -430,7 +530,8 @@ def test_successor_reserves_all_four_roles_until_old_readers_and_projections_rel
     monkeypatch.setattr(r, 'external_capture', strict_empty)
     tasks = [kanban_db.create_task(conn, title='Initial ' + session, session_id=session)
              for session in ('A', 'B')]
-    old = feedmod.Feed(r, emit=lambda _: None)
+    now = [1800000000.]
+    old = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0])
     previous = compose(old, r)
     old.changes(['A', 'B']); drain(previous)
     entered = {key: threading.Event() for key in ('local', 'external', 'A', 'B')}
@@ -468,7 +569,7 @@ def test_successor_reserves_all_four_roles_until_old_readers_and_projections_rel
         assert all(event.wait(3) for event in entered.values())
         assert set(previous.acquiring) == {'local', 'external'} and len(previous.active) == 2
         old_workers = {**previous.acquiring, **previous.active}
-        new = feedmod.Feed(r, emit=lambda _: None).resume(old)
+        new = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0]).resume(old)
         owner = new._source_coordinator
         assert previous.closed and not owner.predecessor.ready()
         # Retirement does not join under the writer lock or borrow any new role.
@@ -482,6 +583,10 @@ def test_successor_reserves_all_four_roles_until_old_readers_and_projections_rel
         assert not old_workers['B'].is_alive() and owner.predecessor.ready()
         owner.step()
         owner = new._source_coordinator
+        assert all(a.count for group in owner.scope_attempts.values() for a in group.values())
+        # Cancelled captures retain their consumed attempt and scheduled backoff.
+        # Advance the injected clock, never sleep to substitute for release.
+        now[0] += 31
         drain(owner)
         assert factories and owner.drained.is_set()
         assert all(not worker.is_alive() for worker in old_workers.values())
