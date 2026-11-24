@@ -79,6 +79,8 @@ and a nearby "no new cards" line will otherwise stall the worker on a decision r
 too: from a worker, ship exits 1 until its emitted pre-land proof is uploaded with the `kanban_attach` tool (CLI
 attachment writes are fenced), so list that upload plus the identical ship rerun under "not stops". Likewise ship
 exits 1 on unanswered non-blocking review points until rerun with `--review-reply "<answers>"`; list that too.
+Its detector also counts the I/O word ("nonblocking open", O_NONBLOCK), so approving reviews of file-handling
+code trip it: check each counted point against the head and quote the per-point answers verbatim in the mandate.
 Measure a dollar cap from the comment that set it: sum `usage.cost_usd` over the card's `worker_result` events
 created after that comment. The spend-budget window and older totals start earlier, so they overstate it.
 After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
