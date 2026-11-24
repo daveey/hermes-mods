@@ -200,6 +200,22 @@ class Remote:
         except Exception:
             return None
 
+    def membership_capture(self, owner):
+        """Owner-scoped complete membership key; None always means changed.
+
+        Kept separate from input_stamp until the plugin dependency memo also
+        captures request/binding/operation and historical namespace inputs.
+        """
+        if self.cards is not linked_cards:
+            return None
+        import time
+        try:
+            module = load_file(Path(__file__).with_name('panel_membership.py'))
+            view = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
+            return module.for_remote(self, owner, now=time.time(), view=view)
+        except Exception:
+            return None
+
     def snapshots(self, owner):
         for row in self.cards(owner):
             try:
