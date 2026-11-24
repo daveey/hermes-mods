@@ -97,21 +97,22 @@ def test_changes_wire_bytes_equal_legacy_route(home, monkeypatch):
         legacy.stopped.set()
 
 
-def test_status_wire_matches_legacy_schema_and_never_reports_a_false_stop(home):
+def test_status_wire_matches_legacy_schema_and_never_reports_a_false_stop(home, monkeypatch):
     api = load('_parity_status_api', 'plugin_api.py')
     legacy = legacy_feed(api)
     provider = provider_for(api)
+    monkeypatch.setattr(time, 'time', lambda: WALL)
+    monkeypatch.setattr(time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(time, 'perf_counter', lambda: 100.0)
     try:
         provider.feed.tick()
         legacy.tick()
-        got = json.loads(provider({'body': {'_verb': 'status', '_wire_identity': identity(api)},
-                                   'accepted': time.monotonic()}))
+        raw = provider({'body': {'_verb': 'status', '_wire_identity': identity(api)}, 'accepted': 100.0})
+        got = json.loads(raw)
         want = api.json_safe({'feed': api.FEED_ID, 'profile': api.LAUNCH_PROFILE,
                               'running': not legacy.stopped.is_set(), **legacy.status()})
-        assert got['running'] is True and set(got) == set(want)
-        for key in want:
-            if key not in ('epoch', 'timing', 'ages', 'computed_at'):
-                assert got[key] == want[key], key
+        assert got['running'] is True
+        assert raw == json.dumps(want, ensure_ascii=False, separators=(',', ':')).encode()
         provider.feed.stopped.set()
         stopped = json.loads(provider({'body': {'_verb': 'status', '_wire_identity': identity(api)},
                                        'accepted': time.monotonic()}))
