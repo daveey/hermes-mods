@@ -2451,8 +2451,9 @@ def _coalesce(f, last_start: float | None) -> None:
 # by full_every_s - DUTY_TRUST_MARGIN_S - 2T, and a pass of 25 s or more earns none at the default 60 s window.
 # This holds for passes of similar length: the margin covers the 3 s floor grid and a next pass up to about 7 s
 # longer; a much longer one can show a chat untrusted once, after which its own length earns no rest. Not held: keyed refreshes, a cold reader waiting for its first bundle, a
-# pending retry (`_retry` or a deferred reconcile) and the board and decision lanes. One chat that fails every
-# pass keeps `_retry` non-empty and so keeps the rest off: `timing.duty_deferrals` staying at 0 shows it.
+# pending retry (`_retry` or a deferred reconcile) while its budgeted retry clock is armed (`_recovery_due`), and
+# the board and decision lanes. A chat that fails every pass spends its retries and then rests like the others:
+# `timing.duty_deferrals` not rising under continuous writes shows a regression of that.
 # HERMES_PANEL_DUTY=0 turns the rest off.
 DUTY_REST_RATIO = 2.0
 DUTY_TRUST_MARGIN_S = 10.0
@@ -2468,6 +2469,21 @@ def _duty_owed(f) -> float:
     window = float(getattr(f, 'full_every_s', 60.0))
     rest = min(DUTY_REST_RATIO * took, max(0.0, window - DUTY_TRUST_MARGIN_S - 2 * took))
     return max(0.0, rest - (time.monotonic() - ended))
+
+
+_RETRY_CLOCKS = ('_admission_retry_at', '_hydrate_retry_at', '_reconcile_retry_at')
+
+
+def _recovery_due(f) -> bool:
+    """True while failed work still has a budgeted retry armed (`Feed._spend` / `Feed._backoff`): that retry
+    skips the duty rest. A chat left in `_retry` or `_reconcile_deferred` after its retries ran out has no
+    clock armed (`_spend` returns None) and is re-admitted by the next source write like any other chat, so it
+    no longer skips the rest. Before, the non-empty set alone did: on the hub four chats whose remote
+    reconciliation defers on every pass kept the rest off for the whole process (`duty_deferrals` stayed at 6
+    over 100 back-to-back passes of 6-21 s, 2026-11-24)."""
+    if not (getattr(f, '_retry', None) or getattr(f, '_reconcile_deferred', None)):
+        return False
+    return any(getattr(f, name, None) is not None for name in _RETRY_CLOCKS)
 
 
 def _settle(f, last_start: float) -> None:
@@ -2582,8 +2598,7 @@ def _run(f) -> None:
                     f.refresh_keyed(keyed)
                 if not keyed_only:
                     # getattr: the pacing tests' feed doubles carry only what their case needs.
-                    urgent = (getattr(f._cold, 'is_set', lambda: True)() or bool(getattr(f, '_retry', None))
-                              or bool(getattr(f, '_reconcile_deferred', None)))
+                    urgent = getattr(f._cold, 'is_set', lambda: True)() or _recovery_due(f)
                     if not urgent and _duty_owed(f) > 0:
                         # The full pass stays due: the wake is still set (so the loop returns after the floor)
                         # and a keyed batch arriving meanwhile must not clear it as a keyed-only iteration.
