@@ -168,6 +168,15 @@ version changes as misses, and test both image-rollout stability and tool-versio
 invalidation. Never relabel old archives under a new input key to hide a proof
 miss: rerun reviewed preparation and validate new provenance/digests.
 
+When a mirror runbook explicitly permits input-addressed reuse after a clean base
+merge, compare the complete compatibility-input pattern set, not only root locks.
+If every input is unchanged, preserve the original archive names, manifest source
+SHA, actual preparation run/artifact IDs and digests in the new isolated candidate's
+notes; never rewrite provenance or assign different keys. Independently validate
+the source delta and run the actual denied-registry proof on the NEW exact head.
+Source-only merges need not force redundant artifact downloads/publication loops,
+but old proof success never establishes new-head acceptance.
+
 ## Optional Python lanes and setup-uv cache cleanup
 
 When an optional job can skip every `uv run`, set setup-uv's `ignore-nothing-to-cache: true` (or disable caching for that leg). setup-uv may otherwise fail in its post step because no cache directory was created, turning an intentional test skip into a red job. Verify the hosted post-step result as well as the skipped test step; local shell gate tests do not exercise action cleanup.
