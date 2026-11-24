@@ -6,6 +6,12 @@ Public structural cases live in `plugins/session-panel/tests/test_model.py`; `de
 
 Shared blocker groups must apply the same owner-qualified canonical request retirement precedence as ordinary rows before consulting preserved `human_request`/`wait_state=human`. Test dismissed, answered and withdrawn requests plus a live-open positive control through the real reducer and renderer; an off-list parent must never turn red again after its ask retires. Run the compatible-core panel suite as well as no-core CI: no-core skips can hide stale real-core triage assertions. Give shared-group fixtures nested DOM assertions rather than applying the flat-row golden count contract.
 
+## Per-card fields
+
+A per-card fact (a count, a run property) belongs in `dashboard/plugin_api.py:_detail` as a key of `detail['task']`. It is the single card-detail producer (board capture calls it too), and `reduce_panel` merges `cards[id].detail.task` under each row; core's session-task rows carry only `_TASK_FIELDS`, so adding the field there needs a core change. Guard the SQL with `except sqlite3.Error` -> `None` (unreadable, not zero) and render nothing for missing/None/non-int. Test both ends: `tests/test_core_readers.py` (`r.card(id, 'default')['detail']['task'][field]` on a real board with `task_runs` rows) and a `test_model.py` case whose bundle carries hydrated `cards={id: {'detail': {'task': {...}}}}`. A detail-only append needs no Desktop change: the renderer prints `detail` verbatim.
+
+## Running the suites
+
 Through `terminal`, run:
 
 ```sh
@@ -13,6 +19,8 @@ python3 scripts/test-all --no-core --exact -k plugins/session-panel -k plugins/a
 python3 scripts/test-all --no-core --exact -k repo-guards
 node --experimental-strip-types --test desktop-plugins/session-panel/test/hub-model.test.mjs
 ```
+
+For a quick core-backed run of the panel tests on the hub, use core's venv: `~/.hermes/hermes-agent/.venv/bin/python -m pytest -q -p no:cacheprovider plugins/session-panel/tests/` (`hermes-core-python` has no pytest). Under `pytest -n`, `test_fact_transport.py::test_host_large_reset_recovers_panel_without_resubscription_loop` fails with `AF_UNIX path too long` (xdist's deeper tmp path); rerun it alone before treating it as a regression.
 
 When pinning core for `scripts/test-all`, pass `--hermes-core <isolated checkout>` (or `HERMES_CORE_CHECKOUT`) and verify the emitted core path in `--json` results; setting `HERMES_CORE_SOURCE` alone does not select the runner's checkout. Before the Node command, provision dependencies exactly as `.github/workflows/desktop-plugin-tests.yml` specifies. For full core-backed coverage set `HERMES_CORE_SOURCE` to an isolated compatible core checkout, `HERMES_DESKTOP_DIR`/`HERMES_DESKTOP_PACKAGE` to its installed test dependencies, and make nanostores resolvable from that core. Run serially and require zero core-dependent skips before claiming full coverage. No backend `plugins/session-tasks` suite exists; its tests are Desktop tests. Run all `desktop-plugins/*/test/*.mjs` when changing shared rendering/answer integration.
 
