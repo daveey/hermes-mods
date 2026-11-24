@@ -539,6 +539,44 @@ def held_cause(row, bundle):
     return ''
 
 
+SPEND_ESCALATION_S = 1800
+_REVIEW_PHASE = {'spend_review_queued': 'reviewing', 'spend_review_started': 'reviewing',
+                 'spend_review_escalated': 'escalated'}
+
+
+def spend_review(row, bundle):
+    """The current spend stop's review (core ``kanban_spend_reviewer``): `{phase, at, reason}` or None.
+
+    `reviewing` while the reviewer judges the stop; `escalated` once it handed the stop to the owner."""
+    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    for event in reversed(detail.get('events') or []):
+        if not isinstance(event, dict):
+            continue
+        kind = event.get('kind')
+        if kind in _REVIEW_PHASE:
+            value = event.get('created_at')
+            return {'phase': _REVIEW_PHASE[kind], 'at': seconds(value) if type(value) in (int, float) else 0,
+                    'reason': flat(obj(event.get('payload')).get('reason'))}
+        if kind in ('spend_budget_triaged', 'spend_review_granted', 'claimed', 'unblocked', 'completed', 'archived'):
+            return None
+    return None
+
+
+def spend_escalation_overdue(row, bundle, now):
+    """An escalated stop nobody decided for SPEND_ESCALATION_S: the owner is not paying attention."""
+    review = spend_review(row, bundle)
+    return bool(review and review['phase'] == 'escalated' and 0 < review['at'] <= now - SPEND_ESCALATION_S)
+
+
+def spend_overdue_text(row, bundle, now, *, wire=False):
+    review = spend_review(row, bundle) or {}
+    age = relative(review.get('at'), 'elapsed') if wire else short_dur(now - (review.get('at') or now))
+    reason = review.get('reason') or 'no reason recorded'
+    if len(reason) > WAIT_MAX:
+        reason = reason[:WAIT_MAX - 1].rstrip() + '…'
+    return f'out of budget · the reviewer escalated {age} ago and nobody has decided: {reason}'
+
+
 def agent_hold_text(row, bundle):
     authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
     if authority.get('id'):
@@ -551,7 +589,12 @@ def agent_hold_text(row, bundle):
     reason = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', reason))
     if len(reason) > WAIT_MAX:
         reason = reason[:WAIT_MAX - 1].rstrip() + '…'
+    review = spend_review(row, bundle)
+    if review and review['phase'] == 'reviewing':
+        return 'out of budget · the spend reviewer is deciding now'
     cause = held_cause(row, bundle)
+    if review:
+        return f"out of budget · reviewer escalated: {review['reason'] or reason} · waiting on this chat's agent to decide"
     return (cause + ' · ' if cause else '') + "waiting on this chat's agent to decide: " + reason
 
 
@@ -895,9 +938,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         elif not v.get('wait_kind') and agent_hold(blocker, bundle):
             v['wait_kind'] = 'agent'
             actor = agent_hold_text(blocker, bundle)
-            on = dependency_text + ' · ' + actor if dependency else actor
-            if look == 'stalled':
+            if spend_escalation_overdue(blocker, bundle, now):
+                actor, look = spend_overdue_text(blocker, bundle, now, wire=wire), 'stalled'
+            elif look == 'stalled':
                 look = 'waiting'
+            on = dependency_text + ' · ' + actor if dependency else actor
         upstream = obj(row.get('blocked_upstream'))
         if upstream and look != 'stalled':
             contained = obj(upstream.get('contained'))
@@ -1050,6 +1095,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         elif not card.get('stale') and wait_info(card, now, wire=wire).get('kind'):
             group.update(section='waiting', wait_kind=wait_info(card, now, wire=wire)['kind'],
                          detail=wait_info(card, now, wire=wire)['text'])
+        elif agent_hold(card, bundle) and spend_escalation_overdue(card, bundle, now):
+            group.update(section='stuck', reason='stalled',
+                         detail='stalled: ' + spend_overdue_text(card, bundle, now, wire=wire))
         elif agent_hold(card, bundle):
             group.update(section='waiting', wait_kind='agent',
                          detail=agent_hold_text(card, bundle))
