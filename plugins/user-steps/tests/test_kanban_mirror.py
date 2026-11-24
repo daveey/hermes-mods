@@ -216,10 +216,20 @@ def test_forged_unbound_request_cannot_deliver(tmp_path):
 
 
 def settled_requests(client, mirror):
-    """GET /requests, let the background card pass it queued finish, then GET again."""
-    client.get("/requests", params={"session": "session-a"})
-    assert type(mirror).reconcile_poll.__globals__["_background_idle"](10), "background card pass did not finish"
-    return client.get("/requests", params={"session": "session-a"}).json()["requests"]
+    """Return /requests after a local card pass that saw the current board.
+
+    A warm poll answers from the store and queues its pass. `_schedule` does not
+    queue while a pass is already running, and the previous helper GET left one
+    running. Drain that leftover first (it may have started before an archive),
+    then poll, drain, and read. CI on 431db039 failed when the leftover pass
+    kept the open request through the archive assertion.
+    """
+    idle = type(mirror).reconcile_poll.__globals__["_background_idle"]
+    params = {"session": "session-a"}
+    assert idle(10), "leftover background card pass did not finish"
+    client.get("/requests", params=params)
+    assert idle(10), "background card pass did not finish"
+    return client.get("/requests", params=params).json()["requests"]
 
 
 def test_desktop_queue_routes_card_decision_and_withdraws_on_archive(tmp_path):
