@@ -34,9 +34,9 @@ def test_panel_spec_carries_a_complete_verifiable_manifest(monkeypatch):
     assert manifest['modes'] == {'HERMES_PANEL_COALESCE': True, 'HERMES_PANEL_DUTY': True,
                                  'HERMES_PANEL_SKIP_QUEUE_POSITION': True}
     declared = manifest_mod.verify_declared(manifest, DASH)
-    assert 'producer_provider.py' in declared and 'plugin_api.py' not in declared  # legacy module undeclared
+    assert 'producer_provider.py' in declared and 'plugin_api.py' in declared  # actual factory import
     assert declared['producer_provider.py'] == spec['sha256']
-    on_disk = {p.name for p in DASH.glob('*.py')} - {'plugin_api.py'}
+    on_disk = {p.name for p in DASH.glob('*.py')}
     assert set(declared) == on_disk
 
 

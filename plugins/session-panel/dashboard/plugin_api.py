@@ -1605,9 +1605,9 @@ def _panel_provider_spec() -> dict:
     def digest(name: str) -> str:
         return hashlib.sha256((base / name).read_bytes()).hexdigest()
 
-    # plugin_api.py is the legacy registration module: the producer never loads it, and if it ever
-    # did, the post-import check refuses because it is deliberately not declared.
-    names = sorted(p.name for p in base.glob('*.py') if p.name != 'plugin_api.py')
+    # The factory imports plugin_api for CoreReaders/feed helpers but never calls plugin register().
+    # Include those actual bootstrap bytes; the child checks loaded digests AFTER the factory returns.
+    names = sorted(p.name for p in base.glob('*.py'))
     return {'path': str(base / 'producer_provider.py'), 'sha256': digest('producer_provider.py'),
             'manifest': {
                 'version': 1,
