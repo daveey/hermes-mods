@@ -35,6 +35,9 @@ def adapter(tmp_path, monkeypatch):
     view = remote_globals['load_file'](Path(remote_globals['__file__']).resolve().parents[1] / 'hub-sync' / 'hubview.py')
     monkeypatch.setattr(view, 'db_path', lambda: hub)
     monkeypatch.setitem(remote_globals, 'load_file', lambda _: view)
+    # Legacy physical-stamp adapter contract remains covered independently of
+    # the production semantic capture (which requires real membership stores).
+    monkeypatch.setattr(mirror, '_panel_stamp', lambda _: mirror.remote.input_stamp(store.path))
     calls = []
     monkeypatch.setattr(mirror.remote, 'reconcile', lambda owner: calls.append(owner))
     mirror.reconcile(OWNER)  # settle initial local ActionStore projection first

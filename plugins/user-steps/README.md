@@ -271,12 +271,20 @@ expiry, missing/unknown inputs, unqualified ownership, local-authority ledger
 bindings, or the unsupported alternate `links_reader=replica` shadow path return
 `None`. `panel_membership.unchanged(previous, current)` treats even `None` → `None`
 as changed. Reads never initialize absent stores or project/refresh the ledger.
-This API alone is **not** permission to skip reconciliation: the consuming memo
-must also cover ActionStore requests/bindings/operations and namespace-wide
-historical dependencies, retain single-flight/backoff and the non-sliding full
-pass ceiling, and capture its key before work. It is deliberately not wired to
-`input_stamp` in this change. No live latency reduction is claimed by this input
-contract alone.
+This API alone is **not** permission to skip reconciliation. The panel's
+`Mirror._panel_stamp(owner)` composes it with semantic ActionStore requests,
+revisions, bindings, withdrawals and operations in a closed read snapshot.
+Namespace-wide historical bindings remain dependencies for withdrawn-scope
+policy; unrelated unbound requests in other chats, notification clocks and
+physical DB/WAL changes are not inputs. The local pass still runs independently
+with its namespace-wide historical reconciliation. Unknown membership/store
+reads cannot reuse success; deferred/in-flight passes stay deferred. The existing
+single-flight and exponential failure backoff are retained, and successful hits
+never slide the 60-second canonical deadline measured from pass start. Keys are
+captured before work, so concurrent writes remain owed. The legacy `input_stamp`
+API is retained for compatibility but no longer consumed by the panel. Live
+latency improvement requires a separate installed measurement; unit reuse is not
+that proof.
 
 Both project a
 blocked or triage work card's `human_request` into one server-bound `choice`

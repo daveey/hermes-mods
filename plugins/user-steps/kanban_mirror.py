@@ -947,6 +947,47 @@ class Mirror:
         _mark_remote_fresh(key, started)
         return True
 
+    def _panel_stamp(self, owner):
+        """Semantic remote inputs, never a global DB/WAL or commit revision.
+
+        The remote pass reads this owner's requests and namespace-wide historical
+        bindings when checking withdrawn scopes. Keep their immutable revisions,
+        current lifecycle and operations in one closed ActionStore snapshot. The
+        local pass retains its own namespace-wide dependency handling separately.
+        Capture before work: a write during reconciliation must be revisited.
+        """
+        membership = self.remote.membership_capture(owner)
+        if membership is None:
+            return None
+        try:
+            ns = self.store._ns(owner)
+            with self.store._read() as c:
+                bindings = [tuple(r) for r in c.execute(
+                    'SELECT * FROM kanban_projections WHERE namespace=? ORDER BY request_id', (ns,))]
+                # Unbound requests in this chat also matter: a deterministic
+                # remote request ID may conflict with one. Other chats' unbound
+                # requests and notification timestamps are not inputs to this pass.
+                ids = [r[0] for r in c.execute(
+                    'SELECT id FROM requests WHERE namespace=? AND session=? '
+                    'UNION SELECT request_id FROM kanban_projections WHERE namespace=? ORDER BY 1',
+                    (ns, owner['storedSessionId'], ns))]
+                parts = [encoded(owner), membership, bindings]
+                scope = json.dumps(ids)
+                for table, column, order in (
+                        ('requests', 'id', 'id'),
+                        ('revisions', 'id', 'id,revision'),
+                        ('withdrawal_history', 'id', 'id,revision'),
+                        ('operations', 'request', 'id')):
+                    parts.append([tuple(r) for r in c.execute(
+                        f'SELECT * FROM {table} WHERE namespace=? AND {column} '
+                        f'IN (SELECT value FROM json_each(?)) ORDER BY {order}', (ns, scope))])
+                parts.append([tuple(r) for r in c.execute(
+                    'SELECT id,withdrawal FROM lifecycle WHERE namespace=? '
+                    'AND id IN (SELECT value FROM json_each(?)) ORDER BY id', (ns, scope))])
+            return _digest(parts)
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            return None
+
     def reconcile_panel(self, owner):
         """Strict producer with change-keyed remote reads and bounded failure retry.
 
@@ -955,7 +996,7 @@ class Mirror:
         Keys are captured BEFORE reconciliation so a concurrent write is owed.
         """
         self.core.validate_owner(owner)
-        stamp = self.remote.input_stamp(self.store.path)
+        stamp = self._panel_stamp(owner)
         key = _local_key(self, owner)
         now = time.monotonic()
         with _PANEL_REMOTE_LOCK:
