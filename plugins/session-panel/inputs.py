@@ -49,19 +49,26 @@ def read(reader, session, lineage):
             log.debug('panel canonical requests unavailable', exc_info=True)
     store = reader.conn(home / 'user-steps' / 'actions.sqlite3') if canonical is None else None
     out['profile'] = profile
-    try:
-        out['gateway'] = reader.ksc.load_identity().gateway
-        # user-steps owns local requests as `install:<id>`: the same gateway under its other name.
+    explicit = getattr(reader, 'home_context', None) is not None
+    if explicit:
+        ident = reader._home_identity()
+        out['gateway'] = ident.get('gateway') or ''
+        install = ident.get('install_id')
+        out['gateway_aliases'] = [f'install:{install}'] if install else []
+    else:
         try:
-            from hermes_cli.install_identity import get_install_id
-            install = get_install_id()
-            out['gateway_aliases'] = [f'install:{install}'] if install else []
-        except Exception:
-            out['gateway_aliases'] = []
-    except (AttributeError, OSError, ValueError, RuntimeError):
-        # Core raises SyncUnavailable (RuntimeError) on standalone/unenrolled
-        # installs. Missing hub identity must not discard the local panel inputs.
-        out['gateway'] = ''
+            out['gateway'] = reader.ksc.load_identity().gateway
+            # user-steps owns local requests as `install:<id>`: the same gateway under its other name.
+            try:
+                from hermes_cli.install_identity import get_install_id
+                install = get_install_id()
+                out['gateway_aliases'] = [f'install:{install}'] if install else []
+            except Exception:
+                out['gateway_aliases'] = []
+        except (AttributeError, OSError, ValueError, RuntimeError):
+            # Core raises SyncUnavailable (RuntimeError) on standalone/unenrolled
+            # installs. Missing hub identity must not discard the local panel inputs.
+            out['gateway'] = ''
     if canonical is not None:
         out['requests'] = canonical
     elif store is not None:
@@ -82,53 +89,55 @@ def read(reader, session, lineage):
             log.debug('panel requests unavailable', exc_info=True)
     profile = home.name if home.parent.name == 'profiles' else 'default'
     annotated = {'id': session, 'profile': profile, '_lineage_ids': list(lineage)}
-    for module_name, fn_name in (('hermes_cli.subagent_session_activity', 'annotate_subagent_activity'),
-                                  ('hermes_cli.process_session_activity', 'annotate_background_activity')):
-        try:
-            getattr(importlib.import_module(module_name), fn_name)([annotated])
-        except Exception:
-            out['input_errors'].append(module_name.rsplit('.', 1)[-1] + ' unavailable')
-            log.debug('panel runtime unavailable', exc_info=True)
-    observations = annotated.get('execution_observations') or []
-    processes = {r.get('id'): r for r in annotated.get('background_processes') or []}
-    for obs in observations:
-        identity = _obj(obs.get('identity'))
-        kind, wid = identity.get('kind'), identity.get('work_id')
-        if kind not in ('subagent', 'process'):
-            continue
-        if not wid:
-            out['input_errors'].append(f'{kind} inventory unknown: {obs.get("unknown_reason") or "missing identity"}')
-        item = {'id': wid or f'{kind}-unknown', 'work_id': wid, 'gateway': identity.get('gateway'),
-                'profile': identity.get('profile'), 'execution_observations': [obs]}
-        if kind == 'subagent' and db is not None:
+    if getattr(reader, 'home_context', None) is None:
+        for module_name, fn_name in (('hermes_cli.subagent_session_activity', 'annotate_subagent_activity'),
+                                      ('hermes_cli.process_session_activity', 'annotate_background_activity')):
             try:
-                row = db.execute('SELECT title FROM sessions WHERE id=?', (wid,)).fetchone()
+                getattr(importlib.import_module(module_name), fn_name)([annotated])
             except Exception:
-                row = None
-                out['input_errors'].append('subagent title unavailable')
-            item['title'] = row['title'] if row and row['title'] else 'Sub-agent'
-        else:
-            item['title'] = processes.get(wid, {}).get('command') or 'Background process'
-        out['subagents' if kind == 'subagent' else 'processes'].append(item)
-    # Reuse the rentals API's shared service/snapshot, not another cloud collector.
-    try:
-        name = '_session_panel_rentals_api'
-        api = sys.modules.get(name)
-        if api is None:
-            path = Path(__file__).resolve().parents[1] / 'compute-rentals' / 'dashboard' / 'plugin_api.py'
-            spec = importlib.util.spec_from_file_location(name, path)
-            assert spec is not None and spec.loader is not None
-            api = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(api)
-            api = sys.modules.setdefault(name, api)
-        service = api._plugin().get_service()
-        service.start_refresh()
-        for sid in lineage:
-            inventory = service.inventory(session_id=sid, profile=profile, refresh=False)
-            for machine in inventory.get('machines') or []:
-                if any(o.get('gateway_id') == inventory.get('gateway_id') and o.get('profile') == profile and o.get('session_id') == sid for o in machine.get('ownership') or []):
-                    out['rentals'].append({**machine, 'id': machine['key'], 'title': machine.get('display_name') or machine.get('provider_id') or 'machine'})
-    except Exception:
-        out['input_errors'].append('rentals unavailable')
-        log.debug('panel rentals unavailable', exc_info=True)
+                out['input_errors'].append(module_name.rsplit('.', 1)[-1] + ' unavailable')
+                log.debug('panel runtime unavailable', exc_info=True)
+        observations = annotated.get('execution_observations') or []
+        processes = {r.get('id'): r for r in annotated.get('background_processes') or []}
+        for obs in observations:
+            identity = _obj(obs.get('identity'))
+            kind, wid = identity.get('kind'), identity.get('work_id')
+            if kind not in ('subagent', 'process'):
+                continue
+            if not wid:
+                out['input_errors'].append(f'{kind} inventory unknown: {obs.get("unknown_reason") or "missing identity"}')
+            item = {'id': wid or f'{kind}-unknown', 'work_id': wid, 'gateway': identity.get('gateway'),
+                    'profile': identity.get('profile'), 'execution_observations': [obs]}
+            if kind == 'subagent' and db is not None:
+                try:
+                    row = db.execute('SELECT title FROM sessions WHERE id=?', (wid,)).fetchone()
+                except Exception:
+                    row = None
+                    out['input_errors'].append('subagent title unavailable')
+                item['title'] = row['title'] if row and row['title'] else 'Sub-agent'
+            else:
+                item['title'] = processes.get(wid, {}).get('command') or 'Background process'
+            out['subagents' if kind == 'subagent' else 'processes'].append(item)
+        # Reuse the rentals API's shared service/snapshot, not another cloud collector.
+        try:
+            name = '_session_panel_rentals_api'
+            api = sys.modules.get(name)
+            if api is None:
+                path = Path(__file__).resolve().parents[1] / 'compute-rentals' / 'dashboard' / 'plugin_api.py'
+                spec = importlib.util.spec_from_file_location(name, path)
+                assert spec is not None and spec.loader is not None
+                api = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(api)
+                api = sys.modules.setdefault(name, api)
+            service = api._plugin().get_service()
+            service.start_refresh()
+            for sid in lineage:
+                inventory = service.inventory(session_id=sid, profile=profile, refresh=False)
+                for machine in inventory.get('machines') or []:
+                    if any(o.get('gateway_id') == inventory.get('gateway_id') and o.get('profile') == profile and o.get('session_id') == sid for o in machine.get('ownership') or []):
+                        out['rentals'].append({**machine, 'id': machine['key'], 'title': machine.get('display_name') or machine.get('provider_id') or 'machine'})
+        except Exception:
+            out['input_errors'].append('rentals unavailable')
+            log.debug('panel rentals unavailable', exc_info=True)
     return out
+
