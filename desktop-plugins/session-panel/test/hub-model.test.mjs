@@ -60,6 +60,25 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+test('mounted legacy cached running header fails closed before any heartbeat', async () => {
+ await paint(null); m.resetFeedForTests()
+ current = { connectionId: 'legacy', profile: 'default', session: 'legacy-chat' }
+ const base = Object.values(cases).find(c => c.model?.sections?.running?.length)
+ const model = { ...base.model, header: { ...base.model.header, source: 'derived', state: 'running', label: 'running', status: null } }
+ delete model.freshness
+ window.hermesDesktop = { api: async () => ({ feed: 'legacy-feed', epoch: 'legacy-epoch', rev: 1, bundles: {} }) }
+ m.ingestBundle(current.connectionId, current.profile, { session: current.session, model })
+ try {
+  await paint(J.jsx(m.Panel, {}))
+  assert.equal(m.feedIsLive(current), false)
+  assert.equal(document.querySelector('[data-session-status]').textContent, 'status unknown (stale)')
+  assert.equal(document.querySelector('[data-session-status]').title, 'unknown')
+  assert.equal(document.querySelector('[data-panel-status-stripe]').dataset.panelStatusStripe, 'none')
+ } finally {
+  await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+  current = { connectionId: 'conn', profile: 'default', session: 'chat' }
+ }
+})
 for (const [name, trusted, age, vouched] of [
  ['restored', false, 0, null], ['expired', true, 61, true],
  ['unvouched', true, 0, false], ['fresh', true, 0, true]

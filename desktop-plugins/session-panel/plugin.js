@@ -981,7 +981,8 @@ export function Panel() {
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
   return renderModel(model, {
-    vouched: feeds.get(connKey(route.connectionId, route.profile))?.liveAt ? feedVouches(route) : null,
+    // Cold/legacy cache has no source clock: absence of a heartbeat is not a voucher.
+    vouched: feedVouches(route),
     collapsed,
     onToggle: () => { writeCollapsed(scope, collapsed ? null : attentionKeys(model)); tick(v => v + 1) },
     onChoose: (row, option) => void chooseModelOption(row, option, route),
