@@ -35,6 +35,11 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains on the outbox push, else every ~3s; no claim by then = Desktop not running
 MAX_REPLY_WAIT = 600
+# A relayed request's TTL. The Desktop courier keeps re-submitting a send that core refuses because another
+# backend holds the chat's turn (desktop-plugins/session-mentions/plugin.js `sendRetryUntil`) until this runs
+# out, so a send's wait below must outlast it, or the tool would time out on a message that still lands.
+SEND_TTL = 600
+SEND_RETRY_GRACE = 90  # the last retry's own 60 s submit timeout + posting the result
 
 SCHEMA = {
     "name": "cross_session",
@@ -51,6 +56,8 @@ SCHEMA = {
         "(desktop/cli source); that send is refused and names the card to place instead. "
         "With `wait_for_reply` (seconds, max 600) it waits for that session's next reply "
         "and returns it; otherwise it returns once delivered.\n"
+        "While another Hermes window holds the target's turn the send is retried for up to 10 minutes; "
+        "`status: refused` with `retry_safe: true` after that means nothing was delivered.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
     ),
     "parameters": {
@@ -448,7 +455,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         "wait_for_reply": wait,
         "sender": _sender_info(session_id),
         "created_at": time.time(),
-        "ttl": 600,
+        "ttl": SEND_TTL,
     }
     rf.atomic_write(base / "outbox" / f"{rid}.json", req)
     if hasattr(rf, "notify_outbox"):
@@ -458,6 +465,8 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
     result_path = base / "results" / f"{rid}.json"
     deadline_pickup = time.time() + PICKUP_TIMEOUT
     deadline = time.time() + PICKUP_TIMEOUT + 120 + wait  # a forwarded send adds one hop
+    if action == "send":  # the courier may retry a refused send for the whole TTL before it answers
+        deadline = max(deadline, time.time() + SEND_TTL + SEND_RETRY_GRACE + wait)
     if timeout_seconds is not None:
         deadline = min(deadline, time.time() + max(0, timeout_seconds))
 

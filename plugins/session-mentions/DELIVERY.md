@@ -44,6 +44,13 @@ Fix:
   hidden window's timers to ~1/min (the mini's heartbeat went stale and requests waited a minute).
 - Core's ownership refusal is reported as `status: "refused", delivered: false, retry_safe: true` (the turn was never
   admitted) instead of "unknown".
+- 2026-11-23: that refusal is recognised by the error's `data.reason` (`SESSION_NOT_OWNED`, `SESSION_OWNER_BUSY`;
+  never by code 4090 alone, which `SESSION_OWNER_UNCONFIRMED` shares) and, without one, by both wordings ("open in
+  another" / "active in another Hermes window"). Core had reworded it, so a busy chat's refusal was reported as
+  `unknown, retry_safe: false` and senders gave up. A relayed send now re-submits after a refusal (5 s, doubling to
+  30 s) until the request's TTL (600 s from `created_at`) and answers `refused, retry_safe: true` only then; the
+  tool's wait covers the TTL (`SEND_TTL + SEND_RETRY_GRACE`). A forwarded request and `/tell` still answer the first
+  refusal at once. Tests: `tests/delivery.test.mjs` (fake timers) and `tests/test_send_retry_ttl.py`.
 
 Deploying: the Desktop half hot-reloads on save. The dashboard routes are mounted once per backend, so a backend keeps
 the old outbox until it restarts. The gate only needs the NEW code in the remote-facing (SSH-isolated) backends another

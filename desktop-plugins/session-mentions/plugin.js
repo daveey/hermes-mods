@@ -61,8 +61,26 @@ const HOME_BEAT_TIMEOUT_MS = 5_000
 const HOME_COURIER_ID = 'home-courier'
 const FORWARD_PICKUP_MS = 20_000
 const FORWARD_POLL_MS = 1_500
-// Core's lease refusal (hermes_cli/active_sessions.py): the turn was never admitted.
-const OWNER_REFUSAL_RE = /open in another Hermes window|SESSION_NOT_OWNED|not owned by this runtime/i
+// Core's lease refusal (tui_gateway/session_lifecycle.py::_durable_owner_refusal, answered by
+// methods_prompt.py::_slot_refusal as JSON-RPC 4090 with data.reason): the turn was never admitted.
+// The wording changed from "open in another" to "active in another" Hermes window; match both.
+const OWNER_REFUSAL_RE = /(?:open|active) in another Hermes window|SESSION_NOT_OWNED|not owned by this runtime/i
+// data.reason values that say nothing was admitted. NOT the code alone: 4090 also carries
+// SESSION_OWNER_UNCONFIRMED ("may already be queued there"), which must never be re-sent.
+const OWNER_REFUSAL_REASONS = new Set(['SESSION_NOT_OWNED', 'SESSION_OWNER_BUSY'])
+// A refused send is re-submitted while its request is still alive (relay TTL, plugins/session-mentions
+// `SEND_TTL`): the other backend's turn usually ends within minutes.
+export const OWNER_RETRY_FIRST_MS = 5_000
+export const OWNER_RETRY_MAX_MS = 30_000
+
+/** True when a `prompt.submit` rejection is core's ownership refusal (the turn was never admitted). The host
+ *  rejects with core's JsonRpcGatewayError (`code`, `data.reason`); a structured reason decides alone, and
+ *  only an error without one is judged by its message. */
+export function isOwnerRefusal(error) {
+  const reason = error?.data?.reason
+  if (typeof reason === 'string' && reason) return OWNER_REFUSAL_REASONS.has(reason)
+  return OWNER_REFUSAL_RE.test(String(error?.message || error))
+}
 const HIDDEN_SOURCES = new Set(['cron', 'kanban', 'tool', 'oneshot', 'subagent'])
 
 // ── small utils ──────────────────────────────────────────────────────────────
@@ -651,13 +669,26 @@ export async function readAuthorityTranscript({ connectionId, profile, sessionId
   return { ok: false, error: `transcript longer than ${AUTHORITY_PAGE * AUTHORITY_MAX_PAGES} rows` }
 }
 
+/** Until when (epoch ms) a relayed send may be re-submitted after core's ownership refusal: the request's own
+ *  TTL counted from its `created_at`, never longer than one TTL from now (a skewed gateway clock). 0 = one try:
+ *  a forwarded request answers its refusal at once, because the forwarding Desktop then tries its own route
+ *  (and retries there) and only waits FORWARD_PICKUP_MS + 90 s for this answer. */
+export function sendRetryUntil(req, now = Date.now()) {
+  if (!req || req.forwarded) return 0
+  const ttl = Math.min(600, Math.max(0, Number(req.ttl) || 0)) * 1000
+  const created = Number(req.created_at) * 1000
+  if (!ttl || !Number.isFinite(created) || created <= 0) return 0
+  return Math.min(created + ttl, now + ttl)
+}
+
 async function sessionTitle(target) {
   const meta = await api(target.connectionId, `/api/sessions/${enc(target.sessionId)}${target.profile ? `?profile=${enc(target.profile)}` : ''}`).catch(() => null)
   return meta?.title || ''
 }
 
-/** Deliver `text` as a new user turn into `target`. Optionally wait for the reply. */
-export async function deliver(target, text, waitSeconds = 0) {
+/** Deliver `text` as a new user turn into `target`. Optionally wait for the reply. `retryUntil` (epoch ms): keep
+ *  re-submitting after core's ownership refusal until then (5 s, doubling to 30 s); without it one refusal is final. */
+export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0 } = {}) {
   // The primary socket already owns open Desktop chats. A pooled profile route may
   // spawn another serve process over the SAME store: resume there is not attachment.
   const primaryConnection = async () => {
@@ -689,17 +720,33 @@ export async function deliver(target, text, waitSeconds = 0) {
     const live = resumed?.session_id
     if (!live) throw new Error(`could not open session ${target.sessionId} on that gateway`)
     let sub
-    try {
-      sub = await request('prompt.submit', { session_id: live, text, queued: true }, 60_000)
-    } catch (error) {
-      const msg = String(error?.message || error)
-      // A lease refusal happens before the turn is admitted: definitely not delivered.
-      if (OWNER_REFUSAL_RE.test(msg)) {
-        return { ok: false, delivered: false, status: 'refused', retry_safe: true, live_session_id: live, error: msg, note: 'Nothing was delivered: another Hermes backend holds that chat open. Safe to retry.' }
+    let attempts = 0
+    let backoff = OWNER_RETRY_FIRST_MS
+    const started = Date.now()
+    for (;;) {
+      attempts++
+      try {
+        sub = await request('prompt.submit', { session_id: live, text, queued: true }, 60_000)
+        break
+      } catch (error) {
+        const msg = String(error?.message || error)
+        // The server may have accepted the turn before the socket/response failed.
+        // Never try another route or submit again on an uncertain acknowledgement.
+        if (!isOwnerRefusal(error)) {
+          return { ok: false, delivered: null, status: 'unknown', retry_safe: false, live_session_id: live, error: msg, attempts, note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' }
+        }
+        // A lease refusal happens before the turn is admitted: definitely not delivered, so the same
+        // submit may go again once the other backend's turn ends. Only an accepted submit ends the loop.
+        const left = retryUntil - Date.now()
+        if (left <= 0) {
+          const waited = Math.round((Date.now() - started) / 1000)
+          return { ok: false, delivered: false, status: 'refused', retry_safe: true, live_session_id: live, error: msg, attempts, note: attempts > 1
+            ? `Nothing was delivered: another Hermes backend held that chat for the whole ${waited} s retry window (${attempts} tries). Safe to retry.`
+            : 'Nothing was delivered: another Hermes backend holds that chat open. Safe to retry.' }
+        }
+        await sleep(Math.min(backoff, left))
+        backoff = Math.min(backoff * 2, OWNER_RETRY_MAX_MS)
       }
-      // The server may have accepted the turn before the socket/response failed.
-      // Never try another route or submit again on an uncertain acknowledgement.
-      return { ok: false, delivered: null, status: 'unknown', retry_safe: false, live_session_id: live, error: String(error?.message || error), note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' }
     }
     const out = { ok: ['streaming', 'queued'].includes(sub?.status), delivered: sub?.status === 'streaming', queued: sub?.status === 'queued', status: sub?.status || 'unknown', live_session_id: live, user_row_id: sub?.user_row_id || null, retry_safe: false }
     if (!out.ok) return { ...out, error: `Unexpected submit status: ${out.status}; inspect the target before retrying` }
@@ -1346,7 +1393,7 @@ export async function performRequest(req, origin, conns) {
     // Refused there = never admitted, and the chat may be open in THIS Desktop (its backend on
     // that gateway owns it): the direct route is then the owning one.
     if (forwarded?.status === 'refused') forwarded = null
-    const res = forwarded || (await deliver(target, text, wait))
+    const res = forwarded || (await deliver(target, text, wait, { retryUntil: sendRetryUntil(req) }))
     return { ...res, gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns) }
   }
 
