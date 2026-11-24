@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import closing, ExitStack
 from dataclasses import dataclass, replace
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -260,7 +261,7 @@ def capture_external(readers, demands, refs, prior_parts, hints, *, raw=None):
     return materialize_external(readers, raw, prior_parts)
 
 
-def capture_external_raw(readers, demands, refs, hints):
+def capture_external_raw(readers, demands, refs, hints, *, previous_keys=None):
     """Strict canonical union input, certified only for its frozen demands.
 
     All strict adapters remain one external failure domain. This adapter never
@@ -296,7 +297,61 @@ def capture_external_raw(readers, demands, refs, hints):
         raise ValueError('incomplete canonical external acquisition')
     if any(not isinstance(encoded, (tuple, list)) for encoded in captured.values()):
         raise ValueError('invalid canonical external collection')
+    inventory = dict(inventory)
+    inventory['dependency_inputs'] = _dependency_inputs(
+        readers, external_demands, hint, deadline, previous_keys or {}, captured)
     return ExternalCapture(source, demands, external_demands, hint, before, start, captured, inventory)
+
+
+def _dependency_inputs(readers, demands, hint, deadline, previous_keys, captured):
+    """Source-owned semantic fence for detached dependencies of strict members.
+
+    Membership inventory excludes unlinked ancestors. Covered board revisions
+    name the semantic task fields, events, runs, and links. Content comparison
+    also permits a value reverted during an older in-flight capture to carry.
+    This conservative union is acquired once per board, not once per chat, and
+    never enriches details or promotes dependencies into chat membership.
+    """
+    boards = {}
+    for sid, demand in demands.items():
+        keys = demand.refs | frozenset(previous_keys.get(sid, ()))
+        boards[sid] = {key.board for key in keys}
+        for encoded in captured[sid]:
+            row = json.loads(encoded)
+            if row.get('board'):
+                boards[sid].add(row['board'])
+    facts = {}
+    for board in sorted({board for values in boards.values() for board in values}):
+        path = Path(readers._shadow_path(board))
+        if not path.is_file():
+            facts[board] = None
+            continue
+        with closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=.5)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 100)
+            conn.execute('PRAGMA query_only=ON')
+            conn.execute('BEGIN')
+            from hermes_cli import kanban_activity_revision as revisions
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            digest = hashlib.sha256()
+            for table in revisions.SHADOW_TABLES:
+                digest.update(table.encode())
+                if table not in tables:
+                    digest.update(b'absent')
+                    continue
+                excluded = revisions.BOOKKEEPING_COLUMNS.get(table, ())
+                for row in conn.execute(f'SELECT * FROM {table} ORDER BY rowid'):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('external dependency attestation exceeded its budget')
+                    if table == 'task_events' and row['kind'] in revisions.UNREAD_EVENT_KINDS:
+                        continue
+                    value = {key: row[key] for key in row.keys() if key not in excluded}
+                    digest.update(json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+                    digest.update(b'\n')
+            ident = path.stat()
+            facts[board] = (ident.st_dev, ident.st_ino, digest.hexdigest())
+            conn.rollback()
+    return {sid: {board: facts[board] for board in values} for sid, values in boards.items()}
 
 
 def materialize_external(readers, raw, prior_parts):
