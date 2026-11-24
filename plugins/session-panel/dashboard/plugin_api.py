@@ -1299,6 +1299,7 @@ class CoreReaders:
         from hermes_cli import kanban_session_activity as ksa
         ids = list(ids)[:50]
         tasks = _calm(self._session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived')))
+        tasks = self._with_run_stats(tasks)
         if self._explicit_home() is not None:
             history = self._origin_rows()
             return _load_feed().with_terminal_history(tasks, history, ids)
@@ -1322,6 +1323,28 @@ class CoreReaders:
             log.debug('session-panel feed: origin history unavailable', exc_info=True)
             return tasks
         return _load_feed().with_terminal_history(tasks, history, ids)
+
+    def _with_run_stats(self, tasks):
+        """Done rows on this gateway's own boards get `run_stats` (duration, runs, dollars); other rows unchanged."""
+        try:
+            paths = dict(self.boards())
+            feed = _load_feed()
+            by_board = {}
+            for row in tasks:
+                if row.get('status') in ('done', 'archived') and row.get('source') != 'origin-history':
+                    by_board.setdefault(str(row.get('board') or 'default'), []).append(row)
+            copies = {}
+            for board, rows in by_board.items():
+                path = paths.get(board)
+                c = self.conn(Path(path)) if path is not None and Path(path).exists() else None
+                if c is not None:
+                    # Copies: the listed rows can be core's memoized objects.
+                    for row in feed.with_done_run_stats([dict(r) for r in rows], c):
+                        copies[id(next(r for r in rows if r.get('id') == row.get('id')))] = row
+            tasks = [copies.get(id(row), row) for row in tasks]
+        except Exception:
+            log.debug('session-panel feed: done run stats unavailable', exc_info=True)
+        return tasks
 
     def card(self, card_id: str, board: str):
         scope = self._batch_scope()

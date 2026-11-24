@@ -152,6 +152,9 @@ def capture_local(readers, source, prior_part, demands, hints):
                 raw[key] = {**refresh[tid], 'board': source.board, 'key': f'{source.board}/{tid}'}
             else:
                 raw[key] = thaw(previous.rows[key])
+        # A finished card's runs no longer change: reused rows keep the stats read when they were refreshed.
+        readers.snapshot_feed_helpers().with_done_run_stats(
+            [raw[_key(source, tid)] for tid in refresh], conn)
         memberships = tuple(Membership(_key(source, tid), sid, role) for (sid, tid), role in pairs.items())
         details, edges, per_scope = {}, {}, {}
         feed = readers.snapshot_feed_helpers()

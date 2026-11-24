@@ -163,6 +163,38 @@ def failures_text(row):
     return f'{n} failure' + ('' if n == 1 else 's')
 
 
+def money(usd):
+    return f'${usd:.2f}' if usd < 100 else f'${usd:,.0f}'
+
+
+def tokens_text(n):
+    return f'{n / 1e9:.1f}B tokens' if n >= 1e9 else f'{n / 1e6:.1f}M tokens' if n >= 1e6 else f'{n // 1000}k tokens' if n >= 1000 else f'{n} tokens'
+
+
+def done_meta(row):
+    """Done row: `42m · 2 restarts · $3.10` (how long its runs took, restarts, dollars), or None without stats.
+
+    Dollars are the worker-reported cost, else the run's tokens at its model's API list price; `~` marks a sum
+    missing runs it could not price (a class-routed run records no concrete model). With no priced run at all
+    the token count stands in, never a made-up dollar figure."""
+    s = obj(row.get('run_stats'))
+    whole = lambda v: v if type(v) is int and v > 0 else 0
+    runs, secs, priced, reported, tokens = (whole(s.get(k)) for k in ('runs', 'run_seconds', 'priced_runs', 'usage_runs', 'tokens'))
+    usd = s.get('cost_usd')
+    usd = float(usd) if isinstance(usd, (int, float)) and not isinstance(usd, bool) and usd > 0 else 0.0
+    if not runs:
+        return None
+    restarts = runs - 1
+    cost = ('~' if priced < reported else '') + money(usd) if usd and priced else tokens_text(tokens) if tokens else ''
+    detail = ' · '.join(p for p in [short_dur(secs) if secs else '',
+                                    f'{restarts} restart' + ('' if restarts == 1 else 's') if restarts else '', cost] if p)
+    spend = (f'{money(usd)} for {priced} of {reported} runs with usage (reported cost, else tokens at API list price)'
+             if usd and priced else 'cost unknown')
+    line = ' · '.join(p for p in [f'{runs} run' + ('' if runs == 1 else 's'), f'run time {short_dur(secs)}' if secs else '',
+                                  tokens_text(tokens) if tokens else '', spend] if p)
+    return {'detail': detail, 'details': [line]}
+
+
 def run_meta(row, state, progress, now, *, wire=False):
     """Running/review row detail: `worker-a4 · opus-5-5 · 12m · 2 failures` (or `quiet 25m`), plus full-word details lines."""
     where, model = where_text(row), model_text(row)
@@ -1086,7 +1118,12 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         done_seen.add(k)
         v = row_view(row)
         result = clean(row.get('result'))
-        v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
+        meta = done_meta(row)
+        if meta:
+            v['detail'] = meta['detail']
+            v['details'] = [*meta['details'], *([result] if result else [])]
+        else:
+            v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
         sections['done'].append(v)
         diagnostic_rows[k] = row
     for views in sections.values():

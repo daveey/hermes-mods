@@ -1560,6 +1560,102 @@ class Feed:
                     'stopped': self.stopped.is_set()}
 
 
+# A subscription route bills nothing per token; price its tokens at the same model's API list rate, so a done
+# card shows what its work would have cost (Codex -> OpenAI, Grok OAuth -> xAI).
+_LIST_PRICE_PROVIDER = {'openai-codex': 'openai', 'xai-oauth': 'xai'}
+_USAGE_KEYS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens')
+
+
+def _positive(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _run_cost(usage: dict, route: dict) -> Optional[float]:
+    """One run's dollars: the worker's reported ``cost_usd``, else its tokens at the routed model's list price.
+    None when neither is known (no usage receipt, or an unpriced model)."""
+    if _positive(usage.get('cost_usd')):
+        return float(usage['cost_usd'])
+    model = str(route.get('model') or '')
+    if not model or model.startswith('class:') or not any(_positive(usage.get(k)) for k in _USAGE_KEYS):
+        return None
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        provider = str(route.get('provider') or '')
+        n = {k: int(usage.get(k) or 0) for k in _USAGE_KEYS}
+        tokens = CanonicalUsage(input_tokens=n['input_tokens'], output_tokens=n['output_tokens'],
+                                cache_read_tokens=n['cache_read_tokens'], cache_write_tokens=n['cache_write_tokens'])
+        result = estimate_usage_cost(model, tokens,
+                                     provider=_LIST_PRICE_PROVIDER.get(provider, provider) or None)
+    except Exception:
+        return None
+    return float(result.amount_usd) if result.amount_usd is not None and result.status == 'estimated' else None
+
+
+def done_run_stats(conn, ids: Iterable[str]) -> dict[str, dict]:
+    """``id -> {runs, run_seconds, cost_usd, priced_runs, usage_runs, tokens}`` for finished cards on one board connection.
+
+    ``runs`` counts every run row (so restarts = runs - 1); ``run_seconds`` sums closed runs' wall time;
+    ``cost_usd`` sums the runs whose dollars are known (``priced_runs`` of the ``usage_runs`` that reported
+    usage; a class-routed run records no concrete model, so its tokens cannot be priced). ``tokens`` sums all
+    reported token counters. Read-only, never raises:
+    a board that cannot be read yields no entry, and the panel then shows nothing rather than zeros."""
+    ids = [str(i) for i in dict.fromkeys(ids) if i]
+    out: dict[str, dict] = {}
+    if not ids:
+        return out
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'task_runs' not in tables:
+            return out
+        marks = ','.join('?' for _ in ids)
+        for tid, runs, secs in conn.execute(
+                f'SELECT task_id, COUNT(*), TOTAL(CASE WHEN ended_at >= started_at THEN ended_at - started_at END) '
+                f'FROM task_runs WHERE task_id IN ({marks}) GROUP BY task_id', ids):
+            out[str(tid)] = {'runs': int(runs), 'run_seconds': int(secs), 'cost_usd': 0.0, 'priced_runs': 0, 'usage_runs': 0, 'tokens': 0}
+        if 'task_events' not in tables or not out:
+            return out
+        usage: dict[tuple, dict] = {}
+        route: dict[tuple, dict] = {}
+        for tid, run_id, kind, raw in conn.execute(
+                f"SELECT task_id, run_id, kind, payload FROM task_events WHERE task_id IN ({marks}) "
+                f"AND kind IN ('worker_result', 'run_route') AND run_id IS NOT NULL ORDER BY id", ids):
+            try:
+                payload = json.loads(raw or '{}') or {}
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if kind == 'run_route':
+                route[(tid, run_id)] = payload
+            elif isinstance(payload.get('usage'), dict):
+                usage[(tid, run_id)] = payload['usage']  # the newest receipt for a run wins
+        for (tid, run_id), item in usage.items():
+            if str(tid) not in out:
+                continue
+            out[str(tid)]['usage_runs'] += 1
+            out[str(tid)]['tokens'] += sum(int(item[k]) for k in _USAGE_KEYS if _positive(item.get(k)))
+            cost = _run_cost(item, route.get((tid, run_id), {}))
+            if cost is not None:
+                out[str(tid)]['cost_usd'] += cost
+                out[str(tid)]['priced_runs'] += 1
+        for stats in out.values():
+            stats['cost_usd'] = round(stats['cost_usd'], 2)
+    except Exception:
+        log.debug('session-panel: done run stats unavailable', exc_info=True)
+        return {}
+    return out
+
+
+def with_done_run_stats(rows: list[dict], conn) -> list[dict]:
+    """Attach ``run_stats`` to the finished rows of one board (in place); open rows are left alone."""
+    done = [r for r in rows if r.get('status') in ('done', 'archived') and r.get('id')]
+    stats = done_run_stats(conn, [r['id'] for r in done]) if done else {}
+    for row in done:
+        if str(row['id']) in stats:
+            row['run_stats'] = stats[str(row['id'])]
+    return rows
+
+
 def with_terminal_history(tasks: list[dict], history: list[dict], ids: Iterable[str]) -> list[dict]:
     """user-steps' `/session-cards` union with core's receipt projection (plugins/user-steps/dashboard/plugin_api.py
     `_with_terminal_history`, same rules), so `done` is exactly that route's answer."""

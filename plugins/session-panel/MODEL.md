@@ -464,7 +464,16 @@ Order matters, matching Desktop `classify`:
    not establish progress. Otherwise In progress. Observed review -> In progress.
 7. Ready -> Ready; todo with no dependency -> not started. Other waits -> Waiting.
 8. Done history: owner-qualified dedup, newest first, only confirmed done/archived
-   rows; stale/unfinished reports are excluded.
+   rows; stale/unfinished reports are excluded. A local done row carries
+   `run_stats` (`runs`, `run_seconds`, `cost_usd`, `priced_runs`, `usage_runs`,
+   `tokens`; `feed.done_run_stats` from `task_runs` + `worker_result`/`run_route`
+   events). Its detail reads `42m · 2 restarts · $3.10`: summed run time,
+   restarts = runs - 1, dollars = worker-reported `cost_usd`, else the run's
+   tokens at the routed model's API list price (subscription routes priced as
+   their API provider). `~$` marks runs with usage it could not price
+   (class-routed runs name no model); no priced run shows the token count, never
+   a guessed dollar figure. Rows without `run_stats` (origin history, old
+   producers) keep the result text.
 
 ### Deliberate shape/presentation differences
 
