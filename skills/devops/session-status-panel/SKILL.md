@@ -141,7 +141,7 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - Before changing provisional receipt presentation or cleanup, read `references/provisional-decision-receipts.md`.
 - Before changing hierarchy guides, read `references/tree-guide-styles.md`; attribute presence is not computed-border proof.
 - Before owner-scoped reconciliation keys, read `references/membership-capture.md` (complete inputs, source modes, unknown fences and memo composition).
-- For exact source-inclusion telemetry, freeze publication vector/coverage beside the same immutable pre-serialized wire entry; select both from one session/cursor/epoch snapshot. Check actual successful ASGI body-message bytes/hash after the final send, not just the response constructor's body. Test body replacement, cancellation, failed send, real core hosted/loopback admission and later-publication races. Distinguish exact post-transform server emission from authenticated catch-up and native presentation; invalidation-only frames carry no included model publications. Instrumentation must not change the production bundles/freshness envelope to fit its sidecars, and closed-window loss/error accounting must survive rotation.
+- Before exact inclusion telemetry, read `references/exact-inclusion-custody.md` (immutable wire custody, actual ASGI writes and loss accounting).
 - Passing jsdom proves structure, not native pixels; screenshots prove pixels, not that a click was recorded.
 - Before changing waiting-row layout, read `references/waiting-row-legibility.md` (native elapsed-suffix visibility).
 
