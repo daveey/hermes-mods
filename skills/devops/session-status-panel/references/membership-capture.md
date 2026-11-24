@@ -4,4 +4,8 @@ Capture complete membership inputs rather than filtering only previously known I
 
 Keep source-mode selection explicit: the legacy replica/ledger path does not cover `links_reader=replica` chat-link shadows, so an unsupported mode must return unknown. Compare unknown as changed even for repeated unknown reads; raw DB/WAL identity and a relaxed global fingerprint are not semantic proof.
 
-Compose ActionStore request/binding/operation and historical namespace dependencies before wiring a capture into a memo, and retain single-flight, deferred backoff and a non-sliding canonical ceiling. A standalone capture is not itself live latency proof.
+Distinguish ledger-only membership from missing publication: a task can lack a direct chat link yet have a current owner publication. A retained ledger status plus fresh owner heartbeat does not prove that observation current. Require exact owner row/version/payload or conservatively return unknown; never call the writeful ledger projector inside capture.
+
+Exercise real canonical projection as an independent disposable-store oracle for missing rows, version/content mismatch, terminal evidence and healthy observations. Hold a real `BEGIN IMMEDIATE` writer on the fixture ledger to prevent canonical refresh and expose retained-observation mismatches. Preserve all old assertions; repair a fixture's invalid healthy-source premise rather than relax expected behavior.
+
+Fence unavailable local authority instead of issuing reusable absence certificates. Compose ActionStore request/binding/operation and historical namespace dependencies in the consuming memo, not the remote membership API. Retain single-flight, deferred failure backoff and a non-sliding actual-full-pass ceiling. A standalone capture is not itself live latency proof: measure a fresh natural routed-serve window only after memo wiring lands, and report zero unchanged samples as missing proof.
