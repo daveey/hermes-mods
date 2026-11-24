@@ -1,7 +1,10 @@
 """One scheduled fleet drift consumer, with durable incidents and native Kanban tools.
 
 Configuration is host-local JSON: owner_gateway, state_path, targets (key -> argv),
-assignee and optional board. Each command must return the sync diff JSON (exit 0/1).
+assignee and optional board, timeout (per-target seconds, default 90), and alerting:
+unavailable_alert_after and absent_alert_after (seconds, or a map by target key with "*"),
+presence (target key -> argv; exit 0 = host up) and presence_timeout (default 15).
+Each command must return the sync diff JSON (exit 0/1).
 No credentials, hostnames or schedules are shipped in this module.
 """
 from __future__ import annotations
