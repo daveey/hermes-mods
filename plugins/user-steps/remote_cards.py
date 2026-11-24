@@ -146,6 +146,32 @@ class Courier:
         return data.get('request')
 
 
+def _strict_db_stamp(path):
+    """Required DB plus optional WAL; metadata errors must reach input_stamp.
+
+    hubview._file_sig deliberately conflates missing and unreadable files for its
+    advisory caches. That contract cannot certify this successful-work shortcut.
+    """
+    path = Path(path)
+    def signature(p):
+        st = p.stat()
+        return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    database = signature(path)
+    try:
+        wal = signature(Path(str(path) + '-wal'))
+    except FileNotFoundError:
+        wal = ('absent-wal',)
+    return database, wal
+
+
+def _known_revision(value):
+    # Opaque/unknown sentinels must not become reusable success evidence. This
+    # intentionally fails conservative for older core fingerprint formats.
+    if isinstance(value, (tuple, list)):
+        return bool(value) and all(_known_revision(part) for part in value)
+    return type(value) in (str, int) and (not isinstance(value, str) or bool(value))
+
+
 class Remote:
     def __init__(self, mirror, *, cards=linked_cards, courier=None, gateway=source_gateway):
         self.mirror, self.cards = mirror, cards
@@ -164,10 +190,13 @@ class Remote:
         try:
             from hermes_cli import kanban_session_activity as activity
             view = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
-            return (activity._activity_fingerprint(),
-                    view._file_sig(view.db_path()),
-                    view._file_sig(self.mirror.core._state_db()),
-                    view._file_sig(Path(store_path)))
+            revision = activity._activity_fingerprint()
+            if not _known_revision(revision):
+                return None
+            return (revision,
+                    _strict_db_stamp(view.db_path()),
+                    _strict_db_stamp(self.mirror.core._state_db()),
+                    _strict_db_stamp(store_path))
         except Exception:
             return None
 
