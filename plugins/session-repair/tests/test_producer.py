@@ -7,10 +7,10 @@ p=load('_sr_producer_test', PLUGIN/'producer.py')
 @pytest.mark.parametrize('ref,data,done', [
  ('actions/runs/123',{'status':'completed','conclusion':'success'},True),
  ('actions/runs/123',{'status':'in_progress'},False),
- ('pull/123',{'state':'OPEN','reviewDecision':'APPROVED'},True),
+ ('pull/123',{'state':'OPEN','reviewDecision':'APPROVED'},False),
  ('pull/123',{'state':'MERGED'},True),
  ('pull/123',{'state':'CLOSED'},True),
- ('pull/123',{'state':'OPEN','statusCheckRollup':[{'conclusion':'SUCCESS'}]},True),
+ ('pull/123',{'state':'OPEN','statusCheckRollup':[{'conclusion':'SUCCESS'}]},False),
  ('pull/123',{'state':'OPEN','statusCheckRollup':[]},False),
  ('pull/123',{'state':'OPEN','statusCheckRollup':[{'conclusion':'FAILURE'}]},False),
 ])
@@ -21,7 +21,7 @@ def test_readback(ref,data,done,kind):
         calls.append(argv)
         return subprocess.CompletedProcess(argv,0,stdout=json.dumps(data))
     out=p.read_github(kind,'https://github.com/example/project/'+ref,runner)
-    assert out['happened']==done
+    assert out['happened'] == (done and not (kind == 'deploy' and ref.startswith('pull/')))
     assert calls[0][:4]==['token-broker','exec','--scope','user/github']
 
 

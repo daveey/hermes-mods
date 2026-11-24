@@ -1149,7 +1149,11 @@ def healthy_future_park(card: Card, park: dict, now: float) -> bool:
         observed = _num(data.get('observed_at'))
         due = _num(data.get('next_due_at'))
         every = _num(data.get('every'))
-        return (data.get('health') == 'ok' and data.get('state') == 'external_running'
+        healthy_state = (data.get('state') == 'external_running' or
+                         (data.get('adapter') == 'shell' and data.get('state') == 'external_unknown'))
+        # A successful shell poll returning 'not yet' is healthy observation,
+        # not proof that its custom condition happened or that the owner is stuck.
+        return (data.get('health') == 'ok' and healthy_state
                 and data.get('consecutive_failures') == 0 and observed is not None
                 and every is not None and 0 < every <= 21600 and due is not None
                 and park['at'] <= observed <= now and due <= observed + every + 900
@@ -1190,6 +1194,12 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         live = {'state': producer, 'last_event_at': at, 'happened': False}
     elif kind in ('ci', 'deploy', 'external'):
         live = src.producer_state(kind, ref)
+    if live.get('happened') and park['payload'].get('wake_check') and re.fullmatch(
+            r'https://github\.com/[^/]+/[^/]+/pull/\d+(?:[/?#].*)?', str(ref)):
+        # The explicit probe owns the condition (merge queue, installed ancestry,
+        # serving boot, etc.). GitHub's green/closed PR is not its result. Keep
+        # elapsed-time diagnosis if that probe becomes unmonitored or overdue.
+        live = {**live, 'happened': False, 'condition_unproven': 'explicit wake_check'}
     if live.get('happened'):
         # Give core's 300s external watcher two full polls after completion.
         # updatedAt is conservative (later edits may delay us), unlike park age.
@@ -1225,6 +1235,10 @@ def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Findin
             sid = str(row.get('id') or '')
             if sid in src.exclude_chats or sid in linked or row.get('kind') not in ('unresolved', 'waiting'):
                 continue
+            status = row.get('status') or {}
+            if (isinstance(status, dict) and status.get('kind') == 'done'
+                    and (status.get('coverage') or {}).get('state') == 'complete'):
+                continue  # canonical settled work overrides legacy no_summary/unresolved
             if row.get('items') or any(x.get('kind') in ('human', 'decision', 'ask', 'cron', 'card') for x in row.get('on') or []):
                 continue
             source_filter = " AND source IN ('desktop','tui')"

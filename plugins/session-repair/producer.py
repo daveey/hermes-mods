@@ -25,9 +25,9 @@ def read_github(kind, ref, runner=subprocess.run):
         if what=='actions/runs':
             happened = data.get('status')=='completed'
         else:
-            checks = data.get('statusCheckRollup') or []
-            green = bool(checks) and all((x.get('conclusion')=='SUCCESS' or x.get('state')=='SUCCESS') for x in checks)
-            happened = data.get('state') in ('MERGED','CLOSED') or data.get('reviewDecision')=='APPROVED' or green
+            # A review/check result is not a landed PR, and a landed PR is not
+            # a deployment. Custom probe predicates are reconciled by the scanner.
+            happened = kind != 'deploy' and data.get('state') in ('MERGED','CLOSED')
         happened_at = None
         if happened:
             try:
