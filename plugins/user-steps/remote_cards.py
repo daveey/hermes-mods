@@ -172,7 +172,32 @@ def _known_revision(value):
     return type(value) in (str, int) and (not isinstance(value, str) or bool(value))
 
 
-class Remote:
+class DeliveryPresentation:
+    """Pure captured-operation reducer: no board, runtime, courier or store."""
+
+    RETIRING = 'remote-retiring'
+    UNCONFIRMED_AFTER_S = 3600
+
+    @staticmethod
+    def _age(op):
+        from datetime import datetime, timezone
+        try:
+            at = datetime.fromisoformat((op.get('retired') or {})['at'])
+            return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
+        except (KeyError, ValueError, TypeError):
+            return 0.0
+
+    def project_delivery_note(self, op, target):
+        if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
+            return None
+        age = int(self._age(op))
+        gateway = json.loads(target['snapshot'])['remote']['target']['ownerGateway']
+        unconfirmed = age >= self.UNCONFIRMED_AFTER_S
+        return dict(state='delivering', ageSeconds=age, unconfirmed=unconfirmed,
+                    text=(f'Delivery to {gateway} not confirmed ({age // 60} min)' if unconfirmed else 'Delivering…'))
+
+
+class Remote(DeliveryPresentation):
     def __init__(self, mirror, *, cards=linked_cards, courier=None, gateway=source_gateway):
         self.mirror, self.cards = mirror, cards
         self.gateway = gateway
@@ -330,19 +355,8 @@ class Remote:
     def _target(target):
         return tuple(target.get(k) for k in ('ownerGateway', 'ownerProfile', 'board', 'task'))
 
-    RETIRING = 'remote-retiring'
     STABLE_REFUSAL_S = 120      # proof refusal must have been in force this long before absence counts
-    UNCONFIRMED_AFTER_S = 3600  # beyond the courier retry window the tile says delivery is unconfirmed
     TERMINAL = ('rejected', 'expired', 'failed')
-
-    @staticmethod
-    def _age(op):
-        from datetime import datetime, timezone
-        try:
-            at = datetime.fromisoformat((op.get('retired') or {})['at'])
-            return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
-        except (KeyError, ValueError, TypeError):
-            return 0.0
 
     def delivery_note(self, owner, request):
         """Display-only: a held (retiring) remote operation is `Delivering`, never `Cancelled`."""
@@ -353,16 +367,6 @@ class Remote:
         if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
             return None
         return self.project_delivery_note(op, self.mirror.binding(owner, request['requestId']))
-
-    def project_delivery_note(self, op, target):
-        """Reduce materialized operation/binding bytes without opening a store."""
-        if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
-            return None
-        age = int(self._age(op))
-        gateway = json.loads(target['snapshot'])['remote']['target']['ownerGateway']
-        unconfirmed = age >= self.UNCONFIRMED_AFTER_S
-        return dict(state='delivering', ageSeconds=age, unconfirmed=unconfirmed,
-                    text=(f'Delivery to {gateway} not confirmed ({age // 60} min)' if unconfirmed else 'Delivering…'))
 
     def _retire(self, owner, oid, reason):
         """Departure/generation change: state machine in docs/remote-card-answer-states.md.
