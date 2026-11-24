@@ -620,6 +620,22 @@ class SnapshotStore:
                         freeze(refs), freeze(members), freeze(self._failures),
                         freeze({s: self.demands(s) for s in self._versions}))
 
+    def receipt_state(self):
+        """Read-only detached measurement view, also available after retirement.
+
+        Unlike pin(), this never creates or refreshes an admission. It grants no
+        source authority and changes neither the v1 schema nor any CAS contract.
+        Encoding and sink I/O belong to the caller after this lock is released.
+        """
+        with self._lock:
+            return freeze({'store_epoch': self.epoch, 'store_sequence': self._sequence,
+                'closed': self._closed, 'versions': self._versions,
+                'watches': self._watches, 'admissions': self._admissions,
+                'demands': {s: {self._demand(c).id: self._demand(c) for c in self._watches}
+                            for s in self._versions},
+                'scope_receipts': {s: p.scope_receipts for s, p in self._parts.items()},
+                'failures': self._failures})
+
     def pin(self, chat):
         with self._lock:
             self._live()
