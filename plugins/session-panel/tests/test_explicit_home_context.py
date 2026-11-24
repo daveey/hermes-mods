@@ -58,8 +58,8 @@ def seed_home(home: Path, *, session: str, marker: str):
             'INSERT INTO sessions VALUES (?,?,?)',
             (session, None, json.dumps({'marker': marker, 'kind': 'outcome'})),
         )
+    kanban_db = pytest.importorskip('hermes_cli.kanban_db')
     from hermes_cli.kanban_db_connect import connect
-    from hermes_cli import kanban_db
     conn = connect(home / 'kanban.db')
     try:
         tid = kanban_db.create_task(conn, title=marker, session_id=session, initial_status='running')
@@ -108,6 +108,18 @@ def test_empty_generation_strings_fail_closed(tmp_path):
         ctx_for(home, life='')
     with pytest.raises(ValueError, match='generation'):
         ctx_for(home, auth='')
+    with pytest.raises(ValueError, match='generation'):
+        home_mod().PanelHomeContext.from_authorized_home(
+            home, lifecycle_generation=1, authorization_generation='auth-1',
+        )
+
+
+def test_state_db_cannot_combine_with_home_context(api, tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    ctx = ctx_for(home)
+    with pytest.raises(TypeError, match='state_db'):
+        api.CoreReaders(home / 'state.db', home_context=ctx)
 
 
 def test_context_is_immutable_across_calls(tmp_path):
@@ -291,6 +303,10 @@ def test_unsupported_hub_adapter_is_unavailable_not_ambient(api, tmp_path, monke
         watch = [str(Path(p).resolve()) for p in readers.watch_paths()]
         assert str((hub / 'hub.db').resolve()) not in watch
         assert not any('hermes-hub' in item for item in watch)
+        with pytest.raises(Exception) as mail:
+            readers.require_scope('mail_config')
+        assert type(mail.value).__name__ == unsupported_name
+        assert mail.value.scope == 'mail_config'
     finally:
         readers.release()
 
