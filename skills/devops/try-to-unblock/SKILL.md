@@ -70,6 +70,9 @@ never ending in a catch-all such as "any other guard refusal": workers then stop
 (`scripts/check` health, lint, tests) fail on lines their round just wrote. Allow a bounded number of such
 own-line fixes inside the round instead. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
+If a renewal's landing path ends in `hermes-core-wt ship`, name filing ship's reviewer card in the mandate
+(`core-wt-review-request.json`, linked as the card's parent). Ship rejects a same-card review with exit 3,
+and a nearby "no new cards" line will otherwise stall the worker on a decision request.
 Measure a dollar cap from the comment that set it: sum `usage.cost_usd` over the card's `worker_result` events
 created after that comment. The spend-budget window and older totals start earlier, so they overstate it.
 After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
