@@ -20,14 +20,19 @@ _INVENTORY = OrderedDict()
 _INVENTORY_LOCK = threading.Lock()
 
 
-def _inventory(raw, key, gateway, profile, linked_sessions):
+def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
     digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
-    cache_key = (digest, key, gateway, profile, linked_sessions)
+    cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
     with _INVENTORY_LOCK:
         value = _INVENTORY.get(cache_key)
         if value is not None:
             _INVENTORY.move_to_end(cache_key)
             return value
+    # Preserve sqlite's original TEXT -> strict UTF-8 -> json.loads(str)
+    # semantics. json.loads(bytes) would accept a BOM and lone surrogates that
+    # the TEXT reader rejects. Storage class also qualifies warm cache entries.
+    if storage_type == 'text':
+        raw = raw.decode('utf-8')
     task = _object(raw)
     parts = key.split('/')
     if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
@@ -215,9 +220,9 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             # Read all membership links, not just previously known task IDs. The
             # selected inventory must see arrivals, removals and legacy twins.
             candidates, direct = [], set()
-            for gw, key, raw, version in replica.execute(
-                    "SELECT gw,key,CAST(data AS BLOB),version FROM replica WHERE coll='tasks'"):
-                identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions)
+            for gw, key, raw, version, storage_type in replica.execute(
+                    "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'"):
+                identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions, storage_type)
                 candidates.append((gw, key, version, identity, created))
                 if alias_set.intersection(sessions):
                     direct.add((gw, key))

@@ -304,7 +304,11 @@ Version numbers, DB/WAL identity and cache age never certify membership. New or
 same-version changed/malformed records, removals, re-homes, source freshness and
 owner evidence still pass through the complete capture fences. The scale
 regression exercises a successful panel memo at 27,000 unrelated publications,
-guards decode work plus thread CPU, and checks same-version malformed changes.
+guards decode work plus thread CPU, and checks same-version arrivals and malformed
+changes. TEXT decoding retains strict UTF-8 and JSON string semantics (including
+BOM/surrogate rejection), separately keyed from BLOB payloads. Above 65,536
+publications, a full sequential scan can thrash the LRU and decoding cost returns;
+the cache size is an accelerator limit, not a correctness or membership limit.
 
 Both project a
 blocked or triage work card's `human_request` into one server-bound `choice`
