@@ -1562,6 +1562,20 @@ def _emit(payload: dict) -> None:
     broadcast_plugin_event(PLUGIN_ID, 'changed', push_payload(payload))
 
 
+def attach_external(relay) -> None:
+    """Bind an exec relay: HTTP projection serving plus ordered event delivery to this serve's clients.
+
+    Dormant: nothing in this module calls it; the lifecycle owner does, after COMPLETE admission."""
+    _LOADER.external_projection = relay
+    relay.set_event_sink(_emit)
+
+
+def detach_external(relay) -> None:
+    relay.set_event_sink(None)
+    if getattr(_LOADER, 'external_projection', None) is relay:
+        _LOADER.external_projection = None
+
+
 def _launch_profile() -> str:
     """The profile this process serves when no request scopes it: read on a fresh thread (no request context)."""
     out = ['default']
@@ -2751,6 +2765,11 @@ async def changes(body: ChangesBody, request: Request):
 
 @router.get('/status')
 def status():
+    external = _external_projection()
+    if external is not None:
+        from hermes_cli.serve_producer_runtime import projection_response
+        command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+        return projection_response(external, command)
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None:
         return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'running': False}
@@ -2774,6 +2793,15 @@ async def decision_refresh(body: DecisionRefreshBody):
     from fastapi import HTTPException
     if _request_profile() != LAUNCH_PROFILE:
         raise HTTPException(409, 'Panel profile unavailable')
+    external = _external_projection()
+    if external is not None:
+        from hermes_cli.serve_producer_runtime import projection_response
+        command = {'_verb': 'decision-refresh', 'session': body.session,
+                   '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+        response = projection_response(external, command)
+        if response.status_code == 503:
+            raise HTTPException(503, 'Session panel decision pending', headers={'Retry-After': '1'})
+        return response
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or f.stopped.is_set():
         raise HTTPException(503, 'Session panel starting')

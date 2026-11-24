@@ -1,16 +1,55 @@
-"""Explicit panel-only exec fixture provider; no plugin discovery or startup.
-
-This walking skeleton does not certify the full safe-provider registration
-manifest. It is intentionally unreachable from normal plugin registration.
-"""
+"""Panel exec provider: complete Feed/board/decision/events. Not plugin register()."""
 from __future__ import annotations
 
 import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 import queue
+
+
+class EventRing:
+    """Bounded ordered events: seq 1.. contiguous; a cursor older than the ring gets reset+snapshot."""
+
+    MAX_EVENTS = 256
+    MAX_BYTES = 2 * 1024 * 1024
+    MAX_BATCH_BYTES = 512 * 1024
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = []  # [(seq, payload, size)]
+        self._bytes = 0
+        self._seq = 0
+
+    def append(self, payload):
+        size = len(json.dumps(payload, ensure_ascii=True, separators=(',', ':')))
+        with self._lock:
+            self._seq += 1
+            self._items.append((self._seq, payload, size))
+            self._bytes += size
+            while len(self._items) > self.MAX_EVENTS or self._bytes > self.MAX_BYTES:
+                self._bytes -= self._items.pop(0)[2]
+            return self._seq
+
+    def since(self, after, limit=64):
+        with self._lock:
+            head = self._seq
+            if after is None:
+                return {'seq': head, 'events': [], 'reset': False}
+            oldest = self._items[0][0] if self._items else head + 1
+            if after == -1 or after > head or after + 1 < oldest:
+                return {'seq': head, 'events': [], 'reset': True}
+            out, total = [], 0
+            for seq, payload, size in self._items:
+                if seq <= after:
+                    continue
+                if len(out) >= limit or (out and total + size > self.MAX_BATCH_BYTES):
+                    break
+                out.append([seq, payload])
+                total += size
+            return {'seq': head, 'events': out, 'reset': False}
 
 
 def open_provider(config):
@@ -34,47 +73,105 @@ class PanelProducer:
             self.readers = api.CoreReaders()
         else:
             self.readers = api.CoreReaders(home_context=home_context, installation=installation)
-        self.feed = api._load_feed().Feed(self.readers, emit=lambda event: None)
+        self.events = queue.Queue()
+        self.ring = EventRing()
+        self._lease_lock = threading.Lock()
+        self._leases = {}
+        self.feed = api._load_feed().Feed(self.readers, emit=self._emit)
+        self._threads = []
+        self._start_lanes()
+
+    def _emit(self, payload):
+        """Child-side producer events go to a bounded ordered ring, never straight to a socket."""
+        raw = dict(payload)
+        pushed = self.api.push_payload(raw)
+        # Serving identity belongs to the serve process that re-stamps it.
+        pushed.pop('feed', None)
+        pushed.pop('profile', None)
+        self.ring.append(pushed)
+
+    def events_since(self, after, limit=64):
+        batch = self.ring.since(after, limit)
+        if batch['reset']:
+            f = self.feed
+            with f.lock:
+                names = sorted(f.bundles)
+            snap = f.changes(names, since=0)
+            pushed = self.api.push_payload(snap)
+            pushed.pop('feed', None)
+            pushed.pop('profile', None)
+            batch['snapshot'] = pushed
+        return batch
+
+    def _start_lanes(self):
+        core = self.api._load_feed()
+        feed = self.feed
+        t = threading.Thread(target=self.api._run, args=(feed,), name='session-panel-feed', daemon=True)
+        feed._feed_thread = t
+        self._threads.append(t)
+        t.start()
+        d = threading.Thread(target=self.api._run_decisions, args=(feed,),
+                             name='session-panel-decisions', daemon=True)
+        feed._decision_thread = d
+        self._threads.append(d)
+        d.start()
+        b = threading.Thread(target=self.api._run_board, args=(feed, core.BoardLane),
+                             name='session-panel-board', daemon=True)
+        feed._board_thread = b
+        self._threads.append(b)
+        b.start()
+        with feed.lock:
+            feed._board_service_required = True
 
     def __call__(self, payload):
-        body = payload['body']
-        # Bound by the serving endpoint, not child argv or browser input. The
-        # relay keys the entire command, isolating serving slots/profiles.
+        body = payload['body'] if isinstance(payload, dict) and 'body' in payload else payload
         identity = body['_wire_identity']
         if set(identity) != {'feed', 'profile'} or not all(isinstance(v, str) for v in identity.values()):
             raise ValueError('invalid serving identity')
         prefix = json.dumps(identity, ensure_ascii=False, separators=(',', ':')).encode()[:-1] + b','
-        sessions = body.get('sessions', [])
-        accepted = payload['accepted']
+        verb = body.get('_verb', 'changes')
+        accepted = payload.get('accepted', time.monotonic()) if isinstance(payload, dict) else time.monotonic()
         now = time.monotonic()
         if now < accepted or accepted + 900 <= now:
             raise RuntimeError('expired browser interest')
         f = self.feed
+        if verb == 'status':
+            status = f.status()
+            running = not f.stopped.is_set()
+            wire = json.dumps({'running': running, **status}, ensure_ascii=False, separators=(',', ':')).encode()
+            return prefix + wire[1:]
+        if verb == 'decision-refresh':
+            session = body['session']
+            result = f.refresh_decision(session, readers=self.readers)
+            result['bundle'] = f.decision_projection(result['bundle'])
+            wire = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode()
+            return prefix + wire[1:]
+        sessions = body.get('sessions', [])
         wall = f.clock()
-        f._panel_subscribers = {key: value for key, value in f._panel_subscribers.items() if value[1] > wall}
         subscriber = body.get('subscriber')
-        if subscriber and subscriber not in f._panel_subscribers and len(f._panel_subscribers) >= 256:
-            raise RuntimeError('subscriber budget')
-        # Consume the browser command exactly once, then preserve its original
-        # HTTP acceptance deadline instead of granting a fresh TTL on dequeue.
-        f.changes_bytes(sessions, subscriber=body.get('subscriber'), visible_session=body.get('visible_session'))
+        visible = body.get('visible_session')
+        lease = wall + max(0, accepted + 75 - now)  # 75s runs from original HTTP acceptance
+        with self._lease_lock:
+            self._leases = {key: value for key, value in self._leases.items() if value[1] > wall}
+            if subscriber and subscriber not in self._leases and len(self._leases) >= 256:
+                raise RuntimeError('subscriber budget')
+            if subscriber:
+                self._leases[subscriber] = (visible, lease)
+        f.changes_bytes(sessions)
         f._drain()
-        # This thin slice has no board-lane consumer. It owns visibility updates
-        # directly, so do not retain the legacy lane's unconsumed queue.
-        while True:
-            try:
-                f._panel_updates.get_nowait()
-            except queue.Empty:
-                break
-        for session in sessions:
-            if session in f.interest:
-                f.interest[session] = f.clock() + max(0, accepted + 900 - now)
         if subscriber:
-            f._panel_subscribers[subscriber] = (body.get('visible_session'), f.clock() + max(0, accepted + 75 - now))
+            # The board lane is the single owner of _panel_subscribers.
+            f._panel_updates.put((subscriber, visible, lease))
+            f._board.set()
+            lane = getattr(f, '_board_lane', None)
+            if lane is not None:
+                lane.service_wake.set()
+        with f.lock:
+            for session in sessions:
+                if session in f.interest:
+                    f.interest[session] = f.clock() + max(0, accepted + 900 - now)
         try:
-            f.tick()
             wire = f.changes_bytes(sessions, since=body.get('since', 0), epoch=body.get('epoch'))
-            # changes_bytes is reused for byte parity, not another browser renewal.
             while not f._registrations.empty():
                 f._registrations.get_nowait()
             if any(session in f.failures for session in sessions):
@@ -97,4 +194,10 @@ class PanelProducer:
 
     def close(self):
         self.feed.stopped.set()
+        for attr in ('_wake', '_decide', '_board'):
+            event = getattr(self.feed, attr, None)
+            if event is not None:
+                event.set()
+        for thread in self._threads:
+            thread.join(timeout=2)
         self.readers.release()
