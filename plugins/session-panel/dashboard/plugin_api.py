@@ -2658,12 +2658,42 @@ def _save_running() -> bool:
     return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=EXIT_SAVE_TIMEOUT_S)
 
 
+def ensure_snapshot_service(feed, api_generation, reader_factory):
+    """Register current readers for an already explicitly opted-in owner only."""
+    ensure = getattr(feed, 'ensure_snapshot_service', None)
+    # Registration can precede feed.py's natural reload. The published factory
+    # is consumed by its successor's resume; an older class cannot install it.
+    return ensure(api_generation, reader_factory) if callable(ensure) else None
+
+
+def register_snapshot_readers(reader_factory):
+    """Publish capability before/after a genuine saved RESTART, without traffic.
+
+    Publish under the loader lock, then acquire the process lock in the same
+    order as the loader. Never run reader construction under either lock. A
+    resumed feed also consumes this registry itself, closing the other ordering.
+    """
+    with _LOADER.lock:
+        setattr(_LOADER, 'snapshot_reader_factory', reader_factory)
+        core = sys.modules.get(_FEED_KEY)
+        if core is not None:
+            setattr(core, 'SNAPSHOT_READER_FACTORY', reader_factory)
+        generation = _LOADER.generation
+    if core is None:
+        return None
+    with core.PROCESS_LOCK:
+        current = core.PROCESS_FEED
+    if current is not None:
+        return ensure_snapshot_service(current, generation, reader_factory)
+    return None
+
+
 # Legacy reload callbacks are excluded from the producer-only import.
 _PRODUCER_ONLY = __name__ == '_session_panel_producer_api_v1'
 if not _PRODUCER_ONLY and _external_projection() is None:
     # Publish current readers before a saved predecessor entry can resume a
     # current Feed. Its legacy factory is not the registration authority.
-    _LOADER.snapshot_reader_factory = CoreReaders
+    register_snapshot_readers(CoreReaders)
     _load_feed().RESTART = feed
     _load_feed().INSTALL_FACTS = install_facts
     _load_feed().STOP_FACTS = stop_facts
