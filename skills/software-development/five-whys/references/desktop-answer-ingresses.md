@@ -1,0 +1,5 @@
+# Recorded Desktop answer, missing effect
+
+Compare the recorded ActionStore operation, its producer-owned projection snapshot, and the board transition receipt before attributing a missing effect to a missing click. A local projection (no `snapshot.remote`) can use the plugin's direct `KanbanMirror.deliver` path while a remote projection uses core's courier verifier. Test both composed producer/consumer ingresses: tests of the remote owner alone do not prove local policy issuance.
+
+Preserve the original operation and receipt during recovery. An already-delivered operation may return early on receipt replay, so fixing future clicks does not itself repair history. Authenticate any historical recovery from the actual immutable operation and producer binding, retain independent holds, and obtain independent review before adding an authority-issuing recovery path. Never reconstruct a click, relabel a local projection as remote, or request another click without proving existing evidence cannot safely be used.

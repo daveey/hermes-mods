@@ -132,6 +132,8 @@ For new restriction kinds, read `references/restriction-event-writers.md`.
 
 Before held-task transfer classification, read `references/transfer-classification.md` (resend write sets and recovery boundaries).
 
+For a recorded Desktop answer with a missing effect, read `references/desktop-answer-ingresses.md` before retrying.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
