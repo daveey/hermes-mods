@@ -77,10 +77,22 @@ class PanelProducer:
             while not f._registrations.empty():
                 f._registrations.get_nowait()
             if any(session in f.failures for session in sessions):
-                raise RuntimeError('panel source capture unavailable')
+                raise self._unavailable_error(sessions) or RuntimeError('panel source capture unavailable')
             return prefix + wire[1:]
         finally:
             self.readers.release()
+
+    def _unavailable_error(self, sessions):
+        """The typed adapter error when every failed session was refused by an explicit-home adapter gate.
+
+        A failure that is not a recorded gate refusal stays the generic error: unavailability is never inferred."""
+        seen = getattr(self.readers, 'unavailable_seen', None)
+        scopes = seen() if callable(seen) else frozenset()
+        failed = [self.feed.failures[s].get('error', '') for s in sessions if s in self.feed.failures]
+        if not scopes or not failed or not all(e.startswith('UnsupportedHomeAdapter:') for e in failed):
+            return None
+        named = sorted(scope for scope in scopes if failed[0].endswith(scope))
+        return self.api._home_context_mod().UnsupportedHomeAdapter((named or sorted(scopes))[0])
 
     def close(self):
         self.feed.stopped.set()

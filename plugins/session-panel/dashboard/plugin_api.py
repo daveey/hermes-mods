@@ -207,6 +207,21 @@ class BoardChanges:
                    for row in rows for (_path, board), ids in self.sources.items())
 
 
+# Scopes with no explicit-home adapter. In explicit mode each is refused (typed ``UnsupportedHomeAdapter``) before any
+# ambient home/identity resolver runs; none falls back to the process home or answers fresh-empty.
+EXPLICIT_UNAVAILABLE_SCOPES = frozenset({
+    'hub_db',                # hub replica DB: not a profile-home API
+    'mail_config',           # mail config path: not a profile-home API
+    'local_card_scope',      # core card rows: board list + gateway/profile identity resolve from the process home
+    'external_inventory',    # origin ledger / replica inventory: sync config + identity resolve from the process home
+    'origin_history',        # terminal origin history reader: same ambient inventory
+    'panel_runtime_inputs',  # gateway/install identity, sub-agent/process activity, rentals: process-scoped
+    'snapshot_capture',      # board capture: card scope + shadow lookup resolve from the process home
+    'user_steps',            # user-steps core/store/owner resolve the process profile home
+    'replica_card_owner',    # replica card owner: sync config resolves from the process home
+})
+
+
 class CoreReaders:
     """Feed reads against this gateway's own boards, board replicas and state.db, read-only (query_only). Each thread has its own
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
@@ -222,9 +237,11 @@ class CoreReaders:
         self._boards_at = 0.0
         self._boards_lock = threading.Lock()
         self.home_context = home_context
+        self._unavailable_lock = threading.Lock()
+        self._unavailable_hits: set[str] = set()
         if home_context is not None:
             state_db = Path(home_context.home) / 'state.db'
-            self.unavailable_scopes = frozenset({'hub_db', 'mail_config'})
+            self.unavailable_scopes = EXPLICIT_UNAVAILABLE_SCOPES
         else:
             self.unavailable_scopes = frozenset()
             if state_db is None:
@@ -242,8 +259,18 @@ class CoreReaders:
         return ctx.identity
 
     def require_scope(self, scope: str):
+        """Fail closed in explicit mode: call this BEFORE any acquisition that resolves an ambient home or identity.
+
+        Legacy (omitted-context) readers never raise here. The refused scope is recorded so a producer can report
+        typed unavailability instead of a generic or empty failure."""
         if scope in getattr(self, 'unavailable_scopes', frozenset()):
+            with self._unavailable_lock:
+                self._unavailable_hits.add(scope)
             raise _home_context_mod().UnsupportedHomeAdapter(scope)
+
+    def unavailable_seen(self) -> frozenset:
+        with self._unavailable_lock:
+            return frozenset(self._unavailable_hits)
 
     def snapshot_path(self) -> Path:
         ctx = self._explicit_home()
@@ -251,6 +278,12 @@ class CoreReaders:
             return _snapshot_path()
         safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}-{ctx.namespace()}')
         return ctx.home / 'session-panel' / f'feed-{safe}.json'
+
+    def timing_path(self) -> Path:
+        if self._explicit_home() is None:
+            return timing_path()
+        path = self.snapshot_path()
+        return path.with_name('timing-' + path.name)
 
     def _shadow_path(self, slug: str) -> Path:
         ctx = self._explicit_home()
@@ -382,9 +415,11 @@ class CoreReaders:
         return _load_feed()
 
     def capture_local(self, source, prior_part, demands, hints):
+        self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_local(self, source, prior_part, demands, hints)
 
     def capture_external(self, demands, refs, prior_parts, *, hints):
+        self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints)
 
     def external_capture(self, held, *, include_inventory=False):
@@ -393,6 +428,7 @@ class CoreReaders:
         Strict reads are essential here: stale-while-revalidate may return the old
         value and consume the only notification for a committed receipt.
         """
+        self.require_scope('external_inventory')
         if not held:
             return {}  # hidden panels do not admit a global ledger projection
         from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
@@ -487,6 +523,7 @@ class CoreReaders:
 
     def snapshot_select_external(self, inventory, ids, *, observed_at):
         """Select from the one strict inventory using the existing canonical helpers."""
+        self.require_scope('external_inventory')
         from hermes_cli import kanban_session_activity as ksa
         from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
         from hermes_cli.kanban_execution_observations import add_cards
@@ -743,6 +780,7 @@ class CoreReaders:
         return scope
 
     def _session_tasks(self, ids, statuses):
+        self.require_scope('local_card_scope')
         from hermes_cli import kanban_session_activity as ksa
         scope = self._batch_scope()
         if (scope is None or len(scope['lineages']) < 2 or len(scope['ids']) > 400
@@ -817,6 +855,7 @@ class CoreReaders:
 
     def _remote_inventory(self, scope, ids, statuses):
         """Share replica hydration, not ids-dependent origin-obligation dedup or failure decisions."""
+        self.require_scope('external_inventory')
         from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
         from hermes_cli import kanban_chat_links as links
         from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
@@ -976,6 +1015,7 @@ class CoreReaders:
         has passed (at least one always runs) and lists the rest in
         ``reconcile_unreached``: the feed carries them to its next pass.
         """
+        self.require_scope('user_steps')
         api = self._user_step_api()
         deferred = set()
         timings = []
@@ -1006,6 +1046,7 @@ class CoreReaders:
 
     def decision_inputs(self, session, lineage):
         """Read authoritative owner-scoped decisions, with no unrelated board reconciliation."""
+        self.require_scope('user_steps')
         c = self.conn(self.state_db())
         if c is None:
             raise RuntimeError('session outcome unavailable')
@@ -1036,6 +1077,7 @@ class CoreReaders:
         return mod
 
     def _user_step_requests(self, session, lineage, *, reconcile):
+        self.require_scope('user_steps')
         mod = self._user_step_api()
         if reconcile:
             return mod.panel_requests(self.state_db().parent, session, lineage)
@@ -1057,6 +1099,7 @@ class CoreReaders:
         return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
 
     def panel_inputs(self, session, lineage):
+        self.require_scope('panel_runtime_inputs')
         path = Path(__file__).resolve().parents[1] / 'inputs.py'
         spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
         assert spec is not None and spec.loader is not None
@@ -1065,6 +1108,7 @@ class CoreReaders:
         return mod.read(self, session, lineage)
 
     def linked(self, ids):
+        self.require_scope('local_card_scope')
         from hermes_cli import kanban_session_activity as ksa
         return _calm(self._session_tasks(list(ids)[:50], tuple(ksa.LISTED_STATUSES)))
 
@@ -1072,6 +1116,9 @@ class CoreReaders:
         from hermes_cli import kanban_session_activity as ksa
         ids = list(ids)[:50]
         tasks = _calm(self._session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived')))
+        # The terminal origin-history reader resolves the ambient origin ledger: refuse it on its own, not only
+        # through the task rows above.
+        self.require_scope('origin_history')
         reader = getattr(ksa, 'remote_links_and_origin_rows', None)
         if reader is None:
             return tasks
@@ -1171,6 +1218,7 @@ class CoreReaders:
         out = {'task': d, 'events': events, 'runs': runs, 'links': {'parents': parents, 'children': []},
                'link_tasks': link_tasks, 'source': 'replica' if replica else 'live', 'slim': True}
         if replica:
+            self.require_scope('replica_card_owner')
             try:
                 from hermes_cli import kanban_foreign_card as kfc
                 owner = kfc.created_on(c, card_id)
@@ -1375,10 +1423,17 @@ def timing_path() -> Path:
     return _snapshot_path().with_name('timing-' + _snapshot_path().name)
 
 
+def _explicit_readers(f):
+    """The feed's readers when they carry an explicit home context, else None (legacy ambient paths unchanged)."""
+    readers = getattr(f, 'readers', None)
+    return readers if getattr(readers, 'home_context', None) is not None else None
+
+
 def write_timing(f, path: Optional[Path] = None) -> bool:
     """Atomically write the feed's wall-clock timing (`Feed.timing`) as JSON. Best effort: never raises."""
     try:
-        path = path or timing_path()
+        explicit = _explicit_readers(f)
+        path = path or (explicit.timing_path() if explicit is not None else timing_path())
         with f.lock:
             body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
@@ -1458,7 +1513,8 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
     False when the file has a newer claim, the feed was busy past `timeout`, or the write failed (logged)."""
     tmp = None
     try:
-        path = path or _snapshot_path()
+        explicit = _explicit_readers(f)
+        path = path or (explicit.snapshot_path() if explicit is not None else _snapshot_path())
         snap = f.snapshot(timeout=timeout)
         if snap is None:
             return False
@@ -1504,11 +1560,13 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
         return False
 
 
-def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -> Optional[dict]:
+def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None, readers=None) -> Optional[dict]:
     """This backend's last snapshot when it can be carried on: same feed id, profile and epoch in header and body,
-    at most RESTORE_MAX_AGE_S old. None otherwise (missing, stale, unreadable, another backend's)."""
+    at most RESTORE_MAX_AGE_S old. None otherwise (missing, stale, unreadable, another backend's).
+    Explicit-home `readers` select their own home+generation namespace; omitted keeps the ambient path."""
     try:
-        path = path or _snapshot_path()
+        explicit = readers if getattr(readers, 'home_context', None) is not None else None
+        path = path or (explicit.snapshot_path() if explicit is not None else _snapshot_path())
         head_line, _, body = path.read_text(encoding='utf-8').partition('\n')
         head, snap = json.loads(head_line), json.loads(body)
     except FileNotFoundError:
