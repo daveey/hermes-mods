@@ -194,8 +194,8 @@ say what's running, never what needs the user.
 - "Spend budget decision: <title>" cards (body "Card X has stopped. No chat owns its decision") are administrative wrappers. The system raises them as asks to David, but they are not his decisions.
   1. Read the source card's stop reason and the cards it names.
   2. If the premise is gone (the named cards moved on, or the source says its premises are superseded), comment that on the source, then archive both the source and the wrapper.
-  3. Otherwise comment the disposition on the source (held, no new spend) and archive only the wrapper.
-  4. Check `task_links` for children first, then withdraw the ask with `action_request`.
+  3. Otherwise comment the disposition on the source and on the wrapper (held, no new spend; supervisor should retain), and leave the wrapper open. Archiving only the wrapper re-files a fresh one for the same stop about 2h later ("Decide this parked card … decision_retained"), because an archived wrapper counts as no owner. Only archiving the source ends the cycle.
+  4. Check `task_links` for children first, then withdraw the ask with `action_request`. A withdraw that returns 409 "A decision is already recorded" means David already clicked a choice that never reached you: find it (the undelivered-decision incident card names the operation), and deliver it before anything else. For Unblock, comment the choice on the wrapper, then `promote` it.
   5. If David asks what one means, explain the source work in plain words: what it builds, why it stopped, what fixing it would take.
   Don't relay the wrapper's "Unblock = promote" line. A source held by a safety refusal ignores `promote`, which prints success without applying it.
 - A scope-stopped card owned by another chat: that owner often posts its renewal mandate comment minutes before (or without) running `renew-scope` and `promote`.
