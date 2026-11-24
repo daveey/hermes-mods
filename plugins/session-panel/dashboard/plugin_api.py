@@ -2653,9 +2653,10 @@ def _settle(f, last_start: float) -> None:
 
 def _run_decisions(f) -> None:
     """A blocked board sweep must not delay a recorded decision's status line."""
-    # Own current-generation readers: the existing Feed may have been constructed
-    # through an older API whose readers do not implement the cheap decision path.
-    readers = CoreReaders()
+    # Own current-generation readers without discarding the feed's explicit-home authority.
+    explicit = _explicit_readers(f)
+    readers = CoreReaders() if explicit is None else CoreReaders(
+        home_context=explicit.home_context, installation=explicit.installation)
     try:
         first = True
         last = None
