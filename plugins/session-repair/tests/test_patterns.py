@@ -630,7 +630,7 @@ def test_long_wait_ci_boundary(env, monkeypatch, waited_s, expected):
 
 @pytest.mark.parametrize('kind', ['ci', 'deploy', 'external'])
 def test_long_wait_completed_green_at_five_minutes(env, monkeypatch, kind):
-    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True})
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True,'happened_at':env.now-601})
     f = one(env, 'BS-long-wait', F.long_wait(env.conn, env.now, kind=kind, waited_s=300))
     assert f['variant']=='event_happened' and f['fix']['kind']=='nudge'
 

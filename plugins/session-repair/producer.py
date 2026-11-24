@@ -1,4 +1,6 @@
 """Bounded, read-only GitHub producer reads. Never interpret a ref as shell text."""
+import datetime
+import math
 import json
 import re
 import subprocess
@@ -10,8 +12,8 @@ def read_github(kind, ref, runner=subprocess.run):
     if not m:
         return {'state': 'not_resolvable', 'happened': False}
     repo, what, number = m.groups()
-    args = (['run','view',number,'--repo',repo,'--json','status,conclusion,url'] if what=='actions/runs'
-            else ['pr','view',number,'--repo',repo,'--json','state,reviewDecision,statusCheckRollup,url'])
+    args = (['run','view',number,'--repo',repo,'--json','status,conclusion,url,updatedAt'] if what=='actions/runs'
+            else ['pr','view',number,'--repo',repo,'--json','state,reviewDecision,statusCheckRollup,url,updatedAt'])
     try:
         r = runner(['token-broker','exec','--scope','user/github','--reason','session-repair producer readback','--','gh',*args],
                    capture_output=True, text=True, timeout=25)
@@ -26,6 +28,14 @@ def read_github(kind, ref, runner=subprocess.run):
             checks = data.get('statusCheckRollup') or []
             green = bool(checks) and all((x.get('conclusion')=='SUCCESS' or x.get('state')=='SUCCESS') for x in checks)
             happened = data.get('state') in ('MERGED','CLOSED') or data.get('reviewDecision')=='APPROVED' or green
-        return {'state':data,'happened':happened}
+        happened_at = None
+        if happened:
+            try:
+                stamp = datetime.datetime.fromisoformat(data['updatedAt'].replace('Z', '+00:00'))
+                if stamp.tzinfo is not None and math.isfinite(stamp.timestamp()):
+                    happened_at = stamp.timestamp()
+            except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+                pass  # missing timestamps cannot justify an early owner nudge
+        return {'state':data,'happened':happened, 'happened_at':happened_at}
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return {'state':'readback_failed','happened':False}

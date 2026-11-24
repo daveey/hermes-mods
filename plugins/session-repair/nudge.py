@@ -214,6 +214,41 @@ def finish_delivery(scan, src, f, history, rec, text):
     return wake
 
 
+def independent_wake(scan, src, f, pending):
+    """Only a positive dispatcher receipt resolves an uncertain card comment.
+
+    Keep the frozen write as audit evidence; never retry it. Missing/stale reads,
+    a new park, or mere scanner ineligibility do not establish delivery/disposition.
+    """
+    if not f.get('card') or 'park_id' not in f.get('evidence', {}):
+        return None
+    try:
+        task, c = src.task(f['board'], f['card'])
+        if not task or task.status not in ('ready', 'running', 'review', 'done'):
+            return None
+        for ev in scan._events(c, f['card'], limit=10000):
+            if ev['id'] <= f['evidence']['park_id']:
+                break
+            if ev['kind'] in ('scheduled', 'continued', 'blocked'):
+                return None
+            if (ev['kind'] == 'condition_met' and ev['at'] >= pending['at']
+                    and ev['payload'].get('external_result')):
+                return {'event_id':ev['id'], 'at':ev['at'], 'status':task.status}
+    except Exception:
+        return None
+    return None
+
+
+def settle_unknown(scan, src, f, history):
+    pending = history['pending']
+    wake = independent_wake(scan, src, f, pending)
+    if not wake:
+        return {'fingerprint':f['fingerprint'], 'outcome':'delivery_unknown', 'pending_at':pending['at']}
+    history['superseded_delivery'] = {**history.pop('pending'), 'independent_wake':wake}
+    return {'fingerprint':f['fingerprint'], 'outcome':'superseded_by_dispatcher',
+            'pending_at':pending['at'], 'independent_wake':wake}
+
+
 def process(findings, *, home, now, scan, runner, argv, read_json, write_json, append):
     sd = home / 'session-repair'
     mode = config_mode(home)
@@ -249,7 +284,8 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
                 write_json(path,state)
                 continue
             else:
-                actions.append({'fingerprint':fp,'outcome':'delivery_unknown','pending_at':pending['at']})
+                actions.append(settle_unknown(scan, src, original, history))
+                write_json(path,state)
                 continue
         current, src = fresh(scan, original)
         if current is None:
@@ -325,7 +361,7 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
                 history['receipt'] = rec
                 actions.append({**action,'outcome':'nudged','receipt':rec,'wake':wake})
             else:
-                actions.append({**action,'outcome':'delivery_unknown'})
+                actions.append({**action, **settle_unknown(scan, scan.Sources(), current, history)})
         room -= 1
         write_json(path,state)
     write_json(path,state)

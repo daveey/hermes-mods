@@ -1190,6 +1190,12 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         live = {'state': producer, 'last_event_at': at, 'happened': False}
     elif kind in ('ci', 'deploy', 'external'):
         live = src.producer_state(kind, ref)
+    if live.get('happened'):
+        # Give core's 300s external watcher two full polls after completion.
+        # updatedAt is conservative (later edits may delay us), unlike park age.
+        completed = _num(live.get('happened_at'))
+        if completed is None or src.now - completed < 600:
+            return None
     if not live.get('happened') and waited < threshold:
         return None
     last = _events(c, card.id)

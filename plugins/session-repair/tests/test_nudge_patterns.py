@@ -30,7 +30,7 @@ def test_ci_age(env, age, expected):
         assert result[0]['evidence']['threshold_s'] == 2700
 
 def test_completed_green_immediate(env, monkeypatch):
-    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True})
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True,'happened_at':env.now-601})
     assert hits(env, wait(env, 300))[0]['variant'] == 'event_happened'
 
 def test_human_and_running_excluded(env):

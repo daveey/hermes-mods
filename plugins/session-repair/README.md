@@ -25,7 +25,7 @@ Three parts:
 | BS-review-no-reviewer | review with no running run > 60 min after the newest review event: `idle` (review dispatch on), `idle_manual_review` (off) | `dispatch --max 1` (`idle` only) |
 | BS-broken-chain | `missing_parent`, `missing_awaited`, `cycle` | none: fix card |
 | BS-notice-undelivered | last message a `kanban_notice` whose close-out ended `error` / `busy`, deferred > 2 h past due, claimed > 2 h with no verdict, or never claimed > 2 h (not human-blocked); `subscription_lag` (a `tui` subscription with an event undelivered > 60 min). Never the repair chat | one close-out turn (`hermes chat --resume <id> --oneshot`) |
-| BS-long-wait | external-producer park: CI/deploy 45m, external 3h, card 4h (producer quiet 1h), resource 2h; GitHub event already happened overrides age; clock never | `nudge`: one owner comment plus a guarded reassessment wake (not release of a hold) |
+| BS-long-wait | external-producer park: CI/deploy 45m, external 3h, card 4h (producer quiet 1h), resource 2h; GitHub event completed >=600s ago overrides age (producer `updatedAt`, never park age; missing timestamp cannot authorize a completion nudge); clock never | `nudge`: one owner comment plus a guarded reassessment wake (not release of a hold) |
 | BS-quiet-chat | unresolved/waiting desktop/tui chat quiet >60m within 3d, no linked card, live cron/run or open ask; never repair chat | `nudge`: one resumed chat turn |
 
 A finding: `{id, variant, card, board, chat, title, summary, evidence, fix: {kind: auto|card|nudge, action, commands,
@@ -98,6 +98,13 @@ same-episode `wake_check_alive` or `external_watch` evidence without executing p
 its cadence (remote alive receipts are rate-limited to three hours); failures, mismatched commands, stale
 receipts and overdue deadlines remain eligible. A merged PR is not deployment completion when a healthy
 installation probe is still waiting. The owner-wake transaction rechecks this guard as well.
+
+A missing nudge comment receipt remains `delivery_unknown`, is never resent, and makes the tick fail.
+Only a fresh exact-target read showing a dispatcher `condition_met` with `external_result` after the
+pending write, in the same parked episode, and an owner now ready/running/review/done resolves it as
+`superseded_by_dispatcher` (non-error). The original frozen write and dispatcher receipt remain in
+`superseded_delivery`; no comment delivery is claimed. Old errored ticks are never rewritten. A new park,
+missing readback, probe health alone or mere scanner ineligibility cannot clear the uncertainty.
 
 Unexplained-wait detection excludes canonical pending spend decisions in triage, including retained HOLDs:
 these need an explicit owner decision, not a generic unblock. For other waits, an old generic park and the
