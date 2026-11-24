@@ -1,4 +1,5 @@
 """Cursor/ledger, alias and scope certificates for the board lane inventory."""
+import threading
 from types import SimpleNamespace
 
 from test_selective_producer import load_api
@@ -6,7 +7,11 @@ from test_selective_producer import load_api
 
 def fixture(tmp_path, monkeypatch):
     api = load_api()
-    r = api.CoreReaders(tmp_path / 'state.db')
+    # Exercise the memo independently of the unrelated core sync adapter loaded
+    # by __init__; no-core CI must run these unit contracts, not skip them.
+    r = api.CoreReaders.__new__(api.CoreReaders)
+    r._local = threading.local()
+    r._state_db = tmp_path / 'state.db'
     state = {'scope': 'A', 'cursor': 1, 'alias': 1, 'now': 0.0}
     calls = []
     def read(**kwargs):
