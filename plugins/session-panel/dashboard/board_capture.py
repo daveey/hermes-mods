@@ -41,6 +41,13 @@ def _reuse(previous, values):
             for key, value in values.items()}
 
 
+def _require_adapter(readers):
+    """Explicit-home readers refuse capture before any ambient card scope or shadow lookup (direct callers too)."""
+    require = getattr(readers, 'require_scope', None)
+    if callable(require):
+        require('snapshot_capture')
+
+
 def capture_local(readers, source, prior_part, demands, hints):
     """Capture exact frozen ScopeDemands on one caller-owned query-only snapshot.
 
@@ -48,6 +55,7 @@ def capture_local(readers, source, prior_part, demands, hints):
     transaction raises; its caller retains cursor/failure custody in SnapshotStore.
     Membership is selected in a JSON-bound union even on unchanged cursor stamps.
     """
+    _require_adapter(readers)
     from hermes_cli import kanban_task_change as changes
     from hermes_cli.kanban_execution_observations import card_scope, add_cards
     from hermes_cli.kanban_session_acquisition import enrich_session_tasks
@@ -219,6 +227,7 @@ def capture_external(readers, demands, refs, prior_parts, hints):
     calls capture_local and never touches a Feed or SnapshotStore lock. ``hints``
     is a SourceKey -> CaptureHints map (one aggregate external source).
     """
+    _require_adapter(readers)
     if len(hints) != 1:
         raise ValueError('canonical external adapters have one atomic failure domain')
     source, hint = next(iter(hints.items()))
