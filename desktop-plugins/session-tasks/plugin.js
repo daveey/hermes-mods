@@ -1436,7 +1436,7 @@ const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
 // A synced worker-homed replica in a parked state (ready/todo/review) is the owner's board report, not an unobserved run:
 // its title already says where and how long ago it synced, so it is not forced to "status unknown".
 const PARKED_REPORT = new Set(['ready', 'todo', 'review'])
-const legacyLiveCard = c => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state)) && !(c.replica && Number.isFinite(c.syncedAt) && PARKED_REPORT.has(str(c.state)))
+const legacyLiveCard = (c, now) => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state)) && !(c.replica && Number.isFinite(c.syncedAt) && c.syncedAt >= 0 && c.syncedAt <= now && PARKED_REPORT.has(str(c.state)))
 
 export function Chip({ chip: rawChip, now }) {
   // Owner-qualified PanelModel text is authoritative, including historical ages.
@@ -1445,7 +1445,7 @@ export function Chip({ chip: rawChip, now }) {
   const ev = ['bg', 'sub'].includes(rawChip.kind) ? chipObservation(rawChip, now / 1000) : null
   const chip = ev
     ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` }
-    : !rawChip.display && legacyLiveCard(rawChip)
+    : !rawChip.display && legacyLiveCard(rawChip, now / 1000)
       ? { ...rawChip, state: 'unknown', title: `${rawChip.title}\n${rawChip.replica ? `status ${observationLine(unobservedView(rawChip, now / 1000), now / 1000)}` : `status unknown (producer sent no observations) · last known: ${rawChip.state}`}` }
       : rawChip
   const color = chipColor(chip.look || chip.state)

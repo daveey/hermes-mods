@@ -84,9 +84,11 @@ test('a synced worker-homed parked replica chip reports its board state, not sta
   const synced = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: replica, now: 1000000 }))
   assert.doesNotMatch(synced, /status unknown|unknown \(/)
   assert.match(synced, /synced 10s ago/)
-  const unsynced = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...replica, syncedAt: null }, now: 1000000 }))
-  assert.match(unsynced, /status/)
-  assert.match(unsynced, /unknown/)
+  for (const syncedAt of [null, 1001, Infinity, NaN]) {
+    const unsynced = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...replica, syncedAt }, now: 1000000 }))
+    assert.match(unsynced, /status/)
+    assert.match(unsynced, /unknown/)
+  }
   const running = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...replica, state: 'running' }, now: 1000000 }))
   assert.match(running, /unknown/)
 })
