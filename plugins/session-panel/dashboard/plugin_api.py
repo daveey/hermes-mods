@@ -80,6 +80,19 @@ def _home_context_mod():
     return mod
 
 
+def _explicit_home_mod():
+    path = Path(__file__).with_name('explicit_home.py')
+    key = '_session_panel_explicit_home'
+    mod = sys.modules.get(key)
+    if mod is None or not hasattr(mod, 'identity'):
+        spec = importlib.util.spec_from_file_location(key, path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def _external_projection():
     """Dormant pre-import selection; never hand over an existing legacy owner."""
     external = getattr(_LOADER, 'external_projection', None)
@@ -207,18 +220,11 @@ class BoardChanges:
                    for row in rows for (_path, board), ids in self.sources.items())
 
 
-# Scopes with no explicit-home adapter. In explicit mode each is refused (typed ``UnsupportedHomeAdapter``) before any
-# ambient home/identity resolver runs; none falls back to the process home or answers fresh-empty.
+# Scopes with no profile-home adapter. Explicit mode refuses these before any ambient resolver.
+# Working acquisition (H) implements the former blanket refusals via home-local canonical readers.
 EXPLICIT_UNAVAILABLE_SCOPES = frozenset({
-    'hub_db',                # hub replica DB: not a profile-home API
-    'mail_config',           # mail config path: not a profile-home API
-    'local_card_scope',      # core card rows: board list + gateway/profile identity resolve from the process home
-    'external_inventory',    # origin ledger / replica inventory: sync config + identity resolve from the process home
-    'origin_history',        # terminal origin history reader: same ambient inventory
-    'panel_runtime_inputs',  # gateway/install identity, sub-agent/process activity, rentals: process-scoped
-    'snapshot_capture',      # board capture: card scope + shadow lookup resolve from the process home
-    'user_steps',            # user-steps core/store/owner resolve the process profile home
-    'replica_card_owner',    # replica card owner: sync config resolves from the process home
+    'hub_db',       # hub replica DB: not a profile-home API
+    'mail_config',  # mail config path: not a profile-home API
 })
 
 
@@ -227,7 +233,7 @@ class CoreReaders:
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
     file was replaced (another inode) and dropped when the file is gone."""
 
-    def __init__(self, state_db: Optional[Path] = None, *, home_context=None):
+    def __init__(self, state_db: Optional[Path] = None, *, home_context=None, installation=None):
         if home_context is not None and state_db is not None:
             raise TypeError('state_db is not combined with home_context')
         from hermes_cli import kanban_sync_client as ksc
@@ -237,6 +243,7 @@ class CoreReaders:
         self._boards_at = 0.0
         self._boards_lock = threading.Lock()
         self.home_context = home_context
+        self.installation = installation
         self._unavailable_lock = threading.Lock()
         self._unavailable_hits: set[str] = set()
         if home_context is not None:
@@ -251,6 +258,27 @@ class CoreReaders:
 
     def _explicit_home(self):
         return getattr(self, 'home_context', None)
+
+    def _home_sync_config(self) -> dict:
+        return _explicit_home_mod().parse_home_sync_config(self.home_context.home)
+
+    def _home_identity(self) -> dict:
+        return _explicit_home_mod().identity(self.home_context.home, self.installation)
+
+    def card_scope_for(self, path) -> tuple:
+        """(gateway, profile) for a board path under the authorized home. Never card_scope()."""
+        ident = self._home_identity()
+        return ident.get('gateway'), ident.get('profile')
+
+    def _refuse(self, scope: str):
+        with self._unavailable_lock:
+            self._unavailable_hits.add(scope)
+        raise _home_context_mod().UnsupportedHomeAdapter(scope)
+
+    def _origin_rows(self) -> list:
+        ident = self._home_identity()
+        return _explicit_home_mod().origin_rows(
+            self.home_context.home, gateway=ident.get('gateway') or '', profile=ident.get('profile') or 'default')
 
     def cache_identity(self):
         ctx = self._explicit_home()
@@ -415,11 +443,13 @@ class CoreReaders:
         return _load_feed()
 
     def capture_local(self, source, prior_part, demands, hints):
-        self.require_scope('snapshot_capture')
+        if self._explicit_home() is None:
+            self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_local(self, source, prior_part, demands, hints)
 
     def capture_external(self, demands, refs, prior_parts, *, hints):
-        self.require_scope('snapshot_capture')
+        if self._explicit_home() is None:
+            self.require_scope('snapshot_capture')
         return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints)
 
     def external_capture(self, held, *, include_inventory=False):
@@ -428,6 +458,8 @@ class CoreReaders:
         Strict reads are essential here: stale-while-revalidate may return the old
         value and consume the only notification for a committed receipt.
         """
+        if self._explicit_home() is not None:
+            return self._explicit_external_capture(held, include_inventory=include_inventory)
         self.require_scope('external_inventory')
         if not held:
             return {}  # hidden panels do not admit a global ledger projection
@@ -457,6 +489,50 @@ class CoreReaders:
                        for scope in refs[session].get(row.get('id'), ()))
         # Retain every field, including evidence timestamps: they affect lease
         # validity. No presentation classifier or guessed volatile-field filter.
+        captured = {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
+                                for row in rows
+                                if set(value['lineage']).intersection(
+                                    (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
+                                or refers(s, row)))
+                for s, value in held.items()}
+        if include_inventory:
+            return captured, {'origin': cards, 'history': history, 'replica': replica,
+                              'gateway': gateway, 'profile': profile}
+        return captured
+
+    def _explicit_external_capture(self, held, *, include_inventory=False):
+        if not held:
+            return {}
+        ident = self._home_identity()
+        gateway, profile = ident.get('gateway'), ident.get('profile')
+        cfg = self._home_sync_config()
+        history = self._origin_rows()
+        cards = [row for row in history if not row.get('released')]
+        replica = None
+        rows = list(cards) + list(history)
+        if cfg.get('links_reader') == 'replica':
+            if not gateway:
+                self._refuse('external_inventory')
+            from hermes_cli import kanban_chat_links as links
+            from hermes_cli import kanban_session_activity as ksa
+            ids = list(dict.fromkeys(i for value in held.values() for i in value['lineage']))
+            unreadable = []
+            shadows = [(slug, self._shadow_path(slug)) for slug, _ in self.boards()]
+            replica = links.replica_cards(
+                ids, gateway,
+                tuple(ksa.LISTED_STATUSES) + ('done', 'archived'),
+                replicas=shadows, stale_ok=False, origin_cards=cards,
+                unreadable_out=unreadable, profile=profile)
+            rows.extend(replica)
+            if unreadable:
+                raise RuntimeError('session-panel external replica capture unavailable')
+        refs = {s: self._external_refs(value) for s, value in held.items()}
+
+        def refers(session, row):
+            return any(all(not coordinate or not row.get(key) or row[key] == coordinate
+                           for key, coordinate in scope.items())
+                       for scope in refs[session].get(row.get('id'), ()))
+
         captured = {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
                                 for row in rows
                                 if set(value['lineage']).intersection(
@@ -523,7 +599,8 @@ class CoreReaders:
 
     def snapshot_select_external(self, inventory, ids, *, observed_at):
         """Select from the one strict inventory using the existing canonical helpers."""
-        self.require_scope('external_inventory')
+        if self._explicit_home() is None:
+            self.require_scope('external_inventory')
         from hermes_cli import kanban_session_activity as ksa
         from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
         from hermes_cli.kanban_execution_observations import add_cards
@@ -536,7 +613,9 @@ class CoreReaders:
                 selected = preserve_origin_obligations(
                     [c for c in inventory['replica'] if c['session'] in ids], inventory['origin'],
                     gateway=inventory['gateway'], profile=inventory['profile'], ids=list(ids), statuses=statuses)
-            values = add_cards(_project_remote_listed(selected, ids, statuses), now=observed_at)
+            values = add_cards(_project_remote_listed(selected, ids, statuses), now=observed_at,
+                               **({'gateway': inventory.get('gateway'), 'profile': inventory.get('profile')}
+                                  if self._explicit_home() is not None else {}))
             if terminal:
                 values = _load_feed().with_terminal_history(values, inventory['history'], ids)
             outputs['done' if terminal else 'linked'] = _calm(values)
@@ -780,6 +859,8 @@ class CoreReaders:
         return scope
 
     def _session_tasks(self, ids, statuses):
+        if self._explicit_home() is not None:
+            return self._explicit_session_tasks(ids, statuses)
         self.require_scope('local_card_scope')
         from hermes_cli import kanban_session_activity as ksa
         scope = self._batch_scope()
@@ -853,8 +934,44 @@ class CoreReaders:
             log.debug('session-panel primary-mirror check failed', exc_info=True)
             return False
 
+    def _explicit_session_tasks(self, ids, statuses):
+        from hermes_cli import kanban_session_activity as ksa
+        from hermes_cli.kanban_execution_observations import add_cards
+        ident = self._home_identity()
+        scope = (ident.get('gateway'), ident.get('profile'))
+        out = []
+        for slug, path in self.boards():
+            path = Path(path)
+            if not path.is_file():
+                continue
+            rows = ksa._read_session_tasks(path, list(ids), statuses, scope=scope)
+            for row in rows:
+                row.setdefault('key', f"{slug}/{row['id']}")
+                out.append(row)
+        remote = self._explicit_remote_inventory(ids, statuses)
+        return add_cards(out + remote, gateway=scope[0], profile=scope[1])
+
+    def _explicit_remote_inventory(self, ids, statuses):
+        cfg = self._home_sync_config()
+        ident = self._home_identity()
+        if cfg.get('links_reader') == 'replica':
+            if not ident.get('gateway'):
+                self._refuse('external_inventory')
+            from hermes_cli import kanban_chat_links as links
+            shadows = [(slug, self._shadow_path(slug)) for slug, _ in self.boards()]
+            origin = [row for row in self._origin_rows() if not row.get('released')]
+            return links.replica_cards(
+                list(ids), ident['gateway'], statuses, replicas=shadows,
+                stale_ok=True, origin_cards=origin, profile=ident.get('profile'))
+        rows = self._origin_rows()
+        wanted = set(ids)
+        return [row for row in rows if not row.get('released')
+                and wanted.intersection((row.get('session'), row.get('origin_session'), row.get('resolved_session')))]
+
     def _remote_inventory(self, scope, ids, statuses):
         """Share replica hydration, not ids-dependent origin-obligation dedup or failure decisions."""
+        if self._explicit_home() is not None:
+            return self._explicit_remote_inventory(ids, statuses)
         self.require_scope('external_inventory')
         from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
         from hermes_cli import kanban_chat_links as links
@@ -1015,6 +1132,15 @@ class CoreReaders:
         has passed (at least one always runs) and lists the rest in
         ``reconcile_unreached``: the feed carries them to its next pass.
         """
+        if self._explicit_home() is not None:
+            ident = self._home_identity()
+            if not ident.get('install_id'):
+                self._refuse('user_steps')
+            # Presentation never reconciles. The canonical producer lane still requires a
+            # home-local Mirror; until that adapter exists, do not call process-home Mirror.
+            self.reconcile_unreached = []
+            self.reconcile_timings = []
+            return set()
         self.require_scope('user_steps')
         api = self._user_step_api()
         deferred = set()
@@ -1046,7 +1172,8 @@ class CoreReaders:
 
     def decision_inputs(self, session, lineage):
         """Read authoritative owner-scoped decisions, with no unrelated board reconciliation."""
-        self.require_scope('user_steps')
+        if self._explicit_home() is None:
+            self.require_scope('user_steps')
         c = self.conn(self.state_db())
         if c is None:
             raise RuntimeError('session outcome unavailable')
@@ -1077,6 +1204,14 @@ class CoreReaders:
         return mod
 
     def _user_step_requests(self, session, lineage, *, reconcile):
+        if self._explicit_home() is not None:
+            ident = self._home_identity()
+            if not ident.get('install_id'):
+                self._refuse('user_steps')
+            mod = self._user_step_api()
+            return mod.panel_requests(
+                self.state_db().parent, session, lineage, reconcile=reconcile,
+                install_id=ident['install_id'], profile=ident.get('profile'), bound=True)
         self.require_scope('user_steps')
         mod = self._user_step_api()
         if reconcile:
@@ -1099,7 +1234,8 @@ class CoreReaders:
         return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
 
     def panel_inputs(self, session, lineage):
-        self.require_scope('panel_runtime_inputs')
+        if self._explicit_home() is None:
+            self.require_scope('panel_runtime_inputs')
         path = Path(__file__).resolve().parents[1] / 'inputs.py'
         spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
         assert spec is not None and spec.loader is not None
@@ -1108,7 +1244,8 @@ class CoreReaders:
         return mod.read(self, session, lineage)
 
     def linked(self, ids):
-        self.require_scope('local_card_scope')
+        if self._explicit_home() is None:
+            self.require_scope('local_card_scope')
         from hermes_cli import kanban_session_activity as ksa
         return _calm(self._session_tasks(list(ids)[:50], tuple(ksa.LISTED_STATUSES)))
 
@@ -1116,8 +1253,10 @@ class CoreReaders:
         from hermes_cli import kanban_session_activity as ksa
         ids = list(ids)[:50]
         tasks = _calm(self._session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived')))
-        # The terminal origin-history reader resolves the ambient origin ledger: refuse it on its own, not only
-        # through the task rows above.
+        if self._explicit_home() is not None:
+            history = self._origin_rows()
+            return _load_feed().with_terminal_history(tasks, history, ids)
+        # The terminal origin-history reader resolves the ambient origin ledger.
         self.require_scope('origin_history')
         reader = getattr(ksa, 'remote_links_and_origin_rows', None)
         if reader is None:
@@ -1218,7 +1357,8 @@ class CoreReaders:
         out = {'task': d, 'events': events, 'runs': runs, 'links': {'parents': parents, 'children': []},
                'link_tasks': link_tasks, 'source': 'replica' if replica else 'live', 'slim': True}
         if replica:
-            self.require_scope('replica_card_owner')
+            if self._explicit_home() is None:
+                self.require_scope('replica_card_owner')
             try:
                 from hermes_cli import kanban_foreign_card as kfc
                 owner = kfc.created_on(c, card_id)

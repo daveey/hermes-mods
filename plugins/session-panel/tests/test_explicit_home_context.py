@@ -53,6 +53,8 @@ def outcome_marker(readers, session: str) -> str:
 
 def seed_home(home: Path, *, session: str, marker: str):
     home.mkdir(parents=True, exist_ok=True)
+    (home / 'install_id').write_text('a' * 32)
+    (home / 'config.yaml').write_text(json.dumps({'kanban': {'sync': {'gateway': 'gw-explicit'}}}))
     with sqlite3.connect(home / 'state.db') as db:
         db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
         db.execute(
@@ -69,8 +71,14 @@ def seed_home(home: Path, *, session: str, marker: str):
     ledger = home / 'kanban' / 'origin-ledger.db'
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(ledger) as db:
-        db.execute('CREATE TABLE marker(v TEXT)')
-        db.execute('INSERT INTO marker VALUES (?)', (marker,))
+        db.execute("""CREATE TABLE IF NOT EXISTS origin_obligations (
+            binding_id TEXT PRIMARY KEY, binding_hash TEXT NOT NULL,
+            binding_json TEXT NOT NULL, resolved_session TEXT NOT NULL,
+            task_json TEXT NOT NULL, observation_version INTEGER NOT NULL,
+            released INTEGER NOT NULL DEFAULT 0)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS origin_receipts (
+            request_id TEXT PRIMARY KEY NOT NULL, binding_hash TEXT NOT NULL,
+            receipt_json TEXT NOT NULL)""")
     (home / 'origin-work.db').write_bytes(marker.encode())
     (home / 'user-steps').mkdir(exist_ok=True)
     return tid
@@ -353,12 +361,10 @@ def test_provider_ignores_browser_payload_home_fields(tmp_path, monkeypatch):
             '_wire_identity': {'feed': 'fixture:serve', 'profile': 'decoy'},
         }
         env_before = dict(os.environ)
-        # The browser-shaped body actually enters the producer. It cannot retarget the bound home, and the
-        # unsupported acquisition is typed unavailable (not a decoy read, not a fresh-empty success).
-        with pytest.raises(Exception) as raised:
-            produced({'body': body, 'accepted': time.monotonic() - 1})
-        assert type(raised.value).__name__ == 'UnsupportedHomeAdapter', repr(raised.value)
-        assert 'DECOY' not in str(raised.value) and str(decoy) not in str(raised.value)
+        # The browser-shaped body actually enters the producer. It cannot retarget the bound home.
+        wire = produced({'body': body, 'accepted': time.monotonic() - 1})
+        text = wire.decode() if isinstance(wire, (bytes, bytearray)) else str(wire)
+        assert 'DECOY' not in text and 'TRUSTED' in text
         assert dict(os.environ) == env_before
         assert produced.readers.state_db() == ctx.home / 'state.db'
         assert produced.readers.home_context.home == ctx.home

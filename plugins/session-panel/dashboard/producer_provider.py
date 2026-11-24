@@ -23,16 +23,17 @@ def open_provider(config):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     home_context = config.get('home_context') if isinstance(config, dict) else None
-    return PanelProducer(module, home_context=home_context)
+    installation = config.get('installation') if isinstance(config, dict) else None
+    return PanelProducer(module, home_context=home_context, installation=installation)
 
 
 class PanelProducer:
-    def __init__(self, api, *, home_context=None):
+    def __init__(self, api, *, home_context=None, installation=None):
         self.api = api
         if home_context is None:
             self.readers = api.CoreReaders()
         else:
-            self.readers = api.CoreReaders(home_context=home_context)
+            self.readers = api.CoreReaders(home_context=home_context, installation=installation)
         self.feed = api._load_feed().Feed(self.readers, emit=lambda event: None)
 
     def __call__(self, payload):

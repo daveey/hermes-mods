@@ -222,55 +222,98 @@ def test_supported_card_and_state_data_are_complete(api, worlds, tripwires):
                for p, _ in stamps)
 
 
-UNSUPPORTED = {
-    'decision_inputs': ('user_steps', lambda r: r.decision_inputs('chat', ['chat'])),
-    'user_step_requests': ('user_steps', lambda r: r.user_step_requests('chat', ['chat'])),
-    'reconcile_user_steps': ('user_steps', lambda r: r.reconcile_user_steps('chat', ['chat'])),
-    'reconcile_sources': ('user_steps', lambda r: r.reconcile_sources(['chat'])),
-    'linked': ('local_card_scope', lambda r: r.linked(['chat'])),
-    'done': ('local_card_scope', lambda r: r.done(['chat'])),
-    'session_tasks': ('local_card_scope', lambda r: r._session_tasks(['chat'], ('running',))),
-    'external_capture': ('external_inventory', lambda r: r.external_capture(
-        {'chat': {'lineage': ['chat'], 'bundle': {}, 'refs': []}})),
-    'external_capture_inventory': ('external_inventory', lambda r: r.external_capture(
-        {'chat': {'lineage': ['chat'], 'bundle': {}, 'refs': []}}, include_inventory=True)),
-    'remote_inventory': ('external_inventory', lambda r: r._remote_inventory(
-        {'remote': {}, 'ids': ['chat']}, ['chat'], ('running',))),
-    'snapshot_select_external': ('external_inventory', lambda r: r.snapshot_select_external(
-        {'replica': None, 'origin': [], 'history': [], 'gateway': None, 'profile': None}, ['chat'], observed_at=0)),
-    'panel_inputs': ('panel_runtime_inputs', lambda r: r.panel_inputs('chat', ['chat'])),
-    'capture_local': ('snapshot_capture', lambda r: r.capture_local(None, None, None, None)),
-    'capture_external': ('snapshot_capture', lambda r: r.capture_external(None, None, None, hints=None)),
+ACQUIRED = {
+    'decision_inputs': lambda r: r.decision_inputs('chat', ['chat']),
+    'user_step_requests': lambda r: r.user_step_requests('chat', ['chat']),
+    'linked': lambda r: r.linked(['chat']),
+    'done': lambda r: r.done(['chat']),
+    'session_tasks': lambda r: r._session_tasks(['chat'], ('running', 'ready', 'todo', 'blocked', 'review')),
+    'external_capture': lambda r: r.external_capture(
+        {'chat': {'lineage': ['chat'], 'bundle': {}, 'refs': []}}),
+    'external_capture_inventory': lambda r: r.external_capture(
+        {'chat': {'lineage': ['chat'], 'bundle': {}, 'refs': []}}, include_inventory=True),
+    'remote_inventory': lambda r: r._remote_inventory(
+        {'remote': {}, 'ids': ['chat']}, ['chat'], ('running',)),
+    'snapshot_select_external': lambda r: r.snapshot_select_external(
+        {'replica': None, 'origin': [], 'history': [], 'gateway': 'gw-explicit', 'profile': 'researcher'},
+        ['chat'], observed_at=0),
+    'panel_inputs': lambda r: r.panel_inputs('chat', ['chat']),
 }
 
 
-@pytest.mark.parametrize('name', sorted(UNSUPPORTED))
-def test_unsupported_acquisition_is_typed_unavailable_before_any_ambient_resolver(name, api, worlds, tripwires):
-    scope, call = UNSUPPORTED[name]
+@pytest.mark.parametrize('name', sorted(ACQUIRED))
+def test_supported_acquisition_returns_home_data_without_ambient(name, api, worlds, tripwires):
     readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
     try:
-        with pytest.raises(Exception) as raised:
-            call(readers)
+        result = ACQUIRED[name](readers)
     finally:
         readers.release()
-    assert tripwires == [], f'ambient resolver ran: {tripwires}; raised {raised.value!r}'
-    assert type(raised.value).__name__ == 'UnsupportedHomeAdapter', repr(raised.value)
-    assert raised.value.scope == scope
-    assert 'AMBIENT-MARKER' not in str(raised.value)
+    assert tripwires == [], f'ambient resolver ran: {tripwires}'
+    text = blob(result)
+    assert 'AMBIENT-MARKER' not in text
+    if name in {'linked', 'session_tasks', 'done'}:
+        assert worlds['task_id'] in text or 'EXPLICIT-DATA' in text
+    if name == 'panel_inputs':
+        assert result['outcome_json']['marker'] == 'EXPLICIT-DATA'
+        assert result['gateway'] == 'gw-explicit'
+    if name == 'decision_inputs':
+        assert result['outcome_json']['marker'] == 'EXPLICIT-DATA'
 
 
-def test_done_history_reader_is_gated_itself_not_only_through_task_rows(api, worlds, tripwires, monkeypatch):
-    """Killing test for the history gate: task rows succeed, the origin-history reader must still not run."""
+def test_hub_and_mail_remain_typed_unavailable(api, worlds, tripwires):
     readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
-    monkeypatch.setattr(readers, '_session_tasks', lambda ids, statuses: [])
+    try:
+        for scope in ('hub_db', 'mail_config'):
+            with pytest.raises(Exception) as raised:
+                readers.require_scope(scope)
+            assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
+            assert raised.value.scope == scope
+    finally:
+        readers.release()
+    assert tripwires == []
+
+
+def test_missing_install_id_refuses_user_steps_not_empty(api, worlds, tripwires, tmp_path):
+    home = tmp_path / 'tenants' / 'bare'
+    with tripwires.disarmed():
+        seed_home(home, session='chat', marker='BARE')
+        (home / 'install_id').unlink()
+    readers = api.CoreReaders(home_context=ctx_for(home))
     try:
         with pytest.raises(Exception) as raised:
-            readers.done(['chat'])
+            readers.decision_inputs('chat', ['chat'])
     finally:
         readers.release()
     assert tripwires == []
     assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
-    assert raised.value.scope == 'origin_history'
+    assert raised.value.scope == 'user_steps'
+
+
+def test_replica_links_without_gateway_refuses_inventory(api, worlds, tripwires, tmp_path):
+    home = tmp_path / 'tenants' / 'replica-only'
+    with tripwires.disarmed():
+        seed_home(home, session='chat', marker='REPLICA-CFG')
+        (home / 'config.yaml').write_text(json.dumps({'kanban': {'sync': {'links_reader': 'replica'}}}))
+    readers = api.CoreReaders(home_context=ctx_for(home))
+    try:
+        with pytest.raises(Exception) as raised:
+            readers.external_capture({'chat': {'lineage': ['chat'], 'bundle': {}, 'refs': []}})
+    finally:
+        readers.release()
+    assert tripwires == []
+    assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
+    assert raised.value.scope == 'external_inventory'
+
+
+def test_done_history_reader_uses_home_ledger_not_ambient(api, worlds, tripwires, monkeypatch):
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    monkeypatch.setattr(readers, '_session_tasks', lambda ids, statuses: [])
+    try:
+        result = readers.done(['chat'])
+    finally:
+        readers.release()
+    assert tripwires == []
+    assert 'AMBIENT-MARKER' not in blob(result)
 
 
 def test_unavailable_hits_are_recorded_for_the_producer(api, worlds):
@@ -278,8 +321,8 @@ def test_unavailable_hits_are_recorded_for_the_producer(api, worlds):
     try:
         assert readers.unavailable_seen() == frozenset()
         with pytest.raises(Exception):
-            readers.linked(['chat'])
-        assert readers.unavailable_seen() == frozenset({'local_card_scope'})
+            readers.require_scope('hub_db')
+        assert readers.unavailable_seen() == frozenset({'hub_db'})
     finally:
         readers.release()
 
@@ -323,21 +366,21 @@ def payload_for(sessions, **extra):
     return {'body': body, 'accepted': time.monotonic() - 1}
 
 
-def test_provider_produced_payload_is_typed_unavailable_and_never_ambient(api, worlds, tripwires):
-    """The produced(payload) entry with a browser-shaped body: typed unavailable, not fresh-empty success."""
+def test_provider_produced_payload_is_complete_home_data_and_never_ambient(api, worlds, tripwires):
+    """The produced(payload) entry with a browser-shaped body: populated COMPLETE wire, not unavailable."""
     provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_explicit_acquisition_provider')
     ctx = ctx_for(worlds['explicit'])
     env_before = dict(os.environ)
     with launch_label_read(tripwires):
         produced = provider.open_provider({'home_context': ctx})  # import-time launch label: retained, see inventory
     try:
-        with pytest.raises(Exception) as raised:
-            produced(payload_for(['chat']))
+        wire = produced(payload_for(['chat']))
         assert tripwires == []
-        assert type(raised.value).__name__ == 'UnsupportedHomeAdapter', repr(raised.value)
-        assert raised.value.scope in {'user_steps', 'local_card_scope', 'panel_runtime_inputs', 'external_inventory'}
         assert produced.readers.home_context.home == ctx.home
-        assert str(worlds['ambient']) not in str(raised.value)
+        text = blob(wire)
+        assert 'AMBIENT-MARKER' not in text
+        assert str(worlds['ambient']) not in text.replace(str(ctx.home), '')
+        assert 'EXPLICIT-DATA' in text or worlds['task_id'] in text
     finally:
         produced.close()
     assert dict(os.environ) == env_before
@@ -346,14 +389,14 @@ def test_provider_produced_payload_is_typed_unavailable_and_never_ambient(api, w
 def test_provider_classification_is_typed_only_for_recorded_gate_refusals(api, worlds):
     provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_explicit_acquisition_provider2')
     produced = provider.open_provider({'home_context': ctx_for(worlds['explicit'])})
-    refused = 'UnsupportedHomeAdapter: explicit-home adapter unavailable for local_card_scope'
+    refused = 'UnsupportedHomeAdapter: explicit-home adapter unavailable for hub_db'
     try:
         produced.feed.failures = {'a': {'error': refused}}
         assert produced._unavailable_error(['a']) is None  # nothing recorded by a gate: never inferred from text
         with pytest.raises(Exception):
-            produced.readers.require_scope('local_card_scope')
+            produced.readers.require_scope('hub_db')
         typed = produced._unavailable_error(['a'])
-        assert type(typed).__name__ == 'UnsupportedHomeAdapter' and typed.scope == 'local_card_scope'
+        assert type(typed).__name__ == 'UnsupportedHomeAdapter' and typed.scope == 'hub_db'
         produced.feed.failures = {'a': {'error': refused}, 'b': {'error': 'RuntimeError: boom'}}
         assert produced._unavailable_error(['a', 'b']) is None  # one generic failure keeps the generic error
         produced.feed.failures = {'b': {'error': 'RuntimeError: boom'}}
@@ -445,19 +488,18 @@ def seed_replica_only_card(home: Path) -> str:
         conn.close()
 
 
-def test_replica_card_owner_is_gated_not_silently_ambient(api, worlds, tripwires):
-    """kfc.created_on resolves sync config from the process home and its failure was swallowed to owner=None."""
+def test_replica_card_owner_is_home_local_not_ambient(api, worlds, tripwires):
     with tripwires.disarmed():
         replica_id = seed_replica_only_card(worlds['explicit'])
     readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
     try:
-        with pytest.raises(Exception) as raised:
-            readers.card(replica_id, 'default')
+        rec = readers.card(replica_id, 'default')
     finally:
         readers.release()
     assert tripwires == []
-    assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
-    assert raised.value.scope == 'replica_card_owner'
+    assert rec['detail']['source'] == 'replica'
+    assert rec['detail']['task']['title'] == 'REPLICA-ONLY'
+    assert 'owner' in rec['detail']
 
 
 def test_live_card_is_served_even_when_a_replica_exists_for_other_cards(api, worlds, tripwires):
@@ -491,16 +533,89 @@ def test_every_gate_scope_is_declared_and_legacy_never_gates(api, worlds):
 
 
 @pytest.mark.parametrize('which', ['capture_local', 'capture_external'])
-def test_board_capture_module_refuses_explicit_readers_when_called_directly(which, api, worlds, tripwires):
-    """The module function is a second entry past the reader methods; it must gate itself."""
+def test_board_capture_module_does_not_use_ambient_on_direct_call(which, api, worlds, tripwires):
+    """The module function is a second entry past the reader methods; it must not resolve process home."""
     capture = api.CoreReaders.snapshot_modules()
     readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
     try:
         call = getattr(capture, which)
-        with pytest.raises(Exception) as raised:
+        with pytest.raises((TypeError, ValueError, AttributeError)):
             call(readers, None, None, None, None) if which == 'capture_local' else call(readers, None, None, None, {})
     finally:
         readers.release()
     assert tripwires == []
-    assert type(raised.value).__name__ == 'UnsupportedHomeAdapter'
-    assert raised.value.scope == 'snapshot_capture'
+
+
+def test_panel_producer_returns_populated_complete_wire(api, worlds, tripwires):
+    provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_explicit_sources_provider')
+    ctx = ctx_for(worlds['explicit'])
+    env_before = dict(os.environ)
+    with launch_label_read(tripwires):
+        produced = provider.open_provider({'home_context': ctx})
+    try:
+        wire = produced(payload_for(['chat']))
+    finally:
+        produced.close()
+    assert tripwires == []
+    assert dict(os.environ) == env_before
+    text = blob(wire)
+    assert 'EXPLICIT-DATA' in text
+    assert worlds['task_id'] in text
+    assert 'AMBIENT-MARKER' not in text
+
+
+def test_two_homes_equal_labels_contradictory_rows(api, worlds, tripwires, tmp_path):
+    other = tmp_path / 'tenants2' / 'researcher'
+    with tripwires.disarmed():
+        other_id = seed_home(other, session='chat', marker='OTHER-DATA')
+    a = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    b = api.CoreReaders(home_context=ctx_for(other))
+    try:
+        left = a.linked(['chat'])
+        right = b.linked(['chat'])
+        from test_explicit_home_context import outcome_marker
+        assert outcome_marker(a, 'chat') == 'EXPLICIT-DATA'
+        assert outcome_marker(b, 'chat') == 'OTHER-DATA'
+        assert worlds['task_id'] in blob(left)
+        assert other_id in blob(right)
+        assert worlds['task_id'] not in blob(right)
+        assert other_id not in blob(left)
+        assert a._home_identity()['profile'] == b._home_identity()['profile']
+        assert a.home_context.home != b.home_context.home
+    finally:
+        a.release()
+        b.release()
+    assert tripwires == []
+
+
+def test_capture_local_returns_home_card(api, worlds, tripwires):
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    mod = readers.snapshot_modules()
+    m = mod.snapshot
+    path = str(worlds['explicit'] / 'kanban.db')
+    source = m.SourceKey('gw-explicit', 'researcher', 'default', 'local', path)
+    store = m.SnapshotStore()
+    store.add_source(source)
+    hint = mod.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+    try:
+        part = readers.capture_local(source, None, store.demands(source), hint)
+    finally:
+        readers.release()
+    assert tripwires == []
+    assert 'kanban.db' in part.receipt.source.canonical_path
+    assert part.receipt.source.gateway == 'gw-explicit'
+
+
+def test_stale_missing_ledger_is_not_fresh_empty_success(api, worlds, tripwires, tmp_path):
+    home = tmp_path / 'tenants' / 'broken-ledger'
+    with tripwires.disarmed():
+        seed_home(home, session='chat', marker='BROKEN')
+        ledger = home / 'kanban' / 'origin-ledger.db'
+        ledger.write_bytes(b'not-a-sqlite-database')
+    readers = api.CoreReaders(home_context=ctx_for(home))
+    try:
+        with pytest.raises(Exception):
+            readers.done(['chat'])
+    finally:
+        readers.release()
+    assert tripwires == []

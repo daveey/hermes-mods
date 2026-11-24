@@ -42,10 +42,20 @@ def _reuse(previous, values):
 
 
 def _require_adapter(readers):
-    """Explicit-home readers refuse capture before any ambient card scope or shadow lookup (direct callers too)."""
+    """Legacy omitted-context still gates; explicit-home readers capture via home-local scope."""
+    if getattr(readers, 'home_context', None) is not None:
+        return
     require = getattr(readers, 'require_scope', None)
     if callable(require):
         require('snapshot_capture')
+
+
+def _scope_for(readers, path):
+    fn = getattr(readers, 'card_scope_for', None)
+    if callable(fn) and getattr(readers, 'home_context', None) is not None:
+        return fn(path)
+    from hermes_cli.kanban_execution_observations import card_scope
+    return card_scope(path)
 
 
 def capture_local(readers, source, prior_part, demands, hints):
@@ -57,7 +67,7 @@ def capture_local(readers, source, prior_part, demands, hints):
     """
     _require_adapter(readers)
     from hermes_cli import kanban_task_change as changes
-    from hermes_cli.kanban_execution_observations import card_scope, add_cards
+    from hermes_cli.kanban_execution_observations import add_cards
     from hermes_cli.kanban_session_acquisition import enrich_session_tasks
     from hermes_cli.kanban_session_outcome_tasks import select_listed_local_task_set
     from hermes_cli.kanban_session_activity import LISTED_STATUSES
@@ -66,7 +76,7 @@ def capture_local(readers, source, prior_part, demands, hints):
         raise ValueError('canonical local capture requires a local source')
     demands = freeze(demands)
     path = Path(source.canonical_path)
-    scope = card_scope(path)  # identity/config resolution precedes the SQL snapshot
+    scope = _scope_for(readers, path)  # identity/config resolution precedes the SQL snapshot
     before = readers._stat(path)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -197,7 +207,7 @@ def capture_local(readers, source, prior_part, demands, hints):
     # Projection is canonical and detached, outside the SQL transaction. Cached
     # rows retain their original observation: reuse never renews an execution lease.
     projected = [raw[_key(source, tid)] for tid in refresh]
-    add_cards(projected, now=hints.observed_at)
+    add_cards(projected, now=hints.observed_at, gateway=scope[0], profile=scope[1])
     rows = _reuse(previous.rows if previous else {}, raw)
     details = _reuse(previous.details if previous else {}, details)
     metrics['full'] = full
@@ -329,7 +339,7 @@ def _external_closure(readers, rows, scope_keys, demands, hints, deadline):
                     if key.profile != 'default':
                         unknown.add(sid)
                         continue
-                    path = Path(readers.ksc.shadow_path(key.board))
+                    path = Path(readers._shadow_path(key.board))
                     if not path.is_file():
                         unknown.add(sid)
                         continue
