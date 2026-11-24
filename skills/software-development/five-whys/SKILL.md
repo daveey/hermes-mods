@@ -237,7 +237,7 @@ Countermeasures:
 
 ### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
 
-For a chain going into a new card's body, check the draft before `kanban_create`: a worker claims the card within minutes, so a fix round after filing needs a body edit plus a steer its live run actually receives.
+Check the draft before it is posted, not after: a chain for a new card's body before `kanban_create` (a worker claims the card within minutes, so a fix round after filing needs a body edit plus a steer its live run actually receives), and one for a comment, such as a HERMES-NOTE that names a cause, before posting (a comment stays as written, so a fix round is a second comment).
 
 ## Done means
 - [ ] For `backend-timeouts`, did the unchanged detector show `count: 0` over a full fresh 30-minute production window starting after final serving-process activation, with failed cold-call evidence (including over-budget 17-second calls) preserved and operational acceptance kept separate from historical causal attribution, rather than treating fast individual calls or a recovered reboot as proof?
