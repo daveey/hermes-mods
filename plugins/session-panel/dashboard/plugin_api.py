@@ -108,6 +108,19 @@ def _external_projection():
     return external
 
 
+def _legacy_fenced() -> bool:
+    """True from legacy retirement (or a stored external selection at start) until the lifecycle's own
+    successor step lifts it. Retained callbacks (reload RESTART, facts latch, request fallbacks) check this
+    instead of reviving a retired generation; a failed drain or failed external start keeps it set."""
+    return bool(getattr(_LOADER, 'legacy_fenced', False))
+
+
+def _start_legacy_authorized() -> bool:
+    """The lifecycle's one successor step: lift the fence, then start the legacy owner."""
+    _LOADER.legacy_fenced = False
+    return start_publication()
+
+
 def _legacy_http_unavailable() -> bool:
     """Missing relay during selected external custody is unavailable, never legacy authority.
 
@@ -1588,6 +1601,8 @@ def attach_external(relay) -> None:
     """Bind an exec relay: HTTP projection serving plus ordered event delivery to this serve's clients.
 
     Dormant: nothing in this module calls it; the lifecycle owner does, after COMPLETE admission."""
+    if getattr(relay, 'retired', True):
+        raise RuntimeError('relay retired: a retained callback cannot attach a withdrawn generation')
     _LOADER.external_projection = relay
     relay.set_event_sink(_emit)
 
@@ -1619,28 +1634,25 @@ def _panel_provider_spec() -> dict:
                 'facts': {'HERMES_FACTS_PANEL': _mitigation('HERMES_FACTS_PANEL')}}}
 
 
-def _retire_legacy_panel() -> bool:
-    """Positive retirement of this process's legacy owner: True only when its threads are gone and the
-    process feed slot is cleared (the pre-import guard then admits the lifecycle-authorized attach)."""
+def _retire_legacy_panel(timeout: float = 25.0) -> bool:
+    """Positive retirement of this process's legacy owner: True only when EVERY lane is gone (feed, decision,
+    board and watch threads plus board capture workers and the capacity service) and the process feed slot is
+    cleared. The fence goes up first and stays up on any failure: no retained callback restarts a legacy owner."""
+    _LOADER.legacy_fenced = True
     core = sys.modules.get(_FEED_KEY)
     starting = _LOADER.__dict__.get('starting')
     if starting is not None and starting.is_alive():
-        starting.join(10)
+        starting.join(min(10.0, timeout))
         if starting.is_alive():
             return False
     f = getattr(core, 'PROCESS_FEED', None)
     if f is not None:
-        f.stopped.set()
         for attr in ('_wake', '_decide', '_board'):
             event = getattr(f, attr, None)
             if event is not None:
                 event.set()
-        for attr in ('_feed_thread', '_decision_thread', '_board_thread'):
-            thread = getattr(f, attr, None)
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(10)
-                if thread.is_alive():
-                    return False
+        if not _quiesce(f, timeout):
+            return False
         if getattr(_LOADER, 'facts_registration', None) is not None:
             return False  # FACTS custody is not ours to drop here
         core.PROCESS_FEED = None
@@ -1667,13 +1679,13 @@ def make_panel_relay(home, runtime, generation=None):
 
 
 def install_panel_lifecycle(environ=None):
-    """Join the one installation-local mode/custody seam. Returns the lifecycle, or None when neither
-    HERMES_SERVE_PANEL_EXTERNAL nor HERMES_SERVE_PRODUCERS_EXTERNAL is set (legacy serves are untouched).
+    """Join the one installation-local mode/custody seam. Returns the lifecycle, or None only when core has
+    no seam (an older core: legacy only).
 
+    A serve naming neither selector joins read-only: it creates no installation state, never writes the mode
+    and starts its legacy owner, but it watches the revisioned mode like every OFF serve (a cheap stat poll).
     Dormant: nothing selects external mode on a real serve until the activation owner sets it."""
     env = os.environ if environ is None else environ
-    if env.get('HERMES_SERVE_PANEL_EXTERNAL') is None and env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is None:
-        return None
     try:
         from hermes_cli import serve_producer_lifecycle as lifecycle_mod
         from hermes_cli import serve_producer_mode as mode_mod
@@ -1682,12 +1694,17 @@ def install_panel_lifecycle(environ=None):
         return None  # an older core has no seam: legacy only
     installation = Path(get_hermes_home())
     runtime = installation / 'serve-producers' / 'runtime'
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-    mode_mod.initialize_mode(installation, dict(env))
+    if env.get('HERMES_SERVE_PANEL_EXTERNAL') is not None or env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is not None:
+        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mode_mod.initialize_mode(installation, dict(env))
     external = mode_mod.effective_external(installation, dict(env))
 
     def make_relay():
         return make_panel_relay(installation, runtime)
+
+    def admit():
+        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)  # first external start creates the custody dirs
+        return lifecycle_mod.default_admit(runtime, installation, root=installation)
 
     def publish_initial(relay, timeout=60.0):
         key = relay.submit(panel_initial_payload())
@@ -1699,14 +1716,15 @@ def install_panel_lifecycle(environ=None):
         return False
 
     lifecycle = lifecycle_mod.PanelLifecycle(
-        installation,
-        admit=lambda: lifecycle_mod.default_admit(runtime, installation, root=installation),
-        retire_legacy=_retire_legacy_panel, start_legacy=start_publication, make_relay=make_relay,
+        installation, admit=admit,
+        retire_legacy=_retire_legacy_panel, start_legacy=_start_legacy_authorized, make_relay=make_relay,
         publish_initial=publish_initial, attach=attach_external, detach=detach_external,
         environ=dict(env), legacy_running=not external)
-    if not external:
-        start_publication()  # OFF serves run the legacy owner and watch the mode
     _LOADER.panel_lifecycle = lifecycle
+    if external:
+        _LOADER.legacy_fenced = True  # a stored external selection: no legacy owner before the lifecycle's say
+    else:
+        start_publication()  # OFF serves run the legacy owner and watch the mode
     lifecycle.start_watching()
     return lifecycle
 
@@ -1953,6 +1971,8 @@ def feed():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
     if _external_projection() is not None:
         raise RuntimeError('external projection excludes legacy feed startup')
+    if _legacy_fenced():
+        raise RuntimeError('legacy feed startup fenced by the panel lifecycle')
     while True:
         core = _load_feed()
         with core.PROCESS_LOCK:
@@ -2205,6 +2225,8 @@ def _facts_mode_changed(mode, generation, *, token=None):
     """Off-request latch callback; repeated generations never duplicate lanes."""
     if mode not in ('legacy', 'facts'):
         raise ValueError('unsupported facts mode')
+    if _legacy_fenced():
+        return  # a delayed latch callback never restarts a retired or fenced legacy owner
     core = _load_feed()
     _LOADER.__dict__.setdefault('facts_transition_lock', threading.Lock())
     with _LOADER.facts_transition_lock:
@@ -2854,7 +2876,7 @@ _WIRE_PREFIX = json.dumps({'feed': FEED_ID, 'profile': LAUNCH_PROFILE},
 def start_publication() -> bool:
     """Start (or resume) the process's feed on its own thread; True when a start was launched. Disk restore and the
     feed lifecycle locks never run on an interactive request. One start in flight per process."""
-    if _external_projection() is not None:
+    if _external_projection() is not None or _legacy_fenced():
         return False
     running = _LOADER.__dict__.get('starting')
     if running is not None and running.is_alive():

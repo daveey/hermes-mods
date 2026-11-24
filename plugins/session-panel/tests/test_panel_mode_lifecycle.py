@@ -57,7 +57,14 @@ def served(tmp_path, monkeypatch):
         db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
         db.execute("INSERT INTO sessions VALUES ('chat',NULL,'{}')")
     monkeypatch.setattr(lifecycle_mod, 'default_admit', complete_admit)
+    import types
+    loader = sys.modules.setdefault('_session_panel_feed_loader', types.ModuleType('_session_panel_feed_loader'))
+    reset = ('legacy_fenced', 'panel_lifecycle', 'external_projection', 'starting')
+    for attr in reset:  # the loader module is shared by every load_api() copy in this process
+        loader.__dict__.pop(attr, None)
     yield tmp_path
+    for attr in reset:
+        loader.__dict__.pop(attr, None)
     core = sys.modules.get(FEED_KEY)
     feed = getattr(core, 'PROCESS_FEED', None)
     if feed is not None:
@@ -65,10 +72,95 @@ def served(tmp_path, monkeypatch):
         core.PROCESS_FEED = None
 
 
-def test_unset_env_leaves_serve_untouched(served):
+def test_unset_env_serve_watches_read_only_and_follows_the_setter(served, monkeypatch):
     api = load_api('_mode_unset_api')
-    assert api.install_panel_lifecycle({}) is None
-    assert not (served / 'serve-producers').exists(), 'no selection state without an explicit stage selector'
+    starts = []
+    monkeypatch.setattr(api, 'start_publication', lambda: (starts.append(1), True)[1])
+    lifecycle = api.install_panel_lifecycle({})
+    try:
+        assert lifecycle is not None and lifecycle.state == 'off' and starts == [1]
+        assert not (served / 'serve-producers').exists(), 'watching creates no installation state'
+        assert lifecycle._thread is not None and lifecycle._thread.is_alive()
+        write_mode(served, external=True)  # the one supported setter; this serve had no env at all
+        wait_until(lambda: lifecycle.state == 'external')
+        assert api._external_projection() is lifecycle.relay
+        write_mode(served, external=False)
+        wait_until(lambda: lifecycle.state == 'off')
+        assert api._external_projection() is None and starts == [1, 1]
+    finally:
+        lifecycle.stop_watching()
+        if lifecycle.relay is not None:
+            api.detach_external(lifecycle.relay)
+            lifecycle.relay.close(timeout=10)
+
+
+def test_unset_env_serve_follows_a_stored_external_mode_at_start(served, monkeypatch):
+    api = load_api('_mode_stored_api')
+    starts = []
+    monkeypatch.setattr(api, 'start_publication', lambda: (starts.append(1), True)[1])
+    write_mode(served, external=True)
+    lifecycle = api.install_panel_lifecycle({})
+    try:
+        assert starts == [], 'a stored external mode never starts a legacy owner first'
+        assert api._legacy_fenced(), 'the legacy owner is fenced from the first instant'
+        wait_until(lambda: lifecycle.state == 'external')
+    finally:
+        lifecycle.stop_watching()
+        if lifecycle.relay is not None:
+            api.detach_external(lifecycle.relay)
+            lifecycle.relay.close(timeout=10)
+
+
+def test_retired_legacy_is_fenced_against_every_retained_callback(served, monkeypatch):
+    api = load_api('_fence_api')
+    started = []
+    assert not api._legacy_fenced()
+    assert api._retire_legacy_panel() is True
+    assert api._legacy_fenced()
+    assert api.start_publication() is False
+    with pytest.raises(RuntimeError, match='fenced'):
+        api.feed()
+    api._facts_mode_changed('legacy', 7)  # a delayed core latch callback is a no-op, not a restart
+    assert getattr(sys.modules.get(FEED_KEY), 'PROCESS_FEED', None) is None and started == []
+    assert api._LOADER.__dict__.get('starting') is None
+    monkeypatch.setattr(api, 'start_publication', lambda: started.append('start') or True)
+    api._start_legacy_authorized()  # only the lifecycle's own successor step lifts the fence
+    assert started == ['start'] and not api._legacy_fenced()
+
+
+def test_retire_legacy_drains_every_lane_not_just_three_threads(served):
+    import types
+    api = load_api('_drain_api')
+    core = api._load_feed()
+    release = threading.Event()
+    watcher = threading.Thread(target=release.wait, name='stuck-watch', daemon=True)
+    watcher.start()
+    fake = types.SimpleNamespace(stopped=threading.Event(), lock=threading.RLock(), _watch_thread=watcher)
+    core.PROCESS_FEED = fake
+    try:
+        assert api._retire_legacy_panel(timeout=0.2) is False, 'a surviving lane keeps custody'
+        assert core.PROCESS_FEED is fake and fake.stopped.is_set()
+        assert api._legacy_fenced(), 'fence retained: no automatic fallback after a failed drain'
+        release.set()
+        watcher.join(5)
+        assert api._retire_legacy_panel(timeout=5) is True and core.PROCESS_FEED is None
+    finally:
+        release.set()
+        core.PROCESS_FEED = None
+
+
+def test_attach_refuses_a_withdrawn_generation(served):
+    import types
+    api = load_api('_attach_api')
+    sunk = []
+    stale = types.SimpleNamespace(retired=True, set_event_sink=sunk.append)
+    with pytest.raises(RuntimeError, match='retired'):
+        api.attach_external(stale)
+    assert api._external_projection() is None and sunk == []
+    live = types.SimpleNamespace(retired=False, set_event_sink=sunk.append)
+    api.attach_external(live)
+    assert api._external_projection() is live and len(sunk) == 1
+    api.detach_external(live)
 
 
 def test_setter_moves_one_serve_legacy_external_legacy_without_restart(served, monkeypatch):

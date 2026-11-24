@@ -11,7 +11,10 @@ unless a serve is launched with one of the two environment variables below.
 - Master override: `HERMES_SERVE_PRODUCERS_EXTERNAL=0` forces OFF. A serve started with it publishes OFF
   (a new revision if the stored mode was ON) so external peers drain.
 - Unset variables never overwrite a stored mode: the runtime setter stays durable across restarts.
-  A serve started with **neither** variable does not touch the seam at all (legacy behaviour unchanged).
+  A serve started with **neither** variable still joins the seam *read-only*: it creates no installation
+  state and never writes the mode, runs its legacy owner, and watches the mode file (a `stat` poll; the file is
+  re-read only when its stamp changes). A stored external mode is followed at start (the legacy owner is fenced
+  from the first instant, so nothing starts it before the lifecycle's own transition).
 - An env file alone does **not** update a running serve.
 
 ## One supported runtime setter (no serve PID restart)
@@ -30,12 +33,14 @@ boolean; the file is the same mode the environment initializes.
 
 ## Transitions (same serve PID, both directions)
 
-OFF → EXTERNAL: strict COMPLETE admission under the held LaunchGate → positive legacy retirement (feed
-threads joined and the process feed slot cleared) → exec broker+child (execution fence before provider
+OFF → EXTERNAL: strict COMPLETE admission under the held LaunchGate → positive legacy retirement (every
+lane drained: feed/decision/board/watch threads, board capture workers and the capacity service; the process feed
+slot cleared; the legacy fence stays up) → exec broker+child (execution fence before provider
 import; provider manifest digests verified first) → completed initial publication → atomic attach of
 route + event sink (READY).
 
-EXTERNAL → OFF: revoke the output/ACK generation → detach (admission closed, event sink dropped) → wait
+EXTERNAL → OFF: withdraw the relay generation (outputs/ACKs revoked; the relay can never serve, enqueue or attach
+again, so a retained callback cannot revive it) → detach (admission closed, event sink dropped) → wait
 for the whole family to exit → only then start the legacy owner.
 
 Any failed step, incomplete admission, un-retired legacy owner or surviving child/descendant leaves the panel
