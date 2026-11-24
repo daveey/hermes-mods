@@ -913,6 +913,7 @@ class CoreReaders:
             except Exception as exc:
                 left = [f'{type(exc).__name__}: {exc}']
             timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
+                            'at': time.time(), 'unchanged': bool(getattr(left, 'unchanged', False)),
                             'deferred': bool(left)})
             if left:
                 deferred.add(session)

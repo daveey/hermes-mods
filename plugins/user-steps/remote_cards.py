@@ -152,6 +152,25 @@ class Remote:
         self.gateway = gateway
         self.courier = courier
 
+    def input_stamp(self, store_path):
+        """Cheap source revisions, not another membership projection.
+
+        An injected membership adapter has no declared inputs. Unreadable stamps
+        disable success memoization, never vouch for an empty remote inventory.
+        The caller retains a 60s full-pass ceiling for time/courier transitions.
+        """
+        if self.cards is not linked_cards:
+            return None
+        try:
+            from hermes_cli import kanban_session_activity as activity
+            view = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
+            return (activity._activity_fingerprint(),
+                    view._file_sig(view.db_path()),
+                    view._file_sig(self.mirror.core._state_db()),
+                    view._file_sig(Path(store_path)))
+        except Exception:
+            return None
+
     def snapshots(self, owner):
         for row in self.cards(owner):
             try:

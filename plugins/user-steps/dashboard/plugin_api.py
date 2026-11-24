@@ -255,6 +255,11 @@ def panel_requests_many(home: Path, lineages) -> dict:
             for sid, group in scopes.items()}
 
 
+class PanelReconcileResult(list):
+    """Deferred owners plus a conservative unchanged-source timing annotation."""
+    unchanged = False
+
+
 def panel_reconcile(home: Path, session: str, lineage) -> list:
     """Source-event producer, separate from read-only panel presentation.
 
@@ -270,11 +275,14 @@ def panel_reconcile(home: Path, session: str, lineage) -> list:
             raise
         return []  # queried absent own session, not failed source or failed reconciliation
     producer = _load('kanban_mirror').Mirror(core, core.ActionStore())
-    deferred = []
+    deferred = PanelReconcileResult()
+    deferred.unchanged = bool(owners)
     for own in owners:
         try:
-            producer.reconcile(own, strict=True)
+            producer.reconcile_panel(own)
+            deferred.unchanged = deferred.unchanged and producer.panel_remote_unchanged
         except Exception as exc:
+            deferred.unchanged = False
             deferred.append(f"{own['storedSessionId']}: {type(exc).__name__}: {exc}"[:300])
     return deferred
 
