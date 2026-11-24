@@ -295,6 +295,17 @@ API is retained for compatibility but no longer consumed by the panel. Live
 latency improvement requires a separate installed measurement; unit reuse is not
 that proof.
 
+The complete inventory scan uses a bounded content-addressed decoder cache
+(65,536 compact records, no full task bodies or SQLite handles). Every capture
+still reads and SHA-256 hashes every current publication, including unrelated
+records; unchanged bytes reuse only identity, creation identity and scoped links.
+Selected publications are decoded in full inside the same read transaction.
+Version numbers, DB/WAL identity and cache age never certify membership. New or
+same-version changed/malformed records, removals, re-homes, source freshness and
+owner evidence still pass through the complete capture fences. The scale
+regression exercises a successful panel memo at 27,000 unrelated publications,
+guards decode work plus thread CPU, and checks same-version malformed changes.
+
 Both project a
 blocked or triage work card's `human_request` into one server-bound `choice`
 request. Block-loop escalation events are part of the generation fence. Explicit `{label, value}` choices retain their
