@@ -356,6 +356,12 @@ class SourceCoordinator:
                 self._active_ages[s] = age
                 if s in state['active']:
                     self.pending.setdefault(s, age)
+                    a = projections[s]
+                    if a.count and a.retry_at is None:
+                        # Fenced in-flight retry consumed its attempt just like
+                        # acquisition above. Preserve budget/age and give it the
+                        # existing bounded delay, not an eternal in-flight mark.
+                        a.retry_at = self.feed._backoff(a.count)
         # Forget/rewatch still wins over copied identities; _register handles its
         # exact token/lineage transition before any capture can claim coverage.
         self.canonical_dirty = {s: i for i, s in enumerate(self.chats, 1)}
@@ -1005,10 +1011,6 @@ class SourceCoordinator:
                     else:
                         for ticket in tickets:
                             ticket.error = RuntimeError('snapshot watch was replaced')
-                elif (not projection.missing_scopes and s not in self.pending
-                      and self.store.current(projection.admission)):
-                    self.feed._board_failures.discard(s)
-                    self.feed._retry.discard(s)
                 if (result.disposition != 'superseded'
                         and self.store.current(projection.admission)
                         and self._queue_generations.get(s, 0) == queued_generation
@@ -1024,6 +1026,18 @@ class SourceCoordinator:
                     # owed and preserve their original first-unserved age.
                     self.pending.pop(s, None)
                     self.projection_attempts.pop(s, None)
+                elif result.disposition in {'stored', 'no_change'}:
+                    # Success served this attempt, but a post-pin request is
+                    # still owed. Re-arm its existing finite budget; leaving
+                    # retry_at=None with count>0 would mean permanently in-flight.
+                    attempt = self.projection_attempts.get(s)
+                    if attempt is not None and attempt.count and attempt.retry_at is None:
+                        attempt.retry_at = self.feed.clock()
+                if (result.disposition != 'superseded' and not projection.missing_scopes
+                        and s not in self.pending and self.store.current(projection.admission)):
+                    # Evaluate after served-episode removal, not before it.
+                    self.feed._board_failures.discard(s)
+                    self.feed._retry.discard(s)
             for ticket in tickets:
                 if result.disposition in {'stored', 'no_change'}:
                     # The writer may have merged a newer canonical component
