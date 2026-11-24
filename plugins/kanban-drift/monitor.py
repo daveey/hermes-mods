@@ -153,8 +153,15 @@ def collect(argv, timeout=90):
         return report
 
 
+# Repair cards this monitor files are owned by core's standing "Kanban owner: kanban-drift" chat
+# (hermes_cli.kanban_owner_chat), so a scope or budget stop on one is decided by that chat, not left for a human.
+PRODUCER = "kanban-drift"
+PRODUCER_ENV = "HERMES_KANBAN_PRODUCER"
+
+
 def native_tool(name, args):
     from model_tools import handle_function_call
+    os.environ[PRODUCER_ENV] = PRODUCER  # named over the cron job's default, so the owner chat reads as this monitor
     result = json.loads(handle_function_call(name, args))
     if result.get("error") or result.get("success") is False:
         raise RuntimeError(json.dumps(result))

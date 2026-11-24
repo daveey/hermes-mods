@@ -615,3 +615,18 @@ def test_restart_from_old_state_with_counters_posts_nothing(tmp_path):
     assert sum(n == "kanban_comment" for n, _ in tools.calls) == 0
     m.sample("hub/default", {**old, "checked": 250, "foreign_cards": 40, "rejected_ops": 7})
     assert sum(n == "kanban_comment" for n, _ in tools.calls) == 1
+
+
+def test_native_tool_declares_the_monitor_as_its_cards_producer(monkeypatch):
+    seen = {}
+
+    def fake_handle(name, args):
+        import os
+        seen["producer"] = os.environ.get(monitor.PRODUCER_ENV)
+        return json.dumps({"task_id": "t_x"})
+
+    import types
+    monkeypatch.setitem(sys.modules, "model_tools", types.SimpleNamespace(handle_function_call=fake_handle))
+    monkeypatch.setenv(monitor.PRODUCER_ENV, "cron:a9ff61f12e19")
+    assert monitor.native_tool("kanban_create", {"title": "x"}) == {"task_id": "t_x"}
+    assert seen["producer"] == "kanban-drift"
