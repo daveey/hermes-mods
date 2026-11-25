@@ -224,7 +224,7 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 - Mac probes that a worker reports "no agent route" for (mini/MacBook check_compat, git ancestry, sqlite reads) often
   run directly with `tailnet_exec` from the user's interactive chat. A host outside `tailnet.auto_hosts` returns an
   approval request instead; name it in the report.
-- Review card gave up on `review_model_unavailable`, or an ask to delete a scratch workspace: `references/gave-up-recipes.md`.
+- Review card gave up on `review_model_unavailable`, a `workspace_kind=dir but no workspace_path` spawn loop, or an ask to delete a scratch workspace: `references/gave-up-recipes.md`.
 
 ## 4. Ask about the rest: `clarify`, no timeout
 

@@ -28,6 +28,20 @@ only restart-safe runs; run it in the background, because the drain plus apply o
 read back HEAD and a `kanban sync: default primary` log line. Exact-model recovery pins are not an alternative
 to supported capability routing and independent custody.
 
+## Spawn loop: `workspace_kind=dir but no workspace_path`
+
+The card fails before any agent starts, and triage sweeps or promoting it without fixing the path repeat the failure. Its
+recovery card's worker can't repair it, because the worker mutation fence refuses `set_workspace_path`. From the
+owning chat (a non-worker process) on the card's home gateway:
+1. Take the path from the card's `created` event payload (`workspace_path`). Check that the directory exists and
+   `git status -sb` is clean.
+2. Run this in `execute_code`. Hermes's python has the core deps, and a bare system python fails on imports:
+   `from hermes_cli.kanban_db_connect import connect_closing; from hermes_cli.kanban_db_workspace import set_workspace_path, resolve_workspace`.
+   Then `with connect_closing(board=B) as c:`, call `with c: set_workspace_path(c, id, path)`, and check
+   `resolve_workspace(kb.get_task(c, id), board=B)`.
+3. Run `hermes kanban --board B promote --seen <newest cid> <id> "<restored path + why>"`. Then read back a fresh
+   `spawned` + `worker_bound` event, not just `ready`. Archive the recovery card and comment on the original.
+
 ## Deleting a finished card's scratch workspace
 
 Core scratch GC removes terminal cards' scratch trees after `kanban.worktree_retention_days`. Comment that and
