@@ -147,7 +147,10 @@ def pytest_sessionstart(session):
     reporter = config.pluginmanager.get_plugin('terminalreporter')
     _CI_PROGRESS.update(reporter=reporter, started=time.monotonic(), completed=0)
     if reporter:
-        receipt = dict(python=platform.python_version(), cpu_count=os.cpu_count(),
+        import sqlite3
+        import _sqlite3
+        receipt = dict(sqlite_version=sqlite3.sqlite_version, sqlite_threadsafety=sqlite3.threadsafety,
+                       sqlite_module=_sqlite3.__file__, python=platform.python_version(), cpu_count=os.cpu_count(),
                        affinity=len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
                        worker_count=getattr(config.option, 'numprocesses', 0) or 0,
                        dist=getattr(config.option, 'dist', 'no'),
@@ -303,7 +306,7 @@ def pytest_sessionfinish(session, exitstatus):
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node, error):
-    violations = node.workeroutput.get('coach_isolation_violations', [])
+    violations = getattr(node, 'workeroutput', {}).get('coach_isolation_violations', [])
     existing = getattr(node.config, '_coach_worker_violations', [])
     node.config._coach_worker_violations = existing + violations
 
