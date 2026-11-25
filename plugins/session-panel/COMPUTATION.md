@@ -12,7 +12,10 @@ exceed the unchanged client HTTP deadline; this fix reduces duplicated work, not
 
 `CoreReaders.batch` retains only thread-local, pass-scoped work. It shares local enriched rows per
 board/status set and replica inventory before lineage-dependent origin-obligation deduplication.
-Core's per-lineage membership selector still chooses creator/subscriber membership and `via`.
+Core's membership selector still chooses creator/subscriber membership and `via`: it runs once per
+board/status set over the whole pass's ids (`select_listed_local_task_set`), and each lineage takes its
+cards from those (session, card) pairs in the selector's own order with creator precedence
+(`_lineage_members`), not one selector call per chat.
 Successful projected local rows populate the ordinary core busy memo. A failed union read falls
 back once to core's ordinary per-lineage reads; execution-evidence errors also trigger that fallback.
 Card details are deep-copied from a pass memo; unavailable/missing cards are not negative-cached.

@@ -867,14 +867,15 @@ class CoreReaders:
     def batch(self, sessions):
         """Thread/pass-local hydration only. Nothing survives this context or crosses profiles/requests.
 
-        Local membership is still core's creator/subscriber selector; remote inventory is cached BEFORE
-        core's lineage-key dedup, so a card linked to two chats remains in both. Errors are not memoized.
+        Local membership is still core's creator/subscriber selector, read once per board and status set for the
+        whole pass (`_lineage_members`); remote inventory is cached BEFORE core's lineage-key dedup, so a card
+        linked to two chats remains in both. Errors are not memoized.
         """
         previous = getattr(self._local, 'batch', None)
         if previous is not None:
             yield
             return
-        scope = {'lineages': {}, 'local': {}, 'remote': {}, 'cards': {}}
+        scope = {'lineages': {}, 'local': {}, 'members': {}, 'remote': {}, 'cards': {}}
         self._local.batch = scope
         try:
             for s in sessions:
@@ -901,7 +902,7 @@ class CoreReaders:
                 except FileNotFoundError:
                     stamp.append((str(path), None))
             if scope.get('stamp') != stamp:
-                for name in ('local', 'remote', 'cards'):
+                for name in ('local', 'members', 'remote', 'cards'):
                     scope[name].clear()
                 scope.pop('history', None)
                 scope.pop('local_failed', None)
@@ -917,7 +918,7 @@ class CoreReaders:
         if (scope is None or len(scope['lineages']) < 2 or len(scope['ids']) > 400
                 or not set(ids) <= set(scope['ids'])):
             return ksa.session_tasks(ids, statuses, stale_ok=True)
-        from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
+        from hermes_cli.kanban_session_outcome_tasks import select_listed_local_task_set
         from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
         from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
         from hermes_cli.kanban_execution_observations import add_cards
@@ -937,7 +938,11 @@ class CoreReaders:
                 c = self.conn(path)
                 if c is None:
                     raise RuntimeError('session-panel membership board unavailable')
-                members = select_listed_local_tasks(c, ids, statuses)
+                if key not in scope['members']:
+                    # Every pass chat's (session, card) -> via pairs in one selector call per board and status set,
+                    # not one per chat: 340 calls / ~4,000 statements of a 16-chat hub pass were this loop.
+                    scope['members'][key] = select_listed_local_task_set(c, scope['ids'], statuses, strict=False)[1]
+                members = _lineage_members(scope['members'][key], ids)
                 # A writer may have changed membership after the union read; never omit a new card.
                 if not members.keys() <= rows.keys():
                     return ksa.session_tasks(ids, statuses, stale_ok=True)
@@ -1481,6 +1486,24 @@ class CoreReaders:
             if owned_snapshot and c.in_transaction:
                 c.rollback()
         return out
+
+
+def _lineage_members(pairs, ids):
+    """`select_listed_local_tasks(conn, ids, statuses)` derived from the pass's `select_listed_local_task_set` pairs.
+
+    The selector runs its three membership queries (creator, created link, tui subscription) with the chat ids as an
+    `IN (json_each)` list, which SQLite materializes as a sorted ephemeral index: the rows for a subset of the ids are
+    the union's rows for those ids, in the union's order. `pairs` keeps each (session, card) at its first row, so the
+    first pair naming one of `ids` places the card where the lineage's own read finds it first. A created pair wins
+    over a subscription, as the selector's creator precedence does (creator rows precede subscription rows)."""
+    wanted = set(ids)
+    members = {}
+    for (session, tid), via in pairs.items():
+        if session in wanted:
+            member = members.setdefault(tid, {'via': via})
+            if via == 'created':
+                member['via'] = 'created'
+    return members
 
 
 def _diagnostic_refs(detail):
