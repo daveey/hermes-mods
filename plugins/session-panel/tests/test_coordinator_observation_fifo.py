@@ -87,7 +87,7 @@ class Gate:
         self.lane, self.cond = lane, threading.Condition()
         self.order, self.inside, self.gates, self.peak = [], set(), {}, 0
         self.start_seq = {}
-        original = lane._project
+        original = self.original = lane._project
         def held(s):
             with self.cond:
                 self.start_seq[s] = len(self.order)
@@ -184,7 +184,7 @@ def _inject(name, monkeypatch, r, lane, hot, sessions):
     return action, threads, errors, failures
 
 
-def _run(api, board, monkeypatch, event=None):
+def _run(api, board, monkeypatch, event=None, *, full_timeout=False):
     conn, r, f, lane, sessions, tasks = _setup(api, board, monkeypatch)
     gate = Gate(lane, monkeypatch)
     action, threads, errors, failures = None, [], [], []
@@ -217,7 +217,33 @@ def _run(api, board, monkeypatch, event=None):
                     # A finite failure/beat/full requeue may re-run, once, work already in
                     # flight (it keeps its first-admitted age); nothing else is excused.
                     extra = len(lane.active)
-                action()
+                if full_timeout:
+                    assert event == 'full'
+                    entered, release = threading.Event(), threading.Event()
+                    capture = lane._capture_one
+                    def held(rd, source, stamp):
+                        if source != lane.external:
+                            entered.set()
+                            assert release.wait(15), 'full-route source barrier not released'
+                        return capture(rd, source, stamp)
+                    monkeypatch.setattr(lane, '_capture_one', held)
+                    # A real NEW write requires another owned local acquisition.
+                    conn.execute('UPDATE tasks SET title=? WHERE id=?',
+                                 ('Full route held source', tasks[hot[0]]))
+                    conn.commit()
+                    try:
+                        action()
+                        assert entered.wait(5)
+                        threads[-1].join(5)
+                        assert not threads[-1].is_alive(), 'full did not retain its bounded wait'
+                        assert len(errors) == 1
+                        assert type(errors[0]) is TimeoutError and str(errors[0]) == \
+                            'local source acquisition is still pending', errors
+                    finally:
+                        release.set()
+                        monkeypatch.setattr(lane, '_capture_one', capture)
+                else:
+                    action()
                 _arrive(lane, conn, tasks, hot, version + 1000)
             lane.service()
             gate.settle()
@@ -254,14 +280,20 @@ def _run(api, board, monkeypatch, event=None):
             thread.join(10)
             assert not thread.is_alive()
         if errors:
-            # A saturated real source may exceed tick's unchanged 3s synchronous
-            # wait. Keep that canonical failure visible; it is not a successful
-            # beat or latency receipt. FIFO and eventual exact content below
-            # remain mandatory, followed by a successful quiescent real beat.
-            assert event == 'beat'
+            # Both real routes call _settle_local with the unchanged 3s bound.
+            # Retain the exact canonical failure, never call it a successful
+            # route/latency receipt. All FIFO/role/content assertions still apply;
+            # require a successful same-route retry after the finite queue drains.
+            assert event in ('beat', 'full'), [(type(exc).__name__, str(exc)) for exc in errors]
             assert all(type(exc) is TimeoutError and str(exc) ==
                        'local source acquisition is still pending' for exc in errors), errors
-            lane.tick()
+            monkeypatch.setattr(lane, '_project', gate.original)
+            if event == 'full':
+                requested = hot[:2] + sessions[:2]
+                recovered = lane.full(requested)
+                assert set(recovered) == set(requested), 'full retry lost a requested chat'
+            else:
+                lane.tick()
             drain(lane)
         if event == 'failure':
             assert 1 <= len(failures) <= 8, 'strict failures must stay finite'
@@ -281,7 +313,8 @@ def test_continuous_arrivals_64_serve_oldest_quiet_chat_within_initial_queue_len
     assert completions <= ahead + 1
 
 
-def test_real_tick_timeout_retains_source_owner_and_recovers_exact_content(api, board, monkeypatch):
+@pytest.mark.parametrize('route', ['beat', 'full'])
+def test_real_tick_timeout_retains_source_owner_and_recovers_exact_content(api, board, monkeypatch, route):
     conn, r, f, lane, sessions, tasks = _setup(api, board, monkeypatch)
     entered, release = threading.Event(), threading.Event()
     original = lane._capture_one
@@ -301,8 +334,9 @@ def test_real_tick_timeout_retains_source_owner_and_recovers_exact_content(api, 
         lane.step()
         assert entered.wait(5)
         worker = lane.acquiring['local']
+        invoke = lane.tick if route == 'beat' else lambda: lane.full([s])
         with pytest.raises(TimeoutError, match='^local source acquisition is still pending$'):
-            lane.tick()
+            invoke()
         assert worker.is_alive() and lane.acquiring['local'] is worker
         assert lane.store.version(source) == version
         assert f.bundles[s]['bundle'] == before
@@ -311,7 +345,7 @@ def test_real_tick_timeout_retains_source_owner_and_recovers_exact_content(api, 
         worker.join(10)
         assert not worker.is_alive()
         drain(lane)
-        lane.tick()
+        invoke()
         drain(lane)
         assert {row['title'] for row in f.bundles[s]['bundle']['tasks']} == {'After bounded source wait'}
         assert all(session in f.bundles for session in sessions)
@@ -319,6 +353,11 @@ def test_real_tick_timeout_retains_source_owner_and_recovers_exact_content(api, 
     finally:
         release.set()
         f.stopped.set(); lane.close(); r.release(); conn.close()
+
+
+def test_full_timeout_interleave_keeps_fifo_and_recovers_exact_content(api, board, monkeypatch):
+    completions, ahead = _run(api, board, monkeypatch, 'full', full_timeout=True)
+    assert completions <= ahead + 1
 
 
 @pytest.mark.parametrize('event', ['failure', 'beat', 'full'])
