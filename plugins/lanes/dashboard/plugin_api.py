@@ -372,19 +372,38 @@ def _governed_sources(mods, conn, evidence, hours, window):
         # per-board reader() calls would evict the other boards' published values.
         contexts = defaultdict(list)
         flow_mods = flow_core()
+        context_failures = {}
         if flow_mods is not None:
-            for _, _, source in sources:
-                for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
-                    contexts[url].append(context)
+            for slug, source_conn, source in sources:
+                try:
+                    _sibling('board_merge').arm_deadline(source_conn)
+                    for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
+                        contexts[url].append(context)
+                except (OSError, RuntimeError, sqlite3.Error) as exc:
+                    context_failures[slug] = str(exc)
         combined = {url: values[0] if len(values) == 1 else values for url, values in contexts.items()}
         with _observer_init_lock:
             reader = _observations().reader(combined)
         for slug, source_conn, source in sources:
-            pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)
+            try:
+                _sibling('board_merge').arm_deadline(source_conn)
+                if slug in context_failures:
+                    raise RuntimeError(context_failures[slug])
+                pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
+                source_failed = True
+                pairs.append(({'configured': True, 'lanes': {}}, {'configured': False, 'reason': f'{slug}: {exc}'}))
+                snapshots.append(dict(board=slug, available=False, stale=True, reason=str(exc)))
+                continue
             for card in (pair[1] or {}).get('cards', []):
                 card['board'] = slug
+            if pair[1] and pair[1].get('configured') is False:
+                pair[1]['reason'] = f"{slug}: {pair[1].get('reason', 'flow unavailable')}"
             pairs.append(pair)
-            receipt = gov.snapshot(source_conn)
+            try:
+                receipt = gov.snapshot(source_conn)
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
+                receipt = dict(board=slug, available=False, stale=True, reason=str(exc))
             receipt['flow_available'] = (pair[1] or {}).get('configured') is not False
             receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
             snapshots.append(receipt)
