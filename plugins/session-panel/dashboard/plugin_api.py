@@ -1756,7 +1756,8 @@ def install_panel_lifecycle(environ=None):
     # The installation is the Hermes root this serve's home belongs to, so every compatible serve of one
     # installation joins the same broker/child; the served home itself is bound per request, not here.
     installation = Path(get_default_hermes_root(home=get_hermes_home()))
-    runtime = installation / 'serve-producers' / 'runtime'
+    # Preserve the supported launcher's existing stable lock/receipt domain.
+    runtime = installation / 'serve-producer-v1'
     if env.get('HERMES_SERVE_PANEL_EXTERNAL') is not None or env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is not None:
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
         mode_mod.initialize_mode(installation, dict(env))
@@ -1766,8 +1767,9 @@ def install_panel_lifecycle(environ=None):
         return make_panel_relay(installation, runtime)
 
     def admit():
+        from hermes_cli._startup_fast import project_root_str
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)  # first external start creates the custody dirs
-        return lifecycle_mod.default_admit(runtime, installation, root=installation)
+        return lifecycle_mod.default_admit(runtime, Path(project_root_str()), root=installation)
 
     def publish_initial(relay, timeout=60.0):
         key = relay.submit(panel_initial_payload())  # the relay stamps its own home binding

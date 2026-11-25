@@ -77,6 +77,12 @@ class _LazyModule:
                 object.__setattr__(self, "_module", module)
             return self._module
 
+    def __getattribute__(self, name):
+        # Patching tools inspect vars(target) to preserve local attributes.
+        if name == '__dict__':
+            return object.__getattribute__(self, '_load')().__dict__
+        return object.__getattribute__(self, name)
+
     def __getattr__(self, name):
         return getattr(self._load(), name)
 
