@@ -29,14 +29,16 @@ const checks = [], errors = []
 try {
   const page = await browser.newPage({ viewport: { width: 1200, height: 900 } })
   page.on('pageerror', (e) => errors.push(e.message))
-  await page.route('http://fixture.test/', (r) => r.fulfill({ contentType: 'text/html', body: '<html></html>' }))
-  await page.goto('http://fixture.test/')
-  await page.setContent(`<style>*{box-sizing:border-box}body{font:13px sans-serif}
+  // Serve the DOM in the navigation: replacing a navigated document with setContent
+  // can silently disable native pointer capture in Chromium 159, even on a plain div.
+  const html = `<style>*{box-sizing:border-box}body{font:13px sans-serif}
     .llms-pop,.hermes-tp-popover{background:#eee;border:1px solid #777}
     #outside{position:absolute;top:800px}
     /* Expose an outer-button padded strip independently of the span's own padding. */
     .llms-tool .llms-chip,.hermes-tp-tool .hermes-tp-tbchip{height:20px}
-    </style><div id="root"></div><input id="outside"/>`)
+    </style><div id="root"></div><input id="outside"/>`
+  await page.route('http://fixture.test/', (r) => r.fulfill({ contentType: 'text/html', body: html }))
+  await page.goto('http://fixture.test/')
   await page.addScriptTag({ content: out.outputFiles[0].text })
   const state = async (panel, open, label) => {
     await page.waitForTimeout(80) // include Radix's deferred outside-pointer listener
@@ -92,6 +94,15 @@ try {
       await page.mouse.up()
       await state(panel, true, `${name}: panel drag stays open`)
       assert.ok(await page.evaluate(() => calls.some(c => c.body?.mode === 'manual' && c.body?.share)))
+      const manualCount = await page.evaluate(() => calls.filter(c => c.body?.mode === 'manual' && c.body?.share).length)
+      const knob = await page.getByRole('slider', { name: 'Claude share of traffic' }).boundingBox()
+      await page.mouse.move(knob.x + knob.width / 2, knob.y + knob.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(bar.x + 120, bar.y + 8, { steps: 4 })
+      await page.mouse.up()
+      await state(panel, true, `${name}: knob drag stays open`)
+      assert.equal(await page.evaluate(() => calls.filter(c => c.body?.mode === 'manual' && c.body?.share).length), manualCount + 1,
+        'knob-start drag sends exactly one manual REST update')
     } else {
       const input = page.getByRole('textbox', { name: 'Limit, thousands of tokens per minute' })
       await input.click()
@@ -108,5 +119,10 @@ try {
   assert.deepEqual(errors, [])
   const events = await page.evaluate(() => events)
   assert.ok(events.filter(e => e.type === 'click').every(e => e.trusted), 'all clicks came from browser input')
-  console.log(JSON.stringify({ passed: checks.length, failed: 0, checks, events }, null, 2))
+  for (const target of ['llms-bar t', 'llms-knob']) {
+    assert.ok(events.some(e => e.type === 'gotpointercapture' && e.target === target && e.trusted), `${target}: native pointer capture acquired`)
+    assert.ok(events.some(e => e.type === 'pointerup' && e.target === target && e.trusted), `${target}: captured release delivered`)
+  }
+  console.log(JSON.stringify({ browser: browser.version(), playwright: require('playwright/package.json').version,
+    passed: checks.length, failed: 0, checks, calls: await page.evaluate(() => calls), events }, null, 2))
 } finally { await browser.close() }

@@ -24,9 +24,24 @@ Alternatively install Playwright Chromium and omit `CHROME_BIN`. The browser scr
 acceptance check, not silently skipped inside the jsdom suite. Its JSON includes assertion names and raw
 trusted pointer/focus/click events. It throws on page errors, failed assertions or synthetic click events.
 
+## Pointer-capture fixture lifecycle
+
+Playwright 1.65.1 / Chromium 159.0.8154.6 exposed a harness lifecycle failure: navigating to intercepted HTML
+and then replacing that document with `page.setContent` can make native `setPointerCapture` silently fail.
+A minimal native div (no React, Radix or plugins) reproduced it; delivering the same DOM in the navigation
+response restored capture. A diagnostic post-down animation frame did not repair the failing lifecycle.
+The harness therefore serves its DOM directly; it does not add gesture sleeps or relax the manual REST check.
+It records browser/Playwright versions, actual REST payloads and trusted capture/release events.
+
+The original bar-start drag is retained. Knob-start coverage exposed a separate source defect: the knob captured
+its pointer but had no move/up/cancel handlers (the bar is a sibling, not an ancestor). The new check failed with
+one manual update instead of two before adding those handlers, then passed. Both start targets must acquire
+native capture, receive the trusted release and commit a manual update while the panel stays open.
+This isolates the harness and knob defects; it does not establish the user's production mouse-out cause.
+
 ## Proof and causal boundaries
 
-Executed on Linux Chromium with Node 22: **32 browser state assertions passed**, plus REST-payload assertions
+Executed on Linux Chromium with Node 22: **33 browser state assertions passed**, plus REST-payload assertions
 for split Auto/manual drag and throughput form submission; **49 Node tests passed, 0 failed, 0 skipped**.
 Running the same browser fixture against pre-fix source `2dba6c7d` fails `split: focus outside stays open`:
 expected 1 panel, observed 0. The fixture also exposed first-outside-click failure after panel interaction

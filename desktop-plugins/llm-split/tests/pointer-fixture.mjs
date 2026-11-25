@@ -8,7 +8,7 @@ import * as L from '../plugin.js'
 import * as P from '../../throughput/plugin.js'
 const h = React.createElement
 window.events = []
-for (const type of ['pointerdown', 'pointerup', 'click', 'pointerout', 'focusin', 'focusout']) {
+for (const type of ['pointerdown', 'pointerup', 'gotpointercapture', 'lostpointercapture', 'pointercancel', 'click', 'pointerout', 'focusin', 'focusout']) {
   document.addEventListener(type, (e) => window.events.push({ type, target: e.target.className, trusted: e.isTrusted }), true)
 }
 const split = {
