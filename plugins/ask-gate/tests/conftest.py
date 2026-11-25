@@ -69,7 +69,9 @@ def _load():
 def gate(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("ASK_GATE_LEDGER", str(tmp_path / "state" / "ask-ledger.sqlite"))
-    for k in ("HERMES_KANBAN_TASK", "ASK_GATE_OFF"):
+    # Tests select their surface explicitly; an inherited backend port must not
+    # turn ordinary CLI/default fixtures into nonblocking backend fixtures.
+    for k in ("HERMES_KANBAN_TASK", "ASK_GATE_OFF", "HERMES_ALWAYS_ON_BACKEND"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("ASK_GATE_NO_PREWARM", "1")
     # Core's chat projection (other gateways' cards of a chat): empty by default, so no test reads a real core's
