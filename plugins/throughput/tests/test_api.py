@@ -394,7 +394,10 @@ def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypat
     write; answers with the GET payload and its ``pacing``."""
     import json
     c, throttle, root = _isolated(api, tmp_path, monkeypatch)
-    now = time.time()
+    now = int(time.time()) + 0.0006
+    # Keep the response on the write's clock tick: millisecond rounding and
+    # newest-wins stamps can legitimately put the saved level just ahead of now.
+    monkeypatch.setattr(time, "time", lambda: now)
     level = {"mode": "auto", "percent": 20.0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0},
              "budget_at": now - 60, "set_at": now - 30, "burst": {"factor": 2.0, "until": now + 3000, "set_at": now - 30}}
     throttle._write_json(throttle.level_path(root), level)
