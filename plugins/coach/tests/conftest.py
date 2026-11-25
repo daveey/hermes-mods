@@ -83,24 +83,43 @@ _CI_PROGRESS = {}
 _WATCHDOG_FD = None
 
 
-def _arm_watchdog(config):
+def _watchdog_seconds(config, item=None):
+    # pytest-timeout resolves CLI > PYTEST_TIMEOUT > ini at configure time.
+    if hasattr(config, '_env_timeout'):
+        seconds = config._env_timeout
+    else:
+        try:
+            seconds = config.getini('timeout')
+        except ValueError:  # copied conftest probes without pytest-timeout
+            seconds = None
+    if item is not None:
+        marker = item.get_closest_marker('timeout')
+        if marker:
+            seconds = marker.args[0] if marker.args else marker.kwargs.get('timeout', seconds)
+    return float(120 if seconds is None or seconds == '' else seconds)
+
+
+def _arm_watchdog(config, item=None):
     if _WATCHDOG_FD is None:  # configure/collection can fail before sessionstart
         return
     import faulthandler
-    try:
-        seconds = float(config.getini('timeout') or 120)
-    except ValueError:  # copied conftest probes without pytest-timeout
-        seconds = 120
-    faulthandler.dump_traceback_later(seconds, file=_WATCHDOG_FD, exit=True)
+    seconds = _watchdog_seconds(config, item)
+    if seconds > 0:
+        faulthandler.dump_traceback_later(seconds, file=_WATCHDOG_FD, exit=True)
+    else:
+        faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
     # C watchdog still fires if the GIL/import lock is stuck; the raw descriptor
     # bypasses pytest capture so os._exit cannot discard the only stack.
-    _arm_watchdog(item.config)
+    _arm_watchdog(item.config, item)
     yield
-    _arm_watchdog(item.config)  # also bound idle/worker shutdown after the last item
+    # An idle xdist worker may legitimately await a peer's longer item deadline.
+    # Bound active items and sessionfinish, not inter-worker scheduler waits.
+    import faulthandler
+    faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True, specname='pytest_sessionfinish')
