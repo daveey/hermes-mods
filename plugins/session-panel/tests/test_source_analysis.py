@@ -98,6 +98,69 @@ def served(log=None, first=1 * SEC, done=3 * SEC, via='emit'):
     return log, a, pub, body
 
 
+def test_receiptless_failed_admission_remains_primary_episode():
+    log = Log()
+    log.admit('initial', [], SEC)
+    log.add('source_error', 2 * SEC, error='TimeoutError')
+    log.admit('initial', [], SEC, at=3 * SEC)
+    log.close(30 * SEC)
+    result = analyze(log)
+    assert result['inputs_valid']
+    assert result['outcomes']['admitted_distinct'] == 1
+    assert result['outcomes']['admitted_duplicate_observations'] == 1
+    assert result['events']['total'] == 0, 'no source receipt was acquired'
+    episode = result['episodes']
+    assert (episode['total'], episode['fulfilled'], episode['unmatched']) == (1, 0, 1)
+    assert episode['unmatched_sample'][0]['start'] == SEC
+    assert episode['unmatched_sample'][0]['lower_bound_ns'] == 29 * SEC
+    assert episode['unmatched_lower_bound_over_budget'] == result['failures_over_budget'] == 1
+
+
+@pytest.mark.parametrize('mode', ['same_id', 'successor', 'unrelated', 'forgotten', 'open'])
+def test_receiptless_episode_requires_exact_inclusion_or_declared_successor(mode):
+    log = Log()
+    first = log.admit('initial', [], SEC)
+    if mode in ('same_id', 'successor', 'unrelated'):
+        aid = 'initial' if mode == 'same_id' else 'later'
+        later = log.admit(aid, ['new-receipt'], SEC if aid == 'initial' else 2 * SEC)
+        if mode == 'successor':
+            log.add('superseded', 2 * SEC, predecessor_admission_id='initial', successor_admission_id='later')
+        pub, body = log.store(later, 3 * SEC)
+        log.emit(pub, body, 4 * SEC)
+    elif mode == 'forgotten':
+        log.add('forgotten', 2 * SEC, admission=first)
+    if mode != 'open':
+        log.close(30 * SEC)
+    else:
+        log.add('source_error', 30 * SEC, error='TimeoutError')
+    result = analyze(log)
+    if mode in ('same_id', 'successor'):
+        assert result['episodes']['unmatched'] == 0
+        assert result['episodes']['fulfilled_series']['max_ns'] == 3 * SEC
+    else:
+        assert result['episodes']['unmatched'] == 1
+        assert result['episodes']['unmatched_sample'][0]['lower_bound_ns'] == 29 * SEC
+        assert result['episodes']['unmatched_right_censored'] == (mode == 'open')
+        assert result['failures_over_budget'] == 1
+
+
+@pytest.mark.parametrize('via', ['emit', 'catchup'])
+def test_receiptless_exact_inclusion_and_join_bound(via, monkeypatch):
+    log = Log()
+    a = log.admit('initial', [], SEC)
+    pub, body = log.store(a, 2 * SEC)
+    log.emit(pub, body, 4 * SEC, via=via)
+    log.close(30 * SEC)
+    result = analyze(log)
+    assert result['inputs_valid']
+    assert result['events']['total'] == 0
+    assert result['episodes']['total'] == result['episodes']['fulfilled'] == 1
+    assert result['episodes']['fulfilled_series']['max_ns'] == 3 * SEC
+    monkeypatch.setattr(A, 'MAX_JOIN_WORK', 0)
+    with pytest.raises(A.AnalysisBounds, match='admission inclusion join bound'):
+        analyze(log)
+
+
 def test_exact_fulfilment_is_reported_without_acceptance_verdict():
     log, *_ = served()
     log.close(10 * SEC)

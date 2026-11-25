@@ -313,7 +313,14 @@ def validate_records(records, *, require_closed=False):
         event = r['event']
         if event == 'window_end':
             ended.add(window)
-            if r.get('dropped_records') != 0 or r.get('write_errors') != []:
+            dropped = r.get('dropped_records')
+            error_lists = (r.get('write_errors'), r.get('encoding_errors'))
+            if (type(dropped) is not int or dropped < 0
+                    or any(not isinstance(items, list)
+                           or any(not isinstance(item, str) for item in items)
+                           for items in error_lists)):
+                errors.append('invalid terminal receipt-window accounting')
+            elif dropped or any(error_lists):
                 errors.append('receipt window lost records')
         if event not in ('model_stored', 'emit_callback', 'emit_success', 'catchup_success'):
             continue

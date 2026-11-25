@@ -345,9 +345,16 @@ class SourceCoordinator:
             return Attempt(value(a.stamp), value(a.demands), a.count, a.retry_at)
         state = retirement.state
         chats = value(state['chats'])
-        attempts = {value(k): attempt(a) for k, a in state['attempts'].items()}
-        scopes = {value(k): {value(s): attempt(a) for s, a in group.items()}
-                  for k, group in state['scope_attempts'].items()}
+        # Store transfer preserves historical immutable source versions, but only
+        # this reader's actual inventory can own acquisition/retry deadlines.
+        # Removed sources have no executor to settle a carried expired attempt.
+        # Do not invent coverage or reset budgets for unchanged source keys.
+        current_sources = set(self.sources) | {self.external}
+        attempts = {key: attempt(a) for k, a in state['attempts'].items()
+                    if (key := value(k)) in current_sources}
+        scopes = {key: {value(s): attempt(a) for s, a in group.items()}
+                  for k, group in state['scope_attempts'].items()
+                  if (key := value(k)) in current_sources}
         roles = {k: attempt(a) for k, a in state['role_attempts'].items()}
         projections = {k: attempt(a) for k, a in state['projection_attempts'].items()}
         stopped = retirement.owner.store

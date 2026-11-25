@@ -53,6 +53,30 @@ def model_record(log):
     return p, bundle
 
 
+@pytest.mark.parametrize('field,bad', [
+    ('dropped_records', value) for value in (None, True, False, -1, 0.0, '0', [], {})
+] + [
+    (field, value) for field in ('write_errors', 'encoding_errors')
+    for value in (None, False, 0, '', {}, [1], ['lost record'])
+])
+@pytest.mark.parametrize('omit', [False, True])
+def test_standalone_closed_validator_rejects_terminal_shape_and_loss(field, bad, omit):
+    m, log = receipts(), MemoryLog()
+    p, bundle = model_record(log)
+    log.record('catchup_success', kind='model', publications=[p], authenticated=True,
+        request_id='request', response_id='response', write_completed_ns=1,
+        **m.payload_fields(m.encode({'epoch': 'feed', 'bundles': {'S': bundle}})))
+    log.record('window_end', dropped_records=0, write_errors=[], encoding_errors=[])
+    control = m.validate_records(log.events, require_closed=True)
+    assert control['valid'] and control['fulfilled'] == 1
+    if omit:
+        del log.events[-1][field]
+    else:
+        log.events[-1][field] = bad
+    result = m.validate_records(log.events, require_closed=True)
+    assert not result['valid'] and result['errors']
+
+
 def test_log_is_explicit_bounded_append_only_and_private(tmp_path):
     m, path = receipts(), tmp_path / 'private' / 'receipts.jsonl'
     assert not path.exists()

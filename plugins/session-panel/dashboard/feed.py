@@ -1226,6 +1226,9 @@ class Feed:
                                     or (projection.observation_parent is not None and (held_projection is None
                                         or held_projection.publication_token is not projection.observation_parent))
                                     or (projection.observation_parent is None and held_projection is not None
+                                        and held_projection.feed_epoch == self.epoch
+                                        and held_projection.feed_owner is self._projection_owner
+                                        and held_projection.watch_token is projection.watch_token
                                         and held_projection.observation_parent is not None
                                         and held_projection.admission == projection.admission)):
                                 _results[s] = projection_module.PublishResult('superseded')

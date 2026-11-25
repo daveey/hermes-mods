@@ -98,6 +98,11 @@ cross-window/process claims, duplicate records and
 records after closure fail closed. `server_emitted` and
 `authenticated_catchup` are distinct counters; publications deduplicate by key.
 Unmatched entries are retained, never dropped to improve latency statistics.
+Terminal accounting requires a nonnegative integer `dropped_records` (not a
+boolean or float), and explicit string lists for both `write_errors` and
+`encoding_errors`. Missing/malformed counters invalidate the window; nonzero
+loss or either nonempty error list also invalidates it, even if every stored
+publication otherwise has an exact inclusion.
 
 ## Opt-in stages and bounded analysis
 
@@ -136,6 +141,13 @@ Bytes, depth, records, joins and inclusion checks have fixed bounds. Malformed,
 incomplete or cross-process evidence fails closed. Semantic expected-row/action/
 absence checks, native Desktop p95 and aggregate CPU remain `NOT_EVALUATED`;
 timings alone never produce C acceptance. Retain the input segments and report.
+Primary episodes are seeded from every valid admission, including initial
+`receipt_ids=[]` before a failed capture. Repeated admission IDs are not new
+samples. Receipt-less anchors require exact included admission identity or a
+bounded explicit same-chat admitted successor chain; an arbitrary later model,
+forget, storage or invalidation does not fulfill them. Their original age and
+closed-window lower bound (or open-window censoring) remain in the denominator,
+independently of the per-source receipt-event series.
 
 ## Remaining acceptance and rollback
 
