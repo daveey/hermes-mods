@@ -150,7 +150,7 @@ def pytest_sessionstart(session):
         import sqlite3
         import _sqlite3
         receipt = dict(sqlite_version=sqlite3.sqlite_version, sqlite_threadsafety=sqlite3.threadsafety,
-                       sqlite_module=_sqlite3.__file__, python=platform.python_version(), cpu_count=os.cpu_count(),
+                       sqlite_module=getattr(_sqlite3, '__file__', 'built-in'), python=platform.python_version(), cpu_count=os.cpu_count(),
                        affinity=len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
                        worker_count=getattr(config.option, 'numprocesses', 0) or 0,
                        dist=getattr(config.option, 'dist', 'no'),
