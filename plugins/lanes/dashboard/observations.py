@@ -38,7 +38,7 @@ class Observations:
         self.factory, self.ttl, self.clock = factory, ttl, clock
         self.trace = trace
         self.cache_id = uuid.uuid4().hex
-        self.attempted = set()
+        self.attempted = {}  # last attempted context per URL, bounded by the board
         self.lock = threading.Lock()
         self.contexts = {}
         self.values = {}  # url -> (context, read-start, observation)
@@ -70,7 +70,7 @@ class Observations:
             if contexts != self.contexts:
                 invalidated = [(u, ctx) for u, ctx in self.contexts.items() if contexts.get(u) != ctx]
                 self.contexts = dict(contexts)
-                self.attempted.intersection_update(contexts)
+                self.attempted = {u: c for u, c in self.attempted.items() if u in contexts}
                 self.values = {u: v for u, v in self.values.items() if contexts.get(u) == v[0]}
                 self.terminal.intersection_update(self.values)
                 self.pending = {u: c for u, c in self.pending.items() if contexts.get(u) == c}
@@ -84,7 +84,7 @@ class Observations:
         if self.trace is not None:
             try:
                 self.trace(self.cache_id, event, url, context, **fields)
-            except (OSError, ValueError, TypeError, ImportError):
+            except Exception:
                 pass  # diagnostics cannot change provider evidence or strand the worker
 
     def cursor(self):
@@ -120,8 +120,9 @@ class Observations:
                 reasons = {}
                 for url in job:
                     prior = self.values.get(url)
-                    reasons[url] = ('expiry' if prior else 'retry' if url in self.attempted else 'cold',
-                                    self.clock() - prior[1] if prior else None)
+                    reason = ('expiry' if prior else 'cold' if url not in self.attempted else
+                              'retry' if self.attempted[url] == job[url] else 'context')
+                    reasons[url] = (reason, self.clock() - prior[1] if prior else None)
                 self.attempted.update(job)
             started = self.clock()
             for url, ctx in job.items():

@@ -41,8 +41,8 @@ def emit(record, *, path=None):
         raw = os.read(fd, BYTE_CAP + 1)
         try:
             rows = json.loads(raw) if raw and len(raw) <= BYTE_CAP else []
-        except (ValueError, UnicodeError):
-            rows = []
+        except Exception:
+            rows = []  # malformed/deeply nested diagnostics must self-recover
         if not isinstance(rows, list):
             rows = []
         rows = rows[-(CAP - 1):] + [dict(record, pid=os.getpid(), at=time.time())]
