@@ -82,15 +82,19 @@ const OWNER_RETRY_SUBMIT_TIMEOUT_MS = 45_000
 // A send's reply wait ends this long before the sender's whole wait (`total_wait_seconds`) does: the last
 // 3 s poll, reading the transcript and posting the result.
 export const REPLY_MARGIN_S = 10
-// The longest one reply poll can take: its 3 s sleep, session.resume's 30 s timeout and the transcript read (two
-// parallel REST reads at api()'s 30 s default). No poll starts unless it ends before the sender's whole wait does.
-const REPLY_POLL_MAX_MS = 3_000 + 30_000 + 30_000
+// A reply poll: a 3 s pause, then session.resume and the transcript read, each up to 30 s. Under a sender's whole
+// wait those timeouts shrink to the time left before it ends; with less than REPLY_POLL_MIN_MS left, polling stops.
+const REPLY_POLL_PAUSE_MS = 3_000
+const REPLY_POLL_READ_MS = 30_000
+const REPLY_POLL_MIN_MS = 3_000
 // The tool takes back a request no Desktop claimed within its PICKUP_TIMEOUT (plugins/session-mentions): the most a
 // claimed request can have waited before this Desktop saw it, when the gateway cannot say how long it did.
 export const MAX_PICKUP_DELAY_S = 30
 // A forwarded send's far courier must have posted its result this long before this Desktop's own wait ends: the
 // next FORWARD_POLL_MS poll plus reading that status.
 export const FORWARD_RESULT_MARGIN_S = 5
+// The forward's /enqueue POST timeout: the far gateway counts the request's age only from when it lands there.
+export const FORWARD_ENQUEUE_TIMEOUT_S = 15
 
 // One per register(): dispose ends its waits, so a disabled or reloaded plugin stops re-submitting.
 const newInstance = () => ({ disposed: false, wake: new Set() })
@@ -630,11 +634,11 @@ async function routeFor(connectionId, profile) {
   return onConn.find(r => r.targetProfile === p) || null
 }
 
-async function readTranscript({ connectionId, profile, sessionId }, limit = 40) {
+async function readTranscript({ connectionId, profile, sessionId }, limit = 40, timeoutMs = undefined) {
   const q = `limit=${Math.max(1, Math.min(200, limit))}&order=latest${profile ? `&profile=${enc(profile)}` : ''}`
   const [meta, page] = await Promise.all([
-    api(connectionId, `/api/sessions/${enc(sessionId)}${profile ? `?profile=${enc(profile)}` : ''}`).catch(() => null),
-    api(connectionId, `/api/sessions/${enc(sessionId)}/messages?${q}`)
+    api(connectionId, `/api/sessions/${enc(sessionId)}${profile ? `?profile=${enc(profile)}` : ''}`, { timeoutMs }).catch(() => null),
+    api(connectionId, `/api/sessions/${enc(sessionId)}/messages?${q}`, { timeoutMs })
   ])
   const messages = (Array.isArray(page?.messages) ? page.messages : [])
     .filter(m => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
@@ -727,16 +731,15 @@ export function sendRetryUntil(req, claimedAt = Date.now()) {
 }
 
 /** How many seconds of a send's whole wait (`total_wait_seconds`, set by the cross_session tool; null without it)
- *  are left for a reply. Time spent is the request's age on its gateway's clock (`GET /status/<id>`), or at
- *  least the time since THIS Desktop claimed it when the gateway cannot say. */
+ *  are left for a reply. Time spent is the request's age on its gateway's clock (`GET /status/<id>`); when the
+ *  gateway cannot say, the time since THIS Desktop claimed it plus the pickup estimate (claimDelaySeconds). */
 export const replyBudgetOf = (origin, req, claimedAt) => {
   const total = Number(req?.total_wait_seconds)
   if (!(total > 0)) return null
   const waited = claimDelaySeconds(req, claimedAt)
   return async () => {
-    let spent = waited + (Date.now() - claimedAt) / 1000
     const st = await relay(origin, `/status/${enc(req.id)}`, { timeoutMs: 5_000 }).catch(() => null)
-    if (Number.isFinite(st?.age)) spent = Math.max(spent, st.age)
+    const spent = Number.isFinite(st?.age) ? st.age : waited + (Date.now() - claimedAt) / 1000
     return total - REPLY_MARGIN_S - spent
   }
 }
@@ -885,13 +888,18 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, s
 
     const after = Number(sub?.user_row_id || 0)
     if (!after) return { ...out, reply: null, note: 'Accepted, but this backend supplied no user row for reply correlation. Inspect the target transcript; do not resend.' }
-    const deadline = Date.now() + Math.min(600, Math.max(0, waitSeconds)) * 1000
-    // A poll that could still be running when the whole wait ends would post after the sender gave up.
-    while (Date.now() < deadline && Date.now() + REPLY_POLL_MAX_MS <= wholeWaitEnd) {
-      await sleep(3000)
-      const st = await request('session.resume', { session_id: target.sessionId, omit_messages: true }, 30_000).catch(() => null)
-      if (!st || st.running) continue
-      const tr = await readTranscript(target, 200).catch(() => null)
+    const waitStarted = Date.now()
+    const deadline = waitStarted + Math.min(600, Math.max(0, waitSeconds)) * 1000
+    // Each read gets at most what is left before the whole wait ends: a poll that ran past it would post after
+    // the sender gave up.
+    const readBudget = () => Math.min(REPLY_POLL_READ_MS, wholeWaitEnd - Date.now())
+    let cut = false
+    while (Date.now() < deadline) {
+      await sleep(Math.max(0, Math.min(REPLY_POLL_PAUSE_MS, wholeWaitEnd - Date.now() - REPLY_POLL_MIN_MS)))
+      if (readBudget() < REPLY_POLL_MIN_MS) { cut = true; break }
+      const st = await request('session.resume', { session_id: target.sessionId, omit_messages: true }, readBudget()).catch(() => null)
+      if (!st || st.running || readBudget() < REPLY_POLL_MIN_MS) continue
+      const tr = await readTranscript(target, 200, readBudget()).catch(() => null)
       const messages = [...(tr?.messages || [])].sort((a, b) => Number(a.id) - Number(b.id))
       // Anchor to OUR user row, not the previous turn's reply or a later user's turn.
       const anchor = messages.findIndex(m => m.role === 'user' && Number(m.id) === after)
@@ -901,6 +909,7 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, s
       const replies = (nextUser < 0 ? subsequent : subsequent.slice(0, nextUser)).filter(m => m.role === 'assistant')
       if (replies.length) return { ...out, delivered: true, queued: false, status: 'replied', reply: replies[replies.length - 1].content }
     }
+    if (cut) out.reply_wait_seconds = waitSeconds = Math.floor((Date.now() - waitStarted) / 1000)
     return { ...out, reply: null, note: `no correlated reply within ${waitSeconds}s — do not resend automatically` }
   } finally {
     if (typeof release === 'function') release()
@@ -1694,7 +1703,7 @@ export async function forwardSend(target, text, waitSeconds = 0, replyBudget = n
   if (replyBudget && waitSeconds) {
     const left = await replyBudget()
     budgetEnd = Date.now() + Math.max(0, left) * 1000
-    farTotal = Math.max(0, Math.floor(left - FORWARD_RESULT_MARGIN_S))
+    farTotal = Math.max(0, Math.floor(left - FORWARD_ENQUEUE_TIMEOUT_S - FORWARD_RESULT_MARGIN_S))
     farWait = Math.max(0, Math.min(waitSeconds, farTotal - REPLY_MARGIN_S))
   }
   const request = {
@@ -1716,7 +1725,7 @@ export async function forwardSend(target, text, waitSeconds = 0, replyBudget = n
 
   let enq = null
   try {
-    enq = await relay(target.connectionId, '/enqueue', { method: 'POST', body: { request }, timeoutMs: 15_000 })
+    enq = await relay(target.connectionId, '/enqueue', { method: 'POST', body: { request }, timeoutMs: FORWARD_ENQUEUE_TIMEOUT_S * 1000 })
   } catch {
     // The POST may have landed. Only fall back once the request is provably not there.
     const st = await status()

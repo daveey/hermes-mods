@@ -500,25 +500,64 @@ test('a send without total_wait_seconds (older tool, other senders) keeps its as
 // the request; total_wait_seconds is 400. A result must be posted by the 400 s mark (the margin is the post).
 const later = (ms, value) => new Promise(r => setTimeout(() => r(value), ms))
 
-test('the reply loop starts no iteration that could end after the whole wait (slow resume and transcript reads)', async t => {
+/** Answers with `value` after `ms`, or rejects at `timeoutMs` when that comes first (what the bridge and RPC do). */
+const answerWithin = (ms, value, timeoutMs) => new Promise((resolve, reject) => {
+  const done = setTimeout(() => resolve(typeof value === 'function' ? value() : value), ms)
+  if (timeoutMs && timeoutMs < ms) setTimeout(() => { clearTimeout(done); reject(new Error(`timed out after ${timeoutMs} ms`)) }, timeoutMs)
+})
+
+/** A chat that accepts at once and replies `replyAt` s after the submit; its reads take `rpcMs` each. */
+async function replyingChat(t, replyAt, rpcMs = 0) {
   fakeTime(t)
-  // Each poll: 3 s sleep, session.resume answering at its 30 s timeout, then a 30 s transcript read with no reply.
+  const transcript = () => ({ messages: [{ id: 3, role: 'user', content: 'hi' },
+    ...((Date.now() - T0) / 1000 >= replyAt ? [{ id: 4, role: 'assistant', content: 'the reply' }] : [])] })
   globalThis.window = { hermesDesktop: { api: async req => {
     if (req.path.includes('/status/')) return { state: 'claimed', age: (Date.now() - T0) / 1000 }
-    if (req.path.includes('/messages')) return later(30_000, { messages: [] })
-    if (req.path.startsWith('/api/sessions/')) return later(30_000, { title: 't' })
+    if (req.path.includes('/messages')) return answerWithin(rpcMs, transcript, req.timeoutMs)
+    if (req.path.startsWith('/api/sessions/')) return answerWithin(rpcMs, { title: 't' }, req.timeoutMs)
     return {}
   } } }
   let submits = 0
   const m = await load({ state, connections: async () => localConns,
-    request: async method => {
+    request: async (method, _params, timeout) => {
       if (method === 'prompt.submit') { submits++; return { status: 'queued', user_row_id: 3 } }
-      return submits ? later(30_000, { session_id: 'live', running: false }) : { session_id: 'live' }
+      return submits ? answerWithin(rpcMs, { session_id: 'live', running: false }, timeout) : { session_id: 'live' }
     } })
   const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400 }), 'local', localConns), 900)
-  const ended = (Date.now() - T0) / 1000
+  return { res, ended: (Date.now() - T0) / 1000 }
+}
+
+for (const at of [340, 360, 380]) {
+  test(`a reply ${at} s into a 390 s wait is caught, and posts inside the whole wait`, async t => {
+    const { res, ended } = await replyingChat(t, at)
+    assert.equal(res.status, 'replied'); assert.equal(res.reply, 'the reply')
+    assert.equal(ended <= 400, true, `answered at ${ended} s`)
+  })
+}
+
+test('a reply after the 390 s wait is not waited for; the result posts inside the whole wait', async t => {
+  const { res, ended } = await replyingChat(t, 395)
+  assert.equal(res.reply, null); assert.match(res.note, /within 390s/)
+  assert.equal(ended <= 400, true, `answered at ${ended} s`)
+})
+
+test('slow reads: each poll\'s resume and transcript timeouts shrink to the time left, so the post lands in time', async t => {
+  // Every read takes 30 s (each answers at its own 30 s timeout): a poll is 3 + 30 + 30 s.
+  const { res, ended } = await replyingChat(t, 10_000, 30_000)
   assert.equal(res.ok, true); assert.equal(res.reply, null)
-  assert.equal(ended <= 400, true, `reply loop ended at ${ended} s: past the whole wait, the post lands after the tool gave up`)
+  assert.equal(ended <= 400, true, `reply loop ended at ${ended} s: the post lands after the tool gave up`)
+  assert.equal(ended >= 390, true, `stopped polling at ${ended} s, before the 390 s wait was over`)
+})
+
+test('with /status age, the gateway age alone is the time spent (no local pickup estimate added)', async t => {
+  fakeTime(t)
+  // Claimed at once on the gateway (age counts from the claim here) though created_at looks 25 s old on this Mac.
+  bridge(() => ({ state: 'claimed', age: (Date.now() - T0) / 1000 }))
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400, created_at: T0 / 1000 - 25 }), 'local', localConns))
+  assert.equal('reply_wait_seconds' in res, false)
+  assert.match(res.note, /within 390s/)
 })
 
 test('without /status age, a late claim counts the wait since the request\'s created_at', async t => {
@@ -567,7 +606,9 @@ test('a cross-gateway send hands the far courier only what is left after its own
   assert.equal(at >= 8, true)
   // What is left when the request goes out, less the far side's post and this side's next poll.
   const left = 400 - 10 - at
-  assert.equal(request.total_wait_seconds, Math.floor(left - m.FORWARD_RESULT_MARGIN_S))
+  // Less the enqueue POST's own timeout: the far gateway starts counting only once the request lands there.
+  assert.equal(m.FORWARD_ENQUEUE_TIMEOUT_S, 15)
+  assert.equal(request.total_wait_seconds, Math.floor(left - m.FORWARD_ENQUEUE_TIMEOUT_S - m.FORWARD_RESULT_MARGIN_S))
   assert.equal(request.wait_for_reply, request.total_wait_seconds - 10)
   const ended = (Date.now() - T0) / 1000
   assert.equal(res.status, 'unknown'); assert.equal(res.retry_safe, false)
