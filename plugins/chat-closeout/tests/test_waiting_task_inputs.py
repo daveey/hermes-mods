@@ -21,6 +21,29 @@ def certified(world, clock):
     return world
 
 
+@pytest.mark.parametrize('dedicated', [True, False])
+def test_waiting_board_selects_reader_domain(certified, monkeypatch, dedicated):
+    import contextlib
+    calls = []
+    original = ksa.cached_ro
+    @contextlib.contextmanager
+    def selected(path, *, busy_budget):
+        calls.append((path, busy_budget))
+        with original(path, busy_budget=busy_budget) as conn:
+            yield conn
+    if dedicated:
+        monkeypatch.setattr(ksa, 'waiting_ro', selected, raising=False)
+        def wrong_reader(*args, **kwargs):
+            pytest.fail('generic retention selected despite dedicated reader support')
+        monkeypatch.setattr(ksa, 'cached_ro', wrong_reader)
+    else:
+        monkeypatch.delattr(ksa, 'waiting_ro', raising=False)
+        monkeypatch.setattr(ksa, 'cached_ro', selected)
+    with plugin._waiting_board_read(certified['board']) as conn:
+        assert conn.execute("SELECT id FROM tasks WHERE id = 't_1'").fetchone() == ('t_1',)
+    assert calls == [(certified['board'], 0)]
+
+
 def test_waiting_sql_error_logs_query_site_without_message(certified, monkeypatch, caplog):
     """Class-only accounting cannot distinguish a locked read from a missing-table query."""
     error = sqlite3.OperationalError('private SQL parameter must not be logged')

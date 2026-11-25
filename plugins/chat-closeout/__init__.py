@@ -1866,7 +1866,10 @@ def _waiting_board_read(path: Path):
     from hermes_cli import kanban_session_activity as ksa, kanban_activity_revision as rev
     from hermes_cli.kanban_generation import BoardLifecycleBusy
     try:
-        with rev.probe_lock(path), ksa.cached_ro(path, busy_budget=0) as conn:
+        # A supporting core isolates these repeatedly watched boards from generic
+        # dashboard retention. Older cores retain the same fail-fresh admission.
+        reader = getattr(ksa, "waiting_ro", ksa.cached_ro)
+        with rev.probe_lock(path), reader(path, busy_budget=0) as conn:
             yield conn
     except BoardLifecycleBusy as exc:
         raise wi.Unportable("waiting board lifecycle busy") from exc

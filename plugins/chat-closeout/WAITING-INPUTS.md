@@ -13,6 +13,16 @@ reconcile and transcript proof for every pending row (`transcript_key` was 61 of
 measured cost was 15.3% of the busiest serve's samples, the gateway host pass was about 3.0% of a core, and the serve
 loop about 0.8%.
 
+## Reader retention
+
+On supporting cores, certified board probes select `kanban_session_activity.waiting_ro`.
+It uses a separate bounded reader domain, so unrelated dashboard readers cannot evict a
+healthy waiting reader and force another zero-budget tracked open. Older cores retain
+`cached_ro`. Both paths keep the probe lock, zero statement/admission budget, transaction
+certification and fail-fresh behavior. No query result or SQLite snapshot is retained.
+The dedicated domain does not bypass cold tracking contention or private-reader admission;
+CPU/error acceptance requires measurement after natural activation, not this selection test.
+
 ## The inputs
 
 `waiting_inputs()` is registered as `register_waiting_source("chat-closeout", waiting_source, inputs=waiting_inputs)`.
