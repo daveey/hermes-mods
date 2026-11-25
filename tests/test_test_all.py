@@ -471,7 +471,7 @@ class TestAll(unittest.TestCase):
         '''})
         coach = next(s for s in runner['discover'](self.root, None, False)
                      if s['name'] == 'plugins/coach')
-        self.assertEqual(coach['args'], ['-n', '4', '--dist=worksteal'])
+        self.assertEqual(coach['args'], ['-n', '4', '--dist=worksteal', '--durations=30'])
         with patch.dict(os.environ):
             os.environ.pop('PYTEST_ADDOPTS', None)
             report = self.root / 'coach.json'
@@ -479,6 +479,64 @@ class TestAll(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = json.loads(report.read_text())['suites'][0]
         self.assertEqual((row['passed'], row['failed'], row['errors']), (1, 0, 0))
+
+    def test_coach_ci_shards_partition_every_file_once_without_more_workers(self):
+        runner = runpy.run_path(str(RUNNER))
+        make_tree(self.root, {"coach": "def test_coach(): pass\n"})
+        plugin = self.root / 'plugins' / 'coach'
+        for i in range(40):
+            (plugin / f'test_case_{i}.py').write_text('def test_case(): pass\n')
+        original = next(s for s in runner['discover'](self.root, None, False)
+                        if s['name'] == 'plugins/coach')
+        expand = runner.get('coach_shards')
+        self.assertIsNotNone(expand, 'CI needs two independently bounded coach suites')
+        shards = expand([original], 2)
+        self.assertEqual([s['name'] for s in shards], ['plugins/coach/1', 'plugins/coach/2'])
+        left, right = [set(s['targets']) for s in shards]
+        self.assertFalse(left & right)
+        self.assertEqual(left | right, set(original['targets']))
+        self.assertTrue(left and right)
+        for s in shards:
+            self.assertEqual(s['dir'], original['dir'])
+            self.assertEqual(s['args'], ['-n', '2', '--dist=worksteal', '--durations=30'])
+        self.assertEqual(expand([original], 1), [original])
+        self.assertEqual(expand([original], 2), shards, 'partition must be deterministic')
+        other = dict(name='plugins/other', targets=['x'], args=[])
+        self.assertEqual(expand([other], 2), [other])
+
+    def test_coach_ci_shards_execute_both_and_propagate_second_shard_failure(self):
+        import hashlib
+        plugin = self.root / 'plugins' / 'coach'
+        plugin.mkdir(parents=True)
+        buckets = [[], []]
+        for i in range(24):
+            name = f'test_shard_{i}.py'
+            index = hashlib.sha256(name.encode()).digest()[0] % 2
+            path = plugin / name
+            path.write_text('def test_case(): pass\n')
+            buckets[index].append(path)
+        self.assertTrue(all(buckets))
+        broken = buckets[1][0]
+        broken.write_text("def test_case(): assert False, 'second shard failure'\n")
+        report = self.root / 'shards.json'
+        with patch.dict(os.environ):
+            os.environ.pop('PYTEST_ADDOPTS', None)
+            result = run(self.root, '--exact', '-k', 'plugins/coach', '--coach-shards', '2',
+                         '--json', str(report))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rows = json.loads(report.read_text())['suites']
+        self.assertEqual([r['name'] for r in rows], ['plugins/coach/1', 'plugins/coach/2'])
+        self.assertEqual([r['status'] for r in rows], ['PASS', 'FAIL'])
+        self.assertEqual(sum(r['passed'] for r in rows), 23)
+        self.assertEqual(sum(r['failed'] for r in rows), 1)
+        self.assertIn('second shard failure', result.stdout)
+        broken.write_text('def test_case(): pass\n')
+        with patch.dict(os.environ):
+            os.environ.pop('PYTEST_ADDOPTS', None)
+            green = run(self.root, '--exact', '-k', 'plugins/coach', '--coach-shards', '2',
+                        '--json', str(report))
+        self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+        self.assertEqual(sum(r['passed'] for r in json.loads(report.read_text())['suites']), 24)
 
     def test_exact_selects_whole_suite_names_without_adding_repo_guards(self):
         """plugin-suites.yml runs `--exact -k <suite>` per selected suite: `-k plugins/coach` must not also run

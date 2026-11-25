@@ -123,6 +123,13 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertNotIn("--hermes-core", self.text)  # core comes only from the checkout step's env
         self.assertNotIn("continue-on-error", self.text)
 
+    def test_coach_ci_sharding_is_explicit_without_raising_suite_timeout(self):
+        step = self.text.split('      - name: Run selected suites', 1)[1]
+        command = next(line for line in step.splitlines()
+                       if '"$HERMES_MODS_PYTHON" scripts/test-all --exact' in line)
+        self.assertIn('--coach-shards 2', command)
+        self.assertNotIn('--timeout', command)
+
     def test_core_backed_tests_run_against_the_public_core_on_the_314_leg(self):
         # The hub used to run these (hub-mods-suite, hermes-sync mods-suite-gate); now core is public, CI does.
         step = self.text.split("      - name: Check out public core (3.14 leg)\n", 1)[1].split("\n      - ", 1)[0]

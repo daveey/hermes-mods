@@ -79,6 +79,48 @@ def pytest_configure(config):
                                        "matching a spec (core's tests/_fixtures/platform_gating.py)")
 
 
+_CI_PROGRESS = {}
+
+
+def pytest_sessionstart(session):
+    # xdist forwards phase reports to the controller. Print there, outside test
+    # capture, so even an outer 1500s kill retains runtime and named slow phases.
+    if hasattr(session.config, 'workerinput'):
+        return
+    import json
+    import platform
+    import sysconfig
+    import time
+    config = session.config
+    reporter = config.pluginmanager.get_plugin('terminalreporter')
+    _CI_PROGRESS.update(reporter=reporter, started=time.monotonic(), completed=0)
+    if reporter:
+        receipt = dict(python=platform.python_version(), cpu_count=os.cpu_count(),
+                       affinity=len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
+                       worker_count=getattr(config.option, 'numprocesses', 0) or 0,
+                       dist=getattr(config.option, 'dist', 'no'),
+                       free_threaded=bool(sysconfig.get_config_var('Py_GIL_DISABLED')))
+        reporter.write_line('COACH_RUNTIME ' + json.dumps(receipt, sort_keys=True))
+
+
+def pytest_runtest_logreport(report):
+    reporter = _CI_PROGRESS.get('reporter')
+    if reporter is None:
+        return
+    import json
+    import time
+    elapsed = round(time.monotonic() - _CI_PROGRESS['started'], 3)
+    if report.duration >= 1 or report.failed:
+        reporter.write_line('COACH_PHASE ' + json.dumps(dict(
+            elapsed=elapsed, worker=getattr(report, 'worker_id', 'main'),
+            nodeid=report.nodeid, phase=report.when, seconds=round(report.duration, 3),
+            outcome=report.outcome), sort_keys=True))
+    if report.when == 'teardown':
+        _CI_PROGRESS['completed'] += 1
+        if _CI_PROGRESS['completed'] % 100 == 0:
+            reporter.write_line(f"COACH_PROGRESS elapsed={elapsed} completed={_CI_PROGRESS['completed']}")
+
+
 def pytest_collection_modifyitems(config, items):
     if _NO_CORE:
         for item in items:
