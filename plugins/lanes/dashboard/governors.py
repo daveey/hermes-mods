@@ -50,7 +50,14 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
             if card.get('reason') != 'you':
                 card['reason'] = 'gov:' + charge['governor']
             by_lane[card['lane']][charge['governor']] += 1
-    for entry in registry:
+    # A newer dispatcher may emit an id this producer's registry does not know.
+    # Keep its complete charged counters, but never invent a healthy state/name.
+    registered = {entry['id'] for entry in registry}
+    unsupported = sorted(set(groups) - registered)
+    entries = list(registry) + [dict(id=ident, label=f'Unknown governor ({ident})',
+                                   kind='unknown', threshold='Unknown dispatcher governor')
+                                for ident in unsupported]
+    for entry in entries:
         ident = entry['id']
         observations = groups[ident]
         known = [(r, s, b) for r, s, b in observations if s['available']]
@@ -68,7 +75,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         at_cap |= any(ident in numeric_caps and isinstance(r.get('reading'), (int, float)) and
                       isinstance(r.get('threshold'), (int, float)) and r['reading'] >= r['threshold']
                       for r, _, _ in known)
-        state = 'on' if count else 'unknown' if unknown else 'at_cap' if at_cap else 'off'
+        unknown |= ident in unsupported
+        state = 'unknown' if ident in unsupported else 'on' if count else 'unknown' if unknown else 'at_cap' if at_cap else 'off'
         readings = [dict(board=s['board'], lane=r.get('scope'), reading=r.get('reading'),
                          threshold=r.get('threshold'), detail=r.get('detail'), cards=r.get('cards', 0))
                     for r, s, _ in known if r.get('reading') is not None or r.get('cards')]
@@ -80,7 +88,13 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                          readings=readings, detail=reading_row.get('detail'), lanes=lanes,
                          since=min((r['since'] for r, _, _ in known if r.get('since')), default=None),
                          scope=scope, partial=bool(unknown), clears=entry['threshold']))
-    assert sum(r['cards_charged'] for r in rows) == idle
+    charged = sum(r['cards_charged'] for r in rows)
+    if charged != idle or unsupported:
+        complete = lane_complete = False
+        incomplete_lanes = None
+        if charged != idle:
+            for row in rows:
+                row.update(state='unknown', partial=True)
     device = adapter or {}
     try:
         stamp = float(device.get('read_at') or 0)
@@ -93,7 +107,7 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
     return dict(rows=rows, scope=scope, available=complete, lane_accounting_available=lane_complete,
                 incomplete_lanes=incomplete_lanes,
                 idle_total=idle if complete else None,
-                known_idle_total=idle, charged_total=idle,
+                known_idle_total=idle, charged_total=charged,
                 counts=dict(Counter(r['state'] for r in rows)),
                 lane_reasons={lane: [dict(id=k, count=v) for k, v in counts.most_common()]
                               for lane, counts in by_lane.items()},

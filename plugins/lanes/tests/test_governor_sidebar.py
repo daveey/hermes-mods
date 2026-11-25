@@ -173,6 +173,46 @@ def test_adapter_deadline_uses_its_declared_cadence(board, api, monkeypatch):
     assert 130 in api._governor_deadlines
 
 
+@pytest.mark.parametrize('facet', ['deadline', 'diagnostics'])
+def test_core_cursor_uses_receipt_bound_and_ignores_tick_diagnostics(board, api, monkeypatch, facet):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='receipt freshness', assignee='default', tenant='babybear')
+        core_fixtures._tick(conn)
+        path = gov.snapshot_path(conn)
+        doc = json.loads(path.read_text())
+        doc['freshness_bound_s'] = 105
+        path.write_text(json.dumps(doc))
+        before, _ = api._capture_cursor()
+        if facet == 'deadline':
+            assert doc['tick_at'] + 105 in api._governor_deadlines
+            return
+        doc['tick_completions'] = [*doc.get('tick_completions', []), doc['tick_at'] + 1]
+        doc['tick_gap_p95_s'] = 23.5
+        doc['tick_at'] += 1
+        path.write_text(json.dumps(doc))
+        after, _ = api._capture_cursor()
+        assert after == before, 'diagnostics and fresh tick do not invalidate decisions'
+
+
+def test_registry_version_skew_preserves_online_view_and_accounting(board, api, monkeypatch):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='new governor on older producer registry', assignee='default', tenant='babybear')
+        core_fixtures._tick(conn)
+        registry = gov.registry()
+        monkeypatch.setattr(gov, 'registry', lambda: [r for r in registry if r['id'] != 'llm_pool'])
+        body = view(api)
+        assert body['configured']
+        projected = body['governors']
+        unknown = next(r for r in projected['rows'] if r['id'] == 'llm_pool')
+        assert unknown['state'] == 'unknown'
+        assert unknown['cards_charged'] == 1
+        assert sum(r['cards_charged'] for r in projected['rows']) == projected['known_idle_total'] == 1
+
+
 def test_stale_device_adapter_does_not_become_a_fleet_governor(board, api, monkeypatch, tmp_path):
     config(board)
     core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])

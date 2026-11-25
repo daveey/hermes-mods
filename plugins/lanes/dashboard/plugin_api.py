@@ -671,10 +671,18 @@ def _capture_cursor():
             stamp = doc.get('tick_at', doc.get('read_at'))
             if isinstance(stamp, (int, float)):
                 cadence = doc.get('cadence_s', 60)
-                if isinstance(cadence, (int, float)) and 0 < cadence < float('inf'):
-                    deadlines.append(stamp + 3 * cadence)
+                # Core owns its receipt freshness bound. The device adapter has
+                # no core receipt and retains the documented 3x cadence policy.
+                if name.endswith('.governors.json'):
+                    from hermes_cli.kanban_governors import freshness_bound
+                    bound = freshness_bound(doc)
+                else:
+                    bound = 3 * cadence if isinstance(cadence, (int, float)) else None
+                if isinstance(bound, (int, float)) and 0 <= bound < float('inf'):
+                    deadlines.append(stamp + bound)
             # Ignore tick time while unchanged decisions remain fresh.
-            cursors.append((name, {k: v for k, v in doc.items() if k not in ('tick_at', 'read_at')}))
+            cursors.append((name, {k: v for k, v in doc.items() if k not in
+                                  ('tick_at', 'read_at', 'tick_completions', 'tick_gap_p95_s')}))
         except (OSError, ValueError, AttributeError):
             cursors.append((name, None))
     _governor_deadlines = tuple(deadlines)

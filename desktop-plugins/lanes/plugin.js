@@ -921,7 +921,8 @@ function useTabTotalsHosted() {
   return hosted
 }
 
-export function Lanes({ ctx }) {
+// One state/filter owner for both SDK layouts; modern Desktop paints totals only.
+export function Lanes({ ctx, totalsOnly = false }) {
   const [open, setOpenState] = useState(loadOpen)
   const [selected, setSelectedState] = useState(loadSelected)
   const [statusPicked, setStatusPicked] = useState(loadStatusSelected)
@@ -981,11 +982,11 @@ export function Lanes({ ctx }) {
   }, [working])
 
   useEffect(() => {
-    if (!working) return undefined
+    if (!working || totalsOnly) return undefined
     const take = (event) => { event.preventDefault(); setOpen(true) }
     window.addEventListener(KANBAN_CHIP_EVENT, take)
     return () => window.removeEventListener(KANBAN_CHIP_EVENT, take)
-  }, [working])
+  }, [working, totalsOnly])
   // The session-list filter: registered only while something is selected (and re-registered when the selection or
   // the hub's session map changes, so the list re-filters); the list's own "clear filters" calls onClear.
   const sessionMap = snap?.sessions
@@ -1058,12 +1059,13 @@ export function Lanes({ ctx }) {
       noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
     }),
     !live ? h('small', { key: 'live', className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
-    h('button', {
+    totalsOnly ? null : h('button', {
       key: 'toggle', type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
       'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: (event) => { event.stopPropagation(); toggle() }
     }, open ? '▴' : '▾')
   ]
   tabTotals.current = { render: () => totals }
+  if (totalsOnly) return h('div', { className: 'hermes-lanes-mini' }, h(StripRight), tabHosted ? null : totals)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
       // Lane pills wrap inside their own box (min width = widest pill) so the chip, global filters and
@@ -1208,10 +1210,7 @@ export function SidebarLanes({ ctx }) {
 }
 
 export function TopTotals({ ctx }) {
-  const [snap, setSnap] = useState(attentionStore(ctx).view)
-  useEffect(() => attentionStore(ctx).listen(setSnap), [ctx])
-  return h('div', { className: 'hermes-lanes-mini' }, h(StripRight),
-    h(StatusTotals, { status: snap?.status, picked: [], onToggle: () => {}, onAll: () => {} }))
+  return h(Lanes, { ctx, totalsOnly: true })
 }
 
 const CSS = `
