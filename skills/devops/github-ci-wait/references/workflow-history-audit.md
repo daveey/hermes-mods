@@ -75,6 +75,12 @@ To identify the workflow, use `gh run view RUN -R O/R --json workflowDatabaseId`
   inventing a cause. An explicit runner-communication annotation supports investigating runner logs,
   host boot time and maintenance history, but does not alone identify why communication was lost.
 
+## Establish the executed workflow revision
+
+Read actual `WorkflowRun.file.repositoryFileUrl` through GraphQL rather than inferring workflow selection from a freshly fetched PR merge ref. Fetch the run's `node_id` with REST, then query `node(id: $id) { ... on WorkflowRun { databaseId event runAttempt file { path repositoryFileUrl repositoryName } checkSuite { databaseId commit { oid } } } }`. `CheckSuite.headSha` is not a field; use `commit { oid }`. A reopened old-head PR can run the workflow pinned to its original head even when its refreshed merge ref contains a new main workflow. Empty REST `referenced_workflows` only means no referenced reusable workflow is reported, not that the top-level workflow revision is unknown or current-main. Require the actual file URL, suite/head, run/attempt and job inventory before calling compatibility proven.
+
+When an additive required job is absent from an old head, do not fabricate a check, waive the required context, or repeat close/reopen after actual evidence disproves it. Prefer an explicitly authorized minimal CI-source forward-port that preserves native steps and creates a NEW head with fresh exact-head independent review and genuine CI. This is not unchanged-head qualification or routine catchup rebase. A classifier/workflow repair usually selects native execution itself; require real native success for that controlled proof before broader rollout.
+
 ## Verify conditional test lanes
 
 When a workflow serves both ordinary PR validation and input-enabled native tests, treat a workflow-level pass as discovery, not proof that the native lane ran. The same SHA and workflow can have a green PR run with native jobs skipped and a failing dispatched native run.
