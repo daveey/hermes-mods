@@ -211,6 +211,13 @@ def test_real_stale_full_barrier_held_sweep_later_seq_cannot_renew_observed_cloc
     monkeypatch.setattr(r, 'external_capture', strict_empty)
     now = [api.time.time()]
     task = kanban_db.create_task(conn, title='Waiting work', session_id='S')
+    # Pin a canonical waiting state instead of relying on create_task's defaults.
+    from datetime import datetime, timezone
+    wake = datetime.fromtimestamp(now[0] + 3600, timezone.utc).isoformat()
+    assert kanban_db.schedule_task(
+        conn, task, reason=f'SCHEDULED_UNTIL={wake} Fixture cooldown',
+        clock_only=True, awaiting={'kind': 'clock', 'why': 'Fixture cooldown'})
+    conn.commit()
 
     f = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0])
     f.watch(['S'])
