@@ -126,15 +126,26 @@ def pytest_runtest_protocol(item, nextitem):
 def pytest_sessionfinish_watchdog(session, exitstatus):
     _arm_watchdog(session.config)
     yield
-    _arm_watchdog(session.config)
+    import faulthandler
+    faulthandler.cancel_dump_traceback_later()
 
 
-@pytest.hookimpl(hookwrapper=True, tryfirst=True)
-def pytest_unconfigure(config):
+@pytest.hookimpl(hookwrapper=True, tryfirst=True, specname='pytest_unconfigure')
+def pytest_unconfigure_watchdog(config):
+    _arm_watchdog(config)
     yield
     # Pytest's own faulthandler plugin cancels the process-wide timer here.
-    # Retain our non-inheritable FD/timer through late finalizers and atexit.
-    _arm_watchdog(config)
+    # Finished xdist workers return to execnet's normal peer wait BEFORE process
+    # exit; no item/cleanup owns a deadline during that transport idle period.
+    if hasattr(config, 'workerinput'):
+        import atexit
+        import faulthandler
+        faulthandler.cancel_dump_traceback_later()
+        # Arm only at actual interpreter exit, ahead of earlier test callbacks.
+        atexit.register(_arm_watchdog, config)
+    else:
+        # Serial pytest exits directly; retain native coverage for late atexit.
+        _arm_watchdog(config)
 
 
 def pytest_runtest_logstart(nodeid, location):
