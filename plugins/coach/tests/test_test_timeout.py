@@ -19,6 +19,25 @@ def test_coach_has_a_bounded_default_test_timeout(tmp_path):
     assert result.returncode == 0, result.stdout
 
 
+def test_coach_stops_before_later_work_hides_first_failure(tmp_path):
+    suite = tmp_path / 'failfast'
+    suite.mkdir()
+    (suite / 'pytest.ini').write_text((Path(__file__).parents[1] / 'pytest.ini').read_text())
+    (suite / 'test_probe.py').write_text(
+        'from pathlib import Path\n'
+        'def test_01_first_failure():\n'
+        '    assert False, "first_failure_must_remain_visible"\n'
+        'def test_02_later_work():\n'
+        '    Path("later-work").write_text("ran")\n')
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider'],
+        cwd=suite, env=dict(os.environ, PYTEST_ADDOPTS=''), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+    assert result.returncode == 1, result.stdout
+    assert 'test_01_first_failure' in result.stdout, result.stdout
+    assert 'first_failure_must_remain_visible' in result.stdout, result.stdout
+    assert not (suite / 'later-work').exists(), 'later tests can consume the suite budget and hide the first failure'
+
+
 @pytest.mark.parametrize('phase', ['setup', 'call', 'teardown'])
 def test_coach_timeout_names_blocked_phase(tmp_path, phase):
     suite = tmp_path / 'blocked'
