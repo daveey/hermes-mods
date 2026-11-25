@@ -15,7 +15,8 @@ import time
 # 5000/h bucket is shared per GitHub user. An entry is re-read only after it
 # is older than TTL_S; a failed/rate-limited batch backs off BACKOFF_MIN_S
 # doubling to BACKOFF_MAX_S.
-TTL_S = 300
+TTL_S = 600
+TERMINAL_TTL_S = 3600
 BACKOFF_MIN_S = 60
 BACKOFF_MAX_S = 900
 
@@ -37,6 +38,7 @@ class Observations:
         self.lock = threading.Lock()
         self.contexts = {}
         self.values = {}  # url -> (context, read-start, observation)
+        self.terminal = set()
         self.pending = {}
         self.active = {}
         self.thread = None
@@ -47,7 +49,7 @@ class Observations:
     def _fresh_values(self):
         now = self.clock()
         return {u: data for u, (ctx, start, data) in self.values.items()
-                if self.contexts.get(u) == ctx and now - start < self.ttl}
+                if self.contexts.get(u) == ctx and now - start < (TERMINAL_TTL_S if u in self.terminal else self.ttl)}
 
     def _cursor(self):
         fresh = self._fresh_values()
@@ -63,6 +65,7 @@ class Observations:
             if contexts != self.contexts:
                 self.contexts = dict(contexts)
                 self.values = {u: v for u, v in self.values.items() if contexts.get(u) == v[0]}
+                self.terminal.intersection_update(self.values)
                 self.pending = {u: c for u, c in self.pending.items() if contexts.get(u) == c}
                 self.revision += 1
             return Published(self, dict(contexts), copy.deepcopy(self._fresh_values()), self._cursor())
@@ -77,12 +80,12 @@ class Observations:
             if now < self.backoff_until:
                 return  # rate-limited/failing: serve existing values until ttl
             # Replace/coalesce by URL; space is bounded by the current board, not requests.
+            fresh = self._fresh_values()
             for url in urls:
                 ctx = contexts.get(url)
                 if ctx is None or self.contexts.get(url) != ctx or self.active.get(url) == ctx:
                     continue
-                old = self.values.get(url)
-                if old is not None and old[0] == ctx and old[2] and now - old[1] < self.ttl:  # empty = failed read: retry (paced by backoff)
+                if url in fresh:
                     continue
                 self.pending[url] = ctx
             if self.pending and self.thread is None:
@@ -99,25 +102,32 @@ class Observations:
                 self.active = job
             started = self.clock()
             values = {}
+            terminal = set()
             failed = False
             try:
                 reader = self.factory()  # core's whole-batch 30s network budget
                 reader.prefetch(job)
                 values = {url: copy.deepcopy(reader.get(url)) for url in job}
+                states = getattr(reader, "states", {})
+                terminal = {url for url in job if states.get(url) in ("MERGED", "CLOSED")
+                            or values[url].get("merged") is True}
             except Exception:
                 failed = True
                 logging.getLogger(__name__).exception('Lanes PR observation failed')
             with self.lock:
                 self.active = {}
-                if failed or not any(values.get(u) for u in job):
+                if failed or not (terminal or any(values.get(u) for u in job)):
                     self.backoff_delay = min(self.backoff_delay * 2 or BACKOFF_MIN_S, BACKOFF_MAX_S)
                     self.backoff_until = self.clock() + self.backoff_delay
                 else:
                     self.backoff_delay = self.backoff_until = 0.
                 before = self._fresh_values()
                 for url, ctx in job.items():
-                    if self.contexts.get(url) == ctx:
-                        self.values[url] = (ctx, started, values.get(url, {}))
+                    if self.contexts.get(url) == ctx and (values.get(url) or url in terminal):
+                        self.values[url] = (ctx, started, values[url])
+                        self.terminal.discard(url)
+                        if url in terminal:
+                            self.terminal.add(url)
                 if before != self._fresh_values():
                     self.revision += 1
                 # No periodic network work without another projection request.

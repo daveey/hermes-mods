@@ -222,11 +222,13 @@ board backups are tested separately and never checked into this repository.
 
 PR network observation runs in one process-shared, bounded background worker,
 not the stream or GET request. A report consumes an immutable published reader.
-Entries expire 60 seconds after read **start**, refresh becomes due at 30 seconds,
-and publication/refresh/expiry wakes the stream's normal hash-deduplicated path.
-Each URL binds to its own cards' evidence revisions and contract/status; unrelated
-board events and plain heartbeat/watch ticks cannot starve publication. A changed
-PR/head event on an owning card invalidates its old observation immediately on
+Entries expire 600 seconds after read **start** for OPEN PRs and 3600 seconds for
+MERGED/CLOSED PRs (CLOSED recognition requires the additive core Reader state seam).
+Expiry/publication wakes the stream's normal hash-deduplicated path; all-failed
+batches retain exponential retry backoff. Failed reads are not cached as observations.
+Each URL binds to its cards' explicit PR/head evidence and contract/status; comments,
+dispatch skips/holds, wake bookkeeping and plain heartbeat/watch ticks do not evict it.
+A changed PR/head event on an owning card invalidates its old observation immediately on
 projection. Results completing after invalidation cannot resurrect old approval.
 Missing/expired/failed observations stay unknown under the existing classifier.
 External GitHub changes not yet reported to the board are bounded by that TTL;
