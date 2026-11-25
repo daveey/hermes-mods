@@ -1,5 +1,5 @@
 // LLM split (design option B, ~/design/llm-split/board.html): a titlebar chip that shows the router's traffic split
-// between the subscription pools next to their quota share, and a hover panel whose drag bar sets the split.
+// between the subscription pools next to their quota share, and a click-open panel whose drag bar sets the split.
 // Click (or Enter on the focused chip) opens the panel; the titlebar tooltip names it.
 // Chip: mini stacked bar (traffic) with a tick at Claude's quota share, "13:86" (Claude:GPT traffic %), one word
 // (auto · manual · ANT over · GPT over · ANT dry). Panel: per-pool accounts, Quota bar, draggable Traffic bar, Auto|Manual.
@@ -198,8 +198,22 @@ export const TOGGLE_EVENT = 'hermes-toggle-llm-split'
 export function Chip({ ctx }) {
   const q = useSplit(ctx)
   const [open, setOpen] = useState(false)
+  const triggerRef = useRef(null), panelRef = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    // Radix's document pointerdown bookkeeping can miss a bubbling event stopped by
+    // the titlebar button (including portaled panel events). Capture the actual outside
+    // click, without dismissing on focus/movement or treating the button's padding as outside.
+    const outside = (e) => {
+      const trigger = triggerRef.current?.closest('button') || triggerRef.current
+      if (!trigger?.contains(e.target) && !panelRef.current?.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('click', outside, true)
+    return () => document.removeEventListener('click', outside, true)
+  }, [open])
   const [draft, setDraft] = useState(null)
   const [error, setError] = useState(null)
+  useEffect(() => { if (!open) { setDraft(null); setError(null) } }, [open])
   useEffect(() => {
     const toggle = () => setOpen((o) => !o)
     window.addEventListener(TOGGLE_EVENT, toggle)
@@ -218,15 +232,18 @@ export function Chip({ ctx }) {
   const stop = (e) => e.stopPropagation()
   return h(Popover, { open, onOpenChange: (o) => { setOpen(o); if (!o) { setDraft(null); setError(null) } } },
     h(PopoverTrigger, { asChild: true },
-      h('span', { className: 'llms-chip', 'data-testid': 'llm-split-chip', 'aria-label': titleFor(sum) },
+      h('span', { ref: triggerRef, className: 'llms-chip', 'data-testid': 'llm-split-chip', 'aria-label': titleFor(sum) },
         h('span', { className: 'llms-mini' }, h(Segments, { share: sum.traffic, order }),
           sum.hasQuota && h('i', { className: 'llms-qm', style: { left: `${sum.quota[ANT] || 0}%` } })),
         h('span', { className: 'llms-num' }, `${pct(sum.traffic[ANT])}:${pct(sum.traffic[GPT])}`),
         h('span', { className: `llms-word ${sum.tone}` }, sum.word))),
-    h(PopoverContent, { align: 'end', sideOffset: 6, className: 'llms-pop',
+    h(PopoverContent, { ref: panelRef, align: 'end', sideOffset: 6, className: 'llms-pop',
       onClick: stop, onPointerDown: stop, onPointerMove: stop, onPointerUp: stop,
+      onFocus: stop, // portal focus must not open the outer titlebar Tooltip
       onKeyDown: (e) => { if (e.key !== 'Escape') e.stopPropagation() },
-      onOpenAutoFocus: (e) => e.preventDefault() },
+      onOpenAutoFocus: (e) => e.preventDefault(),
+      // Close on an outside click (or Escape, or the chip), never because focus or the pointer moved away.
+      onFocusOutside: (e) => e.preventDefault() },
       h(Panel, { ctx, snap, draft, setDraft, error, setError })))
 }
 
@@ -276,7 +293,10 @@ export function tool(ctx) {
     span: CHIP_SPAN, // titlebar cells this tool takes (cores without `span` reserve one)
     className: 'llms-tool',
     icon: h(Chip, { ctx }),
-    onSelect: (event) => { if (!event || event.detail === 0) window.dispatchEvent(new window.Event(TOGGLE_EVENT)) }
+    // The span trigger handles its descendants. The outer button handles keyboard and its own padding.
+    onSelect: (event) => {
+      if (!event || event.detail === 0 || (event.currentTarget && event.target === event.currentTarget)) window.dispatchEvent(new window.Event(TOGGLE_EVENT))
+    }
   }
 }
 

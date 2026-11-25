@@ -177,5 +177,12 @@ test('keyboard-activated titlebar button (detail 0) toggles the panel; a mouse c
   await React.act(async () => t.onSelect({ detail: 1 }))
   await m.flush()
   assert.ok(bar(), 'mouse click left to the trigger')
+  const outer = {}
+  await React.act(async () => t.onSelect({ detail: 1, target: outer, currentTarget: outer }))
+  await m.flush()
+  assert.ok(!bar(), 'outer button padding closes the panel')
+  await React.act(async () => t.onSelect({ detail: 1, target: outer, currentTarget: outer }))
+  await m.flush()
+  assert.ok(bar(), 'outer button padding opens the panel')
   await m.close()
 })
