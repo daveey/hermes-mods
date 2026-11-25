@@ -316,11 +316,14 @@ def test_trace_distinguishes_expiry_retry_invalidation_and_process_local_cold():
     assert events[-2][1] == {'reason': 'expiry', 'age': 600}
     poke(store, {'pr': 'h2'})
     assert any(a[1] == 'invalidate' and a[3] == 'h1' for a, kw in events)
-    assert events[-2][1]['reason'] == 'retry'
+    assert events[-2][1]['reason'] == 'context'
     factory.fail = True
     poke(store, {'pr': 'h3'})
     assert events[-1][1]['outcome'] == 'failed'
     assert store.reader({'pr': 'h3'}).get('pr') == {}
+    clock[0] += 60
+    poke(store, {'pr': 'h3'})
+    assert events[-2][1]['reason'] == 'retry'
     assert module.Observations(factory).cache_id != store.cache_id
 
 
