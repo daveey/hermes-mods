@@ -127,6 +127,16 @@ The task/event/receipt/adverse-event/evidence reads share a SQLite read snapshot
 an already-borrowed transaction is preserved. There are no writes, renewals or
 capability/coverage advertisements. Existing watcher-receipt logic is unchanged.
 
+On older cores, a missing optional reassessment module (including its submodules,
+identified by `ModuleNotFoundError.name` starting with
+`hermes_cli.kanban_owner_reassessment`) is **silent non-authority**: it cannot
+suppress `too_long` and does not add a scanner error. Missing unrelated
+dependencies, including other `hermes_cli` modules or an unknown module name,
+and runtime/evidence failures on a capable core still leave `too_long` eligible
+and report the failure in scanner errors. Exception message text is not capability
+identity. `tests/test_reassessment_optional_core.py` exercises these paths through
+the scanner, including misleading messages.
+
 The scanner independently resolves **GitHub external targets**, encoded as
 `{kind: external, identity: <exact producer URL>, revision: <full lowercase head SHA>}`.
 `gh run view` supplies `headSha`; `gh pr view` supplies `headRefOid`. It also supports
