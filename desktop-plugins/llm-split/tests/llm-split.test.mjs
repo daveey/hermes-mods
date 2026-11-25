@@ -120,6 +120,48 @@ test('drag on the traffic bar sets a manual split and PUTs it on release', async
   await m.close()
 })
 
+test('Grok boundary changes Grok independently, cancel and invalid geometry never PUT', async () => {
+  const ctx = fakeCtx(snap({ traffic: { weights: {}, share: { anthropic: 20, 'openai-codex': 55, 'xai-oauth': 25 } } }))
+  const m = await mount(h(P.Chip, { ctx }))
+  await m.click(chip())
+  const knob = document.querySelector('[aria-label="Grok share of traffic"]')
+  assert.ok(knob, 'second accessible boundary')
+  bar().getBoundingClientRect = () => ({ left: 100, width: 200 })
+  const PE = window.PointerEvent || MouseEvent
+  const fire = (type, x) => React.act(async () => knob.dispatchEvent(new PE(type, { bubbles: true, cancelable: true, clientX: x, button: 0 })))
+  await fire('pointerdown', 250)
+  await fire('pointermove', 220)
+  await fire('pointerup', 220)
+  await m.flush()
+  assert.deepEqual(ctx.calls.filter(c => c.method === 'PUT').at(-1).body.share,
+    { anthropic: 20, 'openai-codex': 40, 'xai-oauth': 40 })
+  await fire('pointerdown', 220); await fire('pointercancel', 180); await fire('pointerup', 180)
+  assert.equal(ctx.calls.filter(c => c.method === 'PUT').length, 1)
+  bar().getBoundingClientRect = () => ({ left: 100, width: 0 })
+  await fire('pointerdown', 220); await fire('pointerup', 180)
+  assert.equal(ctx.calls.filter(c => c.method === 'PUT').length, 1)
+  await m.close()
+})
+
+test('Grok keys clamp at both extremes and canceled keyboard draft never commits', async () => {
+  const ctx = fakeCtx(snap({ traffic: { weights: {}, share: { anthropic: 20, 'openai-codex': 55, 'xai-oauth': 25 } } }))
+  const m = await mount(h(P.Chip, { ctx }))
+  await m.click(chip())
+  const knob = document.querySelector('[aria-label="Grok share of traffic"]')
+  assert.ok(knob)
+  const key = k => React.act(async () => knob.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true })))
+  await key('End')
+  assert.equal(knob.getAttribute('aria-valuenow'), '80')
+  const ant = document.querySelector('[aria-label="Claude share of traffic"]')
+  assert.notEqual(knob.style.top, ant.style.top, 'coincident boundaries remain separately hittable')
+  await key('Home')
+  assert.equal(knob.getAttribute('aria-valuenow'), '0')
+  await key('Escape')
+  await React.act(async () => new Promise(r => setTimeout(r, P.KEY_COMMIT_MS + 50)))
+  assert.equal(ctx.calls.filter(c => c.method === 'PUT').length, 0)
+  await m.close()
+})
+
 test('Auto button PUTs mode auto and the chip says auto', async () => {
   const ctx = fakeCtx(snap())
   const m = await mount(h(P.Chip, { ctx }))

@@ -129,11 +129,19 @@ def read_quota(root: Path, now: Optional[float] = None) -> Dict[str, Any]:
 
 # ── homes and weights ─────────────────────────────────────────────────────────
 
-def homes(root: Path) -> List[Path]:
+def homes(root: Path, strict: bool = False) -> List[Path]:
     """The root home and every profile home whose config.yaml has a ``model_routing.routes`` mapping."""
     out = []
     for h in [root, *sorted((root / "profiles").glob("*"))]:
-        if _routes(_load_yaml(h / "config.yaml")):
+        path = h / 'config.yaml'
+        if strict and path.is_file():
+            import yaml
+            cfg = yaml.safe_load(path.read_bytes())
+            if not isinstance(cfg, dict):
+                raise ValueError(f"config is not a mapping: {path}")
+        else:
+            cfg = _load_yaml(path)
+        if _routes(cfg):
             out.append(h)
     return out
 
@@ -202,8 +210,8 @@ def weights_for(share: Dict[str, float], provs: Iterable[str]) -> Dict[str, int]
     return {p: w[pool_of(p)] for p in provs}
 
 
-def write_weights(home: Path, weights: Dict[str, int], now: Optional[float] = None) -> bool:
-    """Set each route's weight to its provider's; True when the file changed. Raises on an invalid result.
+def _prepare_weights(home: Path, weights: Dict[str, int]):
+    """Prepare original/replacement bytes without writing; raises on invalid output.
 
     Only the ``weight:`` value tokens change: ruamel finds their line/column, the text is edited in place, so the
     rest of config.yaml (indentation, comments, quoting) is byte-identical.
@@ -211,10 +219,11 @@ def write_weights(home: Path, weights: Dict[str, int], now: Optional[float] = No
     import re
     from ruamel.yaml import YAML
     path = home / "config.yaml"
-    text = path.read_text()
+    original = path.read_bytes()
+    text = original.decode("utf-8")
     doc = YAML().load(text)
     lines = text.splitlines(keepends=True)
-    changed = False
+    edits = []
     for level in ((doc.get("model_routing") or {}).get("routes") or {}).values():
         for r in level or []:
             p = r.get("provider")
@@ -225,21 +234,59 @@ def write_weights(home: Path, weights: Dict[str, int], now: Optional[float] = No
             m = re.compile(r"-?\d+").match(line, col)
             if not m:
                 raise ValueError(f"cannot locate weight value at {path}:{ln + 1}")
-            lines[ln] = line[:m.start()] + str(int(weights[p])) + line[m.end():]
-            changed = True
-    if not changed:
-        return False
+            edits.append((ln, m.start(), m.end(), str(int(weights[p]))))
+    # Positions refer to original bytes: edit right-to-left even within one flow line.
+    for ln, start, end, value in sorted(edits, reverse=True):
+        lines[ln] = lines[ln][:start] + value + lines[ln][end:]
     new = "".join(lines)
-    _validate(new)
-    now = time.time() if now is None else now
-    backup = path.with_name(f"config.yaml.pre-llm-split-{time.strftime('%Y%m%d', time.gmtime(now))}")
-    if not backup.exists():
-        backup.write_text(text)
-    tmp = path.with_name(f".config.yaml.llm-split.{os.getpid()}")
-    tmp.write_text(new)
-    os.chmod(tmp, path.stat().st_mode & 0o777)
-    os.replace(tmp, path)
-    return True
+    _validate(new)  # unchanged homes must also validate before any home is installed
+    return path, original, new.encode("utf-8")
+
+
+def _replace_bytes(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f".{path.name}.llm-split.{os.getpid()}")
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _install_weights(plans, now: float, finish=lambda: None):
+    """Prepare every home first; restore installed bytes on write/state failure.
+
+    Atomic per-file replacement, not a crash-atomic multi-file transaction.
+    Rollback failure is explicit rather than hidden behind the original error.
+    """
+    changed = [(p, old, new) for p, old, new in plans if old != new]
+    installed = []
+    try:
+        for p, old, new in plans:
+            if p.read_bytes() != old:
+                raise ValueError(f"config changed during split preparation: {p}")
+        for p, old, new in changed:
+            backup = p.with_name(f"config.yaml.pre-llm-split-{time.strftime('%Y%m%d', time.gmtime(now))}")
+            if not backup.exists():
+                backup.write_bytes(old)
+            _replace_bytes(p, new)
+            installed.append((p, old))
+        finish()
+    except Exception as exc:
+        failed = []
+        for p, old in reversed(installed):
+            try:
+                _replace_bytes(p, old)
+            except Exception as rollback:
+                failed.append(f"{p}: {rollback}")
+        if failed:
+            raise RuntimeError(f"split failed: {exc}; ROLLBACK FAILED: {'; '.join(failed)}") from exc
+        raise
+    return [str(p.parent) for p, _, _ in changed]
+
+
+def write_weights(home: Path, weights: Dict[str, int], now: Optional[float] = None) -> bool:
+    return bool(_install_weights([_prepare_weights(home, weights)], time.time() if now is None else now))
 
 
 def _validate(text: str) -> None:
@@ -349,13 +396,11 @@ def apply(root: Path, mode: str, share: Optional[Dict[str, Any]] = None, now: Op
                 raise ValueError("no quota reading on this host: auto has nothing to follow")
             target = _normalise({p: q["share"].get(p, 0.0) for p in pools}, pools)
         weights = weights_for(target, provs)
-        written = []
-        for h in homes(root):
-            mine = {p: w for p, w in weights.items() if p in read_weights(h)}
-            if write_weights(h, mine, now):
-                written.append(str(h))
-        _write_state(root, {"mode": mode, "share": target if mode == "manual" else None, "updated_at": now,
-                            "weights": weights, "written": written})
+        plans = [_prepare_weights(h, weights) for h in homes(root, strict=True)]
+        written = [str(p.parent) for p, old, new in plans if old != new]
+        _install_weights(plans, now, lambda: _write_state(root, {
+            "mode": mode, "share": target if mode == "manual" else None, "updated_at": now,
+            "weights": weights, "written": written}))
     snap = snapshot(root, now)
     snap["written"] = written
     return snap

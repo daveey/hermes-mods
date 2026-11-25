@@ -39,6 +39,33 @@ one manual update instead of two before adding those handlers, then passed. Both
 native capture, receive the trusted release and commit a manual update while the panel stays open.
 This isolates the harness and knob defects; it does not establish the user's production mouse-out cause.
 
+## Flow-YAML saves and three-pool boundaries
+
+The traffic bar exposes Claude/GPT and GPT/Grok boundaries. Dragging the first keeps Grok fixed;
+dragging the second keeps Claude fixed. A bar-start drag chooses the nearer boundary. Each handle has
+an accessible pool label, arrow/Shift-arrow, Home/End controls; coincident boundaries separate vertically.
+Quota remains read-only. Pointer cancel, lost capture and invalid coordinates discard the gesture; Escape
+or unmount cancels a pending keyboard save. Completed gestures send one manual update on release.
+
+Problem: one-line flow YAML with several `weight: 1` tokens failed saving with `cannot locate weight value`.
+Why 1: replacing an earlier weight with a multi-digit value shifted later tokens on the same line.
+Why 2: the writer reused ruamel's original columns against already-mutated text.
+Root (happened): edits were applied in traversal order rather than descending original token position.
+The writer now prepares all replacements right-to-left, retaining UTF-8, CRLF, comments and other scalars.
+A separate partial-update risk came from writing homes before validating later profiles; all homes now
+prepare/validate first, then normal write/state failures restore already-installed original bytes.
+Rollback failures explicitly name unrecovered files. This is **not** a crash-atomic multi-file transaction.
+
+Root (not caught): backend fixtures were block YAML with one weight per line, while the UI test explicitly
+asserted that Grok stayed fixed; neither tested same-line token growth or a second boundary.
+Recurrence: the earlier click/titlebar fixes below did not change this writer or promise independent Grok control.
+Countermeasures: `plugins/llm-split/tests/test_flow.py` exercises one-line/multiline flow, repeated grow/shrink,
+exact unrelated-byte preservation, invalid/malformed later homes, write/state failure rollback and explicit
+rollback failure; `test_api.py` PUTs manual/auto and GETs readback across mixed-format homes.
+`llm-split.test.mjs` adds independent Grok, cancellation, invalid geometry and keyboard extremes;
+`pointer-browser.mjs` uses trusted input for both Grok start paths, key commits, nonoverlapping extremes,
+panel persistence and cancellation. Production routing intent is never guessed to obtain a live save receipt.
+
 ## Proof and causal boundaries
 
 Executed on Linux Chromium with Node 22: **33 browser state assertions passed**, plus REST-payload assertions

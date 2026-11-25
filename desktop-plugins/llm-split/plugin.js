@@ -120,32 +120,54 @@ export function Panel({ ctx, snap, draft, setDraft, error, setError }) {
     return put(body)
   }, [put, order.join()])
 
-  const at = (clientX) => {
+  const gesture = useRef(null)
+  const boundarySplit = (x, boundary, base) => boundary === GRK
+    ? splitAt(base[ANT] || 0, clamp(100 - x, 0, 100 - (base[ANT] || 0)))
+    : splitAt(x, base[GRK] || 0)
+  const at = (clientX, boundary, base) => {
     const r = bar.current?.getBoundingClientRect()
-    if (!r || !r.width) return null
-    return splitAt(((clientX - r.left) / r.width) * 100, grk)
+    if (!r || !Number.isFinite(r.width) || r.width <= 0 || !Number.isFinite(clientX)) return null
+    return boundarySplit(((clientX - r.left) / r.width) * 100, boundary, base)
   }
-  const onPointerDown = (e) => {
-    if (e.button !== 0) return
+  const cancel = () => {
+    gesture.current = null; clearTimeout(timer.current)
+    setDragging(false); setDraft(null)
+  }
+  const onPointerDown = (e, boundary) => {
+    if (e.button !== 0 || busy || gesture.current) return
     e.preventDefault(); e.stopPropagation()
-    const s = at(e.clientX); if (!s) return
+    const r = bar.current?.getBoundingClientRect()
+    if (!boundary) boundary = order.includes(GRK) && r &&
+      Math.abs(e.clientX - r.left - r.width * (1 - grk / 100)) <
+      Math.abs(e.clientX - r.left - r.width * ((sum.traffic[ANT] || 0) / 100)) ? GRK : ANT
+    const base = sum.traffic
+    const s = at(e.clientX, boundary, base); if (!s) return
+    clearTimeout(timer.current)
+    gesture.current = { id: e.pointerId, boundary, base }
     setDraft(s); setDragging(true)
     e.currentTarget.setPointerCapture?.(e.pointerId)
   }
-  const onPointerMove = (e) => { if (dragging) { const s = at(e.clientX); if (s) setDraft(s) } }
-  const onPointerUp = (e) => {
-    if (!dragging) return
-    setDragging(false)
-    const s = at(e.clientX) || draft
-    if (s) { setDraft(s); commit(s) }
+  const onPointerMove = (e) => {
+    const g = gesture.current
+    if (g && e.pointerId === g.id) { const s = at(e.clientX, g.boundary, g.base); if (s) setDraft(s) }
   }
-  const onKeyDown = (e) => {
+  const onPointerUp = (e) => {
+    const g = gesture.current
+    if (!g || e.pointerId !== g.id) return
+    gesture.current = null; setDragging(false)
+    const s = at(e.clientX, g.boundary, g.base)
+    if (s) { setDraft(s); commit(s) } else setDraft(null)
+  }
+  const onKeyDown = (e, boundary = ANT) => {
+    if (e.key === 'Escape') { cancel(); return }
+    if (busy || gesture.current) return
     const step = e.shiftKey ? 10 : 1
     const d = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? step : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -step : 0
     if (!d && e.key !== 'Home' && e.key !== 'End') return
     e.preventDefault(); e.stopPropagation()
-    const cur = sum.traffic[ANT] || 0
-    const s = splitAt(e.key === 'Home' ? 0 : e.key === 'End' ? 100 : cur + d, grk)
+    const cur = sum.traffic[boundary] || 0
+    const value = e.key === 'Home' ? 0 : e.key === 'End' ? 100 : cur + d
+    const s = boundarySplit(boundary === GRK ? 100 - value : value, boundary, sum.traffic)
     setDraft(s)
     clearTimeout(timer.current)
     timer.current = setTimeout(() => commit(s), KEY_COMMIT_MS)
@@ -172,12 +194,21 @@ export function Panel({ ctx, snap, draft, setDraft, error, setError }) {
     h('div', { className: 'llms-row' }, h('div', { className: 'llms-lab' }, 'Traffic'),
       h('div', { className: 'llms-tr' },
         h('div', { ref: bar, className: 'llms-bar t', 'data-testid': 'traffic-bar', onPointerDown, onPointerMove, onPointerUp,
-          onPointerCancel: () => { setDragging(false); setDraft(null) } }, h(Segments, { share: sum.traffic, order, labels: true })),
+          onPointerCancel: cancel, onLostPointerCapture: () => { if (gesture.current) cancel() } }, h(Segments, { share: sum.traffic, order, labels: true })),
         sum.hasQuota && h('i', { className: 'llms-qtick', style: { left: `${sum.quota[ANT] || 0}%` }, title: 'Claude quota share' }),
-        h('div', { className: 'llms-knob', tabIndex: 0, role: 'slider', 'aria-label': 'Claude share of traffic',
-          'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': pct(knobLeft), 'aria-valuetext': `Claude ${pct(knobLeft)}%`,
-          style: { left: `${knobLeft}%` }, onKeyDown, onPointerDown, onPointerMove, onPointerUp,
-          onPointerCancel: () => { setDragging(false); setDraft(null) } }))),
+        [ANT, ...(order.includes(GRK) ? [GRK] : [])].map((p) => {
+          const left = p === ANT ? knobLeft : 100 - grk
+          const close = order.includes(GRK) && 100 - grk - knobLeft < 6
+          const value = p === ANT ? knobLeft : grk
+          const label = p === ANT ? 'Claude' : 'Grok'
+          return h('div', { key: p, className: 'llms-knob', tabIndex: busy ? -1 : 0, role: 'slider',
+            'aria-label': `${label} share of traffic`, 'aria-disabled': busy,
+            'aria-valuemin': 0, 'aria-valuemax': 100 - (p === ANT ? grk : knobLeft),
+            'aria-valuenow': pct(value), 'aria-valuetext': `${label} ${pct(value)}%`,
+            style: { left: `${left}%`, ...(close ? { top: p === ANT ? '-10px' : '12px', height: '14px' } : {}) },
+            onKeyDown: (e) => onKeyDown(e, p), onPointerDown: (e) => onPointerDown(e, p), onPointerMove, onPointerUp,
+            onPointerCancel: cancel, onLostPointerCapture: () => { if (gesture.current) cancel() } })
+        }))),
     h('div', { className: 'llms-foot' },
       h('div', { className: 'llms-seg', role: 'radiogroup', 'aria-label': 'Mode' },
         h('button', { type: 'button', role: 'radio', 'aria-checked': sum.mode === 'auto', className: sum.mode === 'auto' ? 'on' : '',
@@ -290,7 +321,7 @@ export function tool(ctx) {
   return {
     id: 'llm-split',
     label: 'LLM split',
-    title: 'Claude ⇄ GPT: traffic split vs quota. Click to adjust',
+    title: 'Claude ⇄ GPT ⇄ Grok: traffic split vs quota. Click to adjust',
     span: CHIP_SPAN, // titlebar cells this tool takes (cores without `span` reserve one)
     className: 'llms-tool',
     icon: h(Chip, { ctx }),

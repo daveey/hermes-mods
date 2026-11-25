@@ -12,9 +12,9 @@ for (const type of ['pointerdown', 'pointerup', 'gotpointercapture', 'lostpointe
   document.addEventListener(type, (e) => window.events.push({ type, target: e.target.className, trusted: e.isTrusted }), true)
 }
 const split = {
-  pools: [{ id: 'anthropic', label: 'Claude' }, { id: 'openai-codex', label: 'GPT' }],
-  mode: 'manual', traffic: { share: { anthropic: 30, 'openai-codex': 70 } },
-  quota: { share: { anthropic: 30, 'openai-codex': 70 }, dry: [] }
+  pools: [{ id: 'anthropic', label: 'Claude' }, { id: 'openai-codex', label: 'GPT' }, { id: 'xai-oauth', label: 'Grok' }],
+  mode: 'manual', traffic: { share: { anthropic: 30, 'openai-codex': 45, 'xai-oauth': 25 } },
+  quota: { share: { anthropic: 30, 'openai-codex': 45, 'xai-oauth': 25 }, dry: [] }
 }
 window.calls = []
 const ctx = {
