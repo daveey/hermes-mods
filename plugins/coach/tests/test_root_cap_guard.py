@@ -74,6 +74,46 @@ def test_coach_loader_compiles_once_but_keeps_module_state_private(monkeypatch):
     assert len(compilations) == 1, "fixture must reuse code, not recompile or share module state"
 
 
+def test_acceptance_loader_reuses_code_with_fresh_globals_and_content_invalidation(tmp_path, monkeypatch):
+    import builtins
+
+    rc = _coach_mod()._load("root_cap")
+    coach = tmp_path / "coach"
+    coach.mkdir()
+    sibling = tmp_path / "kanban-honest-done"
+    sibling.mkdir()
+    source = sibling / "acceptance.py"
+    source.write_text("value = []\ndef read(): return value\nversion = 1\n")
+    monkeypatch.setattr(rc, "__file__", str(coach / "root_cap.py"))
+    real_compile = builtins.compile
+    compilations = []
+
+    def counted_compile(data, filename, *args, **kwargs):
+        if str(filename) == str(source):
+            compilations.append(filename)
+        return real_compile(data, filename, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "compile", counted_compile)
+    first = rc._acceptance()
+    first.value.append("private")
+    second = rc._acceptance()
+    assert first is not second
+    assert first.read() == ["private"] and second.read() == []
+    assert first.read.__globals__ is first.__dict__
+    assert second.read.__globals__ is second.__dict__
+    assert first.__file__ == second.__file__ == str(source)
+    assert first.__spec__.name == second.__spec__.name == "_root_cap_acceptance"
+    assert len(compilations) == 1
+    stamp = source.stat()
+    source.write_text("value = []\ndef read(): return value\nversion = 2\n")
+    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert rc._acceptance().version == 2
+    assert len(compilations) == 2
+    source.unlink()
+    with pytest.raises(FileNotFoundError):
+        rc._acceptance()
+
+
 class World:
     """Isolated root home + kanban + state.db + approved artifact + real coach hooks."""
 

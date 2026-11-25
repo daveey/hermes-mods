@@ -20,6 +20,7 @@ import ast
 import contextlib
 import datetime
 import fcntl
+from functools import lru_cache
 import glob
 import hashlib
 import importlib.util
@@ -294,11 +295,19 @@ def config_value(target_home, key):
     return data
 
 
+@lru_cache(maxsize=1)
+def _acceptance_code(path, source):
+    # Content, not mtime/size: a same-size replacement must take effect immediately.
+    # Retain only immutable code; acceptance's mutable module state stays per call.
+    return compile(source, path, "exec", dont_inherit=True)
+
+
 def _acceptance():
     path = Path(__file__).resolve().parent.parent / "kanban-honest-done" / "acceptance.py"
+    source = path.read_bytes()  # Missing/unreadable source must never reuse stale authority.
     spec = importlib.util.spec_from_file_location("_root_cap_acceptance", path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    exec(_acceptance_code(str(path), source), mod.__dict__)
     return mod
 
 
