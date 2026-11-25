@@ -57,6 +57,10 @@ For all-board dashboards, propagate flow completeness beyond governor counts int
 
 When consuming core governor snapshots, keep complete governor counters separate from capped per-card receipts: `truncated` makes affected lane counts and exact held-card navigation incomplete, not a smaller authoritative count. Carry each board's flow-read completeness independently of its tick freshness; a fresh tick cannot certify a failed flow read as zero held or “starting”. Mark affected lane details unknown/disable exact-set navigation while retaining healthy sibling lanes and full known global counters. Prove this through real dispatcher fixtures with a reduced receipt cap and an injected flow-read failure, then assert the rendered sidebar; persist selected lane as well as section expansion and test unmount/remount.
 
+## Multi-board projection correctness
+
+Arm each SQLite deadline when that board's work starts, not when sibling connections open. Contain context, summary and receipt failures to their source; one interrupted sibling must not take the view offline. Prove slow first and later boards with real dispatcher DBs, actual expired progress handlers, healthy sibling rendering and recovery. Share unknown/partial summary formatting between the sidebar and old-SDK strip/panel; assert both mounts from one real projection, including visible unknown lanes, shares and governor held counts.
+
 ## When the user asks for a change
 
 Use the smallest applicable command below, then read back the result: `show` for shares, `explain <card>` for assignment. When creating cards under an established project-lane direction, assign and verify the lane as the creator rather than leaving that administrative step in the worker's brief. If a worker returns a creator-only lane request, run `assign`, read back with `explain`, and post the evidence via `kanban_comment` so the parked task can finish; this avoids another worker run merely to attempt a mutation outside its authority.
