@@ -53,8 +53,26 @@ def test_production_inventory_memo_cost_and_same_version_changes(replica_panel, 
 
     from test_panel_timing import timing, checked
     mirror_module = p.mirror.reconcile_panel.__func__.__globals__
-    traced_costs = []
-    for _ in range(3):
+    # Base-referenced control includes disabled-trace hot-path overhead too.
+    # Freeze the old helper, rather than comparing two modes of new code only.
+    import ast
+    import inspect
+    import statistics
+    import types
+    from inventory_base_reference import _inventory as base_inventory
+    assert ast.dump(ast.parse(inspect.getsource(module._inventory))) == ast.dump(
+        ast.parse(inspect.getsource(base_inventory)))
+    baseline = types.FunctionType(base_inventory.__code__, module.__dict__)
+    current = module._inventory
+    base_costs, traced_costs = [], []
+    for _ in range(7):
+        with monkeypatch.context() as control:
+            control.setattr(module, '_inventory', baseline)
+            start = time.thread_time()
+            p.run()
+            base_costs.append(time.thread_time() - start)
+            assert p.mirror.panel_remote_unchanged
+        assert module._inventory is current
         trace = timing.Recorder()
         start = time.thread_time()
         with mirror_module['panel_trace'](trace):
@@ -63,8 +81,8 @@ def test_production_inventory_memo_cost_and_same_version_changes(replica_panel, 
         assert p.mirror.panel_remote_unchanged
         out = checked(trace)
         assert out['stages']['inventory_hash_sample']['calls'] >= count // 64
-    print('TIMING_OVERHEAD', dict(untraced_cpu_s=costs, traced_cpu_s=traced_costs))
-    assert min(traced_costs) < min(costs) + .05, (costs, traced_costs)
+    print('TIMING_OVERHEAD', dict(base_inventory_cpu_s=base_costs, traced_cpu_s=traced_costs))
+    assert statistics.median(traced_costs) < statistics.median(base_costs) + .05, (base_costs, traced_costs)
 
     # Publication version and global DB identity are NOT trusted cache keys.
     # Changing a previously unrelated payload at the same version can add this

@@ -22,6 +22,36 @@ def checked(trace):
     return out
 
 
+def test_unsampled_inventory_is_pre_instrumentation_base():
+    import ast
+    import inspect
+    from inventory_base_reference import _inventory as base_inventory
+    assert ast.dump(ast.parse(inspect.getsource(membership._inventory))) == ast.dump(
+        ast.parse(inspect.getsource(base_inventory)))
+
+
+def test_copied_context_does_not_share_cross_thread_exclusive_stack():
+    from contextvars import copy_context
+    trace = timing.Recorder()
+    errors = []
+    def child():
+        try:
+            with mirror._stage('foreign_thread'):
+                assert mirror._PANEL_TRACE.get() is trace
+        except BaseException as exc:
+            errors.append(exc)
+    with mirror.panel_trace(trace), trace.stage('owner'):
+        context = copy_context()
+        thread = threading.Thread(target=context.run, args=(child,))
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+    assert not errors
+    out = checked(trace)
+    assert 'foreign_thread' not in out['stages']
+    assert out['stages']['owner']['calls'] == 1
+
+
 def test_exact_nested_exclusive_accounting_on_exception(monkeypatch):
     clocks = [0, 0]
     monkeypatch.setattr(timing.time, 'monotonic_ns', lambda: clocks[0])
