@@ -136,7 +136,12 @@ def homes(root: Path, strict: bool = False) -> List[Path]:
         path = h / 'config.yaml'
         if strict and path.is_file():
             import yaml
-            cfg = yaml.safe_load(path.read_bytes())
+            try:
+                cfg = yaml.safe_load(path.read_bytes())
+            except (yaml.YAMLError, UnicodeError) as exc:
+                raise ValueError(f"cannot parse config {path}: {exc}") from exc
+            if cfg is None:  # empty/comment-only homes have no routing policy
+                continue
             if not isinstance(cfg, dict):
                 raise ValueError(f"config is not a mapping: {path}")
         else:
@@ -223,7 +228,7 @@ def _prepare_weights(home: Path, weights: Dict[str, int]):
     text = original.decode("utf-8")
     doc = YAML().load(text)
     lines = text.splitlines(keepends=True)
-    edits = []
+    edits = {}
     for level in ((doc.get("model_routing") or {}).get("routes") or {}).values():
         for r in level or []:
             p = r.get("provider")
@@ -234,9 +239,14 @@ def _prepare_weights(home: Path, weights: Dict[str, int]):
             m = re.compile(r"-?\d+").match(line, col)
             if not m:
                 raise ValueError(f"cannot locate weight value at {path}:{ln + 1}")
-            edits.append((ln, m.start(), m.end(), str(int(weights[p]))))
+            # YAML aliases revisit the same source node: replace its token once.
+            key = (ln, m.start(), m.end())
+            value = str(int(weights[p]))
+            if key in edits and edits[key] != value:
+                raise ValueError(f"conflicting aliased weight at {path}:{ln + 1}")
+            edits[key] = value
     # Positions refer to original bytes: edit right-to-left even within one flow line.
-    for ln, start, end, value in sorted(edits, reverse=True):
+    for (ln, start, end), value in sorted(edits.items(), reverse=True):
         lines[ln] = lines[ln][:start] + value + lines[ln][end:]
     new = "".join(lines)
     _validate(new)  # unchanged homes must also validate before any home is installed

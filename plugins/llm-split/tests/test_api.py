@@ -66,6 +66,28 @@ def test_flow_endpoint_manual_auto_and_get_readback(client, width):
         assert readback['mode'] == body['mode']
 
 
+@pytest.mark.parametrize('failure', ['yaml', 'encoding', 'write', 'rollback'])
+def test_save_failures_return_actionable_detail(client, monkeypatch, failure):
+    import sys
+    http, root = client
+    c = sys.modules['hermes_llm_split_core']
+    original = (root / 'config.yaml').read_bytes()
+    if failure in ('yaml', 'encoding'):
+        profile = root / 'profiles' / 'broken'
+        profile.mkdir(parents=True)
+        (profile / 'config.yaml').write_bytes(b'model_routing: [' if failure == 'yaml' else b'\xff')
+        expected, text = 400, 'config'
+    else:
+        expected, text = 500, 'injected write failure' if failure == 'write' else 'ROLLBACK FAILED'
+        def fail(*args):
+            raise OSError('injected write failure') if failure == 'write' else RuntimeError('ROLLBACK FAILED: injected')
+        monkeypatch.setattr(c, '_write_state', fail)
+    response = http.put('/v1/split', json={'mode': 'auto'})
+    assert response.status_code == expected
+    assert text in response.json()['detail']
+    assert (root / 'config.yaml').read_bytes() == original
+
+
 def test_bad_bodies_are_400(client):
     http, _ = client
     for body in ({"mode": "manual"}, {"mode": "x"}, {"mode": "manual", "share": {"anthropic": -3}}):

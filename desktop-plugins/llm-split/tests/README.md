@@ -54,7 +54,14 @@ Root (happened): edits were applied in traversal order rather than descending or
 The writer now prepares all replacements right-to-left, retaining UTF-8, CRLF, comments and other scalars.
 A separate partial-update risk came from writing homes before validating later profiles; all homes now
 prepare/validate first, then normal write/state failures restore already-installed original bytes.
-Rollback failures explicitly name unrecovered files. This is **not** a crash-atomic multi-file transaction.
+Rollback failures explicitly name unrecovered files and reach the REST error detail (500 for write/rollback
+failures, 400 for invalid configs). This is **not** a crash-atomic multi-file transaction.
+Empty/comment-only profiles are nonrouting and skipped byte-for-byte. Malformed, undecodable or nonmapping
+configs fail closed before any writes: their routing status cannot be established safely.
+Anchored/aliased route lists reuse source tokens, so the replacement plan deduplicates original spans.
+The first review caught missing empty-profile and alias coverage: strict discovery had conflated no document
+with invalid shape, and traversal visits had been mistaken for distinct textual tokens. Regressions cover both
+flow widths and repeated growth/shrink, plus manual/auto empty-profile saves and actionable API failures.
 
 Root (not caught): backend fixtures were block YAML with one weight per line, while the UI test explicitly
 asserted that Grok stayed fixed; neither tested same-line token growth or a second boundary.

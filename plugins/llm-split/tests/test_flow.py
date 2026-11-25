@@ -36,6 +36,42 @@ def test_flow_grow_shrink_exact_bytes(tmp_path, width):
     assert next(tmp_path.glob('*.pre-llm-split-*')).read_bytes() == original
 
 
+@pytest.mark.parametrize('empty', [b'', b'# unrelated profile\r\n'])
+def test_empty_nonrouting_profile_is_skipped(tmp_path, empty):
+    paths = mixed(tmp_path)
+    plain = tmp_path / 'profiles' / 'plain'
+    plain.mkdir()
+    path = plain / 'config.yaml'
+    path.write_bytes(empty)
+    for mode in ('manual', 'auto'):
+        if mode == 'auto':
+            import json
+            (tmp_path / 'llm_pacing.json').write_text(json.dumps({'v2': {
+                'computed_at': NOW, 'pools': {'anthropic': {'ratio': 1}}}}))
+        core.apply(tmp_path, mode, {'anthropic': 16, 'openai-codex': 58, 'xai-oauth': 25}, NOW)
+        assert path.read_bytes() == empty
+        assert str(plain) not in core.snapshot(tmp_path, NOW)['homes']
+    assert not list(plain.glob('*.pre-llm-split-*'))
+
+
+@pytest.mark.parametrize('width', [80, 100000])
+def test_aliased_route_lists_edit_each_source_token_once(tmp_path, width):
+    data = yaml.safe_load(CONFIG)
+    routes = data['model_routing']['routes']
+    routes['fast'] = routes['deep']
+    original = ('# keep é\r\n' + yaml.safe_dump(data, default_flow_style=True,
+                sort_keys=False, width=width).replace('\n', '\r\n')).encode()
+    path = tmp_path / 'config.yaml'
+    path.write_bytes(original)
+    assert b'&id001' in original and b'*id001' in original
+    for target in (21, 1, 10, 3, 1):
+        weights = dict.fromkeys(('anthropic', 'openai-codex', 'xai-oauth'), target)
+        core.write_weights(tmp_path, weights, NOW)
+        expected = re.sub(rb'(weight: )1(?=[,}])', lambda m: m[1] + str(target).encode(), original)
+        assert path.read_bytes() == expected
+        assert weights_in(path) == {'deep': weights, 'fast': weights}
+
+
 def mixed(tmp_path):
     (tmp_path / 'config.yaml').write_text(CONFIG)
     profile = tmp_path / 'profiles' / 'alpha'
