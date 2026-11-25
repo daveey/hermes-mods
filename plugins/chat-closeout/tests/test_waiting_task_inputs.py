@@ -21,6 +21,53 @@ def certified(world, clock):
     return world
 
 
+def test_waiting_sql_error_logs_query_site_without_message(certified, monkeypatch, caplog):
+    """Class-only accounting cannot distinguish a locked read from a missing-table query."""
+    error = sqlite3.OperationalError('private SQL parameter must not be logged')
+    error.sqlite_errorname = 'SQLITE_BUSY'
+    def query_site(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(plugin, '_input_parts', query_site)
+    with caplog.at_level('WARNING', logger='chat_closeout'):
+        with pytest.raises(sqlite3.OperationalError) as raised:
+            plugin.waiting_inputs()
+    assert raised.value is error  # observability only; no suppression or retry
+    assert 'waiting_inputs SQLite failure' in caplog.text
+    assert 'SQLITE_BUSY' in caplog.text
+    assert 'query_site' in caplog.text
+    assert 'private SQL parameter' not in caplog.text
+    assert plugin._inputs_local.failed and plugin._inputs_local.hit is None
+
+
+def test_large_watched_set_reads_marks_in_one_query(certified, monkeypatch):
+    """The live waiting ledger watches about 1200 tails, not just the two in the tiny fixture."""
+    import contextlib
+    from hermes_cli import kanban_activity_revision as rev
+    tails = {f'missing-{i}' for i in range(1200)} | {'t_1', 't_2', "quoted-'tail"}
+    statements = []
+    original = plugin._waiting_board_read
+    @contextlib.contextmanager
+    def traced(path):
+        with original(path) as conn:
+            conn.set_trace_callback(statements.append)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+    monkeypatch.setattr(plugin, '_waiting_board_read', traced)
+    key = plugin._waiting_board_key(certified['board'], tails)
+    cursor = plugin._wi['waiting_boards'][(str(certified['board']), None)]
+    with sqlite3.connect(certified['board']) as conn:
+        marks = [[tail, conn.execute(f'SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?', (tail,)).fetchone()]
+                 for tail in sorted(tails | {rev.FULL_MARK})]
+    expected = plugin.wi.strict_digest(['tasks-v1', cursor.dev, cursor.ino, cursor.shm,
+                                      cursor.schema_version, cursor.tables,
+                                      [[tail, list(mark) if mark is not None else None] for tail, mark in marks]])
+    assert key == expected  # exact old key, including absent and FULL marks
+    keyed = [sql for sql in statements if f'FROM {rev.CHANGE_TABLE} WHERE task_id' in sql]
+    assert len(keyed) == 1, f'{len(keyed)} mark SELECTs for one waiting board'
+
+
 @pytest.mark.parametrize('kind', ['heartbeat', 'comment', 'status'])
 def test_unrelated_writes_leave_declared_inputs_unchanged(certified, clock, kind):
     key = plugin.waiting_inputs()

@@ -1892,9 +1892,13 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
                 if cursor is None:
                     cache.pop(ident, None)
                     raise wi.Unportable("uncertified waiting task inputs")
-                marks = [[tail, conn.execute(
-                    f"SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?", (tail,)).fetchone()]
-                    for tail in sorted(tails | {rev.FULL_MARK})]
+                selected = sorted(tails | {rev.FULL_MARK})
+                # One indexed lookup per board, not one SQL statement per watched task. Keep missing
+                # marks and ordering in the portable key exactly as before, in this same snapshot.
+                found = dict(conn.execute(
+                    f"SELECT task_id, rev FROM {rev.CHANGE_TABLE} WHERE task_id IN "
+                    "(SELECT value FROM json_each(?))", (json.dumps(selected),)).fetchall())
+                marks = [[tail, (found[tail],) if tail in found else None] for tail in selected]
                 # changed_since rechecks path/shm identity after its read, including when the caller owns
                 # the transaction. Repeat after the marks, so a replacement during their read is unknown.
                 _changed, final = tc.changed_since(conn, cursor, tables=tables)
@@ -2073,6 +2077,17 @@ def waiting_inputs() -> Any:
             parts = _input_parts(rows, time.time())
             # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
             key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
+        except sqlite3.OperationalError as exc:
+            # Class-only counters hide the failing query. Record code and source sites, never the
+            # exception message, SQL parameters, source text or full paths (those may be private).
+            sites, tb = [], exc.__traceback__
+            while tb is not None:
+                code = tb.tb_frame.f_code
+                sites.append(f"{Path(code.co_filename).name}:{tb.tb_lineno}:{code.co_name}")
+                tb = tb.tb_next
+            logger.warning("chat-closeout: waiting_inputs SQLite failure %s at %s",
+                           getattr(exc, "sqlite_errorname", "OperationalError"), " > ".join(sites[-8:]))
+            raise
         except wi.Unportable as exc:
             # The designed no-adoption signal (e.g. a zero-budget BoardLifecycleBusy board key): core recomputes
             # through ``waiting_source``. A fallback, not an error; it is re-raised below, outside the pass. Any

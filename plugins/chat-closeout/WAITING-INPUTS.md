@@ -45,8 +45,12 @@ the known batch-tail selection. Root (not caught): tests checked per-row work, n
 and zero source calls during irrelevant write storms. Recurrence: this extends the earlier host-only
 scoping fix (`_host_board_key`); that history-dependent token cannot certify portable waiting inputs.
 
-`_waiting_board_key` instead publishes deterministic selected task marks. A cold observer computes the
+`_waiting_board_key` instead publishes deterministic selected task marks. All watched marks are read with
+one parameterized `json_each` indexed lookup per board, not one SQL statement per tail; absent marks,
+FULL marks, ordering and the portable digest remain identical. A cold observer computes the
 same value independently; its cursor is used only to reject FULL/restore/regression, never as a value.
+`waiting_inputs` OperationalErrors retain normal propagation and accounting, with a warning containing
+only the SQLite error name and basename/line/function source sites (no exception text, SQL or parameters).
 Missing certification, unknown freshness, errors and older cores force fresh reads. Failed declarations
 also discard the same-thread reusable input and bypass the three-second answer and row memos.
 
