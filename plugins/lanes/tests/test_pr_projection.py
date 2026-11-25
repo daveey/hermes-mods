@@ -53,8 +53,17 @@ def board(tmp_path, monkeypatch):
     gh.write_text(
         "import sys, json, time\n"
         "time.sleep(float(__import__('os').environ.get('FAKE_GH_SLEEP', '2')))\n"
-        "if sys.argv[2] == 'checks':\n print(json.dumps([{'bucket': 'pass'}]))\n"
-        "else:\n print(json.dumps({'state': 'OPEN', 'headRefOid': 'abc', 'reviewDecision': 'APPROVED', 'author': {'login': 'a'}, 'reviews': []}))\n")
+        "head = 'a' * 40\n"
+        "pr = {'state': 'OPEN', 'headRefOid': head, 'reviewDecision': 'APPROVED', 'author': {'login': 'a'}}\n"
+        "if sys.argv[1:3] == ['api', 'graphql']:\n"
+        " pr['reviews'] = {'pageInfo': {'hasPreviousPage': False}, 'nodes': []}\n"
+        " pr['commits'] = {'nodes': [{'commit': {'oid': head, 'statusCheckRollup': {'contexts': {"
+        "'pageInfo': {'hasNextPage': False}, 'nodes': [{'__typename': 'CheckRun', 'isRequired': True, "
+        "'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]}}}}]}\n"
+        " print(json.dumps({'data': {'repository': {'pullRequest': pr}}}))\n"
+        "elif sys.argv[1:3] == ['pr', 'view']:\n"
+        " print(json.dumps(pr))\n"
+        "else:\n sys.exit('unexpected fake gh request: ' + repr(sys.argv[1:]))\n")
     monkeypatch.setattr(st, '_gh_argv', lambda: [sys.executable, str(gh)])
     calls = []
     real_run = subprocess.run
@@ -111,7 +120,7 @@ def test_busy_board_still_publishes(board, head_kind):
         time.sleep(1)
     print('gh subprocess calls during churn:', len(calls), 'renders:', seen, 'revision', api._observations().revision)
     assert ('merge', 'review') in seen, 'PR never classified on a busy board'
-    assert len(calls) == 3, 'unrelated events must not repeat network observations'
+    assert len(calls) == 2, 'unrelated events must not repeat network observations'
     with connect() as conn:
         conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr',?,?,?)",
                      (head_kind, int(time.time()), json.dumps({'metadata': {'published_pr': URL, 'head': 'changed'}})))
@@ -126,7 +135,7 @@ def test_same_card_dispatch_churn_reuses_pr_observation(board, monkeypatch, kind
     monkeypatch.setenv('FAKE_GH_SLEEP', '0')
     api.flow('6h')
     api._observations().join(10)
-    assert len(calls) == 3  # retain the core's head confirmation
+    assert len(calls) == 2  # retain the core's head confirmation
     with connect() as conn:
         conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr',?,?,?)",
                      (kind, int(time.time()), json.dumps({'reason': 'active_pr'})))
@@ -134,7 +143,7 @@ def test_same_card_dispatch_churn_reuses_pr_observation(board, monkeypatch, kind
     api._written()
     assert pr_of(api.flow('6h')) == ('merge', 'review')
     api._observations().join(10)
-    assert len(calls) == 3, 'operational churn must not evict GitHub evidence'
+    assert len(calls) == 2, 'operational churn must not evict GitHub evidence'
     with connect() as conn:
         conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr','external_watch',?,?)",
                      (int(time.time()), json.dumps({'metadata': {'head_sha': 'new'}})))
@@ -142,4 +151,4 @@ def test_same_card_dispatch_churn_reuses_pr_observation(board, monkeypatch, kind
     api._written()
     assert pr_of(api.flow('6h'))[0] != 'merge'
     api._observations().join(10)
-    assert len(calls) == 6
+    assert len(calls) == 4
