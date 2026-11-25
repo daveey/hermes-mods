@@ -34,6 +34,27 @@ REQUIRED = {
         'test_a_stale_decision_card_does_not_release_a_later_stop',
         'test_a_stamped_ask_this_board_did_not_file_keeps_the_plain_unblock',
     },
+    # The stamped local answer through real core's authority adapter. Each file skips on a core without
+    # hermes_cli/kanban_selfwork_local.py, so every case is named here.
+    'test_local_authority_core': {
+        'test_real_pending_click_grants_and_acknowledges',
+        'test_stamped_offer_old_core_refuses_not_plain_unblock',
+        'test_old_plugin_plain_unblock_is_refused_by_new_core',
+        'test_stamped_offer_wrong_adapter_version_refuses',
+    },
+    'test_local_authority_core_refusals': {
+        'test_reviewer_archive_stamped_offer',
+        'test_reviewer_real_adapter_refusal',
+        'test_reviewer_remote_precedes_local_adapter',
+    },
+    'test_local_authority_core_binding': {
+        *(f'test_ask_without_an_offer_on_this_card_keeps_the_plain_unblock[{case}]'
+          for case in ('stamp-names-another-card', 'unstamped')),
+        'test_target_card_with_a_stamp_naming_another_card_is_refused_by_core',
+        *(f'test_malformed_stamp_on_the_target_stays_on_the_adapter[{case}]'
+          for case in ('text', 'null', 'task-not-text', 'empty')),
+        'test_stamped_other_text_is_refused_by_the_adapter_and_writes_nothing',
+    },
 }
 REQUIRED_COUNT = sum(len(names) for names in REQUIRED.values())
 

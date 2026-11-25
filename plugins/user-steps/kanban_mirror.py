@@ -1608,7 +1608,14 @@ class Mirror:
             return self.remote.deliver(op, binding)
         # Authority-bearing local offers must never fall through to plain unblock,
         # including on a core version that does not implement this adapter.
-        if ('selfwork_exception_target' in snapshot.get('ask', {})
+        # A stamp naming another card is not an offer on this one (core's `granting` and its
+        # plain-unblock fence both key on the task): that ask keeps the ordinary answer.
+        # Anything else under the key, malformed included, stays on the adapter.
+        ask = snapshot.get('ask', {})
+        stamp = ask.get('selfwork_exception_target')
+        foreign = (isinstance(stamp, dict) and isinstance(stamp.get('task'), str)
+                   and stamp['task'] != binding['task'])
+        if ('selfwork_exception_target' in ask and not foreign
                 and op.get('decision', {}).get('choiceId') != 'card-1'):
             try:
                 from hermes_cli import kanban_selfwork_local

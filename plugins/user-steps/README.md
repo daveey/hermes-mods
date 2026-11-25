@@ -377,11 +377,13 @@ HERMES_HUB_CLIENT_REAL=/path/to/courier/client/hermes_hub.py \
 ```
 
 The required `remote-card-composed` hosted job uses Python 3.14, landed core
-`0397ba2abd1be2b28c41626152696f0901acab4f` and landed courier
+`68da7497670db04be1c6cd6e5d9cc861d954784b` and landed courier
 `11058ac91990624059dd4214e420334cbcc5d006`. It stages the existing fixtures under
-core's real `tests/conftest.py` and runs all three remote courier/race files through
-`scripts/run_tests.sh` with zero retries. `composed_results.py` requires the nine
-composed parameter cases and rejects missing/duplicate cases, failures and **any**
+core's real `tests/conftest.py` and runs the remote courier/race files, the Unblock
+click release file and the three `test_local_authority_core*` files (the stamped
+local answer through core's authority adapter) through
+`scripts/run_tests.sh` with zero retries. `composed_results.py` names every required
+case and rejects missing/duplicate cases, failures and **any**
 skips in these reports. Standalone `test-all` success is not composed acceptance:
 setting a compatible core path alone does not load core's isolation guards.
 

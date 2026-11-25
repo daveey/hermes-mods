@@ -1,4 +1,5 @@
 """Acceptance cannot report green on skipped/missing/failed composed cases."""
+import re
 import xml.etree.ElementTree as ET
 import pytest
 from test_withdrawal import ROOT, load_module
@@ -40,10 +41,47 @@ def test_the_unblock_click_release_cases_are_required():
     assert 'test_kanban_mirror_release_core' in (ROOT / 'run-core-integration.sh').read_text()
 
 
+LOCAL_AUTHORITY_CASES = {
+    'test_local_authority_core': {
+        'test_real_pending_click_grants_and_acknowledges',
+        'test_stamped_offer_old_core_refuses_not_plain_unblock',
+        'test_old_plugin_plain_unblock_is_refused_by_new_core',
+        'test_stamped_offer_wrong_adapter_version_refuses',
+    },
+    'test_local_authority_core_refusals': {
+        'test_reviewer_archive_stamped_offer',
+        'test_reviewer_real_adapter_refusal',
+        'test_reviewer_remote_precedes_local_adapter',
+    },
+    'test_local_authority_core_binding': {
+        'test_ask_without_an_offer_on_this_card_keeps_the_plain_unblock[stamp-names-another-card]',
+        'test_ask_without_an_offer_on_this_card_keeps_the_plain_unblock[unstamped]',
+        'test_target_card_with_a_stamp_naming_another_card_is_refused_by_core',
+        'test_malformed_stamp_on_the_target_stays_on_the_adapter[text]',
+        'test_malformed_stamp_on_the_target_stays_on_the_adapter[null]',
+        'test_malformed_stamp_on_the_target_stays_on_the_adapter[task-not-text]',
+        'test_malformed_stamp_on_the_target_stays_on_the_adapter[empty]',
+        'test_stamped_other_text_is_refused_by_the_adapter_and_writes_nothing',
+    },
+}
+
+
+def test_the_local_authority_cases_are_required_and_run():
+    # The stamped local answer through real core's adapter skips on a core without kanban_selfwork_local, and
+    # everywhere outside run-core-integration.sh; CI must run and count each case, never a skip.
+    runner = (ROOT / 'run-core-integration.sh').read_text()
+    composed = runner.split('--remote-card-composed', 1)[1].split('composed_results.py', 1)[0]
+    for stem, cases in LOCAL_AUTHORITY_CASES.items():
+        assert results.REQUIRED[stem] == cases
+        assert re.search(rf'\b{stem}\b', composed)
+        defined = set(re.findall(r'(?m)^def (test_\w+)', (ROOT / 'tests' / (stem + '.py')).read_text()))
+        assert defined == {name.split('[')[0] for name in cases}
+
+
 def test_complete_manifest_passes(tmp_path, capsys):
     reports(tmp_path)
-    assert results.verify(tmp_path) == 23
-    assert '23 required PASS; 23 total PASS; 0 SKIP' in capsys.readouterr().out
+    assert results.verify(tmp_path) == 38
+    assert '38 required PASS; 38 total PASS; 0 SKIP' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('mutation', ['skipped', 'failure', 'error', 'missing-case',
