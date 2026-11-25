@@ -85,8 +85,9 @@ def test_shadow_task_inputs_ignore_other_tasks_but_not_batch(certified, clock, m
         conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT)')
         rev.ensure_revision(conn, rev.SHADOW_TABLES)
         conn.executemany('INSERT INTO tasks VALUES (?,?)', [('t_1', 'batch'), ('other', 'elsewhere')])
+        conn.execute('CREATE TABLE kanban_sync_state (board_id TEXT, pulled_at REAL)')
     fresh = [True]
-    monkeypatch.setattr(plugin, '_read_shadow', lambda *a: (fresh[0], {}))
+    monkeypatch.setattr(plugin, '_read_shadow', lambda board, ids: (fresh[0], plugin.core.shadow_rows(path, ids)[1]))
     key = plugin.waiting_inputs()
     with sqlite3.connect(path) as conn:
         conn.execute("UPDATE tasks SET title='unrelated' WHERE id='other'")
@@ -99,6 +100,37 @@ def test_shadow_task_inputs_ignore_other_tasks_but_not_batch(certified, clock, m
     assert changed != key
     fresh[0] = False
     assert plugin.waiting_inputs() != changed
+
+
+@pytest.mark.parametrize('fresh', [False, True])
+@pytest.mark.parametrize('mutation', ['update', 'insert', 'delete'])
+def test_legacy_shadow_without_task_cursor_is_content_evidence(certified, clock, monkeypatch, fresh, mutation):
+    """A dormant legacy shadow must not poison every declared-input probe (live fallback)."""
+    root = certified['board'].parent
+    monkeypatch.setattr(plugin, '_kanban_root', lambda: root)
+    path = root / 'kanban' / 'sync-shadow' / 'example.db'
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT)')
+        conn.execute('CREATE TABLE kanban_sync_state (board_id TEXT, pulled_at REAL)')
+        conn.execute('INSERT INTO kanban_sync_state VALUES (?,?)', ('example', clock.wall if fresh else 0))
+        conn.execute("INSERT INTO tasks VALUES ('other', 'unrelated', 'running')")
+        if mutation != 'insert':
+            conn.execute("INSERT INTO tasks VALUES ('t_1', 'watched', 'running')")
+    # No revision or task-change table, just as an older shadow need not have task cursor coverage.
+    key = plugin.waiting_inputs()
+    assert plugin.waiting_inputs() == key
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE tasks SET title='churn' WHERE id='other'")
+    assert plugin.waiting_inputs() == key
+    with sqlite3.connect(path) as conn:
+        if mutation == 'update':
+            conn.execute("UPDATE tasks SET status='done' WHERE id='t_1'")
+        elif mutation == 'delete':
+            conn.execute("DELETE FROM tasks WHERE id='t_1'")
+        else:
+            conn.execute("INSERT INTO tasks VALUES ('t_1', 'watched', 'running')")
+    assert plugin.waiting_inputs() != key  # lost notification: next read still sees the change
 
 
 @pytest.mark.parametrize('mutation', ['delete', 'reinstall', 'regression', 'replace-file'])
