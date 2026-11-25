@@ -39,6 +39,46 @@ def test_waiting_sql_error_logs_query_site_without_message(certified, monkeypatc
     assert plugin._inputs_local.failed and plugin._inputs_local.hit is None
 
 
+@pytest.mark.parametrize('phase', ['enter', 'exit'])
+def test_waiting_sql_error_logs_proof_boundary(certified, monkeypatch, caplog, phase):
+    """The accounting scope includes proof context entry/exit, not just its body."""
+    import contextlib
+    error = sqlite3.OperationalError('private boundary text must not be logged')
+    error.sqlite_errorname = 'SQLITE_BUSY'
+    @contextlib.contextmanager
+    def proof_boundary():
+        if phase == 'enter':
+            raise error
+        yield
+        raise error
+    monkeypatch.setattr(plugin, '_proof_pass', proof_boundary)
+    monkeypatch.setattr(plugin, '_input_parts', lambda *args: {'scope': None})
+    with caplog.at_level('WARNING', logger='chat_closeout'):
+        with pytest.raises(sqlite3.OperationalError) as raised:
+            plugin.waiting_inputs()
+    assert raised.value is error
+    assert 'waiting_inputs SQLite failure' in caplog.text
+    assert 'SQLITE_BUSY' in caplog.text
+    assert 'proof_boundary' in caplog.text
+    assert 'private boundary text' not in caplog.text
+    assert plugin._inputs_local.failed and plugin._inputs_local.hit is None
+
+
+def test_waiting_fallback_logs_source_without_private_reason(certified, monkeypatch, caplog):
+    error = plugin.wi.Unportable('private board path must not be logged')
+    def fallback_site(*args):
+        raise error
+    monkeypatch.setattr(plugin, '_input_parts', fallback_site)
+    with caplog.at_level('WARNING', logger='chat_closeout'):
+        with pytest.raises(plugin.wi.Unportable) as raised:
+            plugin.waiting_inputs()
+    assert raised.value is error
+    assert 'waiting_inputs no-adoption Unportable' in caplog.text
+    assert 'fallback_site' in caplog.text
+    assert 'private board path' not in caplog.text
+    assert plugin._inputs_local.failed and plugin._inputs_local.hit is None
+
+
 def test_large_watched_set_reads_marks_in_one_query(certified, monkeypatch):
     """The live waiting ledger watches about 1200 tails, not just the two in the tiny fixture."""
     import contextlib
