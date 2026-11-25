@@ -16,6 +16,11 @@ from test_goal_serve_acceptance import _ready, _turn, _idle
 class FixtureFrames(Frames):
     def receive(self):
         frame = super().receive()
+        params = frame.get("params", {})
+        payload = params.get("payload", {})
+        if (params.get("type") == "status.update" and payload.get("kind") == "process"
+                and payload.get("text", "").startswith("Background Process Finished:")):
+            self.warm_custody.set()
         if frame.get("method") == "approval" and "id" in frame:
             assert frame["params"]["command"] in self.commands
             self.ws.send(json.dumps(dict(jsonrpc="2.0", id=frame["id"], result=dict(choice="once"))))
@@ -42,6 +47,13 @@ class Model(BaseHTTPRequestHandler):
         elif body.get("model") == "process-primary" and body.get("stream"):
             step = self.server.step
             self.server.step += 1
+            if step == 1:
+                # Idle precedes post-turn followups, which can consume the shared
+                # completion queue without a registered-poller health receipt.
+                # Keep this turn running until the real poller observes the warm
+                # completion; it then owns delivery from its held-event list.
+                (self.server.home / "warm-release").touch()
+                assert self.server.warm_custody.wait(30), "poller never observed warm completion"
             if step in (0, 3):
                 marker = self.server.home / ("warm-release" if step == 0 else "repair-release")
                 script = ("from pathlib import Path; import threading,time; "
@@ -74,6 +86,41 @@ class Model(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(chunk).encode())
 
 
+def test_model_holds_warm_reply_until_poller_observes_completion(tmp_path):
+    from io import BytesIO
+    from types import SimpleNamespace
+
+    handler = SimpleNamespace()
+    body = json.dumps(dict(model="process-primary", stream=True)).encode()
+    handler.rfile, handler.wfile = BytesIO(body), BytesIO()
+    handler.headers = {"Content-Length": str(len(body))}
+    waited = []
+
+    class Custody:
+        def wait(self, timeout):
+            assert (tmp_path / "warm-release").exists()
+            assert handler.wfile.getvalue() == b"", "turn must remain running until poller custody"
+            waited.append(timeout)
+            return True
+
+    handler.server = SimpleNamespace(calls=[], step=1, home=tmp_path, warm_custody=Custody())
+    handler.send_response = lambda *_: None
+    handler.send_header = lambda *_: None
+    handler.end_headers = lambda: None
+    Model.do_POST(handler)
+    assert waited == [30], "warm completion must reach poller before the first turn can settle"
+    assert b"Fixture started." in handler.wfile.getvalue()
+
+    # A missing poller observation must fail instead of releasing the reply.
+    import pytest
+    handler.server.step = 1
+    handler.server.warm_custody = SimpleNamespace(wait=lambda timeout: False)
+    handler.rfile, handler.wfile = BytesIO(body), BytesIO()
+    with pytest.raises(AssertionError, match="poller never observed warm completion"):
+        Model.do_POST(handler)
+    assert handler.wfile.getvalue() == b""
+
+
 def _fixture_python(home):
     # Approval text is redacted, so a numeric build stamp in sys.executable
     # cannot be compared losslessly. Keep the exact command allowlist and use
@@ -103,6 +150,7 @@ def test_process_ownership_over_production_serve(tmp_path):
     env.update(HERMES_DASHBOARD_SESSION_TOKEN=token, HERMES_DESKTOP_READY_FILE=str(home / "ready.json"))
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Model)
     provider.calls, provider.step, provider.home, provider.commands = [], 0, home, []
+    provider.warm_custody = threading.Event()
     provider.python = _fixture_python(home)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
@@ -123,15 +171,14 @@ def test_process_ownership_over_production_serve(tmp_path):
             with connect(f"ws://127.0.0.1:{port}/api/ws?token={token}", open_timeout=30) as ws:
                 frames = object.__new__(FixtureFrames)
                 frames.commands = provider.commands
+                frames.warm_custody = provider.warm_custody
                 frames.frames, frames.ws = [], ws
                 frames.until(lambda f: f.get("params", {}).get("type") == "gateway.ready")
                 frames.rpc("client.capabilities", dict(server_requests=True))
                 sid = frames.rpc("session.create", dict(source="desktop", cwd=str(home), title="Process fixture"))["session_id"]
                 _, first = _turn(frames, sid, "Run a short local fixture.")
                 assert first["status"] == "complete", (first, errors.read_text())
-                _idle(frames, sid)
                 start = len(frames.frames)
-                (home / "warm-release").touch()
                 _, completion = _turn(frames, sid, start=start)
                 assert completion["status"] == "complete", completion
                 _idle(frames, sid)
