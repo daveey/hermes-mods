@@ -4,8 +4,35 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import threading
 
 import pytest
+
+
+@contextlib.contextmanager
+def join_transition_writers(monkeypatch):
+    """Retain fixture home, policy and mocks until post-commit outcome writers finish.
+
+    Loading tui_gateway.server elsewhere in the suite enables these real core threads; observing the
+    transition's return value does not establish that its off-thread filesystem work has completed.
+    """
+    owner = threading.current_thread()
+    writers = []
+    start = threading.Thread.start
+
+    def tracked_start(thread, *args, **kwargs):
+        if threading.current_thread() is owner and thread.name == 'card-transition-outcome':
+            writers.append(thread)
+        return start(thread, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, 'start', tracked_start)
+        try:
+            yield
+        finally:
+            for thread in writers:
+                thread.join()  # no timeout: deleting the home while a writer lives is never safe
+
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('closeout_resolution', ROOT / '__init__.py')
@@ -32,7 +59,8 @@ def isolate_claim_policy(monkeypatch):
         if capacity is not None and hasattr(capacity, '_test_policy_override'):
             assert capacity.policy_root() == Path(os.path.realpath(policy)), (
                 f'policy override {policy} not honoured (TMPDIR outside a temp root?)')
-        yield
+        with join_transition_writers(monkeypatch):
+            yield
 
 
 @pytest.fixture
