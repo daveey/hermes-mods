@@ -52,6 +52,15 @@ Reference for skill `kanban-red-sweep` (moved verbatim from SKILL.md).
   already go to another provider. A host whose core predates first-spawn wall routing wastes only the first spawn of
   each new card; the quota-wall alert card names the fix commit, so check it with `git merge-base --is-ancestor`. Count
   `gave_up` events and check the fallback pool's weekly headroom (resetwatch `probe.py --fresh`) before calling it harm.
+- A card that stopped `capability_unavailable` on a guard's "unreadable"/"cannot read complete ... records" refusal
+  (state-push-guard, ship-only-guard) may only have hit GitHub's GraphQL quota: those guards read through
+  `gh api graphql` and report any failed read as unreadable. Test with a real call,
+  `gh api -i graphql -f query='{viewer{login}}'`, and read `X-RateLimit-Used`/`-Reset`; `gh api rate_limit` can show
+  thousands remaining while the real call is refused. If exhausted, wait for the reset, confirm a 200, then
+  `release` with a note: publish the already-validated head without re-running its tests, check the quota before
+  the push, and wait for `resetAt` inside the run instead of stopping (no bypass env, no guard edit; any other
+  refusal text is quoted and stops). Find the burner in `~/.hermes/logs/gh-calls.log` (tab-separated epoch, caller,
+  parent command, gh args): count the last hour by caller and by args with PR numbers masked.
 - A card missing from a board isn't absent. Its row, events and run results live on the gateway that created it, not
   on the machine that ran it; `cross_task read <id>` finds it there.
 - `notify-subscribe` from a Desktop chat warns "binding a different chat" and suggests `agent:main:local:dm:<id>`.
