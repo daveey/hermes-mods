@@ -45,8 +45,14 @@ def emit(record, *, path=None):
             rows = []  # malformed/deeply nested diagnostics must self-recover
         if not isinstance(rows, list):
             rows = []
-        rows = rows[-(CAP - 1):] + [dict(record, pid=os.getpid(), at=time.time())]
+        rows = [row for row in rows[-(CAP - 1):] if isinstance(row, dict)]
+        rows.append(dict(record, pid=os.getpid(), at=time.time()))
         body = json.dumps(rows, separators=(',', ':')).encode()
+        # Bound bytes as well as count; a large inherited row must not prevent
+        # all future diagnostics. An oversized new record is simply dropped.
+        while len(body) > BYTE_CAP and len(rows) > 1:
+            rows.pop(0)
+            body = json.dumps(rows, separators=(',', ':')).encode()
         if len(body) > BYTE_CAP:
             return
         os.lseek(fd, 0, os.SEEK_SET)
