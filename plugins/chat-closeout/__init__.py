@@ -1935,13 +1935,17 @@ def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_o
                 global_out.append([stem, None, False])
             continue
         try:
-            fresh, _found = _read_shadow(stem, set())
+            # The coverage reader consumes only selected task presence/SHADOW_FIELDS and freshness.
+            # Key those actual values, not task-change coverage: dormant shadows from older writers
+            # may never acquire a change table, and must not poison every waiting declaration.
+            fresh, found = _read_shadow(stem, waiting_tails if waiting_tails is not None else set())
         except Exception:
             fresh = None
         if waiting_tails is not None:
             if fresh is None:
                 raise wi.Unportable("unknown shadow freshness")
-            scoped = broad = _waiting_board_key(path, waiting_tails, tables)
+            scoped = broad = wi.strict_digest([
+                "shadow-values-v1", sorted(found), getattr(found, "rows", {})])
         elif host_tails is None:
             scoped = broad = wi.portable_digest(ksa._board_content_key(path, tables))
         else:
