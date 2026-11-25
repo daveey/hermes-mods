@@ -58,6 +58,17 @@ try:
         raise SystemExit(0)
     wait(lambda: getattr(sys.modules.get(api._FEED_KEY), 'PROCESS_FEED', None) is not None)
     assert lifecycle.state == 'off'
+    # A real supported non-hosting peer (a gateway) is enrolled and alive through the whole external window.
+    gateway = subprocess.Popen(
+        [sys.executable, '-I', '-c',
+         'import sys; sys.path.insert(0, sys.argv[1])\n'
+         'from hermes_cli.process_identity import register_self\n'
+         'from hermes_cli.serve_producer_admission import supported_launch\n'
+         "assert register_self('gateway', project_root=sys.argv[1])\n"
+         "assert supported_launch('gateway') is not None\n"
+         "print('ready', flush=True); sys.stdin.buffer.read()", str(ROOT)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert gateway.stdout is not None and gateway.stdout.readline().strip() == b'ready'
     write_mode(home, external=True)
     wait(lambda: lifecycle.state in ('external', 'unavailable'))
     assert lifecycle.state == 'external', lifecycle.reason
@@ -96,6 +107,10 @@ try:
     print(json.dumps({'gate': 'same PID external to OFF', 'pid': os.getpid(),
                       'old_relay_retired': first.retired, 'legacy_fenced': api._legacy_fenced()}), flush=True)
 finally:
+    gateway_peer = globals().get('gateway')
+    if gateway_peer is not None:
+        gateway_peer.stdin.close()
+        gateway_peer.wait(timeout=60)
     lifecycle.stop_watching()
     if lifecycle.relay is not None:
         api.detach_external(lifecycle.relay)
