@@ -616,7 +616,7 @@ class Feed:
             registration = (api_generation, reader_factory)
             if getattr(pending, 'installing', False) or getattr(pending, 'failed_registration', None) == registration:
                 return pending
-            if pending.predecessor is not None and not pending.predecessor.ready():
+            if not self._source_module().predecessor_ready(pending.predecessor):
                 # Even current metadata discovery can open SQLite. Hold it behind
                 # the same four-role retirement fence as capture/projection.
                 pending.predecessor.bind(pending)

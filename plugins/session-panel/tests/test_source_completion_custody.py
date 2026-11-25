@@ -95,11 +95,23 @@ def test_inherited_reported_ready_cannot_release_live_worker_or_spin_expired_ret
         # completion marker; it has no new-generation workers snapshot.
         predecessor = types.SimpleNamespace(
             owner=types.SimpleNamespace(acquiring={'local': worker}, active={}),
-            parent=None, remaining=set(), ready=lambda: True)
+            parent=None, remaining=set(), ready=lambda: True, bind=lambda _: None)
         lane.predecessor = predecessor
         lane.role_attempts['local'].retry_at = 99.
         assert not lane._available(), 'old readiness bypassed actual exit custody'
         assert lane.retry_at() == 100.01, 'expired inherited retry caused a zero-delay spin'
+        source = f._source_module()
+        pending = source.PendingSourceOwner(f, gateway=lane.gateway, profile=lane.profile,
+                                            predecessor=predecessor)
+        f._source_coordinator = pending
+        factories = []
+        def factory():
+            factories.append(1)
+            raise AssertionError('reader constructed before predecessor exit')
+        assert f.ensure_snapshot_service('current', factory) is pending
+        assert not factories, 'old ready admitted metadata/reader hydration'
+        assert pending.retry_at() == 100.01, 'pending installer lost last exit wake'
+        f._source_coordinator = lane
         release.set(); worker.join(3)
         assert not worker.is_alive() and lane._available()
         assert lane.retry_at() == 99., 'drain erased the inherited retry deadline'

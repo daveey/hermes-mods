@@ -101,6 +101,12 @@ def _predecessor_exit_pending(predecessor):
     return False
 
 
+def predecessor_ready(predecessor):
+    """Current-generation fence even when saved retirement code predates it."""
+    return (predecessor is None or
+            (predecessor.ready() and not _predecessor_exit_pending(predecessor)))
+
+
 class RetiringOwner:
     """Compatibility fence for a genuinely older coordinator implementation.
 
@@ -212,7 +218,12 @@ class PendingSourceOwner:
 
     def retry_at(self):
         owner = self._current()
-        return owner.retry_at() if owner is not None else None
+        if owner is not None:
+            return owner.retry_at()
+        # The worker's completion wake may precede its actual return. The saved
+        # board loop must revisit installation after that exit without API traffic.
+        return (self.feed.clock() + .01
+                if _predecessor_exit_pending(self.predecessor) else None)
 
     def step(self):
         owner = self._current()
@@ -389,8 +400,7 @@ class SourceCoordinator:
         # An inherited retirement object can implement an older ready() which
         # consumes completion before actual thread exit. Its reported readiness
         # is necessary, never sufficient, for successor capacity admission.
-        return (self.predecessor is None or
-                (self.predecessor.ready() and not _predecessor_exit_pending(self.predecessor)))
+        return predecessor_ready(self.predecessor)
 
     def _worker_started(self):
         self._workers += 1
