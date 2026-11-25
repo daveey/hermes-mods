@@ -19,9 +19,16 @@ def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, mon
     core = mirror.core
     monkeypatch.setattr(core, 'home', lambda: tmp_path)
     monkeypatch.setattr(core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
+    original_load = api._load
     def load(name):
         from types import SimpleNamespace
-        return core if name == 'core' else SimpleNamespace(Mirror=lambda *_: mirror)
+        if name == 'core':
+            return core
+        if name == 'kanban_mirror':
+            runtime = mirror.reconcile_panel.__func__.__globals__
+            return SimpleNamespace(Mirror=lambda *_: mirror, panel_trace=runtime['panel_trace'],
+                                   _stage=runtime['_stage'])
+        return original_load(name)
     monkeypatch.setattr(api, '_load', load)
     # Only the store constructor is substituted; projection, immutable binding,
     # presentation and decision delivery all use the real producer/store.
