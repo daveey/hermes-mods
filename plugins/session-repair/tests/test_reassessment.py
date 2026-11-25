@@ -204,6 +204,22 @@ def test_proven_prior_adverse_event_does_not_veto_current_episode(world, kind):
     assert hits(world) == []
 
 
+@pytest.mark.parametrize('masked', [False, True])
+def test_future_dated_healthy_observation_never_exempts(world, masked):
+    env, tid, *_ = world
+    if masked:  # a future healthy stamp must not outrank a current unhealthy watcher
+        F.event(env.conn, tid, 'external_watch', {}, at=env.now-1)
+    F.event(env.conn, tid, 'external_watch', HEALTHY_WATCH, at=env.now+1)
+    assert hits(world)[0]['variant'] == 'too_long'
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'condition_met'])
+def test_future_dated_adverse_observation_fails_closed(world, kind):
+    env, tid, *_ = world
+    F.event(env.conn, tid, kind, {}, at=env.now+1)
+    assert hits(world)[0]['variant'] == 'too_long'
+
+
 @pytest.mark.parametrize('kind', ['wake_check_broken', 'external_watch'])
 @pytest.mark.parametrize('stamp', [-1, '', 'invalid', 1.5])
 def test_invalid_observation_chronology_fails_closed(world, kind, stamp):

@@ -81,6 +81,10 @@ def test_tick_journal_keeps_silent_scans_and_errors(tmp_path):
     assert rows[0]['mode'] == 'shadow' and rows[0]['chats'] == 3 and rows[0]['cards'] == 7
     assert rows[0]['findings'] == 0 and rows[0]['errors'] == [] and rows[0]['duration_s'] >= 0
     assert len(rows[0]['build']) == 64
+    import hashlib
+    expected = hashlib.sha256(b''.join((run.HERE / n).read_bytes() for n in (
+        'scan.py', 'run.py', 'nudge.py', 'producer.py', 'target_reader.py'))).hexdigest()
+    assert rows[0]['build'] == expected, 'build fingerprint must cover target_reader.py'
     assert rows[2]['errors'] == ['read failed'] and rows[2]['error_count'] == 1
     def broken():
         raise RuntimeError('scanner failed')
