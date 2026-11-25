@@ -23,6 +23,29 @@ def _obj(value):
         return {}
 
 
+def process_inputs(session, lineage, profile):
+    """Capture actual process probes, never renew a carried observation's lease."""
+    annotated = {'id': session, 'profile': profile, '_lineage_ids': list(lineage)}
+    producer = importlib.import_module('hermes_cli.process_session_activity')
+    # A checkpoint birth can arrive inside the sidebar adapter's three-second
+    # cache. This admitted producer pass must probe, not certify that old cache.
+    producer._invalidate_cache()
+    producer.annotate_background_activity([annotated])
+    details = {r.get('id'): r for r in annotated.get('background_processes') or []}
+    items = []
+    for obs in annotated.get('execution_observations') or []:
+        identity = _obj(obs.get('identity'))
+        if identity.get('kind') != 'process':
+            continue
+        wid = identity.get('work_id')
+        if not wid:
+            raise ValueError('process inventory identity unavailable')
+        items.append({'id': wid, 'work_id': wid, 'gateway': identity.get('gateway'),
+                      'profile': identity.get('profile'), 'execution_observations': [obs],
+                      'title': details.get(wid, {}).get('command') or 'Background process'})
+    return items
+
+
 def read(reader, session, lineage):
     out = {'outcome_json': {}, 'requests': [], 'subagents': [], 'processes': [], 'rentals': [], 'input_errors': []}
     db = reader.conn(reader.state_db())

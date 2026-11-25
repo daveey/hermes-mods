@@ -69,6 +69,20 @@ Final lifecycle/population acceptance and B3 activation/performance/native proof
 are required, not implied by source or cached hashes. No wire version or Desktop
 classification changes.
 
+## Runtime process evidence
+
+The background canonical lane watches the profile's `processes.json` for process
+birth/exit and re-probes known open processes every 45 seconds. This renews actual
+kernel observations, not a carried payload's timestamp or the board snapshot's
+`computed_at`. The admitted read invalidates the process adapter's short sidebar
+cache so a birth immediately following an empty read cannot be certified absent.
+Probe failures retain old evidence with finite retry, never a new running lease.
+When no process remains, timed process probes stop. HTTP readers do no source I/O.
+The refreshed canonical `outcome_json.status` remains the one state envelope shared
+by the panel header and Desktop sidebar; rows do not implement a competing status
+classifier. Intentional process termination can leave a failed receipt requiring
+acknowledgement rather than automatically claiming successful completion.
+
 ## Board-source freshness
 
 Wire models carry additive `freshness: {trusted, computed_at, ttl_s}` transport
