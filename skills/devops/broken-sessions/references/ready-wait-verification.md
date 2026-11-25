@@ -12,6 +12,14 @@ stays silent here because a recorded skip explains the wait. First check that ea
 fix/decision card whose target is already `done` is moot, so comment and archive it. File the lease refusal on a
 dispatcher card for the rest.
 
+`Held cards: <id>=decision_pending` in those worker logs means an open spend-stop episode still holds the card in the
+workers' view, while the hub list shows `ready` and `hermes kanban why` says `triage: nothing holds it`. The hub's
+`kanban_show` queue note (labels_mismatch, "do not re-place") hides this, so grep the worker logs first. If the stop
+is already superseded (re-scoped, budget set, parent done), the owning chat runs
+`hermes kanban promote <id> --seen <newest comment id> --dry-run --json "<what changed>"`, then the same without
+`--dry-run`. If `hermes kanban release` refuses with `budget_decision_unread` ("Budget decision comment unavailable"),
+re-running sync does not help; use promote. Then confirm a worker claims it (spawned/worker_bound event).
+
 The hub's local kanban.db can keep showing a card as `ready`, with no spawned/run_route/worker_bound event, while a pool worker already holds the Board lease and is running it. Board-lease claims can stop reaching the hub replica. Before bumping priority, re-placing or filing a stall card, check the workers themselves:
 
 ```sh
