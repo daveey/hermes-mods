@@ -41,6 +41,9 @@ export const STATUS = [
 export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
 // Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
 export const SESSION_FILTER_AREA = sdk.SESSION_FILTER_AREA || ''
+// Desktops with the Sessions tab-strip slot (beside Sessions / Bots) take the counts, "not live" and the expand
+// toggle there; older ones keep them on the strip's first row.
+export const SESSIONS_TAB_STRIP_AREA = sdk.SESSIONS_TAB_STRIP_AREA || ''
 const useSidebarSessions = typeof sdk.useSidebarSessions === 'function' ? sdk.useSidebarSessions : () => null
 
 // ── which gateway to talk to ──────────────────────────────────────────────
@@ -885,6 +888,36 @@ export function StripRight() {
     area.hosts.values().next().value === token ? area.item?.render() : null)
 }
 
+// The strip owns the totals' state; the tab-strip contribution only paints what the strip hands it. Two listener
+// sets so the strip re-renders on host mount/unmount only, never on its own item updates (no render loop).
+export function tabTotalsArea() {
+  const key = Symbol.for('hermes.lanes.sessionsTabTotals.v1')
+  return globalThis[key] ||= { hosts: new Set(), item: null, hostListeners: new Set(), itemListeners: new Set(),
+    hostsChanged() { for (const fn of [...this.hostListeners]) fn() },
+    set(item) { this.item = item; for (const fn of [...this.itemListeners]) fn() } }
+}
+export function SessionsTabTotals() {
+  const area = tabTotalsArea(), token = useRef({}).current
+  const [, update] = useState(0)
+  useEffect(() => {
+    const changed = () => update((n) => n + 1)
+    area.itemListeners.add(changed); area.hosts.add(token); area.hostsChanged()
+    return () => { area.itemListeners.delete(changed); area.hosts.delete(token); area.hostsChanged() }
+  }, [area, token])
+  const mine = area.hosts.values().next().value === token
+  return mine && area.item ? h('span', { className: 'hermes-lanes-tabtotals', 'data-slot': 'lanes-tab-totals' }, area.item.render()) : null
+}
+function useTabTotalsHosted() {
+  const area = tabTotalsArea()
+  const [hosted, setHosted] = useState(() => area.hosts.size > 0)
+  useEffect(() => {
+    const changed = () => setHosted(area.hosts.size > 0)
+    area.hostListeners.add(changed); changed()
+    return () => { area.hostListeners.delete(changed) }
+  }, [area])
+  return hosted
+}
+
 export function Lanes({ ctx }) {
   const [open, setOpenState] = useState(loadOpen)
   const [selected, setSelectedState] = useState(loadSelected)
@@ -907,6 +940,11 @@ export function Lanes({ ctx }) {
   }
   const [snap, setSnap] = useState()
   const [live, setLive] = useState(false)
+  const tabHosted = useTabTotalsHosted()
+  const tabTotals = useRef(null)
+  // Hand the latest totals to the Sessions tab strip after every render; clear them when the strip stops showing.
+  useEffect(() => { tabTotalsArea().set(tabHosted ? tabTotals.current : null) })
+  useEffect(() => () => tabTotalsArea().set(null), [])
   const subscription = useRef()
   useEffect(() => {
     subscription.current = attentionStore(ctx).connect({ hours: windowHours, window: flowWindow(windowHours), expanded: open },
@@ -984,6 +1022,7 @@ export function Lanes({ ctx }) {
       return false
     } finally { setSaving(false) }
   }
+  tabTotals.current = null
   if (snap?.warming) return h('div', { className: 'hermes-lanes-note', 'data-view': 'warming' }, 'Loading…')
   if (!working) return null
   const list = rows(snap)
@@ -1009,6 +1048,19 @@ export function Lanes({ ctx }) {
   const anySelected = picked.length > 0 || statusPicked.length > 0 || noCards
   const noCardsCount = sidebarSessions && snap?.sessions ? sidebarSessions.filter((s) => !sessionCards(s, snap.sessions).length).length : null
   const toggle = () => setOpen((value) => !value)
+  const totals = [
+    h(StatusTotals, {
+      key: 'totals',
+      status: selectedStatus(snap, picked), gates: snap?.gates, scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
+      noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
+    }),
+    !live ? h('small', { key: 'live', className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
+    h('button', {
+      key: 'toggle', type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
+      'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: (event) => { event.stopPropagation(); toggle() }
+    }, open ? '▴' : '▾')
+  ]
+  tabTotals.current = { render: () => totals }
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
       // Lane pills wrap inside their own box (min width = widest pill) so the chip, global filters and
@@ -1019,15 +1071,7 @@ export function Lanes({ ctx }) {
           selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
         }))),
       h(StripRight),
-      h(StatusTotals, {
-        status: selectedStatus(snap, picked), gates: snap?.gates, scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
-        noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
-      }),
-      !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
-      h('button', {
-        type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
-        'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: (event) => { event.stopPropagation(); toggle() }
-      }, open ? '▴' : '▾')),
+      tabHosted ? null : totals),
     open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: bodyMaxHeight, overflow: 'auto' } },
       h(Panel, {
         snap, flowError: '',
@@ -1072,6 +1116,10 @@ const CSS = `
 .hermes-lanes-status+.hermes-lanes-toggle,.hermes-lanes-status+small+.hermes-lanes-toggle{margin-left:0}
 .hermes-lanes-toggle{margin-left:auto;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-body{max-height:60vh;overflow:auto}
+.hermes-lanes-tabtotals{display:inline-flex;align-items:center;gap:4px;padding:0 4px;font-size:12px;white-space:nowrap}
+.hermes-lanes-tabtotals>.hermes-lanes-status{margin-left:0;padding-left:0;border-left:0}
+.hermes-lanes-tabtotals .hermes-lanes-cat{height:20px;padding:0 4px}
+.hermes-lanes-tabtotals>.hermes-lanes-toggle{margin-left:0;height:20px;padding:0 6px}
 .hermes-lanes{display:flex;flex-direction:column;gap:8px;font-size:12px;padding:6px}
 .hermes-lanes-head,.hermes-lanes-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .hermes-lanes-head strong{font-size:14px}
@@ -1128,6 +1176,7 @@ export default {
     document.head.append(style)
     ctx.onDispose(() => style.remove())
     ctx.register({ id: 'strip', area: STRIP_AREA, order: 10, render: () => h(Lanes, { ctx }) })
+    if (SESSIONS_TAB_STRIP_AREA) ctx.register({ id: 'tab-totals', area: SESSIONS_TAB_STRIP_AREA, order: 10, render: () => h(SessionsTabTotals) })
     if (sdk.SIDEBAR_SECTIONS_AREA && sdk.SidebarSection && sdk.SidebarSectionRow) {
       ctx.register({ id: 'unlinked-asks', area: sdk.SIDEBAR_SECTIONS_AREA, order: 10, render: () => h(UnlinkedAsks, { ctx }) })
     }
