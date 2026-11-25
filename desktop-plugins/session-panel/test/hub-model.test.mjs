@@ -47,7 +47,12 @@ test('aged parked board data keeps its status and age in the panel and task chip
   assert.match(detail, /as of .*panel data 2m old/)
   assert.doesNotMatch(detail, /status unknown/)
   assert.equal(row.evidence_state, 'unknown')
-  assert.equal(row.wait_kind, undefined)
+  // Historical delivery classification survives the quiet refresh cadence;
+  // it does not vouch for current execution or producer liveness.
+  assert.equal(row.wait_kind, 'ci')
+  const pip = document.querySelector('[data-row-pip="waiting"]')
+  assert.equal(pip.dataset.waitKind, 'ci')
+  assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(56, 189, 248)')
   const tasks = await import('../../session-tasks/plugin.js')
   window.__sessionPanel = { clockRow: m.clockRow }
   const [chip] = tasks.withModelDisplay([{ kind: 'kanban', id: row.id, gateway: row.gateway,
