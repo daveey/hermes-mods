@@ -545,6 +545,73 @@ def test_reader_install_revalidates_stop_and_registration_without_duplicate_role
         old.stopped.set(); previous.close(); current.release(); conn.close()
 
 
+@pytest.mark.parametrize('barrier', ['factory', 'release'])
+@pytest.mark.parametrize('resumes', [1, 2])
+def test_pending_reader_install_custody_survives_consecutive_resumes(
+        api, board, monkeypatch, barrier, resumes):
+    path, conn = board
+    current = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(current, 'external_capture', strict_empty)
+    old = feedmod.Feed(current, emit=lambda _: None)
+    previous = compose(old, current)
+    monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', None)
+    loader = sys.modules.get('_session_panel_feed_loader')
+    if loader is not None:
+        monkeypatch.setattr(loader, 'snapshot_reader_factory', None, raising=False)
+    first = feedmod.Feed(RetiredReaders(), emit=lambda _: None).resume(old)
+    entered, release = threading.Event(), threading.Event()
+    calls, errors = [], []
+    original_release = current.release
+    def held_release():
+        if barrier == 'release' and threading.current_thread() is installer:
+            entered.set(); assert release.wait(15)
+        original_release()
+    monkeypatch.setattr(current, 'release', held_release)
+    def factory():
+        calls.append(threading.get_ident())
+        if len(calls) == 1 and barrier == 'factory':
+            entered.set(); assert release.wait(15)
+        return current
+    def install():
+        try:
+            api.ensure_snapshot_service(first, 'first', factory)
+        except BaseException as exc:
+            errors.append(exc)
+    installer = threading.Thread(target=install)
+    feeds = [old, first]
+    pending = first._source_coordinator
+    installer.start()
+    try:
+        assert entered.wait(5)
+        for _ in range(resumes):
+            successor = feedmod.Feed(RetiredReaders(), emit=lambda _: None).resume(feeds[-1])
+            feeds.append(successor)
+            pending = successor._source_coordinator
+            assert api.ensure_snapshot_service(successor, 'current', factory) is pending
+            pending.step()
+            assert len(calls) == 1, 'overlapping reader candidates across resume'
+            assert pending.retry_at() is not None
+            assert pending.service_worker is None
+        release.set(); installer.join(5)
+        assert not installer.is_alive() and not errors
+        assert first._source_coordinator.pending_install
+        # The saved pending loop revisits after release without new HTTP traffic.
+        pending.step()
+        owner = feeds[-1]._source_coordinator
+        assert owner is not pending
+        # step also starts legitimate source acquisitions on their owned roles;
+        # exactly one candidate is constructed on this installation caller.
+        assert calls.count(threading.get_ident()) == 1
+        assert owner.service_worker is None
+        assert owner.predecessor.ready()
+    finally:
+        release.set(); installer.join(5)
+        for f in reversed(feeds):
+            f.stopped.set(); f._source_coordinator.close()
+        current.release(); conn.close()
+        assert not installer.is_alive() and not errors
+
+
 def test_unsupported_registration_is_unknown_and_not_retried_by_beat_full_or_step(api, board, monkeypatch):
     path, conn = board
     current = readers_for(api, path, monkeypatch)

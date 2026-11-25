@@ -197,9 +197,10 @@ class PendingSourceOwner:
     pending_install = True
     service_worker = None
 
-    def __init__(self, feed, *, gateway, profile, predecessor):
+    def __init__(self, feed, *, gateway, profile, predecessor, installers=()):
         self.feed, self.gateway, self.profile = feed, gateway, profile
         self.predecessor = predecessor
+        self.installers = installers
         self.closed = False
         self.service_wake = feed._board
         self.reader_factory = None
@@ -222,8 +223,11 @@ class PendingSourceOwner:
             return owner.retry_at()
         # The worker's completion wake may precede its actual return. The saved
         # board loop must revisit installation after that exit without API traffic.
+        # Pending reloads must also wait for older candidate release, not just
+        # retired capture/projection exit. No extra waiter thread is needed.
         return (self.feed.clock() + .01
-                if _predecessor_exit_pending(self.predecessor) else None)
+                if (any(getattr(p, 'installing', False) for p in self.installers)
+                    or _predecessor_exit_pending(self.predecessor)) else None)
 
     def step(self):
         owner = self._current()

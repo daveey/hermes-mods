@@ -455,7 +455,15 @@ class Feed:
         request started a new epoch with no bundles (4 resets in 15 min on the hub), and every Desktop dropped its
         trust and re-read. The revision space, held bundles and interest carry over; every held chat is recomputed
         before a push vouches for it again. `prev` emits nothing after this (its in-flight push finishes first)."""
-        predecessor = getattr(prev, '_source_coordinator', None)
+        with prev.lock:
+            predecessor = getattr(prev, '_source_coordinator', None)
+            installers = ()
+            if predecessor is not None and getattr(predecessor, 'pending_install', False):
+                # Stop admission before taking the installation snapshot. A
+                # constructing/releasing candidate still owns its reader slot.
+                predecessor.closed = True
+                installers = tuple(p for p in (*getattr(predecessor, 'installers', ()), predecessor)
+                                   if getattr(p, 'installing', False))
         retirement = None
         if predecessor is not None:
             # Withdraw source authority without joining under either writer lock.
@@ -506,7 +514,8 @@ class Feed:
         if predecessor is not None:
             module = self._source_module()
             self._source_coordinator = self._board_lane = module.PendingSourceOwner(self,
-                gateway=predecessor.gateway, profile=predecessor.profile, predecessor=retirement)
+                gateway=predecessor.gateway, profile=predecessor.profile, predecessor=retirement,
+                installers=installers)
             self._snapshot_install_pending = True
             # The saved API constructed this object on the restart thread; release
             # its unused reader on that same thread. No old connection transfers.
@@ -614,7 +623,9 @@ class Feed:
             pending.reader_factory = reader_factory
             pending.api_generation = api_generation
             registration = (api_generation, reader_factory)
-            if getattr(pending, 'installing', False) or getattr(pending, 'failed_registration', None) == registration:
+            if (getattr(pending, 'installing', False)
+                    or any(getattr(p, 'installing', False) for p in getattr(pending, 'installers', ()))
+                    or getattr(pending, 'failed_registration', None) == registration):
                 return pending
             if not self._source_module().predecessor_ready(pending.predecessor):
                 # Even current metadata discovery can open SQLite. Hold it behind
@@ -674,7 +685,7 @@ class Feed:
             finally:
                 with self.lock:
                     pending.installing = False
-                    if (pending.api_generation, pending.reader_factory) != registration:
+                    if pending.closed or (pending.api_generation, pending.reader_factory) != registration:
                         self._board.set()
 
     def compose_board_sources(self, reader_factory, *, gateway, profile, _predecessor=None):
