@@ -148,6 +148,16 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   running or blocked (the panel counts it as "other"): walk open ancestors to it. Unblock/promote can't release it; only
   a live run of its event's `policy.authority` (or a new completed `policy.producer` run) can, via
   `kanban_resume_contained` with the episode uid (`tasks.containment_episode`). A `done` authority leaves it parked forever.
+  Archiving the contained card does not free its children either (an archived contained parent still counts as
+  unsatisfied) and `unlink` on its edges is refused (`containment_pending`). When the child's real wait is another
+  card, archive the child with the reason and let its producer refile it waiting on that card directly. The refile
+  is yours until a unique live replacement exists: tell the contained parent's owner chat at archive time that it
+  is pending (its owner-wake otherwise opens a recovery card to refile it), confirm with the producer's dry-run,
+  then send that chat the new id and its `awaiting` once the first run parks. A worker may park on a daily clock
+  instead of the producer card: comment the card wait it should use.
+  A burn-down cluster card is "dormant" only by the detector's fresh projection, never by the counts in its body or
+  a worker's summary: check the bridge log for `using stale on-disk data` first, because the bridge refiles any
+  cluster still `open` the moment its card is archived.
   Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
   self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
