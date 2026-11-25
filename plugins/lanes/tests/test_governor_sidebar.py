@@ -173,6 +173,22 @@ def test_adapter_deadline_uses_its_declared_cadence(board, api, monkeypatch):
     assert 130 in api._governor_deadlines
 
 
+def test_stale_device_adapter_does_not_become_a_fleet_governor(board, api, monkeypatch, tmp_path):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='hub card with residual device telemetry', assignee='default', tenant='babybear')
+        core_fixtures._tick(conn)
+        path = board / 'state/governors/mac-mini.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'version': 1, 'read_at': api.time.time() - 31,
+                                    'cadence_s': 10, 'available': True, 'status_counts': {'ready': 9}}))
+        body = view(api)
+        assert body['governors']['device_footnote']['state'] == 'unknown'
+        assert body['governors']['available']
+        render(tmp_path, body, 'adapter-stale')
+
+
 def test_freshness_expires_without_a_file_write(api, monkeypatch):
     monkeypatch.setattr(api._change_source, 'read', lambda _capture: 'unchanged')
     monkeypatch.setattr(api, '_governor_deadlines', (100,))
