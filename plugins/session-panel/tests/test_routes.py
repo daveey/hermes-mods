@@ -134,8 +134,37 @@ def _restore(api, original):
 def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over_at_once(monkeypatch):
     # [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py module, so the feed
     # fix stayed inactive until the backend restarted.
-    import time
+    import threading
     api, old_mod = _hot(monkeypatch, 'a')
+    # Observe the handover before any successor work, then exercise a real
+    # publication before the client catches up. Instance readiness alone permits
+    # all three producer lanes to advance rev before the equality below.
+    ready, advance, published = threading.Event(), threading.Event(), threading.Event()
+    feeds = []
+
+    def park(f, *args):
+        f.stopped.wait()
+
+    def produce(f):
+        feeds.append(f)
+        if isinstance(f, old_mod.Feed):
+            f.stopped.wait()
+            return
+        ready.set()
+        assert advance.wait(5), 'observer never released successor publication'
+        if not f.stopped.is_set():
+            f.readers.cards['t_aaaaaa1']['detail']['task']['title'] = 'Updated by successor source'
+            f._publish(f._compute_all(['S1']))
+            published.set()
+        f.stopped.wait()
+
+    monkeypatch.setattr(api, '_run', produce)
+    monkeypatch.setattr(api, '_run_decisions', park)
+    monkeypatch.setattr(api, '_run_board', park)
+    # This fixture owns in-memory feeds, not a serving process's checkpoint.
+    monkeypatch.setattr(api, 'load_snapshot', lambda: None)
+    monkeypatch.setattr(api, 'save_snapshot', lambda *a, **k: True)
+    monkeypatch.setattr(api, '_save_at_exit', lambda: None)
     try:
         assert api._load_feed() is old_mod, 'an unchanged feed.py is not reloaded'
         running = api.feed()
@@ -150,18 +179,36 @@ def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over_at_on
         assert new_mod is not old_mod and new_mod.Feed is not old_mod.Feed
         assert sys.modules[api._FEED_KEY] is new_mod and new_mod.PROCESS_LOCK is old_mod.PROCESS_LOCK
         assert running.stopped.is_set()
-        deadline = time.monotonic() + 5
-        while not isinstance(new_mod.PROCESS_FEED, new_mod.Feed) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        f = new_mod.PROCESS_FEED  # resumed without any request
+        assert ready.wait(5), 'reload must start its successor without a request'
+        f = new_mod.PROCESS_FEED
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
         assert f.epoch == first['epoch'] and f.rev == running.rev
         assert api.feed() is f
         held = running.rev  # what a client of the old code holds
+        advance.set()
+        assert published.wait(5), 'successor must publish independently of client reads'
+        assert f.epoch == first['epoch'] and f.rev == held + 1
+        assert running.rev == held, 'the retired predecessor remains frozen'
         out = f.changes(['S1'], since=held, epoch=first['epoch'])
         assert out['reset'] is False, 'no reset across the handover'
-        assert all(f.bundles[s]['rev'] > held for s in out['bundles']), 'only what changed since (its thread may tick)'
+        assert set(out['bundles']) == {'S1'}, 'the changed publication must reach the old cursor'
+        assert out['bundles']['S1']['model']['sections']['waiting'][0]['title'] == 'Updated by successor source'
+        assert all(f.bundles[s]['rev'] > held for s in out['bundles']), 'only what changed since'
     finally:
+        # Complete thread registration before collecting exact identities; never
+        # restore mocks/module ownership while a fixture producer is still alive.
+        advance.set()
+        with old_mod.PROCESS_LOCK:
+            current = sys.modules.get(api._FEED_KEY)
+            owned = [*feeds, getattr(old_mod, 'PROCESS_FEED', None), getattr(current, 'PROCESS_FEED', None)]
+            for f in owned:
+                if f is not None:
+                    f.stopped.set()
+            threads = {getattr(f, attr, None) for f in owned if f is not None
+                       for attr in ('_feed_thread', '_decision_thread', '_board_thread')}
+        for worker in threads - {None}:
+            worker.join(5)
+            assert not worker.is_alive(), 'fixture producer did not exit'
         _restore(api, old_mod)
 
 
