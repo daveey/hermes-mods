@@ -452,6 +452,36 @@ def test_snapshot_and_timing_default_to_the_explicit_home_namespace(api, worlds,
     assert tripwires == []
 
 
+def test_snapshot_identity_preserves_nonproducer_and_ambient_scope(api, worlds, monkeypatch):
+    monkeypatch.setattr(api, 'FEED_ID', 'desktop:slot')
+    monkeypatch.setattr(api, 'LAUNCH_PROFILE', 'launch')
+    monkeypatch.setattr(api, 'FEED_ROLE', 'serve-slot')
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    try:
+        assert readers.snapshot_identity() == {'feed': 'desktop:slot', 'profile': 'launch'}
+        assert 'serve-slot' in readers.snapshot_path().name
+    finally:
+        readers.release()
+    ambient = api.CoreReaders()
+    ambient.producer_snapshot_scope = True
+    try:
+        assert ambient.snapshot_identity() == {'feed': 'desktop:slot', 'profile': 'launch'}
+    finally:
+        ambient.release()
+
+
+@pytest.mark.parametrize('gateway', [None, 'fixture-gateway'])
+def test_producer_snapshot_identity_gateway_and_local_fallback(api, worlds, monkeypatch, gateway):
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    readers.producer_snapshot_scope = True
+    monkeypatch.setattr(readers, '_home_identity', lambda: {'gateway': gateway, 'profile': 'scoped-profile'})
+    try:
+        assert readers.snapshot_identity() == {
+            'feed': f'{gateway or "local"}:panel', 'profile': 'scoped-profile'}
+    finally:
+        readers.release()
+
+
 def test_child_snapshot_uses_authorized_home_scope_not_exec_argv(api, worlds, monkeypatch):
     provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_snapshot_scope_provider')
     child_api = provider.open_provider({'home_context': ctx_for(worlds['explicit'])})
