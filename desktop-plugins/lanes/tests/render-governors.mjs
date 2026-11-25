@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
-const { view, case: scenario } = JSON.parse(await readFile(process.argv[2], 'utf8'))
+const { view, case: scenario, failed_lane, healthy_lane } = JSON.parse(await readFile(process.argv[2], 'utf8'))
 const P = await loadPlugin({ SIDEBAR_SECTIONS_AREA: 'sidebar.sections' })
 const pane = await mount(React.createElement(P.SidebarView, {
   snap: view, open: true, setOpen() {}, write() {}, onHeld() {}
@@ -36,6 +36,14 @@ try {
     assert.match(pane.container.querySelector('[data-governor="placement"]').textContent, /1 held/)
     assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 held/)
+  } else if (scenario === 'partial-status') {
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— running/)
+    assert.match(pane.container.textContent, /Partial lanes data/)
+    assert.match(pane.container.textContent, /\$— today/)
+    const bad = pane.container.querySelector(`[data-sidebar-lane="${failed_lane}"] button`)
+    const good = pane.container.querySelector(`[data-sidebar-lane="${healthy_lane}"] button`)
+    assert.equal(bad.querySelectorAll('span')[1].textContent, '—')
+    assert.equal(good.querySelectorAll('span')[1].textContent, '1')
   } else if (scenario === 'incomplete') {
     assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /unknown/i)
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))

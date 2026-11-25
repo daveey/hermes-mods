@@ -30,6 +30,15 @@ def merge(pairs):
     snap, raw = deepcopy(pairs[0])
     raw = raw or {}
     raw.setdefault('cards', [])
+    failures = [(other, flow or {}) for other, flow in pairs
+                if not flow or flow.get('configured') is False]
+    raw['flow_complete'] = not failures
+    raw['incomplete_status_lanes'] = sorted({name for other, _ in failures
+                                            for name, row in other.get('lanes', {}).items() if row.get('open')})
+    raw['partial_reason'] = '; '.join(flow.get('reason') or 'board flow unavailable' for _, flow in failures)
+    # First-board failure must not suppress healthy siblings (or certify a later
+    # failure as complete merely because the first source succeeded).
+    raw['configured'] = any(flow and flow.get('configured') is not False for _, flow in pairs)
     for other, flow in pairs[1:]:
         for name, row in other.get('lanes', {}).items():
             if name not in snap.get('lanes', {}):

@@ -1139,6 +1139,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
   return h('section', { className: 'lanes-sidebar', 'data-slot': 'lanes-sidebar', 'data-offline': error ? '1' : '0' },
     h('button', { className: 'lanes-sb-heading', 'aria-expanded': open, onClick: () => setOpen(!open) }, 'Ⅲ LANES', open ? ' ▾' : ' ▸'),
     error ? h('div', { role: 'status' }, 'Lanes offline - retrying') : null,
+    snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
     !snap ? h('div', null, 'Loading lanes…') : h('div', { className: error ? 'lanes-last-known' : '' },
       h('div', { className: 'lanes-sb-line', 'data-sidebar-totals': true },
         h('span', { style: { color: CARD_COLORS.run } }, `${status.run ?? '—'} running`),

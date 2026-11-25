@@ -246,6 +246,65 @@ def test_failed_board_keeps_healthy_sibling_lane_known(board, api, monkeypatch):
         assert len(body['lanes']['other']['held_cards']) == 1
 
 
+@pytest.mark.parametrize('failed_board', ['default', 'beta'])
+def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_path, failed_board):
+    config(board)
+    core_fixtures._usage(monkeypatch, [10])
+    kb.create_board('beta')
+    with kbc.connect() as a, kbc.connect(board='beta') as b:
+        kb.create_task(a, title='first board running', assignee='default', tenant='babybear')
+        kb.create_task(b, title='second board running', assignee='default', tenant='other')
+        core_fixtures._tick(a)
+        core_fixtures._tick(b, board='beta')
+        original = api.flow_core()[1].snapshot
+        def read(conn, *args, **kwargs):
+            if gov._board(conn) == failed_board:
+                raise RuntimeError('fixture flow failure')
+            return original(conn, *args, **kwargs)
+        monkeypatch.setattr(api.flow_core()[1], 'snapshot', read)
+        body = view(api)
+        failed_lane = 'babybear' if failed_board == 'default' else 'other'
+        healthy_lane = 'other' if failed_board == 'default' else 'babybear'
+        assert body['totals']['running'] == 2
+        assert body.get('status', {}).get('run') is None
+        assert body['lanes'][failed_lane].get('status', {}).get('run') is None
+        assert body['lanes'][healthy_lane]['status']['run'] == 1
+        assert body['sidebar']['cost_today'] is None
+        assert 'fixture flow failure' in body['flow_error']
+        assert not body.get('attention', {}).get('available', False)
+        render(tmp_path, body, 'partial-status', failed_lane=failed_lane, healthy_lane=healthy_lane)
+
+
+def test_failed_cursor_keeps_healthy_changes_and_recovery(board, api, monkeypatch):
+    import sqlite3
+    from contextlib import contextmanager
+    config(board)
+    kb.create_board('beta')
+    kb.create_board('gamma')
+    merge = api._sibling('board_merge')
+    original = merge.read_board
+    failed = [True]
+    @contextmanager
+    def read(path, **kwargs):
+        if failed[0] and '/beta/' in str(path):
+            raise sqlite3.OperationalError('fixture sibling failure')
+        with original(path, **kwargs) as db:
+            yield db
+    monkeypatch.setattr(merge, 'read_board', read)
+    # Public change_cursor owns semantic capture; no source-notification mocking.
+    before = api.change_cursor()
+    meta = next(b for b in kb.list_boards() if b['slug'] == 'beta')
+    assert str(meta['db_path']) in api._capture_cursor()[1]
+    with kbc.connect(board='gamma') as db:
+        kb.create_task(db, title='healthy sibling changed', assignee='default', tenant='other')
+    after = api.change_cursor()
+    assert after != before
+    failed[0] = False
+    with kbc.connect(board='beta') as db:
+        kb.create_task(db, title='recovered sibling changed', assignee='default', tenant='other')
+    assert api.change_cursor() != after
+
+
 def test_overlap_exclusively_charged(pool_hub, api, monkeypatch, tmp_path):
     config(pool_hub.home, sync={'enabled': True})
     core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 10])
