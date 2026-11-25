@@ -116,6 +116,16 @@ acquire and release records distinguish queue wait from complete serialized
 publication hold, and from callback duration. File I/O remains on the bounded
 logger thread, outside producer locks.
 
+`projection_end.projected_card_details` counts the actual hydrated `cards`
+mapping; `projected_membership_rows` counts tasks plus done rows. Neither is a
+count of displayed Model rows or physical SQL fetches. Local capture
+`rows_returned` counts every materialized row on its owned connection, including
+enrichment/detail queries; `selected_logical_rows` counts selected logical
+objects. `vm_steps` uses 100-instruction quanta (`vm_step_quantum=100`), not exact
+single-instruction totals. External adapter costs remain unavailable where the
+adapter does not supply them. Actual-ceiling giant-title fixtures explicitly
+mark StageCost unavailable; they establish custody, not performance or cost.
+
 `dashboard/source_analysis.py` consumes bounded private JSONL and delegates exact
 inclusion to the real receipt validator. It reports P/A/E/T stage statistics,
 budget violations, missing/unmatched/superseded accounting and unavailable costs.

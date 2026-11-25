@@ -40,3 +40,9 @@ def test_real_source_writer_emit_log_roundtrips_through_stage_analyzer(observed,
             'projection_end', 'writer_request', 'writer_acquire', 'writer_release',
             'model_stored', 'emit_success', 'window_end'} <= events
     assert report['captures']['ended'] > 0
+    projections = [row for row in rows if row['event'] == 'projection_end']
+    assert projections
+    for row in projections:
+        assert row['projected_card_details'] == len(f.bundles[row['session']]['bundle']['cards'])
+        bundle = f.bundles[row['session']]['bundle']
+        assert row['projected_membership_rows'] == len(bundle['tasks']) + len(bundle['done'])

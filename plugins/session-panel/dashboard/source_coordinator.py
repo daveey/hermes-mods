@@ -86,11 +86,26 @@ class Ticket:
     error: Exception | None = None
 
 
+def _predecessor_exit_pending(predecessor):
+    """Inspect stored old-generation owners without requiring a new method."""
+    seen = set()
+    while predecessor is not None and id(predecessor) not in seen:
+        seen.add(id(predecessor))
+        owner = predecessor.owner
+        workers = getattr(predecessor, 'workers', None)
+        if workers is None:
+            workers = (*owner.acquiring.values(), *owner.active.values())
+        if not predecessor.remaining and any(w.is_alive() for w in workers):
+            return True
+        predecessor = predecessor.parent
+    return False
+
+
 class RetiringOwner:
     """Compatibility fence for a genuinely older coordinator implementation.
 
     It need not know today's retire/drained methods. Its completion queue already
-    marks work after reader release. Keep every occupied role until that marker,
+    marks work after reader release. Keep every occupied role until thread exit,
     including ancestors still draining across consecutive reloads.
     """
     def __init__(self, owner):
@@ -119,6 +134,7 @@ class RetiringOwner:
             }
             self.remaining = {('acquisition_done', key) for key in owner.acquiring}
             self.remaining.update(('projection_done', key) for key in owner.active)
+            self.workers = tuple((*owner.acquiring.values(), *owner.active.values()))
             owner.closed = True
             owner.store.close(owner.store.epoch)
             owner.service_stop.set()
@@ -140,9 +156,10 @@ class RetiringOwner:
                     attempt.retry_at = self.owner.feed._backoff(attempt.count)
                 self.remaining.discard((kind, key))
             parent_ready = self.parent is None or self.parent.ready()
-            if not self.remaining and parent_ready:
+            if not self.remaining and parent_ready and not _predecessor_exit_pending(self):
                 self.drained.set()
         return self.drained.is_set()
+
 
     def bind(self, successor):
         # Wake the old scheduler on its original event before handing worker
@@ -247,6 +264,7 @@ class SourceCoordinator:
             self.store.add_source(source)
         self.lock = threading.RLock()
         self.completed = queue.SimpleQueue()
+        self._completion_pending = False
         self.pending, self.active, self.acquiring = {}, {}, {}
         self._active_ages = {}
         self._queue_generations = {}  # local worker fence, never source authority
@@ -368,7 +386,11 @@ class SourceCoordinator:
         self._change_seq = len(self.canonical_dirty)
 
     def _available(self):
-        return self.predecessor is None or self.predecessor.ready()
+        # An inherited retirement object can implement an older ready() which
+        # consumes completion before actual thread exit. Its reported readiness
+        # is necessary, never sufficient, for successor capacity admission.
+        return (self.predecessor is None or
+                (self.predecessor.ready() and not _predecessor_exit_pending(self.predecessor)))
 
     def _worker_started(self):
         self._workers += 1
@@ -405,7 +427,17 @@ class SourceCoordinator:
 
     def retry_at(self):
         with self.lock:
+            if not self._available():
+                # Inherited work cannot run until predecessor capacity retires.
+                # Expired source deadlines must not spin the service behind it.
+                return (self.feed.clock() + .01
+                        if _predecessor_exit_pending(self.predecessor) else None)
             ats = []
+            if self._completion_pending:
+                # No join under this lock: the worker still needs it to exit.
+                # Reuse the existing service loop for bounded exit observation,
+                # never another thread or a renewed source/projection attempt.
+                ats.append(self.feed.clock() + .01)
             for source, attempt in self.attempts.items():
                 role = 'external' if source == self.external else 'local'
                 owner = self.role_attempts[role]
@@ -877,14 +909,23 @@ class SourceCoordinator:
                 return
             if not self._available():
                 return
+            deferred = []
             while True:
                 try:
                     kind, key, value = self.completed.get_nowait()
                 except queue.Empty:
                     break
                 if kind == 'acquisition_done':
+                    worker = self.acquiring.get(key)
+                    if worker is not None and worker.is_alive():
+                        deferred.append((kind, key, value))
+                        continue
                     self.acquiring.pop(key, None)
                 elif kind == 'projection_done':
+                    worker = self.active.get(key)
+                    if worker is not None and worker.is_alive():
+                        deferred.append((kind, key, value))
+                        continue
                     self.active.pop(key, None)
                     if key not in self.projection_attempts:
                         self._active_ages.pop(key, None)
@@ -897,6 +938,9 @@ class SourceCoordinator:
                     if key == self.external:
                         completed = {sid.chat.session_id for sid in value.receipt.coverage.completed_scopes}
                         self.feed._board_capture_failures.difference_update(completed)
+            for completion in deferred:
+                self.completed.put(completion)
+            self._completion_pending = bool(deferred)
             for s, attempt in self.projection_attempts.items():
                 if attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at:
                     self.pending.setdefault(s, self._active_ages.get(s, time.monotonic_ns()))
@@ -1087,6 +1131,10 @@ class SourceCoordinator:
                     covered_scopes=projection.covered_scopes if projection is not None else None,
                     missing_scopes=projection.missing_scopes if projection is not None else None,
                     dependencies=projection.dependencies if projection is not None else None,
+                    projected_card_details=(len(projection.bundle.get('cards', {}))
+                        if projection is not None else None),
+                    projected_membership_rows=(len(projection.bundle.get('tasks', ()))
+                        + len(projection.bundle.get('done', ())) if projection is not None else None),
                     io_cost=io_cost,
                     elapsed_ns=computation_end - started, thread_cpu_ns=computation_cpu - cpu,
                     total_worker_elapsed_ns=time.monotonic_ns() - started)
