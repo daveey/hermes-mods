@@ -1251,7 +1251,7 @@ def canonical_age_reassessment(card: Card, src: Sources, park: dict, awaited: di
         task = row('SELECT * FROM tasks WHERE id=?', (card.id,))
         event = row('SELECT * FROM task_events WHERE id=? AND task_id=?', (park['id'], card.id))
         receipt = verified_for_event(c, event, task, now=int(src.now)) if event and task else None
-        if not task or not receipt or not src.now < receipt['reassess_at']:
+        if not event or not task or not receipt or not src.now < receipt['reassess_at']:
             return False
         if (receipt['target'] != target
                 or any((awaited.get(k) or '') != (receipt['producer'].get(k) or '')
@@ -1263,22 +1263,44 @@ def canonical_age_reassessment(card: Card, src: Sources, park: dict, awaited: di
             if not c.execute('SELECT 1 FROM task_events WHERE uid=? AND task_id=?' + live_event,
                              (ref['uid'], card.id)).fetchone():
                 return False
-        watch = row("SELECT payload FROM task_events WHERE task_id=? AND id>? AND kind='external_watch' "
-                    + live_event + " ORDER BY id DESC LIMIT 1", (card.id, park['id']))
-        if watch:
+        # Replica ids are arrival order, not origin chronology. Only portable
+        # timestamps can prove an observation predates this exact certified park.
+        # Same-second events remain ambiguous: never use local ids or backfilled
+        # UUIDv7 clocks to turn uncertain adverse evidence into an exemption.
+        adverse_kinds = ('wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met')
+        cur = c.execute("SELECT kind,created_at,payload FROM task_events WHERE task_id=? AND kind IN "
+                        "('external_watch','wake_check_broken','wake_check_lost','wake_check_stale','condition_met')"
+                        + live_event, (card.id,))
+        observations = [dict(zip((d[0] for d in cur.description), value)) for value in cur.fetchall()]
+        watches = []
+        park_at = event['created_at']
+        if type(park_at) is not int or not 0 <= park_at <= src.now:
+            return False
+        for observation in observations:
+            at = observation['created_at']
+            if type(at) is not int or not 0 <= at <= src.now:
+                return False
+            if at < park_at:
+                continue
+            if observation['kind'] in adverse_kinds:
+                return False
+            watches.append(observation)
+        # A healthy receipt must be unambiguously later than every conflicting
+        # watcher. Equal timestamps cannot be resolved by replica arrival order.
+        latest_at = max((value['created_at'] for value in watches), default=None)
+        for watch in watches:
+            if watch['created_at'] != latest_at:
+                continue
             data = _json(watch['payload']) or {}
-            if (data.get('health') != 'ok' or data.get('consecutive_failures') != 0
-                    or data.get('state') != 'external_running'):
+            if (not isinstance(data, dict) or data.get('health') != 'ok'
+                    or data.get('consecutive_failures') != 0 or data.get('state') != 'external_running'):
                 return False
         if task.get('lease_holder') and (_num(task.get('lease_expires')) or 0) <= src.now * 1000:
             return False
         if c.execute("SELECT 1 FROM task_runs WHERE task_id=? AND (status='running' OR started_at>?) LIMIT 1",
                      (card.id, park['at'])).fetchone():
             return False
-        adverse = c.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? AND kind IN "
-                            "('wake_check_broken','wake_check_lost','wake_check_stale','condition_met') "
-                            + live_event + ' LIMIT 1', (card.id, park['id'])).fetchone()
-        if adverse or _promotion_held(c, card):
+        if _promotion_held(c, card):
             return False
         from hermes_cli.kanban_spend_decision import pending, execution_refusal
         return not (pending(c, card.id) or execution_refusal(c, card.id))

@@ -155,6 +155,66 @@ def test_adverse_episode_event_cannot_be_overridden(world, kind):
     assert hits(world)[0]['variant'] == 'too_long'
 
 
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met', 'external_watch'])
+@pytest.mark.parametrize('remapped', [False, True])
+def test_adverse_chronology_survives_replica_id_remap(world, kind, remapped):
+    env, tid, eid, *_ = world
+    assert hits(world) == []
+    F.event(env.conn, tid, kind, {'health': 'offline', 'state': 'external_unknown'}, at=env.now-1)
+    if remapped:
+        env.conn.execute('UPDATE task_events SET id=id+10000 WHERE id=?', (eid,))
+    env.conn.commit()
+    assert hits(world)[0]['variant'] == 'too_long'
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met', 'external_watch'])
+def test_same_second_adverse_event_with_backfilled_uid_is_ambiguous(world, kind):
+    env, tid, eid, receipt, _ = world
+    F.event(env.conn, tid, kind, {}, at=receipt['park_event']['created_at'])
+    # UUIDv7 minted now is a backfill clock, not the old event's chronology.
+    env.conn.execute('UPDATE task_events SET uid=? WHERE task_id=? AND kind=?', (uuid7(), tid, kind))
+    env.conn.execute('UPDATE task_events SET id=id+10000 WHERE id=?', (eid,))
+    env.conn.commit()
+    assert hits(world)[0]['variant'] == 'too_long'
+
+
+HEALTHY_WATCH = {'health': 'ok', 'state': 'external_running', 'consecutive_failures': 0}
+
+
+@pytest.mark.parametrize('later_healthy', [False, True])
+@pytest.mark.parametrize('tie', [False, True])
+def test_competing_watchers_use_origin_chronology_not_arrival(world, later_healthy, tie):
+    env, tid, *_ = world
+    older, newer = env.now-10, env.now-1
+    # Older observation arrives last, with the larger replica-local id.
+    F.event(env.conn, tid, 'external_watch', HEALTHY_WATCH if later_healthy else {}, at=newer)
+    F.event(env.conn, tid, 'external_watch', {} if later_healthy else HEALTHY_WATCH,
+            at=newer if tie else older)
+    result = hits(world)
+    if later_healthy and not tie:
+        assert result == []
+    else:
+        assert result and result[0]['variant'] == 'too_long'
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met', 'external_watch'])
+def test_proven_prior_adverse_event_does_not_veto_current_episode(world, kind):
+    env, tid, _, receipt, _ = world
+    F.event(env.conn, tid, kind, {}, at=receipt['park_event']['created_at']-1)
+    assert hits(world) == []
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'external_watch'])
+@pytest.mark.parametrize('stamp', [-1, '', 'invalid', 1.5])
+def test_invalid_observation_chronology_fails_closed(world, kind, stamp):
+    env, tid, eid, *_ = world
+    F.event(env.conn, tid, kind, HEALTHY_WATCH, at=env.now-1)
+    env.conn.execute('UPDATE task_events SET created_at=? WHERE task_id=? AND kind=?', (stamp, tid, kind))
+    env.conn.execute('UPDATE task_events SET id=id+10000 WHERE id=?', (eid,))
+    env.conn.commit()
+    assert hits(world)[0]['variant'] == 'too_long'
+
+
 @pytest.mark.parametrize('bad', ['missing_receipt', 'missing_evidence', 'changed_payload', 'new_park', 'new_run', 'expired_lease'])
 def test_current_episode_and_required_evidence(world, bad):
     env, tid, eid, r, _ = world
