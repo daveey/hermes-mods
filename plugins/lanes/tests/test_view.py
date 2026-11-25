@@ -56,7 +56,8 @@ def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
     monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
     for expanded in (False, True):
         view = api.lane_view(6, '6h', expanded)
-        assert view['status'] == {'you': 1, 'ext': 2, 'worker': 4, 'run': 1, 'dep': 2, 'triage': 1, 'other': 1}
+        assert view['status'] == {'you': 1, 'ext': 2, 'gate': 2, 'worker': 2, 'run': 1, 'dep': 2, 'triage': 1,
+                                  'other': 1}
         assert sum(view['status'].values()) == len(cards)
         strips = {n: view['lanes'][n]['strip'] for n in ('a', 'b')}
         assert sum(s['blocked'] for s in strips.values()) == view['status']['you']
@@ -86,7 +87,29 @@ def test_collapsed_view_maps_open_cards_to_their_sessions(monkeypatch):
     monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {'a': {'open': 4}, 'b': {'open': 2}}})
     monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
     assert api.lane_view(6, '6h', False)['sessions'] == {
-        's1': {'a': {'you': 1, 'run': 1}, 'b': {'dep': 1}}, 's2': {'b': {'worker': 1}}}
+        's1': {'a': {'you': 1, 'run': 1}, 'b': {'dep': 1}}, 's2': {'b': {'gate': 1}}}
+
+
+def test_view_names_each_gate_and_who_filed_its_unlinked_cards(monkeypatch):
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    cards = [dict(id='t_1', lane='hermes', reason='gate', source={'kind': 'automation', 'id': 'ci-sweeper'}),
+             dict(id='t_2', lane='hermes', reason='gate', source={'kind': 'automation', 'id': 'ci-sweeper'}),
+             dict(id='t_3', lane='hermes', reason='gate', source={'kind': 'session', 'id': 's1'}),
+             dict(id='t_4', lane='hermes', reason='gate', source={'kind': 'user', 'id': ''}),
+             dict(id='t_5', lane='bb', reason='limit:usd_per_day', source={'kind': 'session', 'id': 's2'}),
+             dict(id='t_6', lane='bb', reason='slot')]
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {
+        'hermes': {'open': 4, 'gated': True, 'admitted_today': 0, 'admit_per_day': 2}, 'bb': {'open': 2}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
+    view = api.lane_view(6, '6h', False)
+    assert view['status']['gate'] == 5 and view['status']['worker'] == 1
+    assert view['gates'] == [
+        {'lane': 'hermes', 'kind': 'lane_gate', 'count': 4, 'linked': 1, 'unlinked': {'ci-sweeper': 2, 'user': 1},
+         'admitted_today': 0, 'admit_per_day': 2},
+        {'lane': 'bb', 'kind': 'limit:usd_per_day', 'count': 1, 'linked': 1, 'unlinked': {}}]
+    assert [g['lane'] for g in view['lanes']['bb']['gates']] == ['bb']
+    assert sum(g['count'] for g in view['gates']) == view['status']['gate']
 
 
 @pytest.mark.parametrize('maximum,target,running,cap,inside,over', [

@@ -14,14 +14,46 @@ REASONS = {
 
 
 # The strip's all-lanes counts: one bucket per open card, in urgency order. Colours are owned by Desktop.
-STATUS = ('you', 'ext', 'worker', 'run', 'dep', 'triage', 'other')
-_STATUS_OF = {'you': 'you', 'time': 'ext', 'review': 'ext', 'gate': 'worker', 'slot': 'worker', 'quota': 'worker',
+# A card held at a lane gate or over a lane's daily limit is not waiting for a worker: no free slot would start it.
+STATUS = ('you', 'ext', 'gate', 'worker', 'run', 'dep', 'triage', 'other')
+_STATUS_OF = {'you': 'you', 'time': 'ext', 'review': 'ext', 'gate': 'gate', 'slot': 'worker', 'quota': 'worker',
               'run': 'run', 'dep': 'dep', 'triage': 'triage'}
 
 
 def status_of(reason):
     reason = str(reason or '')
-    return 'worker' if reason.startswith('limit:') else _STATUS_OF.get(reason, 'other')
+    return 'gate' if reason.startswith('limit:') else _STATUS_OF.get(reason, 'other')
+
+
+def _gate_kind(reason):
+    return 'lane_gate' if reason == 'gate' else str(reason)
+
+
+def gates(cards, lanes):
+    """Every gate holding cards, named: [{lane, kind, count, linked, unlinked: {creator: n}, admitted_today,
+    admit_per_day}], biggest first. ``kind`` is ``lane_gate`` or a ``limit:*`` daily cap. ``unlinked`` counts the held
+    cards no chat session owns, by the automation that filed them, so a count with no rows in the session pane says why."""
+    out = {}
+    for c in cards:
+        if status_of(c.get('reason')) != 'gate' or not c.get('lane'):
+            continue
+        key = (c['lane'], _gate_kind(c.get('reason')))
+        row = out.setdefault(key, {'lane': key[0], 'kind': key[1], 'count': 0, 'linked': 0, 'unlinked': Counter()})
+        row['count'] += 1
+        src = c.get('source') or {}
+        if src.get('kind') == 'session' and src.get('id'):
+            row['linked'] += 1
+        else:
+            row['unlinked'][str(src.get('id') or src.get('kind') or 'unknown')] += 1
+    rows = []
+    for row in out.values():
+        lane = (lanes or {}).get(row['lane']) or {}
+        row['unlinked'] = dict(row['unlinked'].most_common())
+        if row['kind'] == 'lane_gate':
+            row['admitted_today'] = lane.get('admitted_today')
+            row['admit_per_day'] = lane.get('admit_per_day')
+        rows.append(row)
+    return sorted(rows, key=lambda r: (-r['count'], r['lane'], r['kind']))
 
 
 def session_counts(cards):
@@ -107,6 +139,7 @@ def project(snap, raw, expanded):
                       ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done')}
     if raw and raw.get('configured') is not False and 'cards' in raw:
         view['status'] = status_counts(raw['cards'])
+        view['gates'] = gates(raw['cards'], view['lanes'])
         if 'attention' in raw:
             view['attention'] = raw['attention']
             if view['attention'].get('available'):
@@ -136,6 +169,7 @@ def project(snap, raw, expanded):
             if actual is not None:
                 row['strip']['actual'] = actual
             row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
+            row['gates'] = [g for g in view['gates'] if g['lane'] == name]
         view['sessions'] = session_counts(raw['cards'])
     if not expanded:
         return view

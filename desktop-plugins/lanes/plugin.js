@@ -29,16 +29,16 @@ export const KANBAN_CHIP_EVENT = 'hermes-kanban-chip'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
 export const METER_COLORS = { running: '#388bfd', notReady: '#d4a72c', blocked: '#d64545' }
 // Card-state colours shared with the sidebar's card squares (Tailwind red-500, pink-500, emerald-500, sky-500, zinc-500).
-export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', worker: '#10b981', run: '#0ea5e9', dep: '#71717a' }
+export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', gate: '#a855f7', worker: '#10b981', run: '#0ea5e9', dep: '#71717a' }
 export const LANE_COUNT_COLORS = { blocked: CARD_COLORS.you, running: CARD_COLORS.run, other: '#a1a1aa' }
 /** All-lanes strip counts: hub `status` key, words, colour (null = outlined, no fill). */
 export const STATUS = [
   ['you', 'blocked on you', CARD_COLORS.you], ['ext', 'waiting on external (CI, review, timer)', CARD_COLORS.ext],
-  ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
+  ['gate', 'held at a gate', CARD_COLORS.gate], ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
   ['dep', 'waiting on other cards', CARD_COLORS.dep], ['triage', 'in triage', null], ['other', 'other', null]
 ]
 /** The colour word a tooltip names for each count, so hovering says what the colour means. */
-export const COLOR_WORDS = { you: 'Red', ext: 'Pink', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
+export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
 // Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
 export const SESSION_FILTER_AREA = sdk.SESSION_FILTER_AREA || ''
 const useSidebarSessions = typeof sdk.useSidebarSessions === 'function' ? sdk.useSidebarSessions : () => null
@@ -809,9 +809,30 @@ export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
 
+const GATE_KIND = { lane_gate: 'lane gate', 'limit:cards_per_day': 'cards/day limit', 'limit:usd_per_day': '$/day limit' }
+/** The pill word: the one gate holding cards ("held at hermes lane gate"), or a count of gates. */
+export function gateWord(gates, scope = '') {
+  const names = scope ? scope.split(', ') : []
+  const shown = (gates || []).filter((g) => !names.length || names.includes(g.lane))
+  if (shown.length === 1) return `held at ${shown[0].lane} ${GATE_KIND[shown[0].kind] || shown[0].kind}`
+  return shown.length ? `held at ${shown.length} gates` : 'held at a gate'
+}
+/** Names each gate holding cards: "hermes lane gate: 46 (0/2 admitted today; 45 not linked to a chat: 30 ci-sweeper, …)". */
+export function gateLines(gates, scope = []) {
+  return (gates || []).filter((g) => !scope.length || scope.includes(g.lane)).map((g) => {
+    const kind = GATE_KIND[g.kind] || g.kind
+    const budget = g.kind === 'lane_gate' && g.admitted_today != null ? `${g.admitted_today}${g.admit_per_day == null ? '' : `/${g.admit_per_day}`} admitted today` : ''
+    const top = Object.entries(g.unlinked || {}).slice(0, 3).map(([who, n]) => `${n} ${who}`).join(', ')
+    const unlinked = Object.values(g.unlinked || {}).reduce((a, n) => a + n, 0)
+    const orphans = unlinked ? `${unlinked} not linked to a chat${top ? `: ${top}` : ''}` : ''
+    const extra = [budget, orphans].filter(Boolean).join('; ')
+    return `${g.lane} ${kind}: ${g.count}${extra ? ` (${extra})` : ''}`
+  })
+}
+
 /** The counts on the right, from the hub's `status` projection (older hubs send none: nothing shows): [all], one
  *  toggle per category with cards, and the no-cards toggle (only where the Desktop can list and filter sessions). */
-function StatusTotals({ status, scope, picked, noCards, noCardsCount, anySelected, onToggle, onNoCards, onAll }) {
+function StatusTotals({ status, gates, scope, picked, noCards, noCardsCount, anySelected, onToggle, onNoCards, onAll }) {
   if (!status) return null
   const items = STATUS.filter(([key]) => (status[key] || 0) > 0 || picked.includes(key))
   const where = scope ? ` in ${scope}` : ''
@@ -827,12 +848,12 @@ function StatusTotals({ status, scope, picked, noCards, noCardsCount, anySelecte
       return h('button', {
         type: 'button', key, className: 'hermes-lanes-cat hermes-lanes-status-item', 'data-status': key,
         'aria-pressed': on, 'data-selected': on ? '1' : '0', 'data-dimmed': picked.length && !on ? '1' : '0',
-        title: `${COLOR_WORDS[key]}: ${label}, ${plural(n, 'card')}${where}. Click to ${on ? 'deselect' : 'select'}`,
+        title: `${COLOR_WORDS[key]}: ${label}, ${plural(n, 'card')}${where}${key === 'gate' && gates?.length ? ` — ${gateLines(gates, scope ? scope.split(', ') : []).join('; ')}` : ''}. Click to ${on ? 'deselect' : 'select'}`,
         onClick: (event) => { event.stopPropagation(); onToggle(key) }
       },
         h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
         h('span', { className: 'hermes-lanes-n' }, n),
-        h('span', { className: 'hermes-lanes-status-word' }, label))
+        h('span', { className: 'hermes-lanes-status-word' }, key === 'gate' && gates?.length ? gateWord(gates, scope) : label))
     }),
     noCardsCount == null ? null : h('button', {
       type: 'button', className: 'hermes-lanes-cat hermes-lanes-status-item', 'data-status': 'nocards',
@@ -999,7 +1020,7 @@ export function Lanes({ ctx }) {
         }))),
       h(StripRight),
       h(StatusTotals, {
-        status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
+        status: selectedStatus(snap, picked), gates: snap?.gates, scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
         noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
       }),
       !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,

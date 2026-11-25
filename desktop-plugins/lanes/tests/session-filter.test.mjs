@@ -8,8 +8,9 @@ const sidebar = [{ id: 's1' }, { id: 's2' }, { id: 's3' }, { id: 's4' }, { id: '
 const sessions = { s1: { product: { you: 1, run: 1 }, infra: { dep: 1 } }, s2: { infra: { worker: 1 } } }
 const snap = { configured: true, sessions, lanes: {
   product: { share: 50, strip: { blocked: 1, running: 1, other: 0 }, status: { you: 1, run: 1 } },
-  infra: { share: 50, strip: { blocked: 0, running: 0, other: 2 }, status: { dep: 1, worker: 1 } } },
-  status: { you: 1, worker: 1, run: 1, dep: 1 } }
+  infra: { share: 50, strip: { blocked: 0, running: 0, other: 3 }, status: { dep: 1, worker: 1, gate: 1 } } },
+  status: { you: 1, worker: 1, run: 1, dep: 1, gate: 1 },
+  gates: [{ lane: 'infra', kind: 'lane_gate', count: 1, linked: 0, unlinked: { 'ci-sweeper': 1 }, admitted_today: 0, admit_per_day: 2 }] }
 const P = await loadPlugin({ SESSION_FILTER_AREA: 'sessions.filter', useSidebarSessions: () => sidebar })
 const views = []
 let filters = []
@@ -91,6 +92,8 @@ test('tooltips name the colour and the count', async () => {
   const { cat, lane, all } = await setup()
   assert.match(cat('you').title, /^Red: blocked on you, 1 card\./)
   assert.match(cat('worker').title, /^Green: waiting for a worker/)
+  assert.match(cat('gate').title, /^Purple: held at a gate, 1 card — infra lane gate: 1 \(0\/2 admitted today; 1 not linked to a chat: 1 ci-sweeper\)/)
+  assert.equal(cat('gate').querySelector('.hermes-lanes-status-word').textContent, 'held at infra lane gate')
   assert.match(cat('run').title, /^Blue: running/)
   assert.match(cat('dep').title, /^Grey: waiting on other cards/)
   assert.match(cat('nocards').title, /^Dashed: sessions with no open cards, 2 sessions/)
