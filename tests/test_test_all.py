@@ -805,10 +805,11 @@ class TestAll(unittest.TestCase):
             self.assertEqual(site, self.root / 'python-3.14' / 'site-packages')
             install.assert_called_once_with(
                 ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
-                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pytest-xdist', 'pyyaml', 'ruamel.yaml',
+                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pytest-xdist', 'pytest-timeout>=2.4,<3', 'pyyaml', 'ruamel.yaml',
                  'fastapi', 'httpx', 'psutil', 'cryptography', 'pillow', 'jsonschema', 'anthropic==0.125.0'], check=True)
             for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'jsonschema', 'anthropic'):
                 (site / name).mkdir(parents=True)
+            (site / 'pytest_timeout.py').touch()
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
             metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
@@ -847,6 +848,7 @@ class TestAll(unittest.TestCase):
             site = self.root / 'python-3.14' / 'site-packages'
             for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic', *required):
                 (site / name).mkdir(parents=True)
+            (site / 'pytest_timeout.py').touch()
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
             metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
@@ -860,6 +862,14 @@ class TestAll(unittest.TestCase):
                 (site / module_dir).mkdir()
             ensure('/fake/python')
             self.assertEqual(install.call_count, len(required))
+            # Older cache sites have every directory but lack the timeout module.
+            (site / 'pytest_timeout.py').unlink()
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, len(required) + 1)
+            self.assertIn('pytest-timeout>=2.4,<3', install.call_args.args[0])
+            (site / 'pytest_timeout.py').touch()
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, len(required) + 1)
 
     def test_test_site_carries_core_runtime_deps_unless_running_core_venv(self):
         # The macOS production interpreter (any interpreter outside core's venv) sees only this site: core's own
@@ -890,6 +900,7 @@ class TestAll(unittest.TestCase):
             self.assertEqual(overrides.read_text(), 'Pillow==13.0.0\n')
             for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'jsonschema', 'anthropic'):
                 (site / name).mkdir(parents=True)
+            (site / 'pytest_timeout.py').touch()
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
             metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
