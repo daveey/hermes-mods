@@ -12,7 +12,7 @@ import { createElement as h, useState, useEffect, useRef, useCallback } from 're
 export const POLL_MS = 60000
 export const KEY_COMMIT_MS = 400
 export const OVER_PTS = 5 // |traffic - quota| below this reads as "manual" (matches quota)
-export const CHIP_SPAN = 5 // the chip is 5 titlebar cells wide (5 x 24 px)
+export const CHIP_SPAN = 8 // the chip is 8 titlebar cells wide (8 x 24 px; the core's span cap)
 export const QUERY_KEY = ['llm-split', 'split']
 const ANT = 'anthropic', GPT = 'openai-codex', GRK = 'xai-oauth'
 export const COLORS = { [ANT]: '#d97757', [GPT]: '#3fb8a0', [GRK]: '#9aa0a6' }
@@ -231,12 +231,12 @@ export function Chip({ ctx }) {
 }
 
 export const CSS = `
-.llms-chip{display:inline-flex;align-items:center;justify-content:center;gap:5px;width:100%;height:100%;padding:0 6px;user-select:none;white-space:nowrap}
+.llms-chip{display:inline-flex;align-items:center;justify-content:center;gap:7px;width:100%;height:100%;padding:0 6px;user-select:none;white-space:nowrap}
 .llms-chip.dim{opacity:.55}
-.llms-mini{position:relative;display:flex;width:30px;height:6px;border-radius:2px;overflow:hidden;background:var(--ui-stroke-tertiary,rgba(127,127,127,.25))}
+.llms-mini{position:relative;display:flex;width:84px;height:8px;border-radius:2px;overflow:hidden;background:var(--ui-stroke-tertiary,rgba(127,127,127,.25))}
 .llms-mini>span{height:100%}
 .llms-mini>span+span{box-shadow:inset 1px 0 0 var(--ui-chat-surface-background,#141517)}
-.llms-qm{position:absolute;top:-2px;width:1.5px;height:10px;margin-left:-.75px;background:var(--foreground);opacity:.9}
+.llms-qm{position:absolute;top:-2px;width:1.5px;height:12px;margin-left:-.75px;background:var(--foreground);opacity:.9}
 .llms-num{font:500 10.5px/1 var(--font-mono,ui-monospace,monospace);color:var(--foreground);font-variant-numeric:tabular-nums}
 .llms-word{font-size:10.5px;line-height:1;color:var(--muted-foreground)}
 .llms-word.ok{color:${OK}} .llms-word.warn{color:${TIGHT}} .llms-word.bad{color:${DRY}}
@@ -286,7 +286,7 @@ export default {
   description: 'Titlebar chip: Claude/GPT quota share vs traffic split; drag to set it, or let it follow quota.',
   register(ctx) {
     const style = document.createElement('style')
-    style.textContent = CSS + '.llms-tool{width:calc(5*var(--titlebar-control-size,24px))!important;padding:0!important}'
+    style.textContent = CSS + `.llms-tool{width:calc(${CHIP_SPAN}*var(--titlebar-control-size,24px))!important;padding:0!important}`
     document.head.append(style)
     ctx.onDispose(() => style.remove())
     ctx.register({ id: 'chip', area: 'titleBar.tools.right', order: 50, data: tool(ctx) })

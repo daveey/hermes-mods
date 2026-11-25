@@ -1,5 +1,5 @@
 // Throughput: tokens, sessions and cards per gateway over time (direction B "Flow").
-// Chip: 34 px token sparkline + "56k tok/m · 1.5 cards/m". Popover: three mirrored stacked charts
+// Chip (titlebar, left of the llm-split chip; status-bar fallback): 34 px token sparkline + "56k tok/m · 1.5 cards/m". Popover: three mirrored stacked charts
 // (inflow above the line, outflow below), stacked by gateway. Data: GET /v1/series?range=… on the
 // local gateway (plugins/throughput/series.py): per-bucket counts, null = gateway doesn't report.
 // Throttle: GET/PUT /v1/throttle (plugins/throughput/throttle.py). A slider under Tokens sets a 0-100 % level;
@@ -33,6 +33,9 @@ const PALETTE = ['#7aa2ff', '#3ddc97', '#f0a43a', '#d982f0', '#5fd4e6', '#ef7b7b
 const FIXED = { ephemeral: '#9aa0aa', unattributed: '#6b7280' }
 const NOREP = 'These gateways don\u2019t report this metric yet (their Board counters arrive with the core token/session counters), so they show \u201c\u2013\u201d, never 0'
 const BAR = 'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+const TB_CHIP = 'hermes-tp-tbchip'
+export const TITLEBAR_SPAN = 8 // titlebar cells (8 x 24 px; the core's span cap), left of llm-split (order 50)
+export const SHOW_EVENT = 'hermes-show-throughput'
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
 
@@ -785,7 +788,7 @@ export function ChipMenu({ throttle, failed = false, busy = false, error = null,
   ]
 }
 
-export function Throughput({ ctx }) {
+export function Throughput({ ctx, placement = 'bar' }) {
   const [open, setOpen] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [view, setViewState] = useState(loadView)
@@ -987,7 +990,9 @@ export function Throughput({ ctx }) {
     : `Loading ${view.range}\u2026`
   const n = frame ? chipNumbers(frame, view) : null
   const label = n ? `${fmt(n.tok)} tok/${view.unit} \u00b7 ${fmt(n.cards)} cards/${view.unit}` : 'Throughput \u2026'
-  const chip = h('button', { type: 'button', className: BAR, 'data-slot': 'throughput-chip', 'aria-label': `Show throughput: ${label}`, title: 'Throughput: tokens and cards done per ' + { s: 'second', m: 'minute', h: 'hour' }[view.unit] + ' (rate now) \u00b7 right-click: limit and raise' },
+  // In the titlebar the chip sits inside the titlebar tool's own <button>: render a span trigger, not a nested button.
+  const inTitlebar = placement === 'titlebar'
+  const chip = h(inTitlebar ? 'span' : 'button', { ...(inTitlebar ? {} : { type: 'button' }), className: inTitlebar ? TB_CHIP : BAR, 'data-slot': 'throughput-chip', 'aria-label': `Show throughput: ${label}`, title: 'Throughput: tokens and cards done per ' + { s: 'second', m: 'minute', h: 'hour' }[view.unit] + ' (rate now) \u00b7 right-click: limit and raise' },
     n ? h(Spark, { values: n.spark }) : null,
     h('span', { className: 'hermes-tp-chiptext' }, label))
   return h(Popover, { open, onOpenChange: setOpen },
@@ -996,7 +1001,7 @@ export function Throughput({ ctx }) {
       h(ContextMenuContent, { className: 'hermes-tp-menu', 'data-slot': 'throughput-menu' },
         h(ChipMenu, { throttle: throttleQuery.data || null, failed: throttleQuery.isError && !throttleQuery.data, busy: limitBusy, error: throttleError || burstError, onLimit, onBurst, onEndBurst, openPanel: () => setOpen(true) }))),
     h(PopoverContent, {
-      side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
+      side: inTitlebar ? 'bottom' : 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
       ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onLimit, limitBusy, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
@@ -1006,6 +1011,10 @@ export function Throughput({ ctx }) {
 export const CSS = `
 .hermes-tp-spark{color:var(--ui-green,#3ddc97);flex-shrink:0}
 .hermes-tp-chiptext{white-space:nowrap;font-variant-numeric:tabular-nums}
+.hermes-tp-tool{padding:0!important}
+.hermes-tp-tbchip{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;width:100%;height:100%;padding:0 6px;font-size:11px;color:var(--ui-text-tertiary);overflow:hidden}
+.hermes-tp-tbchip .hermes-tp-chiptext{overflow:hidden;text-overflow:ellipsis}
+.hermes-tp-tool:hover .hermes-tp-tbchip{color:var(--foreground)}
 .hermes-tp{display:flex;flex-direction:column;gap:6px;padding:6px 4px;font-size:12px;color:var(--ui-text-primary,inherit)}
 .hermes-tp-top{display:flex;align-items:center;gap:8px}
 .hermes-tp-top h2{font-size:13px;font-weight:600;margin:0}
@@ -1136,16 +1145,42 @@ export function registerStripChip(ctx, component = Throughput) {
   return () => { if (area.item === item) { area.item = null; area.notify() } }
 }
 
+// Titlebar placement: hosts the chip (so the status-bar fallback and the lanes strip stand down) and takes the
+// single-subscription lease like any other placement.
+export function TitlebarHost({ ctx, component = Throughput }) {
+  const area = stripArea(), token = useRef({}).current
+  useEffect(() => {
+    area.hosts.add(token); area.notify()
+    return () => { area.hosts.delete(token); area.notify() }
+  }, [area, token])
+  return h(ExclusiveChip, { ctx, component: component === Throughput ? TitlebarThroughput : component })
+}
+const TitlebarThroughput = ({ ctx }) => h(Throughput, { ctx, placement: 'titlebar' })
+
+export function titlebarTool(ctx, component) {
+  return {
+    id: 'throughput',
+    label: 'Throughput',
+    title: 'Throughput: tokens and cards done (rate now). Click for the panel; right-click: limit and raise',
+    span: TITLEBAR_SPAN,
+    className: 'hermes-tp-tool',
+    icon: h(TitlebarHost, { ctx, component }),
+    // Mouse clicks reach the span's own popover trigger; Enter/Space on the focused button arrive with detail 0.
+    onSelect: (event) => { if (!event || event.detail === 0) window.dispatchEvent(new window.Event(SHOW_EVENT)) }
+  }
+}
+
 export default {
   id: 'throughput',
   name: 'Throughput',
-  description: 'Status-bar chip + panel: tokens, sessions and cards per gateway over time.',
+  description: 'Titlebar chip + panel: tokens, sessions and cards per gateway over time.',
   register(ctx) {
     const style = document.createElement('style')
-    style.textContent = CSS
+    style.textContent = CSS + `.hermes-tp-tool{width:calc(${TITLEBAR_SPAN}*var(--titlebar-control-size,24px))!important}`
     document.head.append(style)
     ctx.onDispose(() => style.remove())
-    ctx.onDispose(registerStripChip(ctx))
+    // Titlebar, left of the llm-split chip; the status bar keeps a fallback for when no titlebar host is mounted.
+    ctx.register({ id: 'titlebar-chip', area: 'titleBar.tools.right', order: 40, data: titlebarTool(ctx) })
     ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 7, render: () => h(ChipPlacement, { ctx }) })
     ctx.register({
       id: 'show-throughput',

@@ -455,11 +455,15 @@ test('no throttle endpoint (older backend): the panel renders without slider or 
   }
 })
 
-test('register: chip right after Runners, palette entry, CSS removed on dispose', () => {
+test('register: titlebar chip left of llm-split, status-bar fallback, palette entry, CSS removed on dispose', () => {
   const regs = []
   const disposers = []
   P.default.register({ register: (r) => regs.push(r), onDispose: (f) => { disposers.push(f) } })
-  assert.deepEqual(regs.map((r) => [r.id, r.area, r.order]), [['chip', 'statusBar.right', 7], ['show-throughput', 'palette', undefined]])
+  assert.deepEqual(regs.map((r) => [r.id, r.area, r.order]), [['titlebar-chip', 'titleBar.tools.right', 40], ['chip', 'statusBar.right', 7], ['show-throughput', 'palette', undefined]])
+  const tool = regs[0].data
+  assert.equal(tool.span, P.TITLEBAR_SPAN)
+  assert.equal(tool.className, 'hermes-tp-tool')
+  assert.ok([...document.head.querySelectorAll('style')].some((s) => s.textContent.includes(`.hermes-tp-tool{width:calc(${P.TITLEBAR_SPAN}*`)))
   assert.ok([...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
   for (const dispose of disposers.reverse()) dispose()
   assert.ok(![...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))

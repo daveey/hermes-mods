@@ -67,15 +67,18 @@ test('validSnapshot rejects junk', () => {
   for (const bad of [null, {}, { pools: [] }, { pools: [], traffic: {} }]) assert.equal(P.validSnapshot(bad), false)
 })
 
-test('register: one titleBar.tools.right item, 5 cells wide, CSS injected and removed', () => {
+test('register: one titleBar.tools.right item, 8 cells wide right of throughput, CSS injected and removed', () => {
   const regs = []
   const disposers = []
   P.default.register({ register: (r) => regs.push(r), onDispose: (f) => disposers.push(f), rest: async () => snap() })
   assert.equal(regs.length, 1)
   assert.equal(regs[0].area, 'titleBar.tools.right')
-  assert.equal(regs[0].data.span, 5)
+  assert.equal(regs[0].order, 50) // throughput's titlebar chip is order 40, so it sits to the left
+  assert.equal(regs[0].data.span, 8)
   assert.ok(React.isValidElement(regs[0].data.icon))
-  assert.ok([...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.llms-chip')))
+  const css = [...document.head.querySelectorAll('style')].map((s) => s.textContent).join('')
+  assert.ok(css.includes('.llms-tool{width:calc(8*var(--titlebar-control-size,24px))'))
+  assert.ok(css.includes('.llms-mini{position:relative;display:flex;width:84px'))
   disposers.forEach((f) => f())
   assert.ok(![...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.llms-chip')))
 })
