@@ -330,14 +330,25 @@ def test_trace_distinguishes_expiry_retry_invalidation_and_process_local_cold():
 def test_trace_sink_runs_outside_observer_lock():
     module = load()
     factory, events = Counting(), []
+    class OwnerLock:
+        """Observe current-thread ownership, never another thread's scheduling."""
+        def __init__(self):
+            self.raw = threading.Lock()
+            self.owner = None
+        def __enter__(self):
+            self.raw.acquire()
+            self.owner = threading.get_ident()
+        def __exit__(self, *exc):
+            self.owner = None
+            self.raw.release()
     def sink(*args, **fields):
-        assert store.lock.acquire(blocking=False)
-        store.lock.release()
-        events.append(args[1])
+        events.append((args[1], store.lock.owner == threading.get_ident()))
     store = module.Observations(factory, trace=sink)
+    store.lock = OwnerLock()
     poke(store, {'pr': 'h1'})
     poke(store, {'pr': 'h2'})
-    assert events == ['fill', 'result', 'invalidate', 'fill', 'result']
+    assert events == [(event, False) for event in
+                      ['fill', 'result', 'invalidate', 'fill', 'result']]
 
 
 def test_trace_errors_do_not_strand_refresh_and_discarded_results_are_distinct():

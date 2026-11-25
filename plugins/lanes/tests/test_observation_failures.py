@@ -23,10 +23,13 @@ def test_unexpected_trace_failure_cannot_strand_fill_or_invalidation(error, even
     assert store.thread is None and store.active == {}
 
 
-def test_deeply_nested_ring_recovers_and_publishes(tmp_path):
+@pytest.mark.parametrize('depth', [100, 100000])
+def test_deeply_nested_ring_recovers_and_publishes(tmp_path, depth):
     trace = trace_module()
     path = tmp_path / 'ring.json'
-    path.write_text('[' * 100000 + ']' * 100000)
+    # Shallow case always decodes: non-record rows must be discarded even
+    # on interpreters/stack limits which successfully decode the deep case.
+    path.write_text('[' * depth + ']' * depth)
     assert path.stat().st_size < trace.BYTE_CAP
     store = load().Observations(Counting(), trace=lambda *a, **kw: trace.emit(
         {'event': a[1]}, path=path))
@@ -36,6 +39,70 @@ def test_deeply_nested_ring_recovers_and_publishes(tmp_path):
     poke(store, {'pr': 'new'})
     assert store.reader({'pr': 'new'}).get('pr')['approved']
     assert store.thread is None and store.active == {}
+
+
+def test_decode_exception_recovers_without_stack_limit_dependency(tmp_path, monkeypatch):
+    trace = trace_module()
+    path = tmp_path / 'ring.json'
+    path.write_text('[{}]')
+    def broken(raw):
+        raise RecursionError('synthetic decoder boundary')
+    with monkeypatch.context() as patch:
+        patch.setattr(trace.json, 'loads', broken)
+        trace.emit({'event': 'recovered'}, path=path)
+    assert [row['event'] for row in json.loads(path.read_text())] == ['recovered']
+
+
+def test_ring_recovers_oversized_history_and_truncates(tmp_path):
+    trace = trace_module()
+    path = tmp_path / 'ring.json'
+    path.write_text(json.dumps([{'old': 'x' * (trace.BYTE_CAP - 40)}]))
+    assert path.stat().st_size < trace.BYTE_CAP
+    trace.emit({'event': 'new', 'data': 'y' * 100}, path=path)
+    rows = json.loads(path.read_text())
+    assert len(rows) == 1 and rows[0]['event'] == 'new'
+    assert path.stat().st_size < 1000
+    before = path.read_bytes()
+    trace.emit({'oversized': 'x' * trace.BYTE_CAP}, path=path)
+    assert path.read_bytes() == before
+    path.write_bytes(b'x' * (trace.BYTE_CAP + 1))
+    trace.emit({'event': 'reset'}, path=path)
+    assert [row['event'] for row in json.loads(path.read_text())] == ['reset']
+
+
+def test_ring_rejects_foreign_owner_and_nonregular_file(tmp_path, monkeypatch):
+    import os
+    import stat
+    from types import SimpleNamespace
+    trace = trace_module()
+    path = tmp_path / 'ring.json'
+    path.write_text('sentinel')
+    for mode, uid in [(stat.S_IFREG, os.getuid() + 1), (stat.S_IFIFO, os.getuid())]:
+        with monkeypatch.context() as patch:
+            patch.setattr(trace.os, 'fstat', lambda fd: SimpleNamespace(st_mode=mode, st_uid=uid))
+            trace.emit({'event': 'refused'}, path=path)
+        assert path.read_text() == 'sentinel'
+
+
+def test_ring_read_is_byte_bounded(tmp_path, monkeypatch):
+    trace = trace_module()
+    real_read, sizes = trace.os.read, []
+    def read(fd, size):
+        sizes.append(size)
+        return real_read(fd, size)
+    monkeypatch.setattr(trace.os, 'read', read)
+    trace.emit({'event': 'new'}, path=tmp_path / 'ring.json')
+    assert sizes == [trace.BYTE_CAP + 1]
+
+
+def test_attempted_contexts_are_pruned_with_board():
+    store = load().Observations(Counting())
+    poke(store, {'first': 'h1', 'second': 'h2'})
+    assert store.attempted == {'first': 'h1', 'second': 'h2'}
+    store.reader({'second': 'h2'})
+    assert store.attempted == {'second': 'h2'}
+    store.reader({})
+    assert store.attempted == {}
 
 
 def test_real_factory_wires_private_trace_without_network(tmp_path, monkeypatch):

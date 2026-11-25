@@ -162,7 +162,7 @@ class Observations:
                             for url, ctx in job.items()}
             for url, ctx in job.items():
                 self._trace('result', url, ctx, outcome=outcomes[url], elapsed=self.clock() - started)
-                # No periodic network work without another projection request.
+            # No periodic network work without another projection request.
 
     def join(self, timeout):
         with self.lock:
