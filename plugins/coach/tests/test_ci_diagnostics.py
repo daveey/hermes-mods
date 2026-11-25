@@ -21,6 +21,23 @@ def test_worker_crash_preserves_existing_violation_receipts():
     assert config._coach_worker_violations == ['earlier violation', 'later violation']
 
 
+@pytest.mark.parametrize('global_timeout, marker, expected', [
+    (2, None, 2),       # plugin has already resolved CLI > env > ini
+    (0, None, 0),       # explicit --timeout=0 disables the native timer too
+    (2, ((.4,), {}), .4),
+    (2, ((), {'timeout': .6}), .6),
+    (2, ((0,), {}), 0),
+    (None, None, 120),
+])
+def test_native_watchdog_uses_effective_deadline(global_timeout, marker, expected):
+    import conftest
+    from types import SimpleNamespace
+    config = SimpleNamespace(_env_timeout=global_timeout)
+    mark = SimpleNamespace(args=marker[0], kwargs=marker[1]) if marker else None
+    item = SimpleNamespace(get_closest_marker=lambda name: mark)
+    assert conftest._watchdog_seconds(config, item) == expected
+
+
 def test_ci_receipts_name_runtime_and_slow_test_before_summary(tmp_path):
     suite = tmp_path / 'suite'
     suite.mkdir()
