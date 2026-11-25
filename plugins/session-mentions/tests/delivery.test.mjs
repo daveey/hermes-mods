@@ -577,6 +577,9 @@ test('a created_at from a skewed gateway clock counts at most the maximum pickup
   // request waited no time; count the most it can have waited.
   assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 7200 }, T0), m.MAX_PICKUP_DELAY_S) // gateway 2 h ahead
   assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 5 }, T0), m.MAX_PICKUP_DELAY_S) // 5 s ahead
+  // Within CLOCK_SLACK_S: a Mac a fraction of a second behind with a near-instant pickup keeps its reply wait.
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 1 }, T0), 0) // 1 s ahead
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 2 }, T0), 0) // 2 s ahead
   assert.equal(m.claimDelaySeconds({}, T0), m.MAX_PICKUP_DELAY_S)
 })
 

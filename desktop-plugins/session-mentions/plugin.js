@@ -90,6 +90,9 @@ const REPLY_POLL_MIN_MS = 3_000
 // The tool takes back a request no Desktop claimed within its PICKUP_TIMEOUT (plugins/session-mentions): the most a
 // claimed request can have waited before this Desktop saw it, when the gateway cannot say how long it did.
 export const MAX_PICKUP_DELAY_S = 30
+// How far this Mac's clock may run behind the gateway's before a created_at after the claim stops reading as a
+// near-instant pickup (claimDelaySeconds).
+const CLOCK_SLACK_S = 2
 // A forwarded send's far courier must have posted its result this long before this Desktop's own wait ends: the
 // next FORWARD_POLL_MS poll plus reading that status.
 export const FORWARD_RESULT_MARGIN_S = 5
@@ -747,14 +750,15 @@ export const replyBudgetOf = (origin, req, claimedAt) => {
 /** How long the request waited on its gateway before this Desktop claimed it, for when `/status` gives no age:
  *  the request's `created_at` (the gateway's clock) against this Desktop's claim time, capped at
  *  MAX_PICKUP_DELAY_S because the two clocks differ; MAX_PICKUP_DELAY_S when the request has no `created_at` or
- *  its `created_at` is after the claim (this Mac's clock is behind). */
+ *  its `created_at` is more than CLOCK_SLACK_S after the claim (this Mac's clock is behind). */
 export function claimDelaySeconds(req, claimedAt = Date.now()) {
   const created = Number(req?.created_at)
   const waited = claimedAt / 1000 - created
-  // A created_at after this claim only proves this Mac's clock is behind the gateway's: the request may still have
-  // waited the whole pickup window, and assuming none would let the reply wait end after the tool gave up.
-  if (!(created > 0) || waited < 0) return MAX_PICKUP_DELAY_S
-  return Math.min(MAX_PICKUP_DELAY_S, waited)
+  // A created_at clearly after this claim only proves this Mac's clock is behind the gateway's: the request may
+  // still have waited the whole pickup window, and assuming none would let the reply wait end after the tool gave
+  // up. Up to CLOCK_SLACK_S behind is ordinary drift on a near-instant pickup: count it as none.
+  if (!(created > 0) || waited < -CLOCK_SLACK_S) return MAX_PICKUP_DELAY_S
+  return Math.max(0, Math.min(MAX_PICKUP_DELAY_S, waited))
 }
 
 /** Asks the request's gateway whether its sender still waits (`GET /status/<id>`): true = stop re-submitting.
