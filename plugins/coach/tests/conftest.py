@@ -80,9 +80,61 @@ def pytest_configure(config):
 
 
 _CI_PROGRESS = {}
+_WATCHDOG_FD = None
+
+
+def _arm_watchdog(config):
+    if _WATCHDOG_FD is None:  # configure/collection can fail before sessionstart
+        return
+    import faulthandler
+    try:
+        seconds = float(config.getini('timeout') or 120)
+    except ValueError:  # copied conftest probes without pytest-timeout
+        seconds = 120
+    faulthandler.dump_traceback_later(seconds, file=_WATCHDOG_FD, exit=True)
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    # C watchdog still fires if the GIL/import lock is stuck; the raw descriptor
+    # bypasses pytest capture so os._exit cannot discard the only stack.
+    _arm_watchdog(item.config)
+    yield
+    _arm_watchdog(item.config)  # also bound idle/worker shutdown after the last item
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True, specname='pytest_sessionfinish')
+def pytest_sessionfinish_watchdog(session, exitstatus):
+    _arm_watchdog(session.config)
+    yield
+    _arm_watchdog(session.config)
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_unconfigure(config):
+    yield
+    # Pytest's own faulthandler plugin cancels the process-wide timer here.
+    # Retain our non-inheritable FD/timer through late finalizers and atexit.
+    _arm_watchdog(config)
+
+
+def pytest_runtest_logstart(nodeid, location):
+    reporter = _CI_PROGRESS.get('reporter')
+    if reporter:
+        import json
+        import time
+        reporter.write_line('COACH_START ' + json.dumps(dict(
+            nodeid=nodeid, elapsed=round(time.monotonic() - _CI_PROGRESS['started'], 3)), sort_keys=True))
+        reporter.flush()
 
 
 def pytest_sessionstart(session):
+    global _WATCHDOG_FD
+    import contextlib
+    capture = session.config.pluginmanager.get_plugin('capturemanager')
+    with capture.global_and_fixture_disabled() if capture else contextlib.nullcontext():
+        _WATCHDOG_FD = os.dup(sys.stderr.fileno())
+    os.set_inheritable(_WATCHDOG_FD, False)
     # xdist forwards phase reports to the controller. Print there, outside test
     # capture, so even an outer 1500s kill retains runtime and named slow phases.
     if hasattr(session.config, 'workerinput'):
