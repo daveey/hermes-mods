@@ -1639,14 +1639,17 @@ def _prewarm() -> None:
     threading.Thread(target=ctx.run, args=(go,), name="ask-gate-prewarm", daemon=True).start()
 
 
-WARM_JOIN_S = 4.0  # register waits this long for the warm-up (startup, never a turn); ASK_GATE_WARM_JOIN_S overrides
+WARM_JOIN_S = 4.0  # ordinary-process default; always-on backend defaults to zero, explicit env overrides either
 
 
 def _warm_join_s() -> float:
+    # The always-on backend must hand off app/auth startup without waiting for
+    # unrelated card projection warming. Keep ordinary first-turn behavior.
+    default = 0.0 if os.environ.get("HERMES_ALWAYS_ON_BACKEND") == "1" else WARM_JOIN_S
     try:
-        return max(0.0, float(os.environ.get("ASK_GATE_WARM_JOIN_S", WARM_JOIN_S)))
+        return max(0.0, float(os.environ.get("ASK_GATE_WARM_JOIN_S", default)))
     except ValueError:
-        return WARM_JOIN_S
+        return default
 
 
 def _warm_projection(join: float = 0.0) -> None:
