@@ -20,7 +20,14 @@ Saved decision loops cannot inject old readers into an opted-in successor refres
 `plugin_api.register_snapshot_readers(factory)` publishes current capability under
 the loader lock, then snapshots the current Feed under the process lock and calls
 `ensure_snapshot_service(feed, api_generation, factory)` outside those locks.
-Resume independently consumes registration, covering both orderings. Older Feed
+Resume independently publishes registration on its pending owner and wakes the
+existing saved board loop, covering both orderings. It never constructs a current
+reader inline: a genuine saved API resumes while holding `PROCESS_LOCK`, whereas
+current `CoreReaders.snapshot_modules()` acquires the loader lock. The loader's
+natural reload acquires loader then process, so inline installation would reverse
+that order. The existing pending board step performs installation outside both
+lifecycle locks, without another thread or HTTP request. Manual resume remains
+inert until driven or explicitly registered. Older Feed
 classes lacking the seam retain the published factory for natural succession;
 registration does not opt them in.
 

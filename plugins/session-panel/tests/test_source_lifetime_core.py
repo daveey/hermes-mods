@@ -233,6 +233,10 @@ def test_genuine_saved_restart_resumes_explicit_owner_without_current_api(
             assert owner.service_worker is None
             register.set()
         assert entered.wait(2)
+        # Resume only publishes registration under the saved API's PROCESS_LOCK.
+        # The unchanged saved board step installs off that lifecycle lock.
+        if current_registered:
+            owner = new._source_coordinator
         if not current_registered:
             assert owner.pending_install and not owner.service_worker
             assert current_api.register_snapshot_readers(lambda: r) is new._source_coordinator
@@ -287,6 +291,8 @@ def test_resume_transfers_exact_scope_age_and_exhausted_source_budget(api, board
     new = feedmod.Feed(RetiredReaders(), emit=lambda _: None, clock=lambda: now[0])
     try:
         new.resume(old)
+        pending = new._source_coordinator
+        new.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
         owner = new._source_coordinator
         assert owner.store.epoch == previous.store.epoch, 'resume replaced compatible store identity'
         assert new._watch_tokens['S'] is old._watch_tokens['S']
@@ -346,6 +352,8 @@ def test_resume_retains_exhausted_role_and_projection_budgets(api, board, monkey
     new = feedmod.Feed(RetiredReaders(), emit=lambda _: None, clock=lambda: now[0])
     try:
         new.resume(old)
+        pending = new._source_coordinator
+        new.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
         owner = new._source_coordinator
         held = (owner.role_attempts['local'] if failure_kind == 'registration'
                 else owner.projection_attempts['S'])
@@ -383,6 +391,8 @@ def test_resume_after_finished_projection_before_completion_service(api, board, 
     new = feedmod.Feed(RetiredReaders(), emit=lambda _: None)
     try:
         new.resume(old)
+        pending = new._source_coordinator
+        new.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
         owner = new._source_coordinator
         owner.service()
         assert 'S' not in owner.pending, 'already finished projection was recreated as unserved work'
@@ -410,7 +420,10 @@ def test_transfer_capacity_failure_does_not_consume_predecessor(api, board, monk
     new = feedmod.Feed(RetiredReaders(), emit=lambda _: None)
     try:
         new.resume(old)
+        pending = new._source_coordinator
+        new.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
         assert new._snapshot_install_pending
+        assert pending.failed_registration == (pending.api_generation, pending.reader_factory)
         assert not getattr(previous.store, '_transferred', False)
         monkeypatch.setattr(current, 'boards', original_boards)
         owner = new.ensure_snapshot_service('recovered coordinates', lambda: current)
@@ -463,6 +476,9 @@ def test_successor_uses_current_readers_or_waits_without_old_factory(
         new.resume(old)
         assert not calls and not retired.accesses
         assert retired.released == 1, 'unused saved-API reader was not released on its owning thread'
+        if registered:
+            assert new._snapshot_install_pending
+            new._source_coordinator.step()  # manually drive the saved off-lock board entry
         if not registered:
             pending = new._source_coordinator
             assert new._snapshot_install_pending

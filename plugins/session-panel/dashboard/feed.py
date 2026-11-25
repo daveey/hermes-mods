@@ -523,7 +523,14 @@ class Feed:
             unused.release()
             loader = sys.modules.get('_session_panel_feed_loader')
             factory = SNAPSHOT_READER_FACTORY or getattr(loader, 'snapshot_reader_factory', None)
-            self.ensure_snapshot_service(getattr(loader, 'generation', None), factory)
+            # resume can be called by a genuine saved API while PROCESS_LOCK is
+            # held. Current capability discovery takes the loader lock, whose
+            # reload path takes PROCESS_LOCK in the opposite order. Publish only
+            # registration here; the existing board loop installs after resume.
+            pending = self._source_coordinator
+            pending.api_generation = getattr(loader, 'generation', None)
+            pending.reader_factory = factory
+            self._board.set()
         return self
 
     def _current(self) -> 'Feed':
