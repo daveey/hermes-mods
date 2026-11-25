@@ -1219,12 +1219,16 @@ class CoreReaders:
                 stage_timing = getattr(exc, 'panel_timing', None)
                 left = [f'{type(exc).__name__}: {exc}']
             if stage_timing is not None:
-                total_ns, total_cpu = time.monotonic_ns() - began_ns, time.thread_time_ns() - began_cpu
-                stage_timing = dict(stage_timing, reader_wall_ns=total_ns, reader_cpu_ns=total_cpu,
-                                    preflight_wall_ns=preflight_ns - began_ns,
-                                    preflight_cpu_ns=preflight_cpu - began_cpu,
-                                    reader_residual_wall_ns=total_ns - (preflight_ns - began_ns) - stage_timing['wall_ns'],
-                                    reader_residual_cpu_ns=total_cpu - (preflight_cpu - began_cpu) - stage_timing['cpu_ns'])
+                try:
+                    total_ns, total_cpu = time.monotonic_ns() - began_ns, time.thread_time_ns() - began_cpu
+                    stage_timing = dict(stage_timing, reader_wall_ns=total_ns, reader_cpu_ns=total_cpu,
+                                        preflight_wall_ns=preflight_ns - began_ns,
+                                        preflight_cpu_ns=preflight_cpu - began_cpu,
+                                        reader_residual_wall_ns=total_ns - (preflight_ns - began_ns) - stage_timing['wall_ns'],
+                                        reader_residual_cpu_ns=total_cpu - (preflight_cpu - began_cpu) - stage_timing['cpu_ns'])
+                except Exception:
+                    # Optional diagnostics must never alter source admission.
+                    stage_timing = None
             timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
                             'at': time.time(), 'unchanged': bool(getattr(left, 'unchanged', False)),
                             'deferred': bool(left), 'stage_timing': stage_timing})

@@ -6,6 +6,7 @@ Only explicit lock/SQLite boundaries localize it further. No sinks or locks here
 from contextlib import contextmanager, nullcontext
 import itertools
 import os
+import threading
 import time
 
 _IDS = itertools.count(1)
@@ -14,6 +15,7 @@ _IDS = itertools.count(1)
 class Recorder:
     def __init__(self):
         self.call_id = f'{os.getpid()}:{next(_IDS)}'
+        self.thread = threading.get_ident()
         self.wall = time.monotonic_ns()
         self.cpu = time.thread_time_ns()
         self.rows = {}
@@ -21,6 +23,11 @@ class Recorder:
 
     @contextmanager
     def stage(self, name):
+        # A copied ContextVar can carry this recorder into a child thread.
+        # Thread CPU and exclusive nesting are owner-thread quantities only.
+        if threading.get_ident() != self.thread:
+            yield
+            return
         # Names are static code labels, never source values. Aggregation bounds
         # storage independently of rows, owners, queries or contention duration.
         if name not in self.rows and len(self.rows) >= 64:

@@ -48,8 +48,14 @@ lock-acquisition spans localize a lock wait; SQL spans localize SQL-boundary
 latency without pretending to separate SQLite's internal CPU and wait mechanisms.
 
 The 27,000-publication regression exercises a warmed successful composed memo,
-checks unchanged/fail-closed semantics, bounds extra traced CPU to 50 ms and
-prints raw paired CPU measurements. It is an offline overhead control, **not**
+checks unchanged/fail-closed semantics, and compares seven paired thread-CPU
+measurements (median extra traced CPU below 50 ms). Its frozen pre-attribution
+inventory helper and AST-equality control detect overhead added even when tracing
+is disabled; unsampled rows use exactly that bare-lock path. A full-module base
+comparison remains an independent review check, not a toggle-only control. The
+recorder ignores cross-thread stages if a copied context carries it to a child;
+thread-CPU/exclusive accounting applies only to the creating thread. Raw paired
+CPU measurements are offline overhead controls, **not**
 production latency acceptance. Dedicated tests also check exact nested totals,
 exception/context cleanup, bounded storage, source privacy, read equivalence,
 and real retained-reader lock contention. Natural live diagnostics require a

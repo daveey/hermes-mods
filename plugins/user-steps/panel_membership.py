@@ -34,7 +34,35 @@ def _inventory_lock(timing):
         _INVENTORY_LOCK.release()
 
 
-def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None, timing=None):
+def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
+    # Keep the unsampled hot path identical to the pre-instrumentation reader.
+    digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+    cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
+    with _INVENTORY_LOCK:
+        value = _INVENTORY.get(cache_key)
+        if value is not None:
+            _INVENTORY.move_to_end(cache_key)
+            return value
+    # Preserve sqlite's original TEXT -> strict UTF-8 -> json.loads(str)
+    # semantics. json.loads(bytes) would accept a BOM and lone surrogates that
+    # the TEXT reader rejects. Storage class also qualifies warm cache entries.
+    if storage_type == 'text':
+        raw = raw.decode('utf-8')
+    task = _object(raw)
+    parts = key.split('/')
+    if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
+        raise ValueError('unknown replica identity')
+    value = ((parts[-2], parts[-1]), task.get('created_at'),
+             frozenset(linked_sessions(task, gateway, profile)))
+    with _INVENTORY_LOCK:
+        _INVENTORY[cache_key] = value
+        _INVENTORY.move_to_end(cache_key)
+        while len(_INVENTORY) > _INVENTORY_MAX:
+            _INVENTORY.popitem(last=False)
+    return value
+
+
+def _inventory_sampled(raw, key, gateway, profile, linked_sessions, storage_type, timing):
     with _stage(timing, 'inventory_hash_sample'):
         digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
     cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
@@ -248,8 +276,12 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                         "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'")):
                     # Keep full scans unchanged; row-level hash/decode/lock
                     # attribution is a systematic 1/64 sample to bound overhead.
-                    probe = timing if index % 64 == 0 else None
-                    identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions, storage_type, probe)
+                    if timing is not None and index % 64 == 0:
+                        identity, created, sessions = _inventory_sampled(
+                            raw, key, gateway, profile, linked_sessions, storage_type, timing)
+                    else:
+                        identity, created, sessions = _inventory(
+                            raw, key, gateway, profile, linked_sessions, storage_type)
                     candidates.append((gw, key, version, identity, created))
                     if alias_set.intersection(sessions):
                         direct.add((gw, key))

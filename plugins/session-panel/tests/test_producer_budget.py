@@ -110,7 +110,8 @@ def test_core_readers_stop_starting_chats_after_the_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize('failed', [False, True])
-def test_reader_stage_carriage_and_total_residual(monkeypatch, failed):
+@pytest.mark.parametrize('malformed', [False, True])
+def test_reader_stage_carriage_and_total_residual(monkeypatch, failed, malformed):
     pytest.importorskip('hermes_cli.kanban_sync_client')
     import importlib.util
     import time
@@ -128,6 +129,8 @@ def test_reader_stage_carriage_and_total_residual(monkeypatch, failed):
         value = RuntimeError('unavailable') if failed else Result()
         value.panel_timing = dict(version=1, call_id='fixture:1', wall_ns=0, cpu_ns=0,
                                   stages={'residual': dict(wall_ns=0, cpu_ns=0, calls=1)})
+        if malformed:
+            value.panel_timing = {'version': 1}  # mixed-version diagnostics
         if failed:
             raise value
         return value
@@ -140,6 +143,9 @@ def test_reader_stage_carriage_and_total_residual(monkeypatch, failed):
     row = r.reconcile_timings[0]
     assert row['unchanged'] is (not failed) and row['deferred'] is failed
     trace = row['stage_timing']
+    if malformed:
+        assert trace is None
+        return
     assert trace['call_id'] == 'fixture:1'
     assert trace['preflight_wall_ns'] >= 5_000_000
     for clock in ('wall', 'cpu'):

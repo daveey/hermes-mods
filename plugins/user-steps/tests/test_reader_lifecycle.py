@@ -238,7 +238,10 @@ def test_queued_borrower_cannot_retain_detached_entry(db):
             self.lock.release()
 
     entry.lock = ObservedLock()
-    entry.lock.acquire()
+    # The harness owns the lock before the borrower exists. Only the borrower's
+    # blocking acquire may arm the queued-borrower handshake.
+    entry.lock.lock.acquire()
+    assert not waiting.is_set()
 
     def read():
         with mod._kept(db) as c:
