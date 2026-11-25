@@ -19,9 +19,10 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
     for snap in snapshots:
         fresh = bool(snap.get('available') and not snap.get('stale'))
         source = dict(source='kanban_governors.snapshot', gateway='hub', board=snap.get('board'),
-                      age_s=snap.get('age_s'), available=fresh)
+                      age_s=snap.get('age_s'), available=fresh,
+                      flow_available=snap.get('flow_available', True), truncated=bool(snap.get('truncated')))
         scope.append(source)
-        complete &= fresh
+        complete &= fresh and snap.get('flow_available', True)
         if fresh:
             idle += snap.get('idle_total') or 0
         for row in snap.get('governors', []):
@@ -29,6 +30,11 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         if fresh:
             for tid, charge in snap.get('cards', {}).items():
                 charges[snap.get('board'), tid] = charge
+    lane_complete = complete and not any(s.get('truncated') for s in snapshots)
+    incomplete_sources = [s for s in snapshots if not s.get('available') or s.get('stale') or
+                          not s.get('flow_available', True) or s.get('truncated')]
+    incomplete_lanes = (None if any('open_lanes' not in s for s in incomplete_sources) else
+                        sorted({name for s in incomplete_sources for name in s['open_lanes']}))
     rows = []
     by_lane = defaultdict(Counter)
     for card in cards:
@@ -84,7 +90,9 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                             age is not None and 0 < cadence < float('inf') and -5 <= age <= 3 * cadence)
     except (TypeError, ValueError, OverflowError):
         age, device_fresh = None, False
-    return dict(rows=rows, scope=scope, available=complete, idle_total=idle if complete else None,
+    return dict(rows=rows, scope=scope, available=complete, lane_accounting_available=lane_complete,
+                incomplete_lanes=incomplete_lanes,
+                idle_total=idle if complete else None,
                 known_idle_total=idle, charged_total=idle,
                 counts=dict(Counter(r['state'] for r in rows)),
                 lane_reasons={lane: [dict(id=k, count=v) for k, v in counts.most_common()]

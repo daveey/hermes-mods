@@ -34,6 +34,23 @@ test('sidebar registration is separate from top totals and old SDK keeps origina
   assert.equal(legacy.contributions.find(c => c.id === 'strip').render().type, old.Lanes)
 })
 
+test('expanded lane survives unmount and remount', async () => {
+  localStorage.clear()
+  const t = setup()
+  await P.sourceFor(t.ctx).read(6, '6h', true)
+  const first = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
+  try {
+    await first.click(first.container.querySelector('.lanes-sb-heading'))
+    await first.click(first.container.querySelector('[data-sidebar-lane="work"] button'))
+  } finally { await first.close() }
+  const second = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
+  try {
+    assert.equal(second.container.querySelector('.lanes-sb-heading').getAttribute('aria-expanded'), 'true')
+    assert.equal(second.container.querySelector('[data-sidebar-lane="work"] button').getAttribute('aria-expanded'), 'true')
+    assert.ok(second.container.querySelector('button[type=submit]'))
+  } finally { await second.close(); localStorage.clear() }
+})
+
 test('minimized counts are hub numbers, expand and lane controls persist; offline retains numbers', async () => {
   localStorage.clear()
   const t = setup()
