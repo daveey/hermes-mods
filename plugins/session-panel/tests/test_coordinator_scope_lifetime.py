@@ -10,6 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
+# Public Python 3.11 CI deliberately has no Hermes core. Match the shared
+# real-reader fixtures before importing their core-backed helpers.
+pytest.importorskip('hermes_cli.kanban_db')
+
 from hermes_cli.kanban_db_connect import connect
 from hermes_cli import kanban_chat_links as links
 
