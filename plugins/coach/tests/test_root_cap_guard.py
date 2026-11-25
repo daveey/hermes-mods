@@ -52,6 +52,9 @@ class World:
         monkeypatch.setenv("COACH_LESSONS", "0")
         self.monkeypatch = monkeypatch
         kdb = sqlite3.connect(tmp_path / "kanban.db")
+        # DDL otherwise autocommits each CREATE separately. Publish the complete
+        # fixture atomically; retain SQLite's normal journaling and durability.
+        kdb.execute("BEGIN")
         kdb.execute("create table tasks (id text primary key, status text not null, current_run_id integer, "
                     "assignee text)")
         kdb.executemany("insert into tasks values (?,?,?,?)", [(OWNER, "running", 7, "coach"),
@@ -63,12 +66,14 @@ class World:
         from hermes_cli.profiles import get_active_profile_name
         self.profile = get_active_profile_name()
         sdb = sqlite3.connect(self.root / "state.db")
+        sdb.execute("BEGIN")
         sdb.execute("create table sessions (id text primary key, parent_session_id text, source text, end_reason text, profile_name text, started_at real)")
         sdb.execute("create table messages (id integer primary key, session_id text, role text, content text, "
                     "timestamp real, display_kind text, _compressed_summary integer, observed integer, display_metadata text, "
                     "api_content text, message_uid text)")
         sdb.execute("insert into sessions values ('approval-chat', null, 'desktop', null, '%s', 1)" % self.profile)
         sdb.execute("insert into sessions values ('worker-chat', null, 'kanban', null, '%s', 1)" % self.profile)
+        sdb.commit()
         self.sdb = sdb
         self.shared = self.root / "coach"  # the ROOT store every profile consults (root_cap.shared_dir)
         self.artifact = tmp_path / "approved" / "spec.md"
