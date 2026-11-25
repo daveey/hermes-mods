@@ -63,6 +63,11 @@ def test_absent_replica_module_is_silent_non_authority(world, monkeypatch):
     pytest.param(None, 'missing dependency without a module name', id='unknown-name'),
     pytest.param('some_runtime_dep', "No module named 'hermes_cli.kanban_owner_reassessment'",
                  id='misleading-message'),
+    pytest.param('hermes_cli.kanban_owner_recovery', 'missing unrelated recovery module', id='recovery-sibling'),
+    # Every strict shortening of the allowed prefix must still report an unrelated module.
+    # Pin the boundary as a whole, not just the few prefixes used by earlier mutants.
+    *[pytest.param(CORE[:n] + 'x', 'missing divergent module', id=f'prefix-diverges-{n}')
+      for n in range(len('hermes_cli.'), len(CORE))],
 ])
 def test_missing_unrelated_dependency_is_still_an_error(world, monkeypatch, missing_name, message):
     env, tid = world
