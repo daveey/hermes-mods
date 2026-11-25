@@ -943,7 +943,9 @@ class CoreReaders:
                     # not one per chat: 340 calls / ~4,000 statements of a 16-chat hub pass were this loop.
                     scope['members'][key] = select_listed_local_task_set(c, scope['ids'], statuses, strict=False)[1]
                 members = _lineage_members(scope['members'][key], ids)
-                # A writer may have changed membership after the union read; never omit a new card.
+                # Membership is one snapshot per pass, read once per board and status set right after the union
+                # rows. This guard covers only the gap between the union read and that first membership read (a card
+                # gained there falls back to a fresh per-lineage read); later membership changes appear next pass.
                 if not members.keys() <= rows.keys():
                     return ksa.session_tasks(ids, statuses, stale_ok=True)
                 board = ksa._board_slug(path)
@@ -1494,14 +1496,18 @@ def _lineage_members(pairs, ids):
     The selector runs its three membership queries (creator, created link, tui subscription) with the chat ids as an
     `IN (json_each)` list, which SQLite materializes as a sorted ephemeral index: the rows for a subset of the ids are
     the union's rows for those ids, in the union's order. `pairs` keeps each (session, card) at its first row, so the
-    first pair naming one of `ids` places the card where the lineage's own read finds it first. A created pair wins
-    over a subscription, as the selector's creator precedence does (creator rows precede subscription rows)."""
+    first pair naming one of `ids` places the card where the lineage's own read finds it first.
+
+    `via` follows the selector's creator precedence through its query order: both creator queries (task creator,
+    created link) run before the subscription query, so every `created` pair enters `pairs` ahead of any
+    `subscribed` pair, and a card's first pair naming one of `ids` is already `created` whenever any is."""
     wanted = set(ids)
     members = {}
     for (session, tid), via in pairs.items():
         if session in wanted:
             member = members.setdefault(tid, {'via': via})
             if via == 'created':
+                # Unreachable while the invariant above holds; kept so a reordered selector cannot demote a creator.
                 member['via'] = 'created'
     return members
 

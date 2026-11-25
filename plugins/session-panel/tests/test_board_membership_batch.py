@@ -81,6 +81,26 @@ def test_lineage_members_equal_the_per_lineage_selector_in_order_and_via(mixed, 
     assert compared > 50
 
 
+def test_lineage_members_hold_for_every_chat_ordering_against_a_reversed_pass_list(mixed, api):
+    """Lineage order and pass-list order are both irrelevant: every ordering of 1-3 chats, read from pairs selected
+    over the pass list in reverse, matches core's own read of that lineage in card order and `via`."""
+    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks, select_listed_local_task_set
+    r, cards, ksa, path, c = mixed
+    c.row_factory = sqlite3.Row
+    chats = SESSIONS + ['absent']
+    lineages = [list(x) for n in (1, 2, 3) for x in itertools.permutations(chats, n)]
+    union = list(reversed(list(dict.fromkeys(i for lineage in lineages for i in lineage))))
+    compared = 0
+    for statuses in _statuses(ksa):
+        pairs = select_listed_local_task_set(c, union, statuses, strict=False)[1]
+        for lineage in lineages:
+            expected = [(tid, m['via']) for tid, m in select_listed_local_tasks(c, lineage, statuses).items()]
+            actual = [(tid, m['via']) for tid, m in api._lineage_members(pairs, lineage).items()]
+            assert actual == expected, lineage
+            compared += 1
+    assert compared == 2 * (7 + 7 * 6 + 7 * 6 * 5)
+
+
 def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed, monkeypatch):
     import hermes_cli.kanban_session_outcome_tasks as kot
     r, cards, ksa, path, c = mixed
