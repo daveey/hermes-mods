@@ -494,3 +494,82 @@ test('a send without total_wait_seconds (older tool, other senders) keeps its as
   const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 30 }), 'local', localConns))
   assert.equal('reply_wait_seconds' in res, false); assert.match(res.note, /within 30s/)
 })
+
+// ── relay leftovers: every wait ends early enough that the result posts before the tool's deadline ──────────
+// The tool waits min(SEND_BUSY_RETRY + grace + wait, SEND_TOTAL_WAIT_MAX + SEND_REPLY_MARGIN) = 410 s from writing
+// the request; total_wait_seconds is 400. A result must be posted by the 400 s mark (the margin is the post).
+const later = (ms, value) => new Promise(r => setTimeout(() => r(value), ms))
+
+test('the reply loop starts no iteration that could end after the whole wait (slow resume and transcript reads)', async t => {
+  fakeTime(t)
+  // Each poll: 3 s sleep, session.resume answering at its 30 s timeout, then a 30 s transcript read with no reply.
+  globalThis.window = { hermesDesktop: { api: async req => {
+    if (req.path.includes('/status/')) return { state: 'claimed', age: (Date.now() - T0) / 1000 }
+    if (req.path.includes('/messages')) return later(30_000, { messages: [] })
+    if (req.path.startsWith('/api/sessions/')) return later(30_000, { title: 't' })
+    return {}
+  } } }
+  let submits = 0
+  const m = await load({ state, connections: async () => localConns,
+    request: async method => {
+      if (method === 'prompt.submit') { submits++; return { status: 'queued', user_row_id: 3 } }
+      return submits ? later(30_000, { session_id: 'live', running: false }) : { session_id: 'live' }
+    } })
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400 }), 'local', localConns), 900)
+  const ended = (Date.now() - T0) / 1000
+  assert.equal(res.ok, true); assert.equal(res.reply, null)
+  assert.equal(ended <= 400, true, `reply loop ended at ${ended} s: past the whole wait, the post lands after the tool gave up`)
+})
+
+test('without /status age, a late claim counts the wait since the request\'s created_at', async t => {
+  fakeTime(t)
+  globalThis.window = { hermesDesktop: { api: async req => { if (req.path.includes('/status/')) throw new Error('gateway unreachable'); return {} } } }
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  // Written on the gateway 25 s before this Desktop claimed it.
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400, created_at: T0 / 1000 - 25 }), 'local', localConns))
+  assert.equal(res.reply_wait_seconds, 400 - 10 - 25)
+})
+
+test('a created_at from a skewed gateway clock counts at most the maximum pickup delay, never less than none', async t => {
+  const m = await load({ state })
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 - 7200 }, T0), m.MAX_PICKUP_DELAY_S) // gateway 2 h behind
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 7200 }, T0), 0) // gateway 2 h ahead
+  assert.equal(m.claimDelaySeconds({}, T0), m.MAX_PICKUP_DELAY_S)
+})
+
+test('without /status age or created_at, a claim counts the maximum pickup delay', async t => {
+  fakeTime(t)
+  globalThis.window = { hermesDesktop: { api: async req => { if (req.path.includes('/status/')) throw new Error('gateway unreachable'); return {} } } }
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400, created_at: undefined }), 'local', localConns))
+  assert.equal(m.MAX_PICKUP_DELAY_S, 30)
+  assert.equal(res.reply_wait_seconds, 400 - 10 - m.MAX_PICKUP_DELAY_S)
+})
+
+test('a cross-gateway send hands the far courier only what is left after its own ping and enqueue, and ends in time', async t => {
+  fakeTime(t)
+  const enqueued = []
+  globalThis.window = { hermesDesktop: { api: async req => {
+    if (req.path.endsWith('/ping')) return later(8_000, { ok: true, home_courier: true, forwarding: true })
+    if (req.path.endsWith('/enqueue')) { enqueued.push({ at: (Date.now() - T0) / 1000, request: req.body.request }); return later(15_000, { ok: true }) }
+    if (req.path.includes('/status/fwd-')) return { state: 'claimed' } // the far courier never finishes
+    if (req.path.includes('/status/')) return { state: 'claimed', age: (Date.now() - T0) / 1000 }
+    return {}
+  } } }
+  const m = await load({ state, connections: async () => twoConns,
+    profileRoutes: async () => [{ connectionId: 'macbook', profile: 'default', targetProfile: 'default' }],
+    requestProfile: async () => { throw new Error('direct route must not be used after a claimed forward') } })
+  const res = await onFakeTime(t, m.performRequest(farSend({ wait_for_reply: 390, total_wait_seconds: 400 }), 'local', twoConns), 900)
+  assert.equal(enqueued.length, 1)
+  const { at, request } = enqueued[0]
+  assert.equal(at >= 8, true)
+  // What is left when the request goes out, less the far side's post and this side's next poll.
+  const left = 400 - 10 - at
+  assert.equal(request.total_wait_seconds, Math.floor(left - m.FORWARD_RESULT_MARGIN_S))
+  assert.equal(request.wait_for_reply, request.total_wait_seconds - 10)
+  const ended = (Date.now() - T0) / 1000
+  assert.equal(res.status, 'unknown'); assert.equal(res.retry_safe, false)
+  assert.equal(ended <= 400, true, `forwarded send answered at ${ended} s: after the tool's wait`)
+})

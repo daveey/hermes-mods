@@ -82,6 +82,15 @@ const OWNER_RETRY_SUBMIT_TIMEOUT_MS = 45_000
 // A send's reply wait ends this long before the sender's whole wait (`total_wait_seconds`) does: the last
 // 3 s poll, reading the transcript and posting the result.
 export const REPLY_MARGIN_S = 10
+// The longest one reply poll can take: its 3 s sleep, session.resume's 30 s timeout and the transcript read (two
+// parallel REST reads at api()'s 30 s default). No poll starts unless it ends before the sender's whole wait does.
+const REPLY_POLL_MAX_MS = 3_000 + 30_000 + 30_000
+// The tool takes back a request no Desktop claimed within its PICKUP_TIMEOUT (plugins/session-mentions): the most a
+// claimed request can have waited before this Desktop saw it, when the gateway cannot say how long it did.
+export const MAX_PICKUP_DELAY_S = 30
+// A forwarded send's far courier must have posted its result this long before this Desktop's own wait ends: the
+// next FORWARD_POLL_MS poll plus reading that status.
+export const FORWARD_RESULT_MARGIN_S = 5
 
 // One per register(): dispose ends its waits, so a disabled or reloaded plugin stops re-submitting.
 const newInstance = () => ({ disposed: false, wake: new Set() })
@@ -723,12 +732,22 @@ export function sendRetryUntil(req, claimedAt = Date.now()) {
 export const replyBudgetOf = (origin, req, claimedAt) => {
   const total = Number(req?.total_wait_seconds)
   if (!(total > 0)) return null
+  const waited = claimDelaySeconds(req, claimedAt)
   return async () => {
-    let spent = (Date.now() - claimedAt) / 1000
+    let spent = waited + (Date.now() - claimedAt) / 1000
     const st = await relay(origin, `/status/${enc(req.id)}`, { timeoutMs: 5_000 }).catch(() => null)
     if (Number.isFinite(st?.age)) spent = Math.max(spent, st.age)
     return total - REPLY_MARGIN_S - spent
   }
+}
+
+/** How long the request waited on its gateway before this Desktop claimed it, for when `/status` gives no age:
+ *  the request's `created_at` (the gateway's clock) against this Desktop's claim time, bounded to
+ *  [0, MAX_PICKUP_DELAY_S] because the two clocks differ; MAX_PICKUP_DELAY_S when the request has no `created_at`. */
+export function claimDelaySeconds(req, claimedAt = Date.now()) {
+  const created = Number(req?.created_at)
+  if (!(created > 0)) return MAX_PICKUP_DELAY_S
+  return Math.max(0, Math.min(MAX_PICKUP_DELAY_S, claimedAt / 1000 - created))
 }
 
 /** Asks the request's gateway whether its sender still waits (`GET /status/<id>`): true = stop re-submitting.
@@ -854,8 +873,10 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, s
     const out = { ok: ['streaming', 'queued'].includes(sub?.status), delivered: sub?.status === 'streaming', queued: sub?.status === 'queued', status: sub?.status || 'unknown', live_session_id: live, user_row_id: sub?.user_row_id || null, retry_safe: false }
     if (!out.ok) return { ...out, error: `Unexpected submit status: ${out.status}; inspect the target before retrying` }
     if (!waitSeconds) return out
+    let wholeWaitEnd = Infinity // when the sender's whole wait ends, less the margin to post the result
     if (replyBudget) {
       const left = Math.max(0, Math.floor(await replyBudget()))
+      wholeWaitEnd = Date.now() + (left + REPLY_MARGIN_S) * 1000
       if (left < waitSeconds) {
         out.reply_wait_seconds = waitSeconds = left
         if (!left) return { ...out, reply: null, note: 'Accepted, but reaching the chat used up the whole wait: no time was left to wait for a reply. Read the target later; do not resend.' }
@@ -865,7 +886,8 @@ export async function deliver(target, text, waitSeconds = 0, { retryUntil = 0, s
     const after = Number(sub?.user_row_id || 0)
     if (!after) return { ...out, reply: null, note: 'Accepted, but this backend supplied no user row for reply correlation. Inspect the target transcript; do not resend.' }
     const deadline = Date.now() + Math.min(600, Math.max(0, waitSeconds)) * 1000
-    while (Date.now() < deadline) {
+    // A poll that could still be running when the whole wait ends would post after the sender gave up.
+    while (Date.now() < deadline && Date.now() + REPLY_POLL_MAX_MS <= wholeWaitEnd) {
       await sleep(3000)
       const st = await request('session.resume', { session_id: target.sessionId, omit_messages: true }, 30_000).catch(() => null)
       if (!st || st.running) continue
@@ -1516,10 +1538,8 @@ export async function performRequest(req, origin, conns) {
       for (let round = 1; ; round++) {
         // A forward round can take FORWARD_ROUND_MS; late in the window only the direct route still answers in time.
         const forward = round === 1 || retryUntil - Date.now() >= FORWARD_ROUND_MS - OWNER_RETRY_SUBMIT_TIMEOUT_MS
-        // The home courier cannot see this request's budget: hand it the reply wait that is left now.
-        const farWait = replyBudget && wait ? Math.max(0, Math.min(wait, Math.floor(await replyBudget()))) : wait
-        let forwarded = forward ? await forwardSend(target, text, farWait) : null
-        if (forwarded?.ok && farWait < wait) forwarded = { ...forwarded, reply_wait_seconds: farWait }
+        // forwardSend sizes the far courier's wait from what is left when its request goes out (replyBudget).
+        let forwarded = forward ? await forwardSend(target, text, wait, replyBudget) : null
         // Refused there = never admitted, and the chat may be open in THIS Desktop (its backend on
         // that gateway owns it): the direct route is then the owning one.
         if (forwarded?.status === 'refused') {
@@ -1661,19 +1681,35 @@ const relay = (connectionId, path, opts) => api(connectionId, `/api/plugins/${PL
 /** Hand a send to the target gateway's own Desktop courier. Returns null when that gateway has
  *  no live home courier (or predates forwarding) and nothing was queued there, so the caller
  *  delivers directly. Never returns null once the forwarded request may have been claimed. */
-export async function forwardSend(target, text, waitSeconds = 0) {
+export async function forwardSend(target, text, waitSeconds = 0, replyBudget = null) {
   const ping = await relay(target.connectionId, '/ping', { timeoutMs: 8_000 }).catch(() => null)
   if (!ping?.forwarding || !ping?.home_courier) return null
   const id = `fwd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  // With a sender's budget, the far courier gets what is left of it NOW, less this side's next poll, as its own
+  // whole wait: it counts its pickup and submit against that on its gateway's clock and posts by then. Its reply
+  // wait is capped too, for a far courier from before total_wait_seconds.
+  let budgetEnd = Infinity
+  let farWait = waitSeconds
+  let farTotal = null
+  if (replyBudget && waitSeconds) {
+    const left = await replyBudget()
+    budgetEnd = Date.now() + Math.max(0, left) * 1000
+    farTotal = Math.max(0, Math.floor(left - FORWARD_RESULT_MARGIN_S))
+    farWait = Math.max(0, Math.min(waitSeconds, farTotal - REPLY_MARGIN_S))
+  }
   const request = {
     id,
     action: 'send',
     args: { target: `@session:${target.profile || 'default'}/${target.sessionId}`, message: text },
     prewrapped: true,
     forwarded: true,
-    wait_for_reply: waitSeconds,
+    wait_for_reply: farWait,
+    ...(farTotal ? { total_wait_seconds: farTotal } : {}),
     ttl: 600
   }
+  const shortened = res => (res?.ok && farWait < waitSeconds
+    ? { ...res, reply_wait_seconds: Math.min(farWait, Number(res.reply_wait_seconds ?? farWait)) }
+    : res)
   const status = () => relay(target.connectionId, `/status/${id}`, { timeoutMs: 10_000 }).catch(() => null)
   const withdraw = async () => !!(await relay(target.connectionId, '/cancel', { method: 'POST', body: { id }, timeoutMs: 10_000 }).catch(() => null))?.ok
   const unknown = error => ({ ok: false, delivered: null, status: 'unknown', retry_safe: false, forwarded: true, error, note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' })
@@ -1692,11 +1728,12 @@ export async function forwardSend(target, text, waitSeconds = 0) {
   if (!enq?.ok) return null
 
   const started = Date.now()
-  const deadline = started + FORWARD_ROUND_MS + Math.min(600, Math.max(0, waitSeconds)) * 1000
+  // Never past the sender's whole wait: an answer after it reaches nobody.
+  const deadline = Math.min(budgetEnd, started + FORWARD_ROUND_MS + Math.min(600, Math.max(0, farWait)) * 1000)
   while (Date.now() < deadline) {
     await sleep(FORWARD_POLL_MS)
     const st = await status()
-    if (st?.state === 'done') return { ...(st.result || { ok: false, error: 'empty forwarded result' }), forwarded: true }
+    if (st?.state === 'done') return shortened({ ...(st.result || { ok: false, error: 'empty forwarded result' }), forwarded: true })
     if (st?.state === 'pending' && Date.now() - started > FORWARD_PICKUP_MS && (await withdraw())) return null
   }
   return unknown(`The target gateway's Desktop did not finish the forwarded send in time`)

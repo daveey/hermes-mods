@@ -265,9 +265,11 @@ def test_yielded_request_keeps_claimed_delivery_live(sm, monkeypatch, action):
     assert "Read the target before resending" in out["message"]
 
 
-def test_mark_cancelled_only_flags_a_claimed_request(sm):
+def test_mark_cancelled_only_flags_a_claimed_request(sm, tmp_path):
     rf = sm.rf
-    base = rf.root()
+    # Never rf.root(): outside core (no hermes_constants) it is the live ~/.hermes relay that a running Desktop
+    # courier drains, and it claimed this test's p1 on 2026-11-25.
+    base = tmp_path / "session_mentions"
     for sub in ("outbox", "claimed", "results"):
         (base / sub).mkdir(parents=True, exist_ok=True)
     assert rf.mark_cancelled("nope", base) is False
@@ -304,7 +306,7 @@ const source = await fs.readFile(process.argv[2], 'utf8')
 globalThis.__smHost = { state: {} }
 const code = source.replace("import { COMPOSER_AREAS, host } from '@hermes/plugin-sdk'", 'const host = globalThis.__smHost; const COMPOSER_AREAS = {}')
 const m = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
-console.log(JSON.stringify({ window: m.OWNER_RETRY_WINDOW_S, asked: m.busyRetrySeconds(JSON.parse(process.argv[3])), margin: m.REPLY_MARGIN_S }))
+console.log(JSON.stringify({ window: m.OWNER_RETRY_WINDOW_S, asked: m.busyRetrySeconds(JSON.parse(process.argv[3])), margin: m.REPLY_MARGIN_S, pickup: m.MAX_PICKUP_DELAY_S }))
 """
 
 
@@ -320,5 +322,7 @@ def test_courier_and_tool_agree_on_the_window(sm, tmp_path):
     run = subprocess.run([node, str(script), str(_JS), json.dumps(req)], capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr[-2000:]
     got = json.loads(run.stdout)
-    assert got == {"window": sm.SEND_BUSY_RETRY, "asked": sm.SEND_BUSY_RETRY, "margin": sm.SEND_REPLY_MARGIN}
+    # The courier's worst-case pickup delay (used when /status gives no age) is the tool's pickup timeout.
+    assert got == {"window": sm.SEND_BUSY_RETRY, "asked": sm.SEND_BUSY_RETRY, "margin": sm.SEND_REPLY_MARGIN,
+                   "pickup": sm.PICKUP_TIMEOUT}
     assert sm.SEND_BUSY_RETRY + sm.SEND_RETRY_GRACE < CORE_TOOL_CUT_S
