@@ -12,8 +12,8 @@ def read_github(kind, ref, runner=subprocess.run):
     if not m:
         return {'state': 'not_resolvable', 'happened': False}
     repo, what, number = m.groups()
-    args = (['run','view',number,'--repo',repo,'--json','status,conclusion,url,updatedAt'] if what=='actions/runs'
-            else ['pr','view',number,'--repo',repo,'--json','state,reviewDecision,statusCheckRollup,url,updatedAt'])
+    args = (['run','view',number,'--repo',repo,'--json','status,conclusion,url,updatedAt,headSha'] if what=='actions/runs'
+            else ['pr','view',number,'--repo',repo,'--json','state,reviewDecision,statusCheckRollup,url,updatedAt,headRefOid'])
     try:
         r = runner(['token-broker','exec','--scope','user/github','--reason','session-repair producer readback','--','gh',*args],
                    capture_output=True, text=True, timeout=25)

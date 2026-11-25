@@ -182,8 +182,15 @@ class Sources:
         cache = self.__dict__.setdefault('_producer_cache', {})
         key = (kind, ref)
         if key not in cache:
-            cache[key] = (read_github(kind, ref) if len(cache) < 20 else
-                          {'state':'readback_failed','happened':False,'reason':'per-scan producer read budget'})
+            if len(cache) >= 20:
+                cache[key] = {'state':'readback_failed','happened':False,'reason':'per-scan producer read budget'}
+            elif isinstance(ref, str) and ref.startswith('owner-target:'):
+                target_spec = importlib.util.spec_from_file_location('_session_repair_targets', Path(__file__).with_name('target_reader.py'))
+                targets = importlib.util.module_from_spec(target_spec)
+                target_spec.loader.exec_module(targets)
+                cache[key] = targets.read_target(ref, self.home() / 'session-repair' / 'target-readers.json', self.now)
+            else:
+                cache[key] = read_github(kind, ref)
         return cache[key]
 
     def outcome_rows(self) -> list[dict]:
@@ -1178,6 +1185,111 @@ def healthy_future_park(card: Card, park: dict, now: float) -> bool:
     return False
 
 
+def reassessment_target(awaited: dict, live: dict, now: Optional[float] = None) -> Optional[dict]:
+    """Derive identity/revision from an independent producer read, never receipt JSON.
+
+    Source-host queue/update observers are opt-in administrator-configured adapters.
+    They prove the selected target is still pending, not general producer health.
+    """
+    ref = awaited.get('ref')
+    observation = live.get('target_observation')
+    if observation is not None:
+        spec = importlib.util.spec_from_file_location('_session_repair_targets', Path(__file__).with_name('target_reader.py'))
+        targets = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(targets)
+        if (now is not None and isinstance(ref,str) and targets.SELECTOR.fullmatch(ref)
+                and not live.get('happened') and live.get('state') == 'owner_target_pending'
+                and not awaited.get('gateway') and not awaited.get('board')
+                and targets.valid_observation(observation, ref, now)):
+            return dict(observation['target'])
+        return None
+    state = live.get('state')
+    if (live.get('happened') or not isinstance(state, dict)
+            or state.get('url') != ref or awaited.get('gateway') or awaited.get('board')):
+        return None
+    if re.fullmatch(r'https://github\.com/[^/]+/[^/]+/actions/runs/\d+', str(ref)):
+        if (state.get('status') not in ('queued', 'in_progress', 'waiting', 'pending', 'requested')
+                or state.get('conclusion') not in (None, '')):
+            return None
+        revision = state.get('headSha')
+    elif re.fullmatch(r'https://github\.com/[^/]+/[^/]+/pull/\d+', str(ref)):
+        if state.get('state') != 'OPEN' or state.get('reviewDecision') == 'CHANGES_REQUESTED':
+            return None
+        checks = state.get('statusCheckRollup')
+        if not isinstance(checks, list) or any(
+                not isinstance(check, dict) or check.get('conclusion') not in (None, '', 'SUCCESS', 'NEUTRAL', 'SKIPPED')
+                or check.get('state') in ('ERROR', 'FAILURE') for check in checks):
+            return None
+        revision = state.get('headRefOid')
+    else:
+        return None
+    if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+        return None
+    return {'kind': 'external', 'identity': ref, 'revision': revision}
+
+
+def canonical_age_reassessment(card: Card, src: Sources, park: dict, awaited: dict, live: dict) -> bool:
+    """Read-only, exact-episode age exemption; unavailable proof always fails closed.
+
+    Keep receipt, live task, adverse events and current park in one SQLite read
+    snapshot. Do not create stores, fetch/renew receipts, or trust pending JSON.
+    """
+    target = reassessment_target(awaited, live, src.now)
+    if target is None:
+        return False
+    c = card.conn
+    own_snapshot = not c.in_transaction
+    try:
+        from hermes_cli.kanban_owner_reassessment import producer
+        from hermes_cli.kanban_owner_reassessment_replica import verified_for_event
+        if own_snapshot:
+            c.execute('BEGIN')
+        def row(sql, args):
+            cur = c.execute(sql, args)
+            value = cur.fetchone()
+            return dict(zip((d[0] for d in cur.description), value)) if value else None
+        task = row('SELECT * FROM tasks WHERE id=?', (card.id,))
+        event = row('SELECT * FROM task_events WHERE id=? AND task_id=?', (park['id'], card.id))
+        receipt = verified_for_event(c, event, task, now=int(src.now)) if event and task else None
+        if not task or not receipt or not src.now < receipt['reassess_at']:
+            return False
+        if (receipt['target'] != target
+                or any((awaited.get(k) or '') != (receipt['producer'].get(k) or '')
+                       for k in ('kind', 'ref', 'gateway'))
+                or producer(park['payload'].get('awaiting')) != receipt['producer']):
+            return False
+        live_event = ' AND deleted_at IS NULL' if _col(c, 'task_events', 'deleted_at') else ''
+        for ref in receipt['evidence_refs']:
+            if not c.execute('SELECT 1 FROM task_events WHERE uid=? AND task_id=?' + live_event,
+                             (ref['uid'], card.id)).fetchone():
+                return False
+        watch = row("SELECT payload FROM task_events WHERE task_id=? AND id>? AND kind='external_watch' "
+                    + live_event + " ORDER BY id DESC LIMIT 1", (card.id, park['id']))
+        if watch:
+            data = _json(watch['payload']) or {}
+            if (data.get('health') != 'ok' or data.get('consecutive_failures') != 0
+                    or data.get('state') != 'external_running'):
+                return False
+        if task.get('lease_holder') and (_num(task.get('lease_expires')) or 0) <= src.now * 1000:
+            return False
+        if c.execute("SELECT 1 FROM task_runs WHERE task_id=? AND (status='running' OR started_at>?) LIMIT 1",
+                     (card.id, park['at'])).fetchone():
+            return False
+        adverse = c.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? AND kind IN "
+                            "('wake_check_broken','wake_check_lost','wake_check_stale','condition_met') "
+                            + live_event + ' LIMIT 1', (card.id, park['id'])).fetchone()
+        if adverse or _promotion_held(c, card):
+            return False
+        from hermes_cli.kanban_spend_decision import pending, execution_refusal
+        return not (pending(c, card.id) or execution_refusal(c, card.id))
+    except Exception as exc:  # optional old core / unreadable evidence cannot authorize
+        src.error(f'owner reassessment {card.board}/{card.id}', exc)
+        return False
+    finally:
+        if own_snapshot and c.in_transaction:
+            c.rollback()  # ends only our read transaction; never ends a borrowed caller's transaction
+
+
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
         return None
@@ -1225,6 +1337,8 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
             return None
     if not live.get('happened') and waited < threshold:
         return None
+    if not live.get('happened') and canonical_age_reassessment(card, src, park, awaited, live):
+        return None  # only age; producer completion and every other rule retain their own verdict
     last = _events(c, card.id)
     return _finding('BS-long-wait', card, 'event_happened' if live.get('happened') else 'too_long',
                     f'potentially stuck: {kind} {ref}, waiting {_fmt_age(waited)}',

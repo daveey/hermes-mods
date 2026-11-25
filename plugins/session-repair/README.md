@@ -117,6 +117,167 @@ these need an explicit owner decision, not a generic unblock. For other waits, a
 panel's projected age cannot predate the latest run's admission/end boundary. This scanner-side guard avoids
 reusing core projections from an earlier episode; it does not change the card, its budget or its block kind.
 
+## Canonical age-only owner reassessment (WIP; not rollout proof)
+
+`BS-long-wait` can omit only its `too_long` result while a Board-certified owner
+reassessment remains current and `now < reassess_at`. It calls core's read-only
+`kanban_owner_reassessment_replica.verified_for_event(conn, event, task, now=...)`
+on the exact raw event, not a pending journal or a caller-supplied JSON receipt.
+The task/event/receipt/adverse-event/evidence reads share a SQLite read snapshot;
+an already-borrowed transaction is preserved. There are no writes, renewals or
+capability/coverage advertisements. Existing watcher-receipt logic is unchanged.
+
+The scanner independently resolves **GitHub external targets**, encoded as
+`{kind: external, identity: <exact producer URL>, revision: <full lowercase head SHA>}`.
+`gh run view` supplies `headSha`; `gh pr view` supplies `headRefOid`. It also supports
+opt-in **queue/update source readers** through `target_reader.py` and core's
+`hermes_cli.kanban_owner_target`. They establish exact target identity/revision
+and a bounded pending observation, **not producer health, a reassessment receipt,
+or execution/release authority**. Target, structured producer and current park
+must all agree with the certified receipt.
+
+Unknown/unavailable readback, missing required portable evidence, successor runs,
+expired retained leases, adverse watcher events, failed checks and completed
+producers cannot use this age exemption. Containment, spend and recovery hold
+exclusions remain; no other rule is exempted. No receipt is inferred from prose
+or a future wake. Opaque external targets without an independent reader still
+fail closed. Equal immutable park timestamps fail closed rather than using
+remapped local arrival IDs; the receipt reader supports local execution tables
+without tombstone columns and sync-shadow tables with `deleted_at`.
+
+### Source registry and scanner adapter schemas
+
+These are **administrator-owned**, separate files under
+`$HERMES_HOME/session-repair/`: `target-sources.json` lives on the source host;
+`target-readers.json` lives on the scanning gateway. Neither is installed or
+activated by importing the reader. The awaiting `ref` is only
+`owner-target:<authority>/<key>`; each label must match `[A-Za-z0-9_.-]{1,64}`.
+It cannot supply a path, command or identity override. Examples below use generic
+placeholder paths and repository names; they are not deployment configuration.
+
+`target-sources.json` schema: an object with **exactly** `version` (integer `1`),
+`authority` (the selector's authority) and `sources` (an object mapping selector
+keys to one of the following exact-key objects). Paths must be absolute after
+user expansion. Refs must be explicit valid Git refs; the update implementation
+currently accepts only the main-channel values shown here.
+
+```json
+{
+  "version": 1,
+  "authority": "source-a",
+  "sources": {
+    "release-queue": {
+      "kind": "queue",
+      "queue_path": "/srv/example/queue/queue.json",
+      "repository": "example/project",
+      "pr": 1,
+      "observation_path": "/srv/example/queue/pr-observations/1.json",
+      "train_path": "/srv/example/queue/train.json",
+      "pause_path": "/srv/example/queue/PAUSE"
+    },
+    "installed-core": {
+      "kind": "update",
+      "repo_path": "/srv/example/core",
+      "repository": "https://example.com/example/core.git",
+      "channel": "main",
+      "remote_ref": "refs/heads/main",
+      "target_ref": "refs/remotes/origin/main",
+      "observation_path": "/srv/example/cache/target-observation.json",
+      "stamp_path": "/srv/example/installed/install-stamp.json",
+      "stamp_sha_key": "commit"
+    }
+  }
+}
+```
+
+| Source | Field types and required independent evidence |
+|---|---|
+| `queue` | All fields are strings except positive integer `pr`. `repository` is `owner/repo` (each segment 1–100 letters, digits, `_`, `.`, `-`). Exactly one live `queued` entry for that PR must have a valid enqueue generation and reviewed full lowercase SHA. A fresh authenticated producer observation binds repository, PR, enqueue generation and head. Queue/train files must be fresh; pause markers, queue/entry pauses, hold/vet reasons, held candidates, single-candidate train failure, active train skips or vet state other than `ready` veto pending status. Historical terminal entries may coexist; missing/ambiguous live entries fail closed. |
+| `update` | All fields are strings. `repository` must exactly equal the checkout's origin URL. `stamp_sha_key` is one of `commit`, `core_sha`, `full_sha`, `serves_sha`, `sha` and must read an **installed** full lowercase SHA, not an offered/prebuilt build. A fresh updater-owned fetch observation binds actual host, resolved repo path, origin, main channel, both refs and full target SHA. Local Git ancestry gives `pending` only when installed is a strict ancestor of target, `satisfied` when target is already installed or an ancestor of installed, and `failed` for divergence. Origin, target ref, stamp and observation are re-read after ancestry evaluation; changed/unreadable evidence fails closed. |
+
+Queue producer observations have exactly `version`, `repository`, `pr`,
+`enqueue_generation`, `head`, `observed_at`, `state`; update observations have
+exactly `version`, `host`, `repo_path`, `repository`, `channel`, `remote_ref`,
+`target_ref`, `head`, `observed_at`, `state`. Both use version `1`, state `current`,
+and an acquisition timestamp in epoch seconds no older than 1,200 seconds and
+not in the future. Source file mtimes must also be current where required.
+Scanning or touching a file cannot renew acquisition evidence. Queue vetting has
+no guaranteed refresh cadence: old evidence expires. The updater's fact comes
+from its own successful fetch, not shared `FETCH_HEAD`; optional observation
+failures do not stop ordinary updates. Even if invalidation fails completely,
+an old matching fact retains only its original 20-minute lifetime.
+
+`target-readers.json` schema: an object with **exactly** `version` (integer `1`)
+and `authorities` (an object mapping authority names to fixed argv arrays).
+Each argv has 1–32 nonempty strings, each at most 4,096 characters without NUL;
+its executable must be absolute. A local example for the source above:
+
+```json
+{
+  "version": 1,
+  "authorities": {
+    "source-a": ["/opt/example/venv/bin/python", "-m", "hermes_cli.kanban_owner_target"]
+  }
+}
+```
+
+For `owner-target:source-a/release-queue`, the scanner appends only
+`observe --selector owner-target:source-a/release-queue` to that fixed argv.
+**No shell is invoked and no command/path interpolation is performed.** A remote
+adapter must separately provide existing authenticated transport with a fixed
+administrator-approved destination/command and preserve this argument contract;
+the observation JSON is not itself transport authentication. The source CLI
+accepts only `observe --selector`, not a registry path override.
+
+The response has exactly `version`, `observed_at`, `selector`, `target`,
+`disposition`. Only version `1`, the exact selector, and disposition `pending`
+can qualify. `target` has exactly `kind`, `identity`, `revision`: kind is `queue`
+or `update`; identity is `<selector>@<64 lowercase hex digits>`, hashing actual
+source hostname plus the normalized whole source config. Reusing a key for a
+new component/path/channel invalidates old receipts. Queue revision is
+`<enqueue-generation>:<40 lowercase hex digits>`; update revision is a bare
+40-digit lowercase SHA. A pending observation still needs the separate canonical
+same-episode receipt; it never authorizes suppression by itself.
+
+The scanner bounds config/response JSON to 16 KiB and acquisition to 10 seconds,
+rejects duplicate keys/nonfinite JSON constants, nonregular config files, failed
+commands, wrong schemas and stale responses. Response age is at most 1,200
+seconds, with up to 30 seconds of future tolerance for acquisition after the
+frozen scan clock; this never extends a certificate deadline. Source JSON reads
+are bounded regular-file reads (normally 1 MiB, with smaller observation limits),
+reject changes during acquisition and use bounded read-only Git commands.
+Only the configured source is consulted; unknown authority/key, missing facts,
+`satisfied`, `failed` or `unavailable` responses cannot suppress. The scanner
+shares its existing 20-target per-scan producer-read budget and caches reads;
+there is no new poller. Awaiting gateway/board overrides are rejected.
+
+### Proof boundary and remaining rollout work
+
+`tests/test_reassessment.py` uses the real certifier and durable receipt verifier
+with an **explicitly simulated** Board transport and the production SQL reader;
+these are scanner adversarial/snapshot tests. Separately, isolated composed
+fixtures exercised four fresh same-lifecycle opt-ins through genuine outbox,
+authenticated Board HTTP/DO admission/evidence, durable cache, replica close/reopen
+with remapped IDs, and the scanner. All four aged waits suppressed; sixteen paired
+no-opt-in/expired/target-change/failure controls returned `too_long`. Queue fixtures
+used real vet paths with a closed API fixture; updater fixtures used the actual
+updater with local Git fetches. Controlled clocks/mtimes simulated aging.
+
+This is **isolated proof, not production deployment, live credential validation,
+historical receipt grandfathering or review approval**. No production source
+registry, adapter transport or capability advertisement is activated by this WIP.
+Exact-head review, publication/CI, installation and authenticated production
+source configuration remain separate gates. Historical prose is not an opt-in.
+Before per-variant promotion, complete the approved at-least-six-hour fixed-variant
+shadow audit with every would-act a true positive and zero errors; nudges remain
+shadow until independently certified. Existing spend/budget/block-kind, safety,
+storage, dependency and unknown-delivery/no-resend boundaries are unchanged.
+
+The canonical suite command is
+`scripts/test-all --hermes-core <core-WIP> -k session-repair`; set a generous
+per-suite timeout and retain `--output-dir`/`--json` receipts. Source-reader schema
+and fail-closed cases are also covered in `tests/test_target_reader.py`.
+
 ## Independent nudge lane
 
 `config.json` additionally accepts `nudge_mode: shadow|live` (default shadow). This does not enable the older
