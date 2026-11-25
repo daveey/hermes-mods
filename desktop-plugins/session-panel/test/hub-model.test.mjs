@@ -197,6 +197,8 @@ for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'ov
   assert.equal(eta.querySelector('[data-eta-left]').textContent, {normal:'13m',over:'+16m',unknown:'—'}[state])
   if (state === 'over') assert.equal(eta.querySelector('[data-eta-left]').style.color, 'rgb(240, 136, 62)')
   if (state === 'unknown') assert.ok(eta.textContent.includes('/ ?'))
+  const etaColor = state === 'over' ? 'rgb(240, 136, 62)' : kind === 'deploy' ? 'rgb(163, 113, 247)' : 'rgb(56, 189, 248)'
+  assert.equal(eta.querySelector('[data-eta-left]').style.color, etaColor)
   eta.dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true }))
   assert.equal(actions[0][1].target.id, row.id)
   await paint(m.renderModel(model, { now: now + 60 }))
@@ -209,8 +211,10 @@ for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'ov
   await paint(React.createElement(tasksEta.Chip, { chip, now: now * 1000 }))
   assert.ok(document.querySelector('[data-chip-pip]') === null)
   assert.equal(document.querySelector('[data-wait-eta]').dataset.waitEta, kind)
+  assert.equal(document.querySelector('[data-eta-left]').style.color, etaColor)
   await paint(React.createElement(tasksEta.CardRow, {chip, now: now * 1000}))
   assert.equal(document.querySelector('[data-wait-eta]').dataset.waitEta, kind)
+  assert.equal(document.querySelector('[data-eta-left]').style.color, etaColor)
  })
 }
 test('ordinary waits and stale/blocked chip controls keep pips', async () => {

@@ -68,7 +68,7 @@ export function renderWaitEta(eta, now, props = {}) {
       fontSize: 11, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', flex: 'none', textAlign: 'right', ...props.style },
     children: [jsx('span', { style: { opacity: .75 }, children: r.waited }),
       jsx('span', { style: { color: 'var(--muted-foreground)', textAlign: 'left', paddingLeft: 2 }, children: `/ ${r.expected ?? '?'}` }),
-      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : r.expected === null ? 'var(--muted-foreground)' : eta.wait_kind === 'deploy' ? '#a371f7' : '#38bdf8' }, children: r.left })] })
+      jsx('span', { 'data-eta-left': '', style: { color: r.over ? '#f0883e' : eta.wait_kind === 'deploy' ? '#a371f7' : '#38bdf8' }, children: r.left })] })
 }
 
 const ID = 'session-tasks'
