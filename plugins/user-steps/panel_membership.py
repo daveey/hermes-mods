@@ -8,6 +8,9 @@ from contextlib import closing
 import hashlib
 import json
 import math
+import os
+import sqlite3
+import threading
 
 
 
@@ -62,6 +65,181 @@ def _aliases(conn, session, step_sql, cap):
             seen.add(sid)
             sid = forward[sid]
     return sorted(found), sorted(edges)
+
+
+_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(version), "
+          "total(octet_length(data)) FROM replica WHERE coll='tasks'")
+_MANIFEST = ("SELECT json_group_array(json_array(gw,key,seq,version,octet_length(data))) "
+             "FROM replica WHERE coll='tasks'")
+_BULK = 500
+_INDEXES = 4
+_indexes = {}
+_indexes_lock = threading.Lock()
+
+
+class _TaskIndex:
+    """Which replica task rows link which session, for one (replica file, gateway, profile).
+
+    One capture used to step and decode every task row of the fleet per owner (27k rows,
+    136 MB on the hub). sqlite3 hands the GIL over on every fetched row, so that scan
+    was also the feed thread's context-switch storm. The index keeps only membership
+    facts (identity, linked sessions) per row and is brought level with the CALLER'S
+    read snapshot on every use: hermes-hub stamps each replica write with the feed's
+    monotonic ``seq``, so the totals probe core's strict reader trusts tells whether
+    any task row moved, and a one-step manifest of (seq, version, byte length) names
+    the rows that did. Only those are read again.
+
+    It never holds task content and never answers for a snapshot it was not refreshed
+    in. Content of an owner's relevant rows is always re-read by the caller. Not seen:
+    a rewrite that keeps a row's seq, version and byte length, which the canonical
+    projector does not see either.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.probe = None
+        self.rows = {}         # (gw, key) -> ((seq, version, size), identity or None, sessions)
+        self.by_session = {}
+        self.by_identity = {}
+        self.invalid = set()
+
+    def _drop(self, ident):
+        _, identity, sessions = self.rows.pop(ident)
+        self.invalid.discard(ident)
+        for bucket, names in ((self.by_identity, (identity,)), (self.by_session, sessions)):
+            for name in names:
+                held = bucket.get(name)
+                if held is not None:
+                    held.discard(ident)
+                    if not held:
+                        del bucket[name]
+
+    def _put(self, ident, raw, stamp, sessions_of):
+        if ident in self.rows:
+            self._drop(ident)
+        try:
+            task = _object(raw)
+            parts = ident[1].split('/')
+            if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
+                raise ValueError('unknown replica identity')
+            identity, sessions = (parts[-2], parts[-1]), tuple(sessions_of(task))
+            hash(sessions)
+        except Exception:
+            # The full scan failed the whole capture on such a row; so does invalid.
+            self.rows[ident] = (stamp, None, ())
+            self.invalid.add(ident)
+            return
+        self.rows[ident] = (stamp, identity, sessions)
+        self.by_identity.setdefault(identity, set()).add(ident)
+        for session in sessions:
+            self.by_session.setdefault(session, set()).add(ident)
+
+    def refresh(self, conn, sessions_of):
+        """Level with ``conn``'s snapshot; False when this replica cannot be keyed by seq."""
+        try:
+            probe = tuple(conn.execute(_PROBE).fetchone())
+        except sqlite3.OperationalError:
+            return False  # no seq column: the caller reads every row
+        if probe[0] != probe[1]:
+            return False
+        if probe == self.probe:
+            return True
+        self.probe = None
+        manifest = {(gw, key): (seq, version, size)
+                    for gw, key, seq, version, size in json.loads(conn.execute(_MANIFEST).fetchone()[0])}
+        for ident in [i for i in self.rows if i not in manifest]:
+            self._drop(ident)
+        moved = {i for i, stamp in manifest.items() if i not in self.rows or self.rows[i][0] != stamp}
+        columns = "SELECT gw,key,data,seq,version,octet_length(data) FROM replica WHERE coll='tasks'"
+        if len(moved) > _BULK:
+            # First use or a resync: one pass over the collection, once, not once per owner.
+            rows = (row for row in conn.execute(columns) if (row[0], row[1]) in moved)
+        else:
+            rows = (row for ident in sorted(moved)
+                    for row in conn.execute(columns + ' AND gw=? AND key=?', ident))
+        for gw, key, raw, seq, version, size in rows:
+            if manifest[(gw, key)] != (seq, version, size):
+                raise ValueError('replica manifest and rows disagree')
+            self._put((gw, key), raw, (seq, version, size), sessions_of)
+            moved.discard((gw, key))
+        if moved:
+            raise ValueError('replica manifest and rows disagree')
+        self.probe = probe
+        return True
+
+
+def _task_index(path, gateway, profile, linked_sessions):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    # File identity only. Size and mtime move on every checkpoint and prove nothing.
+    key = (os.fspath(path), st.st_dev, st.st_ino, gateway, profile, linked_sessions)
+    with _indexes_lock:
+        index = _indexes.pop(key, None) or _TaskIndex()
+        _indexes[key] = index
+        while len(_indexes) > _INDEXES:
+            _indexes.pop(next(iter(_indexes)))
+        return index
+
+
+def _scan(replica, alias_set, sessions_of):
+    """Every task row, decoded. The reference inventory; used when there is no seq."""
+    candidates, direct = [], set()
+    for gw, key, raw, version in replica.execute(
+            "SELECT gw,key,data,version FROM replica WHERE coll='tasks'"):
+        task = _object(raw)
+        parts = key.split('/')
+        if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
+            raise ValueError('unknown replica identity')
+        candidates.append((gw, key, task, version, (parts[-2], parts[-1])))
+        if alias_set.intersection(sessions_of(task)):
+            direct.add((gw, key))
+    return candidates, direct
+
+
+def _inventory(replica, replica_path, gateway, profile, alias_set, obligations, linked_sessions):
+    """(candidates, direct): direct links of this chat plus every row that can be relevant.
+
+    Same verdicts and the same selected rows as ``_scan``; rows that are neither linked,
+    obligated nor an identity twin of one of those are never candidates there either.
+    """
+    def sessions_of(task):
+        return linked_sessions(task, gateway, profile)
+    index = _task_index(replica_path, gateway, profile, linked_sessions)
+    if index is None:
+        return _scan(replica, alias_set, sessions_of)
+    direct, wanted, stamps = set(), set(), {}
+    with index.lock:
+        if not index.refresh(replica, sessions_of):
+            index = None
+        else:
+            if index.invalid:
+                raise ValueError('unknown replica identity')
+            for session in alias_set:
+                direct.update(index.by_session.get(session, ()))
+            wanted.update(direct)
+            identities = {index.rows[ident][1] for ident in direct}
+            for binding, *_ in obligations:
+                owner = binding['owner']
+                ident = (owner['gateway'], binding['task_record_key'])
+                if ident in index.rows:
+                    wanted.add(ident)
+                identities.add((owner['board'], owner['task_id']))
+            for identity in identities:
+                wanted.update(index.by_identity.get(identity, ()))
+            stamps = {ident: index.rows[ident] for ident in wanted}
+    if index is None:
+        return _scan(replica, alias_set, sessions_of)
+    candidates = []
+    for ident in sorted(wanted):
+        row = replica.execute(
+            "SELECT data,version,seq,octet_length(data) FROM replica WHERE coll='tasks' AND gw=? AND key=?",
+            ident).fetchone()
+        stamp, identity, _ = stamps[ident]
+        if row is None or (row[2], row[1], row[3]) != stamp:
+            raise ValueError('replica index and rows disagree')
+        candidates.append((ident[0], ident[1], _object(row[0]), row[1], identity))
+    return candidates, direct
 
 
 def _fresh(value, now, window):
@@ -184,17 +362,9 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
                     return None
             # Read all membership links, not just previously known task IDs. The
             # selected inventory must see arrivals, removals and legacy twins.
-            candidates, direct = [], set()
-            for gw, key, raw, version in replica.execute(
-                    "SELECT gw,key,data,version FROM replica WHERE coll='tasks'"):
-                task = _object(raw)
-                parts = key.split('/')
-                if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
-                    raise ValueError('unknown replica identity')
-                identity = (parts[-2], parts[-1])
-                candidates.append((gw, key, task, version, identity))
-                if alias_set.intersection(linked_sessions(task, gateway, profile)):
-                    direct.add((gw, key))
+            # One shared membership index per replica, never one fleet scan per owner.
+            candidates, direct = _inventory(replica, replica_path, gateway, profile,
+                                            alias_set, obligations, linked_sessions)
             # Retained ledger payloads are not current just because their scope
             # is live. Require the exact owner publication, version AND content,
             # as the canonical projector does before accepting an observation.
