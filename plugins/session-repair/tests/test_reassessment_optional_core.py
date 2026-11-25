@@ -57,6 +57,9 @@ def test_absent_replica_module_is_silent_non_authority(world, monkeypatch):
 @pytest.mark.parametrize(('missing_name', 'message'), [
     pytest.param('some_runtime_dep', "No module named 'some_runtime_dep'", id='external-dependency'),
     pytest.param('hermes_cli.unrelated', "No module named 'hermes_cli.unrelated'", id='core-sibling'),
+    pytest.param('hermes_cli.kanban_spend_decision', 'missing spend decision module', id='kanban-sibling'),
+    pytest.param('hermes_cli.kanban_owner_other', 'missing unrelated owner module', id='owner-sibling'),
+    pytest.param('foreign.hermes_cli.kanban_owner_reassessment', 'missing foreign namesake', id='foreign-namesake'),
     pytest.param(None, 'missing dependency without a module name', id='unknown-name'),
     pytest.param('some_runtime_dep', "No module named 'hermes_cli.kanban_owner_reassessment'",
                  id='misleading-message'),
