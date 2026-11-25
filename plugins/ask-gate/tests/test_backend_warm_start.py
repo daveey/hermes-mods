@@ -6,13 +6,15 @@ import pytest
 
 
 def test_backend_default_starts_warm_without_waiting(gate, monkeypatch):
-    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "1")
+    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "9148")
     monkeypatch.delenv("ASK_GATE_WARM_JOIN_S", raising=False)
     assert gate._warm_join_s() == 0.0
 
 
-@pytest.mark.parametrize("backend,expected", [(None, 4.0), ("0", 4.0), ("true", 4.0), ("1", 0.0)])
-def test_only_exact_backend_marker_selects_nonblocking_default(gate, monkeypatch, backend, expected):
+@pytest.mark.parametrize("backend,expected", [(None, 4.0), ("0", 4.0), ("true", 4.0),
+                                               ("1", 0.0), ("9148", 0.0), ("65535", 0.0),
+                                               ("65536", 4.0), ("-1", 4.0), ("9" * 5000, 4.0)])
+def test_only_backend_port_selects_nonblocking_default(gate, monkeypatch, backend, expected):
     monkeypatch.delenv("ASK_GATE_WARM_JOIN_S", raising=False)
     if backend is None:
         monkeypatch.delenv("HERMES_ALWAYS_ON_BACKEND", raising=False)
@@ -29,7 +31,7 @@ def test_explicit_join_override_keeps_precedence_and_negative_clamp(gate, monkey
     assert gate._warm_join_s() == expected
 
 
-@pytest.mark.parametrize("backend,expected", [("0", 4.0), ("1", 0.0)])
+@pytest.mark.parametrize("backend,expected", [("0", 4.0), ("9148", 0.0)])
 @pytest.mark.parametrize("override", ["", "broken"])
 def test_invalid_override_uses_surface_default(gate, monkeypatch, backend, override, expected):
     monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", backend)
@@ -52,7 +54,7 @@ class _Context:
 
 
 def test_backend_register_returns_while_real_daemon_warm_is_pending(gate, monkeypatch):
-    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "1")
+    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "9148")
     monkeypatch.delenv("ASK_GATE_WARM_JOIN_S", raising=False)
     monkeypatch.delenv("ASK_GATE_NO_PREWARM", raising=False)
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -82,7 +84,7 @@ def test_backend_register_returns_while_real_daemon_warm_is_pending(gate, monkey
 
 
 def test_immediate_backend_turn_reports_incomplete_then_recovers(gate, monkeypatch, board, tmp_path):
-    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "1")
+    monkeypatch.setenv("HERMES_ALWAYS_ON_BACKEND", "9148")
     monkeypatch.delenv("ASK_GATE_WARM_JOIN_S", raising=False)
     monkeypatch.delenv("ASK_GATE_NO_PREWARM", raising=False)
     monkeypatch.setattr(gate.core, "REMOTE_TIMEOUT_S", 0.05)

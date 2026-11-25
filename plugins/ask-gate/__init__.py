@@ -1644,8 +1644,12 @@ WARM_JOIN_S = 4.0  # ordinary-process default; always-on backend defaults to zer
 
 def _warm_join_s() -> float:
     # The always-on backend must hand off app/auth startup without waiting for
-    # unrelated card projection warming. Keep ordinary first-turn behavior.
-    default = 0.0 if os.environ.get("HERMES_ALWAYS_ON_BACKEND") == "1" else WARM_JOIN_S
+    # unrelated card projection warming. cmd_backend supplies its TCP port,
+    # not a boolean; this marker is removed later by the post-bind watchdog.
+    # Keep ordinary first-turn behavior and bound parsing of invalid values.
+    raw_port = os.environ.get("HERMES_ALWAYS_ON_BACKEND", "")
+    backend = len(raw_port) <= 5 and raw_port.isascii() and raw_port.isdecimal() and 0 < int(raw_port) < 65536
+    default = 0.0 if backend else WARM_JOIN_S
     try:
         return max(0.0, float(os.environ.get("ASK_GATE_WARM_JOIN_S", default)))
     except ValueError:
