@@ -38,7 +38,7 @@ def canonical_overlay(board, canonical):
     """Independent canonical component, including its availability diagnostics."""
     old_board_errors = canonical.get('board_errors', ())
     errors = [e for e in canonical.get('input_errors', ()) if e not in old_board_errors]
-    result = {**board, **{k: canonical[k] for k in ('canonical_seq', 'outcome_json', 'requests') if k in canonical}}
+    result = {**board, **{k: canonical[k] for k in ('canonical_seq', 'outcome_json', 'requests', 'processes') if k in canonical}}
     result['input_errors'] = list(dict.fromkeys(errors + list(board.get('board_errors', ()))))
     return result
 

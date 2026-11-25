@@ -911,9 +911,17 @@ class Feed:
             # the hub that was one user-steps read per watched chat per second, most of the serve's lock traffic.
             rd = self.readers if readers is None else readers
             now = self._last_decision = self.clock()
+            runtime = getattr(rd, 'runtime_inputs', None)
+            runtime_stamp = getattr(rd, 'runtime_stamp', None)
+            stamp_now = runtime_stamp() if callable(runtime_stamp) else None
+            runtime_seen = self.__dict__.setdefault('_runtime_seen', {})
+            runtime_due = ({s for s, b in held.items()
+                            if stamp_now != getattr(self, '_runtime_stamp', None)
+                            or (b.get('processes') and now - runtime_seen.get(s, 0) >= 45)}
+                           if callable(runtime) else set())
             files = getattr(rd, 'panel_files_stamp', None)
             moved = files() if callable(files) else None
-            if (moved is not None and moved == self._decision_files and not failed
+            if (moved is not None and moved == self._decision_files and not failed and not runtime_due
                     and all(s in self._decision_seen for s in held)):
                 return 0  # nothing behind any held chat's decisions moved: no database opened this pass
             stamps = self._decision_stamps(rd, held)
@@ -923,17 +931,26 @@ class Feed:
                     break
                 stamp = stamps.get(s)
                 seen = self._decision_seen.get(s)
-                if stamp is not None and seen is not None and seen[0] == stamp and s not in failed:
+                if stamp is not None and seen is not None and seen[0] == stamp and s not in failed and s not in runtime_due:
                     continue
                 seq = next(self._seq)
                 try:
                     inputs = read(s, base['lineage'])
                     if not isinstance(inputs, dict) or any(k not in inputs for k in ('outcome_json', 'requests')):
                         raise ValueError('incomplete canonical decision inputs')
+                    if s in runtime_due:
+                        fresh = runtime(s, base['lineage'])
+                        if not isinstance(fresh, dict) or not isinstance(fresh.get('processes'), list) or 'outcome_json' not in fresh:
+                            raise ValueError('incomplete runtime inputs')
+                        inputs = {**inputs, **fresh}
                     with self.lock:
                         if self._decision_result(s, base, seq, failed=False):
                             self._decision_seen[s] = (stamp, now)
+                            if s in runtime_due:
+                                runtime_seen[s] = now
                     update = {k: inputs[k] for k in ('outcome_json', 'requests')}
+                    if 'processes' in inputs:
+                        update['processes'] = inputs['processes']
                     count += len(self._publish({s: {**base, **update, 'canonical_seq': seq}}, canonical_only=True))
                 except Exception:
                     with self.lock:
@@ -941,6 +958,12 @@ class Feed:
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
             if not self.stopped.is_set():
                 self._decision_files = moved if stamps else None
+                if not self._decision_failures:
+                    self._runtime_stamp = stamp_now
+                with self.lock:
+                    deadlines = [runtime_seen.get(s, now) + 45 for s, b in self.bundles.items()
+                                 if s in self.interest and s not in self._decision_failures and b['bundle'].get('processes')]
+                    self._runtime_retry_at = min(deadlines) if deadlines else None
             return count
         finally:
             self._decision_lock.release()
@@ -1119,13 +1142,13 @@ class Feed:
             elif not board_current and old.get('computed_seq', 0) > bundle.get('computed_seq', 0):
                 if old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0) or old['lineage'] != bundle['lineage']:
                     return False
-                bundle = {**old, **{k: bundle[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
+                bundle = {**old, **{k: bundle[k] for k in ('canonical_seq', 'outcome_json', 'requests', 'processes') if k in bundle}}
                 merged = True
             elif old.get('canonical_seq', 0) > bundle.get('canonical_seq', 0) and old['lineage'] == bundle['lineage']:
                 bundle = ((projection_module or _projection()).canonical_overlay(bundle, old) if board_current else
-                          {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}})
+                          {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests', 'processes') if k in old}})
                 merged = True
-            if not board_current and not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests', 'input_errors')):
+            if not board_current and not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests', 'processes', 'input_errors')):
                 prev['bundle'] = {**old, 'canonical_seq': max(old.get('canonical_seq', 0), bundle.get('canonical_seq', 0))}
                 return False  # no re-reduction of unchanged canonical data every second
             if merged and bundle.get('canonical_seq'):

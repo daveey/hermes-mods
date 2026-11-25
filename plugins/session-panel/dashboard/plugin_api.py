@@ -1141,7 +1141,8 @@ class CoreReaders:
 
     def watch_paths(self) -> list[Path]:
         """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
-        return self.board_paths() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3'] + self.external_paths()
+        return self.board_paths() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3',
+                                    self.state_db().parent / 'processes.json'] + self.external_paths()
 
     def external_paths(self) -> list[Path]:
         """Origin receipts and hub replicas are inputs, not task-event boards."""
@@ -1342,15 +1343,43 @@ class CoreReaders:
             return copy.deepcopy(value)
         return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
 
-    def panel_inputs(self, session, lineage):
-        if self._explicit_home() is None:
-            self.require_scope('panel_runtime_inputs')
+    @staticmethod
+    def _panel_input_module():
         path = Path(__file__).resolve().parents[1] / 'inputs.py'
         spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod.read(self, session, lineage)
+        return mod
+
+    def runtime_stamp(self):
+        path = self.state_db().parent / 'processes.json'
+        return self._stat(path) if path.exists() else None
+
+    def runtime_inputs(self, session, lineage):
+        """Background producer only: re-probe processes and publish canonical status.
+
+        Never called by the interactive decision route. The persisted envelope is
+        the single reducer output consumed by both sidebar and panel header.
+        """
+        self.require_scope('panel_runtime_inputs')
+        if self._explicit_home() is not None:
+            self._refuse('panel_runtime_inputs')
+        from hermes_state import SessionDB
+        from hermes_state_outcome import refresh_outcome
+        with SessionDB(db_path=self.state_db()) as db:
+            if db.get_session(session) is None:
+                return {'outcome_json': {}, 'processes': []}
+            outcome = refresh_outcome(session, 'reap', db=db)
+        home = self.state_db().parent
+        profile = home.name if home.parent.name == 'profiles' else 'default'
+        return {'outcome_json': outcome,
+                'processes': self._panel_input_module().process_inputs(session, lineage, profile)}
+
+    def panel_inputs(self, session, lineage):
+        if self._explicit_home() is None:
+            self.require_scope('panel_runtime_inputs')
+        return self._panel_input_module().read(self, session, lineage)
 
     def linked(self, ids):
         if self._explicit_home() is None:
@@ -2656,8 +2685,11 @@ def _run_decisions(f) -> None:
             if not first:
                 # Startup, explicit registration and source events only. A
                 # refused watcher must never turn this lane into a poller.
-                # A failed read's bounded retry (Feed._backoff) is the one timed wake.
-                retry_at = getattr(f, '_decision_retry_at', None)
+                # Failed reads retry finitely. Only known live processes own a
+                # timed kernel re-probe; idle chats remain event-driven.
+                deadlines = [at for at in (getattr(f, '_decision_retry_at', None),
+                                           getattr(f, '_runtime_retry_at', None)) if at is not None]
+                retry_at = min(deadlines) if deadlines else None
                 if retry_at is None:
                     f._decide.wait()
                 else:
