@@ -1114,6 +1114,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 continue
             seen.add(v['key'])
             ev = observation(row, now, kind, projector) if kind != 'machine' else {'state': 'running'}
+            if kind == 'process' and row.get('work_id') and bundle.get('session') and row.get('gateway') and row.get('profile'):
+                v['actions'].append({'kind': 'open_process', 'label': 'Open process',
+                    'target': {'id': row['work_id'], 'session': bundle['session'],
+                               'gateway': row['gateway'], 'profile': row['profile']}})
             v.update(evidence_state=ev.get('state'), detail='rented machine' if kind == 'machine' else ev.get('state', 'unknown').replace('_', ' ') + (f' ({ev["unknown_reason"].replace("_", " ")})' if ev.get('unknown_reason') else ''))
             sections['running' if ev.get('state') == 'running' else 'waiting'].append(v)
     done_seen = set()

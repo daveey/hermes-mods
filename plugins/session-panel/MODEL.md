@@ -71,6 +71,21 @@ classification changes.
 
 ## Runtime process evidence
 
+A process row with complete owner coordinates exposes **Open process** in its
+right-click menu. This opens a read-only Desktop dialog for that process, not
+its parent chat. The gateway/profile route is frozen at click time; navigation
+closes the dialog and late responses cannot replace another owner's view.
+The dialog retains the backend-authored panel observation explicitly labelled
+“at open”, then uses existing owner-scoped `session.resume` (lazy, no messages)
+and `process.list` RPCs for status/output. Refresh is explicit, never polling.
+Foreign checkpoints can be visible to the canonical evidence reader but absent
+from a backend's in-memory process list; in that case output availability fails
+explicitly while the labelled panel observation remains visible. It never
+re-routes to the focused backend, adopts a process, acknowledges its log,
+executes a command or offers process control. Missing owner data exposes no
+action. Older Desktop builds without scoped requests/dialog support report the
+capability gap rather than opening another process.
+
 The background canonical lane watches the profile's `processes.json` for process
 birth/exit and re-probes known open processes every 45 seconds. This renews actual
 kernel observations, not a carried payload's timestamp or the board snapshot's
