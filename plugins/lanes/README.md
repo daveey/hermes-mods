@@ -42,6 +42,16 @@ combination with no completed view waits for its own initial computation; it
 never borrows another window or presentation variant. This is a delivery cache,
 not fresh admission evidence, and does not change the Desktop request timeout.
 
+The mount lifecycle refreshes only the default `(6, 6h, false)` REST key every
+60 seconds after completion, even when no clients request it. This avoids a cold
+first GET after five minutes of inactivity. It shares exact-key single-flight
+serialization with request-driven refreshes; other parameter keys remain lazy.
+The existing 120-second validity ceiling is unchanged: stalled or failing refreshes
+still produce `warming` after expiry, never an arbitrarily old lane payload.
+Shutdown stops future refreshes and retains the lifecycle handle until any active
+computation actually drains. Tests: `test_rest_idle_warm.py` exercises idle delivery
+through the REST router, blocked refresh expiry/close, retries and default-key bounds.
+
 ## Reversible load mitigation
 
 `HERMES_LANES_CHANGE_ONLY` defaults on: native file notifications admit source

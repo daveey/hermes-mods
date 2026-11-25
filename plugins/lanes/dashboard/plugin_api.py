@@ -391,17 +391,14 @@ def rest_view(hours, window, expanded):
         lambda: _lane_view(hours, window, expanded))
 
 
+REST_REFRESH_S = 60.  # default key only; completed views still expire at 120s
+
+
 def start_legacy():
-    """Trusted router mount hook: custom app lifespans skip on_event startup."""
-    worker = _shared_views().warm((6., '6h', False), (_generation, _observation_cursor()),
-                                  lambda: _lane_view(6., '6h', False))
-    class WarmHandle:
-        def close(self):
-            if worker is not None:
-                worker.join(timeout=4.)
-                if worker.is_alive():
-                    raise RuntimeError('lanes warm compute still draining')
-    return WarmHandle()
+    """Keep the startup default fresh even without GET or stream demand."""
+    warmer = _identity.load(_Path(__file__).with_name('default_warm.py'), 'lanes_default_warm')
+    return warmer.DefaultWarm(_shared_views(), lambda: (_generation, _observation_cursor()),
+                              lambda: _lane_view(6., '6h', False), interval=REST_REFRESH_S)
 
 
 @router.get("/v1/lanes")
