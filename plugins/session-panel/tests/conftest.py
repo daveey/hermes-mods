@@ -99,6 +99,7 @@ def _stop_mode_watchers(monkeypatch):
     for server in servers:
         assert server.participant.retire(server.drain), 'test left active panel lanes'
         server.close()
+    monkeypatch.undo()  # the test's own patches first: they may have created the loader attributes popped below
     loader = sys.modules.get('_session_panel_feed_loader')
     if loader is not None:
         loader.__dict__.pop('panel_participant', None)
