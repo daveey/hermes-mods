@@ -872,7 +872,8 @@ class Feed:
             self._decision_result(session, base, seq, failed=True)
             raise
         self._decision_result(session, base, seq, failed=False)
-        self._publish({session: {**base, **{k: inputs[k] for k in ('outcome_json', 'requests')},
+        self._publish({session: {**{k: v for k, v in base.items() if k != 'processes'},
+                                 **{k: inputs[k] for k in ('outcome_json', 'requests')},
                                  'canonical_seq': seq}}, canonical_only=True)
         with self.lock:
             held = self.bundles.get(session)
@@ -926,6 +927,7 @@ class Feed:
                 return 0  # nothing behind any held chat's decisions moved: no database opened this pass
             stamps = self._decision_stamps(rd, held)
             count = 0
+            runtime_superseded = False
             for s, base in held.items():
                 if self.stopped.is_set():
                     break
@@ -946,23 +948,36 @@ class Feed:
                     with self.lock:
                         if self._decision_result(s, base, seq, failed=False):
                             self._decision_seen[s] = (stamp, now)
-                            if s in runtime_due:
-                                runtime_seen[s] = now
                     update = {k: inputs[k] for k in ('outcome_json', 'requests')}
                     if 'processes' in inputs:
                         update['processes'] = inputs['processes']
-                    count += len(self._publish({s: {**base, **update, 'canonical_seq': seq}}, canonical_only=True))
+                    carried = {k: v for k, v in base.items() if k != 'processes'}
+                    count += len(self._publish({s: {**carried, **update, 'canonical_seq': seq}}, canonical_only=True))
+                    if s in runtime_due:
+                        with self.lock:
+                            current = self.bundles.get(s)
+                            if (s in self.interest and current is not None
+                                    and current['bundle']['lineage'] == base['lineage']):
+                                # A newer decision-only read carries old processes.
+                                # Losing its CAS is not a settled runtime capture:
+                                # retain birth admission and retry even when empty.
+                                if current['bundle'].get('canonical_seq') == seq:
+                                    runtime_seen[s] = now
+                                else:
+                                    runtime_superseded = True
                 except Exception:
                     with self.lock:
                         self._decision_result(s, base, seq, failed=True)
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
             if not self.stopped.is_set():
                 self._decision_files = moved if stamps else None
-                if not self._decision_failures:
+                if not self._decision_failures and not runtime_superseded:
                     self._runtime_stamp = stamp_now
                 with self.lock:
                     deadlines = [runtime_seen.get(s, now) + 45 for s, b in self.bundles.items()
                                  if s in self.interest and s not in self._decision_failures and b['bundle'].get('processes')]
+                    if runtime_superseded:
+                        deadlines.append(now + 1)
                     self._runtime_retry_at = min(deadlines) if deadlines else None
             return count
         finally:
@@ -1127,6 +1142,10 @@ class Feed:
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
+        if canonical_only and 'processes' not in bundle:
+            # Decision-only readers have no runtime authority. Carry at commit,
+            # not at read start, so they cannot restore a pre-birth/exit snapshot.
+            bundle = {**bundle, 'processes': prev['bundle'].get('processes', [])}
         board_refresh = not observation_only and (authoritative or board_current or not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0))
         merged = canonical_only
         if prev and not authoritative:
