@@ -570,18 +570,21 @@ class Feed:
         read_at = self.clock()
         r = self.readers if readers is None else readers
         stages = {} if stages is None else stages
-        def timed(name, fn, *args):
+        def timed(name, fn, *args, **kwargs):
             began = time.monotonic()
             try:
-                return fn(*args)
+                # Sibling scopes attribute this thread's CPU, including failed reads.
+                # Core descendants remain inclusive; do not sum them with these stages.
+                with accounted_pass('session_panel.compute.' + name.removesuffix('_s')):
+                    return fn(*args, **kwargs)
             finally:
                 stages[name] = round(stages.get(name, 0) + time.monotonic() - began, 4)
-        lineage = list(timed('lineage_s', r.lineage, session)) or [session]
+        lineage = timed('lineage_s', lambda: list(r.lineage(session))) or [session]
         if base is not None and lineage != base['lineage']:
             self._wake.set()
             raise RuntimeError('board-only read changed lineage; full hydration required')
-        tasks = list(timed('linked_s', r.linked, lineage))
-        done = list(timed('done_s', r.done, lineage))
+        tasks = timed('linked_s', lambda: list(r.linked(lineage)))
+        done = timed('done_s', lambda: list(r.done(lineage)))
         cards: dict[str, dict] = {}
         queue = [(str(t.get('id')), str(t.get('board') or 'default'), t, 0) for t in tasks if t.get('id')]
         seen: set[str] = set()
@@ -608,8 +611,9 @@ class Feed:
         if base is None and callable(read_inputs):
             canonical_seq = next(self._seq)
             inputs = timed('panel_inputs_s', read_inputs, session, lineage)
-        return panel_bundle(session, lineage, tasks, done, cards, computed_at=read_at,
-                            computed_seq=seq, inputs=inputs, canonical_seq=canonical_seq, base=base)
+        return timed('reduction_s', panel_bundle, session, lineage, tasks, done, cards,
+                     computed_at=read_at, computed_seq=seq, inputs=inputs,
+                     canonical_seq=canonical_seq, base=base)
 
     def _decision_result(self, session, base, seq, *, failed):
         """Set read availability only from the newest completed scoped attempt."""
