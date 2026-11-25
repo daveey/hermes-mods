@@ -34,13 +34,18 @@ test('titlebar tool: keyboard select opens the panel, mouse select leaves it to 
   const tool = T.titlebarTool({})
   let shown = 0
   const on = () => shown++
-  window.addEventListener(T.SHOW_EVENT, on)
+  window.addEventListener(T.TOGGLE_EVENT, on)
   try {
     tool.onSelect({ detail: 1 })
     assert.equal(shown, 0)
     tool.onSelect({ detail: 0 })
     assert.equal(shown, 1)
+    const outer = {}
+    tool.onSelect({ detail: 1, target: outer, currentTarget: outer })
+    assert.equal(shown, 2, 'outer button padding toggles')
+    tool.onSelect({ detail: 1, target: {}, currentTarget: outer })
+    assert.equal(shown, 2, 'span descendants are handled by Radix, not twice')
   } finally {
-    window.removeEventListener(T.SHOW_EVENT, on)
+    window.removeEventListener(T.TOGGLE_EVENT, on)
   }
 })

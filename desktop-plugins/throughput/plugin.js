@@ -35,6 +35,7 @@ const NOREP = 'These gateways don\u2019t report this metric yet (their Board cou
 const BAR = 'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 const TB_CHIP = 'hermes-tp-tbchip'
 export const TITLEBAR_SPAN = 8 // titlebar cells (8 x 24 px; the core's span cap), left of llm-split (order 50)
+export const TOGGLE_EVENT = 'hermes-toggle-throughput'
 export const SHOW_EVENT = 'hermes-show-throughput'
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
@@ -790,6 +791,19 @@ export function ChipMenu({ throttle, failed = false, busy = false, error = null,
 
 export function Throughput({ ctx, placement = 'bar' }) {
   const [open, setOpen] = useState(false)
+  const triggerRef = useRef(null), panelRef = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    // Radix's document pointerdown bookkeeping can miss a bubbling event stopped by
+    // the titlebar button (including portaled panel events). Capture the actual outside
+    // click, without dismissing on focus/movement or treating the button's padding as outside.
+    const outside = (e) => {
+      const trigger = triggerRef.current?.closest('button') || triggerRef.current
+      if (!trigger?.contains(e.target) && !panelRef.current?.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('click', outside, true)
+    return () => document.removeEventListener('click', outside, true)
+  }, [open])
   const [menuOpen, setMenuOpen] = useState(false)
   const [view, setViewState] = useState(loadView)
   const [filter, setFilter] = useState({ solo: null, hidden: [] })
@@ -976,8 +990,10 @@ export function Throughput({ ctx, placement = 'bar' }) {
     : `Loading models ${view.range}…`
   useEffect(() => {
     const show = () => setOpen(true)
-    window.addEventListener('hermes-show-throughput', show)
-    return () => window.removeEventListener('hermes-show-throughput', show)
+    const toggle = () => setOpen((value) => !value)
+    window.addEventListener(SHOW_EVENT, show)
+    window.addEventListener(TOGGLE_EVENT, toggle)
+    return () => { window.removeEventListener(SHOW_EVENT, show); window.removeEventListener(TOGGLE_EVENT, toggle) }
   }, [])
   // The chip and the legend keep the last good payload (any range) through a range switch or a failed poll;
   // the charts draw only the selected range's own data.
@@ -992,7 +1008,7 @@ export function Throughput({ ctx, placement = 'bar' }) {
   const label = n ? `${fmt(n.tok)} tok/${view.unit} \u00b7 ${fmt(n.cards)} cards/${view.unit}` : 'Throughput \u2026'
   // In the titlebar the chip sits inside the titlebar tool's own <button>: render a span trigger, not a nested button.
   const inTitlebar = placement === 'titlebar'
-  const chip = h(inTitlebar ? 'span' : 'button', { ...(inTitlebar ? {} : { type: 'button' }), className: inTitlebar ? TB_CHIP : BAR, 'data-slot': 'throughput-chip', 'aria-label': `Show throughput: ${label}`, title: 'Throughput: tokens and cards done per ' + { s: 'second', m: 'minute', h: 'hour' }[view.unit] + ' (rate now) \u00b7 right-click: limit and raise' },
+  const chip = h(inTitlebar ? 'span' : 'button', { ref: triggerRef, ...(inTitlebar ? {} : { type: 'button' }), className: inTitlebar ? TB_CHIP : BAR, 'data-slot': 'throughput-chip', 'aria-label': `Show throughput: ${label}`, title: 'Throughput: tokens and cards done per ' + { s: 'second', m: 'minute', h: 'hour' }[view.unit] + ' (rate now) \u00b7 right-click: limit and raise' },
     n ? h(Spark, { values: n.spark }) : null,
     h('span', { className: 'hermes-tp-chiptext' }, label))
   return h(Popover, { open, onOpenChange: setOpen },
@@ -1001,7 +1017,17 @@ export function Throughput({ ctx, placement = 'bar' }) {
       h(ContextMenuContent, { className: 'hermes-tp-menu', 'data-slot': 'throughput-menu' },
         h(ChipMenu, { throttle: throttleQuery.data || null, failed: throttleQuery.isError && !throttleQuery.data, busy: limitBusy, error: throttleError || burstError, onLimit, onBurst, onEndBurst, openPanel: () => setOpen(true) }))),
     h(PopoverContent, {
+      ref: panelRef,
+      // Keep focus on the titlebar trigger; portal autofocus otherwise bubbles into its Tooltip.
+      onOpenAutoFocus: (e) => e.preventDefault(),
       side: inTitlebar ? 'bottom' : 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
+      // Portaled panel events bubble through the titlebar button's React tree, not its DOM tree.
+      onFocus: (e) => e.stopPropagation(),
+      onClick: (e) => e.stopPropagation(),
+      onPointerDown: (e) => e.stopPropagation(),
+      onKeyDown: (e) => { if (e.key !== 'Escape') e.stopPropagation() },
+      // Close on an outside click (or Escape, or the chip), never because focus or the pointer moved away.
+      onFocusOutside: (e) => e.preventDefault(),
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
       ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onLimit, limitBusy, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
@@ -1167,8 +1193,10 @@ export function titlebarTool(ctx, component) {
     span: TITLEBAR_SPAN,
     className: 'hermes-tp-tool',
     icon: h(TitlebarHost, { ctx, component }),
-    // Mouse clicks reach the span's own popover trigger; Enter/Space on the focused button arrive with detail 0.
-    onSelect: (event) => { if (!event || event.detail === 0) window.dispatchEvent(new window.Event(SHOW_EVENT)) }
+    // The span trigger handles its descendants. The outer button handles keyboard and its own padding.
+    onSelect: (event) => {
+      if (!event || event.detail === 0 || (event.currentTarget && event.target === event.currentTarget)) window.dispatchEvent(new window.Event(TOGGLE_EVENT))
+    }
   }
 }
 
