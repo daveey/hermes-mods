@@ -2071,12 +2071,14 @@ def waiting_inputs() -> Any:
     _inputs_local.hit = None
     _inputs_local.failed = True
     unportable: Optional[Exception] = None
-    with wi.accounting_pass("chat-closeout.waiting_inputs") as acct, _proof_pass():
+    with wi.accounting_pass("chat-closeout.waiting_inputs") as acct:
         try:
-            rows = _pending_rows()
-            parts = _input_parts(rows, time.time())
-            # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
-            key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
+            # Observe the same boundary as accounting, including reader setup/cleanup failures.
+            with _proof_pass():
+                rows = _pending_rows()
+                parts = _input_parts(rows, time.time())
+                # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
+                key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
         except sqlite3.OperationalError as exc:
             # Class-only counters hide the failing query. Record code and source sites, never the
             # exception message, SQL parameters, source text or full paths (those may be private).
@@ -2093,6 +2095,13 @@ def waiting_inputs() -> Any:
             # through ``waiting_source``. A fallback, not an error; it is re-raised below, outside the pass. Any
             # other exception still escapes inside the pass and counts as an error (with its class on newer cores).
             acct.fallback()
+            sites, tb = [], exc.__traceback__
+            while tb is not None:
+                code = tb.tb_frame.f_code
+                sites.append(f"{Path(code.co_filename).name}:{tb.tb_lineno}:{code.co_name}")
+                tb = tb.tb_next
+            logger.warning("chat-closeout: waiting_inputs no-adoption %s at %s",
+                           type(exc).__name__, " > ".join(sites[-8:]))
             unportable = exc
     if unportable is not None:
         raise unportable

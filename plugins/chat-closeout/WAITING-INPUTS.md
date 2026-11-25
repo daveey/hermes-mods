@@ -51,6 +51,11 @@ FULL marks, ordering and the portable digest remain identical. A cold observer c
 same value independently; its cursor is used only to reject FULL/restore/regression, never as a value.
 `waiting_inputs` OperationalErrors retain normal propagation and accounting, with a warning containing
 only the SQLite error name and basename/line/function source sites (no exception text, SQL or parameters).
+The diagnostic encloses proof-reader entry and cleanup as well as the key body, matching the accounting
+boundary. Designed no-adoption fallbacks also log their exception class and source sites, never their raw
+reason (which may include a private path). Both preserve the original exception and fail-closed behavior.
+An absent earlier warning does not establish which query failed; boundary-fault regression tests establish
+diagnostic coverage, not attribution of a historical production exception.
 Missing certification, unknown freshness, errors and older cores force fresh reads. Failed declarations
 also discard the same-thread reusable input and bypass the three-second answer and row memos.
 
