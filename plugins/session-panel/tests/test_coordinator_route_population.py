@@ -62,6 +62,10 @@ def test_real_64_chat_routes_share_40_shared_and_distinct_details_without_projec
             costs.append(cost.finish())
     monkeypatch.setattr(lane, '_project', pure)
     try:
+        # Set up the source independently of the synchronous request's existing
+        # 3s budget. This is a materialization/I/O contract, not a latency gate.
+        # Joining owned workers preserves all population and route assertions.
+        drain(lane)
         f.changes(sessions)
         drain(lane)
         assert len(counts) == 104 and set(counts.values()) == {1}
