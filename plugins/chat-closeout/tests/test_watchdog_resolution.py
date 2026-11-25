@@ -90,6 +90,40 @@ def incident(monkeypatch):
             yield led, kb, connect_closing
 
 
+@pytest.mark.parametrize('fixture_name', ['incident', 'real_board'])
+def test_fixture_joins_outcome_writer_before_removing_home(monkeypatch, fixture_name):
+    if fixture_name == 'real_board':
+        from test_stuck_watchdog import real_board
+        fixture_func = real_board
+    else:
+        fixture_func = incident
+    fixture = getattr(fixture_func, '__wrapped__')(monkeypatch)
+    next(fixture)
+    home = Path(os.environ['HERMES_HOME'])
+    release = threading.Event()
+    observations = []
+    worker = threading.Thread(target=lambda: (release.wait(), observations.append(home.is_dir())),
+                              name='card-transition-outcome', daemon=True)
+    join = worker.join
+    joined = []
+
+    def release_and_join(timeout=None):
+        joined.append(True)
+        release.set()
+        join(timeout)
+
+    monkeypatch.setattr(worker, 'join', release_and_join)
+    worker.start()
+    try:
+        fixture.close()
+        assert joined, 'fixture did not drain its outcome writer'
+        assert observations == [True], 'writer ran after its home was removed'
+    finally:
+        release.set()
+        join(10)
+        fixture.close()
+
+
 def raise_unseen(incident):
     led, kb, connect = incident
     plugin.watchdog_tick(now=1, mono=1, unseen={'chat': 1}, force=True)
