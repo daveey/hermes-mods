@@ -1003,6 +1003,29 @@ def _acked(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT body FROM task_comments WHERE task_id=?", (task_id,)))
 
 
+def register_with(activity) -> bool:
+    """Register only this read-only check and its companions; never install generic plugin hooks.
+
+    Callers supply the core registry explicitly. Importing this module and registration perform no
+    board reads, home resolution, model calls or plugin discovery.
+    """
+    fn = getattr(activity, 'register_done_check', None)
+    if fn is None:
+        return False
+    import inspect
+
+    try:
+        declares = 'watch_paths' in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        declares = False
+    if declares:
+        fn('kanban-honest-done', needs_attention,
+           watch_paths=attention_watch_paths, next_deadline=attention_next_deadline)
+    else:
+        fn('kanban-honest-done', needs_attention)
+    return True
+
+
 def needs_attention(card: dict[str, Any], paths: Optional[list[Path]] = None) -> bool:
     """True when a completed card's handoff admits dropped work and no follow-up card carries it.
 

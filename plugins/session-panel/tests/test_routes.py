@@ -378,6 +378,7 @@ def test_snapshot_save_and_load_round_trip_and_refusals(tmp_path, monkeypatch, c
     first = f.changes(['S1'])
     path = tmp_path / 'feed.json'
     assert api.save_snapshot(f, path, claim=True)
+    assert api.write_timing(f, tmp_path / 'timing.json')
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, 'chat content: owner only'
     snap = api.load_snapshot(path)
     assert snap['epoch'] == first['epoch'] and snap['rev'] == f.rev and set(snap['bundles']) == {'S1'}
@@ -389,6 +390,11 @@ def test_snapshot_save_and_load_round_trip_and_refusals(tmp_path, monkeypatch, c
         bad = dict(head, **{key: value})
         (tmp_path / 'bad.json').write_text(json.dumps(bad) + '\n' + path.read_text().split('\n', 1)[1])
         assert api.load_snapshot(tmp_path / 'bad.json') is None, key
+    # Adjacent valid identity fields must not mask malformed JSON container types.
+    body = path.read_text().split('\n', 1)[1]
+    for bad_head, bad_body in (([], body), (head, '[]')):
+        (tmp_path / 'shape.json').write_text(json.dumps(bad_head) + '\n' + bad_body)
+        assert api.load_snapshot(tmp_path / 'shape.json') is None
     # A newer process claimed the file (its generation is higher): this one never overwrites it, and says so once.
     body = path.read_text().split('\n', 1)[1]
     path.write_text(json.dumps(dict(head, gen=mine + 1, owner_pid=1)) + '\n' + body)

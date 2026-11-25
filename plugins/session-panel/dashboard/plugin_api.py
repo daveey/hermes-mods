@@ -59,6 +59,8 @@ log = logging.getLogger(PLUGIN_ID)
 
 
 _FEED_KEY = '_session_panel_feed_core'
+# Effective source-mode switches that change what the producer emits (_mitigation: unset == enabled).
+_MANIFEST_MODES = ('HERMES_PANEL_COALESCE', 'HERMES_PANEL_DUTY', 'HERMES_PANEL_SKIP_QUEUE_POSITION')
 _FEED_PATH = Path(__file__).resolve().parent / 'feed.py'
 # Process-wide (not per plugin_api generation: a hot reload re-imports this file while the old generation's threads
 # may still call their own _load_feed): one lock and a generation counter for loading feed.py.
@@ -104,6 +106,56 @@ def _external_projection():
         if getattr(_LOADER, 'facts_registration', None) is not None:
             raise RuntimeError('external projection conflicts with legacy facts custody')
     return external
+
+
+def _legacy_fenced() -> bool:
+    """True from legacy retirement (or a stored external selection at start) until the lifecycle's own
+    successor step lifts it. Retained callbacks (reload RESTART, facts latch, request fallbacks) check this
+    instead of reviving a retired generation; a failed drain or failed external start keeps it set."""
+    return bool(getattr(_LOADER, 'legacy_fenced', False))
+
+
+def _panel_start_lock():
+    """Reload-stable serialization of feed installation and positive retirement."""
+    return _LOADER.__dict__.setdefault('panel_start_lock', threading.RLock())
+
+
+def _authorize_legacy():
+    guard = getattr(_LOADER, 'panel_participant', None)
+    if guard is not None and guard._owner is None:
+        from hermes_cli.serve_producer_admission import _wait_gate
+        with _wait_gate(guard.runtime, time.monotonic() + 10) as gate:
+            guard.begin_legacy(gate)
+
+
+def _start_legacy_authorized() -> bool:
+    """The lifecycle's one successor step: same stable custody before lifting the fence."""
+    with _panel_start_lock():
+        _authorize_legacy()
+        _LOADER.legacy_fenced = False
+        return start_publication()
+
+
+def _legacy_http_unavailable() -> bool:
+    """Missing relay during selected external custody is unavailable, never legacy authority.
+
+    Observe only already-published lifecycle state here: requests must not read the mode file,
+    wait for admission, or start a successor. The original ON environment must not defeat a
+    completed rollback; after installation the lifecycle, not that environment, owns the mode.
+    """
+    if _legacy_fenced():
+        return True
+    lifecycle = getattr(_LOADER, 'panel_lifecycle', None)
+    if lifecycle is not None:
+        return lifecycle.state != 'off' or not lifecycle._legacy_running
+    return (os.environ.get('HERMES_SERVE_PRODUCERS_EXTERNAL') != '0'
+            and os.environ.get('HERMES_SERVE_PANEL_EXTERNAL', '').strip().lower()
+            in ('1', 'true', 'yes', 'on'))
+
+
+def _panel_unavailable_response():
+    return Response(b'{"detail":"Session panel unavailable"}', status_code=503,
+                    media_type='application/json', headers={'Retry-After': '1'})
 
 
 def _feed_stamp() -> tuple:
@@ -300,11 +352,20 @@ class CoreReaders:
         with self._unavailable_lock:
             return frozenset(self._unavailable_hits)
 
+    def snapshot_identity(self) -> dict:
+        if self._explicit_home() is not None and getattr(self, 'producer_snapshot_scope', False):
+            # The shared source producer belongs to an authorized home/generation, not its exec argv
+            # or one attaching Desktop slot. Slot identity is stamped separately on each transport reply.
+            ident = self._home_identity()
+            return {'feed': f'{ident.get("gateway") or "local"}:panel', 'profile': ident['profile']}
+        return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+
     def snapshot_path(self) -> Path:
         ctx = self._explicit_home()
         if ctx is None:
             return _snapshot_path()
-        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{self._home_identity()["profile"]}-{ctx.namespace()}')
+        role = 'panel' if getattr(self, 'producer_snapshot_scope', False) else FEED_ROLE
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{role}-{self._home_identity()["profile"]}-{ctx.namespace()}')
         return ctx.home / 'session-panel' / f'feed-{safe}.json'
 
     def timing_path(self) -> Path:
@@ -1562,6 +1623,227 @@ def _emit(payload: dict) -> None:
     broadcast_plugin_event(PLUGIN_ID, 'changed', push_payload(payload))
 
 
+def attach_external(relay) -> None:
+    """Bind an exec relay: HTTP projection serving plus ordered event delivery to this serve's clients.
+
+    Dormant: nothing in this module calls it; the lifecycle owner does, after COMPLETE admission."""
+    if getattr(relay, 'retired', True):
+        raise RuntimeError('relay retired: a retained callback cannot attach a withdrawn generation')
+    _LOADER.external_projection = relay
+    relay.set_event_sink(_emit)
+
+
+def detach_external(relay) -> None:
+    relay.set_event_sink(None)
+    if getattr(_LOADER, 'external_projection', None) is relay:
+        _LOADER.external_projection = None
+
+
+def _callback_bootstrap_mod():
+    name = '_session_panel_callback_bootstrap'
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name('callback_bootstrap.py'))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault(name, module)
+    return module
+
+
+def _panel_provider_spec() -> dict:
+    """Exact producer-safe manifest: the provider and every sibling file it loads, by digest."""
+    import hashlib
+    from hermes_cli.serve_producer_callbacks import capture
+    callback_registry = capture()
+    base = Path(__file__).resolve().parent
+    def digest(name: str) -> str:
+        return hashlib.sha256((base / name).read_bytes()).hexdigest()
+
+    # The factory imports plugin_api for CoreReaders/feed helpers but never calls plugin register().
+    # Include those actual bootstrap bytes; the child checks loaded digests AFTER the factory returns.
+    names = sorted(p.name for p in base.glob('*.py'))
+    return {'path': str(base / 'producer_provider.py'), 'sha256': digest('producer_provider.py'),
+            'partitioned': True,  # one child serves several canonical homes, each bound server-side
+            'manifest': {
+                'version': 1,
+                'providers': {Path(n).stem: {'path': n, 'sha256': digest(n)} for n in names},
+                'callbacks': {'done': [], 'waiting': []},
+                'callback_registry': callback_registry,
+                'callback_bootstrap': _callback_bootstrap_mod().capture_support(callback_registry),
+                'modes': {name: _mitigation(name) for name in _MANIFEST_MODES},
+                'facts': {'HERMES_FACTS_PANEL': _mitigation('HERMES_FACTS_PANEL')}}}
+
+
+def _retire_legacy_panel(timeout: float = 25.0) -> bool:
+    # Close admission before joining a scheduled starter. A starter that has not
+    # entered the reload-stable lock will recheck the fence instead of reviving it.
+    _LOADER.legacy_fenced = True
+    starting = _LOADER.__dict__.get('starting')
+    if starting is not None and starting.is_alive():
+        starting.join(min(10.0, timeout))
+        if starting.is_alive():
+            return False
+    with _panel_start_lock():
+        return _retire_legacy_locked(timeout)
+
+
+def _retire_legacy_locked(timeout: float = 25.0) -> bool:
+    """Positive retirement of this process's legacy owner: True only when EVERY lane is gone (feed, decision,
+    board and watch threads plus board capture workers and the capacity service) and the process feed slot is
+    cleared. The fence goes up first and stays up on any failure: no retained callback restarts a legacy owner."""
+    _LOADER.legacy_fenced = True
+    core = sys.modules.get(_FEED_KEY)
+    starting = _LOADER.__dict__.get('starting')
+    if starting is not None and starting.is_alive():
+        starting.join(min(10.0, timeout))
+        if starting.is_alive():
+            return False
+    f = getattr(core, 'PROCESS_FEED', None)
+    if f is not None:
+        for attr in ('_wake', '_decide', '_board'):
+            event = getattr(f, attr, None)
+            if event is not None:
+                event.set()
+        if not _quiesce(f, timeout):
+            return False
+        if getattr(_LOADER, 'facts_registration', None) is not None:
+            return False  # FACTS custody is not ours to drop here
+        core.PROCESS_FEED = None
+    return True
+
+
+def panel_initial_payload(binding=None):
+    """Mandatory first publication: complete status wire, not an empty mailbox. A partitioned child needs the
+    home claim the owner will publish READY for, so the spawning serve's own binding rides in the initial."""
+    body = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+    if binding is not None:
+        body['_partition'] = binding.wire()
+    return {'body': body, 'accepted': time.monotonic()}
+
+
+def _serve_home():
+    """The one home this process is authorized to serve: its own launch home, never a request label."""
+    from hermes_constants import get_process_hermes_home
+    return Path(get_process_hermes_home())
+
+
+def current_binding(app_state=None):
+    """Server-derived (canonical home, lifecycle, authorization) binding for THIS serve; HomeRevoked if none."""
+    from hermes_cli import serve_producer_home as homes
+    return homes.bind(_serve_home(), app_state)
+
+
+def _partition_still_current(identity) -> bool:
+    from hermes_cli import serve_producer_home as homes
+    return homes.is_current(homes.HomeBinding(*identity), getattr(_LOADER, 'app_state', None))
+
+
+def make_panel_relay(home, runtime, generation=None, *, binding=None):
+    """Production factory: one shared owner, complete initial before broker READY, bound to one served home."""
+    import secrets
+    from hermes_cli.serve_producer_runtime import ProjectionRelay
+    if binding is None:
+        binding = current_binding()  # HomeRevoked: this serve has no authorized home, so no relay exists
+    relay = ProjectionRelay(
+        _panel_provider_spec(), home=home, runtime=runtime,
+        generation=generation or secrets.token_hex(16),
+        initial=panel_initial_payload(binding),
+    )
+    relay.partition_check = _partition_still_current
+    relay.bind_partition(binding)
+    return relay
+
+
+def _bound_external(request=None):
+    """The external relay with its home binding re-derived for THIS request, or None when not external.
+
+    Authorization and generation checks only (stat/in-memory): a changed or revoked binding is revoked in the
+    relay (queued work, outputs, ACKs, events) before any reply; an unauthorized serve leaves the relay unbound,
+    so the route answers 503 rather than another home's or a stale generation's bytes."""
+    external = _external_projection()
+    # getattr(..., False) already covers a missing external; keep one observable authority predicate.
+    if not getattr(external, 'partitioned', False):
+        return external
+    from hermes_cli import serve_producer_home as homes
+    state = getattr(getattr(request, 'app', None), 'state', None)
+    if state is not None:
+        _LOADER.app_state = state
+    try:
+        # Another request can replace the retained slot; this request keeps its own captured authority.
+        external.bind_partition(current_binding(state if state is not None else getattr(_LOADER, 'app_state', None)))
+    except (homes.HomeRevoked, OSError, ValueError):
+        external.unbind_partition()
+    return external
+
+
+def install_panel_lifecycle(environ=None):
+    """Join the one installation-local mode/custody seam. Returns the lifecycle, or None only when core has
+    no seam (an older core: legacy only).
+
+    A serve naming neither selector joins read-only: it creates no installation state, never writes the mode
+    and starts its legacy owner, but it watches the revisioned mode like every OFF serve (a cheap stat poll).
+    Dormant: nothing selects external mode on a real serve until the activation owner sets it."""
+    env = os.environ if environ is None else environ
+    try:
+        from hermes_cli import serve_producer_lifecycle as lifecycle_mod
+        from hermes_cli import serve_producer_mode as mode_mod
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return None  # an older core has no seam: legacy only
+    from hermes_constants import get_default_hermes_root
+    # The installation is the Hermes root this serve's home belongs to, so every compatible serve of one
+    # installation joins the same broker/child; the served home itself is bound per request, not here.
+    installation = Path(get_default_hermes_root(home=get_hermes_home()))
+    # Preserve the supported launcher's existing stable lock/receipt domain.
+    runtime = installation / 'serve-producer-v1'
+    if env.get('HERMES_SERVE_PANEL_EXTERNAL') is not None or env.get('HERMES_SERVE_PRODUCERS_EXTERNAL') is not None:
+        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mode_mod.initialize_mode(installation, dict(env))
+    external = mode_mod.effective_external(installation, dict(env))
+    from hermes_cli.serve_producer_retirement import bind_panel
+    server = bind_panel(runtime, installation, _retire_legacy_panel, start_lock=_panel_start_lock())
+    _LOADER.panel_retirement = server
+    _LOADER.panel_participant = server.participant
+
+    def make_relay():
+        return make_panel_relay(installation, runtime)
+
+    def admit():
+        from hermes_cli._startup_fast import project_root_str
+        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)  # first external start creates the custody dirs
+        return lifecycle_mod.default_admit(runtime, Path(project_root_str()), root=installation)
+
+    def publish_initial(relay, timeout=60.0):
+        key = relay.submit(panel_initial_payload())  # the relay stamps its own home binding
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if relay.read(key) is not None:
+                return True
+            time.sleep(0.05)
+        return False
+
+    lifecycle = lifecycle_mod.PanelLifecycle(
+        installation, admit=admit,
+        retire_legacy=_retire_legacy_panel, start_legacy=_start_legacy_authorized, make_relay=make_relay,
+        publish_initial=publish_initial, attach=attach_external, detach=detach_external,
+        environ=dict(env), legacy_running=not external)
+    _LOADER.panel_lifecycle = lifecycle
+    if external:
+        _LOADER.legacy_fenced = True  # a stored external selection: no legacy owner before the lifecycle's say
+    else:
+        from hermes_cli.serve_producer_admission import AdmissionUnavailable
+        from hermes_cli.serve_producer_custody import CustodyConflict
+        try:
+            _start_legacy_authorized()  # only one OFF process owns the stable family/execution fences
+        except (AdmissionUnavailable, CustodyConflict) as exc:
+            _LOADER.legacy_fenced = True
+            lifecycle._legacy_running = False
+            lifecycle._fail(f'legacy custody unavailable: {exc}')
+    lifecycle.start_watching()
+    return lifecycle
+
+
 def _launch_profile() -> str:
     """The profile this process serves when no request scopes it: read on a fresh thread (no request context)."""
     out = ['default']
@@ -1649,8 +1931,9 @@ def write_timing(f, path: Optional[Path] = None) -> bool:
     try:
         explicit = _explicit_readers(f)
         path = path or (explicit.timing_path() if explicit is not None else timing_path())
+        identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
         with f.lock:
-            body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
+            body = {**identity, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
@@ -1751,7 +2034,8 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
                 _warn(f'claimed:{path}', 'session-panel feed: snapshot not saved; a newer process (claim %s, pid %s) '
                       'carries this feed on', held_gen, held.get('owner_pid'))
                 return False
-            head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
+            identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+            head = {'version': snap['version'], **identity, 'epoch': snap['epoch'],
                     'rev': snap['rev'], 'saved_at': snap['saved_at'], 'gen': mine, 'owner_pid': os.getpid()}
             tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
             fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)  # chat and card content: owner only
@@ -1790,8 +2074,9 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None, r
         _warn('load', 'session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
         return None
     now = time.time() if now is None else now
-    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != FEED_ID \
-            or head.get('profile') != LAUNCH_PROFILE or head.get('epoch') != snap.get('epoch'):
+    identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != identity['feed'] \
+            or head.get('profile') != identity['profile'] or head.get('epoch') != snap.get('epoch'):
         return None
     try:
         if now - float(head.get('saved_at')) > RESTORE_MAX_AGE_S:
@@ -1801,9 +2086,19 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None, r
     return snap
 
 def feed():
+    with _panel_start_lock():
+        if _legacy_fenced():
+            raise RuntimeError('legacy feed startup fenced by the panel lifecycle')
+        _authorize_legacy()
+        return _feed_locked()
+
+
+def _feed_locked():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
     if _external_projection() is not None:
         raise RuntimeError('external projection excludes legacy feed startup')
+    if _legacy_fenced():
+        raise RuntimeError('legacy feed startup fenced by the panel lifecycle')
     while True:
         core = _load_feed()
         with core.PROCESS_LOCK:
@@ -2056,6 +2351,8 @@ def _facts_mode_changed(mode, generation, *, token=None):
     """Off-request latch callback; repeated generations never duplicate lanes."""
     if mode not in ('legacy', 'facts'):
         raise ValueError('unsupported facts mode')
+    if _legacy_fenced():
+        return  # a delayed latch callback never restarts a retired or fenced legacy owner
     core = _load_feed()
     _LOADER.__dict__.setdefault('facts_transition_lock', threading.Lock())
     with _LOADER.facts_transition_lock:
@@ -2519,9 +2816,10 @@ def _settle(f, last_start: float) -> None:
 
 def _run_decisions(f) -> None:
     """A blocked board sweep must not delay a recorded decision's status line."""
-    # Own current-generation readers: the existing Feed may have been constructed
-    # through an older API whose readers do not implement the cheap decision path.
-    readers = CoreReaders()
+    # Own current-generation readers without discarding the feed's explicit-home authority.
+    explicit = _explicit_readers(f)
+    readers = CoreReaders() if explicit is None else CoreReaders(
+        home_context=explicit.home_context, installation=explicit.installation)
     try:
         first = True
         last = None
@@ -2558,7 +2856,10 @@ def _run_decisions(f) -> None:
 
 def _run_board(f, lane_type) -> None:
     """Source admission stays responsive while reconciliation or another chat blocks."""
-    lane = lane_type(f, CoreReaders)
+    explicit = _explicit_readers(f)  # an explicit-home feed never falls back to ambient readers on this lane
+    factory = CoreReaders if explicit is None else (
+        lambda: CoreReaders(home_context=explicit.home_context, installation=explicit.installation))
+    lane = lane_type(f, factory)
     lane.start_service()
     first = True
     last = None
@@ -2701,7 +3002,7 @@ _WIRE_PREFIX = json.dumps({'feed': FEED_ID, 'profile': LAUNCH_PROFILE},
 def start_publication() -> bool:
     """Start (or resume) the process's feed on its own thread; True when a start was launched. Disk restore and the
     feed lifecycle locks never run on an interactive request. One start in flight per process."""
-    if _external_projection() is not None:
+    if _external_projection() is not None or _legacy_fenced():
         return False
     running = _LOADER.__dict__.get('starting')
     if running is not None and running.is_alive():
@@ -2716,13 +3017,16 @@ def _serves_desktop(name: str = __name__, role: str = FEED_ROLE) -> bool:
     """True when core's web server imported this file as the plugin's API in a backend that serves Desktops
     (`hermes serve` / `hermes dashboard`). Core's app runs a lifespan, so a router startup hook never fires, and
     plugin routes may be mounted long after startup: the import is the one moment every such process passes."""
-    return name.startswith('hermes_dashboard_plugin_') and role.split('-', 1)[0] in ('serve', 'dashboard')
+    return name.startswith('hermes_dashboard_plugin_') and (
+        role.split('-', 1)[0] in ('serve', 'dashboard') or os.environ.get('HERMES_PLUGIN_HOST_PROCESS') == '1')
 
 
 if _serves_desktop():
     # The producer runs before the first click: a restarted backend restores its saved bundles and recomputes them
     # while Desktops reconnect, instead of starting on (and making wait) the first request.
-    start_publication()
+    # A serve that names its panel mode (stage selector / master override) joins the mode seam instead.
+    if _external_projection() is None and install_panel_lifecycle() is None:
+        start_publication()
 
 
 @router.post('/changes')
@@ -2730,12 +3034,14 @@ async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    external = _external_projection()
+    external = _bound_external(request)
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
         command = body.model_dump()
         command['_wire_identity'] = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
         return projection_response(external, command)
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this
@@ -2750,7 +3056,14 @@ async def changes(body: ChangesBody, request: Request):
 
 
 @router.get('/status')
-def status():
+def status(request: Request):
+    external = _bound_external(request)
+    if external is not None:
+        from hermes_cli.serve_producer_runtime import projection_response
+        command = {'_verb': 'status', '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+        return projection_response(external, command)
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None:
         return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'running': False}
@@ -2768,12 +3081,25 @@ class DecisionRefreshBody(BaseModel):
 
 
 @router.post('/decision-refresh')
-async def decision_refresh(body: DecisionRefreshBody):
+async def decision_refresh(body: DecisionRefreshBody, request: Request):
     # Server reads canonical state; the caller cannot submit a model or receipt
     # as presentation authority. Never join the background sweep or feed lane.
     from fastapi import HTTPException
     if _request_profile() != LAUNCH_PROFILE:
         raise HTTPException(409, 'Panel profile unavailable')
+    external = _bound_external(request)
+    if external is not None:
+        from hermes_cli.serve_producer_runtime import projection_response
+        command = {'_verb': 'decision-refresh', 'session': body.session,
+                   '_wire_identity': {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}}
+        response = projection_response(external, command, consume=True)
+        if response.status_code == 503:
+            raise HTTPException(503, 'Session panel decision pending', headers={'Retry-After': '1'})
+        if response.body.startswith(b'{"_conflict":'):
+            raise HTTPException(409, json.loads(response.body)['_conflict'])
+        return response
+    if _legacy_http_unavailable():
+        return _panel_unavailable_response()
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or f.stopped.is_set():
         raise HTTPException(503, 'Session panel starting')
