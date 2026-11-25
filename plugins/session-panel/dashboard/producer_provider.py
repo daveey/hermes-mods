@@ -129,7 +129,9 @@ class PanelProducerSet:
             raise ValueError('home partition required')
         producer = self._producer(wire)
         clean = {key: value for key, value in body.items() if key != '_partition'}
-        if isinstance(payload, dict) and 'body' in payload:
+        # Reaching here requires a mapping body and a valid partition. A non-dict payload
+        # was also the body above and could not pass that requirement.
+        if 'body' in payload:
             return producer(dict(payload, body=clean))
         return producer(clean)
 
