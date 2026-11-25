@@ -56,6 +56,10 @@ def lines(path):
 @pytest.fixture(autouse=True)
 def fake_bin(monkeypatch):
     monkeypatch.setenv('SESSION_REPAIR_HERMES', 'hermes')
+    def prepare(sd):
+        run._write_json(sd / 'chat.json', {'session': 'repair-routed'})
+        return 'repair-routed'
+    monkeypatch.setattr(run, 'prepare_consumer', prepare)
 
 
 def test_off_does_not_scan_but_records_tick(tmp_path):
@@ -165,7 +169,7 @@ def test_live_starts_one_turn_with_the_prompt_and_marks_only_what_the_turn_handl
                    now=1000.0, run_mode='live')
     assert len(hermes.chats()) == 1
     argv = hermes.chats()[0]
-    assert argv[:7] == ['hermes', 'chat', '-c', 'Session repair', '--create-if-missing', '--oneshot', '-Q']
+    assert argv[:6] == ['hermes', 'chat', '--resume', 'repair-routed', '--oneshot', '-Q']
     assert '-s' not in argv and '-t' not in argv, 'a resumed chat refuses creation flags: the skill is named in the prompt'
     prompt = (tmp_path / 'session-repair' / 'last-prompt.md').read_text()
     assert '{{' not in prompt and 'broken-sessions' in prompt
@@ -252,11 +256,15 @@ def test_live_pins_the_repair_chat_once_it_exists(tmp_path):
     c = sqlite3.connect(tmp_path / 'state.db')
     c.execute('CREATE TABLE sessions (id TEXT, title TEXT, archived INTEGER, pinned INTEGER, started_at REAL)')
     c.execute("INSERT INTO sessions VALUES ('R1', 'Session repair', 0, 0, 5.0)")
+    c.execute("INSERT INTO sessions VALUES ('repair-routed', 'Session repair (routed)', 0, 0, 6.0)")
+    # A newer title collision must never replace the verified consumer identity.
+    c.execute("INSERT INTO sessions VALUES ('foreign', 'Session repair (routed)', 0, 0, 9.0)")
     c.commit()
     hermes = FakeHermes()
     run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=hermes, now=1000.0, run_mode='live')
-    assert ['hermes', 'sessions', 'pin', 'R1'] in hermes.calls
-    assert json.loads((tmp_path / 'session-repair' / 'chat.json').read_text()) == {'session': 'R1'}
+    assert ['hermes', 'sessions', 'pin', 'repair-routed'] in hermes.calls
+    assert not any(cmd[-1] in ('R1', 'foreign') for cmd in hermes.calls)
+    assert json.loads((tmp_path / 'session-repair' / 'chat.json').read_text()) == {'session': 'repair-routed'}
     c.execute("UPDATE sessions SET pinned = 1")
     c.commit()
     hermes2 = FakeHermes()
@@ -273,9 +281,10 @@ def test_parse_result_takes_the_last_block():
 def test_the_turn_argv_parses_with_cores_own_cli_parser(tmp_path):
     _parser = pytest.importorskip('hermes_cli._parser')
     parser, _subs, _chat = _parser.build_top_level_parser()
-    args = parser.parse_args(run.turn_argv(tmp_path / 'p.md')[1:])
-    assert args.command == 'chat' and args.continue_last == 'Session repair' and args.create_if_missing
+    args = parser.parse_args(run.turn_argv(tmp_path / 'p.md', 'repair-routed')[1:])
+    assert args.command == 'chat' and args.resume == 'repair-routed' and not getattr(args, 'create_if_missing', False)
     assert args.oneshot_exit and args.oneshot is None and args.quiet and args.source == 'cli' and args.query_file == str(tmp_path / 'p.md')
+    assert args.model == 'class:standard' and args.provider == 'auto'
     notice_cmd = ['chat', '--resume', 'S9', '--oneshot', '-Q', '-q', '[Kanban close-out] x']
     a2 = parser.parse_args(notice_cmd)
     assert a2.resume == 'S9' and a2.oneshot_exit and a2.query == '[Kanban close-out] x'

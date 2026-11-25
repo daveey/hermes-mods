@@ -42,7 +42,7 @@ DEDUPE_S = 24 * 3600
 CARDS_PER_RUN = 5
 CARDS_PER_DAY = 20
 FIXES_PER_RUN = 20
-CHAT_TITLE = 'Session repair'
+CHAT_TITLE = 'Session repair (routed)'
 TURN_TIMEOUT_S = 45 * 60
 SKILL = 'broken-sessions'
 BACKOFF_BASE_S = 15 * 60
@@ -264,9 +264,20 @@ def hermes_argv() -> list[str]:
     return [found] if found else [sys.executable, '-m', 'hermes_cli.main']
 
 
-def turn_argv(prompt_path: Path) -> list[str]:
-    return hermes_argv() + ['chat', '-c', CHAT_TITLE, '--create-if-missing', '--oneshot', '-Q', '--source', 'cli',
-                            '--query-file', str(prompt_path)]
+def prepare_consumer(sd: Path) -> str:
+    spec = importlib.util.spec_from_file_location('_session_repair_consumer', HERE / 'consumer.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sid = mod.prepare()
+    _write_json(sd / 'chat.json', {'session': sid})
+    return sid
+
+
+def turn_argv(prompt_path: Path, session: str) -> list[str]:
+    # Resume only the policy-verified class-routed session, not the legacy
+    # titled CLI path (which creates with profile defaults, discarding flags).
+    return hermes_argv() + ['chat', '--resume', session, '--oneshot', '-Q', '--source', 'cli',
+                            '--model', 'class:standard', '--provider', 'auto', '--query-file', str(prompt_path)]
 
 
 def build_prompt(take: list[dict], *, card_budget: int, deferred: int) -> str:
@@ -302,7 +313,11 @@ def start_turn(prompt: str, sd: Path, runner: Callable[..., Any] = subprocess.ru
     path = sd / 'last-prompt.md'
     path.write_text(prompt)
     try:
-        r = runner(turn_argv(path), capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
+        session = prepare_consumer(sd)
+    except (ImportError, OSError, ValueError) as e:
+        return False, f'consumer preparation: {type(e).__name__}: {e}', ''
+    try:
+        r = runner(turn_argv(path, session), capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as e:
         return False, f'{type(e).__name__}: {e}', ''
     tail = ((r.stdout or '')[-4000:] + ('\n' + (r.stderr or '')[-800:] if r.stderr else '')).strip()
@@ -322,8 +337,10 @@ def pin_chat(sd: Path, runner: Callable[..., Any] = subprocess.run, home: Option
         c = sqlite3.connect(f'file:{db}?mode=rw', uri=True, timeout=5)
         try:
             c.execute('PRAGMA query_only=ON')
-            row = c.execute('SELECT id, pinned FROM sessions WHERE title = ? AND archived = 0 ORDER BY started_at DESC '
-                            'LIMIT 1', (CHAT_TITLE,)).fetchone()
+            sid = _read_json(sd / 'chat.json', {}).get('session')
+            if not isinstance(sid, str) or not sid:
+                return None
+            row = c.execute('SELECT id, pinned FROM sessions WHERE id = ? AND archived = 0', (sid,)).fetchone()
         finally:
             c.close()
     except sqlite3.Error:  # pinning is a convenience; the turn already happened

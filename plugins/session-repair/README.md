@@ -52,9 +52,15 @@ so a core helper that tried to write raises instead (`tests/test_readonly.py`).
 
 - `off`: no scan or repair (still records a tick summary).
 - `shadow`: findings not seen in 24 h go to `actions-shadow.jsonl` as `would: fix|file`; no turn, no write.
-- `live`: those findings (under the caps) go to ONE turn in the chat titled **Session repair**:
-  `hermes chat -c "Session repair" --create-if-missing --oneshot -Q --source cli --query-file last-prompt.md`
-  (resolves the existing chat by title, creates it the first time; the argv is tested against core's own parser).
+- `live`: those findings (under the caps) go to ONE turn in **Session repair (routed)**.
+  `consumer.py` uses the canonical gateway store to create/resolve that stable title with explicit
+  `model: class:standard, provider: auto`, then reads back its exact identity and frozen launch policy.
+  Only a policy-verified session is resumed:
+  `hermes chat --resume <verified-id> --oneshot -Q --source cli --model class:standard --provider auto --query-file last-prompt.md`.
+  Legacy titled CLI creation discards launch selectors, and resuming cannot change frozen policy; the old
+  repair chat is retained without mutation. Existing-title policy mismatch refuses the turn, never migrates
+  it. Normal dynamic route eligibility still applies; this is not a quota override. Action/delivery ledgers
+  and unknown-delivery identities stay unchanged. Pinning uses the verified ID, never a newer title collision.
   The prompt is `prompt.md` + the findings JSON, each with an `idempotency_key` `session-repair:<fingerprint>:<UTC
   YYYYMMDD>`; it names the skill (a resumed chat refuses `-s`). The turn applies the `auto` fixes, files fix cards
   by the card policy (look for open work first and comment instead; name open work on the subsystem; `area: card` =
@@ -146,9 +152,8 @@ The tick is a Hermes cron **no-agent** job every 15 min (`hermes cron create --n
 `cron/AGENTS.md`: "`no_agent=True` makes the script the whole job"; empty stdout = silent). Cron has no fixed-session
 option for agent jobs (each run gets its own session; `--continuity` only injects the previous output), and a
 `wakeAgent` gated agent job would also run in a new session each time, so the script starts the agent turn itself
-with `hermes chat -c "Session repair" --create-if-missing`, the supported way to append to one titled chat
-(`hermes_cli/main.py` `_resolve_continue_arg`). The scan runs only when the tick runs; the turn only when something
-is new.
+with `consumer.py`'s canonical class-routed creation/readback followed by exact-ID resume. The scan runs only
+when the tick runs; the turn only when something is new.
 
 ## Install (hub)
 
