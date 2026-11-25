@@ -57,6 +57,12 @@ For all-board dashboards, propagate flow completeness beyond governor counts int
 
 When consuming core governor snapshots, keep complete governor counters separate from capped per-card receipts: `truncated` makes affected lane counts and exact held-card navigation incomplete, not a smaller authoritative count. Carry each board's flow-read completeness independently of its tick freshness; a fresh tick cannot certify a failed flow read as zero held or “starting”. Mark affected lane details unknown/disable exact-set navigation while retaining healthy sibling lanes and full known global counters. Prove this through real dispatcher fixtures with a reduced receipt cap and an injected flow-read failure, then assert the rendered sidebar; persist selected lane as well as section expansion and test unmount/remount.
 
+## Composed Desktop SDK coverage
+
+Test contribution areas together as well as separately: when above-Pinned sidebar and Sessions-tab totals both exist, mount registered contributions and verify totals placement, status selection, actual session-filter matching/clear/unmount cleanup and the not-live indicator. Reuse one state/filter owner for modern totals-only and legacy strip layouts; registering a tab contribution is insufficient if its state owner is never mounted.
+
+Use core freshness_bound(doc) for governor cursor expiry and exclude tick completion/gap diagnostics from semantic decisions while still renewing freshness deadlines. Preserve unknown newer governor ids as unknown rows with charged counters; version skew must not assert the whole lanes view offline.
+
 ## Multi-board projection correctness
 
 Arm each SQLite deadline when that board's work starts, not when sibling connections open. Contain context, summary and receipt failures to their source; one interrupted sibling must not take the view offline. Prove slow first and later boards with real dispatcher DBs, actual expired progress handlers, healthy sibling rendering and recovery. Share unknown/partial summary formatting between the sidebar and old-SDK strip/panel; assert both mounts from one real projection, including visible unknown lanes, shares and governor held counts.
