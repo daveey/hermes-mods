@@ -51,3 +51,6 @@ async def put_split(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         return await asyncio.to_thread(c.apply, c.hermes_root(), mode, share)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (OSError, RuntimeError) as e:
+        # Preserve write/rollback diagnostics for the control's error display.
+        raise HTTPException(status_code=500, detail=str(e))
