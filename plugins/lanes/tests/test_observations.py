@@ -301,3 +301,102 @@ def test_terminal_observations_live_for_one_hour_and_failed_reads_are_not_values
     assert set(terminal.reader(ctx).values) == {'closed', 'merged'}
     clock[0] = 4200
     assert terminal.reader(ctx).values == {}
+
+
+def test_trace_distinguishes_expiry_retry_invalidation_and_process_local_cold():
+    module = load()
+    clock, factory, events = [0.], Counting(), []
+    store = module.Observations(factory, clock=lambda: clock[0],
+                                trace=lambda *a, **kw: events.append((a, kw)))
+    poke(store, {'pr': 'h1'})
+    poke(store, {'pr': 'h1'})
+    assert [kw['reason'] for a, kw in events if a[1] == 'fill'] == ['cold']
+    clock[0] = 600
+    poke(store, {'pr': 'h1'})
+    assert events[-2][1] == {'reason': 'expiry', 'age': 600}
+    poke(store, {'pr': 'h2'})
+    assert any(a[1] == 'invalidate' and a[3] == 'h1' for a, kw in events)
+    assert events[-2][1]['reason'] == 'retry'
+    factory.fail = True
+    poke(store, {'pr': 'h3'})
+    assert events[-1][1]['outcome'] == 'failed'
+    assert store.reader({'pr': 'h3'}).get('pr') == {}
+    assert module.Observations(factory).cache_id != store.cache_id
+
+
+def test_trace_sink_runs_outside_observer_lock():
+    module = load()
+    factory, events = Counting(), []
+    def sink(*args, **fields):
+        assert store.lock.acquire(blocking=False)
+        store.lock.release()
+        events.append(args[1])
+    store = module.Observations(factory, trace=sink)
+    poke(store, {'pr': 'h1'})
+    poke(store, {'pr': 'h2'})
+    assert events == ['fill', 'result', 'invalidate', 'fill', 'result']
+
+
+def test_trace_errors_do_not_strand_refresh_and_discarded_results_are_distinct():
+    module = load()
+    def broken(*a, **kw):
+        raise OSError('unavailable')
+    store = module.Observations(Counting(), trace=broken)
+    poke(store, {'pr': 'h1'})
+    assert store.reader({'pr': 'h1'}).get('pr')['approved']
+    assert store.thread is None
+    records = []
+    class Changing:
+        def prefetch(self, urls):
+            changing.reader({'pr': 'h2'})
+        def get(self, url):
+            return {'merged': False}
+    changing = module.Observations(Changing, trace=lambda *a, **kw: records.append((a, kw)))
+    poke(changing, {'pr': 'h1'})
+    assert records[-1][1]['outcome'] == 'discarded'
+    assert changing.reader({'pr': 'h2'}).get('pr') == {}
+
+
+def trace_module():
+    spec = importlib.util.spec_from_file_location('lanes_trace_test', Path(__file__).parents[1] / 'dashboard' / 'observation_trace.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_trace_ring_bounded_private_and_nonblocking(tmp_path, monkeypatch):
+    import fcntl
+    import json
+    import os
+    module = trace_module()
+    path = tmp_path / 'trace.json'
+    for i in range(module.CAP + 4):
+        module.emit({'event': 'fill', 'index': i}, path=path)
+    rows = json.loads(path.read_text())
+    assert len(rows) == module.CAP and rows[0]['index'] == 4
+    assert rows[-1]['pid'] == os.getpid() and rows[-1]['at'] > 0
+    assert path.stat().st_mode & 0o777 == 0o600
+    with path.open('rb') as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = path.read_bytes()
+        module.emit({'event': 'skipped'}, path=path)
+        assert path.read_bytes() == before
+    captured = []
+    monkeypatch.setattr(module, 'emit', captured.append)
+    module.observer_trace('cache', 'fill', 'https://example.com/private', {'secret': 'payload'}, reason='cold')
+    assert 'private' not in json.dumps(captured) and 'payload' not in json.dumps(captured)
+    assert len(captured[0]['url']) == len(captured[0]['context']) == 16
+
+
+def test_trace_rejects_symlink_and_recovers_corruption(tmp_path):
+    import json
+    module = trace_module()
+    target, link = tmp_path / 'target', tmp_path / 'link'
+    target.write_text('sentinel')
+    link.symlink_to(target)
+    module.emit({'event': 'fill'}, path=link)
+    assert target.read_text() == 'sentinel'
+    module.emit({'event': 'fill'}, path=target)
+    assert json.loads(target.read_text())[0]['event'] == 'fill'
+    module.emit({'event': 'fill'}, path=tmp_path / 'absent' / 'trace')

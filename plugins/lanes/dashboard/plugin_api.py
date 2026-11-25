@@ -183,7 +183,7 @@ def _observations():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.Observations(Reader)
+    return module.Observations(Reader, trace=_sibling('observation_trace').observer_trace)
 
 
 @lru_cache(maxsize=1)

@@ -10,6 +10,7 @@ import copy
 import logging
 import threading
 import time
+import uuid
 
 # Display-only data: each PR costs ~4 GitHub GraphQL requests per read, and the
 # 5000/h bucket is shared per GitHub user. An entry is re-read only after it
@@ -33,8 +34,11 @@ class Published:
 
 
 class Observations:
-    def __init__(self, factory, ttl=TTL_S, clock=time.monotonic):
+    def __init__(self, factory, ttl=TTL_S, clock=time.monotonic, trace=None):
         self.factory, self.ttl, self.clock = factory, ttl, clock
+        self.trace = trace
+        self.cache_id = uuid.uuid4().hex
+        self.attempted = set()
         self.lock = threading.Lock()
         self.contexts = {}
         self.values = {}  # url -> (context, read-start, observation)
@@ -61,14 +65,27 @@ class Observations:
         return self.revision, tuple(sorted(fresh)), retry_ready
 
     def reader(self, contexts):
+        invalidated = []
         with self.lock:
             if contexts != self.contexts:
+                invalidated = [(u, ctx) for u, ctx in self.contexts.items() if contexts.get(u) != ctx]
                 self.contexts = dict(contexts)
+                self.attempted.intersection_update(contexts)
                 self.values = {u: v for u, v in self.values.items() if contexts.get(u) == v[0]}
                 self.terminal.intersection_update(self.values)
                 self.pending = {u: c for u, c in self.pending.items() if contexts.get(u) == c}
                 self.revision += 1
-            return Published(self, dict(contexts), copy.deepcopy(self._fresh_values()), self._cursor())
+            published = Published(self, dict(contexts), copy.deepcopy(self._fresh_values()), self._cursor())
+        for url, ctx in invalidated:
+            self._trace('invalidate', url, ctx, removed=url not in contexts)
+        return published
+
+    def _trace(self, event, url, context, **fields):
+        if self.trace is not None:
+            try:
+                self.trace(self.cache_id, event, url, context, **fields)
+            except (OSError, ValueError, TypeError, ImportError):
+                pass  # diagnostics cannot change provider evidence or strand the worker
 
     def cursor(self):
         with self.lock:
@@ -100,7 +117,16 @@ class Observations:
                     return
                 job, self.pending = self.pending, {}
                 self.active = job
+                reasons = {}
+                for url in job:
+                    prior = self.values.get(url)
+                    reasons[url] = ('expiry' if prior else 'retry' if url in self.attempted else 'cold',
+                                    self.clock() - prior[1] if prior else None)
+                self.attempted.update(job)
             started = self.clock()
+            for url, ctx in job.items():
+                reason, age = reasons[url]
+                self._trace('fill', url, ctx, reason=reason, age=age)
             values = {}
             terminal = set()
             failed = False
@@ -130,6 +156,11 @@ class Observations:
                             self.terminal.add(url)
                 if before != self._fresh_values():
                     self.revision += 1
+                outcomes = {url: ('discarded' if self.contexts.get(url) != ctx else
+                                  'success' if values.get(url) or url in terminal else 'failed')
+                            for url, ctx in job.items()}
+            for url, ctx in job.items():
+                self._trace('result', url, ctx, outcome=outcomes[url], elapsed=self.clock() - started)
                 # No periodic network work without another projection request.
 
     def join(self, timeout):

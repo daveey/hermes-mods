@@ -226,6 +226,12 @@ Entries expire 600 seconds after read **start** for OPEN PRs and 3600 seconds fo
 MERGED/CLOSED PRs (CLOSED recognition requires the additive core Reader state seam).
 Expiry/publication wakes the stream's normal hash-deduplicated path; all-failed
 batches retain exponential retry backoff. Failed reads are not cached as observations.
+A best-effort diagnostic ring at `$HERMES_HOME/logs/lanes-pr-observations.json`
+retains at most 256 records (256 KiB). It records process/cache identities, hashed
+URL/context identities, cold/retry/expiry fills, invalidations and outcomes. It
+contains no raw URLs or board payloads, skips filesystem errors/contention and
+runs outside the observation lock. This diagnoses cross-process duplication and
+context churn without adding a watcher or changing refresh/error policy.
 Each URL binds to its cards' explicit PR/head evidence and contract/status; comments,
 dispatch skips/holds, wake bookkeeping and plain heartbeat/watch ticks do not evict it.
 A changed PR/head event on an owning card invalidates its old observation immediately on
