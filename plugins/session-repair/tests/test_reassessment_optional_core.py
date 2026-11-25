@@ -54,18 +54,25 @@ def test_absent_replica_module_is_silent_non_authority(world, monkeypatch):
     assert errors == []
 
 
-def test_missing_unrelated_dependency_is_still_an_error(world, monkeypatch):
+@pytest.mark.parametrize(('missing_name', 'message'), [
+    pytest.param('some_runtime_dep', "No module named 'some_runtime_dep'", id='external-dependency'),
+    pytest.param('hermes_cli.unrelated', "No module named 'hermes_cli.unrelated'", id='core-sibling'),
+    pytest.param(None, 'missing dependency without a module name', id='unknown-name'),
+    pytest.param('some_runtime_dep', "No module named 'hermes_cli.kanban_owner_reassessment'",
+                 id='misleading-message'),
+])
+def test_missing_unrelated_dependency_is_still_an_error(world, monkeypatch, missing_name, message):
     env, tid = world
     core, replica = types.ModuleType(CORE), types.ModuleType(REPLICA)
     core.producer = lambda *a: {}
     def missing(*a, **kw):
-        raise ModuleNotFoundError("No module named 'some_runtime_dep'", name='some_runtime_dep')
+        raise ModuleNotFoundError(message, name=missing_name)
     replica.verified_for_event = missing
     monkeypatch.setitem(sys.modules, CORE, core)
     monkeypatch.setitem(sys.modules, REPLICA, replica)
     found, errors = run(env, tid)
     assert found and found[0]['variant'] == 'too_long'
-    assert any('some_runtime_dep' in e for e in errors)
+    assert any('owner reassessment' in e and message in e for e in errors)
 
 
 def test_runtime_failure_on_capable_core_is_still_an_error(world, monkeypatch):
