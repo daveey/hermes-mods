@@ -26,6 +26,15 @@ class Source:
                     result.append(None)
         return tuple(result)
 
+    def _cover(self):
+        assert self.events is not None
+        from pathlib import Path
+        directories = tuple(p for p in self.paths if Path(p).is_dir())
+        if directories:
+            self.events.replace(self.paths, directories=directories)
+        else:
+            self.events.replace(self.paths)
+
     def read(self, capture):
         with self.lock:
             if self.fallback:
@@ -49,11 +58,11 @@ class Source:
                 # again with coverage installed so discovery cannot swallow a write.
                 if not self.paths:
                     _, self.paths = capture()
-                self.events.replace(self.paths)
+                self._cover()
                 self.value, paths = capture()
                 if paths != self.paths:
                     self.paths = paths
-                    self.events.replace(paths)
+                    self._cover()
                     self.value, _ = capture()
                 self.pending = False
                 return self.value

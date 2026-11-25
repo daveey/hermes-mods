@@ -13,6 +13,32 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
+## Governor/sidebar projection
+
+The view adds `governors` from persisted `kanban_governors.snapshot` receipts
+across every active board on this gateway. `scope[]` identifies source, gateway,
+board, age and availability. Exclusive dispatcher-first-stop counts conserve the
+snapshot idle total; overlaps and capped card-ID samples never inflate counts.
+`llm_pool` is one subscription-pool row, with provider breakdown only in details.
+Missing/stale core sources remain unknown. The optional
+`state/governors/mac-mini.json` adapter is a device-only lane footnote, not fleet
+accounting; it expires after three reported cadences.
+
+`GET /api/plugins/lanes/v1/governors` exposes the same governor projection.
+Independent boards use tracked read-only snapshots, without DB initialization,
+and share one PR-observation scope so one board cannot evict another's results.
+Source notifications include board metadata, DBs and governor files; clock expiry
+invalidates freshness without polling admission checks. All numbers remain
+server-rendered. The Desktop sidebar supports persisted collapse, lane details,
+existing lane-control PUTs, unknown state and last-known offline values. Older
+SDKs without sidebar sections retain the original strip.
+
+Integration tests create real temporary boards and run the core dispatcher,
+then feed actual producer output through `view.py` into the React/jsdom sidebar.
+Install `desktop-plugins/lanes/tests/package.json` to exercise those DOM checks.
+Above-Pinned placement and exact multi-board held-card navigation require the
+companion additive Desktop SDK seams; an unhandled browser event is not a filter.
+
 ## Shared human-attention coverage
 
 With the companion core API, `needs_you(card)` classifies both lane cards and
