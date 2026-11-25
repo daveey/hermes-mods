@@ -43,7 +43,12 @@ completion/refill. Readers obtained for acquisition are released on their owner
 thread. The canonical reader remains independently owned by Feed.
 
 Pending projections have one coalesced entry per chat, retaining the first
-unserved queue age. Source completions enqueue only the store's affected
+unserved queue age. A successful publication retires that episode's age with
+its attempt, even while the completed worker still owns its slot until actual
+thread exit. A newly queued episode cannot reuse the served age. Publication-
+parent CAS supersession rearms an already-failed retry before queue-readiness
+checks, preserving its failure count and finite budget; an observation-only
+parent replacement is not a new projector failure. Source completions enqueue only the store's affected
 admissions. Completion-driven refill cannot wait for the next strict external
 capture. A local write after strict-entry, including a newly watched chat, can
 acquire and publish its known component while external coverage remains unknown.

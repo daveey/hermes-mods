@@ -1069,6 +1069,13 @@ class SourceCoordinator:
                     if self.tokens.get(s) is self.feed._watch_tokens.get(s) and s in self.feed.interest:
                         self.tickets.setdefault(s, []).extend(tickets)
                         tickets = []
+                        # A same-admission observation can replace the writer
+                        # parent while a failed projection's retry is running.
+                        # Its consumed deadline is not a fresh failure budget:
+                        # rearm before _queue checks readiness, retaining count.
+                        attempt = self.projection_attempts.get(s)
+                        if attempt is not None and attempt.count and attempt.retry_at is None:
+                            attempt.retry_at = self.feed.clock()
                         self._queue([s])
                     else:
                         for ticket in tickets:
@@ -1088,6 +1095,10 @@ class SourceCoordinator:
                     # owed and preserve their original first-unserved age.
                     self.pending.pop(s, None)
                     self.projection_attempts.pop(s, None)
+                    # The episode is served, even if its thread has not exited.
+                    # Retain active/role custody separately; a new episode must
+                    # not inherit this already-served first-unserved age.
+                    self._active_ages.pop(s, None)
                 elif result.disposition in {'stored', 'no_change'}:
                     # Success served this attempt, but a post-pin request is
                     # still owed. Re-arm its existing finite budget; leaving
