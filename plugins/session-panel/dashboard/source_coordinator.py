@@ -362,6 +362,13 @@ class SourceCoordinator:
         if len(set(prior_sources) | set(self.sources) | {self.external}) > stopped._limits[1]:
             raise self.module.SnapshotCapacity('compatible transfer source capacity exceeded')
         store = self.module.SnapshotStore.transfer(stopped)
+        # Transfer retains immutable history, not authority for an acquisition
+        # executor absent from this successor. Revoke its scope certificates via
+        # the fixed B1 reset API while keeping rows explicitly missing/stale.
+        # In particular a healthy predecessor must not certify removed/path-
+        # replaced sources merely because it had no failed retry to inherit.
+        for source in sorted(set(prior_sources) - current_sources):
+            store.reset(source)
         # Newly discovered sources are missing, not inferred from transferred
         # coverage. Unchanged source keys retain their exact immutable versions.
         for source in (*self.sources, self.external):

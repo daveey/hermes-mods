@@ -87,10 +87,18 @@ capture retains its already consumed attempt and gets a finite backoff; reload
 is not a new source event or fresh retry budget. A real changed stamp or changed
 exact demand continues to be the retry recovery boundary. Retry/source-scope
 custody transfers only for keys in the successor reader's actual current source
-inventory (plus its strict external source). Historical immutable store versions
-may remain for fenced partial history, but removed keys have no executor and
-cannot contribute inherited retry deadlines. Unchanged keys retain their exact
-counts/deadlines; added keys start missing, never certified by this filtering.
+inventory (plus its strict external source). Historical immutable store rows
+may remain for fenced partial history, but removed keys have no executor:
+`SnapshotStore.reset` revokes their scope receipts and advances their source
+generation before any successor publication. They remain explicitly missing/stale,
+never authoritative empty or healthy current coverage, even if the predecessor
+was healthy. Canonical-path replacement is a removed old key plus a new missing
+key; only actual acquisition can cover the latter. Removed keys cannot contribute
+inherited retry deadlines. Unchanged keys retain exact versions/counts/deadlines;
+added keys start missing, never certified by this filtering. The real-CoreReaders
+`test_source_inventory_authority.py` matrix checks healthy removal, path replacement,
+unchanged inventory, two consecutive reloads and keyed/full publications; failed-
+acquisition removal controls remain in `test_source_reload_progress.py`.
 
 Canonical input bases/readers are not transferred. Carried bundles remain
 unvouched; metadata/current scope checks and current canonical reads still own
