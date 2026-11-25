@@ -26,6 +26,8 @@
 
 ## Producer design rules
 
+- Re-probe real process evidence on admitted birth/exit changes as well as before a live observation's TTL. An immediate birth after an empty sidebar probe can land inside the process adapter's short cache; a periodic schedule keyed only to returned process rows then never arms. Exercise empty cached inventory → actual terminal(background=true) birth without advancing the cache clock, plus a hold beyond the observation TTL and intentional stop. Distinguish backend/reducer lifecycle proof from mounted/native sidebar proof; preserve failed setup output and clean the disposable session even when an assertion or process-stop call fails.
+
 - Fail closed in the mounted Panel before the first heartbeat: older cached models can lack source freshness metadata, so an unspecified voucher keeps a legacy running header indefinitely. Test actual Panel with legacy cache and no heartbeat, not only renderModel with an explicit false voucher. Keep restored/expired/excluded and fresh controls; transport heartbeats never renew bundle computed_at.
 
 - Treat ceiling chat count as a work bound, not a latency bound. Preserve a real-loop slow-producer regression plus an event-blocked producer while an unrelated write publishes; fast fakes alone hide head-of-line blocking. When isolating canonical ceiling work, test same-owner/ancestor claims, hot handover, forgotten completions, finite asynchronous retries and wake clear/drain races. Retain other-chat producer obligations when an in-flight stamp read consumes a concurrent outcome write; do not blindly re-admit the producer's own completed writes.
