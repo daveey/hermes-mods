@@ -63,7 +63,7 @@ Include all limits, exclusions and expected outcomes. Go approves only that froz
 revision; Change plan grants no execution permission. One go covers the whole plan;
 never ask for it again. Never ask the user to type “say go”: user-steps files a free-text
 `::user-step` as a plan-less `needs_context` approval with no approve button, and a
-`session_outcome(kind=decide)` choice authorizes nothing. Do not wrap the published
+`session_outcome(kind=decide)` choice is no approval substitute. Do not wrap the published
 ask in another user-step: that creates a duplicate. If a plan is missing, supply it
 yourself before asking. The runtime same-message recovery is a backstop, not the
 publication contract. A runtime notice asking you to publish a draft's plan does not
