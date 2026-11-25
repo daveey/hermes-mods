@@ -13,16 +13,28 @@ DASH = Path(sys.argv[2]).resolve()
 sys.path.insert(0, str(ROOT))
 from hermes_cli.process_identity import register_self
 from hermes_cli.serve_producer_admission import supported_launch
-from hermes_cli.serve_producer_mode import write_mode
+from hermes_cli.serve_producer_mode import read_mode
 
 home = Path(os.environ['HERMES_HOME'])
+
+def set_mode(external):
+    """Exercise the supported argparse/dispatcher in a separate, fully exited process."""
+    result = subprocess.run(
+        [sys.executable, '-m', 'hermes_cli.main', 'producer-mode', '--panel-external',
+         str(external).lower(), '--installation', str(home)],
+        capture_output=True, text=True, timeout=120, check=False, cwd=ROOT)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    receipt = json.loads(result.stdout)
+    assert receipt == read_mode(home)
+    return receipt
+
 peer_mode = len(sys.argv) > 3 and sys.argv[3] == 'peer'
 assert register_self('serve', project_root=ROOT)
 supported_launch('serve')
 with sqlite3.connect(home / 'state.db') as db:
     db.execute('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
 if not peer_mode:
-    write_mode(home, external=False)
+    set_mode(False)
 name = '_supported_panel_probe'
 spec = importlib.util.spec_from_file_location(name, DASH / 'plugin_api.py')
 api = importlib.util.module_from_spec(spec)
@@ -69,7 +81,7 @@ try:
          "print('ready', flush=True); sys.stdin.buffer.read()", str(ROOT)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     assert gateway.stdout is not None and gateway.stdout.readline().strip() == b'ready'
-    write_mode(home, external=True)
+    set_mode(True)
     wait(lambda: lifecycle.state in ('external', 'unavailable'))
     assert lifecycle.state == 'external', lifecycle.reason
     first = lifecycle.relay
@@ -99,7 +111,7 @@ try:
         peer.wait(timeout=60)
     assert peer.returncode == 0
     print('fixture: setting OFF', file=sys.stderr, flush=True)
-    write_mode(home, external=False)
+    set_mode(False)
     print('fixture: waiting OFF', file=sys.stderr, flush=True)
     wait(lambda: lifecycle.state in ('off', 'unavailable'))
     print(f'fixture: OFF result {lifecycle.state} {lifecycle.reason}', file=sys.stderr, flush=True)
@@ -110,7 +122,7 @@ try:
     print(json.dumps({'gate': 'same PID external to OFF', 'pid': os.getpid(),
                       'old_relay_retired': first.retired, 'legacy_fenced': api._legacy_fenced()}), flush=True)
     # A retained callback or released witness must not prevent a second symmetric transition.
-    write_mode(home, external=True)
+    set_mode(True)
     wait(lambda: lifecycle.state in ('external', 'unavailable'))
     assert lifecycle.state == 'external', lifecycle.reason
     assert legacy.stopped.is_set() and lifecycle.relay is not first
@@ -118,7 +130,7 @@ try:
     second_key = second.submit({'body': body, 'accepted': time.monotonic()})
     wait(lambda: second.read(second_key) is not None)
     assert json.loads(second.read(second_key))['running'] is True
-    write_mode(home, external=False)
+    set_mode(False)
     wait(lambda: lifecycle.state in ('off', 'unavailable'))
     assert lifecycle.state == 'off', lifecycle.reason
     successor = sys.modules[api._FEED_KEY].PROCESS_FEED

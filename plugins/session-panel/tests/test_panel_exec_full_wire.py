@@ -25,8 +25,9 @@ def helper():
     return module
 
 
+@pytest.mark.parametrize('scenario', ['active', 'mixed'])
 @pytest.mark.parametrize('verb', ['changes', 'status', 'decision-refresh', 'events'])
-def test_real_exec_http_complete_bytes_match_legacy(home, monkeypatch, verb):
+def test_real_exec_http_complete_bytes_match_legacy(home, monkeypatch, verb, scenario):
     api = load('_full_wire_legacy_api', 'plugin_api.py')
     control = helper()
     legacy = legacy_feed(api)
@@ -38,14 +39,24 @@ def test_real_exec_http_complete_bytes_match_legacy(home, monkeypatch, verb):
                         lambda plugin, event, payload=None: frames.append(payload))
     # Non-ASCII survives the wire->IPC text->wire round trip without escaping drift.
     from hermes_cli.kanban_db_connect import connect
+    from hermes_cli import kanban_db
     with connect(home / 'kanban.db') as db:
         db.execute("UPDATE tasks SET title='Parity work — 雪'")
+        if scenario == 'mixed':
+            parent = kanban_db.create_task(db, title='Nested parent', session_id='chat')
+            kanban_db.create_task(db, title='Nested child', session_id='chat', parents=[parent])
+            for state in ('done', 'scheduled', 'blocked'):
+                task = kanban_db.create_task(db, title='Parity ' + state, session_id='chat')
+                db.execute('UPDATE tasks SET status=?, completed_at=? WHERE id=?',
+                           (state, int(control.WALL) - 1 if state == 'done' else None, task))
+
+    sessions = ['chat', 'absent', 'chat'] if scenario == 'mixed' and verb == 'changes' else ['chat']
     with control.clocks():
-        legacy.changes_bytes(['chat'])
+        legacy.changes_bytes(sessions)
         legacy._drain()
         legacy.tick()
         if verb == 'changes':
-            want = api._WIRE_PREFIX + legacy.prepared_changes_bytes(['chat'])[1:]
+            want = api._WIRE_PREFIX + legacy.prepared_changes_bytes(sessions)[1:]
         elif verb == 'events':
             want = json.dumps(api.push_payload(emitted[-1]), ensure_ascii=False, separators=(',', ':')).encode()
         elif verb == 'status':
@@ -79,7 +90,7 @@ def test_real_exec_http_complete_bytes_match_legacy(home, monkeypatch, verb):
                 elif verb == 'decision-refresh':
                     response = client.post('/decision-refresh', json={'session': 'chat'})
                 else:
-                    response = client.post('/changes', json={'sessions': ['chat']})
+                    response = client.post('/changes', json={'sessions': sessions})
                 if response.status_code == 200:
                     break
                 assert response.status_code == 503 and response.headers['retry-after'] == '1'
@@ -93,6 +104,23 @@ def test_real_exec_http_complete_bytes_match_legacy(home, monkeypatch, verb):
                 assert json.dumps(frame, ensure_ascii=False, separators=(',', ':')).encode() == want
             else:
                 assert response.content == want
+                if scenario == 'mixed' and verb == 'changes':
+                    for title in ('Nested parent', 'Nested child', 'Parity done', 'Parity scheduled', 'Parity blocked'):
+                        assert title.encode() in response.content, response.json()
+                    revision = response.json()['rev']
+                    with control.clocks():
+                        unchanged = api._WIRE_PREFIX + legacy.prepared_changes_bytes(
+                            sessions, since=revision, epoch='parity-epoch')[1:]
+                    again = client.post('/changes', json={'sessions': sessions, 'since': revision,
+                                                         'epoch': 'parity-epoch'})
+                    deadline = time.monotonic() + 30
+                    while again.status_code == 503:
+                        assert time.monotonic() < deadline
+                        time.sleep(.05)
+                        again = client.post('/changes', json={'sessions': sessions, 'since': revision,
+                                                             'epoch': 'parity-epoch'})
+                    assert again.status_code == 200
+                    assert again.content == unchanged
     finally:
         api.detach_external(relay)
         assert relay.close(timeout=10)

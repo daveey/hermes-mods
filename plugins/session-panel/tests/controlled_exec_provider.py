@@ -50,7 +50,7 @@ class Controlled:
         body = payload.get('body', payload)
         # Test-only scheduler: one real capture before serving, no background race.
         with clocks():
-            self.feed.changes_bytes(['chat'])
+            self.feed.changes_bytes(body.get('sessions') or ['chat'])
             self.feed._drain()
             self.feed.tick()
             return self.provider({'body': body, 'accepted': MONO})
