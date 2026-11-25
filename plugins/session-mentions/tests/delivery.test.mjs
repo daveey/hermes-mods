@@ -573,7 +573,10 @@ test('without /status age, a late claim counts the wait since the request\'s cre
 test('a created_at from a skewed gateway clock counts at most the maximum pickup delay, never less than none', async t => {
   const m = await load({ state })
   assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 - 7200 }, T0), m.MAX_PICKUP_DELAY_S) // gateway 2 h behind
-  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 7200 }, T0), 0) // gateway 2 h ahead
+  // Gateway ahead of this Mac: created_at after the claim proves only that the clocks differ, not that the
+  // request waited no time; count the most it can have waited.
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 7200 }, T0), m.MAX_PICKUP_DELAY_S) // gateway 2 h ahead
+  assert.equal(m.claimDelaySeconds({ created_at: T0 / 1000 + 5 }, T0), m.MAX_PICKUP_DELAY_S) // 5 s ahead
   assert.equal(m.claimDelaySeconds({}, T0), m.MAX_PICKUP_DELAY_S)
 })
 
@@ -613,4 +616,17 @@ test('a cross-gateway send hands the far courier only what is left after its own
   const ended = (Date.now() - T0) / 1000
   assert.equal(res.status, 'unknown'); assert.equal(res.retry_safe, false)
   assert.equal(ended <= 400, true, `forwarded send answered at ${ended} s: after the tool's wait`)
+})
+
+test('without /status age and with this Mac\'s clock behind the gateway\'s, the result still posts before the tool gives up', async t => {
+  fakeTime(t)
+  globalThis.window = { hermesDesktop: { api: async req => { if (req.path.includes('/status/')) throw new Error('gateway unreachable'); return {} } } }
+  const at = []
+  const m = await load(waitingHost(() => ({ status: 'queued', user_row_id: 3 }), at))
+  // The tool wrote the request 30 s before this claim (its pickup limit); the gateway's clock runs 2 min ahead.
+  const res = await onFakeTime(t, m.performRequest(toolSend({ wait_for_reply: 390, total_wait_seconds: 400, created_at: T0 / 1000 + 120 }), 'local', localConns))
+  assert.equal(res.reply_wait_seconds, 400 - 10 - m.MAX_PICKUP_DELAY_S)
+  // Claimed 30 s after the tool wrote it, the reply wait must end by the tool's 400 s mark (posting fills the last 10 s).
+  const ended = 30 + (Date.now() - T0) / 1000
+  assert.equal(ended <= 400, true, `ended ${ended} s after the tool wrote the request`)
 })

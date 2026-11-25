@@ -745,12 +745,16 @@ export const replyBudgetOf = (origin, req, claimedAt) => {
 }
 
 /** How long the request waited on its gateway before this Desktop claimed it, for when `/status` gives no age:
- *  the request's `created_at` (the gateway's clock) against this Desktop's claim time, bounded to
- *  [0, MAX_PICKUP_DELAY_S] because the two clocks differ; MAX_PICKUP_DELAY_S when the request has no `created_at`. */
+ *  the request's `created_at` (the gateway's clock) against this Desktop's claim time, capped at
+ *  MAX_PICKUP_DELAY_S because the two clocks differ; MAX_PICKUP_DELAY_S when the request has no `created_at` or
+ *  its `created_at` is after the claim (this Mac's clock is behind). */
 export function claimDelaySeconds(req, claimedAt = Date.now()) {
   const created = Number(req?.created_at)
-  if (!(created > 0)) return MAX_PICKUP_DELAY_S
-  return Math.max(0, Math.min(MAX_PICKUP_DELAY_S, claimedAt / 1000 - created))
+  const waited = claimedAt / 1000 - created
+  // A created_at after this claim only proves this Mac's clock is behind the gateway's: the request may still have
+  // waited the whole pickup window, and assuming none would let the reply wait end after the tool gave up.
+  if (!(created > 0) || waited < 0) return MAX_PICKUP_DELAY_S
+  return Math.min(MAX_PICKUP_DELAY_S, waited)
 }
 
 /** Asks the request's gateway whether its sender still waits (`GET /status/<id>`): true = stop re-submitting.
