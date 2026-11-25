@@ -466,6 +466,31 @@ def _devices_note(base) -> str:
     return ("Desktops draining this gateway now: " + ", ".join(seen)) if seen else "No Desktop is draining this gateway right now."
 
 
+def _pickup_diagnosis(base) -> str:
+    """Why nobody claimed a route-less request: no Desktop draining this gateway (quit/asleep: tell the owner,
+    retry later) versus live couriers that did not claim (busy or an older plugin: retry once, then report)."""
+    try:
+        live = rf.live_couriers(base)
+        if live:
+            return (f"{len(live)} Desktop courier(s) are live ({', '.join(sorted(str(c.get('device')) for c in live))}) "
+                    "but none claimed it within the wait; retry once, and if it repeats the Desktop is busy or runs an "
+                    "older session-mentions plugin.")
+        ages = []
+        for path in (base / "couriers").glob("*.json") if (base / "couriers").is_dir() else ():
+            try:
+                ages.append((time.time() - path.stat().st_mtime, path.stem))
+            except OSError:
+                continue
+        if ages:
+            age, dev = min(ages)
+            return (f"No Desktop is draining this gateway now (last courier `{dev}` was seen {int(age)}s ago: it is "
+                    "quitting, asleep or offline). Retry when it is back; a hub-resident session can use the "
+                    "hermes-hub courier for task reads/comments.")
+        return "No Desktop has ever drained this gateway's outbox here (no courier record): open Hermes Desktop on a Mac that reaches it."
+    except Exception:
+        return ""
+
+
 def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeout_seconds: float | None = None) -> str:
     base = rf.root()
     rid = uuid.uuid4().hex
@@ -518,7 +543,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
                             f"(only a Desktop that knows that gateway/Mac claims it). " + _devices_note(base)
                             + (" " + HUB_HINT if action.startswith("task_") else ""))
             return _err("The Hermes Desktop app did not pick up the request — it must be running with the "
-                        "session-mentions plugin enabled to reach other gateways.")
+                        "session-mentions plugin enabled to reach other gateways. " + _pickup_diagnosis(base))
         if action == "send" and _interrupted():
             # The turn was stopped or this call abandoned: nobody reads the answer, so stop the courier's retry.
             if rf.take_back(outbox):

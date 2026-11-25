@@ -151,3 +151,21 @@ def test_bounded_read_timeout_takes_back_its_unclaimed_request(tmp_path, monkeyp
     out = json.loads(sm._relay("task_list", {"gateway": "nous-1"}, "s1", 0, timeout_seconds=0.2))
     assert "Timed out" in out.get("error", ""), out
     assert not list((base / "outbox").iterdir())
+
+
+def test_routeless_pickup_timeout_says_why_nobody_claimed(tmp_path, monkeypatch):
+    """The bare "did not pick up" gave no way to tell a quit Desktop from a busy one; it now diagnoses the couriers."""
+    base = _base(tmp_path)
+    _relay_env(monkeypatch, base)
+    (base / "couriers" / "macbook.json").unlink()
+    out = json.loads(sm._relay("send", {}, "s1", 0))
+    assert "did not pick up" in out["error"] and "no courier record" in out["error"], out
+    stale = base / "couriers" / "macbook.json"
+    stale.write_text(json.dumps({"device": "macbook", "aliases": ["macbook"], "reach": [], "at": 0}))
+    old = time.time() - 300
+    os.utime(stale, (old, old))
+    out = json.loads(sm._relay("send", {}, "s1", 0))
+    assert "last courier `macbook` was seen" in out["error"] and "asleep" in out["error"], out
+    os.utime(stale, None)
+    out = json.loads(sm._relay("send", {}, "s1", 0))
+    assert "1 Desktop courier(s) are live (macbook)" in out["error"], out
