@@ -20,6 +20,7 @@ REQUIRED = {
     # It skips on a core without hermes_cli/kanban_release.py, so every case is named here.
     'test_kanban_mirror_release_core': {
         'test_default_unblock_on_a_scope_stopped_card_releases_it',
+        'test_default_unblock_on_a_plain_stop_asked_on_the_held_card_releases_it',
         'test_default_unblock_on_a_decision_card_releases_its_root',
         'test_custom_choice_ask_is_unchanged',
         'test_core_without_release_keeps_todays_unblock',

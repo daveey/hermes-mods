@@ -77,9 +77,17 @@ def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamp
 def decision_card(kb, c, root, *, stamped=True):
     """The decision card filed for ``root``'s pending stop, blocked on the brief's ask in session-a."""
     from hermes_cli import kanban_spend_decision as decision
-    decision.ensure_producer(c, root)
-    card = c.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
+    # Core stopped filing these at bbdf6ba4 (an ownerless budget stop is asked on the root by the stranded-park
+    # sweep), but release still resolves the open ones already on boards: replay one as the old producer filed it.
+    stop = decision.pending_episode(c, root)
+    episode = stop.get("uid") or str(stop["id"])
+    card = kb.create_task(c, title="Spend budget decision: Synthetic stopped card", assignee="default",
+                          created_by="kanban-spend-budget", idempotency_key=f"spend-budget-decision:{root}:{episode}")
     with kb.write_txn(c):
+        kb._append_event(c, card, "administrative_decision",
+                         {"role": "administrative_decision", "root_task": root, "root_episode": episode})
+        kb._append_event(c, root, decision.NOTICE,
+                         {"episode": episode, "producer": {"kind": "supervisor", "task_id": card}})
         c.execute("UPDATE tasks SET status='blocked', session_id='session-a' WHERE id=?", (card,))
         if stamped:
             file_ask(kb, c, card, offer(c, card))
@@ -139,6 +147,25 @@ def test_default_unblock_on_a_scope_stopped_card_releases_it(real):
                                        (task,)).fetchone()[0])
         assert renewed["authority_kind"] == "human"
         assert c.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual'", (task,)).fetchone()
+    finally:
+        c.close()
+
+
+def test_default_unblock_on_a_plain_stop_asked_on_the_held_card_releases_it(real):
+    """Today's path (core bbdf6ba4 on): an ownerless plain stop files no decision card; the stranded-park sweep
+    asks on the held card itself, stamped with the release it offers, and Unblock there releases it once."""
+    kb, connect, path, store, mod = real
+    c = connect(path)
+    try:
+        task = stopped(kb, c, cause=None)
+        assert not c.execute("SELECT 1 FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()
+        mirror, op = click(mod, store, path)
+        receipt = mirror.deliver(op)
+        assert receipt["released"] == task and receipt["outcome"] == "released"
+        assert mirror.readback(op, receipt) and mirror.deliver(op) == receipt  # a retry writes nothing more
+        assert status(c, task) == "ready"
+        (mandate,) = mandates(c, task)
+        assert mandate.endswith("Desktop Unblock, operation " + op["operationId"])
     finally:
         c.close()
 

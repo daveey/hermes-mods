@@ -17,6 +17,7 @@ def reports(directory):
 
 RELEASE_CASES = {
     'test_default_unblock_on_a_scope_stopped_card_releases_it',
+    'test_default_unblock_on_a_plain_stop_asked_on_the_held_card_releases_it',
     'test_default_unblock_on_a_decision_card_releases_its_root',
     'test_custom_choice_ask_is_unchanged',
     'test_core_without_release_keeps_todays_unblock',
@@ -41,8 +42,8 @@ def test_the_unblock_click_release_cases_are_required():
 
 def test_complete_manifest_passes(tmp_path, capsys):
     reports(tmp_path)
-    assert results.verify(tmp_path) == 22
-    assert '22 required PASS; 22 total PASS; 0 SKIP' in capsys.readouterr().out
+    assert results.verify(tmp_path) == 23
+    assert '23 required PASS; 23 total PASS; 0 SKIP' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('mutation', ['skipped', 'failure', 'error', 'missing-case',
