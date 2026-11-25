@@ -452,6 +452,27 @@ def test_snapshot_and_timing_default_to_the_explicit_home_namespace(api, worlds,
     assert tripwires == []
 
 
+def test_child_snapshot_uses_authorized_home_scope_not_exec_argv(api, worlds, monkeypatch):
+    provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_snapshot_scope_provider')
+    child_api = provider.open_provider({'home_context': ctx_for(worlds['explicit'])})
+    # open_provider owns a separate API module, just like the real exec import.
+    child = child_api.api
+    monkeypatch.setattr(child, 'FEED_ROLE', 'producer')
+    monkeypatch.setattr(child, 'FEED_ID', 'fixture:producer')
+    try:
+        assert child.save_snapshot(child_api.feed, claim=True)
+        assert child.write_timing(child_api.feed)
+        path = child_api.readers.snapshot_path()
+        assert 'producer' not in path.name
+        head = json.loads(path.read_text().splitlines()[0])
+        timing = json.loads(child_api.readers.timing_path().read_text())
+        assert head['feed'] != 'fixture:producer' and timing['feed'] == head['feed']
+        assert head['profile'] == timing['profile'] == child_api.readers._home_identity()['profile']
+        assert child.load_snapshot(readers=child_api.readers) is not None
+    finally:
+        child_api.close()
+
+
 def test_snapshot_paths_of_two_homes_with_equal_labels_do_not_collide(api, worlds, tmp_path):
     other = tmp_path / 'other' / 'researcher'
     seed_home(other, session='chat', marker='OTHER')

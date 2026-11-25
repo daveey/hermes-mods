@@ -352,11 +352,20 @@ class CoreReaders:
         with self._unavailable_lock:
             return frozenset(self._unavailable_hits)
 
+    def snapshot_identity(self) -> dict:
+        if self._explicit_home() is not None and getattr(self, 'producer_snapshot_scope', False):
+            # The shared source producer belongs to an authorized home/generation, not its exec argv
+            # or one attaching Desktop slot. Slot identity is stamped separately on each transport reply.
+            ident = self._home_identity()
+            return {'feed': f'{ident.get("gateway") or "local"}:panel', 'profile': ident['profile']}
+        return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+
     def snapshot_path(self) -> Path:
         ctx = self._explicit_home()
         if ctx is None:
             return _snapshot_path()
-        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{self._home_identity()["profile"]}-{ctx.namespace()}')
+        role = 'panel' if getattr(self, 'producer_snapshot_scope', False) else FEED_ROLE
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{role}-{self._home_identity()["profile"]}-{ctx.namespace()}')
         return ctx.home / 'session-panel' / f'feed-{safe}.json'
 
     def timing_path(self) -> Path:
@@ -1922,8 +1931,9 @@ def write_timing(f, path: Optional[Path] = None) -> bool:
     try:
         explicit = _explicit_readers(f)
         path = path or (explicit.timing_path() if explicit is not None else timing_path())
+        identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
         with f.lock:
-            body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
+            body = {**identity, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
@@ -2024,7 +2034,8 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
                 _warn(f'claimed:{path}', 'session-panel feed: snapshot not saved; a newer process (claim %s, pid %s) '
                       'carries this feed on', held_gen, held.get('owner_pid'))
                 return False
-            head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
+            identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+            head = {'version': snap['version'], **identity, 'epoch': snap['epoch'],
                     'rev': snap['rev'], 'saved_at': snap['saved_at'], 'gen': mine, 'owner_pid': os.getpid()}
             tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
             fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)  # chat and card content: owner only
@@ -2063,8 +2074,9 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None, r
         _warn('load', 'session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
         return None
     now = time.time() if now is None else now
-    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != FEED_ID \
-            or head.get('profile') != LAUNCH_PROFILE or head.get('epoch') != snap.get('epoch'):
+    identity = explicit.snapshot_identity() if explicit is not None else {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
+    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != identity['feed'] \
+            or head.get('profile') != identity['profile'] or head.get('epoch') != snap.get('epoch'):
         return None
     try:
         if now - float(head.get('saved_at')) > RESTORE_MAX_AGE_S:

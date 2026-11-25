@@ -162,6 +162,7 @@ class PanelProducer:
             self.readers = api.CoreReaders()
         else:
             self.readers = api.CoreReaders(home_context=home_context, installation=installation)
+        self.readers.producer_snapshot_scope = True
         self.events = queue.Queue()
         self.ring = EventRing()
         self._lease_lock = threading.Lock()
@@ -228,7 +229,7 @@ class PanelProducer:
         if verb == 'status':
             status = f.status()
             running = not f.stopped.is_set()
-            wire = json.dumps({'running': running, **status}, ensure_ascii=False, separators=(',', ':')).encode()
+            wire = json.dumps(self.api.json_safe({'running': running, **status}), ensure_ascii=False, separators=(',', ':')).encode()
             return prefix + wire[1:]
         if verb == 'decision-refresh':
             session = body['session']
@@ -238,7 +239,7 @@ class PanelProducer:
                 # Canonical conflict semantics travel as a publication, not a transport failure.
                 return json.dumps({'_conflict': str(exc)}, ensure_ascii=False, separators=(',', ':')).encode()
             result['bundle'] = f.decision_projection(result['bundle'])
-            wire = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode()
+            wire = json.dumps(self.api.json_safe(result), ensure_ascii=False, separators=(',', ':')).encode()
             return prefix + wire[1:]
         sessions = body.get('sessions', [])
         wall = f.clock()
@@ -262,8 +263,11 @@ class PanelProducer:
                 lane.service_wake.set()
         try:
             wire = f.prepared_changes_bytes(sessions, since=body.get('since', 0), epoch=body.get('epoch'))
-            if any(session in f.failures for session in sessions):
-                raise self._unavailable_error(sessions) or RuntimeError('panel source capture unavailable')
+            unavailable = self._unavailable_error(sessions)
+            if unavailable is not None:
+                raise unavailable
+            if any(session in f.failures and session not in f._wire[2] for session in sessions):
+                raise RuntimeError('panel source capture unavailable')
             return prefix + wire[1:]
         finally:
             self.readers.release()

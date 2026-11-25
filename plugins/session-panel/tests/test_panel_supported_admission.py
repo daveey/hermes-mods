@@ -37,8 +37,9 @@ def test_supported_panel_real_census_legacy_drain_exec_and_same_pid_rollback(tmp
     # Normal core boot can redirect print() to stderr; receipt transport is not the gate.
     rows = [json.loads(line) for line in (result.stdout + '\n' + result.stderr).splitlines()
             if line.startswith('{')]
-    assert len(rows) == 3, result.stdout + '\nSTDERR:\n' + result.stderr
-    external, attached, off = rows
+    assert len(rows) == 4, result.stdout + '\nSTDERR:\n' + result.stderr
+    external, attached, off, cycle = rows
+    assert cycle == {'gate': 'second same PID cycle', 'pid': external['pid']}
     assert external['gate'] == 'real panel OFF to external'
     assert external['status']['running'] is True
     assert external['pid'] != external['broker']

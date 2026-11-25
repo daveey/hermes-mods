@@ -104,8 +104,27 @@ try:
     wait(lambda: lifecycle.state in ('off', 'unavailable'))
     print(f'fixture: OFF result {lifecycle.state} {lifecycle.reason}', file=sys.stderr, flush=True)
     assert lifecycle.state == 'off', lifecycle.reason
+    legacy = sys.modules[api._FEED_KEY].PROCESS_FEED
+    assert legacy is not None and not legacy.stopped.is_set()
+    assert first.read(key) is None, 'retired generation cannot return held status'
     print(json.dumps({'gate': 'same PID external to OFF', 'pid': os.getpid(),
                       'old_relay_retired': first.retired, 'legacy_fenced': api._legacy_fenced()}), flush=True)
+    # A retained callback or released witness must not prevent a second symmetric transition.
+    write_mode(home, external=True)
+    wait(lambda: lifecycle.state in ('external', 'unavailable'))
+    assert lifecycle.state == 'external', lifecycle.reason
+    assert legacy.stopped.is_set() and lifecycle.relay is not first
+    second = lifecycle.relay
+    second_key = second.submit({'body': body, 'accepted': time.monotonic()})
+    wait(lambda: second.read(second_key) is not None)
+    assert json.loads(second.read(second_key))['running'] is True
+    write_mode(home, external=False)
+    wait(lambda: lifecycle.state in ('off', 'unavailable'))
+    assert lifecycle.state == 'off', lifecycle.reason
+    successor = sys.modules[api._FEED_KEY].PROCESS_FEED
+    assert successor is not legacy and not successor.stopped.is_set()
+    assert second.retired and second.read(second_key) is None
+    print(json.dumps({'gate': 'second same PID cycle', 'pid': os.getpid()}), flush=True)
 finally:
     gateway_peer = globals().get('gateway')
     if gateway_peer is not None:

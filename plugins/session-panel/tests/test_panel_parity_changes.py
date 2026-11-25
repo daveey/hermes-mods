@@ -122,6 +122,84 @@ def test_status_wire_matches_legacy_schema_and_never_reports_a_false_stop(home, 
         legacy.stopped.set()
 
 
+@pytest.mark.parametrize('verb', ['status', 'decision-refresh'])
+def test_nonfinite_fields_use_the_same_json_safe_as_legacy(home, monkeypatch, verb):
+    api = load('_parity_json_safe_api', 'plugin_api.py')
+    provider = provider_for(api)
+    try:
+        if verb == 'status':
+            monkeypatch.setattr(provider.feed, 'status', lambda: {'age_s': float('nan')})
+            want = {'feed': api.FEED_ID, 'profile': api.LAUNCH_PROFILE, 'running': True, 'age_s': None}
+        else:
+            monkeypatch.setattr(provider.feed, 'refresh_decision', lambda *a, **k: {'bundle': {'age_s': float('inf')}})
+            monkeypatch.setattr(provider.feed, 'decision_projection', lambda bundle: bundle)
+            want = {'feed': api.FEED_ID, 'profile': api.LAUNCH_PROFILE, 'bundle': {'age_s': None}}
+        raw = provider({'body': {'_verb': verb, 'session': 'chat', '_wire_identity': identity(api)},
+                        'accepted': time.monotonic()})
+        assert raw == json.dumps(want, ensure_ascii=False, separators=(',', ':')).encode()
+    finally:
+        provider.close()
+
+
+def test_warm_failed_changes_remain_untrusted_byte_parity_then_recover(home, monkeypatch):
+    api = load('_parity_failed_warm_api', 'plugin_api.py')
+    legacy = legacy_feed(api)
+    provider = provider_for(api)
+    monkeypatch.setattr(time, 'time', lambda: WALL)
+    body = {'sessions': ['chat'], '_wire_identity': identity(api)}
+    try:
+        for feed in (legacy, provider.feed):
+            feed.changes_bytes(['chat'])
+            feed._drain()
+            feed.tick()
+            feed.failures['chat'] = {'error': 'RuntimeError: source failed'}
+            feed._publish_wire()
+        want = api._WIRE_PREFIX + legacy.prepared_changes_bytes(['chat'])[1:]
+        got = provider({'body': body, 'accepted': time.monotonic()})
+        assert json.loads(got)['bundles']['chat']['model']['freshness']['trusted'] is False
+        assert got == want
+        for feed in (legacy, provider.feed):
+            feed.failures.clear()
+            feed._publish_wire()
+        recovered = provider({'body': body, 'accepted': time.monotonic()})
+        assert json.loads(recovered)['bundles']['chat']['model']['freshness']['trusted'] is True
+        assert recovered == api._WIRE_PREFIX + legacy.prepared_changes_bytes(['chat'])[1:]
+    finally:
+        provider.close()
+        legacy.stopped.set()
+
+
+@pytest.mark.parametrize('held', [False, True])
+def test_adapter_refusal_never_serves_even_held_wire(home, monkeypatch, held):
+    api = load('_parity_refused_api', 'plugin_api.py')
+    provider = provider_for(api)
+    try:
+        if held:
+            provider.feed.changes_bytes(['chat'])
+            provider.feed._drain()
+            provider.feed.tick()
+        provider.feed.failures['chat'] = {'error': 'source failed'}
+        error = api._home_context_mod().UnsupportedHomeAdapter('hub_db')
+        monkeypatch.setattr(provider, '_unavailable_error', lambda sessions: error)
+        with pytest.raises(type(error)):
+            provider({'body': {'sessions': ['chat'], '_wire_identity': identity(api)},
+                      'accepted': time.monotonic()})
+    finally:
+        provider.close()
+
+
+def test_cold_failed_capture_cannot_publish_empty_success(home):
+    api = load('_parity_cold_failed_api', 'plugin_api.py')
+    provider = provider_for(api)
+    try:
+        provider.feed.failures['chat'] = {'error': 'source failed'}
+        with pytest.raises(RuntimeError, match='capture unavailable'):
+            provider({'body': {'sessions': ['chat'], '_wire_identity': identity(api)},
+                      'accepted': time.monotonic()})
+    finally:
+        provider.close()
+
+
 def test_decision_conflict_is_a_publication_not_a_transport_failure(home):
     api = load('_parity_decision_api', 'plugin_api.py')
     provider = provider_for(api)
