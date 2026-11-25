@@ -276,6 +276,42 @@ def test_window_loss_is_explicit():
     assert not r['inputs_valid'] and not r['validator']['valid']
 
 
+@pytest.mark.parametrize('field,bad', [
+    ('dropped_records', value) for value in (None, True, False, -1, 0.0, '0', [], {})
+] + [
+    (field, value) for field in ('write_errors', 'encoding_errors')
+    for value in (None, False, 0, '', {}, [1])
+])
+@pytest.mark.parametrize('omit', [False, True])
+def test_closed_window_malformed_loss_counters_remain_unknown(field, bad, omit):
+    log, *_ = served()
+    log.close(10 * SEC)
+    if omit:
+        del log.rows[-1][field]
+    else:
+        log.rows[-1][field] = bad
+    # An intact window must not hide an unknown window behind a partial sum.
+    intact, *_ = served(Log('intact'))
+    intact.close(10 * SEC, dropped=3)
+    r = A.analyze_records(log.rows + intact.rows, receipts=R)
+    gaps = r['log_gaps']
+    assert gaps['unclosed_windows'] == []
+    assert gaps['counters_complete'] is False
+    assert gaps['dropped_records'] is None
+    assert gaps['per_window']['w1'][field] == (None if omit else bad)
+    assert not r['inputs_valid']
+
+
+@pytest.mark.parametrize('dropped,errors', [(0, []), (3, []), (0, ['sink error'])])
+def test_closed_window_known_loss_counters_are_complete(dropped, errors):
+    log, *_ = served()
+    log.close(10 * SEC, dropped=dropped, errors=errors)
+    r = analyze(log)
+    assert r['log_gaps']['counters_complete'] is True
+    assert r['log_gaps']['dropped_records'] == dropped
+    assert r['inputs_valid'] is (dropped == 0 and not errors)
+
+
 def test_nearest_rank_p95():
     assert A.stats(list(range(1, 21)))['p95_ns'] == 19
     assert A.stats(list(range(1, 101)))['p95_ns'] == 95
