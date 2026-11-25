@@ -1613,6 +1613,18 @@ def detach_external(relay) -> None:
         _LOADER.external_projection = None
 
 
+def _callback_bootstrap_mod():
+    name = '_session_panel_callback_bootstrap'
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name('callback_bootstrap.py'))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault(name, module)
+    return module
+
+
 def _panel_provider_spec() -> dict:
     """Exact producer-safe manifest: the provider and every sibling file it loads, by digest."""
     import hashlib
@@ -1630,11 +1642,9 @@ def _panel_provider_spec() -> dict:
             'manifest': {
                 'version': 1,
                 'providers': {Path(n).stem: {'path': n, 'sha256': digest(n)} for n in names},
-                # Source-file declarations and actual registered callbacks are distinct. Until a safe
-                # registrar reproduces this exact live inventory, the child's pre-READY check refuses;
-                # configured callbacks must never become successful fresh-empty output.
                 'callbacks': {'done': [], 'waiting': []},
                 'callback_registry': callback_registry,
+                'callback_bootstrap': _callback_bootstrap_mod().capture_support(callback_registry),
                 'modes': {name: _mitigation(name) for name in _MANIFEST_MODES},
                 'facts': {'HERMES_FACTS_PANEL': _mitigation('HERMES_FACTS_PANEL')}}}
 

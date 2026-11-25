@@ -19,6 +19,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import hashlib
+import importlib
 import importlib.util
 import json
 import logging
@@ -35,27 +36,59 @@ from typing import Any, Callable, Optional
 
 if __package__:
     from . import core
-    from . import owner_wake
-    from . import routing
     from . import waiting_inputs as wi
 else:  # pytest imports the hyphenated plugin dir without a parent package
     _spec = importlib.util.spec_from_file_location("chat_closeout_core", Path(__file__).with_name("core.py"))
     core = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(core)
     core = sys.modules.setdefault("chat_closeout_core", core)
-    _spec = importlib.util.spec_from_file_location("chat_closeout_owner_wake", Path(__file__).with_name("owner_wake.py"))
-    owner_wake = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(owner_wake)
-    owner_wake = sys.modules.setdefault("chat_closeout_owner_wake", owner_wake)
-    _spec = importlib.util.spec_from_file_location("chat_closeout_routing", Path(__file__).with_name("routing.py"))
-    routing = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(routing)
-    routing = sys.modules.setdefault("chat_closeout_routing", routing)
     _spec = importlib.util.spec_from_file_location("chat_closeout_waiting_inputs",
                                                    Path(__file__).with_name("waiting_inputs.py"))
     wi = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(wi)
     wi = sys.modules.setdefault("chat_closeout_waiting_inputs", wi)
+
+
+class _LazyModule:
+    """Defer wake-only dependencies; attribute patches still reach the real module."""
+
+    def __init__(self, name: str):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_package", __package__)
+        object.__setattr__(self, "_module", None)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def _load(self):
+        with self._lock:
+            if self._module is None:
+                if self._package:
+                    module = importlib.import_module("." + self._name, self._package)
+                else:
+                    name = "chat_closeout_" + self._name
+                    module = sys.modules.get(name)
+                    if module is None:
+                        spec = importlib.util.spec_from_file_location(
+                            name, Path(__file__).with_name(self._name + ".py"))
+                        assert spec is not None and spec.loader is not None
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        # Never publish a partially initialized file-loaded module.
+                        module = sys.modules.setdefault(name, module)
+                object.__setattr__(self, "_module", module)
+            return self._module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._load(), name, value)
+
+    def __delattr__(self, name):
+        delattr(self._load(), name)
+
+
+owner_wake = _LazyModule("owner_wake")
+routing = _LazyModule("routing")
 
 logger = logging.getLogger("chat_closeout")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -2239,18 +2272,26 @@ def waiting_source() -> dict[str, list[str]]:
         return out
 
 
-def _register_waiting_source() -> None:
-    try:
-        from hermes_cli import kanban_session_activity as ksa
-    except Exception:
-        return
-    reg = getattr(ksa, "register_waiting_source", None)
+def register_waiting_with(activity) -> None:
+    """Register only waiting callbacks with the supplied core activity registry.
+
+    Safe for dormant panel readers: no hooks, thread startup or callback execution.
+    """
+    reg = getattr(activity, "register_waiting_source", None)
     if reg is None:  # older cores lack the seam: the row just goes green a little early
         return
     try:
         reg("chat-closeout", waiting_source, inputs=waiting_inputs)
     except TypeError:  # a core whose seam takes no inputs: every adoption re-runs the source, as before
         reg("chat-closeout", waiting_source)
+
+
+def _register_waiting_source() -> None:
+    try:
+        from hermes_cli import kanban_session_activity as ksa
+    except Exception:
+        return
+    register_waiting_with(ksa)
 
 
 # ---- the backend thread: close-out waker + watchdog -------------------------------------------------------------

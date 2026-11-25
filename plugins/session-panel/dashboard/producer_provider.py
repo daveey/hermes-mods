@@ -62,6 +62,9 @@ def open_provider(config):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+    provider = config.get('provider') if isinstance(config, dict) else None
+    if isinstance(provider, dict) and 'callback_registry' in provider.get('manifest', {}):
+        module._callback_bootstrap_mod().bootstrap(provider['manifest'])
     home_context = config.get('home_context') if isinstance(config, dict) else None
     installation = config.get('installation') if isinstance(config, dict) else None
     spec = config.get('provider') if isinstance(config, dict) else None
