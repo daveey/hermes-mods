@@ -52,9 +52,7 @@ def test_real_honest_done_callback_and_all_companions_are_inventoried(tmp_path, 
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    activity.register_done_check('kanban-honest-done', module.needs_attention,
-                                watch_paths=module.attention_watch_paths,
-                                next_deadline=module.attention_next_deadline)
+    assert module.register_with(activity) is True
     expected = load_api()._panel_provider_spec()['manifest']['callback_registry']
     actual = expected['done']['kanban-honest-done']
     assert actual['function']['qualname'] == 'needs_attention'
