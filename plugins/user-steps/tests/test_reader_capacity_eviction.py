@@ -27,15 +27,16 @@ def test_queued_borrower_cannot_retain_capacity_evicted_entry(db, tmp_path):
             self.lock = threading.Lock()
 
         def acquire(self, blocking=True):
+            if blocking:
+                waiting.set()
+                assert resume.wait(5), 'borrower was not released after eviction'
             return self.lock.acquire(blocking=blocking)
 
         def release(self):
             self.lock.release()
 
         def __enter__(self):
-            waiting.set()
-            assert resume.wait(5), 'borrower was not released after eviction'
-            self.lock.acquire()
+            self.acquire()
 
         def __exit__(self, *exc):
             self.lock.release()
