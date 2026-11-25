@@ -42,6 +42,8 @@ When testing asynchronous lifecycle behavior, read `references/async-lifecycle-t
 
 When attributing CPU or worker activity, read `references/resource-observability-pitfalls.md` (macOS thread accounting and worker identity independent of retained task rows).
 
+For pmset sleep/wake attribution, match the event-kind column, not Sleep/Wake words anywhere in the line: `Kernel Client Acks` diagnostics can contain both `Delays to Wake notifications` and `Delays to Sleep notifications` after a real Wake. Preserve the raw matching line and preceding actual transition before treating an awake-gate rejection as proof the Mac is asleep; fixtures must include these acknowledgement lines.
+
 When diagnosing SQLite stalls or corruption, read `references/sqlite-recovery-pitfalls.md` (transaction-lock reproduction and coordinated database recovery).
 
 - Fixing the copy you can reach when another copy is the source of truth (a mirrored dir, a synced host, a vendored
