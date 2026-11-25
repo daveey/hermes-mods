@@ -224,14 +224,15 @@ def test_queued_borrower_cannot_retain_detached_entry(db):
             self.lock = threading.Lock()
 
         def acquire(self, blocking=True):
+            if blocking:
+                waiting.set()
             return self.lock.acquire(blocking=blocking)
 
         def release(self):
             self.lock.release()
 
         def __enter__(self):
-            waiting.set()
-            self.lock.acquire()
+            self.acquire()
 
         def __exit__(self, *exc):
             self.lock.release()
