@@ -60,6 +60,38 @@ for (const variant of ['loading', 'unknown', 'offline', 'long']) test(`collapsed
   } finally { await pane.close() }
 })
 
+for (const open of [false, true]) test(`offline before any snapshot never claims last-known data (${open ? 'expanded' : 'collapsed'})`, async () => {
+  localStorage.clear()
+  if (open) localStorage.setItem(P.GOVERNORS_OPEN_KEY, '1')
+  const pane = await mount(React.createElement(P.SidebarView, { snap: undefined, error: 'unreachable', open, setOpen() {} }))
+  try {
+    const [lanes, governors] = pane.container.querySelectorAll('.lanes-sb-heading')
+    assert.equal(lanes.getAttribute('aria-expanded'), String(open))
+    assert.equal(governors.getAttribute('aria-expanded'), String(open))
+    assert.match(lanes.textContent, /Lanes offline - retrying · Loading lanes…/)
+    assert.match(governors.textContent, /Governors offline · Loading governors…/)
+    for (const heading of [lanes, governors]) assert.equal(heading.getAttribute('aria-description'), heading.querySelector('.lanes-sb-summary').title)
+    assert.doesNotMatch(pane.container.textContent, /last known/i)
+    assert.ok(pane.container.querySelector('.lanes-last-known') === null, 'nothing is styled as last-known data')
+    assert.equal(pane.container.querySelectorAll('[data-sidebar-body]').length, open ? 2 : 0)
+    if (open) {
+      assert.equal(pane.container.querySelector('[data-sidebar-body="lanes"] [role=status]').textContent, 'Lanes offline - retrying')
+      assert.match(pane.container.querySelector('[data-sidebar-body="lanes"]').textContent, /Loading lanes…/)
+      assert.match(pane.container.querySelector('[data-sidebar-body="governors"]').textContent, /Loading governors…/)
+    }
+  } finally { await pane.close(); localStorage.clear() }
+})
+
+test('offline after a snapshot labels both expanded bodies as last known', async () => {
+  localStorage.clear()
+  localStorage.setItem(P.GOVERNORS_OPEN_KEY, '1')
+  const pane = await mount(React.createElement(P.SidebarView, { snap: snapshot(), error: 'unreachable', open: true, setOpen() {} }))
+  try {
+    assert.equal(pane.container.querySelector('[data-sidebar-body="lanes"] [role=status]').textContent, 'Lanes offline - retrying · last known')
+    assert.equal(pane.container.querySelectorAll('[data-sidebar-body].lanes-last-known').length, 2)
+  } finally { await pane.close(); localStorage.clear() }
+})
+
 function setup(body = snapshot()) {
   const contributions = [], writes = []
   let push
