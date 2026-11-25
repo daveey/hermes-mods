@@ -265,6 +265,7 @@ def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_pa
         body = view(api)
         failed_lane = 'babybear' if failed_board == 'default' else 'other'
         healthy_lane = 'other' if failed_board == 'default' else 'babybear'
+        assert body['summary_complete'] is True
         assert body['totals']['running'] == 2
         assert body.get('status', {}).get('run') is None
         assert body['lanes'][failed_lane].get('status', {}).get('run') is None
@@ -273,6 +274,39 @@ def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_pa
         assert 'fixture flow failure' in body['flow_error']
         assert not body.get('attention', {}).get('available', False)
         render(tmp_path, body, 'partial-status', failed_lane=failed_lane, healthy_lane=healthy_lane)
+
+
+def test_missing_board_summary_is_unknown_not_zero(board, api, monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import contextmanager
+    config(board)
+    core_fixtures._usage(monkeypatch, [10])
+    kb.create_board('beta')
+    with kbc.connect() as a, kbc.connect(board='beta') as b:
+        kb.create_task(a, title='healthy running', assignee='default', tenant='babybear')
+        kb.create_task(b, title='unreadable waiting', assignee='default', tenant='other')
+        core_fixtures._tick(a)
+        core_fixtures._tick(b, max_spawn=0, board='beta')
+        healthy = view(api)
+        assert healthy['totals']['not_ready'] == 1
+        merge = api._sibling('board_merge')
+        original = merge.read_board
+        @contextmanager
+        def read(path, **kwargs):
+            if '/beta/' in str(path):
+                raise sqlite3.OperationalError('fixture unavailable board')
+            with original(path, **kwargs) as db:
+                yield db
+        monkeypatch.setattr(merge, 'read_board', read)
+        partial = view(api)
+        render(tmp_path, partial, 'partial-summary')
+        assert partial['summary_complete'] is False
+        assert partial['totals']['not_ready'] is None
+        assert all(row['not_ready'] is None and row['actual'] is None for row in partial['lanes'].values())
+        monkeypatch.setattr(merge, 'read_board', original)
+        recovered = view(api)
+        assert recovered['summary_complete'] is True
+        assert recovered['totals']['not_ready'] == 1
 
 
 def test_failed_cursor_keeps_healthy_changes_and_recovery(board, api, monkeypatch):

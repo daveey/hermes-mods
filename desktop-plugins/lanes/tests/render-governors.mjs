@@ -36,6 +36,16 @@ try {
     assert.match(pane.container.querySelector('[data-governor="placement"]').textContent, /1 held/)
     assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 held/)
+  } else if (scenario === 'partial-summary') {
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— waiting/)
+    assert.doesNotMatch(pane.container.querySelector('[data-sidebar-totals]').textContent, /0 waiting/)
+    assert.match(pane.container.textContent, /Partial lanes data/)
+    assert.equal(pane.container.querySelector('.lanes-share-bar'), null)
+    for (const row of pane.container.querySelectorAll('[data-sidebar-lane]')) {
+      assert.equal([...row.querySelector('button').querySelectorAll('span')].at(-1).textContent, '—')
+      assert.match(row.querySelector('.lanes-target-share').textContent, /—/)
+      assert.equal(row.querySelector('meter'), null)
+    }
   } else if (scenario === 'partial-status') {
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— running/)
     assert.match(pane.container.textContent, /Partial lanes data/)

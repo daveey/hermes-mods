@@ -224,6 +224,18 @@ def project(snap, raw, expanded):
                 row['status'] = {}
                 row['gates'] = []
                 row['usage'] = None
+    view['summary_complete'] = raw.get('summary_complete', True)
+    if not view['summary_complete']:
+        # Any missing board can contribute to any lane and to the share
+        # denominator. Retain policy/controls, not partial accounting values.
+        view['totals'] = {key: None for key in view['totals']}
+        for row in view['lanes'].values():
+            for key in ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done',
+                        'actual', 'run_seconds', 'run_hours', 'runs', 'admitted_today', 'cost_usd', 'tokens', 'usage_runs'):
+                row[key] = None
+            row['drift'] = 'unknown: board source unavailable'
+        if 'sidebar' in view:
+            view['sidebar']['idle_lanes'] = []
     if not expanded:
         return view
     cards = raw.get('cards', [])
