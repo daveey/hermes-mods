@@ -157,6 +157,151 @@ def test_fresh_host_card_owns_the_paths_it_lists(tmp_path, capsys):
     assert len(board.creates()) == 1
 
 
+def test_scoped_path_acceptance(tmp_path, capsys):
+    write_log(tmp_path, {HUB_SYNC: 112, FLEET: 51})
+    board = Board()
+    seed_catch_all(tmp_path, board)
+    run(tmp_path, board)
+    body = board.creates()[0][1]
+    assert f"no `{HUB_SYNC}` entry in" in body
+    assert "`awake_by_path`" in body
+    assert "prints `\"count\": 0`" not in body
+    assert "If incident `t_catch` completes with aggregate count 0" in body
+    assert "Do not link this card behind another path card." in body
+    capsys.readouterr()
+
+
+def test_scoped_conn_acceptance(tmp_path, monkeypatch):
+    board = Board()
+    seed_catch_all(tmp_path, board)
+    monkeypatch.setattr(bt, "saturated_conns", lambda *a: ["peer"])
+    rep = {"awake_count": 60, "count": 60, "by_path": {}, "awake_by_path": {},
+           "awake_by_conn": {"peer": 60}, "awake_conn_bursts": {"peer": {
+               "count": 60, "in_bursts": 60, "burst_buckets": 4,
+               "paths": {HUB_SYNC: 60}, "burst_by_path": {HUB_SYNC: 60}}}}
+    monkeypatch.setattr(bt, "_evidence", lambda *a: "evidence")
+    bt.file_path_cards(tmp_path, "macbook-1", NOW, rep, {}, 50, 30, board,
+                       {"action": "throttled", "task_id": "t_catch"})
+    body = board.creates()[0][1]
+    assert "no `peer` entry in" in body and "`awake_by_conn`" in body
+    assert "prints `\"count\": 0`" not in body
+    assert "If incident `t_catch` completes with aggregate count 0" in body
+    assert "Do not link this card behind another path card." in body
+
+
+def seed_closed_incident(home, board):
+    seed_catch_all(home, board, status="done")
+    board.add("t_path", "scheduled", "path fix")
+    st = bt.load_state(home)
+    st[bt.PATHS_KEY] = {f"macbook-1:{HUB_SYNC}": {
+        "task_id": "t_path", "created": NOW.timestamp() - 7200, "last_comment": 0,
+        "host_task_id": "t_catch", "path": HUB_SYNC, "host": "macbook-1"}}
+    bt.save_state(home, st)
+
+
+def test_closed_incident_clear_path_comment_throttled(tmp_path, capsys):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    write_log(tmp_path, {FLEET: 2})  # below threshold must still notify
+    run(tmp_path, board)
+    report = json.loads(capsys.readouterr().out)
+    assert len(board.comments()) == 1
+    argv = board.comments()[0][0]
+    assert argv[3] == "t_path"
+    assert report["window_start"] in argv[-1] and report["window_end"] in argv[-1]
+    assert '"count": 2' in argv[-1]
+    run(tmp_path, board, now=NOW + timedelta(minutes=1))
+    assert len(board.comments()) == 1
+    assert not board.creates()
+    capsys.readouterr()
+
+
+def test_closed_incident_present_path_no_comment(tmp_path, capsys):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    write_log(tmp_path, {HUB_SYNC: 2})
+    run(tmp_path, board)
+    assert board.comments() == []
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("incident_status", ["running", "archived", "unreadable"])
+def test_recovery_requires_done_incident(tmp_path, capsys, incident_status):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    if incident_status == "unreadable":
+        del board.tasks["t_catch"]
+    else:
+        board.tasks["t_catch"]["task"]["status"] = incident_status
+    run(tmp_path, board)
+    assert board.comments() == []
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("path_status", ["done", "archived", "unreadable"])
+def test_recovery_requires_open_path(tmp_path, capsys, path_status):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    if path_status == "unreadable":
+        del board.tasks["t_path"]
+    else:
+        board.tasks["t_path"]["task"]["status"] = path_status
+    run(tmp_path, board)
+    assert board.comments() == []
+    capsys.readouterr()
+
+
+def test_recovery_legacy_body_and_failed_comment_throttle(tmp_path, capsys):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    st = bt.load_state(tmp_path)
+    ent = st[bt.PATHS_KEY][f"macbook-1:{HUB_SYNC}"]
+    del ent["host_task_id"]
+    del ent["path"]
+    bt.save_state(tmp_path, st)
+    board.tasks["t_path"]["task"]["body"] = "the incident card `t_catch` is not working on it"
+
+    def fail_comments(argv, **kwargs):
+        res = board(argv, **kwargs)
+        if argv[:3] == ["hermes", "kanban", "comment"]:
+            res.returncode = 1
+        return res
+
+    run(tmp_path, fail_comments)
+    run(tmp_path, fail_comments, NOW + timedelta(minutes=1))
+    assert len(board.comments()) == 1
+    run(tmp_path, fail_comments, NOW + timedelta(seconds=bt.COMMENT_EVERY_S))
+    assert len(board.comments()) == 2
+    capsys.readouterr()
+
+
+def test_host_body_golden(monkeypatch):
+    monkeypatch.setattr(bt, "_evidence", lambda *a: "EVIDENCE")
+    monkeypatch.setattr(bt, "home_pin_note", lambda *a: "PIN")
+    monkeypatch.setattr(bt, "_saturation_step", lambda *a: "STEP\n")
+    assert bt.card_body("host", {}, {}, 50, 30) == '''The Desktop backend timed out on requests. Users see this as chats that won't load,
+archive asking "task status unavailable", stale boards.
+
+PIN
+
+## Evidence
+EVIDENCE
+
+## Do this
+1. Find what makes the backend slow (it is usually CPU-starved or a request is doing heavy work per call): time the
+   top paths above against the local backend, `ps`/`sample` the busiest `hermes serve`, and check recent core
+   commits for per-request work (e.g. 2026-10-27: a per-request kanban integrity_check, fixed in f2d0e23785).
+2. Fix the cause (not just a restart). Use the five-whys skill for the chain.
+STEP
+
+## Acceptance
+- After the fix, a fresh 30-minute window shows zero timeouts:
+  `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` prints `"count": 0` with `window_start`
+  later than the fix. A restart alone, or a count taken right after a restart, does not satisfy this.
+- Paste that output in a comment before completing.
+'''
+
+
 def test_dry_run_files_no_path_cards(tmp_path, capsys):
     write_log(tmp_path, {HUB_SYNC: 112, FLEET: 51})
     board = Board()

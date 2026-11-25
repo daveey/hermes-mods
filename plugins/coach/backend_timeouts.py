@@ -1356,6 +1356,50 @@ def _ensure_owner(home: Path, st: dict, skey: str, base: str, now: datetime, run
     return {"owner": new_tid, "action": "created", "key": key}
 
 
+def _incident_acceptance(host_tid: Optional[str]) -> str:
+    return (f"\nIf incident `{host_tid}` completes with aggregate count 0, this card is satisfied by that result: "
+            "paste the incident's JSON and complete.\n"
+            "Do not link this card behind another path card.\n")
+
+
+def comment_resolved_paths(home: Path, host: str, now: datetime, rep: dict, runner: Callable) -> None:
+    """Notify, never close, open path owners after their own incident is done.
+
+    Run even below the filing threshold. Legacy entries have no incident metadata:
+    read the exact incident reference from their original body instead of guessing
+    from whichever daily incident is newest.
+    """
+    st = load_state(home)
+    for skey, ent in (st.get(PATHS_KEY) or {}).items():
+        if not skey.startswith(f"{host}:/"):
+            continue  # connections and special owner cards are not request paths
+        path = ent.get("path") or skey[len(host) + 1:]
+        if path in (rep.get("awake_by_path") or {}):
+            continue
+        if now.timestamp() - float(ent.get("last_comment") or 0) < COMMENT_EVERY_S:
+            continue
+        tid = ent.get("task_id")
+        if not tid:
+            continue
+        data = _show(runner, tid)
+        if not data or data["task"]["status"] in CLOSED:
+            continue
+        host_tid = ent.get("host_task_id")
+        if not host_tid:
+            match = re.search(r"the incident card `(t_[^`]+)`", data["task"].get("body") or "")
+            host_tid = match.group(1) if match else None
+        if not host_tid or _card_status(runner, host_tid) != "done":
+            continue
+        evidence = {k: rep.get(k) for k in ("window_start", "window_end", "count", "awake_by_path")}
+        text = (f"Incident `{host_tid}` is done. This scan has no `{path}` entry in awake_by_path:\n"
+                + json.dumps(evidence) + "\nCheck that this is a fresh 30-minute window with window_start later "
+                "than your fix, then paste the output and complete. If the incident completed with aggregate "
+                "count 0, paste its JSON to satisfy this card instead. This watcher does not close cards.")
+        r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
+        ent["last_comment"] = now.timestamp()
+        save_state(home, st)
+
+
 def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int,
                     window_min: int, runner: Callable, host_result: dict) -> dict:
     """Every saturated conn, then every significant path, gets an owner: reuse our open card (comment hourly),
@@ -1386,7 +1430,8 @@ def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict
         def conn_body(previous, conn=conn, tok=tok):
             why = (f"No open card names `{tok}`: the incident card `{host_tid}` is not working on it (it is closed, "
                    f"or waits behind parents about other paths).\n")
-            return why + conn_card_body(host, conn, rep, probe, threshold, window_min, previous)
+            return (why + conn_card_body(host, conn, rep, probe, threshold, window_min, previous)
+                    + _incident_acceptance(host_tid))
 
         still = (f"Still firing at {now.isoformat()} on {host}: {tok} {info['count']} of {rep.get('awake_count')} "
                  f"awake timeouts in {window_min} min, {info['in_bursts']} in {info['burst_buckets']} shared "
@@ -1400,13 +1445,24 @@ def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict
             why = (f"No open card names `{path}`: the incident card `{host_tid}` is not working on it "
                    f"(it is closed, or waits behind parents about other paths). This card owns `{path_token(path)}` "
                    f"({n_by.get(path)} of {rep.get('awake_count')} awake timeouts).\n{previous}\n")
-            return why + card_body(host, rep, probe, threshold, window_min)
+            diagnosis = card_body(host, rep, probe, threshold, window_min).split("## Acceptance\n", 1)[0]
+            return (why + diagnosis + "## Acceptance\n"
+                    "- After the fix, a fresh 30-minute window shows zero timeouts on this path:\n"
+                    "  `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` shows "
+                    f"no `{path}` entry in\n"
+                    "  `awake_by_path`, with `window_start` later than the fix. "
+                    "A restart alone does not satisfy this.\n"
+                    "- Paste that output in a comment before completing.\n"
+                    + _incident_acceptance(host_tid))
 
         still = (f"Still firing at {now.isoformat()} on {host}: {path} {n_by.get(path)} of "
                  f"{rep.get('awake_count')} awake timeouts in {window_min} min.")
         out[path] = _ensure_owner(home, st, f"{host}:{path}", f"backend-timeouts:{host}:{path}", now, runner,
                                   "path", lambda path=path: path_owner(runner, host_ent, path), path_body,
                                   path_card_title(path, n_by.get(path) or 0, window_min), still)
+        if out[path].get("action") == "created":
+            st[PATHS_KEY][f"{host}:{path}"].update(host_task_id=host_tid, path=path)
+            save_state(home, st)
     return out
 
 
@@ -1567,6 +1623,8 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
                 if owners:
                     host_card["path_owners"] = owners
                 res["cards"].append(host_card)
+    if not a.dry_run:
+        comment_resolved_paths(home, host, now, rep, runner or subprocess.run)
     receipt_failed = False
     if not a.dry_run:
         try:
