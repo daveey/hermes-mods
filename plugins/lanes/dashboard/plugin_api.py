@@ -389,6 +389,9 @@ def _governed_sources(mods, conn, evidence, hours, window):
             receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
             snapshots.append(receipt)
         snap, raw = _sibling('board_merge').merge(pairs)
+        # A flow failure still has an independent summary; an unreadable board
+        # has neither. Do not certify the surviving summaries as fleet totals.
+        raw['summary_complete'] = not source_failed
         if source_failed:
             raw['flow_complete'] = False
             raw['incomplete_status_lanes'] = list(snap.get('lanes', {}))

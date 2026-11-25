@@ -1147,8 +1147,9 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
         h('span', { style: { color: CARD_COLORS.you } }, `${status.you ?? '—'} you`),
         h('span', null, `${snap.totals?.not_ready ?? '—'} waiting`)),
       h('div', { className: 'lanes-sb-muted' }, `$${snap.sidebar?.cost_today?.toFixed(2) ?? '—'} today`),
-      h('div', { className: 'lanes-share-bar', 'aria-label': 'Worker share' }, Object.entries(snap.lanes || {}).map(([name, row]) =>
-        h('span', { key: name, title: `${name} ${pct(row.actual)}`, style: { width: pct(row.actual) } }))),
+      snap.summary_complete === false ? h('div', { className: 'lanes-sb-muted' }, 'Worker share unknown') :
+        h('div', { className: 'lanes-share-bar', 'aria-label': 'Worker share' }, Object.entries(snap.lanes || {}).map(([name, row]) =>
+          h('span', { key: name, title: `${name} ${pct(row.actual)}`, style: { width: pct(row.actual) } }))),
       open ? Object.entries(snap.lanes || {}).filter(([name]) => showIdle || !idle.includes(name)).map(([name, row]) =>
         h('div', { key: name, className: 'lanes-sb-lane', 'data-sidebar-lane': name },
           h('button', { className: 'lanes-sb-line', 'aria-expanded': laneOpen === name, onClick: () => setLaneOpen(laneOpen === name ? '' : name) },
@@ -1157,8 +1158,9 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
             h('span', { style: { color: CARD_COLORS.run } }, row.status?.run ?? '—'),
             h('span', { className: 'lanes-held' }, row.governor_held ?? '—'), h('span', null, row.not_ready ?? '—')),
           h('div', { className: 'lanes-sb-muted', 'data-top-reason': name }, row.top_reason || 'Governor state unknown'),
-          h('div', { className: 'lanes-target-share', title: `Actual ${pct(row.actual)} / target ${pct(row.target)}` },
-            h('span', null, pct(row.actual)), h('meter', { min: 0, max: 1, value: row.actual || 0 }), h('span', null, `target ${pct(row.target)}`)),
+          h('div', { className: 'lanes-target-share', title: `Actual ${row.actual == null ? 'unknown' : pct(row.actual)} / target ${pct(row.target)}` },
+            h('span', null, row.actual == null ? '—' : pct(row.actual)),
+            row.actual == null ? null : h('meter', { min: 0, max: 1, value: row.actual }), h('span', null, `target ${pct(row.target)}`)),
           laneOpen === name ? h('div', { className: 'lanes-sb-detail' },
             h('h4', null, 'WHERE CARDS ARE'),
             h('div', { className: 'lanes-steps' }, (row.steps || []).map(s => h('div', { key: s.key, 'data-step': s.key,
