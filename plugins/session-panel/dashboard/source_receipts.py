@@ -294,7 +294,12 @@ def validate_records(records, *, require_closed=False):
             errors.append('invalid schema/event'); continue
         if any(r.get(k) is None for k in IDENTITY_FIELDS):
             errors.append('missing process/runtime identity'); continue
-        custody_identity = tuple(r[k] for k in IDENTITY_FIELDS)
+        try:
+            # Python equality aliases JSON booleans, integers and floats. Runtime
+            # custody must retain their exact encoded scalar types instead.
+            custody_identity = encode(tuple(r[k] for k in IDENTITY_FIELDS))
+        except (TypeError, ValueError):
+            errors.append('invalid process/runtime identity'); continue
         window = r.get('window_id')
         record_id = r.get('record_id')
         if not isinstance(window, str) or not window or not isinstance(record_id, str) or not record_id:
@@ -356,9 +361,16 @@ def validate_records(records, *, require_closed=False):
             if not all(isinstance(k, str) and k for k in key):
                 errors.append('invalid inclusion key'); continue
             original = stored.get(key)
-            if original is None or original[0] != p or original[2:] != (custody_identity, window):
+            if original is None or original[2:] != (custody_identity, window):
                 errors.append('inclusion has no exact stored vector'); continue
-            if body.get('epoch') != key[0] or (body.get('bundles') or {}).get(key[2]) != original[1]:
+            try:
+                exact_vector = encode(original[0]) == encode(p)
+                exact_model = encode(body['bundles'].get(key[2])) == encode(original[1])
+            except (TypeError, ValueError):
+                errors.append('inclusion has invalid JSON custody'); continue
+            if not exact_vector:
+                errors.append('inclusion has no exact stored vector'); continue
+            if body.get('epoch') != key[0] or not exact_model:
                 errors.append('inclusion payload does not contain exact stored model'); continue
             fulfilled.add(key)
             (caught_up if event == 'catchup_success' else emitted).add(key)
