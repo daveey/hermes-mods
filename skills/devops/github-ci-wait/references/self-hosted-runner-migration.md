@@ -78,6 +78,7 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
   `git rm -r --cached` + `.gitignore`, never by cleaning the host.
 - When a migration commit was made from a local checkout, check its `--stat` for accidental bulk adds
   (node_modules, scratch scripts) before calling it done.
+- Treat `actions/runners` as self-hosted inventory, not visibility into GitHub-hosted macOS capacity. A hosted `macos-*` job with no listed matching runner is not proof of an offline pool. Read an actually executed job's runner-image header before proposing another hosted image; image selection alone is not capacity relief. Never add a hosted-image alias to a busy persistent runner without host/toolchain/security qualification. Existing queued runs retain their workflow source: a routing PR does not reroute them, and owner adoption needs fresh exact-head review and CI. Preserve real tag-release image qualification separately from disposable PR proofs.
 - Diagnose saturation by label, not total queued runs: paginate the runners and each queued/in-progress run's
   jobs (`repos/OWNER/REPO/actions/runners`, `actions/runs/ID/jobs`), then group online/busy slots, queued job
   names and age by required custom label. General, Docker and observer lanes can saturate independently;
