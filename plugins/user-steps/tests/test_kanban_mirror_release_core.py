@@ -78,7 +78,12 @@ def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamp
 
 
 def decision_card(kb, c, root, *, stamped=True):
-    """The decision card filed for ``root``'s pending stop, blocked on the brief's ask in session-a."""
+    """A historical decision wrapper, still supported for existing stored cards.
+
+    Modern core routes new stops to the owning chat instead of creating this
+    wrapper. Seed the historical record, not today's producer, so this continues
+    exercising legacy release and crash recovery through the real mirror/core.
+    """
     from hermes_cli import kanban_spend_decision as decision
     # Core stopped filing these at bbdf6ba4 (an ownerless budget stop is asked on the root by the stranded-park
     # sweep), but release still resolves the open ones already on boards: replay one as the old producer filed it.
