@@ -7,6 +7,7 @@ No command is ever executed; the live home, config and kanban are never touched.
 """
 import contextlib
 import os
+from functools import cache
 import hashlib
 import importlib.util
 import json
@@ -27,11 +28,50 @@ FAR = "2099-01-01T00:00:00Z"
 PAD = ["ok", "thanks", "sure"]
 
 
+@cache
+def _coach_code():
+    # Suite source is immutable during a run. Cache only code: every fixture must still
+    # execute it in a new module so monkeypatches, globals and hook closures stay private.
+    spec = importlib.util.spec_from_file_location("coach_init_rootcap", HERE / "__init__.py")
+    return spec.loader.get_code(spec.name)
+
+
 def _coach_mod():
     spec = importlib.util.spec_from_file_location("coach_init_rootcap", HERE / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    exec(_coach_code(), mod.__dict__)
     return mod
+
+
+def test_coach_loader_compiles_once_but_keeps_module_state_private(monkeypatch):
+    from importlib.machinery import SourceFileLoader
+
+    cached_code = globals().get("_coach_code")
+    if cached_code is not None:
+        cached_code.cache_clear()
+    real_get_code = SourceFileLoader.get_code
+    compilations = []
+    source = str(HERE / "__init__.py")
+
+    def counted_get_code(loader, fullname):
+        if loader.path == source:
+            compilations.append(loader.path)
+        return real_get_code(loader, fullname)
+
+    monkeypatch.setattr(SourceFileLoader, "get_code", counted_get_code)
+    first = _coach_mod()
+    original_bg = first._bg_thread
+    first._bg_thread = lambda *a, **kw: None
+    first._fixture_only = True
+    second = _coach_mod()
+    assert first is not second
+    assert not hasattr(second, "_fixture_only")
+    assert second._bg_thread is not first._bg_thread
+    assert second._bg_thread.__globals__ is second.__dict__
+    assert original_bg.__globals__ is first.__dict__
+    assert first.__file__ == second.__file__ == source
+    assert first.__spec__.name == second.__spec__.name == "coach_init_rootcap"
+    assert len(compilations) == 1, "fixture must reuse code, not recompile or share module state"
 
 
 class World:
