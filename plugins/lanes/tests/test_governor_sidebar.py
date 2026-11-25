@@ -196,6 +196,41 @@ def test_core_cursor_uses_receipt_bound_and_ignores_tick_diagnostics(board, api,
         assert after == before, 'diagnostics and fresh tick do not invalidate decisions'
 
 
+def test_composed_sdk_mount_order_preserves_real_lane_limits(board, api, monkeypatch, tmp_path):
+    core_fixtures.model_tier._write_cfg(board, admission={'lanes': {
+        'babybear': {'share': 20, 'max_workers': 3, 'cards_per_day': 7, 'usd_per_day': 12.5},
+        'other': {'share': 10}}})
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='composed SDK limits', assignee='default', tenant='babybear')
+        core_fixtures._tick(conn)
+        expanded = view(api)
+        collapsed = api._lane_view(6, '6h', False)
+    assert expanded['lanes']['babybear']['limits'] == {
+        'max_workers': 3, 'cards_per_day': 7, 'usd_per_day': 12.5}
+    assert 'limits' not in collapsed['lanes']['babybear']
+    if not (NODE.parent / 'node_modules/react').exists():
+        pytest.skip('install desktop-plugins/lanes/tests/package.json for jsdom acceptance')
+    path = tmp_path / 'composed.json'
+    path.write_text(json.dumps({'collapsed': collapsed, 'expanded': expanded}))
+    result = subprocess.run(['node', str(NODE.with_name('render-composed-sidebar.mjs')), str(path)],
+                            text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cursor_tolerates_core_without_optional_freshness_helper(board, api, monkeypatch):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='older core receipt', assignee='default', tenant='babybear')
+        core_fixtures._tick(conn)
+        path = str(gov.snapshot_path(conn))
+        monkeypatch.delattr(gov, 'freshness_bound')
+        cursor, watched = api._capture_cursor()
+        assert path in watched
+        assert (path, None) in cursor, 'unsupported freshness is unavailable, never a fabricated deadline'
+
+
 def test_registry_version_skew_preserves_online_view_and_accounting(board, api, monkeypatch):
     config(board)
     core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])

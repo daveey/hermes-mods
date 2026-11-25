@@ -683,7 +683,7 @@ def _capture_cursor():
             # Ignore tick time while unchanged decisions remain fresh.
             cursors.append((name, {k: v for k, v in doc.items() if k not in
                                   ('tick_at', 'read_at', 'tick_completions', 'tick_gap_p95_s')}))
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, ImportError):
             cursors.append((name, None))
     _governor_deadlines = tuple(deadlines)
     return cursors, tuple(paths)

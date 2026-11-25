@@ -924,7 +924,9 @@ function useTabTotalsHosted() {
 // One state/filter owner for both SDK layouts; modern Desktop paints totals only.
 export function Lanes({ ctx, totalsOnly = false }) {
   const [open, setOpenState] = useState(loadOpen)
-  const [selected, setSelectedState] = useState(loadSelected)
+  // Legacy lane pills are absent in totals-only mode; their persisted selection
+  // must not invisibly scope fleet totals or the Sessions filter.
+  const [selected, setSelectedState] = useState(() => totalsOnly ? [] : loadSelected())
   const [statusPicked, setStatusPicked] = useState(loadStatusSelected)
   const [noCards, setNoCards] = useState(loadNoCards)
   const sidebarSessions = useSidebarSessions()
@@ -951,17 +953,22 @@ export function Lanes({ ctx, totalsOnly = false }) {
   useEffect(() => () => tabTotalsArea().set(null), [])
   const subscription = useRef()
   useEffect(() => {
-    subscription.current = attentionStore(ctx).connect({ hours: windowHours, window: flowWindow(windowHours), expanded: open },
-      (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive, true)
+    // Sidebar owns modern request parameters. A totals-only subscriber must not
+    // downgrade its expanded projection, regardless of mount order/remounts.
+    // If totals mounts first, start with the sidebar's same complete defaults.
+    const params = totalsOnly ? { hours: 6, window: '6h', expanded: true } :
+      { hours: windowHours, window: flowWindow(windowHours), expanded: open }
+    subscription.current = attentionStore(ctx).connect(params,
+      (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive, !totalsOnly)
     return () => subscription.current?.()
-  }, [source])
+  }, [source, totalsOnly])
   const previous = useRef({ windowHours, open })
   useEffect(() => {
-    if (previous.current.windowHours !== windowHours || previous.current.open !== open) {
+    if (!totalsOnly && (previous.current.windowHours !== windowHours || previous.current.open !== open)) {
       subscription.current?.update({ hours: windowHours, window: flowWindow(windowHours), expanded: open })
       previous.current = { windowHours, open }
     }
-  }, [windowHours, open])
+  }, [windowHours, open, totalsOnly])
   useEffect(() => {
     const show = () => setOpen(true)
     window.addEventListener('hermes-show-lanes', show)
