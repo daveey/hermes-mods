@@ -72,6 +72,14 @@ Reference for skill `kanban-red-sweep` (moved verbatim from SKILL.md).
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
   current human_request and block reason first (newest `blocked` event payload), so only the action changes.
 - Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
+- A card stopped as `capability_unavailable` (or called a "guard wall" by the spend reviewer) on a push/ship guard
+  refusal that says "unreadable ... retry complete reads" is usually a failed GitHub read, not a missing capability:
+  the guard words a spent quota and a timed-out call the same way. Read the live call's headers
+  (`gh api -i graphql -f query='{viewer{login}}'`: `X-RateLimit-Used`, `X-RateLimit-Reset`), since `gh api rate_limit`
+  can show quota left while that call is refused; `~/.hermes/logs/gh-calls.log` (epoch, caller, parent, args) names
+  what spent it. Release after the reset with a note that makes unreadable/retry/rate-limit refusals retries or
+  waits inside the round. Never add "stop on any other refusal" to the note: the next transient text (a list
+  timeout instead of a batch read) stops the card again.
 
 - Before re-parking a linked card for days or ending a sweep chat, read `references/sweep-chat-status.md` (why the chat stays grey).
 
