@@ -36,6 +36,13 @@ try {
     assert.match(pane.container.querySelector('[data-governor="placement"]').textContent, /1 held/)
     assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 held/)
+  } else if (scenario === 'incomplete') {
+    assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /unknown/i)
+    await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))
+    assert.equal(pane.container.querySelector('[data-step]'), null)
+    const held = [...pane.container.querySelectorAll('button')].find(b => b.textContent.startsWith('Show '))
+    assert.equal(held.disabled, true)
+    assert.match(held.textContent, /Show — held/)
   } else if (scenario === 'unknown' || scenario === 'adapter-stale') {
     assert.equal(pool.dataset.state, scenario === 'unknown' ? 'unknown' : 'on')
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))

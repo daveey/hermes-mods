@@ -198,7 +198,52 @@ def test_freshness_expires_without_a_file_write(api, monkeypatch):
     assert api.change_cursor() != before
 
 
+@pytest.mark.parametrize('failure', ['flow', 'truncated'])
+def test_incomplete_lane_evidence_is_unknown(board, api, monkeypatch, tmp_path, failure):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    with kbc.connect() as conn:
+        for n in range(2):
+            kb.create_task(conn, title=f'held card {n}', assignee='default', tenant='babybear')
+        if failure == 'truncated':
+            monkeypatch.setattr(gov, 'MAX_CARDS', 1)
+        core_fixtures._tick(conn)
+        if failure == 'flow':
+            def unavailable(*args, **kwargs):
+                raise RuntimeError('flow source unavailable')
+            monkeypatch.setattr(api.flow_core()[1], 'snapshot', unavailable)
+        body = view(api)
+        row = body['lanes']['babybear']
+        assert body['governors']['known_idle_total'] == 2
+        assert row['governor_held'] is None
+        assert 'unknown' in row['top_reason'].lower()
+        assert not row['held_cards']
+        assert not row['steps']
+        render(tmp_path, body, 'incomplete')
+
+
 pool_hub = core_fixtures.pool_hub
+
+
+def test_failed_board_keeps_healthy_sibling_lane_known(board, api, monkeypatch):
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    kb.create_board('beta')
+    with kbc.connect() as a, kbc.connect(board='beta') as b:
+        kb.create_task(a, title='broken flow', assignee='default', tenant='babybear')
+        kb.create_task(b, title='healthy flow', assignee='default', tenant='other')
+        core_fixtures._tick(a)
+        core_fixtures._tick(b, board='beta')
+        original = api.flow_core()[1].snapshot
+        def read(conn, *args, **kwargs):
+            if gov._board(conn) == 'default':
+                raise RuntimeError('default flow unavailable')
+            return original(conn, *args, **kwargs)
+        monkeypatch.setattr(api.flow_core()[1], 'snapshot', read)
+        body = view(api)
+        assert body['lanes']['babybear']['governor_held'] is None
+        assert body['lanes']['other']['governor_held'] == 1
+        assert len(body['lanes']['other']['held_cards']) == 1
 
 
 def test_overlap_exclusively_charged(pool_hub, api, monkeypatch, tmp_path):

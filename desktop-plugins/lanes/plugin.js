@@ -1084,6 +1084,8 @@ export function Lanes({ ctx }) {
 
 export const SIDEBAR_OPEN_KEY = 'hermes-lanes-sidebar-open'
 function storedSidebarOpen() { try { return localStorage.getItem(SIDEBAR_OPEN_KEY) === '1' } catch { return false } }
+const SIDEBAR_LANE_KEY = 'hermes-lanes-sidebar-lane'
+function storedSidebarLane() { try { return localStorage.getItem(SIDEBAR_LANE_KEY) || '' } catch { return '' } }
 const measureText = value => value == null ? 'unknown' : typeof value === 'object'
   ? Object.entries(value).map(([key, n]) => `${key} ${measureText(n)}`).join(' · ') : String(value)
 
@@ -1127,7 +1129,8 @@ export function LaneControls({ name, row, write, disabled }) {
 }
 
 export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAvailable = false, disabled = false }) {
-  const [laneOpen, setLaneOpen] = useState('')
+  const [laneOpen, updateLaneOpen] = useState(storedSidebarLane)
+  const setLaneOpen = value => { updateLaneOpen(value); try { localStorage.setItem(SIDEBAR_LANE_KEY, value) } catch {} }
   const [showIdle, setShowIdle] = useState(false)
   const [showOff, setShowOff] = useState(false)
   const gov = snap?.governors

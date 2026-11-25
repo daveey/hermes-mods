@@ -138,8 +138,12 @@ def project(snap, raw, expanded):
             lane_cards = [c for c in raw.get('cards', []) if c.get('lane') == name]
             reasons = raw['governors']['lane_reasons'].get(name, [])
             row['governors'] = [{**governors[r['id']], 'lane_count': r['count']} for r in reasons]
-            row['governor_held'] = sum(r['count'] for r in reasons) if raw['governors']['available'] else None
-            row['top_reason'] = (f"{reasons[0]['count']} held · {governors[reasons[0]['id']]['name']}" if reasons else
+            lane_known = raw['governors'].get('lane_accounting_available', raw['governors']['available'])
+            if raw['governors'].get('incomplete_lanes') is not None:
+                lane_known = name not in raw['governors']['incomplete_lanes']
+            row['governor_held'] = sum(r['count'] for r in reasons) if lane_known else None
+            row['top_reason'] = ('Governor state unknown · incomplete lane evidence' if not lane_known else
+                                 f"{reasons[0]['count']} held · {governors[reasons[0]['id']]['name']}" if reasons else
                                  'lane paused' if row.get('paused') else
                                  'Governor state unknown' if not raw['governors']['available'] else
                                  'nothing ready' if not row.get('ready') else 'starting as workers free up')
@@ -149,6 +153,8 @@ def project(snap, raw, expanded):
             row['held_sessions'] = sorted({c['source']['id'] for c in lane_cards if c.get('governor') and
                                           c.get('source', {}).get('kind') == 'session'})
             row['held_cards'] = [dict(board=c['board'], id=c['id']) for c in lane_cards if c.get('governor')]
+            if not lane_known:
+                row.update(governors=[], steps=[], held_sessions=[], held_cards=[])
             if name == 'babybear':
                 row['device_footnote'] = raw['governors']['device_footnote']
         view['sidebar'] = dict(cost_today=sum((r.get('usage') or {}).get('usd_today', 0) for r in raw.get('lanes', {}).values()),

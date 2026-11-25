@@ -382,7 +382,10 @@ def _governed_sources(mods, conn, evidence, hours, window):
             for card in (pair[1] or {}).get('cards', []):
                 card['board'] = slug
             pairs.append(pair)
-            snapshots.append(gov.snapshot(source_conn))
+            receipt = gov.snapshot(source_conn)
+            receipt['flow_available'] = (pair[1] or {}).get('configured') is not False
+            receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
+            snapshots.append(receipt)
         snap, raw = _sibling('board_merge').merge(pairs)
     raw['governors'] = _sibling('governors').project(snapshots, raw.get('cards', []), gov.registry(),
         adapter=_sibling('governors').read_adapter(get_hermes_home()))
