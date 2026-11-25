@@ -48,6 +48,10 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 
 Inventory cold manifests and migration ages before recursively sizing every archive. When all entries are younger than the expiry, an empty expiry report is expected, not proof of a broken collector; compare quarantine duration with volume capacity. Size only the top-level tiers first, and keep partial `du` output on timeouts. A shorter pressure TTL must preserve the existing source/repository/evidence guards, be tested at age and free-space boundaries, and pass independent review before live expiration. Verify actual filesystem reclaim separately from reported per-file bytes (hardlinks affect accounting).
 
+## Native proof fixture inventory
+
+Size immediate proof-fixture directories separately from Cargo targets. Repeated `cabi*` homes can each retain a private executable of roughly 120–160 MB, accumulating tens of GB without a Cargo target leak. Count and sum those directories programmatically, map them to the existing proof owner, and preserve unique proof evidence; a large retained inventory alone does not establish an active writer or permission to delete it. Capture writer ancestry/environment in the same sampling script as `/proc/*/io` deltas: short-lived test runners may exit before a later ownership pass.
+
 ## Cargo verification output pressure
 
 Inventory per-card `repo/target` and per-subagent custom `CARGO_TARGET_DIR` trees before blaming the archiver. A single Coglet verification target can retain over 30 GiB across debug artifacts and incremental state; restarting a card on another worker leaves the old derived output behind. Cargo versions may place ordinary crate artifacts under `target/debug/build/<crate>`, so that directory name alone does not prove a recursive build-script leak. Match pass timestamps to producer task runs and sample `/proc/*/io`; a quiet later sample cannot retrospectively identify the exact writer of a past burst.
