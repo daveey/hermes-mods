@@ -37,7 +37,8 @@ if [[ "${1:-}" == --remote-card-composed ]]; then
   test -f tests/hermes_cli/test_card_answer_courier_integration.py
   mkdir -p "$reports"
   for stem in test_remote_card_async_custody test_remote_card_courier test_remote_card_review_race \
-              test_kanban_mirror_release_core; do
+              test_kanban_mirror_release_core test_local_authority_core test_local_authority_core_refusals \
+              test_local_authority_core_binding; do
     rm -f "$reports/$stem.xml"
     scripts/run_tests.sh "$fixtures/plugins/user-steps/tests/$stem.py" \
       --file-retries 0 --tb=short -v -rA --junitxml="$reports/$stem.xml" "$@"
