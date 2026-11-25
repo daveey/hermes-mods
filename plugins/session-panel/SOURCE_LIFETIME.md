@@ -85,7 +85,12 @@ reader-role and projection retry signatures/counts/deadlines carry independently
 Late queued reader-role failures are included before installation. An interrupted
 capture retains its already consumed attempt and gets a finite backoff; reload
 is not a new source event or fresh retry budget. A real changed stamp or changed
-exact demand continues to be the retry recovery boundary.
+exact demand continues to be the retry recovery boundary. Retry/source-scope
+custody transfers only for keys in the successor reader's actual current source
+inventory (plus its strict external source). Historical immutable store versions
+may remain for fenced partial history, but removed keys have no executor and
+cannot contribute inherited retry deadlines. Unchanged keys retain their exact
+counts/deadlines; added keys start missing, never certified by this filtering.
 
 Canonical input bases/readers are not transferred. Carried bundles remain
 unvouched; metadata/current scope checks and current canonical reads still own

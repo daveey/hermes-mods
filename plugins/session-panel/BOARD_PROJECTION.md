@@ -102,7 +102,11 @@ renewed. Exact parent-publication CAS rejects concurrent old captures, repeated
 observation publication and older full projections of the same Admission.
 Parent tokens do not retain historical projection chains. The coordinator owns
 raw-capture provenance and source-reset detection; clock carriage grants no
-coverage or source freshness.
+coverage or source freshness. The same-admission observation-parent veto applies
+only to a held projection from this Feed owner, epoch and exact watch. A foreign
+predecessor's carried projection cannot veto a successor's fresh projection; it
+is presentation history, not a current observation-parent token. Current-owner
+parent CAS and store/source-vector/watch fences still reject stale writers.
 
 ## Activation and rollback boundary
 

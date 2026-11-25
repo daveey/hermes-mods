@@ -447,12 +447,39 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
         unfulfilled_sample=ev_unf[:SAMPLE])
 
     # ---- per-chat first-admission episodes (primary gate shape) ----
+    # Seed from admissions, not successful source receipts. The initial acquire
+    # can fail before any receipt exists; that first unserved age remains owed.
+    # Keep receipt-level dedup/accounting separate and require exact admission
+    # custody (or an explicit admitted successor) for a receipt-less anchor.
     per_chat = {}
-    for (w, chat, rid), e in events.items():
-        per_chat.setdefault((w, chat), []).append(dict(e, rid=rid))
+    for (w, aid), a in adm.items():
+        anchors = per_chat.setdefault((w, a['chat']), {})
+        if a['receipt_ids']:
+            for rid in a['receipt_ids']:
+                anchors.setdefault(('receipt', rid), dict(events[(w, a['chat'], rid)], rid=('receipt', rid)))
+            continue
+        via = {}
+        for f in fulfil_by.get((w, a['chat']), ()):
+            join_work += 1
+            if join_work > MAX_JOIN_WORK:
+                raise AnalysisBounds('admission inclusion join bound exceeded')
+            ok = f['adm_id'] == aid
+            frontier, hops = {aid}, 0
+            while frontier and hops < 8 and not ok:
+                join_work += len(frontier) + sum(len(succ.get((w, x), ())) for x in frontier)
+                if join_work > MAX_JOIN_WORK:
+                    raise AnalysisBounds('supersession traversal bound exceeded')
+                nxt = set().union(*(succ.get((w, x), set()) for x in frontier))
+                ok = f['adm_id'] in nxt
+                frontier, hops = nxt, hops + 1
+            if ok and f['time'] >= a['first']:
+                via[f['via']] = min(via.get(f['via'], f['time']), f['time'])
+        anchors[('admission', aid)] = dict(first=a['first'], rid=('admission', aid),
+            ful=min(via.values()) if via else None,
+            ful_via=min(via, key=via.get) if via else None)
     episodes = []
-    for (w, chat), evs in per_chat.items():
-        rem = sorted(evs, key=lambda e: (e['first'], e['rid']))
+    for (w, chat), anchors in per_chat.items():
+        rem = sorted(anchors.values(), key=lambda e: (e['first'], e['rid']))
         while rem:
             e0 = rem[0]
             f0 = e0['ful']
