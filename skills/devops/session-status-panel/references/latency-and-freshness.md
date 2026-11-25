@@ -26,6 +26,8 @@
 
 ## Producer design rules
 
+- Settle runtime admission stamps and probe times only after the captured process inventory wins publication. A newer decision-only read can supersede its canonical sequence while carrying an empty pre-birth list; consuming the checkpoint stamp then permanently loses the birth because live-only timers never arm. Retain a bounded immediate retry for superseded captures even with empty published inventory; decision-only reads must carry processes at commit rather than claim authority over their read-start copy. Test birth and exit interleavings through real Feed publication, stable-stamp recovery, and forgotten/lineage-retired captures that must not arm ghost retries.
+
 - Re-probe real process evidence on admitted birth/exit changes as well as before a live observation's TTL. An immediate birth after an empty sidebar probe can land inside the process adapter's short cache; a periodic schedule keyed only to returned process rows then never arms. Exercise empty cached inventory → actual terminal(background=true) birth without advancing the cache clock, plus a hold beyond the observation TTL and intentional stop. Distinguish backend/reducer lifecycle proof from mounted/native sidebar proof; preserve failed setup output and clean the disposable session even when an assertion or process-stop call fails.
 
 - Fail closed in the mounted Panel before the first heartbeat: older cached models can lack source freshness metadata, so an unspecified voucher keeps a legacy running header indefinitely. Test actual Panel with legacy cache and no heartbeat, not only renderModel with an explicit false voucher. Keep restored/expired/excluded and fresh controls; transport heartbeats never renew bundle computed_at.
