@@ -153,7 +153,10 @@ def test_source_failure_budget_survives_full_and_beat_without_false_fresh(api, b
         assert len(calls) == 4, ('full/beat renewed an exhausted strict-source budget', calls)
         assert lane.store.pin(lane.chats['S'])[1].missing_scopes
         resumed_pushes = []
+        monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: r)
         resumed = feedmod.Feed(r, emit=resumed_pushes.append, clock=lambda: now[0]).resume(f)
+        pending = resumed._source_coordinator
+        resumed.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
         assert 'S' in resumed._board_capture_failures
         now[0] += 30
         resumed.beat()
@@ -512,7 +515,10 @@ def drain(lane):
         for worker in workers:
             worker.join(3)
         lane.service()
-        if not lane.active and not lane.pending and not getattr(lane, 'acquiring', {}):
+        # Completion can leave a fresh registration/demand wake with no live
+        # worker. Consume it before declaring the manually driven lane quiescent.
+        if (not lane.active and not lane.pending and not getattr(lane, 'acquiring', {})
+                and not lane.feed._board.is_set()):
             return
     raise AssertionError('source coordinator did not drain')
 
@@ -520,6 +526,25 @@ def drain(lane):
 def compose(f, r):
     method = getattr(f, 'compose_board_sources', None)
     return method(lambda: r, gateway='fixture', profile='default') if method else feedmod.BoardLane(f, lambda: r)
+
+
+def test_manual_drain_consumes_completion_wake_before_quiescence():
+    from types import SimpleNamespace
+    wake = threading.Event()
+    steps = []
+    def step():
+        wake.clear()
+        steps.append(len(steps))
+    def service():
+        # Deterministic completion-after-step, before the idle check. The next
+        # turn must observe newly established demand even with no live worker.
+        if len(steps) == 1:
+            wake.set()
+    lane = SimpleNamespace(step=step, service=service, active={}, pending={},
+                           acquiring={}, feed=SimpleNamespace(_board=wake))
+    drain(lane)
+    assert steps == [0, 1]
+    assert not wake.is_set()
 
 
 @pytest.mark.parametrize('route', ['compute', 'full', 'tick', 'catchup', 'board', 'keyed'])

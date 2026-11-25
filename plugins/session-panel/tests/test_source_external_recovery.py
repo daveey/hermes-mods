@@ -40,6 +40,8 @@ def test_held_external_recovery_requires_current_watch_coverage(
             # predecessor automatic-service establishment has separate controls.
             monkeypatch.setattr(type(previous), 'start_service', lambda self: None)
             current = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0]).resume(old)
+            pending = current._source_coordinator
+            current.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
             lane = current._source_coordinator
             assert not getattr(lane, 'pending_install', False)
             assert lane.store.pin(lane.chats['S0'])[0].parts

@@ -94,6 +94,9 @@ def test_resume_requires_current_strict_provenance_before_clock_carriage(observe
     r, f, lane, c, remote, now = observed
     monkeypatch.setattr(feedmod, 'SNAPSHOT_READER_FACTORY', lambda: r)
     successor = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0]).resume(f)
+    # Manual composition is inert: install current readers outside lifecycle locks.
+    pending = successor._source_coordinator
+    successor.ensure_snapshot_service(pending.api_generation, pending.reader_factory)
     owner = successor._source_coordinator
     calls = []
     original = r.capture_external
