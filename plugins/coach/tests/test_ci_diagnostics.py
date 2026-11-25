@@ -9,6 +9,18 @@ import sys
 import pytest
 
 
+def test_worker_crash_preserves_existing_violation_receipts():
+    import conftest
+    from types import SimpleNamespace
+    config = SimpleNamespace(_coach_worker_violations=['earlier violation'])
+    # Fatal native exit has no workeroutput at all, unlike graceful shutdown.
+    conftest.pytest_testnodedown(SimpleNamespace(config=config), 'fatal watchdog exit')
+    assert config._coach_worker_violations == ['earlier violation']
+    conftest.pytest_testnodedown(SimpleNamespace(config=config, workeroutput={
+        'coach_isolation_violations': ['later violation']}), None)
+    assert config._coach_worker_violations == ['earlier violation', 'later violation']
+
+
 def test_ci_receipts_name_runtime_and_slow_test_before_summary(tmp_path):
     suite = tmp_path / 'suite'
     suite.mkdir()
