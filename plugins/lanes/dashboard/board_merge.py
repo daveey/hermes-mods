@@ -6,6 +6,12 @@ import sqlite3
 import time
 
 
+def arm_deadline(db):
+    """Each board gets its own query budget, not time spent on sibling boards."""
+    deadline = time.monotonic() + 2
+    db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+
+
 @contextmanager
 def read_board(path, *, snapshot=True):
     """Borrow an independent board without init/migrations or retained evidence."""
@@ -15,8 +21,7 @@ def read_board(path, *, snapshot=True):
         db.row_factory = sqlite3.Row
         db.text_factory = kb._lossy_text
         db.execute('PRAGMA query_only=ON')
-        deadline = time.monotonic() + 2
-        db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        arm_deadline(db)
         sync.register_without_install(db, str(Path(path).resolve()))
         if snapshot:
             db.execute('BEGIN')

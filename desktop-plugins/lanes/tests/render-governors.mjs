@@ -37,6 +37,35 @@ try {
     assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 held/)
   } else if (scenario === 'partial-summary') {
+    // The same real projection must stay honest in both SDK mounts.
+    const old = await loadPlugin()
+    const ctx = { rest: async () => view }
+    old.sourceFor(ctx).subscribe = (_p, cb) => {
+      cb(view)
+      return Object.assign(() => {}, { update() {}, refresh() {} })
+    }
+    await old.sourceFor(ctx).read(6, '6h', true)
+    const strip = await mount(React.createElement(old.Lanes, { ctx }))
+    try {
+      for (const name of Object.keys(view.lanes)) {
+        const pill = strip.container.querySelector(`[data-lane-pill="${name}"]`)
+        assert.ok(pill, 'unknown lane remains visible on the old SDK')
+        assert.match(pill.textContent, /partial · —/)
+        assert.match(pill.getAttribute('aria-label'), /— running, — waiting/)
+      }
+    } finally { await strip.close() }
+    const legacy = await mount(React.createElement(P.Panel, { snap: view, onApply() {}, onWindow() {} }))
+    try {
+      assert.match(legacy.container.textContent, /Partial lanes data/)
+      assert.match(legacy.container.querySelector('.hermes-lanes-head').textContent, /— running · — open · all hub boards/)
+      assert.doesNotMatch(legacy.container.textContent, /null running|0% actual/)
+    } finally { await legacy.close() }
+    for (const [name, row] of Object.entries(view.lanes)) {
+      const pill = await mount(React.createElement(P.MiniPill, { row: { name, ...row }, onToggle() {} }))
+      try {
+        assert.match(pill.container.querySelector('button').getAttribute('aria-label'), /— running, — waiting/)
+      } finally { await pill.close() }
+    }
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— waiting/)
     assert.doesNotMatch(pane.container.querySelector('[data-sidebar-totals]').textContent, /0 waiting/)
     assert.match(pane.container.textContent, /Partial lanes data/)
@@ -63,6 +92,7 @@ try {
     assert.match(held.textContent, /Show — held/)
   } else if (scenario === 'unknown' || scenario === 'adapter-stale') {
     assert.equal(pool.dataset.state, scenario === 'unknown' ? 'unknown' : 'on')
+    if (scenario === 'unknown') assert.match(pool.textContent, /— held/)
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))
     assert.equal(pane.container.querySelector('[data-device-footnote]').dataset.deviceFootnote, 'unknown')
   }

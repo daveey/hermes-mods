@@ -276,6 +276,39 @@ def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_pa
         render(tmp_path, body, 'partial-status', failed_lane=failed_lane, healthy_lane=healthy_lane)
 
 
+@pytest.mark.parametrize('failed_board', ['default', 'beta'])
+def test_slow_board_does_not_expire_healthy_sibling(board, api, monkeypatch, tmp_path, failed_board):
+    import threading
+    config(board)
+    core_fixtures._usage(monkeypatch, [10])
+    kb.create_board('beta')
+    with kbc.connect() as a, kbc.connect(board='beta') as b:
+        kb.create_task(a, title='first board running', assignee='default', tenant='babybear')
+        kb.create_task(b, title='second board running', assignee='default', tenant='other')
+        core_fixtures._tick(a)
+        core_fixtures._tick(b, board='beta')
+        original = api.flow_core()[1].snapshot
+        def slow(conn, *args, **kwargs):
+            if gov._board(conn) == failed_board:
+                threading.Event().wait(2.2)
+                # Exercise SQLite's real expired progress handler, not a synthetic exception.
+                conn.execute('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n').fetchone()
+            return original(conn, *args, **kwargs)
+        monkeypatch.setattr(api.flow_core()[1], 'snapshot', slow)
+        body = view(api)
+        failed_lane = 'babybear' if failed_board == 'default' else 'other'
+        healthy_lane = 'other' if failed_board == 'default' else 'babybear'
+        assert body['configured'] is True
+        assert body['summary_complete'] is True
+        assert body['lanes'][healthy_lane]['status']['run'] == 1
+        assert body['lanes'][failed_lane].get('status', {}).get('run') is None
+        assert failed_board in body['flow_error']
+        assert 'interrupted' in body['flow_error']
+        render(tmp_path, body, 'partial-status', failed_lane=failed_lane, healthy_lane=healthy_lane)
+        monkeypatch.setattr(api.flow_core()[1], 'snapshot', original)
+        assert view(api)['lanes'][failed_lane]['status']['run'] == 1
+
+
 def test_missing_board_summary_is_unknown_not_zero(board, api, monkeypatch, tmp_path):
     import sqlite3
     from contextlib import contextmanager

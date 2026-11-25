@@ -381,7 +381,8 @@ export function drift(row) {
   return row.drift || ''
 }
 
-export function pct(value) { return `${Math.round((Number(value) || 0) * 100)}%` }
+export function summaryValue(value, format = String) { return value == null ? '—' : format(value) }
+export function pct(value) { return summaryValue(value, v => `${Math.round((Number(v) || 0) * 100)}%`) }
 
 export function compact(n) {
   n = Number(n) || 0
@@ -579,7 +580,7 @@ export function openCard(id, connectionId, win = typeof window !== 'undefined' ?
 
 /** Open-card mix for a mini pill: blue running, yellow not ready, red human-blocked. Older cores omit blocked_on_you. */
 export function meter(row) {
-  return { running: row?.running ?? 0, notReady: row?.not_ready ?? 0, blocked: row?.blocked_on_you ?? 0, total: row?.open ?? 0 }
+  return { running: row?.running === null ? null : row?.running ?? 0, notReady: row?.not_ready === null ? null : row?.not_ready ?? 0, blocked: row?.blocked_on_you === null ? null : row?.blocked_on_you ?? 0, total: row?.open === null ? null : row?.open ?? 0 }
 }
 
 
@@ -606,8 +607,8 @@ function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }
     h('div', { className: 'hermes-lanes-dim' }, h('span', { className: 'hermes-lanes-big' }, pct(row.target)), ' target',
       h('span', { className: note ? 'hermes-lanes-warn' : '' }, ` · ${pct(row.actual)} actual${note ? ` · ${note}` : ''}`)),
     limits && Object.hasOwn(limits, 'max_workers')
-      ? h('div', null, cap('max_workers', 'max workers', 1, 'running', String), h('span', { className: 'hermes-lanes-dim' }, `${row.running} running`))
-      : h('div', { className: 'hermes-lanes-dim', 'data-valve': 'workers' }, `workers ${row.running} running`),
+      ? h('div', null, cap('max_workers', 'max workers', 1, 'running', String), h('span', { className: 'hermes-lanes-dim' }, `${summaryValue(row.running)} running`))
+      : h('div', { className: 'hermes-lanes-dim', 'data-valve': 'workers' }, `workers ${summaryValue(row.running)} running`),
     cap('cards_per_day', 'cards/day', 1, 'cards_today', (v) => String(v)),
     cap('usd_per_day', '$/day', 0.5, 'usd_today', usd))
 }
@@ -732,7 +733,8 @@ export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, s
   return h('div', { className: 'hermes-lanes' },
     h('div', { className: 'hermes-lanes-head' },
       h('strong', null, 'Lanes'),
-      h('span', { className: 'hermes-lanes-dim' }, `${snap.totals?.running ?? 0} running · ${snap.totals?.open ?? 0} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
+      snap.flow_complete === false ? h('span', { role: 'status' }, 'Partial lanes data · unavailable counts shown as —') : null,
+      h('span', { className: 'hermes-lanes-dim' }, `${summaryValue(snap.totals?.running)} running · ${summaryValue(snap.totals?.open)} open · ${snap.governors ? 'all hub boards' : snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
       snap.shadow ? h('span', { className: 'hermes-lanes-warn', title: 'kanban.admission.lane_shadow is on: cards are classified and counted, but nothing is held, capped, reordered or paused' }, 'Shadow mode: reporting only') : null,
       h('div', { className: 'hermes-lanes-seg', role: 'tablist', 'aria-label': 'View' },
         TABS.map(([value, label]) => h('button', { key: value, type: 'button', role: 'tab', className: value === tab ? 'is-on' : '', 'aria-selected': value === tab, onClick: () => setTab(value) }, label))),
@@ -762,7 +764,7 @@ export function laneCounts(row) {
 export function stripMeter(row) {
   const s = row?.strip
   if (!s) return meter(row)
-  return { blocked: s.blocked || 0, running: s.running || 0, notReady: s.other || 0, total: (s.blocked || 0) + (s.running || 0) + (s.other || 0) }
+  return { blocked: s.blocked === null ? null : s.blocked || 0, running: s.running === null ? null : s.running || 0, notReady: s.other === null ? null : s.other || 0, total: [s.blocked, s.running, s.other].includes(null) ? null : (s.blocked || 0) + (s.running || 0) + (s.other || 0) }
 }
 
 export function tokenScale(list) {
@@ -781,12 +783,12 @@ export function laneTitle(row, selected) {
   const m = stripMeter(row), s = row.strip || {}
   const lines = [row.name]
   if (s.token_avg != null) lines[0] += `: ${compact(s.token_avg)} tok/m avg over 6 h`
-  lines.push(`${m.blocked} blocked on you`)
+  lines.push(`${summaryValue(m.blocked)} blocked on you`)
   const cap = s.cap == null ? '' : s.cap_kind === 'max' ? ` · max ${s.cap}` : ` · fair share ${s.cap} of ${s.fleet_running} busy slots (${pct(row.target)} target)`
-  lines.push(`${m.running} running${cap}`)
+  lines.push(`${summaryValue(m.running)} running${cap}`)
   if (s.over > 0) lines.push(`OVER by ${s.over}: borrowing idle slots — ${(s.idle_lanes || []).join(', ') || 'other lanes'} have nothing ready; ${s.actual == null ? 'actual' : '6 h actual'} ${pct(s.actual ?? row.actual)} vs ${pct(row.target)} target`)
   const mix = Object.entries(s.wait || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(', ')
-  lines.push(`${m.notReady} waiting${mix ? ` (${mix})` : ''}`, `Click to ${selected ? 'deselect' : 'select'} this lane`)
+  lines.push(`${summaryValue(m.notReady)} waiting${mix ? ` (${mix})` : ''}`, `Click to ${selected ? 'deselect' : 'select'} this lane`)
   return lines.join('\n')
 }
 
@@ -797,11 +799,12 @@ export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
   return h('button', {
     type: 'button', className: `hermes-lanes-pill${over > 0 ? ' is-over' : ''}`, 'data-lane-pill': row.name,
     title: laneTitle(row, selected),
-    'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} waiting`,
+    'aria-label': `${row.name}: ${summaryValue(m.blocked)} blocked on you, ${summaryValue(m.running)} running, ${summaryValue(m.notReady)} waiting`,
     'aria-pressed': selected, 'data-selected': selected ? '1' : '0', 'data-dimmed': dimmed ? '1' : '0',
     onClick: (event) => { event.stopPropagation(); onToggle(row.name) }
   },
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
+    m.total == null ? h('span', { className: 'hermes-lanes-dim' }, 'partial · ', summaryValue(m.total)) : null,
     h(LaneSpark, { tokens: s.tokens, scale }),
     m.blocked > 0 ? h('span', { className: 'hermes-lanes-bd sq', 'data-count': 'blocked', style: { background: CARD_COLORS.you } }, m.blocked) : null,
     m.running > 0 ? h('span', { className: 'hermes-lanes-bd cap', 'data-count': 'running' },
@@ -1027,7 +1030,7 @@ export function Lanes({ ctx }) {
   if (!working) return null
   const list = rows(snap)
   // A lane pill selects/deselects that lane for the totals on the right; only the arrow expands or collapses.
-  const shown = list.filter((row) => (row.strip ? stripMeter(row).total > 0 : row.open == null || Number(row.open) > 0)) // no open cards: hidden
+  const shown = list.filter((row) => (row.strip ? stripMeter(row).total == null || stripMeter(row).total > 0 : row.open == null || Number(row.open) > 0)) // only known-empty lanes are hidden
   const picked = selected.filter((name) => shown.some((row) => row.name === name))
   const toggleLane = (name) => setSelectedState((prev) => {
     const next = prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
@@ -1094,7 +1097,7 @@ export function GovernorLine({ row }) {
   const reading = pool && row.reading ? `${row.reading.used_pct ?? '?'}% used · ${row.reading.accounts ?? '?'} accounts` : measureText(row.reading)
   return h('div', { className: 'lanes-governor', 'data-governor': row.id, 'data-state': row.state },
     h('div', { className: 'lanes-sb-line' }, h('span', { className: 'lanes-gov-dot', 'aria-hidden': true }),
-      h('span', null, row.name), h('b', null, row.lane_count ?? row.cards_charged, ' held')),
+      h('span', null, row.name), h('b', null, summaryValue(row.state === 'unknown' ? null : row.lane_count ?? row.cards_charged), ' held')),
     h('div', { className: 'lanes-sb-muted' }, row.state === 'unknown' ? 'unknown · missing or stale source' : row.state,
       ' · ', reading, ' / ', measureText(row.threshold)),
     h('details', null, h('summary', null, 'Readings & release'),
@@ -1142,10 +1145,10 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
     snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
     !snap ? h('div', null, 'Loading lanes…') : h('div', { className: error ? 'lanes-last-known' : '' },
       h('div', { className: 'lanes-sb-line', 'data-sidebar-totals': true },
-        h('span', { style: { color: CARD_COLORS.run } }, `${status.run ?? '—'} running`),
+        h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`),
         h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} held`),
-        h('span', { style: { color: CARD_COLORS.you } }, `${status.you ?? '—'} you`),
-        h('span', null, `${snap.totals?.not_ready ?? '—'} waiting`)),
+        h('span', { style: { color: CARD_COLORS.you } }, `${summaryValue(status.you)} you`),
+        h('span', null, `${summaryValue(snap.totals?.not_ready)} waiting`)),
       h('div', { className: 'lanes-sb-muted' }, `$${snap.sidebar?.cost_today?.toFixed(2) ?? '—'} today`),
       snap.summary_complete === false ? h('div', { className: 'lanes-sb-muted' }, 'Worker share unknown') :
         h('div', { className: 'lanes-share-bar', 'aria-label': 'Worker share' }, Object.entries(snap.lanes || {}).map(([name, row]) =>
@@ -1154,9 +1157,9 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
         h('div', { key: name, className: 'lanes-sb-lane', 'data-sidebar-lane': name },
           h('button', { className: 'lanes-sb-line', 'aria-expanded': laneOpen === name, onClick: () => setLaneOpen(laneOpen === name ? '' : name) },
             h('strong', null, name), row.paused ? h('small', null, 'paused') : null,
-            h('span', { style: { color: CARD_COLORS.you } }, row.status?.you ?? '—'),
-            h('span', { style: { color: CARD_COLORS.run } }, row.status?.run ?? '—'),
-            h('span', { className: 'lanes-held' }, row.governor_held ?? '—'), h('span', null, row.not_ready ?? '—')),
+            h('span', { style: { color: CARD_COLORS.you } }, summaryValue(row.status?.you)),
+            h('span', { style: { color: CARD_COLORS.run } }, summaryValue(row.status?.run)),
+            h('span', { className: 'lanes-held' }, summaryValue(row.governor_held)), h('span', null, summaryValue(row.not_ready))),
           h('div', { className: 'lanes-sb-muted', 'data-top-reason': name }, row.top_reason || 'Governor state unknown'),
           h('div', { className: 'lanes-target-share', title: `Actual ${row.actual == null ? 'unknown' : pct(row.actual)} / target ${pct(row.target)}` },
             h('span', null, row.actual == null ? '—' : pct(row.actual)),
