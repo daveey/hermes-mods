@@ -355,6 +355,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
         return _project_evidence(mods, conn, evidence, hours, window, True, sources=True)
     current = gov._board(conn)
     pairs, snapshots = [], []
+    source_failed = False
     with ExitStack() as stack:
         sources = [(current, conn, evidence)]
         for meta in kb.list_boards(include_archived=False):
@@ -365,6 +366,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
                 other = stack.enter_context(_sibling('board_merge').read_board(meta['db_path']))
                 sources.append((slug, other, stack.enter_context(read_view(other))))
             except (OSError, RuntimeError, sqlite3.Error):
+                source_failed = True
                 snapshots.append(dict(board=slug, available=False, stale=True))
         # One immutable PR observation scope for the entire projection. Alternating
         # per-board reader() calls would evict the other boards' published values.
@@ -387,6 +389,10 @@ def _governed_sources(mods, conn, evidence, hours, window):
             receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
             snapshots.append(receipt)
         snap, raw = _sibling('board_merge').merge(pairs)
+        if source_failed:
+            raw['flow_complete'] = False
+            raw['incomplete_status_lanes'] = list(snap.get('lanes', {}))
+            raw['partial_reason'] = (raw.get('partial_reason', '') + '; board source unavailable').lstrip('; ')
     raw['governors'] = _sibling('governors').project(snapshots, raw.get('cards', []), gov.registry(),
         adapter=_sibling('governors').read_adapter(get_hermes_home()))
     return snap, raw
@@ -621,10 +627,17 @@ def _capture_cursor():
         board_path = Path(current_path if meta['slug'] == current_board else meta['db_path'])
         if str(board_path) not in paths:
             paths.append(str(board_path))
-            with _sibling('board_merge').read_board(board_path, snapshot=False) as db:
-                revision = activity.read_key(db, activity.tables_for(board_path))
-                cursors.append((str(board_path), revision if revision is not None else tuple(
-                    db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
+            import sqlite3
+            try:
+                with _sibling('board_merge').read_board(board_path, snapshot=False) as db:
+                    revision = activity.read_key(db, activity.tables_for(board_path))
+                    cursors.append((str(board_path), revision if revision is not None else tuple(
+                        db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
+            except (OSError, RuntimeError, sqlite3.Error):
+                # Preserve the failed path in native coverage, including recovery
+                # writes/replacement; an unreadable sibling cannot hide healthy
+                # board revisions or terminate the shared stream.
+                cursors.append((str(board_path), 'unavailable'))
         paths.append(str(board_path) + '.governors.json')
     paths.append(str(Path(get_hermes_home()) / 'state/governors/mac-mini.json'))
     for name in paths:

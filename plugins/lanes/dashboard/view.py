@@ -206,9 +206,26 @@ def project(snap, raw, expanded):
             row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
             row['gates'] = [g for g in view['gates'] if g['lane'] == name]
         view['sessions'] = session_counts(raw['cards'])
+    # A valid dispatcher tick does not make a failed flow read authoritative.
+    # Keep independent summary counters and healthy lane status, but never expose
+    # partial card-derived totals, attention, cost or fair-share caps as exact.
+    view['flow_complete'] = raw.get('flow_complete', True)
+    view['flow_error'] = raw.get('partial_reason') or (raw.get('reason', '') if raw.get('configured') is False else '')
+    if not view['flow_complete']:
+        view['status'] = {}
+        view['attention'] = dict(available=False, rows=[], reason=view['flow_error'])
+        view['sessions'] = {}
+        view['gates'] = []
+        if 'sidebar' in view:
+            view['sidebar']['cost_today'] = None
+        for name, row in view['lanes'].items():
+            row.pop('strip', None)
+            if name in raw.get('incomplete_status_lanes', []):
+                row['status'] = {}
+                row['gates'] = []
+                row['usage'] = None
     if not expanded:
         return view
-    view['flow_error'] = raw.get('reason', '') if raw.get('configured') is False else ''
     cards = raw.get('cards', [])
     # Legacy /flow consumers still see cards and per-lane limits/usage at the top level.
     view['cards'] = cards
