@@ -5,6 +5,13 @@ gate, labels/pickup, Board lease, open parents, scheduled. A gated lane's held c
 (green) on the Desktop strip, so a big green number is usually lane-gate holds (`hermes kanban lanes show` /
 `lanes held`), not stuck ready cards. Read it before digging through the Desktop source or the per-card `why`.
 
+Read the card's newest `task_events` before anything else. `respawn_guarded` with `active_pr` or `shared_blocker`, plus `dispatch_skipped labels_mismatch` on every tick, means the card is held until its PR's CI finishes. The Desktop still shows "ready · waiting for a worker to claim it", but no worker could take it. The dispatcher comment that goes with `shared_blocker` names the stuck run, e.g. `runners-offline.macos-latest`. Answer "why isn't it claimed" from the CI side:
+- `gh pr checks <n>`: lists the PR's pending checks.
+- `gh api "repos/<o>/<r>/actions/runs?status=queued&per_page=100"`: shows the hosted-runner backlog. Also query `pending` and `in_progress`.
+- For each queued macOS run, compare `head_sha` with the branch's current head and the PR's state. A run on a closed PR, a superseded head or an old main push only takes a runner slot. Cancel it with `ci_run_cancel.py --run-id <id> --gh-repo <o/r> --expect-attempt <attempt from gh run view --json attempt>` (skill github-ci-wait). A plain `gh run cancel` is refused by the CI cancel guard.
+- A backlog that keeps coming back usually means workflow `paths:` filters fire on unrelated crates. That is one CI card per repo: narrow the PR paths and keep the full build on main and in the merge queue.
+Use `hermes kanban why <id>` for the board-rule view. There is no `diagnose` subcommand.
+
 The same few cards showing `claim_not_acquired` for hours in the workers' `~/.hermes/logs/gateway.log`
 (`kanban dispatcher stuck ... Held cards: <id>=claim_not_acquired`), while those workers claim other cards with the
 same labels, means the Board lease refuses those specific cards. It is not a capacity problem. `BS-ready-worker-free`
