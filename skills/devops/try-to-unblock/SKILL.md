@@ -51,7 +51,9 @@ that no longer exists.
 A `⏸ … blocked` notice can be stale on arrival. It quotes its own event's reason and actor (an agent's CLI block
 can read `actor: user`) and can land after a later clear, including your own metadata-only clear, which sends you
 nothing. Compare the notice's reason with the card's newest `blocked` event and `human_request`. If a later event
-superseded it, nothing is left to clear or ask: leave one trail comment.
+superseded it, reuse the existing disposition: return its comment ID to the notifying observer, without another
+waking card comment. For a repeated-park alert, compare the actual questions, intervening decisions and evidence;
+a reused chat fingerprint does not establish an unchanged premise.
 
 Before writing an ask, look for one that already exists. A decision card the owner filed (named in the newest
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
@@ -124,7 +126,7 @@ Stop at the first rung that works. Each rung is something agents may do without 
 | a2. Inside an approved goal | Is this a sub-plan, next phase or new approach for a goal David already approved, within its limits and exclusions (same budget, permissions, safety, acceptance)? Labels such as "needs separate approval" on a card, `executionAuthorized=false` on an earlier answer, a peer saying "I'll put it to David", a runtime nudge to "publish action_request", or a brief that says "on a miss, bring David the stop-or-continue decision" are NOT evidence he is needed. If you recommend Continue, apply it at this rung. Only a Stop recommendation (giving up the goal) or a change to acceptance or budget reaches rung g. Write follow-up briefs the same way: file the David ask only on a Stop or a change recommendation. | Get an independent review of the plan, then build it; tell David after, in one line. Don't publish an approval request. |
 | a3. Next phase after a finished design | Is it "build what the approved design specifies" (an implementation card, tests only, on existing workers, no deploy, no new spend or authority)? An early "design first, not authorization to implement now" bounds the design phase; once the design is delivered and reviewed, building it inside those safety limits is the goal continuing, not new scope. | File the build card yourself with the design's limits as its exclusions; tell David in one line. Ask only if the build needs a deploy, spend, new permissions or a changed acceptance bar. |
 | b. Agent-decidable pick | Is it a choice between options that stays inside the card's limits (no real money, credentials, write/admin permission, other people, safety, irreversible effect, acceptance threshold)? | Pick your recommendation, apply it, comment how to reverse. |
-| c. Credential/access | Is it "no access"? | Token broker, Secrets Manager, hub/worker routes, elevated header (see AGENTS.md "Secrets"). Missing access is almost never a human step. |
+| c. Credential/access | Is the missing capability worker-local or genuinely unavailable to the owning chat too? | Check existing authorized owner routes before escalating. Have that owner perform the bounded read and return raw artifacts/full hashes; keep one collector and let the worker independently assess its evidence. A worker's missing host route is not a human-only blocker. |
 | d. Do it differently | Does a different route reach the same acceptance without the blocked step (another host, a test fixture, a read-only proof, a scratch environment, a smaller scope)? Not for a provider safety refusal (`safety_refused`): rewording, promoting or splitting the same work into a new card is routing around it. Promote is refused, and the split card's worker stops it as `scope_stopped`. | Re-plan on the card and continue. On a safety refusal, go to rung g: David picks between applying for provider access and dropping that approach for a different design. |
 | e. Someone else's work | Is it waiting on another card, CI, a deploy or a time? | `parents=[...]` or `kanban_schedule`, never a human block. |
 | f. Human-only, but automatable handoff | Does it need David's hands only to type a password or click a dialog? | `run_in_user_terminal` / `remote_approve_dialog` / `browser_focus` (asking-the-user). That is a live step, not a parked card. |
@@ -198,8 +200,9 @@ authority needed rather than treating every spent attempt as a new approval requ
 
 ## 5. Leave a trail
 
-Whatever the outcome, one comment on the card with the rung reached and the evidence (verbatim tool output, not
-a paraphrase). The next agent and the ask-gate judge read it; without it they redo the ladder.
+For a new disposition, record the rung and exact supporting evidence once on the card, then read it back.
+For delayed duplicate notices, reuse that receipt instead of posting another waking comment; repeated replies
+otherwise restart already-settled coordination.
 
 ## Done means
 - [ ] The blocker is one concrete sentence, and its premise was re-read live this turn.
