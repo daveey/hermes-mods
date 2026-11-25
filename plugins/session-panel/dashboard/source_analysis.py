@@ -374,6 +374,17 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
             c = chat_key(p.get('chat'))
             if a is None or c is None or c != a['chat']:
                 ctx.reject('fulfilled publication lacks exact admission/chat', r); continue
+            # Stored/wire equality proves publication custody, not admission
+            # custody. Join to the canonical admitted endpoint in this window
+            # before crediting either a receipt or a receiptless episode. A
+            # declared successor must pass this same check for its own endpoint.
+            endpoint = adm.get((r['window_id'], a['id']))
+            if endpoint is None:
+                ctx.reject('fulfilled publication lacks admitted endpoint', r); continue
+            if any(_canon(endpoint['stable'][field]) != _canon(value)
+                   for field, value in a['stable'].items() if field in endpoint['stable']):
+                integrity.append(f'conflicting publication admission {a["id"]}')
+                ctx.reject('fulfilled publication conflicts with admitted endpoint', r); continue
             fulfil.append(dict(window=r['window_id'], chat=c, adm_id=a['id'], receipt_ids=set(a['receipt_ids']),
                                time=t, via=via, key=key_of(p), first=a['first']))
             inclusion_obs[(r['window_id'], key_of(p), via)] += 1

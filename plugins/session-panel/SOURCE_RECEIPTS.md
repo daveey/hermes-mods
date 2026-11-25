@@ -145,7 +145,14 @@ Primary episodes are seeded from every valid admission, including initial
 `receipt_ids=[]` before a failed capture. Repeated admission IDs are not new
 samples. Receipt-less anchors require exact included admission identity or a
 bounded explicit same-chat admitted successor chain; an arbitrary later model,
-forget, storage or invalidation does not fulfill them. Their original age and
+forget, storage or invalidation does not fulfill them. Before crediting either
+receipt or receipt-less fulfillment, every included publication must join to an
+unconflicted admitted endpoint in the same window. Its known stable ID, chat,
+watch token and first-admitted monotonic/wall clocks must agree with that endpoint
+(including a declared successor's own endpoint). Missing legacy optional fields
+remain unknown; evolving receipt lists and required vectors/scopes are not stable
+identity. Contradictions invalidate the input and cannot erase the original
+unserved age. Their original age and
 closed-window lower bound (or open-window censoring) remain in the denominator,
 independently of the per-source receipt-event series.
 
