@@ -176,6 +176,43 @@ def test_validator_rejects_inexact_or_unwritten_inclusion(mutation):
     assert not result['valid'] and result['fulfilled'] == 0
 
 
+@pytest.mark.parametrize('event', ['emit_success', 'catchup_success'])
+@pytest.mark.parametrize('target', ['bundle', 'vector', 'admission', 'identity'])
+@pytest.mark.parametrize('before,after', [(True, 1), (False, 0), (1, True), (0, False), (1, 1.0)])
+def test_exact_inclusion_preserves_json_scalar_types(event, target, before, after):
+    m, log = receipts(), MemoryLog()
+    p, bundle = model_record(log)
+    if target == 'bundle':
+        bundle['type_probe'] = before
+    elif target in ('vector', 'admission'):
+        p['source_vector' if target == 'vector' else 'admission']['type_probe'] = before
+    else:
+        log.events[0]['pid'] = before
+    log.events[0].update(m.payload_fields(m.encode(bundle)))
+    emitted_p, emitted_bundle = json.loads(m.encode(p)), json.loads(m.encode(bundle))
+    data = dict(kind='model', publications=[emitted_p], authenticated=True,
+        request_id='request', response_id='response', write_completed_ns=1,
+        callback_started_ns=1, callback_completed_ns=2, observation='server_emission')
+    # Positive control uses precisely the same JSON scalar types and custody.
+    data.update(m.payload_fields(m.encode({'epoch': 'feed', 'bundles': {'S': emitted_bundle}})))
+    log.record(event, **data)
+    if target == 'identity':
+        log.events[-1]['pid'] = before
+    positive = m.validate_records(log.events)
+    assert positive['valid'] and positive['fulfilled'] == 1
+    log.events.pop()
+    if target == 'bundle':
+        emitted_bundle['type_probe'] = after
+    elif target in ('vector', 'admission'):
+        emitted_p['source_vector' if target == 'vector' else 'admission']['type_probe'] = after
+    data.update(m.payload_fields(m.encode({'epoch': 'feed', 'bundles': {'S': emitted_bundle}})))
+    log.record(event, **data)
+    if target == 'identity':
+        log.events[-1]['pid'] = after
+    negative = m.validate_records(log.events)
+    assert not negative['valid'] and negative['fulfilled'] == 0
+
+
 @pytest.mark.parametrize('mode', ['hosted', 'loopback'])
 def test_exact_scoped_route_inclusion_uses_core_admission_and_write(observed, monkeypatch, tmp_path, mode):
     from fastapi import FastAPI

@@ -91,7 +91,10 @@ validation does not prove semantic row/action/absence, latency, CPU, contention,
 population or native gates.
 
 The audit joins exact publication keys/vectors, payloads, runtime/process identity
-and window. Corrupt payloads, cross-window/process claims, duplicate records and
+and window. Comparison uses canonical JSON bytes, not Python dictionary equality:
+JSON booleans, integers and floating-point numbers retain their scalar types
+(`true`, `1` and `1.0` are not interchangeable custody). Corrupt payloads,
+cross-window/process claims, duplicate records and
 records after closure fail closed. `server_emitted` and
 `authenticated_catchup` are distinct counters; publications deduplicate by key.
 Unmatched entries are retained, never dropped to improve latency statistics.
