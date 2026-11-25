@@ -180,13 +180,16 @@ test('ETA formatter matches both standalone plugins', () => {
  }
 })
 for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'over', 'unknown']) {
- test(`real reducer ETA ${kind}/${state} replaces only its pip, ticks and preserves opening`, async () => {
+ test(`real reducer ETA ${kind}/${state} keeps its coloured pip, ticks and preserves opening`, async () => {
   const { model, now } = cases[`eta_${kind}_${state}`]
   const row = model.sections.waiting[0]
   const actions = []
   await paint(m.renderModel(model, { now, onAction: (...args) => actions.push(args) }))
   const article = document.querySelector('[data-line-row]')
-  assert.ok(article.querySelector('[data-row-pip]') === null)
+  const pip = article.querySelector('[data-row-pip="waiting"]')
+  assert.ok(pip, 'a delivery wait with an ETA still draws its state box')
+  assert.equal(pip.dataset.waitKind, kind)
+  assert.equal(window.getComputedStyle(pip).borderTopColor, kind === 'deploy' ? 'rgb(163, 113, 247)' : 'rgb(56, 189, 248)')
   const eta = article.querySelector('[data-wait-eta]')
   assert.equal(eta.dataset.waitEta, kind)
   assert.ok(eta.title.includes('fixture history'))

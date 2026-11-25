@@ -605,7 +605,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const hover = [title, ...(row.details || [])].join('\n')
     return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
-      eta ? jsx('span', { 'aria-hidden': true }) : jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
+      // The state box always draws (light blue for CI/clock, purple for deploy): the ETA readout sits at the far
+      // right of a wide panel, so dropping the box left a delivery wait with no colour at all.
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, ...(section === 'waiting' ? { flexWrap: 'wrap', rowGap: 1 } : {}) }, children: [
