@@ -27,6 +27,20 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 5. Root: correctness of an ask depended on the model's discipline, not on a mechanism. Fix: put the check in the runtime,
    where it runs whether or not the model remembers (this plugin), and give it the facts the model lacks (live state, ledger, capabilities).
 
+## Backend startup warming
+
+`register()` keeps projection warming on a daemon thread and installs all four hooks.
+Ordinary processes wait up to four seconds so a first turn can read warm projection
+state; an exact `HERMES_ALWAYS_ON_BACKEND=1` selects a zero-second default join so
+backend app/auth startup does not wait for unrelated card-projection reads.
+`ASK_GATE_WARM_JOIN_S` explicitly overrides either default (negative values clamp
+to zero; malformed values use the process-specific default). Warming still obeys
+worker/off/`ASK_GATE_NO_PREWARM` exclusions. An immediate turn retains its existing
+read budget and reports `local cards only` while the projection remains unavailable;
+no readiness or complete-card proof is invented. Tests: `tests/test_backend_warm_start.py`
+and `tests/test_l1_remote_cards.py`. This policy alone is not a five-second backend
+or proxy acceptance claim.
+
 ## Ready-card conditional evidence
 
 For a non-blocked `kanban_create` without `human_request`, the legacy Checked-line classifier
