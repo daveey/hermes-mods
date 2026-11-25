@@ -11,7 +11,7 @@
 // of shares. A draft survives polls; Reset, a successful Apply or collapsing the strip drops it, and
 // the controls are locked while an Apply is in flight.
 import * as sdk from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
+import { createElement as h, Fragment, useState, useEffect, useMemo, useRef } from 'react'
 
 const { host, PALETTE_AREA } = sdk
 // Older Desktops do not export TOP_STRIP_AREA; a named import would throw at load and skip activation.
@@ -1096,6 +1096,8 @@ export function Lanes({ ctx, totalsOnly = false }) {
 
 export const SIDEBAR_OPEN_KEY = 'hermes-lanes-sidebar-open'
 function storedSidebarOpen() { try { return localStorage.getItem(SIDEBAR_OPEN_KEY) === '1' } catch { return false } }
+export const GOVERNORS_OPEN_KEY = 'hermes-lanes-sidebar-governors-open'
+function storedGovernorsOpen() { try { return localStorage.getItem(GOVERNORS_OPEN_KEY) === '1' } catch { return false } }
 const SIDEBAR_LANE_KEY = 'hermes-lanes-sidebar-lane'
 function storedSidebarLane() { try { return localStorage.getItem(SIDEBAR_LANE_KEY) || '' } catch { return '' } }
 const measureText = value => value == null ? 'unknown' : typeof value === 'object'
@@ -1141,6 +1143,8 @@ export function LaneControls({ name, row, write, disabled }) {
 }
 
 export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAvailable = false, disabled = false }) {
+  const [governorsOpen, updateGovernorsOpen] = useState(storedGovernorsOpen)
+  const setGovernorsOpen = value => { updateGovernorsOpen(value); try { localStorage.setItem(GOVERNORS_OPEN_KEY, value ? '1' : '0') } catch {} }
   const [laneOpen, updateLaneOpen] = useState(storedSidebarLane)
   const setLaneOpen = value => { updateLaneOpen(value); try { localStorage.setItem(SIDEBAR_LANE_KEY, value) } catch {} }
   const [showIdle, setShowIdle] = useState(false)
@@ -1148,16 +1152,28 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
   const gov = snap?.governors
   const idle = snap?.sidebar?.idle_lanes || []
   const status = snap?.status || {}
+  const freshness = error ? `Lanes offline - retrying · ${snap ? 'last known · ' : ''}` : ''
+  const totalsText = `${summaryValue(status.run)} running · ${gov?.idle_total ?? '—'} held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
+  const governorsText = !snap ? 'Loading governors…' : !gov ? 'Governor state unknown' :
+    `${summaryValue(gov.counts?.on)} on · ${summaryValue(gov.counts?.off)} off · ${summaryValue(gov.counts?.at_cap)} at cap · ${summaryValue(gov.counts?.unknown)} unknown`
+  const governorSummary = `${error ? `Governors offline · ${snap ? 'last known · ' : ''}` : ''}${governorsText}`
+  const laneSummary = `${freshness}${snap?.flow_complete === false ? 'Partial · ' : ''}${snap ? totalsText : 'Loading lanes…'}`
   return h('section', { className: 'lanes-sidebar', 'data-slot': 'lanes-sidebar', 'data-offline': error ? '1' : '0' },
-    h('button', { className: 'lanes-sb-heading', 'aria-expanded': open, onClick: () => setOpen(!open) }, 'Ⅲ LANES', open ? ' ▾' : ' ▸'),
-    error ? h('div', { role: 'status' }, 'Lanes offline - retrying') : null,
-    snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
-    !snap ? h('div', null, 'Loading lanes…') : h('div', { className: error ? 'lanes-last-known' : '' },
-      h('div', { className: 'lanes-sb-line', 'data-sidebar-totals': true },
-        h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`),
-        h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} held`),
-        h('span', { style: { color: CARD_COLORS.you } }, `${summaryValue(status.you)} you`),
-        h('span', null, `${summaryValue(snap.totals?.not_ready)} waiting`)),
+    h('div', { 'data-sidebar-section': 'lanes' },
+    h('button', { className: 'lanes-sb-heading', 'aria-label': 'LANES', 'aria-description': laneSummary, 'aria-expanded': open, onClick: () => setOpen(!open) },
+      h('span', { className: 'lanes-sb-label' }, 'Ⅲ LANES'),
+      h('span', { className: 'lanes-sb-summary', title: laneSummary,
+        'data-sidebar-totals': true }, freshness, snap?.flow_complete === false ? 'Partial · ' : '',
+        !snap ? 'Loading lanes…' : h(Fragment, null,
+        h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`), ' · ',
+        h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} held`), ' · ',
+        h('span', { style: { color: CARD_COLORS.you } }, `${summaryValue(status.you)} you`), ' · ',
+        h('span', null, `${summaryValue(snap.totals?.not_ready)} waiting`))),
+      h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, open ? '▾' : '▸')),
+    open ? h('div', { className: error ? 'lanes-last-known' : '', 'data-sidebar-body': 'lanes' },
+      error ? h('div', { role: 'status' }, 'Lanes offline - retrying · last known') : null,
+      snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
+      !snap ? h('div', null, 'Loading lanes…') : h(Fragment, null,
       h('div', { className: 'lanes-sb-muted' }, `$${snap.sidebar?.cost_today?.toFixed(2) ?? '—'} today`),
       snap.summary_complete === false ? h('div', { className: 'lanes-sb-muted' }, 'Worker share unknown') :
         h('div', { className: 'lanes-share-bar', 'aria-label': 'Worker share' }, Object.entries(snap.lanes || {}).map(([name, row]) =>
@@ -1185,13 +1201,18 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
             h('button', { disabled: !heldAvailable || Boolean(error) || row.governor_held == null,
               title: heldAvailable ? 'Open exact held-card set on its owning gateway' : 'Held-card filtering needs a newer Desktop',
               onClick: () => onHeld(name, row) }, `Show ${row.governor_held ?? '—'} held cards →`)) : null)) : null,
-      open && idle.length ? h('button', { onClick: () => setShowIdle(!showIdle) }, `${idle.length} idle lanes ${showIdle ? '▾' : '▸'}`) : null,
-      h('h4', null, 'GOVERNORS'),
-      gov ? gov.rows.filter(g => g.state === 'on' || (open && g.state === 'at_cap')).map(g => h(GovernorLine, { key: g.id, row: g })) : h('div', null, 'Governor state unknown'),
+      idle.length ? h('button', { onClick: () => setShowIdle(!showIdle) }, `${idle.length} idle lanes ${showIdle ? '▾' : '▸'}`) : null)) : null),
+    h('div', { 'data-sidebar-section': 'governors' },
+    h('button', { className: 'lanes-sb-heading', 'aria-label': 'GOVERNORS', 'aria-description': governorSummary, 'aria-expanded': governorsOpen, onClick: () => setGovernorsOpen(!governorsOpen) },
+      h('span', { className: 'lanes-sb-label' }, 'GOVERNORS'),
+      h('span', { className: 'lanes-sb-summary', title: governorSummary }, governorSummary),
+      h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, governorsOpen ? '▾' : '▸')),
+    governorsOpen ? h('div', { 'data-sidebar-body': 'governors', className: error ? 'lanes-last-known' : '' },
+      gov ? gov.rows.filter(g => g.state === 'on' || g.state === 'at_cap').map(g => h(GovernorLine, { key: g.id, row: g })) : h('div', null, snap ? 'Governor state unknown' : 'Loading governors…'),
       gov?.counts?.unknown ? h('details', { className: 'lanes-unknown' }, h('summary', null, `${gov.counts.unknown} unknown · missing or stale sources`),
         gov.rows.filter(g => g.state === 'unknown').map(g => h(GovernorLine, { key: g.id, row: g }))) : null,
       h('button', { onClick: () => setShowOff(!showOff) }, `${gov?.counts?.off ?? '—'} off · ${gov?.counts?.at_cap ?? '—'} at cap`),
-      showOff ? gov?.rows.filter(g => g.state === 'off').map(g => h(GovernorLine, { key: g.id, row: g })) : null))
+      showOff ? gov?.rows.filter(g => g.state === 'off').map(g => h(GovernorLine, { key: g.id, row: g })) : null) : null))
 }
 
 export function SidebarLanes({ ctx }) {
@@ -1225,7 +1246,11 @@ const CSS = `
 .lanes-sidebar button{color:inherit;background:transparent;border:0;font:inherit;cursor:pointer;text-align:left}
 .lanes-sidebar button:focus-visible{outline:1px solid var(--ui-text-secondary)}
 .lanes-sidebar h4,.lanes-sb-heading{font-size:10px;letter-spacing:.1em;color:var(--ui-text-tertiary);margin:10px 0 6px}
-.lanes-sidebar .lanes-sb-heading{color:#8f99ff;font-weight:600;width:100%}
+.lanes-sidebar .lanes-sb-heading{color:#8f99ff;font-weight:600;width:100%;display:flex;align-items:center;gap:7px;min-width:0;height:24px;margin:0;padding:0;white-space:nowrap;line-height:24px}
+.lanes-sb-label,.lanes-sb-chevron{flex:none;font-size:10px;letter-spacing:.1em}
+.lanes-sb-summary{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:normal;font-size:10px;font-weight:400;color:var(--ui-text-tertiary)}
+
+.lanes-sb-heading[aria-label=GOVERNORS]{color:var(--ui-text-tertiary)}
 .lanes-sb-line{display:flex;align-items:center;gap:7px;width:100%;font-variant-numeric:tabular-nums}
 .lanes-sb-line strong,.lanes-sb-line>span:nth-child(2){flex:1}
 .lanes-sb-line b{margin-left:auto;font-weight:500}
