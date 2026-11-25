@@ -51,6 +51,21 @@ def test_production_inventory_memo_cost_and_same_version_changes(replica_panel, 
     assert len(p.calls) == 1
     assert len(module._INVENTORY) <= module._INVENTORY_MAX
 
+    from test_panel_timing import timing, checked
+    mirror_module = p.mirror.reconcile_panel.__func__.__globals__
+    traced_costs = []
+    for _ in range(3):
+        trace = timing.Recorder()
+        start = time.thread_time()
+        with mirror_module['panel_trace'](trace):
+            p.run()
+        traced_costs.append(time.thread_time() - start)
+        assert p.mirror.panel_remote_unchanged
+        out = checked(trace)
+        assert out['stages']['inventory_hash_sample']['calls'] >= count // 64
+    print('TIMING_OVERHEAD', dict(untraced_cpu_s=costs, traced_cpu_s=traced_costs))
+    assert min(traced_costs) < min(costs) + .05, (costs, traced_costs)
+
     # Publication version and global DB identity are NOT trusted cache keys.
     # Changing a previously unrelated payload at the same version can add this
     # chat to membership, and malformed JSON/identity must still fail closed.

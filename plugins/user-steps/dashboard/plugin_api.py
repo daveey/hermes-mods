@@ -290,6 +290,21 @@ class PanelReconcileResult(list):
 
 
 def panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profile=None, bound=False) -> list:
+    trace = _load('panel_timing').Recorder()
+    try:
+        with _load('kanban_mirror').panel_trace(trace):
+            result = _panel_reconcile(home, session, lineage, install_id=install_id,
+                                      profile=profile, bound=bound)
+    except Exception as exc:
+        exc.panel_timing = trace.finish()
+        raise
+    if not isinstance(result, PanelReconcileResult):
+        result = PanelReconcileResult(result)
+    result.panel_timing = trace.finish()
+    return result
+
+
+def _panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profile=None, bound=False) -> list:
     """Source-event producer, separate from read-only panel presentation.
 
     Returns what stayed deferred, one line per owner ([] = every owner reconciled). One owner's
@@ -297,8 +312,10 @@ def panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profi
     nor fails the caller's pass: the caller retries the deferred work, it does not certify it.
     """
     core = _load('core')
+    mirror_module = _load('kanban_mirror')
     try:
-        owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
+        with mirror_module._stage('owners'):
+            owners = panel_owners(home, session, lineage, install_id=install_id, profile=profile, bound=bound)
         if bound:
             raise core.ActionError('Explicit-home reconciliation adapter unavailable', 503)
     except core.ActionError as exc:
@@ -306,8 +323,9 @@ def panel_reconcile(home: Path, session: str, lineage, *, install_id=None, profi
             raise
         return []  # queried absent own session, not failed source or failed reconciliation
     store_path = Path(home) / 'user-steps' / 'actions.sqlite3' if bound else None
-    st = core.ActionStore(path=store_path) if store_path is not None else core.ActionStore()
-    producer = _load('kanban_mirror').Mirror(core, st)
+    with mirror_module._stage('store_init'):
+        st = core.ActionStore(path=store_path) if store_path is not None else core.ActionStore()
+        producer = mirror_module.Mirror(core, st)
     deferred = PanelReconcileResult()
     deferred.unchanged = bool(owners)
     for own in owners:

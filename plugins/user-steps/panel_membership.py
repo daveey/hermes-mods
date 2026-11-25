@@ -4,7 +4,7 @@ This is an invalidation key, NOT a projection or evidence of release. No cached
 membership list, DB mtime, WAL signature or global revision can certify it.
 ActionStore request/binding/operation dependencies belong to the caller's key.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -20,10 +20,25 @@ _INVENTORY = OrderedDict()
 _INVENTORY_LOCK = threading.Lock()
 
 
-def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
-    digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+def _stage(timing, name):
+    return timing.stage(name) if timing is not None else nullcontext()
+
+
+@contextmanager
+def _inventory_lock(timing):
+    with _stage(timing, 'inventory_lock_sample'):
+        _INVENTORY_LOCK.acquire()
+    try:
+        yield
+    finally:
+        _INVENTORY_LOCK.release()
+
+
+def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None, timing=None):
+    with _stage(timing, 'inventory_hash_sample'):
+        digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
     cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
-    with _INVENTORY_LOCK:
+    with _inventory_lock(timing):
         value = _INVENTORY.get(cache_key)
         if value is not None:
             _INVENTORY.move_to_end(cache_key)
@@ -31,15 +46,16 @@ def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
     # Preserve sqlite's original TEXT -> strict UTF-8 -> json.loads(str)
     # semantics. json.loads(bytes) would accept a BOM and lone surrogates that
     # the TEXT reader rejects. Storage class also qualifies warm cache entries.
-    if storage_type == 'text':
-        raw = raw.decode('utf-8')
-    task = _object(raw)
-    parts = key.split('/')
-    if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
-        raise ValueError('unknown replica identity')
-    value = ((parts[-2], parts[-1]), task.get('created_at'),
-             frozenset(linked_sessions(task, gateway, profile)))
-    with _INVENTORY_LOCK:
+    with _stage(timing, 'inventory_decode_sample'):
+        if storage_type == 'text':
+            raw = raw.decode('utf-8')
+        task = _object(raw)
+        parts = key.split('/')
+        if len(parts) not in (2, 3) or not all(parts) or task.get('id') != parts[-1]:
+            raise ValueError('unknown replica identity')
+        value = ((parts[-2], parts[-1]), task.get('created_at'),
+                 frozenset(linked_sessions(task, gateway, profile)))
+    with _inventory_lock(timing):
         _INVENTORY[cache_key] = value
         _INVENTORY.move_to_end(cache_key)
         while len(_INVENTORY) > _INVENTORY_MAX:
@@ -159,7 +175,7 @@ def _shadows(paths, *, connect, gateway, profile, aliases, obligations, now, win
 def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             step_sql, chain_cap, linked_sessions, validate_binding,
             scope_heartbeats, now, shadow_paths=None, shadow_window=180.0,
-            display_cards=None):
+            display_cards=None, timing=None):
     """Return a stable digest, or None when complete inputs cannot be vouched for.
 
     Each database is read in a bounded read transaction and closed before return.
@@ -167,6 +183,13 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
     Required files/tables, including an initialized empty ledger, must exist.
     Rows without provable ownership fail closed rather than becoming empty input.
     """
+    if timing is not None:
+        opener = connect
+        def connect(path, **kwargs):
+            label = ('state_sqlite' if path == state_path else
+                     'ledger_sqlite' if path == ledger_path else
+                     'replica_sqlite' if path == replica_path else 'shadow_sqlite')
+            return timing.connect(opener, path, label, **kwargs)
     try:
         profile, session = owner['profile'], owner['storedSessionId']
         if not all(isinstance(v, str) and v for v in (gateway, profile, session)):
@@ -220,12 +243,16 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             # Read all membership links, not just previously known task IDs. The
             # selected inventory must see arrivals, removals and legacy twins.
             candidates, direct = [], set()
-            for gw, key, raw, version, storage_type in replica.execute(
-                    "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'"):
-                identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions, storage_type)
-                candidates.append((gw, key, version, identity, created))
-                if alias_set.intersection(sessions):
-                    direct.add((gw, key))
+            with _stage(timing, 'inventory_scan'):
+                for index, (gw, key, raw, version, storage_type) in enumerate(replica.execute(
+                        "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'")):
+                    # Keep full scans unchanged; row-level hash/decode/lock
+                    # attribution is a systematic 1/64 sample to bound overhead.
+                    probe = timing if index % 64 == 0 else None
+                    identity, created, sessions = _inventory(raw, key, gateway, profile, linked_sessions, storage_type, probe)
+                    candidates.append((gw, key, version, identity, created))
+                    if alias_set.intersection(sessions):
+                        direct.add((gw, key))
             # Retained ledger payloads are not current just because their scope
             # is live. Require the exact owner publication, version AND content,
             # as the canonical projector does before accepting an observation.
@@ -323,7 +350,8 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
         payload = [2, gateway, profile, session, aliases, edges,
                    sorted(obligations, key=_json), sorted(receipts, key=_json),
                    sorted(rows, key=_json), sorted(info_inputs, key=_json), shadows, display]
-        return hashlib.sha256(_json(payload).encode()).hexdigest()
+        with _stage(timing, 'membership_digest'):
+            return hashlib.sha256(_json(payload).encode()).hexdigest()
     except Exception:
         # Optional core/version differences and every unavailable input fail closed.
         return None
@@ -362,6 +390,7 @@ def for_remote(remote, owner, *, now, view):
                        connect=remote.mirror.core._ro_connect, step_sql=_CHAIN_STEP_SQL,
                        chain_cap=_CHAIN_CAP, linked_sessions=linked_sessions,
                        validate_binding=validate_binding, scope_heartbeats=scope_heartbeats, now=now,
-                       shadow_paths=shadow_paths, shadow_window=shadow_window, display_cards=display_cards)
+                       shadow_paths=shadow_paths, shadow_window=shadow_window, display_cards=display_cards,
+                       timing=remote.mirror.panel_timing())
     except Exception:
         return None

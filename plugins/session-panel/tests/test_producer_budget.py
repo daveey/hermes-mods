@@ -107,3 +107,41 @@ def test_core_readers_stop_starting_chats_after_the_deadline(monkeypatch):
     ran.clear()
     r.reconcile_sources(['A', 'B'])
     assert ran == ['A', 'B'] and r.reconcile_unreached == []
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_reader_stage_carriage_and_total_residual(monkeypatch, failed):
+    pytest.importorskip('hermes_cli.kanban_sync_client')
+    import importlib.util
+    import time
+    spec = importlib.util.spec_from_file_location(
+        '_spf_api_timing', Path(__file__).resolve().parents[1] / 'dashboard' / 'plugin_api.py')
+    assert spec is not None and spec.loader is not None
+    api = importlib.util.module_from_spec(spec)
+    import sys
+    monkeypatch.setitem(sys.modules, spec.name, api)
+    spec.loader.exec_module(api)
+    r = api.CoreReaders(state_db=Path('/nonexistent/state.db'))
+    class Result(list):
+        unchanged = True
+    def panel_reconcile(home, session, lineage):
+        value = RuntimeError('unavailable') if failed else Result()
+        value.panel_timing = dict(version=1, call_id='fixture:1', wall_ns=0, cpu_ns=0,
+                                  stages={'residual': dict(wall_ns=0, cpu_ns=0, calls=1)})
+        if failed:
+            raise value
+        return value
+    monkeypatch.setattr(r, '_user_step_api', lambda: types.SimpleNamespace(panel_reconcile=panel_reconcile))
+    def lineage(s):
+        time.sleep(.01)
+        return [s]
+    monkeypatch.setattr(r, 'lineage', lineage)
+    assert r.reconcile_sources(['A']) == ({'A'} if failed else set())
+    row = r.reconcile_timings[0]
+    assert row['unchanged'] is (not failed) and row['deferred'] is failed
+    trace = row['stage_timing']
+    assert trace['call_id'] == 'fixture:1'
+    assert trace['preflight_wall_ns'] >= 5_000_000
+    for clock in ('wall', 'cpu'):
+        assert trace[f'reader_{clock}_ns'] == (trace[f'preflight_{clock}_ns'] +
+                    trace[f'{clock}_ns'] + trace[f'reader_residual_{clock}_ns'])

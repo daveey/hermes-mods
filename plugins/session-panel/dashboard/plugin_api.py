@@ -1207,13 +1207,27 @@ class CoreReaders:
             # One chat's unavailable source must not fail every other chat's pass (this phase runs
             # before all hydration). The feed retries what is returned here; it is never certified.
             began = time.monotonic()
+            began_ns, began_cpu = time.monotonic_ns(), time.thread_time_ns()
+            preflight_ns, preflight_cpu = began_ns, began_cpu
+            stage_timing = None
             try:
-                left = api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
+                home, lineage = self.state_db().parent, self.lineage(session)
+                preflight_ns, preflight_cpu = time.monotonic_ns(), time.thread_time_ns()
+                left = api.panel_reconcile(home, session, lineage)
+                stage_timing = getattr(left, 'panel_timing', None)
             except Exception as exc:
+                stage_timing = getattr(exc, 'panel_timing', None)
                 left = [f'{type(exc).__name__}: {exc}']
+            if stage_timing is not None:
+                total_ns, total_cpu = time.monotonic_ns() - began_ns, time.thread_time_ns() - began_cpu
+                stage_timing = dict(stage_timing, reader_wall_ns=total_ns, reader_cpu_ns=total_cpu,
+                                    preflight_wall_ns=preflight_ns - began_ns,
+                                    preflight_cpu_ns=preflight_cpu - began_cpu,
+                                    reader_residual_wall_ns=total_ns - (preflight_ns - began_ns) - stage_timing['wall_ns'],
+                                    reader_residual_cpu_ns=total_cpu - (preflight_cpu - began_cpu) - stage_timing['cpu_ns'])
             timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
                             'at': time.time(), 'unchanged': bool(getattr(left, 'unchanged', False)),
-                            'deferred': bool(left)})
+                            'deferred': bool(left), 'stage_timing': stage_timing})
             if left:
                 deferred.add(session)
                 log.debug('session-panel source reconciliation deferred: %s: %s', session, left)

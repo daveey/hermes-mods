@@ -18,8 +18,39 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+
+_PANEL_TRACE = contextvars.ContextVar('panel_reconcile_trace', default=None)
+
+
+def _stage(name):
+    trace = _PANEL_TRACE.get()
+    return trace.stage(name) if trace is not None else nullcontext()
+
+
+@contextmanager
+def panel_trace(trace):
+    token = _PANEL_TRACE.set(trace)
+    try:
+        yield
+    finally:
+        _PANEL_TRACE.reset(token)
+
+
+@contextmanager
+def _timed_lock(lock, name):
+    with _stage(name):
+        lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _traced_connection(conn):
+    trace = _PANEL_TRACE.get()
+    return trace.connection(conn, 'local_sqlite') if trace is not None else conn
 
 
 def _remote_module():
@@ -290,7 +321,7 @@ def _kept(path, *, entry_out=None):
     error. Autocommit reads only; a nested use on the same thread gets a one-shot connection instead."""
     st = os.stat(path)  # raises like an open of a missing file would
     ident = (st.st_dev, st.st_ino)
-    with _POOL_LOCK:
+    with _timed_lock(_POOL_LOCK, 'reader_pool_lock'):
         entry = _POOL.get(str(path))
         if entry is None:
             if len(_POOL) >= _POOL_MAX:
@@ -300,26 +331,28 @@ def _kept(path, *, entry_out=None):
             if not _RETIRED:
                 _POOL[str(path)] = entry
     if entry.owner == threading.get_ident():
-        c = _open_ro(path)
+        with _stage('local_db_open'):
+            c = _open_ro(path)
         try:
-            yield c
+            yield _traced_connection(c)
         finally:
             c.close()
         return
     try:
-        with entry.lock:
+        with _timed_lock(entry.lock, 'reader_entry_lock'):
             entry.owner = threading.get_ident()
             try:
                 if entry.conn is None or entry.ident != ident:
                     if entry.conn is not None:
                         entry.conn.close()
                         entry.conn = None
-                    entry.conn, entry.ident, entry.gen, entry.memo = _open_ro(path), ident, next(_GEN), {}
+                    with _stage('local_db_open'):
+                        entry.conn, entry.ident, entry.gen, entry.memo = _open_ro(path), ident, next(_GEN), {}
                 c = entry.conn
                 if entry_out is not None:
                     entry_out.append(entry)
                 try:
-                    yield c
+                    yield _traced_connection(c)
                 except sqlite3.Error:
                     entry.conn = None  # never reuse a connection that failed mid-read
                     c.close()
@@ -960,12 +993,13 @@ class Mirror:
         local pass retains its own namespace-wide dependency handling separately.
         Capture before work: a write during reconciliation must be revisited.
         """
-        membership = self.remote.membership_capture(owner)
+        with _stage('membership'):
+            membership = self.remote.membership_capture(owner)
         if membership is None:
             return None
         try:
             ns = self.store._ns(owner)
-            with self.store._read() as c:
+            with _stage('action_stamp_read'), self.store._read() as c:
                 bindings = [tuple(r) for r in c.execute(
                     'SELECT * FROM kanban_projections WHERE namespace=? ORDER BY request_id', (ns,))]
                 # Unbound requests in this chat also matter: a deterministic
@@ -988,9 +1022,13 @@ class Mirror:
                 parts.append([tuple(r) for r in c.execute(
                     'SELECT id,withdrawal FROM lifecycle WHERE namespace=? '
                     'AND id IN (SELECT value FROM json_each(?)) ORDER BY id', (ns, scope))])
-            return _digest(parts)
+            with _stage('action_stamp_hash'):
+                return _digest(parts)
         except (sqlite3.Error, OSError, ValueError, TypeError):
             return None
+
+    def panel_timing(self):
+        return _PANEL_TRACE.get()
 
     def reconcile_panel(self, owner):
         """Strict producer with change-keyed remote reads and bounded failure retry.
@@ -1000,12 +1038,12 @@ class Mirror:
         Keys are captured BEFORE reconciliation so a concurrent write is owed.
         """
         self.core.validate_owner(owner)
-        with _accounted_pass('user_steps.panel_stamp') as acct:
+        with _stage('remote_stamp'), _accounted_pass('user_steps.panel_stamp') as acct:
             stamp = self._panel_stamp(owner)
             acct.fallback(stamp is None)
         key = _local_key(self, owner)
         now = time.monotonic()
-        with _PANEL_REMOTE_LOCK:
+        with _timed_lock(_PANEL_REMOTE_LOCK, 'remote_memo_lock'):
             hit = _PANEL_REMOTE.get(key)
             if hit and now < hit[1] and (hit[3] is not None or (stamp is not None and hit[0] == stamp)):
                 run, error = False, hit[3]
@@ -1020,7 +1058,7 @@ class Mirror:
         if run:
             failures = hit[2] if hit else 0
             try:
-                with _accounted_pass('user_steps.panel_remote') as acct:
+                with _stage('remote_reconcile'), _accounted_pass('user_steps.panel_remote') as acct:
                     acct.change(stamp is not None and (hit is None or stamp != hit[0]))
                     acct.fallback(stamp is None or (hit is not None and stamp == hit[0]))
                     if self.remote.reconcile(owner) is False:
@@ -1045,7 +1083,8 @@ class Mirror:
                     if value[1] != float('inf'):
                         del _PANEL_REMOTE[old]
         try:
-            self._reconcile_local(owner, True)
+            with _stage('local_reconcile'):
+                self._reconcile_local(owner, True)
         except BaseException:
             _clear_remote_fresh(encoded(owner))
             raise
@@ -1085,8 +1124,10 @@ class Mirror:
 
     def _reconcile_local(self, owner, strict):
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
-            fenced = self._fenced_core()
-            key = self._key(owner, fenced)
+            with _stage('local_fence'):
+                fenced = self._fenced_core()
+            with _stage('local_key'):
+                key = self._key(owner, fenced)
             okey = encoded(owner)
             now = time.monotonic()
             with _MEMO_LOCK:
@@ -1096,7 +1137,8 @@ class Mirror:
                 return
             acct.change(memo is None or memo[0] != key)
             acct.fallback(key is None or (memo is not None and memo[0] == key))  # unkeyable, or the ceiling
-            clean = self._reconcile(owner, fenced)
+            with _stage('local_full_pass'):
+                clean = self._reconcile(owner, fenced)
             if strict and not clean:
                 raise RuntimeError('Card reconciliation deferred')
             with _MEMO_LOCK:
