@@ -23,8 +23,8 @@ raises, so no fingerprint is produced and core reads locally. It is made of:
 |---|---|---|
 | `rows` | each pending ledger row's settlement fields (`core.SETTLE_ROW_FIELDS`; the waiting pass settles from only these, so the waker's bookkeeping writes — claims, retries, wake results — are no input) | re-read only when the ledger's committed revision moves (`core.revision_token`) |
 | `origin` | digest of the origin ledger's obligations and receipts | re-read only when its committed revision moves |
-| `boards` | each local board's content key (`ksa._board_content_key`: bookkeeping writes excluded) | core's cached key |
-| `shadows` | each sync shadow's content key plus its freshness judged at now | core's cached key, `core.shadow_rows` cache |
+| `boards` | certified per-task revision marks for pending batch tails, plus the FULL mark and file/schema identity | indexed marks in the same transaction as core's trigger/counter/identity certification; the global counter certifies but is not a key value |
+| `shadows` | the same selected-task evidence for every discoverable shadow plus its freshness judged at now | same certified snapshot and `core.shadow_rows` freshness; known absent shadows stay explicit |
 | `replica` | substantive digests of the hub replica `tasks` rows for the batch cards, the owners' scope heartbeats and the sync meta; every clock verdict is judged at now | `ReplicaWatch`, only when the replica's revision moved: a per-gateway index-only probe (`count`, `count(seq)`, `max(seq)`, `total(seq)`), the rows past each gateway's cursor, and every tracked batch row re-read by primary key (raw text compared, so a rewrite in place at its old seq moves it). A NULL `seq`, a probe the merged rows don't reproduce (a delete, a rewrite at an older seq, a new gateway without an info row), a replaced file (dev, ino) or new batch tails rebuild |
 | `lineage` | per-lineage transcript watermark for each pending chat and its compression tip: max `messages.id` (any row), the active rows' max id, count, id sum and timestamp sum (core `transcript_key`'s terms: an active flip or delete below the max, a timestamp repair), `transcript_revision`, `end_reason`, compression-child count | `LineageWatch`: index-only seeks (`idx_messages_session_active`, `idx_messages_session_id`), re-run only when that state.db's stat moved. A db whose triggers can't vouch that `transcript_revision` moves on an in-place rewrite (core `TRANSCRIPT_TRIGGERS`) has no watermark: no key, a full pass every time, like `transcript_key` returning None |
 | `floor` | a 10-minute bucket, in the whole key and in every per-row key | a missed input is recomputed within 10 minutes, per row too |
@@ -36,6 +36,27 @@ unchanged (`test_a_chat_outside_the_ledger_does_not_move_the_key`).
 The replica's liveness-only fields are left out of the digests: `activity_at`, `activity_kind`, and the
 `origin_observation.task_hash` re-stamp they cause. These fields are 67% of changed task rows in rf2. Whether the
 observation still verifies (`_owner_evidence`) is kept, so a real attestation change still moves the key.
+
+### Irrelevant write storms
+
+Problem: the declaration existed but its whole-board values moved on unrelated comments and task writes,
+forcing waiting reads on almost every holder wake. Root (happened): a global invalidation domain despite
+the known batch-tail selection. Root (not caught): tests checked per-row work, not unchanged declarations
+and zero source calls during irrelevant write storms. Recurrence: this extends the earlier host-only
+scoping fix (`_host_board_key`); that history-dependent token cannot certify portable waiting inputs.
+
+`_waiting_board_key` instead publishes deterministic selected task marks. A cold observer computes the
+same value independently; its cursor is used only to reject FULL/restore/regression, never as a value.
+Missing certification, unknown freshness, errors and older cores force fresh reads. Failed declarations
+also discard the same-thread reusable input and bypass the three-second answer and row memos.
+
+Proof: `tests/test_waiting_task_inputs.py` covers unrelated heartbeat/comment/status writes, cold-key parity,
+selected changes without notifications, batch growth, floor rollover, missing coverage/errors, FULL/reinstall,
+same-file counter regression and replacement. Its composed holder test runs the actual core declaration gate
+against twenty real state-message/comment/heartbeat storms with zero extra source calls, then selected-change
+and clock controls. On a core predating the gate only that composition skips; use `HERMES_WAITING_GATE_SOURCE`
+to exercise an exact candidate module without changing the installed core. Live CPU acceptance remains a
+separate integration measurement, not established by these tests.
 
 ## Per-row reuse
 
@@ -60,7 +81,7 @@ Unlike the portable waiting-source key, host board/shadow keys use core's covera
 `kanban_task_change.changed_since` cursor to ignore changes positively attributed to tasks outside the pending
 batch tails. Batch-tail growth, a relevant task/link change, a file/schema replacement, revision regression,
 unknown/full changes, missing coverage or an older core all refresh the broad key. Shadow freshness is still
-judged on every tick. This memo is process-local; the waiting-source key is unchanged. Owner-wake retains the
+judged on every tick. This memo is process-local and distinct from portable selected-task evidence. Owner-wake retains the
 **global** board/shadow keys because parked cards need not occur in any batch. Wake and watchdog also key the
 unseen-notice map (subscriptions may name non-batch tasks), and wake's row cache keys it too: clearing unseen
 notices must reconsider an idle row immediately. These are input probes, not repeated verdict/proof work.

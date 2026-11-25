@@ -1822,8 +1822,8 @@ def _host_board_key(path: Path, tails: set[str], tables=None, *, tail_out=None) 
 
     The core cursor vouches for trigger coverage, file/schema identity, regression and unknown/full changes.
     Older cores and unvouched boards retain the broad key. Read the cursor BEFORE the fresh broad key: a write
-    between them is seen again next tick, never consumed behind an older key. Waiting-source keys stay portable
-    and unchanged; owner-wake keeps the global key because it reads parked cards outside every batch.
+    between them is seen again next tick, never consumed behind an older key. Waiting-source keys use separate
+    portable evidence; owner-wake keeps the global key because it reads parked cards outside every batch.
     """
     from hermes_cli import kanban_session_activity as ksa
     with _host_board_lock:
@@ -1858,8 +1858,63 @@ def _host_board_key(path: Path, tails: set[str], tables=None, *, tail_out=None) 
         return scoped, broad
 
 
+_waiting_board_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _waiting_board_read(path: Path):
+    from hermes_cli import kanban_session_activity as ksa, kanban_activity_revision as rev
+    from hermes_cli.kanban_generation import BoardLifecycleBusy
+    try:
+        with rev.probe_lock(path), ksa.cached_ro(path, busy_budget=0) as conn:
+            yield conn
+    except BoardLifecycleBusy as exc:
+        raise wi.Unportable("waiting board lifecycle busy") from exc
+
+
+def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
+    """Portable selected-task evidence, NOT the host's history-dependent scoped token.
+
+    Core certifies trigger coverage, revision continuity and file identity in the SAME snapshot as our
+    indexed task marks. The global revision is only a certification gate, never a returned value. FULL
+    after a previous observation forces a fresh pass (restore/regression/reinstall); a cold reader can
+    independently build the same key. No certifier on an older core means no memo/adoption, not silence.
+    """
+    from hermes_cli import kanban_task_change as tc, kanban_activity_revision as rev
+    with _waiting_board_lock:
+        cache = _wi.setdefault("waiting_boards", {})
+        ident = (str(path), tuple(tables) if tables is not None else None)
+        previous = cache.get(ident)
+        with _waiting_board_read(path) as conn:
+            conn.execute("BEGIN")
+            try:
+                changed, cursor = tc.changed_since(conn, previous, tables=tables)
+                if cursor is None:
+                    cache.pop(ident, None)
+                    raise wi.Unportable("uncertified waiting task inputs")
+                marks = [[tail, conn.execute(
+                    f"SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?", (tail,)).fetchone()]
+                    for tail in sorted(tails | {rev.FULL_MARK})]
+                # changed_since rechecks path/shm identity after its read, including when the caller owns
+                # the transaction. Repeat after the marks, so a replacement during their read is unknown.
+                _changed, final = tc.changed_since(conn, cursor, tables=tables)
+                if final != cursor:
+                    cache.pop(ident, None)
+                    raise wi.Unportable("waiting board changed identity during read")
+            finally:
+                conn.execute("ROLLBACK")
+        if len(cache) >= 256:
+            cache.clear()
+        cache[ident] = cursor
+        if previous is not None and changed is tc.FULL:
+            raise wi.Unportable("waiting board requires full refresh")
+        return wi.strict_digest(["tasks-v1", cursor.dev, cursor.ino, cursor.shm,
+                                 cursor.schema_version, cursor.tables,
+                                 [[tail, list(mark) if mark is not None else None] for tail, mark in marks]])
+
+
 def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None,
-                  tail_out: Optional[dict] = None) -> list:
+                  tail_out: Optional[dict] = None, waiting_tails: Optional[set[str]] = None) -> list:
     """Each sync shadow / link-only board ``_board_coverage`` may consult: its content key and its freshness at now."""
     from hermes_cli import kanban_session_activity as ksa
     kanban = _kanban_root() / "kanban"
@@ -1883,7 +1938,11 @@ def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_o
             fresh, _found = _read_shadow(stem, set())
         except Exception:
             fresh = None
-        if host_tails is None:
+        if waiting_tails is not None:
+            if fresh is None:
+                raise wi.Unportable("unknown shadow freshness")
+            scoped = broad = _waiting_board_key(path, waiting_tails, tables)
+        elif host_tails is None:
             scoped = broad = wi.portable_digest(ksa._board_content_key(path, tables))
         else:
             tokens = {}
@@ -1949,11 +2008,11 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
             for tail in tails:
                 tail_boards.setdefault(tail, []).append([str(p), tokens[tail]])
         else:
-            scoped = broad = wi.portable_digest(ksa._board_content_key(path))
+            scoped = broad = _waiting_board_key(path, tails)
         boards.append([str(p), scoped])
         global_boards.append([str(p), broad])
     shadows = (_shadow_parts(now, host_tails=tails, global_out=global_shadows, tail_out=tail_shadows)
-               if host else _shadow_parts(now))
+               if host else _shadow_parts(now, waiting_tails=tails))
     if host:
         _state["host_globals"] = {"boards": global_boards, "shadows": global_shadows}
     own_tail_sets = [{str(k).rsplit("/", 1)[-1] for k in row.get("batch") or []} for row in rows] if host else []
@@ -2000,6 +2059,9 @@ def waiting_inputs() -> Any:
     Core reads it on every annotation fingerprint, so it is accounted too (P1 ``chat-closeout.waiting_inputs``)."""
     if _off():
         return ["off"]
+    # A failed fingerprint must never leave a successful old hit or 3-second answer eligible.
+    _inputs_local.hit = None
+    _inputs_local.failed = True
     unportable: Optional[Exception] = None
     with wi.accounting_pass("chat-closeout.waiting_inputs") as acct, _proof_pass():
         try:
@@ -2020,6 +2082,7 @@ def waiting_inputs() -> Any:
     # thread: the fingerprint and the pass that follows it run on one thread, and another thread's (older) reads
     # must never label this thread's answer.
     _inputs_local.hit = (time.monotonic(), rows, parts)
+    _inputs_local.failed = False
     return key
 
 
@@ -2090,7 +2153,12 @@ def waiting_source() -> dict[str, list[str]]:
         # Age limits read reuse, never invalidation: core's counts read or this lock can take longer than
         # INPUTS_REUSE_S. An expired newer fingerprint still forbids returning an older cached answer.
         moved = raw is not None and (memo is None or memo[0] != raw[2])
-        if hit and time.monotonic() - hit[0] < 3.0 and not moved:
+        failed = getattr(_inputs_local, "failed", False)
+        _inputs_local.failed = False
+        if failed:
+            memos[scope] = None
+            row_caches[scope].clear()
+        if hit and time.monotonic() - hit[0] < 3.0 and not moved and not failed:
             return hit[1]
         with wi.accounting_pass("chat-closeout.waiting") as acct, _proof_pass():
             # One proof pass for the inputs and the reconcile: the watermark seeks and the proofs share connections.

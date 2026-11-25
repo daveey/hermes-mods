@@ -245,6 +245,11 @@ def _host_tick(spy, clock, typing):
 
 
 def test_the_watchdog_skips_on_unchanged_inputs_and_sees_a_change(world, spy, clock):  # noqa: F811
+    # This legacy fallback test watches all board writes, including t_2 after it left the batch. Keep its
+    # original unvouched-board premise; certified scoped host behavior has separate tests below.
+    from hermes_cli import kanban_activity_revision as rev
+    with sqlite3.connect(world['board']) as conn:
+        rev.drop_triggers(conn)
     world['led'].write('c1', batch=[], open=[])  # only c3 (working) is pending: the watchdog observes nothing
     world['led'].write('c2', batch=[], open=[])
     typing = lambda: clock.wall - 10  # noqa: E731
