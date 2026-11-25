@@ -47,7 +47,8 @@ test('aged parked board data keeps its status and age in the panel and task chip
   assert.match(detail, /as of .*panel data 2m old/)
   assert.doesNotMatch(detail, /status unknown/)
   assert.equal(row.evidence_state, 'unknown')
-  assert.equal(row.wait_kind, undefined)
+  // e44ba1cb: a delivery wait keeps its wait_kind up to HISTORICAL_DELIVERY_S (360 s); this data is 2m old
+  assert.equal(row.wait_kind, 'ci')
   const tasks = await import('../../session-tasks/plugin.js')
   window.__sessionPanel = { clockRow: m.clockRow }
   const [chip] = tasks.withModelDisplay([{ kind: 'kanban', id: row.id, gateway: row.gateway,
