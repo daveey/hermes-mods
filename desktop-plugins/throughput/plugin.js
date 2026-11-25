@@ -1010,6 +1010,8 @@ export function Throughput({ ctx, placement = 'bar' }) {
 
 export const CSS = `
 .hermes-tp-spark{color:var(--ui-green,#3ddc97);flex-shrink:0}
+/* Titlebar buttons size descendant SVGs as icons; this SVG is a 34px-wide chart. */
+.hermes-tp-tool .hermes-tp-spark{width:34px!important;height:14px!important}
 .hermes-tp-chiptext{white-space:nowrap;font-variant-numeric:tabular-nums}
 .hermes-tp-tool{padding:0!important}
 .hermes-tp-tbchip{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;width:100%;height:100%;padding:0 6px;font-size:11px;color:var(--ui-text-tertiary);overflow:hidden}
