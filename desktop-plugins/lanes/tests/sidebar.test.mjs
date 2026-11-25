@@ -12,6 +12,54 @@ const snapshot = () => ({ configured: true, status: { run: 7, you: 3 }, totals: 
     limits: { max_workers: 4, cards_per_day: 20, usd_per_day: 100 }, boards: ['alpha', 'beta'],
     held_sessions: ['chat'], held_cards: ['card'] }, idle: { open: 0 } } })
 
+test('governors collapse independently and persist across remount', async () => {
+  localStorage.clear()
+  const t = setup()
+  const pane = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
+  try {
+    const governors = pane.container.querySelector('[aria-label="GOVERNORS"]')
+    assert.ok(governors, 'independent governor toggle exists')
+    assert.equal(governors.getAttribute('aria-expanded'), 'false')
+    await pane.click(governors)
+    assert.ok(pane.container.querySelector('[data-governor="llm_pool"]'))
+    assert.ok(pane.container.querySelector('.lanes-share-bar') === null)
+    await pane.click(pane.container.querySelector('[aria-label="LANES"]'))
+    await pane.click(pane.container.querySelector('[aria-label="LANES"]'))
+    assert.equal(governors.getAttribute('aria-expanded'), 'true')
+  } finally { await pane.close() }
+  const remount = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
+  try {
+    assert.equal(remount.container.querySelector('[aria-label="GOVERNORS"]').getAttribute('aria-expanded'), 'true')
+    assert.equal(remount.container.querySelector('[aria-label="LANES"]').getAttribute('aria-expanded'), 'false')
+    await remount.click(remount.container.querySelector('[aria-label="GOVERNORS"]'))
+    assert.ok(remount.container.querySelector('[data-governor]') === null)
+    assert.ok(remount.container.querySelector('details') === null)
+  } finally { await remount.close(); localStorage.clear() }
+})
+
+for (const variant of ['loading', 'unknown', 'offline', 'long']) test(`collapsed sections keep ${variant} truth in their inline summaries`, async () => {
+  localStorage.clear()
+  const snap = variant === 'loading' ? undefined : snapshot()
+  if (variant === 'unknown') { snap.flow_complete = false; snap.status.run = null; snap.governors = undefined }
+  if (variant === 'long') { snap.status.run = 123456789012345; snap.governors.counts.unknown = 987654321098765 }
+  const pane = await mount(React.createElement(P.SidebarView, { snap, error: variant === 'offline' ? 'unreachable' : '', open: false, setOpen() {} }))
+  try {
+    const headings = [...pane.container.querySelectorAll('.lanes-sb-heading')]
+    assert.equal(headings.length, 2)
+    assert.ok(pane.container.querySelector('.lanes-share-bar, [data-governor], details, [data-sidebar-lane]') === null)
+    for (const heading of headings) {
+      assert.equal(heading.getAttribute('aria-expanded'), 'false')
+      const summary = heading.querySelector('.lanes-sb-summary')
+      assert.ok(summary, 'summary is inside heading')
+      assert.equal(summary.title, summary.textContent)
+    }
+    if (variant === 'loading') assert.match(headings[0].textContent, /Loading lanes/)
+    if (variant === 'unknown') { assert.match(headings[0].textContent, /Partial.*— running/); assert.match(headings[1].textContent, /unknown/) }
+    if (variant === 'offline') for (const heading of headings) assert.match(heading.textContent, /offline.*last known/i)
+    if (variant === 'long') { assert.match(headings[0].textContent, /123456789012345/); assert.match(headings[1].textContent, /987654321098765 unknown/) }
+  } finally { await pane.close() }
+})
+
 function setup(body = snapshot()) {
   const contributions = [], writes = []
   let push
@@ -57,10 +105,13 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
   await P.sourceFor(t.ctx).read(6, '6h', true)
   const pane = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
   try {
-    assert.match(pane.container.textContent, /7 running31 held3 you41 waiting/)
-    assert.match(pane.container.textContent, /\$12.34 today/)
-    assert.equal(pane.container.querySelector('[data-sidebar-lane]'), null)
+    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
+    assert.doesNotMatch(pane.container.textContent, /\$12.34 today/)
+    assert.ok(pane.container.querySelector('.lanes-share-bar') === null)
+    assert.ok(pane.container.querySelector('[data-governor]') === null)
+    assert.ok(pane.container.querySelector('[data-sidebar-lane]') === null)
     await pane.click(pane.container.querySelector('.lanes-sb-heading'))
+    assert.match(pane.container.textContent, /\$12.34 today/)
     assert.equal(localStorage.getItem(P.SIDEBAR_OPEN_KEY), '1')
     assert.equal(pane.container.querySelector('[data-sidebar-lane="idle"]'), null)
     await pane.click(pane.container.querySelector('[data-sidebar-lane="work"] button'))
@@ -83,7 +134,7 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
       body: { share: 30, max_workers: null, cards_per_day: 24, usd_per_day: 80.25, paused: true } }])
     await React.act(async () => t.push(undefined, Error('unreachable')))
     assert.match(pane.container.textContent, /Lanes offline - retrying/)
-    assert.match(pane.container.textContent, /7 running31 held3 you41 waiting/)
+    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
     assert.ok(pane.container.querySelector('.lanes-last-known'))
     assert.ok(pane.container.querySelector('button[type=submit]').disabled)
   } finally { await pane.close() }

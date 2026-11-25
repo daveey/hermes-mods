@@ -8,6 +8,8 @@ const pane = await mount(React.createElement(P.SidebarView, {
 }))
 try {
   assert.ok(pane.container.querySelector('[data-slot="lanes-sidebar"]'))
+  assert.ok(pane.container.querySelector('[data-sidebar-body="governors"]') === null, 'governors start minimized')
+  await pane.click(pane.container.querySelector('[aria-label="GOVERNORS"]'))
   const pool = pane.container.querySelector('[data-governor="llm_pool"]')
   if (scenario === 'pool') {
     assert.equal(pool.dataset.state, 'on')
@@ -16,7 +18,7 @@ try {
     assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /LLM pool/)
   } else if (scenario === 'recovered') {
     assert.equal(pool, null, 'pool moves into folded off list')
-    const button = [...pane.container.querySelectorAll('button')].find(b => b.textContent.includes(' off ·'))
+    const button = [...pane.container.querySelectorAll('[data-sidebar-body="governors"] button')].find(b => b.textContent.includes(' off ·'))
     await pane.click(button)
     assert.equal(pane.container.querySelector('[data-governor="llm_pool"]').dataset.state, 'off')
   } else if (scenario === 'gate') {
