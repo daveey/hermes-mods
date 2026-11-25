@@ -110,3 +110,25 @@ def test_old_board_capture_cannot_restore_pre_probe_processes():
     clock['now'] += 46
     f._publish({'S1': {**old, 'computed_seq': 1000}})
     assert f.bundles['S1']['bundle']['processes'][0]['probe_at'] == 998
+
+
+def test_process_row_opens_its_owner_qualified_process_not_the_parent_chat():
+    from test_model import model, bundle, project, NOW
+    raw = {'id': 'proc_owned', 'work_id': 'proc_owned', 'title': 'sleep 600',
+           'gateway': 'owner', 'profile': 'work',
+           'execution_observations': [{'state': 'running', 'identity': {
+               'kind': 'process', 'work_id': 'proc_owned', 'gateway': 'owner', 'profile': 'work'}}]}
+    b = bundle(session='owner-chat', processes=[raw])
+    view = model.reduce_panel(b, now=NOW, projector=project)
+    row = view['sections']['running'][0]
+    assert row['title'] == 'sleep 600'
+    assert row['detail'] == 'running'
+    assert row['actions'] == [{'kind': 'open_process', 'label': 'Open process',
+        'target': {'id': 'proc_owned', 'session': 'owner-chat', 'gateway': 'owner', 'profile': 'work'}}]
+    for missing in ('work_id', 'gateway', 'profile'):
+        bad = dict(raw, **{missing: ''})
+        result = model.reduce_panel(bundle(session='owner-chat', processes=[bad]), now=NOW, projector=project)
+        rows = result['sections']['running'] + result['sections']['waiting']
+        assert not rows[0]['actions'], missing
+    result = model.reduce_panel(bundle(processes=[raw]), now=NOW, projector=project)
+    assert not result['sections']['running'][0]['actions']

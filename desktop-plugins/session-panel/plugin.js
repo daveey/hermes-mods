@@ -4,6 +4,7 @@ import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import * as sdk from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { ProcessView, processRoute } from './process-view.js'
 
 // Identical in the two standalone disk plugins; matches core lib/wait-eta.ts.
 export function formatWaitDuration(seconds) {
@@ -39,7 +40,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v25-row-context-menu'
+const VERSION = 'session-panel-v26-live-processes'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -491,7 +492,8 @@ export function rowMenuItems(row, currentSession = null) {
   return [
     { key: 'session', label: 'Open session', action: session && str(session.target.session) !== str(currentSession) ? session : null },
     { key: 'card', label: 'Open card', action: own },
-    { key: 'dependency', label: 'Open dependency', action: dependency }
+    { key: 'dependency', label: 'Open dependency', action: dependency },
+    ...actions.filter(a => a?.kind === 'open_process' && a.target?.id).map(action => ({key: 'process', label: 'Open process', action}))
   ]
 }
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null } = {}) {
@@ -1014,11 +1016,13 @@ export function Panel() {
   const [, tick] = useState(0)
   const [retry, setRetry] = useState(0)
   const [pending, setPending] = useState(null)
+  const [process, setProcess] = useState(null)
   useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId)
   useValue(host.state.connectionId)
   useValue(host.state.profile || host.state.connectionId)
   const route = panelRoute(), scope = routeKey(route)
+  useEffect(() => setProcess(null), [scope])
   useEffect(() => watchPanel(route), [scope])
   useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
   useEffect(() => {
@@ -1048,7 +1052,7 @@ export function Panel() {
   if (!route.session) return null
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
-  return renderModel(model, {
+  const panel = renderModel(model, {
     // Cold/legacy cache has no source clock: absence of a heartbeat is not a voucher.
     vouched: feedVouches(route),
     collapsed,
@@ -1059,6 +1063,15 @@ export function Panel() {
     onAction: (row, action) => {
       if (action.kind === 'open_url') { void openUrl(action.url); return }
       if (action.kind === 'open_session') { void openSessionAction(action, route); return }
+      if (action.kind === 'open_process') {
+        try {
+          if (typeof host.requestProfile !== 'function' || !sdk.Dialog) throw Error('Opening processes requires a newer Desktop build.')
+          const target = Object.freeze({...action.target, title: row.title, detail: row.detail})
+          const ownerRoute = processRoute(target, tasksBridge(), host.state?.gateways?.get?.())
+          setProcess({target, route: ownerRoute, scope})
+        } catch (e) { host.notify?.({kind: 'error', message: String(e?.message || e)}) }
+        return
+      }
       const t = action.target
       if (!t?.id) return
       const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : route.connectionId
@@ -1066,6 +1079,9 @@ export function Panel() {
       void tasksBridge()?.openTaskChip?.({ id: t.id, kind: 'kanban', gatewayId: t.gateway, profile: t.profile, board: t.board, connectionId })
     }
   })
+  return jsxs('div', {children: [panel, process?.scope === scope && jsx(ProcessView, {
+    target: process.target, route: process.route, onClose: () => setProcess(null)
+  })]})
 }
 
 export default {

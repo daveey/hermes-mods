@@ -26,7 +26,7 @@ export async function resolve(s,c,n) {
  const m = {
  'react': 'const R=globalThis.hubHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef',
  'react/jsx-runtime': 'const J=globalThis.hubHarness.J;export const jsx=J.jsx,jsxs=J.jsxs',
- '@hermes/plugin-sdk': 'const H=globalThis.hubHarness,R=H.React,F=p=>R.createElement(R.Fragment,null,p.children);export const host=H.host,Codicon=()=>null,DisclosureCaret=()=>null,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get?.(),ContextMenu=F,ContextMenuTrigger=F,ContextMenuContent=p=>H.menus?R.createElement("div",{"data-row-menu":p["data-row-menu"]},p.children):null,ContextMenuItem=p=>R.createElement("button",{type:"button","data-row-menu-item":p["data-row-menu-item"],disabled:p.disabled,onClick:p.onSelect},p.children)'
+ '@hermes/plugin-sdk': 'const H=globalThis.hubHarness,R=H.React,F=p=>R.createElement(R.Fragment,null,p.children);export const Dialog=F,DialogContent=p=>R.createElement("div",{"data-process-view":p["data-process-view"]},p.children),DialogHeader=F,DialogTitle=p=>R.createElement("h2",null,p.children),DialogDescription=p=>R.createElement("p",null,p.children),host=H.host,Codicon=()=>null,DisclosureCaret=()=>null,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get?.(),ContextMenu=F,ContextMenuTrigger=F,ContextMenuContent=p=>H.menus?R.createElement("div",{"data-row-menu":p["data-row-menu"]},p.children):null,ContextMenuItem=p=>R.createElement("button",{type:"button","data-row-menu-item":p["data-row-menu-item"],disabled:p.disabled,onClick:p.onSelect},p.children)'
  }; return m[s]?{url:'data:text/javascript,'+encodeURIComponent(m[s]),shortCircuit:true}:n(s,c)
 }
 export async function load(u,c,n) {
@@ -1246,6 +1246,63 @@ test('an older model labelled Open parent card still fills Open dependency', () 
  assert.equal(items.find(i => i.key === 'dependency').action.target.id, 'p')
  assert.equal(items.find(i => i.key === 'card').action.target.id, 'a')
  assert.equal(items.find(i => i.key === 'session').action, null)
+})
+
+test('process row menu dispatches exact owner without inline navigation', async () => {
+ const model = structuredClone(cases.named_parent.model)
+ const row = model.sections.waiting[0]
+ const target = {id: 'proc_owned', session: 'owner-chat', gateway: 'owner', profile: 'work'}
+ row.actions = [{kind: 'open_process', label: 'Open process', target}]
+ const opened = []
+ globalThis.hubHarness.menus = true
+ try {
+  await paint(m.renderModel(model, {onAction: (r, a) => opened.push(a), currentSession: 'chat'}))
+  const menu = document.querySelector(`[data-row-menu="${row.key}"]`)
+  const item = [...menu.querySelectorAll('button')].find(b => b.textContent === 'Open process')
+  assert.ok(item && !item.disabled)
+  assert.equal(document.querySelector('a[href*="proc_owned"]'), null)
+  await React.act(async () => item.click())
+  assert.deepEqual(opened, [{kind: 'open_process', label: 'Open process', target}])
+ } finally { globalThis.hubHarness.menus = false }
+})
+
+test('mounted Panel opens the process owner and cancels its dialog on session navigation', async () => {
+ await paint(null); m.resetFeedForTests()
+ const model = structuredClone(cases.named_parent.model)
+ const row = model.sections.waiting[0]
+ const target = {id: 'proc_owned', session: 'owner-chat', gateway: 'owner', profile: 'work'}
+ row.actions = [{kind: 'open_process', target}]
+ const calls = []
+ const before = {...current}
+ globalThis.hubHarness.menus = true
+ host.state.gateways = atom(() => [{id: 'owner-connection', kind: 'remote'}])
+ window.__sessionTasks = {connectionForHubGateway: g => g === 'owner' ? 'owner-connection' : null}
+ host.requestProfile = async (...args) => {
+  calls.push(args)
+  return args[1] === 'session.resume' ? {stored_session_id: 'owner-chat', session_id: 'owner-runtime'} :
+   {processes: [{session_id: 'proc_owned', command: 'sleep 600', status: 'running', output_tail: 'owned output'}]}
+ }
+ try {
+  m.ingestBundle(current.connectionId, current.profile, {session: current.session, model})
+  await paint(J.jsx(m.Panel, {}))
+  const open = [...document.querySelectorAll('[data-row-menu-item]')].find(b => b.textContent === 'Open process')
+  assert.ok(open)
+  await React.act(async () => open.click())
+  assert.match(document.querySelector('[data-process-view]').textContent, /sleep 600.*running.*owned output/)
+  assert.equal(calls.length, 2)
+  for (const [route] of calls) assert.deepEqual(route, {connectionId: 'owner-connection', mode: 'remote', profile: 'work', targetProfile: 'work'})
+  assert.equal(calls[1][2].session_id, 'owner-runtime')
+  current = {...current, session: 'other-chat'}
+  await paint(J.jsx(m.Panel, {}))
+  assert.equal(document.querySelector('[data-process-view]'), null)
+  current = before
+  await paint(J.jsx(m.Panel, {}))
+  assert.equal(document.querySelector('[data-process-view]'), null, 'returning does not reopen a retired view')
+ } finally {
+  await paint(null); current = before; m.resetFeedForTests()
+  delete host.state.gateways; delete host.requestProfile; delete window.__sessionTasks
+  globalThis.hubHarness.menus = false
+ }
 })
 
 test('Open session routes to the card owner gateway via host.openSession', async () => {
