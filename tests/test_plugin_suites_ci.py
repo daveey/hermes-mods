@@ -152,7 +152,9 @@ class PluginSuitesWorkflow(unittest.TestCase):
     def test_remote_card_composed_is_unconditional_and_uses_landed_inputs(self):
         job = self.text.split('  remote-card-composed:\n', 1)[1].split('\n  suites:', 1)[0]
         self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', job)
-        self.assertIn('ref: 0397ba2abd1be2b28c41626152696f0901acab4f', job)
+        # Core main 23f8b8c1 on the public mirror: carries hermes_cli/kanban_release.py (the Unblock click release).
+        self.assertIn('ref: 23f8b8c15aac788caddecf1d470fb0918e20dd3e', job)
+        self.assertNotIn('0397ba2abd1be2b28c41626152696f0901acab4f', job)
         self.assertIn('ref: 11058ac91990624059dd4214e420334cbcc5d006', job)
         courier_checkout = job.split('          repository: daveey/hermes-hub', 1)[1].split('      - uses:', 1)[0]
         self.assertIn('ssh-key: ${{ secrets.HERMES_HUB_COMPOSED_READ_KEY }}', courier_checkout)
