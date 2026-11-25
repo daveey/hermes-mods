@@ -158,6 +158,19 @@ def test_parked_board_status_survives_old_bundle_with_explicit_age(status, age):
         assert wire['revision'] == later['revision']
 
 
+@pytest.mark.parametrize('age, kind', [(30, 'ci'), (120, 'ci'), (299, 'ci'), (model.HISTORICAL_DELIVERY_S + 1, None), (1800, None)])
+def test_ci_wait_stays_blue_within_quiet_refresh_cadence(age, kind):
+    # A quiet chat's bundle is re-read every 300 s, so a 2-minute-old snapshot is the current parked state: the CI
+    # wait keeps its light-blue wait_kind. Only data older than the refresh cadence drops to the uncoloured default.
+    row = task(status='scheduled', pr_url='https://github.com/softmax-universe/daveey-hermes/pull/4311',
+               wait={'wait_state': 'external_running', 'waiting_on': 'ci https://github.com/x/y/actions/runs/1', 'waiting_since': NOW - age - 60})
+    row['execution_observations'] = [placeholder(row)]
+    project = lambda r, **kw: {'state': 'unknown', 'unknown_reason': 'no_run_identity'}
+    out = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW, projector=project)['sections']['waiting'][0]
+    assert out.get('wait_kind') == kind, out
+    assert ('panel data' in out['detail']) is (age > 60)
+
+
 @pytest.mark.parametrize('status, reason, read_at', [
     ('running', 'no_run_identity', NOW - 120),
     ('scheduled', 'source_expired', NOW - 120),

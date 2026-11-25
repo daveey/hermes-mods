@@ -37,6 +37,11 @@ SECTIONS = ('needs_you', 'stuck', 'running', 'waiting', 'ready', 'done')
 TERMINAL = {'done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'}
 ACTIVE = {'running', 'review', 'ready', 'todo', 'blocked', 'scheduled', 'triage'}
 STUCK_S = 7200
+# A quiet session's board bundle is fully re-read only every QUIET_FULL_EVERY_S (300 s, dashboard/feed.py); card
+# events recompute it at once. Within that cadence plus slack an older snapshot is still the current parked state, so a
+# delivery wait (CI, deploy, clock) keeps its light-blue colour; past it the colour drops to the uncoloured default.
+HISTORICAL_DELIVERY_S = 360
+DELIVERY_KINDS = frozenset({'ci', 'deploy', 'clock', 'card'})  # light-blue/purple waits; 'agent' still drops when aged
 
 
 def obj(value):
@@ -1031,8 +1036,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
             v['details'].append(provenance)
             if aged_parked:
-                v.pop('wait_kind', None)
-                v.pop('wait_eta', None)
+                if now - read_at > HISTORICAL_DELIVERY_S or v.get('wait_kind') not in DELIVERY_KINDS:
+                    v.pop('wait_kind', None)
+                    v.pop('wait_eta', None)
                 age = relative(read_at, 'elapsed') if wire else short_dur(now - read_at)
                 v['detail'] += f' · as of {pacific(read_at)} (panel data {age} old)'
                 v['details'].append('Historical board status: the panel data is over 60 seconds old; this does not establish current execution or producer liveness.')
