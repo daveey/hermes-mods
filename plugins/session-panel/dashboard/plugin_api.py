@@ -1616,6 +1616,8 @@ def detach_external(relay) -> None:
 def _panel_provider_spec() -> dict:
     """Exact producer-safe manifest: the provider and every sibling file it loads, by digest."""
     import hashlib
+    from hermes_cli.serve_producer_callbacks import capture
+    callback_registry = capture()
     base = Path(__file__).resolve().parent
     def digest(name: str) -> str:
         return hashlib.sha256((base / name).read_bytes()).hexdigest()
@@ -1628,9 +1630,11 @@ def _panel_provider_spec() -> dict:
             'manifest': {
                 'version': 1,
                 'providers': {Path(n).stem: {'path': n, 'sha256': digest(n)} for n in names},
-                # This producer registers no done/waiting callbacks: both sections are present and
-                # empty, which is a declared fact, not an omitted (refusing) section.
+                # Source-file declarations and actual registered callbacks are distinct. Until a safe
+                # registrar reproduces this exact live inventory, the child's pre-READY check refuses;
+                # configured callbacks must never become successful fresh-empty output.
                 'callbacks': {'done': [], 'waiting': []},
+                'callback_registry': callback_registry,
                 'modes': {name: _mitigation(name) for name in _MANIFEST_MODES},
                 'facts': {'HERMES_FACTS_PANEL': _mitigation('HERMES_FACTS_PANEL')}}}
 

@@ -28,7 +28,7 @@ def test_panel_spec_carries_a_complete_verifiable_manifest(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     spec = load_api()._panel_provider_spec()
     manifest = spec['manifest']
-    assert set(manifest) == {'version', 'providers', 'callbacks', 'modes', 'facts'}
+    assert set(manifest) == {'version', 'providers', 'callbacks', 'callback_registry', 'modes', 'facts'}
     assert manifest['callbacks'] == {'done': [], 'waiting': []}
     assert manifest['facts'] == {'HERMES_FACTS_PANEL': True}
     assert manifest['modes'] == {'HERMES_PANEL_COALESCE': True, 'HERMES_PANEL_DUTY': True,
