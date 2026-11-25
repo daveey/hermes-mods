@@ -7,6 +7,7 @@ no SQL. No default runtime caller composes this owner before activation review.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import json
 import logging
 import queue
 import sys
@@ -1063,7 +1064,8 @@ class SourceCoordinator:
                     projection = replace(projection, bundle=self.module.freeze(bundle))
             # Bind to the watch that owned this pin, never a same-name watch
             # installed while base selection or pure projection was in flight.
-            projection = replace(projection, watch_token=token)
+            projection = replace(projection, watch_token=token,
+                                 evidence_attempt=projection_attempt_id if measured else None)
             if measured:
                 # Publication has its own complete writer clocks/costs. Network
                 # I/O in the existing emit callback is NOT projection I/O.
@@ -1180,6 +1182,7 @@ class SourceCoordinator:
                 if disposition in {'no_change', 'superseded'} and pin is not None:
                     successor = state['admissions'].get(pin[1].chat)
                     self._record(disposition, chat=pin[1].chat, admission=pin[1],
+                        projection_attempt_id=projection_attempt_id,
                         current_state=state, successor=successor,
                         predecessor_admission_id=pin[1].id,
                         successor_admission_id=(successor.id if successor is not None
@@ -1187,6 +1190,11 @@ class SourceCoordinator:
                         # This outcome is not an inclusion receipt. The analyzer
                         # may fulfill only via exact emission/response custody.
                         inclusion='not_established',
+                        prior_successful_publication=(json.loads(result.prior_successful_publication)
+                            if disposition == 'no_change' and result.prior_successful_publication is not None else None),
+                        identical_model=(json.loads(result.identical_model)
+                            if disposition == 'no_change' and result.identical_model is not None else None),
+                        dependencies=projection.dependencies if projection is not None else None,
                         covered_scopes=projection.covered_scopes if projection is not None else None,
                         missing_scopes=projection.missing_scopes if projection is not None else None)
             for ticket in tickets:

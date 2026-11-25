@@ -24,6 +24,7 @@ class Projection:
     external_capture: tuple = ()
     observation_parent: object = None
     publication_token: object = field(default_factory=object)
+    evidence_attempt: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,9 @@ class PublishResult:
     changed: bool = False
     emit_succeeded: bool = False
     revision: int | None = None
+    # Private evidence, frozen at the serialized writer, never execution truth.
+    prior_successful_publication: bytes | None = None
+    identical_model: bytes | None = None
 
 
 def canonical_overlay(board, canonical):

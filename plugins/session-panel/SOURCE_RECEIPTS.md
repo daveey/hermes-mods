@@ -45,7 +45,15 @@ reduction or locks enter the warmed selection path. Private sidecars decode for
 logging only after ASGI send.
 
 Storage, acquisition success, `_note_publish`, generic callback return and
-invalidation alone are not exact inclusion receipts.
+invalidation alone are not exact inclusion receipts. A private `no_change` record
+may reference only a prior actual successful identical model publication in the
+same feed epoch/watch/lineage. The cache is bounded by current watches, erased on
+forget, and filled only after the real adapter returns with exact transformed
+bundle inclusion. The analyzer independently joins its successful receipt and
+compares both prior and current serialized models (excluding transport-owned
+`freshness`, never other semantic fields). A missing predecessor is explicitly
+unestablished; a claimed failed/missing/mismatched predecessor invalidates the
+window. This is reported separately and creates no changed-model latency sample.
 
 ## Server emission versus authenticated catch-up
 
@@ -138,9 +146,40 @@ mark StageCost unavailable; they establish custody, not performance or cost.
 inclusion to the real receipt validator. It reports P/A/E/T stage statistics,
 budget violations, missing/unmatched/superseded accounting and unavailable costs.
 Bytes, depth, records, joins and inclusion checks have fixed bounds. Malformed,
-incomplete or cross-process evidence fails closed. Semantic expected-row/action/
-absence checks, native Desktop p95 and aggregate CPU remain `NOT_EVALUATED`;
-timings alone never produce C acceptance. Retain the input segments and report.
+incomplete or cross-process evidence fails closed. Strict stage completeness is
+now the default: `source_evidence.audit` requires actual source receipt/admission,
+exact frozen demand values, complete demanded dependency-source maps, projection
+start/end and writer request/acquire/release custody. Private sidecars carry an
+optional `projection_attempt_id` (schema remains `panel-source-receipts/1`): a
+same-admission retry cannot be mistaken for an older projection when its stage
+records are missing. Other-chat serialization can carry that exact prior attempt,
+never an attempt inferred from similar metadata. Install the sink before the
+first watch/acquisition; a warm legacy log with missing predecessor stages is not
+strict proof. `--timing-only` explicitly permits diagnostic-only legacy analysis.
+
+`--expectations /private/expected.json` adds an independent semantic oracle:
+`panel-semantic-expectations/1` with nonempty `cases`. Each case binds `window_id`
+and the exact admitted endpoint (id, ChatKey, watch token, lineage and original
+first-admitted monotonic/wall ages), plus nonempty `rows`. Each expected row has
+full wire `owner={id,key,gateway,profile,board}` and `section`. Present rows require
+exact `title`, a nonempty `status` map of selected wire status fields, and the
+complete exact `actions` array (owner/action/request targets are not normalized).
+`section:null` asserts absence from every section and off-list group; it also
+requires no missing scopes and authoritative owner-qualified covered demand or
+an explicit matching CardKey ref. Unrelated coverage cannot establish absence.
+Supply expectations from an independently observed mutation/pinned canonical
+input control, never copy a candidate emitted model or infer UI state from raw
+task status. Missing, malformed, contradictory or unused expectations fail closed.
+A transitional mismatch cannot serve an episode; the first matching exact
+publication retains the original age. A later regression of the same endpoint
+invalidates the semantic verdict. A successor admission needs its own expectation.
+
+Without a manifest `semantic_oracle=NOT_EVALUATED`. With it the semantic verdict
+is distinct from exact emission, performance, population, native and CPU gates;
+overall `acceptance`, native Desktop p95 and aggregate CPU remain `NOT_EVALUATED`.
+Timings and semantic PASS alone never produce C acceptance. Retain all input
+segments, independent expectations and report. Invalid strict evidence leaves
+that window's eligible episodes censored, rather than crediting incomplete joins.
 Primary episodes are seeded from every valid admission, including initial
 `receipt_ids=[]` before a failed capture. Repeated admission IDs are not new
 samples. Receipt-less anchors require exact included admission identity or a

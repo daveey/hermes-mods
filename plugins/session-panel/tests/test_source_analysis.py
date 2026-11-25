@@ -86,7 +86,7 @@ class Log:
 
 
 def analyze(log, **kw):
-    return A.analyze_records(log.rows, receipts=R, **kw)
+    return A.analyze_records(log.rows, receipts=R, strict_evidence=False, **kw)
 
 
 def served(log=None, first=1 * SEC, done=3 * SEC, via='emit'):
@@ -291,7 +291,7 @@ def test_forged_cross_window_payload_cannot_fulfil():
     forged.emit(pub, body, 3 * SEC)  # inclusion of w1's stored publication
     forged.close(10 * SEC)
     rows = log.rows + forged.rows
-    r = A.analyze_records(rows, receipts=R)
+    r = A.analyze_records(rows, receipts=R, strict_evidence=False)
     assert not r['inputs_valid'] and not r['validator']['valid']
     assert r['outcomes']['rejected_inclusion_records'] == 1
     w2 = [e for e in r['episodes']['unmatched_sample'] if e['window'] == 'w2']
@@ -356,7 +356,7 @@ def test_closed_window_malformed_loss_counters_remain_unknown(field, bad, omit):
     # An intact window must not hide an unknown window behind a partial sum.
     intact, *_ = served(Log('intact'))
     intact.close(10 * SEC, dropped=3)
-    r = A.analyze_records(log.rows + intact.rows, receipts=R)
+    r = A.analyze_records(log.rows + intact.rows, receipts=R, strict_evidence=False)
     gaps = r['log_gaps']
     assert gaps['unclosed_windows'] == []
     assert gaps['counters_complete'] is False
@@ -415,23 +415,23 @@ def test_identity_and_window_shape_checks():
     log.close(10 * SEC)
     drift = copy.deepcopy(log.rows)
     drift[1]['pid'] = 99
-    r = A.analyze_records(drift, receipts=R)
+    r = A.analyze_records(drift, receipts=R, strict_evidence=False)
     assert not r['inputs_valid'] and r['records']['rejected'] >= 1
-    r = A.analyze_records(log.rows, receipts=R, expected_identity=dict(IDENT, pid=5))
+    r = A.analyze_records(log.rows, receipts=R, strict_evidence=False, expected_identity=dict(IDENT, pid=5))
     assert r['records']['analyzed'] == 0 and r['events']['total'] == 0
     junk = [None, 3, {'schema': 'x'}, dict(log.rows[0], window_id='')]
-    r = A.analyze_records(junk, receipts=R)
+    r = A.analyze_records(junk, receipts=R, strict_evidence=False)
     assert r['records']['rejected'] == 4 and not r['inputs_valid']
 
 
 def test_bounds_fail_closed():
     log, *_ = served()
     with pytest.raises(A.AnalysisBounds):
-        A.analyze_records(log.rows, receipts=R, max_records=2)
+        A.analyze_records(log.rows, receipts=R, strict_evidence=False, max_records=2)
     with pytest.raises(A.AnalysisBounds):
-        A.analyze_records(log.rows, receipts=R, max_inclusion_checks=0)
+        A.analyze_records(log.rows, receipts=R, strict_evidence=False, max_inclusion_checks=0)
     with pytest.raises(A.AnalysisBounds):
-        A.analyze_records('not records', receipts=R)
+        A.analyze_records('not records', receipts=R, strict_evidence=False)
 
 
 def test_oversized_receipt_list_rejected():
@@ -455,7 +455,7 @@ def test_duplicate_record_observation_not_pooled():
     log, *_ = served()
     log.close(10 * SEC)
     dup = log.rows[:] + [copy.deepcopy(next(x for x in log.rows if x['event'] == 'emit_success'))]
-    r = A.analyze_records(dup, receipts=R)
+    r = A.analyze_records(dup, receipts=R, strict_evidence=False)
     assert r['records']['duplicate_identical'] == 1 and not r['inputs_valid']
     assert r['episodes']['fulfilled_series']['samples'] == 1
 
@@ -681,5 +681,5 @@ def test_cli_prints_not_evaluated(tmp_path, capsys):
     log.close(10 * SEC)
     p = tmp_path / 's.jsonl'
     p.write_text('\n'.join(json.dumps(x) for x in log.rows))
-    assert A.main([str(p)]) == 0
+    assert A.main([str(p), '--timing-only']) == 0
     assert json.loads(capsys.readouterr().out)['acceptance'] == A.NOT_EVALUATED

@@ -324,6 +324,7 @@ class Feed:
         self._decision_seen: dict[str, tuple] = {}  # decision lane only: session -> (inputs stamp, read at)
         self._wire_sources = {}
         self.receipt_log = self.receipt_module = None  # explicit private measurement only; never default activation
+        self._receipt_emitted = {}  # at most one exact successful model per current watched session
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
         self._publish_wire()
 
@@ -590,6 +591,7 @@ class Feed:
 
     def _forget(self, s: str) -> None:
         self._watch_tokens.pop(s, None)
+        self._receipt_emitted.pop(s, None)
         self._board_failures.discard(s)
         self._board_capture_failures.discard(s)
         self._decision_failures.discard(s)
@@ -1283,8 +1285,15 @@ class Feed:
                                                      projection_module=projection_module, reducer=projection_reducer)
                             self.bundles[s]['board_admission'] = projection.admission
                             self.bundles[s]['board_projection'] = projection
+                            model_bytes = prior_publication = None
+                            if not did_change and self.receipt_log is not None:
+                                model_bytes = self.receipt_module.semantic_model(self.bundles[s]['bundle'])
+                                prior_publication = self.receipt_module.unchanged_predecessor(
+                                    self._receipt_emitted.get(s), epoch=self.epoch,
+                                    token=self._watch_tokens.get(s), model=model_bytes)
                             _results[s] = projection_module.PublishResult('stored' if did_change else 'no_change', did_change,
-                                revision=self.bundles[s]['rev'])
+                                revision=self.bundles[s]['rev'], prior_successful_publication=prior_publication,
+                                identical_model=model_bytes)
                             if did_change:
                                 changed[s] = self.bundles[s]['bundle']
                 self._publish_wire()
@@ -1320,6 +1329,18 @@ class Feed:
                                 observation='server_emission',
                                 kind='model' if transformed.get('bundles') else 'invalidation_only' if transformed.get('sessions') else 'heartbeat',
                                 **self.receipt_module.payload_fields(actual))
+                            # A transform may keep a session but change its bytes.
+                            # Remember only exact inclusion after the real adapter returned.
+                            self._receipt_emitted = {s: v for s, v in self._receipt_emitted.items()
+                                                     if s in self.interest}
+                            for p in included:
+                                s = p['session']
+                                sent = transformed['bundles'][s]
+                                if (transformed.get('epoch') == self.epoch
+                                        and self.receipt_module.encode(sent)
+                                            == self.receipt_module.encode(json.loads(receipt_entries[s][2]))):
+                                    self._receipt_emitted[s] = (self.epoch, self._watch_tokens.get(s),
+                                        self.receipt_module.semantic_model(sent), self.receipt_module.encode(p))
                     self.last_emit = now
                     if _results is not None:
                         for s in changed:
