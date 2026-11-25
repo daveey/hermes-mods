@@ -115,10 +115,25 @@ def _legacy_fenced() -> bool:
     return bool(getattr(_LOADER, 'legacy_fenced', False))
 
 
+def _panel_start_lock():
+    """Reload-stable serialization of feed installation and positive retirement."""
+    return _LOADER.__dict__.setdefault('panel_start_lock', threading.RLock())
+
+
+def _authorize_legacy():
+    guard = getattr(_LOADER, 'panel_participant', None)
+    if guard is not None and guard._owner is None:
+        from hermes_cli.serve_producer_admission import _wait_gate
+        with _wait_gate(guard.runtime, time.monotonic() + 10) as gate:
+            guard.begin_legacy(gate)
+
+
 def _start_legacy_authorized() -> bool:
-    """The lifecycle's one successor step: lift the fence, then start the legacy owner."""
-    _LOADER.legacy_fenced = False
-    return start_publication()
+    """The lifecycle's one successor step: same stable custody before lifting the fence."""
+    with _panel_start_lock():
+        _authorize_legacy()
+        _LOADER.legacy_fenced = False
+        return start_publication()
 
 
 def _legacy_http_unavailable() -> bool:
@@ -128,6 +143,8 @@ def _legacy_http_unavailable() -> bool:
     wait for admission, or start a successor. The original ON environment must not defeat a
     completed rollback; after installation the lifecycle, not that environment, owns the mode.
     """
+    if _legacy_fenced():
+        return True
     lifecycle = getattr(_LOADER, 'panel_lifecycle', None)
     if lifecycle is not None:
         return lifecycle.state != 'off' or not lifecycle._legacy_running
@@ -1650,6 +1667,19 @@ def _panel_provider_spec() -> dict:
 
 
 def _retire_legacy_panel(timeout: float = 25.0) -> bool:
+    # Close admission before joining a scheduled starter. A starter that has not
+    # entered the reload-stable lock will recheck the fence instead of reviving it.
+    _LOADER.legacy_fenced = True
+    starting = _LOADER.__dict__.get('starting')
+    if starting is not None and starting.is_alive():
+        starting.join(min(10.0, timeout))
+        if starting.is_alive():
+            return False
+    with _panel_start_lock():
+        return _retire_legacy_locked(timeout)
+
+
+def _retire_legacy_locked(timeout: float = 25.0) -> bool:
     """Positive retirement of this process's legacy owner: True only when EVERY lane is gone (feed, decision,
     board and watch threads plus board capture workers and the capacity service) and the process feed slot is
     cleared. The fence goes up first and stays up on any failure: no retained callback restarts a legacy owner."""
@@ -1762,6 +1792,10 @@ def install_panel_lifecycle(environ=None):
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
         mode_mod.initialize_mode(installation, dict(env))
     external = mode_mod.effective_external(installation, dict(env))
+    from hermes_cli.serve_producer_retirement import bind_panel
+    server = bind_panel(runtime, installation, _retire_legacy_panel, start_lock=_panel_start_lock())
+    _LOADER.panel_retirement = server
+    _LOADER.panel_participant = server.participant
 
     def make_relay():
         return make_panel_relay(installation, runtime)
@@ -1789,7 +1823,14 @@ def install_panel_lifecycle(environ=None):
     if external:
         _LOADER.legacy_fenced = True  # a stored external selection: no legacy owner before the lifecycle's say
     else:
-        start_publication()  # OFF serves run the legacy owner and watch the mode
+        from hermes_cli.serve_producer_admission import AdmissionUnavailable
+        from hermes_cli.serve_producer_custody import CustodyConflict
+        try:
+            _start_legacy_authorized()  # only one OFF process owns the stable family/execution fences
+        except (AdmissionUnavailable, CustodyConflict) as exc:
+            _LOADER.legacy_fenced = True
+            lifecycle._legacy_running = False
+            lifecycle._fail(f'legacy custody unavailable: {exc}')
     lifecycle.start_watching()
     return lifecycle
 
@@ -2033,6 +2074,14 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None, r
     return snap
 
 def feed():
+    with _panel_start_lock():
+        if _legacy_fenced():
+            raise RuntimeError('legacy feed startup fenced by the panel lifecycle')
+        _authorize_legacy()
+        return _feed_locked()
+
+
+def _feed_locked():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
     if _external_projection() is not None:
         raise RuntimeError('external projection excludes legacy feed startup')
@@ -2964,7 +3013,7 @@ if _serves_desktop():
     # The producer runs before the first click: a restarted backend restores its saved bundles and recomputes them
     # while Desktops reconnect, instead of starting on (and making wait) the first request.
     # A serve that names its panel mode (stage selector / master override) joins the mode seam instead.
-    if install_panel_lifecycle() is None:
+    if _external_projection() is None and install_panel_lifecycle() is None:
         start_publication()
 
 

@@ -14,9 +14,10 @@ def test_lifecycle_default_admission_matches_supported_launch_domain_and_source(
     monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda home=None: tmp_path)
     monkeypatch.setattr(lifecycle.PanelLifecycle, 'start_watching', lambda self: None)
     enrolled = []
+    real_enroll = admission.enroll_launch
     def enroll(runtime, role, *, installation, timeout):
         enrolled.append((Path(runtime), Path(installation)))
-        return object()
+        return real_enroll(runtime, role, installation=installation, timeout=timeout)
     monkeypatch.setattr(admission, 'enroll_launch', enroll)
     admission.supported_launch('serve')
     called = []

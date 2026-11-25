@@ -39,6 +39,11 @@ def load_api(name):
 
 def complete_admit(runtime, installation, *, root):
     gate = LaunchGate.acquire(runtime)
+    from hermes_cli.serve_producer_admission import read_participants_strict
+    from hermes_cli.serve_producer_retirement import request_retirement
+    for ticket in read_participants_strict(runtime):
+        if ticket.identity.pid == os.getpid():
+            request_retirement(runtime, ticket, root, gate)
     collectors = tuple((n, CollectorEvidence((f'{n}:ok',), ())) for n in sorted(REQUIRED_COLLECTORS))
     return gate, AdmissionCut(boot_id='b', generation='a' * 64, installation=str(installation), census=None,
                               collectors=collectors, classifications=(), legacy_candidates=(), retired=(),
@@ -57,6 +62,9 @@ def served(tmp_path, monkeypatch):
         db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,outcome_json TEXT)')
         db.execute("INSERT INTO sessions VALUES ('chat',NULL,'{}')")
     monkeypatch.setattr(lifecycle_mod, 'default_admit', complete_admit)
+    from hermes_cli.serve_producer_admission import enroll_launch
+    from hermes_cli._startup_fast import project_root_str
+    enroll_launch(tmp_path / 'serve-producer-v1', 'serve', installation=Path(project_root_str()))
     import types
     loader = sys.modules.setdefault('_session_panel_feed_loader', types.ModuleType('_session_panel_feed_loader'))
     reset = ('legacy_fenced', 'panel_lifecycle', 'external_projection', 'starting')

@@ -313,6 +313,10 @@ def test_lifecycle_installation_is_the_hermes_root_of_the_served_home(monkeypatc
     assert get_default_hermes_root(home=twins['a']) == twins['a'].parents[1]
     monkeypatch.delenv('HERMES_SERVE_PANEL_EXTERNAL', raising=False)
     monkeypatch.delenv('HERMES_SERVE_PRODUCERS_EXTERNAL', raising=False)
+    from pathlib import Path
+    from hermes_cli.serve_producer_admission import enroll_launch
+    from hermes_cli._startup_fast import project_root_str
+    enroll_launch(twins['a'].parents[1] / 'serve-producer-v1', 'serve', installation=Path(project_root_str()))
     lifecycle = api.install_panel_lifecycle({})
     assert lifecycle is not None
     try:
