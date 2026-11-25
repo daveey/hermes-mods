@@ -254,10 +254,15 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
         type(s['dropped_records']) is not int or s['dropped_records'] != 0
         or s['write_errors'] != [] or s['encoding_errors'] != [])}
     unclosed = sorted(w for w, s in win.items() if not s['closed'])
+    def known_counters(s: dict):
+        return (s['closed'] and type(s['dropped_records']) is int and s['dropped_records'] >= 0
+                and all(isinstance(value, list) and all(isinstance(e, str) for e in value)
+                        for value in (s['write_errors'], s['encoding_errors'])))
+    counters_complete = bool(win) and all(known_counters(s) for s in win.values())
     log_gaps = dict(windows=len(win), unclosed_windows=unclosed, lossy_windows=sorted(lossy),
-        counters_complete=not unclosed and bool(win),
-        dropped_records=sum(s['dropped_records'] for s in win.values() if type(s['dropped_records']) is int)
-                        if not unclosed and win else None,
+        counters_complete=counters_complete,
+        dropped_records=sum(n for s in win.values() if type(n := s['dropped_records']) is int)
+                        if counters_complete else None,
         per_window={w: {k: s[k] for k in ('closed', 'dropped_records', 'write_errors', 'encoding_errors',
                                            'records_after_end')} for w, s in win.items()})
 
