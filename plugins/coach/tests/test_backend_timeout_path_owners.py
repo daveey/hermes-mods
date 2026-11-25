@@ -275,6 +275,81 @@ def test_recovery_legacy_body_and_failed_comment_throttle(tmp_path, capsys):
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("closed", [False, True])
+def test_recovery_checks_throttled_and_closed_retired(tmp_path, capsys, closed):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    board.tasks["t_catch"]["task"]["status"] = "running"
+    if closed:
+        board.tasks["t_path"]["task"]["status"] = "done"
+    run(tmp_path, board)
+    first_calls = len(board.calls)
+    run(tmp_path, board, NOW + timedelta(minutes=1))
+    assert len(board.calls) == first_calls
+    if closed:
+        run(tmp_path, board, NOW + timedelta(hours=2))
+        assert len(board.calls) == first_calls
+    capsys.readouterr()
+
+
+def test_recovery_comment_timeout_contained(tmp_path, capsys):
+    import subprocess
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+
+    def timeout_comment(argv, **kwargs):
+        if argv[:3] == ["hermes", "kanban", "comment"]:
+            board.calls.append((argv, None))
+            raise subprocess.TimeoutExpired(argv, 120)
+        return board(argv, **kwargs)
+
+    assert run(tmp_path, timeout_comment) == 0
+    calls = len(board.calls)
+    assert run(tmp_path, timeout_comment, NOW + timedelta(minutes=1)) == 0
+    assert len(board.calls) == calls
+    capsys.readouterr()
+
+
+def test_recovery_dry_run_no_board_reads(tmp_path, capsys):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    bt.main(["--home", str(tmp_path), "--host", "macbook-1", "--dry-run"],
+            runner=board, now=NOW, probe=lambda: {})
+    assert not board.calls
+    capsys.readouterr()
+
+
+def test_recovery_uses_awake_not_total_paths(tmp_path):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    bt.comment_resolved_paths(tmp_path, "macbook-1", NOW,
+                              {"by_path": {HUB_SYNC: 3}, "awake_by_path": {}}, board)
+    assert len(board.comments()) == 1
+
+
+@pytest.mark.parametrize("key", ["macbook-1:conn:peer", "macbook-1:special", "other:/api/path"])
+def test_recovery_ignores_nonpath_keys(tmp_path, key):
+    board = Board()
+    seed_closed_incident(tmp_path, board)
+    st = bt.load_state(tmp_path)
+    ent = next(iter(st[bt.PATHS_KEY].values()))
+    st[bt.PATHS_KEY] = {key: ent}
+    bt.save_state(tmp_path, st)
+    bt.comment_resolved_paths(tmp_path, "macbook-1", NOW, {}, board)
+    assert not board.calls
+
+
+def test_created_path_records_association(tmp_path, capsys):
+    board = Board()
+    seed_catch_all(tmp_path, board)
+    write_log(tmp_path, {HUB_SYNC: 112, FLEET: 51})
+    run(tmp_path, board)
+    ent = bt.load_state(tmp_path)[bt.PATHS_KEY][f"macbook-1:{HUB_SYNC}"]
+    assert ent["host_task_id"] == "t_catch"
+    assert ent["path"] == HUB_SYNC
+    capsys.readouterr()
+
+
 def test_host_body_golden(monkeypatch):
     monkeypatch.setattr(bt, "_evidence", lambda *a: "EVIDENCE")
     monkeypatch.setattr(bt, "home_pin_note", lambda *a: "PIN")

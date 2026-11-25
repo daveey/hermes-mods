@@ -1371,8 +1371,10 @@ def comment_resolved_paths(home: Path, host: str, now: datetime, rep: dict, runn
     """
     st = load_state(home)
     for skey, ent in (st.get(PATHS_KEY) or {}).items():
-        if not skey.startswith(f"{host}:/"):
-            continue  # connections and special owner cards are not request paths
+        if not skey.startswith(f"{host}:/") or not isinstance(ent, dict) or ent.get("resolved_closed"):
+            continue  # connections, malformed entries and known closed owners need no probes
+        if now.timestamp() - float(ent.get("last_resolved_check") or 0) < COMMENT_EVERY_S:
+            continue
         path = ent.get("path") or skey[len(host) + 1:]
         if path in (rep.get("awake_by_path") or {}):
             continue
@@ -1381,8 +1383,14 @@ def comment_resolved_paths(home: Path, host: str, now: datetime, rep: dict, runn
         tid = ent.get("task_id")
         if not tid:
             continue
+        ent["last_resolved_check"] = now.timestamp()
+        save_state(home, st)  # throttle failed/unreadable checks as well as comments
         data = _show(runner, tid)
-        if not data or data["task"]["status"] in CLOSED:
+        if not data:
+            continue
+        if data["task"]["status"] in CLOSED:
+            ent["resolved_closed"] = True
+            save_state(home, st)
             continue
         host_tid = ent.get("host_task_id")
         if not host_tid:
@@ -1395,7 +1403,10 @@ def comment_resolved_paths(home: Path, host: str, now: datetime, rep: dict, runn
                 + json.dumps(evidence) + "\nCheck that this is a fresh 30-minute window with window_start later "
                 "than your fix, then paste the output and complete. If the incident completed with aggregate "
                 "count 0, paste its JSON to satisfy this card instead. This watcher does not close cards.")
-        r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
+        try:
+            _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # the persisted check throttle bounds retries; keep the scan receipt alive
         ent["last_comment"] = now.timestamp()
         save_state(home, st)
 
