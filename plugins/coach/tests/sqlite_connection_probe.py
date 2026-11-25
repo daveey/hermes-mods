@@ -6,17 +6,18 @@ import threading
 import _sqlite3
 
 print('SQLITE_IDENTITY', sys.version, sqlite3.sqlite_version, sqlite3.threadsafety,
-      _sqlite3.__file__, flush=True)
+      getattr(_sqlite3, '__file__', 'built-in'), flush=True)
 print('SQLITE_BUILD', sqlite3.connect(':memory:').execute('pragma compile_options').fetchall(), flush=True)
 faulthandler.enable()
 faulthandler.dump_traceback_later(5, exit=True)
 connection = sqlite3.connect(':memory:', check_same_thread=False)
 entered = threading.Event()
 def authorize(*args):
-    entered.set()
-    # Yield GIL while retaining SQLite connection mutex: a getter which waits
-    # for that mutex with the GIL held will prevent this callback returning.
-    threading.Event().wait(.5)
+    if not entered.is_set():
+        entered.set()
+        # Yield GIL while retaining SQLite connection mutex: a getter which waits
+        # for that mutex with the GIL held will prevent this callback returning.
+        threading.Event().wait(.5)
     return sqlite3.SQLITE_OK
 connection.set_authorizer(authorize)
 def write():
