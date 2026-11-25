@@ -31,7 +31,8 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 
 `register()` keeps projection warming on a daemon thread and installs all four hooks.
 Ordinary processes wait up to four seconds so a first turn can read warm projection
-state; an exact `HERMES_ALWAYS_ON_BACKEND=1` selects a zero-second default join so
+state; a valid TCP port in `HERMES_ALWAYS_ON_BACKEND` (the marker supplied by the
+canonical backend launcher) selects a zero-second default join so
 backend app/auth startup does not wait for unrelated card-projection reads.
 `ASK_GATE_WARM_JOIN_S` explicitly overrides either default (negative values clamp
 to zero; malformed values use the process-specific default). Warming still obeys
