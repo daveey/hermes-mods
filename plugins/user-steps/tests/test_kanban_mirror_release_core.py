@@ -53,10 +53,13 @@ def file_ask(kb, c, card, ask):
     """Store ``ask`` on ``card`` the way core's stranded-park sweep files it (``_escalate``): the request and,
     in the same transaction, the board's own ``stranded_park_escalated`` record of the offer. Core releases on
     a click only when that record matches the stamp; the ask column alone is a synced row any gateway can write.
+    The record carries the ask's digest as ``_escalate`` writes it, so core's digest check is exercised too.
     Call inside a write transaction."""
+    from hermes_cli import kanban_release
     c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ask), card))
     kb._append_event(c, card, "stranded_park_escalated",
-                     {"request": True, "release_target": ask["release_target"]})
+                     {"request": True, "release_target": ask["release_target"],
+                      "ask_sha256": kanban_release.ask_digest(ask)})
 
 
 def stopped(kb, c, *, cause="scope_stopped", session="session-a", ask=ASK, stamped=True):
