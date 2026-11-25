@@ -1,5 +1,17 @@
 # Is a "ready, no worker" card really unclaimed?
 
+Start with `hermes kanban governors` (hub, a few seconds). It lists every hold with its card count and ids: lane
+gate, labels/pickup, Board lease, open parents, scheduled. A gated lane's held cards count as "waiting for a worker"
+(green) on the Desktop strip, so a big green number is usually lane-gate holds (`hermes kanban lanes show` /
+`lanes held`), not stuck ready cards. Read it before digging through the Desktop source or the per-card `why`.
+
+The same few cards showing `claim_not_acquired` for hours in the workers' `~/.hermes/logs/gateway.log`
+(`kanban dispatcher stuck ... Held cards: <id>=claim_not_acquired`), while those workers claim other cards with the
+same labels, means the Board lease refuses those specific cards. It is not a capacity problem. `BS-ready-worker-free`
+stays silent here because a recorded skip explains the wait. First check that each card is still wanted: a
+fix/decision card whose target is already `done` is moot, so comment and archive it. File the lease refusal on a
+dispatcher card for the rest.
+
 The hub's local kanban.db can keep showing a card as `ready`, with no spawned/run_route/worker_bound event, while a pool worker already holds the Board lease and is running it. Board-lease claims can stop reaching the hub replica. Before bumping priority, re-placing or filing a stall card, check the workers themselves:
 
 ```sh
