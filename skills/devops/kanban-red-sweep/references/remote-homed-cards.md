@@ -21,6 +21,12 @@ alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards
 Remote cards are unblocked, promoted and archived on their own host; comment on them with `cross_task` (it reads and
 comments, never unblocks). The Desktop
 "For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
+- From a Mac gateway, when `kanban_comment` refuses a hub card as read-only here and `cross_task` finds no
+  connected Desktop to carry the request, use the CLI courier:
+  `hermes-hub request hub tasks default/default/<id> comment --arg text="$(cat file)"`. It prints a request id;
+  `hermes-hub requests | grep <id>` goes queued, leased, then `done` with "Comment added to", and only `done` is
+  delivery. Read the card back with `hermes-hub pull` then `hermes-hub tasks --gw hub --json` (rows carry
+  `status`, `awaiting`, `wake_check`, `idempotency_key`); a card created seconds ago is absent until the pull.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name, and start the command with
   `export PATH=$HOME/.local/bin:$PATH;` (the bare shell has no `hermes`). A Mac-homed card answers `not found`
   to hub `promote`, and `kanban_supervisor_request spend_promote` refuses `not_foreign`; release a spend-triaged one
