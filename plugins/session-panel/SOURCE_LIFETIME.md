@@ -43,6 +43,12 @@ outside the Feed lock. Installation rechecks pending identity, registration,
 stop and close after discovery and release. Stop, close or supersession cannot
 publish the candidate or start workers. Supersession wakes the existing board
 entry for its current candidate instead of creating another thread.
+Consecutive resumes close the superseded pending handle under its Feed lock and
+carry every still-installing ancestor independently of source-role retirement.
+The successor cannot construct a candidate until each ancestor's construction,
+capability discovery and reader release has completed. The existing board wake
+and bounded pending-loop revisit provide recovery without HTTP traffic or a
+waiter thread; a pending handle never contributes hydration capacity.
 
 ## Role custody and release
 
