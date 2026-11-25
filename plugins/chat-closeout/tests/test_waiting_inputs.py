@@ -30,6 +30,10 @@ def world(tmp_path, monkeypatch):
         conn.executemany('INSERT INTO tasks VALUES (?,?,?,?,?)', [
             ('t_1', 'one', 'done', None, 100.0), ('t_2', 'two', 'done', None, 100.0),
             ('t_3', 'three', 'running', None, None)])
+        # Production boards certify per-task marks; an unvouched fixture now deliberately falls back fresh.
+        from hermes_cli import kanban_activity_revision as rev
+        conn.commit()
+        rev.ensure_revision(conn, rev.LOCAL_TABLES)
     led = core.Ledger(tmp_path / 'ledger.db')
     led.write('c1', batch=['t_1'], open=[])
     led.write('c2', batch=['t_2'], open=[])
