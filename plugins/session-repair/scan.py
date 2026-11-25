@@ -1304,7 +1304,13 @@ def canonical_age_reassessment(card: Card, src: Sources, park: dict, awaited: di
             return False
         from hermes_cli.kanban_spend_decision import pending, execution_refusal
         return not (pending(c, card.id) or execution_refusal(c, card.id))
-    except Exception as exc:  # optional old core / unreadable evidence cannot authorize
+    except ModuleNotFoundError as exc:
+        # An absent optional core capability is silent non-authority. Any other
+        # missing module (a broken dependency of a capable core) is a real error.
+        if not (exc.name or '').startswith('hermes_cli.kanban_owner_reassessment'):
+            src.error(f'owner reassessment {card.board}/{card.id}', exc)
+        return False
+    except Exception as exc:  # unreadable evidence on a capable core cannot authorize
         src.error(f'owner reassessment {card.board}/{card.id}', exc)
         return False
     finally:

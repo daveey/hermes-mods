@@ -581,7 +581,7 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
         if out.get('failed'):
             errors.append(str(out.get('line') or 'repair turn failed')[:500])
         # Include a source fingerprint so a soak cannot silently span a code change.
-        build = hashlib.sha256(b''.join((HERE / name).read_bytes() for name in ('scan.py', 'run.py', 'nudge.py', 'producer.py'))).hexdigest()
+        build = hashlib.sha256(b''.join((HERE / name).read_bytes() for name in ('scan.py', 'run.py', 'nudge.py', 'producer.py', 'target_reader.py'))).hexdigest()
         _tick_summary(state_dir(home), {
             'ts': ts, 'mode': m, 'build': build, 'chats': result.get('chats', 0),
             'cards': result.get('cards', 0), 'findings': len(result.get('findings') or []),
