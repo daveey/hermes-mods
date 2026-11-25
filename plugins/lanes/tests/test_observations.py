@@ -145,7 +145,7 @@ def poke(store, contexts, urls=None):
 
 def test_constants_and_default_ttl():
     module = load()
-    assert (module.TTL_S, module.BACKOFF_MIN_S, module.BACKOFF_MAX_S) == (300, 60, 900)
+    assert (module.TTL_S, module.BACKOFF_MIN_S, module.BACKOFF_MAX_S) == (600, 60, 900)
     assert module.Observations(Counting()).ttl == module.TTL_S
 
 
@@ -272,3 +272,32 @@ def test_quiet_cursor_wakes_once_when_backoff_exceeds_ttl():
     poke(store, ctx)
     assert len(factory.calls) == 5
     assert store.reader(ctx).get('a')['approved']
+
+
+def test_terminal_observations_live_for_one_hour_and_failed_reads_are_not_values():
+    module = load()
+    clock, factory = [0.], Counting()
+    store = module.Observations(factory, clock=lambda: clock[0])
+    assert store.ttl == 600
+    poke(store, {'pr': 'head'})
+    clock[0] = 599
+    poke(store, {'pr': 'head'})
+    assert len(factory.calls) == 1
+    clock[0] = 600
+    poke(store, {'pr': 'head'})
+    assert len(factory.calls) == 2
+
+    class Terminal:
+        states = {'closed': 'CLOSED', 'merged': 'MERGED'}
+        def prefetch(self, urls):
+            pass
+        def get(self, url):
+            return {'merged': True} if url == 'merged' else {}
+    terminal = module.Observations(Terminal, clock=lambda: clock[0])
+    ctx = {'closed': 'h', 'merged': 'h', 'failed': 'h'}
+    poke(terminal, ctx)
+    assert set(terminal.values) == {'closed', 'merged'}
+    clock[0] = 4199
+    assert set(terminal.reader(ctx).values) == {'closed', 'merged'}
+    clock[0] = 4200
+    assert terminal.reader(ctx).values == {}

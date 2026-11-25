@@ -141,8 +141,8 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
 def _pr_contexts(db, flow_module, *, evidence=None):
     """Only a PR's owning card evidence invalidates its network observation.
 
-    Heartbeats/external-watch ticks carry no head evidence. Other events on the
-    card (including comments/new publication) conservatively invalidate it.
+    Only explicit PR/head evidence changes the provider observation. Scheduling,
+    comments and dispatch diagnostics change the projection, not GitHub's head.
     """
     from collections import defaultdict
     groups = defaultdict(list)
@@ -161,7 +161,7 @@ def _pr_contexts(db, flow_module, *, evidence=None):
                     meta = payload.get('metadata')
                     pr_evidence = meta if isinstance(meta, dict) else payload
                     carries_pr = any(key in pr_evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
-                    if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
+                    if carries_pr:
                         revision = max(revision, event['id'])
                 return revision
             revision = newest(events)

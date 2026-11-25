@@ -118,3 +118,28 @@ def test_busy_board_still_publishes(board, head_kind):
         conn.commit()
     api._written()
     assert pr_of(api.flow('6h'))[0] != 'merge', 'new PR/head evidence reused old approval'
+
+
+@pytest.mark.parametrize('kind', ['commented', 'respawn_guarded', 'dispatch_skipped', 'wake_episode_started'])
+def test_same_card_dispatch_churn_reuses_pr_observation(board, monkeypatch, kind):
+    api, connect, calls = board
+    monkeypatch.setenv('FAKE_GH_SLEEP', '0')
+    api.flow('6h')
+    api._observations().join(10)
+    assert len(calls) == 3  # retain the core's head confirmation
+    with connect() as conn:
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr',?,?,?)",
+                     (kind, int(time.time()), json.dumps({'reason': 'active_pr'})))
+        conn.commit()
+    api._written()
+    assert pr_of(api.flow('6h')) == ('merge', 'review')
+    api._observations().join(10)
+    assert len(calls) == 3, 'operational churn must not evict GitHub evidence'
+    with connect() as conn:
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr','external_watch',?,?)",
+                     (int(time.time()), json.dumps({'metadata': {'head_sha': 'new'}})))
+        conn.commit()
+    api._written()
+    assert pr_of(api.flow('6h'))[0] != 'merge'
+    api._observations().join(10)
+    assert len(calls) == 6
