@@ -57,8 +57,9 @@ RULES = ('BS-ready-worker-free', 'BS-overdue-wake', 'BS-unexplained-wait', 'BS-p
 REPAIR_CHAT_TITLE = 'Session repair'
 REPAIR_KEY_PREFIX = 'session-repair:'
 READY_ENTRY_EVENTS = ('promoted', 'unblocked', 'continuation_woken', 'created', 'reclaimed', 'released', 'status',
-                      'reopened', 'changes_requested')
-REVIEW_ENTRY_EVENTS = ('review_requested', 'hub_review_admitted', 'review_route_deferred', 'status')
+                      'reopened', 'changes_requested', 'condition_met')
+REVIEW_ENTRY_EVENTS = ('review_requested', 'hub_review_admitted', 'review_route_deferred', 'status',
+                       'continuation_woken', 'condition_met')
 NOTIFY_KINDS_FALLBACK = ('completed', 'blocked', 'gave_up', 'crashed', 'timed_out', 'status', 'archived', 'unblocked')
 
 
@@ -596,12 +597,21 @@ def _machine_free(place: dict, src: Sources) -> tuple[Optional[str], dict]:
 
 
 def _ready_since(c, card: Card) -> Optional[float]:
+    ev = _events(c, card.id, READY_ENTRY_EVENTS)
+    entered = _num(ev[0]['at']) if ev else None
     if _col(c, 'tasks', 'ready_since'):
         rs = c.execute('SELECT ready_since FROM tasks WHERE id = ?', (card.id,)).fetchone()
-        if rs and _num(rs[0]):
-            return _num(rs[0]) / 1000.0
-    ev = _events(c, card.id, READY_ENTRY_EVENTS)
-    return _num(ev[0]['at']) if ev else _num(getattr(card.task, 'created_at', None))
+        since = _num(rs[0]) if rs else None
+        if since:
+            return max(since / 1000.0, entered or 0)
+    return entered if entered is not None else _num(getattr(card.task, 'created_at', None))
+
+
+def _current_idle_status(card: Card, status: str) -> bool:
+    """Task objects can precede a concurrent admission/park; do not diagnose that stale episode."""
+    row = card.conn.execute('SELECT status FROM tasks WHERE id=?', (card.id,)).fetchone()
+    return bool(row and row[0] == status and not card.conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND status='running' LIMIT 1", (card.id,)).fetchone())
 
 
 def _skip_explains(skip: Any, now: float) -> bool:
@@ -620,7 +630,7 @@ def _skip_explains(skip: Any, now: float) -> bool:
 def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     """BS-ready-worker-free: ready and unclaimed while a worker that can run it has a free slot, with no recorded
     dispatcher skip in the current ready episode (a skip of any age, or one with `until`, explains the wait)."""
-    if card.status != 'ready':
+    if card.status != 'ready' or not _current_idle_status(card, 'ready'):
         return None
     c, now = card.conn, src.now
     waited = _age(now, _ready_since(c, card))
@@ -999,7 +1009,7 @@ def rule_stuck_run(card: Card, src: Sources) -> Optional[Finding]:
 
 def rule_review_no_reviewer(card: Card, src: Sources) -> Optional[Finding]:
     """BS-review-no-reviewer: in review with no review run for > 60 min."""
-    if card.status != 'review':
+    if card.status != 'review' or not _current_idle_status(card, 'review'):
         return None
     c, now = card.conn, src.now
     rid = getattr(card.task, 'current_run_id', None)
@@ -1127,8 +1137,6 @@ def healthy_future_park(card: Card, park: dict, now: float) -> bool:
     if card.status != 'scheduled' or (_num(payload.get('wake_at')) or 0) <= now:
         return False
     command = str(payload.get('wake_check') or '').strip()
-    if not command:
-        return False
     events = _events(card.conn, card.id, ('external_watch', 'wake_check_alive',
                      'wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met'))
     if not events:
@@ -1137,6 +1145,15 @@ def healthy_future_park(card: Card, park: dict, now: float) -> bool:
     if event['id'] <= park['id'] or not park['at'] <= event['at'] <= now:
         return False
     data = event['payload']
+    if not command:
+        # Native GitHub watchers have a typed producer identity, not a shell
+        # wake_check. Require the exact CI URL in this park and its fresh receipt.
+        awaited = payload.get('awaiting') or {}
+        if not (isinstance(awaited, dict) and awaited.get('kind') == 'ci'
+                and event['kind'] == 'external_watch' and data.get('adapter') == 'github_run'
+                and data.get('url') == awaited.get('ref')
+                and re.fullmatch(r'https://github\.com/[^/]+/[^/]+/actions/runs/\d+', str(data.get('url') or ''))):
+            return False
     recorded = str(data.get('wake_check') or (data.get('_wake_episode_v1') or {}).get('cmd') or '').strip()
     if recorded and recorded != command:
         return False
@@ -1236,6 +1253,10 @@ def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Findin
             if sid in src.exclude_chats or sid in linked or row.get('kind') not in ('unresolved', 'waiting'):
                 continue
             status = row.get('status') or {}
+            if (isinstance(status, dict) and (status.get('coverage') or {}).get('state') == 'unknown'):
+                continue  # a failed source read is not evidence of unfinished cardless work
+            if sid.startswith('kanban_owner_') and row.get('reason') == 'no_summary':
+                continue  # synthetic service custody, not a person's unanswered chat
             if (isinstance(status, dict) and status.get('kind') == 'done'
                     and (status.get('coverage') or {}).get('state') == 'complete'):
                 continue  # canonical settled work overrides legacy no_summary/unresolved

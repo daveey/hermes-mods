@@ -44,3 +44,83 @@ def test_canonical_settled_chat_overrides_legacy_unresolved(env,monkeypatch,sett
     monkeypatch.setattr(env.scan_mod.Sources,'outcome_rows',lambda *a:[row])
     monkeypatch.setattr(env.scan_mod.Sources,'chat_obligations',lambda *a:False)
     assert bool(env.findings(rule='BS-quiet-chat')) != settled
+
+@pytest.mark.parametrize('bad', [None, 'stale', 'broken', 'overdue', 'wrong_ref', 'shell_without_command'])
+def test_native_ci_receipt_does_not_require_shell_command(env, bad):
+    tid = F.legacy_probe_wait(env.conn, env.now, waited_s=10000)
+    ref = 'https://github.com/example/project/actions/runs/123'
+    env.conn.execute("UPDATE task_events SET payload=json_set(json_remove(payload,'$.wake_check'),'$.awaiting',json(?)) WHERE task_id=? AND kind='scheduled'", (json.dumps({'kind':'ci','ref':ref}),tid))
+    at = env.now-(30000 if bad=='stale' else 20)
+    F.event(env.conn,tid,'external_watch',{'adapter':'shell' if bad=='shell_without_command' else 'github_run','url':'other' if bad=='wrong_ref' else ref,'health':'ok','state':'external_running','observed_at':at,'next_due_at':at+300,'every':300,'consecutive_failures':0},at=at)
+    if bad=='broken': F.event(env.conn,tid,'wake_check_broken',{},at=env.now-10)
+    if bad=='overdue': env.conn.execute("UPDATE task_events SET payload=json_set(payload,'$.wake_at',?) WHERE task_id=? AND kind='scheduled'",(env.now-1,tid))
+    env.conn.commit()
+    assert bool(env.findings(rule='BS-long-wait',card=tid)) == bool(bad)
+
+@pytest.mark.parametrize('unknown', [True, False])
+def test_unknown_coverage_is_not_positive_unfinished_work(env, monkeypatch, unknown):
+    row={'id':'quiet','kind':'unresolved','reason':'card_read_failed' if unknown else 'unfinished_work','status':{'kind':'unresolved','coverage':{'state':'unknown' if unknown else 'complete'}}}
+    env.state.execute('INSERT INTO sessions (id,title,started_at,outcome_json) VALUES (?,?,?,?)',('quiet','Quiet',env.now-7200,json.dumps(row)))
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',('quiet','assistant','Waiting',env.now-3700));env.state.commit()
+    monkeypatch.setattr(env.scan_mod.Sources,'outcome_rows',lambda *a:[row])
+    monkeypatch.setattr(env.scan_mod.Sources,'chat_obligations',lambda *a:False)
+    assert bool(env.findings(rule='BS-quiet-chat')) != unknown
+
+@pytest.mark.parametrize('placeholder', [True, False])
+def test_owner_placeholder_no_summary_is_not_a_persons_stalled_chat(env, monkeypatch, placeholder):
+    sid='kanban_owner_service' if placeholder else 'ordinary'
+    row={'id':sid,'kind':'unresolved','reason':'no_summary','on':[],'items':[]}
+    env.state.execute('INSERT INTO sessions (id,title,started_at,outcome_json) VALUES (?,?,?,?)',(sid,'Quiet',env.now-7200,json.dumps(row)))
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',(sid,'assistant','Waiting',env.now-3700));env.state.commit()
+    monkeypatch.setattr(env.scan_mod.Sources,'outcome_rows',lambda *a:[row])
+    monkeypatch.setattr(env.scan_mod.Sources,'chat_obligations',lambda *a:False)
+    assert bool(env.findings(rule='BS-quiet-chat')) != placeholder
+
+@pytest.mark.parametrize('recent', [True, False])
+@pytest.mark.parametrize('wake', ['continuation_woken','condition_met'])
+def test_ready_age_fenced_by_new_wake_even_when_ready_since_old(env, recent, wake):
+    tid=F.card(env.conn,'Ready',status='ready')
+    if not env.scan_mod._col(env.conn,'tasks','ready_since'):
+        env.conn.execute('ALTER TABLE tasks ADD COLUMN ready_since INTEGER')
+    env.conn.execute('UPDATE tasks SET ready_since=? WHERE id=?',((env.now-7200)*1000,tid))
+    F.event(env.conn,tid,wake,{},at=env.now-(10 if recent else 4000));env.conn.commit()
+    card=env.scan_mod.Card(tid,'default',None,env.sources().task('default',tid)[0],env.conn,None)
+    assert env.scan_mod._ready_since(env.conn,card) == pytest.approx(env.now-(10 if recent else 4000))
+
+@pytest.mark.parametrize('new_status', ['running','scheduled'])
+def test_stale_ready_object_does_not_describe_current_executor(env,new_status):
+    tid=F.card(env.conn,'Ready',status='ready')
+    F.age_all_events(env.conn,tid,env.now-7200)
+    if not env.scan_mod._col(env.conn,'tasks','ready_since'):
+        env.conn.execute('ALTER TABLE tasks ADD COLUMN ready_since INTEGER')
+    env.conn.execute('UPDATE tasks SET ready_since=? WHERE id=?',((env.now-7200)*1000,tid));env.conn.commit()
+    src=env.sources(); task=src.task('default',tid)[0]
+    stale=env.scan_mod.Card(tid,'default',None,task,env.conn,None)
+    assert env.scan_mod._current_idle_status(stale,'ready')
+    env.conn.execute('UPDATE tasks SET status=? WHERE id=?',(new_status,tid));env.conn.commit()
+    assert env.scan_mod.rule_ready_worker_free(stale,src) is None
+
+@pytest.mark.parametrize('new_status', ['scheduled','running'])
+def test_stale_review_object_does_not_restart_parked_reviewer(env,new_status):
+    tid=F.card(env.conn,'Review',status='review')
+    F.event(env.conn,tid,'review_requested',{},at=env.now-7200);env.conn.commit()
+    src=env.sources(); stale=env.scan_mod.Card(tid,'default',None,src.task('default',tid)[0],env.conn,None)
+    env.conn.execute('UPDATE tasks SET status=? WHERE id=?',(new_status,tid));env.conn.commit()
+    assert env.scan_mod.rule_review_no_reviewer(stale,src) is None
+
+@pytest.mark.parametrize('recent', [True,False])
+@pytest.mark.parametrize('wake', ['continuation_woken','condition_met'])
+def test_review_wake_starts_new_idle_episode(env,recent,wake):
+    tid=F.card(env.conn,'Review',status='review')
+    F.event(env.conn,tid,'review_requested',{},at=env.now-7200)
+    F.event(env.conn,tid,wake,{},at=env.now-(10 if recent else 4000));env.conn.commit()
+    assert bool(env.findings(rule='BS-review-no-reviewer',card=tid)) != recent
+
+@pytest.mark.parametrize('rule,status',[('rule_ready_worker_free','ready'),('rule_review_no_reviewer','review')])
+def test_running_successor_not_diagnosed_from_idle_task_pointer(env,rule,status):
+    tid=F.card(env.conn,'Idle',status=status)
+    F._run(env.conn,tid,env.now,started_s=10)
+    env.conn.execute('UPDATE tasks SET current_run_id=NULL WHERE id=?',(tid,));env.conn.commit()
+    src=env.sources(); card=env.scan_mod.Card(tid,'default',None,src.task('default',tid)[0],env.conn,None)
+    assert not env.scan_mod._current_idle_status(card,status)
+    assert getattr(env.scan_mod,rule)(card,src) is None
