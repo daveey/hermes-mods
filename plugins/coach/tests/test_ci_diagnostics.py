@@ -61,7 +61,32 @@ def test_ci_receipts_name_runtime_and_slow_test_before_summary(tmp_path):
     assert child.stdout.index('COACH_START ') < child.stdout.index('COACH_PHASE ')
 
 
-@pytest.mark.parametrize('boundary', ['call', 'sessionfinish', 'atexit'])
+@pytest.mark.parametrize('dist', ['load', 'worksteal'])
+def test_completed_worker_does_not_timeout_waiting_for_longer_peer(tmp_path, dist):
+    suite = tmp_path / 'mixed'
+    suite.mkdir()
+    for name in ('conftest.py', 'home_guard.py', 'gateway_reaper.py', 'collection_home.py'):
+        shutil.copyfile(Path(__file__).with_name(name), suite / name)
+    (suite / 'test_mixed.py').write_text(
+        'import pytest, time\n'
+        'def test_fast(): pass\n'
+        '@pytest.mark.timeout(4)\n'
+        'def test_longer(): time.sleep(2)\n')
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTEST_ADDOPTS='')
+    child = subprocess.run([
+        sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+        '-p', 'xdist.plugin', '-p', 'pytest_timeout', '--timeout=1',
+        '--timeout-method=thread', '-n', '2', '--dist=' + dist,
+    ], cwd=suite, env=env, capture_output=True, text=True, timeout=20)
+    output = child.stdout + child.stderr
+    assert child.returncode == 0, output
+    assert '2 passed' in output, output
+    # execnet can report success even when a completed worker's fatal timer fires.
+    assert 'Timeout' not in output, output
+    assert 'Fatal Python error' not in output, output
+
+
+@pytest.mark.parametrize('boundary', ['call', 'sessionfinish', 'unconfigure', 'atexit'])
 def test_fatal_watchdog_survives_capture_and_cancelled_alarm(tmp_path, boundary):
     suite = tmp_path / 'blocked'
     suite.mkdir()
@@ -72,9 +97,10 @@ def test_fatal_watchdog_survives_capture_and_cancelled_alarm(tmp_path, boundary)
     with (suite / 'conftest.py').open('a') as config:
         config.write('\ndef pytest_addoption(parser):\n'
                      '    parser.addini("timeout", "watchdog test deadline", default="0.4")\n')
-        if boundary == 'sessionfinish':
-            config.write('\n@pytest.hookimpl(tryfirst=True)\n'
-                         'def pytest_sessionfinish(session, exitstatus):\n'
+        if boundary in ('sessionfinish', 'unconfigure'):
+            hook = ('def pytest_sessionfinish(session, exitstatus):\n' if boundary == 'sessionfinish'
+                    else 'def pytest_unconfigure(config):\n')
+            config.write('\n@pytest.hookimpl(tryfirst=True)\n' + hook +
                          '    import threading\n'
                          '    threading.Event().wait()\n')
     (suite / 'test_blocked.py').write_text(
