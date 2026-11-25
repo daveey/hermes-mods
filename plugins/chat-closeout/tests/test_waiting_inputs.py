@@ -484,10 +484,10 @@ def test_an_unreadable_board_key_counts_as_a_fallback_not_an_error(world, monkey
     from hermes_cli.kanban_generation import BoardLifecycleBusy
     real_ro = ksa.cached_ro
 
-    def busy_ro(path, *, busy_budget=0.5):
-        if busy_budget == 0:  # core's zero-budget board-key probe meets a lifecycle hold
+    def busy_ro(path, *, busy_budget=0.5, **reader_options):
+        if busy_budget == 0:  # generic and waiting-domain probes meet the same lifecycle hold
             raise BoardLifecycleBusy('board lifecycle busy')
-        return real_ro(path, busy_budget=busy_budget)
+        return real_ro(path, busy_budget=busy_budget, **reader_options)
 
     monkeypatch.setattr(ksa, 'cached_ro', busy_ro)
     key = ksa._board_content_key(world['board'])
