@@ -9,6 +9,7 @@ pytest.importorskip("httpx")
 API = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
 
 from test_core import CONFIG, NOW  # noqa: E402  (same fixture config)
+from test_flow import flow
 
 
 @pytest.fixture
@@ -42,6 +43,27 @@ def test_get_then_drag_then_auto(client):
     r = http.put("/v1/split", json={"mode": "auto"})
     assert r.status_code == 200 and r.json()["mode"] == "auto"
     assert r.json()["traffic"]["weights"] == {"anthropic": 20, "openai-codex": 79, "xai-oauth": 1}
+
+
+@pytest.mark.parametrize('width', [80, 100000])
+def test_flow_endpoint_manual_auto_and_get_readback(client, width):
+    http, root = client
+    profile = root / 'profiles' / 'alpha'
+    profile.mkdir(parents=True)
+    (profile / 'config.yaml').write_bytes(flow(width).encode())
+    for body, expected in [
+        ({'mode': 'manual', 'share': {'anthropic': 16, 'openai-codex': 58, 'xai-oauth': 25}},
+         {'anthropic': 16, 'openai-codex': 59, 'xai-oauth': 25}),
+        ({'mode': 'auto'}, {'anthropic': 20, 'openai-codex': 79, 'xai-oauth': 1})
+    ]:
+        response = http.put('/v1/split', json=body)
+        assert response.status_code == 200, response.text
+        readback = http.get('/v1/split').json()
+        assert readback['traffic']['weights'] == expected
+        assert not readback['mixed_homes']
+        from test_core import weights_in
+        assert weights_in(profile / 'config.yaml')['deep'] == expected
+        assert readback['mode'] == body['mode']
 
 
 def test_bad_bodies_are_400(client):
