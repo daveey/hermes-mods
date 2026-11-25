@@ -453,6 +453,33 @@ class TestAll(unittest.TestCase):
         self.assertIn('repo-guards', r.stdout)
         self.assertEqual(run(self.root, '-k', 'no-such-suite', '--list').stdout.split(), [])
 
+    def test_coach_workstealing_is_outer_argv_not_inherited_by_nested_pytest(self):
+        runner = runpy.run_path(str(RUNNER))
+        make_tree(self.root, {"coach": '''
+            import os
+            import subprocess
+            import sys
+            def test_nested_pytest(tmp_path):
+                # Lifecycle probes deliberately disable autoload and do not load xdist.
+                assert '--dist' not in os.environ.get('PYTEST_ADDOPTS', '')
+                probe = tmp_path / 'test_probe.py'
+                probe.write_text('def test_probe(): pass\\n')
+                env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+                child = subprocess.run([sys.executable, '-m', 'pytest', '-q', str(probe)],
+                                       cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+                assert child.returncode == 0, child.stdout + child.stderr
+        '''})
+        coach = next(s for s in runner['discover'](self.root, None, False)
+                     if s['name'] == 'plugins/coach')
+        self.assertEqual(coach['args'], ['-n', '4', '--dist=worksteal'])
+        with patch.dict(os.environ):
+            os.environ.pop('PYTEST_ADDOPTS', None)
+            report = self.root / 'coach.json'
+            result = run(self.root, '--exact', '-k', 'plugins/coach', '--json', str(report))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(report.read_text())['suites'][0]
+        self.assertEqual((row['passed'], row['failed'], row['errors']), (1, 0, 0))
+
     def test_exact_selects_whole_suite_names_without_adding_repo_guards(self):
         """plugin-suites.yml runs `--exact -k <suite>` per selected suite: `-k plugins/coach` must not also run
         plugins/coach-extra, and repo-guards (run by repo-guards.yml) is not added."""
