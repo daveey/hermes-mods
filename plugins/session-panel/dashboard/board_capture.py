@@ -83,8 +83,15 @@ def capture_local(readers, source, prior_part, demands, hints):
         raise FileNotFoundError(path)
     start = time.monotonic_ns()
     deadline = time.monotonic() + hints.deadline_s
-    metrics = {'opens': 1, 'sql_calls': 0, 'vm_steps': 0, 'details_materialized': 0,
-               'membership_pairs': 0, 'rows_returned': 0}
+    metrics = {'opens': 1, 'sql_calls': 0, 'vm_steps': 0, 'vm_step_quantum': 100,
+               'details_materialized': 0, 'membership_pairs': 0,
+               'selected_logical_rows': 0, 'rows_returned': 0}
+    def counted_row(cursor, values):
+        # Count every row fetched from this owned connection, including core
+        # enrichment/detail/event/run queries and metadata. Selected logical
+        # objects below are a separate quantity, not physical SQL return cost.
+        metrics['rows_returned'] += 1
+        return sqlite3.Row(cursor, values)
     def trace(_statement):
         metrics['sql_calls'] += 1
     def progress():
@@ -102,7 +109,7 @@ def capture_local(readers, source, prior_part, demands, hints):
         for sid in previous.receipt.coverage.completed_scopes:
             reusable.update(previous.scope_keys.get(sid, ()))
     with closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0.5)) as conn:
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = counted_row
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, hints.variable_limit)
         conn.set_trace_callback(trace)
         conn.set_progress_handler(progress, 100)
@@ -141,7 +148,7 @@ def capture_local(readers, source, prior_part, demands, hints):
                         queue.append(child)
         selected, pairs = select_listed_local_task_set(conn, lineage, statuses)
         metrics['membership_pairs'] = len(pairs)
-        metrics['rows_returned'] += len(selected) + len(pairs) + len(remote)
+        metrics['selected_logical_rows'] = len(selected) + len(pairs) + len(remote)
         refresh = {tid: row for tid, row in selected.items()
                    if (full or tid in dirty or _key(source, tid) not in reusable
                        or _key(source, tid) not in (previous.rows if previous else {}))}

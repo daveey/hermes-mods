@@ -91,6 +91,9 @@ API/reader generation, Feed/store epochs, retired ancestors, thread/role identit
 and current source/watch/demand vectors. Source tests, callbacks and cached hashes
 do not establish activation or authenticated exact inclusion.
 
-This implementation slice alone does not establish the complete population/race
-matrix, single strict-capture observation carriage, authenticated inclusion,
-native pixels, latency, performance or CPU gates. Those obligations remain unchanged.
+The same UNACTIVATED source now implements single strict-capture observation
+carriage ([SOURCE_COORDINATOR.md](SOURCE_COORDINATOR.md)) and exact authenticated
+response-write custody ([SOURCE_RECEIPTS.md](SOURCE_RECEIPTS.md)). Their fixtures
+do not establish live activation, native pixels, latency, performance, CPU or
+contention acceptance. The original population/race and downstream gates remain
+unchanged. See [SOURCE_ACTIVATION.md](SOURCE_ACTIVATION.md) for B3's receipt contract.

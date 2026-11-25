@@ -60,9 +60,14 @@ and publication fences. No deployed startup or handler composes it: the default
 runtime below is unchanged. Canonical requests/reconciliation remain independently
 owned and ordered; neither snapshot success nor a newer computation sequence is
 consent. Missing source coverage remains unknown and excluded from freshness.
-Genuine predecessor/reload, complete inclusion/lifecycle acceptance and B3
-activation/performance/native verification remain required, not implied by this
-capability. No wire version or Desktop classification changes.
+[SOURCE_LIFETIME.md](SOURCE_LIFETIME.md) describes genuine predecessor/reload and
+current reader custody; [SOURCE_RECEIPTS.md](SOURCE_RECEIPTS.md) describes exact
+stored payload, post-transform server emission and authenticated ASGI response
+write custody. [SOURCE_ACTIVATION.md](SOURCE_ACTIVATION.md) defines B3's activation,
+drain/window and rollback receipt hooks. All remain explicitly UNACTIVATED.
+Final lifecycle/population acceptance and B3 activation/performance/native proof
+are required, not implied by source or cached hashes. No wire version or Desktop
+classification changes.
 
 ## Board-source freshness
 

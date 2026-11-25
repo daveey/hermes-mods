@@ -150,12 +150,14 @@ I/O cannot be forcibly cancelled; its late result cannot publish through a stopp
 Feed or retired store. Release owned fixture barriers before teardown. Do not
 compose this owner on top of a running legacy BoardLane.
 
-This milestone supplies explicit composition, not production lifecycle migration.
-The downstream lifecycle milestone must prove genuine predecessor entry and both
-registration orderings, hot-reload owner establishment, forget/re-watch/lineage
-races, complete source/observation/inclusion custody and the maximum-population
-matrix before activation. Basic `resume` failure exclusion is not proof of those
-successor-owner cases.
+The B2b-ii source implements genuine saved-predecessor entry and current-generation
+reader establishment, compatible stopped-owner transfer, strict raw observation
+carriage and private exact-publication receipts. See [SOURCE_LIFETIME.md](SOURCE_LIFETIME.md)
+and [SOURCE_RECEIPTS.md](SOURCE_RECEIPTS.md). Completion notification is not thread
+exit: both current and retiring owners retain each occupied role until its worker
+has actually returned. Tests holding that notification/return gap cover all three
+role classes, with and without retirement. These source capabilities are still
+UNACTIVATED; implementation is not final population/contention or runtime acceptance.
 
 Rollback before activation is simply leaving the seam uncalled. After a future
 approved activation, rollback must stop the composed Feed/owner and start a clean
