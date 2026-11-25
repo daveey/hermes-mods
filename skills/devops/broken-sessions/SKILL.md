@@ -202,8 +202,8 @@ the card is ready or running.
 
 **Fix card** (area hermes; never automatic: reclaiming a live worker's card loses its work): read
 `hermes kanban log <id>` and `runs <id>`, check the lease holder (skill hermes-workers); reclaim
-(`hermes kanban reclaim <id>`) only when the worker is gone. **Done when:** the card has a live run with fresh
-events, or is back in ready.
+(`hermes kanban reclaim <id>`) only when the worker is gone (remote holder: `references/stuck-run-reclaim.md`).
+**Done when:** the card has a live run with fresh events, or is back in ready.
 
 ## BS-review-no-reviewer: a review nobody runs
 
