@@ -20,7 +20,7 @@ TID = 't_1234abcd'
 
 
 @pytest.fixture
-def owner(tmp_path, monkeypatch):
+def owner(tmp_path, monkeypatch, tmp_path_factory):
     from hermes_cli import kanban_db as kb
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
@@ -43,6 +43,15 @@ def owner(tmp_path, monkeypatch):
         c.execute("INSERT INTO task_runs (id,task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_started_at,started_at) VALUES (1,?,'default','running',?,?,?,?,?)", (TID,claim_prefix() + str(os.getpid()),int(time.time())+300,os.getpid(),_process_fingerprint(os.getpid()),int(time.time())))
         c.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,notifier_profile,created_at) VALUES (?,'tui',?,'default',?)", (TID,SID,int(time.time())))
     from hermes_state import SessionDB
+    # Build a real empty schema once per worker, then reopen private copies
+    # normally (including migrations and generation checks). Closing checkpoints
+    # the template before its main file is copied; no live WAL is copied.
+    import shutil
+    template = tmp_path_factory.getbasetemp() / 'owner-empty-state.db'
+    if not template.exists():
+        empty = SessionDB(template)
+        empty.close()
+    shutil.copy2(template, tmp_path / 'state.db')
     state = SessionDB(tmp_path / 'state.db')
     try:
         state.create_session(session_id=SID, source='desktop')
@@ -54,6 +63,27 @@ def owner(tmp_path, monkeypatch):
     v = dict(goal=REQUEST, actionable=True, unfinished=True, disposition='owned_continuing', evidence_refs=['user:0','candidate'], boundary_kind=None, continuation_ref=ref, confidence=.99)
     evidence = gd.evidence_for([dict(role='user',content=REQUEST)], 'An existing worker is continuing.')
     return db, v, evidence
+
+
+def test_owner_schema_is_amortized_but_rows_are_private(tmp_path, monkeypatch, tmp_path_factory):
+    from hermes_state import SessionDB
+    builds = []
+    original = SessionDB._init_schema_full
+
+    def counted(self, *args, **kwargs):
+        if self._conn.execute("SELECT 1 FROM sqlite_master WHERE name='sessions'").fetchone() is None:
+            builds.append(self.db_path)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionDB, '_init_schema_full', counted)
+    for name in ('first', 'second'):
+        home = tmp_path / name
+        home.mkdir()
+        getattr(owner, '__wrapped__')(home, monkeypatch, tmp_path_factory)
+        with transaction(home / 'state.db') as conn:
+            assert conn.execute('SELECT content FROM messages').fetchall() == [(REQUEST,)]
+            conn.execute("UPDATE messages SET content='Changed only in this fixture'")
+    assert len(builds) <= 1, 'each owner fixture rebuilt the full session schema'
 
 
 def certify(owner):
