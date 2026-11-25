@@ -201,6 +201,24 @@ class ReceiptLog:
                 stream.close()
 
 
+def semantic_model(bundle):
+    """Exact reducer output; transport freshness is independently owned metadata."""
+    model = bundle.get('model')
+    if not isinstance(model, dict):
+        return None
+    return encode({k: v for k, v in model.items() if k != 'freshness'})
+
+
+def unchanged_predecessor(previous, *, epoch, token, model):
+    """Same writer/watch and byte-identical reducer output, not a revision-only hit."""
+    if previous is None:
+        return None
+    old_epoch, old_token, old_model, publication_json = previous
+    if old_epoch == epoch and old_token is token and old_model == model:
+        return publication_json
+    return None
+
+
 def publication(feed, session, held):
     """Called only by the writer after merge; never consult a later mutable bundle."""
     p, b = held.get('board_projection'), held['bundle']
@@ -214,6 +232,7 @@ def publication(feed, session, held):
         'source_vector': p.input_versions if p is not None else None,
         'covered_scopes': p.covered_scopes if p is not None else None,
         'missing_scopes': p.missing_scopes if p is not None else None,
+        'projection_attempt_id': getattr(p, 'evidence_attempt', None),
         'dependencies': p.dependencies if p is not None else None})
 
 

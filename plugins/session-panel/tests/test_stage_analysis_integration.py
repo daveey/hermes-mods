@@ -29,7 +29,10 @@ def test_real_source_writer_emit_log_roundtrips_through_stage_analyzer(observed,
         lane.close()
         assert log.close()
     rows = read_log(path)
-    report = A.analyze_records(rows, receipts=m, require_closed=True)
+    # This legacy warm fixture intentionally omits the initial admissions and
+    # captures. It remains useful for timing diagnostics, never strict evidence.
+    assert not A.analyze_records(rows, receipts=m, require_closed=True)['inputs_valid']
+    report = A.analyze_records(rows, receipts=m, require_closed=True, strict_evidence=False)
     (tmp_path / 'actual-stage-analysis.json').write_text(json.dumps(report, indent=2, sort_keys=True))
     assert report['inputs_valid'], report
     assert report['acceptance'] == A.NOT_EVALUATED

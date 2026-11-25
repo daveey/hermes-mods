@@ -75,6 +75,16 @@ def load_receipts(path=None):
     return sys.modules[name]
 
 
+def load_sibling(filename):
+    name = '_panel_' + filename.removesuffix('.py')
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+    return sys.modules[name]
+
+
 def clock(v):
     """Valid monotonic/ns clock: real int, not bool, non-negative. Floats are refused."""
     return type(v) is int and v >= 0
@@ -176,7 +186,7 @@ def _screen(r, ctx):
 
 def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_closed=True,
                     expected_identity=None, max_records=MAX_RECORDS,
-                    max_inclusion_checks=MAX_INCLUSION_CHECKS):
+                    max_inclusion_checks=MAX_INCLUSION_CHECKS, strict_evidence=True, expectations=None):
     """Analyze one measurement manifest. Never raises on adversarial content except bounds."""
     if not isinstance(records, (list, tuple)):
         raise AnalysisBounds('records must be a list')
@@ -194,6 +204,10 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
             _bound_content(body)
     R = receipts or load_receipts()
     ctx = _Ctx(R, budget_ns)
+    oracle_module = load_sibling('source_oracle.py')
+    if expectations is not None:
+        _bound_content(expectations)
+    oracle = oracle_module.Oracle(expectations)
 
     # ---- screen + dedupe (identical duplicate observations are never pooled) ----
     recs, seen, dup_identical, dup_conflict = [], {}, 0, 0
@@ -343,6 +357,7 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
                 continue
             stored_by_key.setdefault(k, []).append(r)
     fulfil = []   # dict(window, chat, adm_id, receipt_ids, time, via, key)
+    exact_inclusions, semantic_checks = [], {}
     checks, rejected_inclusions, inclusion_obs = 0, 0, Counter()
     for r in recs:
         if r['event'] not in ('emit_success', 'catchup_success') or r.get('kind') != 'model':
@@ -385,9 +400,28 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
                    for field, value in a['stable'].items() if field in endpoint['stable']):
                 integrity.append(f'conflicting publication admission {a["id"]}')
                 ctx.reject('fulfilled publication conflicts with admitted endpoint', r); continue
-            fulfil.append(dict(window=r['window_id'], chat=c, adm_id=a['id'], receipt_ids=set(a['receipt_ids']),
-                               time=t, via=via, key=key_of(p), first=a['first']))
+            item = dict(window=r['window_id'], chat=c, adm_id=a['id'], receipt_ids=set(a['receipt_ids']),
+                        time=t, via=via, key=key_of(p), first=a['first'])
+            exact_inclusions.append(item)
+            semantic_key = (r['window_id'], key_of(p))
+            if semantic_key not in semantic_checks:
+                body = json.loads(base64.b64decode(r['payload_b64'], validate=True))['bundles'][p['session']]
+                semantic_checks[semantic_key] = oracle.check(r['window_id'], p, body)
+            if oracle.enabled and semantic_checks[semantic_key] is not True:
+                continue  # wrong row/status/action/absence retains the original censored age
+            fulfil.append(item)
             inclusion_obs[(r['window_id'], key_of(p), via)] += 1
+    no_change_report = oracle_module.audit_no_change(recs, exact_inclusions, stored_by_key)
+    stage_audits = {}
+    if strict_evidence:
+        auditor = load_sibling('source_evidence.py')
+        grouped = {w: [] for w in windows}
+        for row in recs:
+            grouped[row['window_id']].append(row)
+        stage_audits = {w: auditor.audit(rows) for w, rows in grouped.items()}
+        # Never turn incomplete source/writer/scope evidence into passing samples.
+        invalid_windows = {w for w, audit in stage_audits.items() if not audit['valid']}
+        fulfil = [item for item in fulfil if item['window'] not in invalid_windows]
     fulfil_by = {}
     for f in fulfil:
         fulfil_by.setdefault((f['window'], f['chat']), []).append(f)
@@ -651,13 +685,19 @@ def analyze_records(records, *, receipts=None, budget_ns=BUDGET_NS, require_clos
                     admitted_duplicate_observations=sum(v - 1 for v in adm_obs.values()),
                     rejected_inclusion_records=rejected_inclusions)
 
+    semantic_report = oracle.report()
+    evidence_valid = bool(stage_audits) and all(audit['valid'] for audit in stage_audits.values())
     inputs_valid = bool(validator['valid'] and not integrity and dup_identical == 0 and dup_conflict == 0
-                        and not ctx.rejected and not lossy)
+                        and not ctx.rejected and not lossy and not no_change_report['invalid']
+                        and (not strict_evidence or evidence_valid)
+                        and (not oracle.enabled or semantic_report['verdict'] == 'PASS'))
     return dict(
         schema='panel-source-analysis/1',
-        acceptance=NOT_EVALUATED, semantic_oracle=NOT_EVALUATED, native_desktop_p95=NOT_EVALUATED,
+        acceptance=NOT_EVALUATED, semantic_oracle=semantic_report['verdict'], native_desktop_p95=NOT_EVALUATED,
+        semantic_expectations=semantic_report, no_change_evidence=no_change_report,
+        strict_evidence=strict_evidence, evidence_valid=evidence_valid, evidence_audits=stage_audits,
         cpu_gate=NOT_EVALUATED,
-        note='timings alone never produce latency or C acceptance PASS; expected row/action/absence oracle absent',
+        note='semantic presentation and exact inclusion are distinct; performance, population, native and CPU gates remain separate',
         inputs_valid=inputs_valid,
         validator={k: validator[k] for k in ('valid', 'errors', 'stored', 'fulfilled', 'server_emitted',
                                               'authenticated_catchup')} | {'unmatched_publications': validator['unmatched']},
@@ -684,6 +724,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('segments', nargs='+', type=Path)
     parser.add_argument('--allow-open', action='store_true')
+    parser.add_argument('--expectations', type=Path, help='independent owner/admission-qualified semantic manifest')
+    parser.add_argument('--timing-only', action='store_true', help='legacy diagnostic inspection; never preflight evidence')
     args = parser.parse_args(argv)
     records = []
     try:
@@ -699,7 +741,15 @@ def main(argv=None):
                         raise AnalysisBounds('file input bound exceeded')
                     if line.strip():
                         records.append(json.loads(line))
-        out = analyze_records(records, require_closed=not args.allow_open)
+        expected = None
+        if args.expectations is not None:
+            with args.expectations.open('rb') as stream:
+                data = stream.read(MAX_INPUT_BYTES + 1)
+            if len(data) > MAX_INPUT_BYTES:
+                raise AnalysisBounds('expectation input bound exceeded')
+            expected = json.loads(data)
+        out = analyze_records(records, require_closed=not args.allow_open,
+                              strict_evidence=not args.timing_only, expectations=expected)
     except (OSError, ValueError, TypeError, RecursionError) as exc:
         out = {'acceptance': NOT_EVALUATED, 'inputs_valid': False, 'error': type(exc).__name__}
     print(json.dumps(out, sort_keys=True))
