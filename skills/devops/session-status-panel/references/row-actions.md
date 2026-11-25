@@ -15,6 +15,7 @@ and an ask row's own Open card stay buttons. A line row's own card also opens by
   (`tasksBridge().connectionForHubGateway`).
 - Drop `open_session` when its session is the panel's own chat or a compression ancestor (`bundle.session` +
   `bundle.lineage`). Otherwise the item is a no-op on most rows.
+- Before selecting a process-open API, inspect its inventory boundary: core `process.list` filters its backend's registry by exact session key, while canonical sidebar/process evidence can include foreign checkpoints and compression lineage. A matching process ID alone does not establish that the RPC can return it. Preserve gateway/profile/session ownership, fail explicitly on a missing inventory entry, and label any retained panel observation as an at-open snapshot rather than fresh RPC evidence. Do not silently use the active backend or acknowledge logs to populate a read-only viewer.
 - Tests: the hub-model jsdom stub must provide ContextMenu* stand-ins (the content renders only when the harness
   enables it). Assert item order, enabled/disabled state, the dispatched action per item, and that no inline
   parent-card button remains.
