@@ -294,8 +294,14 @@ def token_series(db, policy, *, now=None):
     return out
 
 
-def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False):
+def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False, sources=False, reader=None):
     """Same hub-computed projection for owned in-process or borrowed RPC readers."""
+    if not sources:
+        snap, raw = _governed_sources(mods, conn, evidence, hours, window)
+        if variants:
+            return {name: _view_module().project(snap, raw, flag)
+                    for name, flag in (('collapsed', False), ('expanded', True))}
+        return _view_module().project(snap, raw, expanded)
     snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
     raw = None
     if snap.get('configured'):
@@ -304,11 +310,15 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             if flow_mods is None:
                 raise RuntimeError('this Hermes core has no lanes flow support yet')
             flow_mod = flow_mods[1]
-            contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
-            with _observer_init_lock:
-                reader = _observations().reader(contexts)
+            if reader is None:
+                contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
+                with _observer_init_lock:
+                    reader = _observations().reader(contexts)
             raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
             raw['configured'] = bool(raw.get('lanes'))
+            for card in raw.get('cards', []):
+                source_row = evidence.row(card['id'])
+                card['status'] = source_row['status'] if source_row else None
             raw['attention'] = _attention_module().project(raw['cards'], evidence)
             pol = mods[1].policy()
             if pol is not None:
@@ -319,11 +329,64 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             import logging
             logging.getLogger(__name__).exception('lanes flow computation failed')
             raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
-    if variants:
-        # Only presentation differs: read/project source evidence once on the hub.
-        return {name: _view_module().project(snap, raw, flag)
-                for name, flag in (('collapsed', False), ('expanded', True))}
-    return _view_module().project(snap, raw, expanded)
+    return snap, raw
+
+
+@lru_cache(maxsize=None)
+def _sibling(name):
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('lanes_' + name, Path(__file__).with_name(name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _governed_sources(mods, conn, evidence, hours, window):
+    from contextlib import ExitStack
+    from collections import defaultdict
+    import sqlite3
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_lanes_sources import read_view
+    from hermes_constants import get_hermes_home
+    try:
+        from hermes_cli import kanban_governors as gov
+    except ImportError:
+        return _project_evidence(mods, conn, evidence, hours, window, True, sources=True)
+    current = gov._board(conn)
+    pairs, snapshots = [], []
+    with ExitStack() as stack:
+        sources = [(current, conn, evidence)]
+        for meta in kb.list_boards(include_archived=False):
+            slug = meta.get('slug') or kb.DEFAULT_BOARD
+            if slug == current:
+                continue
+            try:
+                other = stack.enter_context(_sibling('board_merge').read_board(meta['db_path']))
+                sources.append((slug, other, stack.enter_context(read_view(other))))
+            except (OSError, RuntimeError, sqlite3.Error):
+                snapshots.append(dict(board=slug, available=False, stale=True))
+        # One immutable PR observation scope for the entire projection. Alternating
+        # per-board reader() calls would evict the other boards' published values.
+        contexts = defaultdict(list)
+        flow_mods = flow_core()
+        if flow_mods is not None:
+            for _, _, source in sources:
+                for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
+                    contexts[url].append(context)
+        combined = {url: values[0] if len(values) == 1 else values for url, values in contexts.items()}
+        with _observer_init_lock:
+            reader = _observations().reader(combined)
+        for slug, source_conn, source in sources:
+            pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)
+            for card in (pair[1] or {}).get('cards', []):
+                card['board'] = slug
+            pairs.append(pair)
+            snapshots.append(gov.snapshot(source_conn))
+        snap, raw = _sibling('board_merge').merge(pairs)
+    raw['governors'] = _sibling('governors').project(snapshots, raw.get('cards', []), gov.registry(),
+        adapter=_sibling('governors').read_adapter(get_hermes_home()))
+    return snap, raw
 
 
 def _need_core():
@@ -411,6 +474,12 @@ async def get_lanes(hours: float = Query(6.0), window: str = Query("6h"), expand
         return {'configured': True, 'warming': True}
 
 
+@router.get('/v1/governors')
+async def get_governors():
+    view = await get_lanes(6.0, '6h', False)
+    return view.get('governors', {'available': False, 'state': 'unknown', 'rows': [], 'scope': []})
+
+
 @router.get("/v1/lanes/flow")
 async def get_flow(window: str = Query("6h")) -> Dict[str, Any]:
     if window not in FLOW_WINDOWS:
@@ -473,7 +542,12 @@ def change_cursor():
     enabled = os.environ.get('HERMES_LANES_CHANGE_ONLY', '1').lower() not in ('0', 'false', 'off', 'no')
     source = _change_source.read(_capture_cursor) if enabled else _capture_cursor()[0]
     observation = _observations().cursor() if _observations.cache_info().currsize else None
-    return [source, observation]
+    # Freshness is a clock transition even when a stopped source writes nothing.
+    freshness = tuple(time.time() <= deadline for deadline in _governor_deadlines)
+    return [source, observation, freshness]
+
+
+_governor_deadlines = ()
 
 
 def _capture_cursor():
@@ -488,6 +562,9 @@ def _capture_cursor():
     cursors, paths = [], []
     with kbc.connect_closing() as conn:
         from hermes_cli import kanban_worker_node as wn
+        from hermes_cli.kanban_capacity_evidence import _board as board_of
+        current_board = board_of(conn)
+        current_path = next(r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main')
         # Cover configured replica creation/replacement even when opening it
         # fails transiently. Recovery must not depend on a local board write.
         replica_path = str(wn._replica_path(conn))
@@ -530,6 +607,39 @@ def _capture_cursor():
             cursors.append((stat.st_mtime_ns, stat.st_size))
         except FileNotFoundError:
             cursors.append(None)
+    global _governor_deadlines
+    from hermes_constants import get_hermes_home
+    from hermes_cli import kanban_db as kb
+    import json
+    deadlines = []
+    paths.append(str(kb.boards_root()))
+    for meta in kb.list_boards(include_archived=False):
+        paths.append(str(kb.board_metadata_path(meta['slug'])))
+        board_path = Path(current_path if meta['slug'] == current_board else meta['db_path'])
+        if str(board_path) not in paths:
+            paths.append(str(board_path))
+            with _sibling('board_merge').read_board(board_path, snapshot=False) as db:
+                revision = activity.read_key(db, activity.tables_for(board_path))
+                cursors.append((str(board_path), revision if revision is not None else tuple(
+                    db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
+        paths.append(str(board_path) + '.governors.json')
+    paths.append(str(Path(get_hermes_home()) / 'state/governors/mac-mini.json'))
+    for name in paths:
+        if not name.endswith('.json') or not (name.endswith('.governors.json') or name.endswith('/mac-mini.json')):
+            continue
+        try:
+            text = Path(name).read_text()
+            doc = json.loads(text)
+            stamp = doc.get('tick_at', doc.get('read_at'))
+            if isinstance(stamp, (int, float)):
+                cadence = doc.get('cadence_s', 60)
+                if isinstance(cadence, (int, float)) and 0 < cadence < float('inf'):
+                    deadlines.append(stamp + 3 * cadence)
+            # Ignore tick time while unchanged decisions remain fresh.
+            cursors.append((name, {k: v for k, v in doc.items() if k not in ('tick_at', 'read_at')}))
+        except (OSError, ValueError, AttributeError):
+            cursors.append((name, None))
+    _governor_deadlines = tuple(deadlines)
     return cursors, tuple(paths)
 
 

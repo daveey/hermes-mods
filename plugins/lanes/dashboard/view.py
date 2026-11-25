@@ -22,11 +22,17 @@ _STATUS_OF = {'you': 'you', 'time': 'ext', 'review': 'ext', 'gate': 'gate', 'slo
 
 def status_of(reason):
     reason = str(reason or '')
-    return 'gate' if reason.startswith('limit:') else _STATUS_OF.get(reason, 'other')
+    if reason == 'gov:dependencies':
+        return 'dep'
+    if reason == 'gov:schedule':
+        return 'ext'
+    if reason.startswith('limit:') or reason in ('gov:lane_gate', 'gov:lane_daily_limit', 'gov:lane_paused'):
+        return 'gate'
+    return 'worker' if reason.startswith('gov:') else _STATUS_OF.get(reason, 'other')
 
 
 def _gate_kind(reason):
-    return 'lane_gate' if reason == 'gate' else str(reason)
+    return 'lane_gate' if reason in ('gate', 'gov:lane_gate') else str(reason).removeprefix('gov:')
 
 
 def gates(cards, lanes):
@@ -54,6 +60,7 @@ def gates(cards, lanes):
             row['admit_per_day'] = lane.get('admit_per_day')
         rows.append(row)
     return sorted(rows, key=lambda r: (-r['count'], r['lane'], r['kind']))
+
 
 
 def session_counts(cards):
@@ -124,6 +131,28 @@ def dam_hint(reason, cards):
 def project(snap, raw, expanded):
     view = {**snap, 'view_version': 1, 'lanes': {name: dict(row) for name, row in snap.get('lanes', {}).items()}}
     raw = raw or {}
+    if raw.get('governors'):
+        view['governors'] = raw['governors']
+        governors = {g['id']: g for g in raw['governors']['rows']}
+        for name, row in view['lanes'].items():
+            lane_cards = [c for c in raw.get('cards', []) if c.get('lane') == name]
+            reasons = raw['governors']['lane_reasons'].get(name, [])
+            row['governors'] = [{**governors[r['id']], 'lane_count': r['count']} for r in reasons]
+            row['governor_held'] = sum(r['count'] for r in reasons) if raw['governors']['available'] else None
+            row['top_reason'] = (f"{reasons[0]['count']} held · {governors[reasons[0]['id']]['name']}" if reasons else
+                                 'lane paused' if row.get('paused') else
+                                 'Governor state unknown' if not raw['governors']['available'] else
+                                 'nothing ready' if not row.get('ready') else 'starting as workers free up')
+            row['boards'] = sorted({c.get('board') for c in lane_cards if c.get('board')})
+            row['steps'] = [dict(key=k, label=l, count=sum(c.get('step') == k for c in lane_cards),
+                                 piling=sum(c.get('step') == k for c in lane_cards) >= 4) for k, l, _ in STEPS]
+            row['held_sessions'] = sorted({c['source']['id'] for c in lane_cards if c.get('governor') and
+                                          c.get('source', {}).get('kind') == 'session'})
+            row['held_cards'] = [dict(board=c['board'], id=c['id']) for c in lane_cards if c.get('governor')]
+            if name == 'babybear':
+                row['device_footnote'] = raw['governors']['device_footnote']
+        view['sidebar'] = dict(cost_today=sum((r.get('usage') or {}).get('usd_today', 0) for r in raw.get('lanes', {}).values()),
+                               idle_lanes=[n for n, r in view['lanes'].items() if not r.get('open')])
     if expanded:
         for name, row in raw.get('lanes', {}).items():
             view['lanes'].setdefault(name, {}).update({k: v for k, v in row.items()
