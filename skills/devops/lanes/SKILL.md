@@ -59,7 +59,7 @@ When consuming core governor snapshots, keep complete governor counters separate
 
 ## Composed Desktop SDK coverage
 
-Test contribution areas together as well as separately: when above-Pinned sidebar and Sessions-tab totals both exist, mount registered contributions and verify totals placement, status selection, actual session-filter matching/clear/unmount cleanup and the not-live indicator. Reuse one state/filter owner for modern totals-only and legacy strip layouts; registering a tab contribution is insufficient if its state owner is never mounted.
+Test contribution areas together as well as separately: when above-Pinned sidebar and Sessions-tab totals both exist, mount registered contributions and verify totals placement, status selection, actual session-filter matching/clear/unmount cleanup and the not-live indicator. Reuse one state/filter owner for modern totals-only and legacy strip layouts; registering a tab contribution is insufficient if its state owner is never mounted. Keep totals-only subscribers passive: sidebar owns expanded/window parameters, including when totals mounts first, remounts, or receives Show-lanes events. Test both mount orders with real collapsed/expanded producer views and configured cap inputs; a collapsed view omits limits and can look unlimited. Ignore persisted legacy lane-pill selection when those pills are absent, without deleting the older layout's saved selection.
 
 Use core freshness_bound(doc) for governor cursor expiry and exclude tick completion/gap diagnostics from semantic decisions while still renewing freshness deadlines. Preserve unknown newer governor ids as unknown rows with charged counters; version skew must not assert the whole lanes view offline.
 
