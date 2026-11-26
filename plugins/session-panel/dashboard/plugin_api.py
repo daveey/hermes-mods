@@ -876,6 +876,15 @@ class CoreReaders:
             yield
             return
         scope = {'lineages': {}, 'local': {}, 'members': {}, 'remote': {}, 'cards': {}}
+        held = getattr(self._local, 'pass_reads', None)
+        if held is not None:
+            # Inside a feed pass the board files are stamped once per chunk, here, not on every card read; a
+            # replaced file drops the pass's shared cards before this chunk reads any.
+            stamp = self._file_stamp()
+            if held['stamp'] != stamp:
+                held['cards'].clear()
+                held['stamp'] = stamp
+            scope['stamp'] = stamp
         self._local.batch = scope
         try:
             for s in sessions:
@@ -894,7 +903,8 @@ class CoreReaders:
         """One feed pass on this thread: every chunk's `batch` shares the pass's card records, so a card held by
         chats in several chunks is read once a pass, not once a chunk (738 reads for 439 cards in a 71-chat hub
         pass, 2026-11-26). Thread-local, created by the pass and dropped when it ends: never a cross-pass memo.
-        A replaced board file clears the shared cards as it clears a chunk's. Content writes during the pass are seen by the next pass, as within one chunk before. [daveey]"""
+        The board files are stamped once per chunk (`batch`), and a replaced file clears the shared cards there.
+        Content writes during the pass are seen by the next pass, as within one chunk before. [daveey]"""
         if getattr(self._local, 'pass_reads', None) is not None:
             yield
             return
@@ -918,13 +928,10 @@ class CoreReaders:
         scope = getattr(self._local, 'batch', None)
         if scope is not None:
             # A pass is one bounded snapshot, not a global cache. Content writes are seen by the next tick;
-            # unrelated state.db traffic must not discard shared board work. Replacements invalidate at once,
-            # including the feed pass's shared cards (`pass_scope`).
+            # unrelated state.db traffic must not discard shared board work. Outside a feed pass replacements
+            # invalidate at once; inside one, at the next chunk (`batch` stamps the files, `pass_scope`).
             held = getattr(self._local, 'pass_reads', None)
-            stamp = self._file_stamp()
-            if held is not None and held['stamp'] != stamp:
-                held['cards'].clear()
-                held['stamp'] = stamp
+            stamp = held['stamp'] if held is not None else self._file_stamp()
             if scope.get('stamp') != stamp:
                 for name in ('local', 'members', 'remote', 'cards'):
                     scope[name].clear()
