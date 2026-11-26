@@ -21,6 +21,35 @@ def test_lineage_with_incomplete_core_schema_stays_on_current_chat(tmp_path):
     assert core.lineage('tip', db) == ['tip']
 
 
+@pytest.mark.parametrize('failure', ['connect', 'pragma'])
+def test_lineage_contains_third_connection_sqlite_errors(tmp_path, monkeypatch, failure):
+    db = tmp_path / 'state.db'
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute('CREATE TABLE sessions(id TEXT, parent_session_id TEXT, end_reason TEXT, source TEXT)')
+        conn.executemany('INSERT INTO sessions VALUES (?,?,?,?)', [
+            ('root', None, 'compression', 'desktop'), ('tip', 'root', None, 'desktop')])
+    original = core._ro_connect
+    count = 0
+    opened = []
+    class BrokenPragma:
+        def execute(self, *args):
+            raise sqlite3.OperationalError('injected lineage PRAGMA failure')
+        def close(self):
+            opened.append('closed')
+    def connect(*args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 3:
+            if failure == 'connect':
+                raise sqlite3.OperationalError('injected third connection failure')
+            return BrokenPragma()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(core, '_ro_connect', connect)
+    assert core.lineage('tip', db) == ['tip']
+    assert count == 3
+    assert opened == (['closed'] if failure == 'pragma' else [])
+
+
 def test_ledger_snapshot_failure_is_before_durable_replace(tmp_path, monkeypatch):
     ledger = core.Ledger(tmp_path / 'ledger', tmp_path / 'state.db')
     original = core._open_controls
