@@ -40,6 +40,16 @@ is already superseded (re-scoped, budget set, parent done), the owning chat runs
 `--dry-run`. If `hermes kanban release` refuses with `budget_decision_unread` ("Budget decision comment unavailable"),
 re-running sync does not help; use promote. Then confirm a worker claims it (spawned/worker_bound event).
 
+## Release succeeds, then immediately reholds on old spend
+
+When zero new runs still exceed a newly granted allowance, inspect the current stop, latest `spend_budget_set` events and checkpoint instead of repeating promotion. Compare `spent.runs`, `since`, and effective limits: historical scope restrictions can deliberately retain cumulative accounting despite a promotion's fresh-window marker. In that case, represent additional runs as retained count plus authorized allowance, not the allowance alone.
+
+1. Trace cache-limit provenance separately. A reviewer writing `cache_read_tokens:null` can restore the board default and lose earlier explicit agent attribution. A release refusal saying the cap *may* be human-set is not proof a human imposed it. Inspect the prior explicit event; preserve actual human or unresolved limits.
+2. When the owning chat has existing full-goal authority and records establish an overwritten agent-set limit, use supported `hermes kanban spend-budget <id> --runs <retained-plus-authorized> --cache-read-tokens <verified-prior-limit> --reason '<provenance and unchanged goal>' --json`. Compute the total with a tool. Zero means unlimited: restore it only when that exact prior limit and authority are evidenced, never as a generic unblock.
+3. Satisfy this command's own read-first gate: read the records it prints, then retry with its exact requested `--seen` identifier. It may require a budget **event** ID; a numerically newer comment or the acknowledgment used by `release` is not interchangeable.
+4. Read back effective limits and retained spend. Run supported `hermes kanban release <id> --runs <authorized-additional>`, satisfying its separate read-first gate, including the newly recorded budget decision. Verify release receipt, persisted state and eventual claim separately. Ready without an immediate rehold establishes release, not execution.
+5. Put the reproduction on the existing spend-review producer owner: preserve explicit cache provenance and reconcile fresh-round grants with restricted cumulative accounting. For this reconciliation, retain historical usage and global defaults; the budget correction does not settle unknown receipts or release independent accounting gates.
+
 The hub's local kanban.db can keep showing a card as `ready`, with no spawned/run_route/worker_bound event, while a pool worker already holds the Board lease and is running it. Board-lease claims can stop reaching the hub replica. Before bumping priority, re-placing or filing a stall card, check the workers themselves:
 
 ```sh
