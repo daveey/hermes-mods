@@ -314,10 +314,14 @@ class Store:
     # ── the gate ──
     def demoted(self) -> list[str]:
         cut = self.clock() - DEMOTE_WINDOW_S
+        projected = _cache.load_sibling(_HERE, "demotion_log").read(self.root / "log.jsonl")
+        if projected is None:
+            projected = ((r.get("ts", 0), r.get("rule")) for r in self.read_log(cut)
+                         if r.get("event") == "choice" and r.get("choice") == "dismissed")
         n: dict = {}
-        for r in self.read_log(cut):
-            if r.get("event") == "choice" and r.get("choice") == "dismissed":
-                n[r.get("rule")] = n.get(r.get("rule"), 0) + 1
+        for ts, rule in projected:
+            if ts >= cut:
+                n[rule] = n.get(rule, 0) + 1
         return sorted(k for k, v in n.items() if k and v >= DEMOTE_DISMISSALS)
 
     def gate(self, sid: str, rule: str, key: str, turn: int, demoted: Optional[list] = None) -> tuple[bool, str]:
