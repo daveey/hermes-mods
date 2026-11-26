@@ -238,7 +238,10 @@ def observe(log: EventLog, now: float, state: str, reason: str, pid: Any, starte
         log.append(e)
         added.append(e)
         last = e
-    if not last or last.get("state") != state or (state == UP and last.get("pid") != pid):
+    # A new down reason is logged too, so a later restart is judged against the latest failure,
+    # not a stale "restart did not finish" (which would otherwise stay latched).
+    if not last or last.get("state") != state or (state == UP and last.get("pid") != pid) \
+            or (state == DOWN and last.get("reason") != reason):
         ts = started if state == UP and started and (not last or started >= last["ts"]) else now
         e = {"ts": round(ts, 1), "state": state, "reason": reason, "pid": pid}
         log.append(e)
@@ -275,12 +278,17 @@ def status(home: Optional[Path] = None, now: Optional[float] = None,
            unit_fn: Callable[[], Optional[str]] = unit_state) -> Dict[str, Any]:
     home = home or hermes_home()
     s = sample(home, now, unit_fn)
-    last = EventLog(home / "hub-status").last()
+    evs = EventLog(home / "hub-status").read()
+    last = evs[-1] if evs else None
     state, reason = escalate(s["state"], s["reason"], last, s["now"])
     if state == UP and s["started"]:
         since = s["started"]
     elif last and last.get("state") == state:
         since = last["ts"]
+        for e in reversed(evs):  # a down spell can span several logged reasons
+            if e.get("state") != state:
+                break
+            since = e["ts"]
     else:
         since = s["now"]
     return {"api": 1, "state": state, "reason": reason, "since": since, "now": s["now"], "pid": s["pid"],

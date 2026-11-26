@@ -45,8 +45,9 @@ test('deriveState: hub answer wins; two misses → unreachable since the last go
   assert.equal(m.deriveState({ status, fails: 1, lastOkAt: NOW - 10_000 }, NOW).state, 'up')
   const d = m.deriveState({ status, fails: 2, lastOkAt: NOW - 20_000, firstFailAt: NOW - 10_000 }, NOW)
   assert.deepEqual([d.state, d.since, d.unreachable], ['down', NOW - 20_000, true])
-  // never reached: red from the first miss
-  assert.equal(m.deriveState({ status: null, fails: 1, lastOkAt: 0, firstFailAt: NOW - 5000 }, NOW).since, NOW - 5000)
+  // never reached: one miss is not an outage, two are (red since the first miss)
+  assert.equal(m.deriveState({ status: null, fails: 1, lastOkAt: 0, firstFailAt: NOW - 5000 }, NOW), null)
+  assert.equal(m.deriveState({ status: null, fails: 2, lastOkAt: 0, firstFailAt: NOW - 5000 }, NOW).since, NOW - 5000)
   assert.equal(m.deriveState({ status: null, fails: 0 }, NOW), null)
   assert.equal(m.deriveState({ status: { state: 'restarting', since: (NOW - 42_000) / 1000 }, fails: 0 }, NOW).state, 'restarting')
   assert.equal(m.deriveState({ status: { state: 'weird' }, fails: 0 }, NOW).state, 'down')
@@ -91,7 +92,7 @@ test('buildSegments merges hub events with local unreachable spans; stripSlots t
 
 test('chipModel: newest slot always shows the live state; label and tooltip', () => {
   const poll = { status: { state: 'restarting', since: (NOW - 42_000) / 1000, reason: 'draining' }, fails: 0, lastOkAt: NOW }
-  const cm = m.chipModel(poll, { range: '24h', data: { events: [] } }, [], NOW)
+  const cm = m.chipModel(poll, { events: [] }, [], NOW)
   assert.equal(cm.slots[11], 'restarting')
   assert.equal(cm.counter, '0:42')
   assert.match(cm.title, /^Hub restarting 0:42\ndraining · since /)
@@ -146,6 +147,22 @@ test('register: polls the hub connection, red after two misses, green again on r
   poll(); await tick()
   assert.equal(el().props['data-state'], 'up')
   assert.ok(store.spans[0].end > 0)
+})
+
+test('the strip keeps 24 h hub history while the popover shows 7 d', () => {
+  const day = { events: [
+    { ts: (NOW - 25 * H) / 1000, state: 'up' },
+    { ts: (NOW - 3 * H) / 1000, state: 'down', reason: 'x' },
+    { ts: (NOW - 2.5 * H) / 1000, state: 'up' }] }
+  const cm = m.chipModel({ status: { state: 'up', since: (NOW - 2.5 * H) / 1000 }, fails: 0, lastOkAt: NOW }, day, [], NOW)
+  assert.equal(cm.slots[10], 'down')
+})
+
+test("today's 7 d row keeps the rest of the day as empty future space", () => {
+  const dayStart = NOW - 20 * H, dayEnd = NOW + 4 * H
+  const parts = m.bandParts([{ start: dayStart, end: NOW, state: 'up' }], dayStart, dayEnd, NOW)
+  assert.deepEqual(parts.map(p => [p.state, (p.end - p.start) / H]), [['up', 20], ['future', 4]])
+  assert.deepEqual(m.bandParts([{ start: dayStart, end: dayEnd, state: 'up' }], dayStart, dayEnd, dayEnd).map(p => p.state), ['up'])
 })
 
 test('no hub connection: no requests, no chip', async () => {
