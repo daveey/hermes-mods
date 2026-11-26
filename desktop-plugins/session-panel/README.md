@@ -62,7 +62,12 @@ batch catch-up, epoch reset, profile aliases, and serialized/coalesced catch-ups
 Older catch-up answers cannot overwrite a newer live push. Restored backend
 revision jumps catch up without changing epoch; an older backend snapshot resets
 only when pushes no longer reach Desktop. Unsupported backends/profiles back off
-for ten minutes and leave the missing-model state visible, without local raw reads.
+for ten minutes and show a `role=alert` error naming the gateway/profile and failure
+reason, not an endless loading/retry placeholder (even if an old model is cached).
+`window.__sessionPanel.covers(route)` is true only for an exact chat with a cached
+model and no unsupported-feed error. Session Tasks keeps its strip, including wait
+ETAs, visible when coverage is false; loading and unsupported routes do not hide it.
+No local raw-card fallback is used by the panel.
 `feedIsLive` and `feedVouches` report transport freshness only.
 
 ## Tests

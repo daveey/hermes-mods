@@ -88,8 +88,14 @@ test('the strip hides while the session panel is loaded and comes back without i
   stripHost.state.focusedSessionOwner.value = { connectionId: 'owner-a', profile: 'default' }
   await refresh()
   assert.ok(render(), 'strip shows on its own')
-  window.__sessionPanel = { active: true }
+  const routes = []
+  let covered = false
+  window.__sessionPanel = { active: true, covers: route => { routes.push(route); return covered } }
   try {
+    assert.ok(render(), 'unsupported panel leaves the task strip visible')
+    assert.equal(routes.at(-1).connectionId, 'owner-a')
+    assert.equal(routes.at(-1).profile, 'default')
+    covered = true
     const effects = stripEffects.length
     assert.equal(render(), null, 'the panel shows this work instead')
     assert.ok(stripEffects.length > effects, 'still subscribes, so polling keeps feeding the panel')

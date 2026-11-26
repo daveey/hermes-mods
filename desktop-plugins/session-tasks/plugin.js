@@ -1623,7 +1623,7 @@ function Strip() {
   useEffect(() => void refresh(), [focused, scope])
   const chips = snap.runtime === focused && snap.scope === scope ? progressChips(snap.chips) : []
   // The session panel shows this work in its own sections; the strip stays subscribed so polling keeps running.
-  if (!chips.length || (typeof window !== 'undefined' && window.__sessionPanel?.active)) return null
+  if (!chips.length || (typeof window !== 'undefined' && window.__sessionPanel?.covers?.({ ...route, session: stored }))) return null
   const cards = chips.filter(c => c.kind === 'kanban')
   const others = chips.filter(c => c.kind !== 'kanban')
   return jsxs('details', {

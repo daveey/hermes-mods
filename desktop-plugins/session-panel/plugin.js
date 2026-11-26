@@ -87,7 +87,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v26-live-processes'
+const VERSION = 'session-panel-v27-route-coverage'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -169,6 +169,11 @@ const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', p
 // `[panel-feed] <connection>/<profile> <state> ...`.
 const feedLog = msg => { try { window.hermesDesktop?.logLine?.(`[panel-feed] ${msg}`) } catch {} }
 const tasksBridge = () => (typeof window !== 'undefined' ? window.__sessionTasks : null)
+const unsupportedFeed = route => feeds.get(connKey(route?.connectionId, route?.profile))?.unsupported === true
+/** Only replace the task strip when this exact chat has a renderable model. */
+export function covers(route) {
+  return !!route?.connectionId && !!route?.session && !unsupportedFeed(route) && !!cachedModel(route)
+}
 /** True while `route`'s gateway feed pushes (or heartbeats) reach this window. */
 export function feedIsLive(route, nowMs = Date.now()) {
   const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
@@ -266,7 +271,8 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
   const unsupported = why => {
     if (!st?.unsupported) feedLog(`${target.connectionId}/${profile} no-feed ${why}`)
-    feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, at: nowMs })
+    feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, reason: why, at: nowMs })
+    modelChanged()
     return false
   }
   const sameFeed = !reset && st && !st.unsupported
@@ -284,7 +290,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
     log('feed catch-up failed', target.connectionId, e?.message || e)
     return false
   }
-  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? `profile ${r.profile}` : 'no epoch')
+  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? 'profile_unsupported' : 'no epoch')
   const cur = feeds.get(key)
   if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
     // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
@@ -302,6 +308,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
   feeds.set(key, next)
+  if (cur?.unsupported) modelChanged()
   if (cur?.epoch !== r.epoch || cur?.feed !== r.feed) feedLog(`${target.connectionId}/${profile} registered feed=${r.feed} epoch=${r.epoch} rev=${next.rev} watching=${target.sessions.length} bundles=${Object.keys(r.bundles || {}).length}`)
   next.fresh = cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.fresh || [] : []
   for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, r)
@@ -1097,6 +1104,8 @@ export function Panel() {
   const model = decisionPresentation(cachedModel(route), route)
   useEffect(() => { observeDecisionRender(route, model) })
   if (!route.session) return null
+  if (unsupportedFeed(route)) return jsx('div', { role: 'alert', 'data-session-panel-error': '',
+    children: `Session panel isn't served for profile ${route.profile || 'default'} on ${route.connectionId}: ${feeds.get(connKey(route.connectionId, route.profile)).reason}. Linked task status remains in the task strip.` })
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
   const panel = renderModel(model, {
@@ -1136,7 +1145,7 @@ export default {
   name: 'Session Panel',
   register(ctx) {
     osApi = ctx?.os || null
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, covers, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null
