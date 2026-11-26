@@ -15,17 +15,33 @@ REASONS = {
 
 # The strip's all-lanes counts: one bucket per open card, in urgency order. Colours are owned by Desktop.
 # A card held at a lane gate or over a lane's daily limit is not waiting for a worker: no free slot would start it.
-STATUS = ('you', 'ext', 'gate', 'worker', 'run', 'dep', 'triage', 'other')
-_STATUS_OF = {'you': 'you', 'time': 'ext', 'review': 'ext', 'gate': 'gate', 'slot': 'worker', 'quota': 'worker',
+# A scheduled card is only "external" (pink) when it waits on CI, a review or a deploy; one parked on another card
+# is grey ``dep``, and one parked on a clock or an outside event (Slack, upstream, telemetry) is ``park``.
+STATUS = ('you', 'ext', 'gate', 'worker', 'run', 'dep', 'park', 'triage', 'other')
+_STATUS_OF = {'you': 'you', 'time': 'park', 'review': 'ext', 'gate': 'gate', 'slot': 'worker', 'quota': 'worker',
               'run': 'run', 'dep': 'dep', 'triage': 'triage'}
+_LANDING_STEPS = ('review', 'ci', 'merge', 'deploy', 'test')
+_EXTERNAL_WAITS = ('ci', 'review', 'deploy')
 
 
-def status_of(reason):
+def _parked_on(card):
+    """Bucket for a scheduled card from what it waits on: the core's ``wait`` (awaiting kind) when it sends one,
+    else its landing step (a card awaiting CI or a deploy sits in a landing step)."""
+    card = card or {}
+    wait = card.get('wait')
+    if wait == 'card':
+        return 'dep'
+    if wait in _EXTERNAL_WAITS or (wait is None and card.get('step') in _LANDING_STEPS):
+        return 'ext'
+    return 'park'
+
+
+def status_of(reason, card=None):
     reason = str(reason or '')
     if reason == 'gov:dependencies':
         return 'dep'
-    if reason == 'gov:schedule':
-        return 'ext'
+    if reason in ('gov:schedule', 'time'):
+        return _parked_on(card)
     if reason.startswith('limit:') or reason in ('gov:lane_gate', 'gov:lane_daily_limit', 'gov:lane_paused'):
         return 'gate'
     return 'worker' if reason.startswith('gov:') else _STATUS_OF.get(reason, 'other')
@@ -79,7 +95,7 @@ def session_counts(cards):
     for c in cards:
         if not c.get('lane'):
             continue
-        key = status_of(c.get('reason'))
+        key = status_of(c.get('reason'), c)
         for sid in card_chats(c):
             cats = out.setdefault(sid, {}).setdefault(c['lane'], {})
             cats[key] = cats.get(key, 0) + 1
@@ -87,7 +103,7 @@ def session_counts(cards):
 
 
 def status_counts(cards):
-    tally = Counter(status_of(c.get('reason')) for c in cards)
+    tally = Counter(status_of(c.get('reason'), c) for c in cards)
     return {key: tally.get(key, 0) for key in STATUS}
 
 
@@ -192,10 +208,9 @@ def project(snap, raw, expanded):
         fleet_running = sum(c.get('reason') == 'run' for c in raw['cards'])
         idle = [name for name, row in view['lanes'].items() if not row['ready']]
         for name, row in view['lanes'].items():
-            reasons = Counter(c.get('reason') or 'unknown' for c in raw['cards'] if c.get('lane') == name)
-            lane = Counter()
-            for reason, count in reasons.items():
-                lane[status_of(reason)] += count
+            mine = [c for c in raw['cards'] if c.get('lane') == name]
+            reasons = Counter(c.get('reason') or 'unknown' for c in mine)
+            lane = Counter(status_of(c.get('reason') or 'unknown', c) for c in mine)
             limits = raw.get('lanes', {}).get(name, {}).get('limits') or row.get('limits') or {}
             maximum = limits.get('max_workers')
             cap = maximum if maximum is not None else round(row.get('target', 0) * fleet_running)

@@ -29,16 +29,17 @@ export const KANBAN_CHIP_EVENT = 'hermes-kanban-chip'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
 export const METER_COLORS = { running: '#388bfd', notReady: '#d4a72c', blocked: '#d64545' }
 // Card-state colours shared with the sidebar's card squares (Tailwind red-500, pink-500, emerald-500, sky-500, zinc-500).
-export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', gate: '#a855f7', worker: '#10b981', run: '#0ea5e9', dep: '#71717a' }
+export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', gate: '#a855f7', worker: '#10b981', run: '#0ea5e9', dep: '#71717a', park: '#eab308' }
 export const LANE_COUNT_COLORS = { blocked: CARD_COLORS.you, running: CARD_COLORS.run, other: '#a1a1aa' }
 /** All-lanes strip counts: hub `status` key, words, colour (null = outlined, no fill). */
 export const STATUS = [
-  ['you', 'blocked on you', CARD_COLORS.you], ['ext', 'waiting on external (CI, review, timer)', CARD_COLORS.ext],
+  ['you', 'blocked on you', CARD_COLORS.you], ['ext', 'waiting on CI, review or deploy', CARD_COLORS.ext],
   ['gate', 'held at a gate', CARD_COLORS.gate], ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
-  ['dep', 'waiting on other cards', CARD_COLORS.dep], ['triage', 'in triage', null], ['other', 'other', null]
+  ['dep', 'waiting on other cards', CARD_COLORS.dep],
+  ['park', 'parked on a timer or outside event', CARD_COLORS.park], ['triage', 'in triage', null], ['other', 'other', null]
 ]
 /** The colour word a tooltip names for each count, so hovering says what the colour means. */
-export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
+export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', park: 'Yellow', triage: 'Outline', other: 'Outline' }
 // Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
 export const SESSION_FILTER_AREA = sdk.SESSION_FILTER_AREA || ''
 // Desktops with the Sessions tab-strip slot (beside Sessions / Bots) take the counts, "not live" and the expand
