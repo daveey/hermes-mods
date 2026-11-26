@@ -529,6 +529,7 @@ def test_closing_a_person_wait_refreshes_the_stored_outcome_without_a_turn(real,
               'response': 'confirm the window', 'next_step': 'schedule it'}
     sent = json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))
     wid = sent['outcome']['on'][0]['id']
+    _drain(plugin)  # finish the initial wait's async refresh before the synchronous seed/read
     so.refresh_outcome('chat', trigger='manual')  # seed the stored outcome directly: the assertion below is the close
     assert wid in json.dumps(so.get_outcome('chat')['status'])
     seen = json.loads(plugin.handle({'kind': 'wait', 'on': [
