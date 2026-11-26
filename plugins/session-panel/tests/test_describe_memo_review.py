@@ -18,7 +18,7 @@ def test_any_id_format_is_a_dependency(api):
 
 
 def test_unparseable_or_hidden_tables_are_never_keyed(api):
-    assert api._describe_statement('SELECT * FROM "tasks" WHERE id=\'t_1\'')[0] == 'predicate'
+    assert api._describe_statement('SELECT title FROM "tasks" WHERE id=\'t_1\'')[0] == 'predicate'
     assert api._describe_statement("SELECT * FROM tasks, task_links WHERE id='t_1'")[0] == 'unsafe'
     assert api._describe_statement("SELECT * FROM tasks t, task_links l WHERE t.id='t_1'")[0] == 'unsafe'
     assert api._describe_statement("SELECT * FROM main.tasks WHERE id='t_1'")[0] == 'unsafe'

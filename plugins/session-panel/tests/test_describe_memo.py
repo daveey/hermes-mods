@@ -253,8 +253,8 @@ def test_census_statements_classify(api):
     keyed = 'SELECT * FROM tasks WHERE id=' + "'t_01a2132ee05d1962'"
     assert api._describe_statement(keyed) == ('keyed', ('t_01a2132ee05d1962',))
     assert api._describe_statement("SELECT cmd FROM task_wake_checks WHERE task_id='t_1'")[0] == 'rerun'
-    assert api._describe_statement("SELECT * FROM tasks WHERE assignee='zed'")[0] == 'predicate'
-    assert api._describe_statement("SELECT * FROM tasks WHERE status='ready' AND id='t_1'")[0] == 'predicate'
+    assert api._describe_statement("SELECT title FROM tasks WHERE assignee='zed'")[0] == 'predicate'
+    assert api._describe_statement("SELECT title FROM tasks WHERE status='ready' AND id='t_1'")[0] == 'predicate'
     assert api._describe_statement('PRAGMA database_list')[0] == 'schema'
 
 

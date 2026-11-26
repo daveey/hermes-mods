@@ -281,6 +281,7 @@ _SQL_QUALIFIED = re.compile(r'\b(?:FROM|JOIN)\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]
 _SQL_COMMA_JOIN = re.compile(
     r'\bFROM\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*(?:\s*\([^()]*\))?)'
     r'(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,', re.I)
+_SQL_STAR = re.compile(r'\bSELECT\s+(?:DISTINCT\s+)?(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*', re.I)
 _PASS_IDS = itertools.count(1)
 
 
@@ -323,7 +324,22 @@ def _describe_statement(sql: str, watched=frozenset({'tasks', 'task_links', 'tas
     if template in _DESCRIBE_KEYED:
         ids = tuple(v.replace("''", "'") for v in _SQL_KEY.findall(text))
         return ('keyed', ids) if ids else ('unsafe', ())
+    if _SQL_STAR.search(template) or _bookkeeping().search(text):
+        # The triggers skip bookkeeping columns and heartbeat inserts: such a read moves without the revision.
+        return 'rerun', ()
     return 'predicate', ()
+
+
+@functools.lru_cache(maxsize=1)
+def _bookkeeping():
+    """Columns and event kinds core's revision triggers deliberately do not mark (claims, leases, heartbeats)."""
+    try:
+        from hermes_cli import kanban_activity_revision as rev
+        names = set().union(*rev.BOOKKEEPING_COLUMNS.values()) | set(rev.UNREAD_EVENT_KINDS)
+    except Exception:
+        names = {'claim_lock', 'claim_expires', 'last_heartbeat_at', 'worker_pid', 'worker_started_at',
+                 'lease_holder', 'lease_expires', 'lease_version', 'sync_version', 'field_hlc', 'heartbeat'}
+    return re.compile(r'\b(?:' + '|'.join(sorted(map(re.escape, names))) + r')\b', re.I)
 
 
 def _result_digest(c, sql: str) -> str:
@@ -331,36 +347,90 @@ def _result_digest(c, sql: str) -> str:
     return hashlib.sha256(repr([tuple(r) for r in rows]).encode()).hexdigest()
 
 
-_SWALLOWED = threading.local()
-_MONITOR_NAME = 'session-panel-describe-memo'
-_MONITOR_LOCK = threading.Lock()
+# One recorder per PROCESS, shared by every module generation (plugin reloads overlap: an old pass can still run
+# while the new generation starts): its thread-local hits, lock, installed tool id, user count and the single
+# callback live in this sys.modules namespace, never in a module generation.
+_SWALLOW = sys.modules.setdefault('_session_panel_describe_swallow', types.ModuleType('_session_panel_describe_swallow'))
+_SWALLOW.__dict__.setdefault('lock', threading.Lock())
+_SWALLOW.__dict__.setdefault('local', threading.local())
+_SWALLOW.__dict__.setdefault('tool', None)
+_SWALLOW.__dict__.setdefault('users', 0)
+_SWALLOW.__dict__.setdefault('epoch', 0)
+_SWALLOW_NAME = 'session-panel-describe-memo'
+_SWALLOW_IDS = (3, 4)  # sys.monitoring reserves 0 (debugger), 1 (coverage), 2 (profiler) and 5 (optimizer)
 
 
-def _swallow_watch() -> bool:
-    """Install (once per process, also across plugin reloads: found again by name) a sys.monitoring hook that notes,
-    on a thread that asked for it, every exception handled inside core's hermes_cli package. describe() swallows
-    evidence errors (an unreadable replica, a failed read) into a degraded row; such a row must not be memoized.
-    False when no monitoring tool id is available: the memo then stores nothing."""
+def _swallow_acquire() -> bool:
+    """Count one more user of the process's swallow recorder, installing it on first use: a sys.monitoring
+    EXCEPTION_HANDLED hook that notes, for a thread that asked (`_swallow_begin`), every exception handled inside
+    core's hermes_cli package. describe() swallows evidence errors (an unreadable replica, a failed read) into a
+    degraded row, which must not be memoized. False (and nothing counted) when it cannot be installed: no
+    sys.monitoring, neither unreserved tool id free, or any error installing it. The memo is then off."""
     monitoring = getattr(sys, 'monitoring', None)
     if monitoring is None:
         return False
-    with _MONITOR_LOCK:
-        tool = next((i for i in range(6) if monitoring.get_tool(i) == _MONITOR_NAME), None)
-        if tool is None:
-            tool = next((i for i in range(6) if monitoring.get_tool(i) is None), None)
-            if tool is None:
-                return False
-            monitoring.use_tool_id(tool, _MONITOR_NAME)
-        import hermes_cli
-        core = os.path.dirname(os.path.abspath(hermes_cli.__file__)) + os.sep
+    ns = _SWALLOW
+    with ns.lock:
+        try:
+            if ns.tool is None or monitoring.get_tool(ns.tool) != _SWALLOW_NAME:
+                tool = next((i for i in _SWALLOW_IDS if monitoring.get_tool(i) in (None, _SWALLOW_NAME)), None)
+                if tool is None:
+                    return False
+                if monitoring.get_tool(tool) is None:
+                    monitoring.use_tool_id(tool, _SWALLOW_NAME)
+                import hermes_cli
+                core = os.path.dirname(os.path.abspath(hermes_cli.__file__)) + os.sep
+                local = ns.local
 
-        def handled(code, offset, exc, _core=core):
-            hits = getattr(_SWALLOWED, 'hits', None)
-            if hits is not None and code.co_filename.startswith(_core):
-                hits.append(f'{type(exc).__name__} in {code.co_name}')
-        monitoring.register_callback(tool, monitoring.events.EXCEPTION_HANDLED, handled)
-        monitoring.set_events(tool, monitoring.get_events(tool) | monitoring.events.EXCEPTION_HANDLED)
-    return True
+                def handled(code, offset, exc, _core=core, _local=local):
+                    hits = getattr(_local, 'hits', None)
+                    if hits is not None and code.co_filename.startswith(_core):
+                        hits.append(f'{type(exc).__name__} in {code.co_name}')
+                monitoring.register_callback(tool, monitoring.events.EXCEPTION_HANDLED, handled)
+                monitoring.set_events(tool, monitoring.get_events(tool) | monitoring.events.EXCEPTION_HANDLED)
+                ns.tool = tool
+                ns.epoch += 1
+            ns.users += 1
+            return True
+        except Exception:
+            log.debug('session-panel describe memo: swallow recorder unavailable', exc_info=True)
+            return False
+
+
+def _swallow_release() -> None:
+    """One user fewer; the last one removes the hook and frees the tool id (no cost or module reference after the
+    feed stops)."""
+    monitoring = getattr(sys, 'monitoring', None)
+    ns = _SWALLOW
+    with ns.lock:
+        ns.users = max(0, ns.users - 1)
+        if ns.users or ns.tool is None or monitoring is None:
+            return
+        tool, ns.tool = ns.tool, None
+        ns.epoch += 1
+        try:
+            if monitoring.get_tool(tool) == _SWALLOW_NAME:
+                monitoring.set_events(tool, 0)
+                monitoring.register_callback(tool, monitoring.events.EXCEPTION_HANDLED, None)
+                monitoring.free_tool_id(tool)
+        except Exception:
+            log.debug('session-panel describe memo: swallow recorder not freed', exc_info=True)
+
+
+def _swallow_begin():
+    """Start recording for this thread; returns the recorder epoch (None when no recorder is installed)."""
+    ns = _SWALLOW
+    ns.local.hits = []
+    return ns.epoch if ns.tool is not None else None
+
+
+def _swallow_end(epoch):
+    """This thread's recorded swallows, or None when the recorder was not installed for the whole window."""
+    ns = _SWALLOW
+    hits, ns.local.hits = getattr(ns.local, 'hits', None), None
+    if epoch is None or ns.tool is None or ns.epoch != epoch:
+        return None
+    return hits
 
 
 class _DescribeMemo:
@@ -379,7 +449,7 @@ class _DescribeMemo:
       (`kanban_foreign_card.replica_path`: None, or the same file by dev/ino, openable, same schema_version) and no
       replica change row for those ids since the replica revision read BEFORE describe ran;
     - for a review card, kanban.review_dispatch as read before describe ran.
-    Not stored: an entry whose describe swallowed an exception inside core (a degraded row: _swallow_watch), read
+    Not stored: an entry whose describe swallowed an exception inside core (a degraded row: _swallow_acquire), read
     with an 'unsafe' statement, or whose board or replica counter could not vouch. A failed check is a miss and
     describes afresh. describe runs with now=0 and reads no clock (2026-11-26 census), so nothing expires with
     time. Once per pass per board the change cursor drops moved entries (FULL drops the board); that keeps the memo
@@ -395,6 +465,17 @@ class _DescribeMemo:
         self.boards: dict[str, dict] = {}
         self.stats = collections.Counter()
         self.verify = None  # parity harness hook: called (conn, card_id, cached) on every hit; None in production
+        self.recorder = False  # holds one user of the process's swallow recorder
+        self.closed = False
+
+    def close(self) -> None:
+        """The feed stopped: release the swallow recorder and turn the memo off."""
+        with self.lock:
+            self.closed = True
+            self.entries.clear()
+            held, self.recorder = self.recorder, False
+        if held:
+            _swallow_release()
 
     def _drop(self, path=None, keep=None):
         for key in [k for k, e in self.entries.items()
@@ -414,7 +495,13 @@ class _DescribeMemo:
         except Exception:
             log.debug('session-panel describe memo: cursor unavailable for %s', path, exc_info=True)
             ids, cursor = changes.FULL, None
-        ok = cursor is not None and _swallow_watch()
+        ok = cursor is not None and not self.closed
+        if ok and not self.recorder:
+            try:
+                self.recorder = _swallow_acquire()
+            except Exception:
+                self.recorder = False
+            ok = self.recorder
         with self.lock:
             if ids is changes.FULL:
                 self._drop(path)
@@ -443,38 +530,50 @@ class _DescribeMemo:
         return _review_dispatch()
 
     @staticmethod
-    def _replica_state(readers, path: str):
-        """The replica as describe would find it now: ('none',) | ('file', path, dev, ino, schema, revision) |
-        None when it exists but cannot vouch (unopenable, counter inconsistent)."""
+    def _replica_state(readers, path: str, ids=None, since=None):
+        """The replica as describe would find it now, read on ONE connection inside one read transaction:
+        (('none',) | ('file', path, dev, ino, schema, revision), moved) where moved says whether any of `ids` has a
+        change row newer than `since`; (None, None) when it exists but cannot vouch (unopenable, counter
+        inconsistent, or the connection's file is not the one at the path before and after the read)."""
         from hermes_cli import kanban_foreign_card as foreign
         rpath = foreign.replica_path(path)
         if rpath is None:
-            return ('none',)
+            return ('none',), False
         rc = readers.conn(Path(rpath))
-        if rc is None:
-            return None
-        st = os.stat(rpath)
-        schema, revision, top = _DescribeMemo._revision(rc)
-        if revision is None or revision != top:
-            return None
-        return ('file', str(rpath), st.st_dev, st.st_ino, schema, revision)
+        opened = (getattr(readers._local, 'conns', None) or {}).get(str(Path(rpath)))
+        if rc is None or opened is None or opened[0] is not rc:
+            return None, None
+        own = not rc.in_transaction
+        try:
+            if own:
+                rc.execute('BEGIN')
+            first = os.stat(rpath)
+            row = _DescribeMemo._revision(rc, ids if ids is not None else (), since if since is not None else 0)
+            second = os.stat(rpath)
+        finally:
+            if own and rc.in_transaction:
+                rc.rollback()
+        schema, revision, top, moved = row
+        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino) and first.st_ino == opened[1]
+        if not same or revision is None or revision != top:
+            return None, None
+        return ('file', str(rpath), first.st_dev, first.st_ino, schema, revision), bool(moved)
 
     def before(self, readers, path: str):
         """Read before describe runs: what an entry is stored against (replica, review config), and arm the
         swallow watch for this thread. Returns a token for `put`, or None when nothing can be stored."""
         try:
-            token = {'replica': self._replica_state(readers, path), 'review': self._review_dispatch()}
+            token = {'replica': self._replica_state(readers, path)[0], 'review': self._review_dispatch()}
         except Exception:
             log.debug('session-panel describe memo: pre-read failed for %s', path, exc_info=True)
             return None
-        _SWALLOWED.hits = []
+        token['epoch'] = _swallow_begin()
         return token
 
     @staticmethod
-    def after():
-        hits = getattr(_SWALLOWED, 'hits', None)
-        _SWALLOWED.hits = None
-        return hits
+    def after(token):
+        """Swallows recorded during describe, or None when they could not all be recorded (no store)."""
+        return _swallow_end(token['epoch'] if token is not None else None)
 
     def get(self, readers, path: str, ino, card_id: str, c):
         """The cached describe for `card_id`, validated in `c`'s current read transaction, else None."""
@@ -494,15 +593,12 @@ class _DescribeMemo:
                 ok = all(_result_digest(c, sql) == digest for sql, digest in entry['rerun'])
             if ok and entry['missing']:
                 replica = entry['replica']
-                now = self._replica_state(readers, path)
                 if replica[0] == 'none':
-                    ok = now == ('none',)
+                    ok = self._replica_state(readers, path)[0] == ('none',)
                 else:
-                    ok = now is not None and now[:5] == replica[:5]
-                    if ok:
-                        rc = readers.conn(Path(replica[1]))
-                        _, _, _, moved = self._revision(rc, entry['missing'], replica[5])
-                        ok = not moved
+                    now, moved = self._replica_state(readers, path, entry['missing'], replica[5])
+                    ok = (now is not None and now[0] == 'file' and now[1:5] == replica[1:5]
+                          and now[5] >= replica[5] and not moved)
             if ok and entry['review'] is not None:
                 ok = self._review_dispatch() == entry['review']
         except Exception:
@@ -519,7 +615,8 @@ class _DescribeMemo:
 
     def put(self, readers, path: str, ino, card_id: str, c, value, statements, token, swallowed) -> None:
         """Store `value` against `token` (read before describe) and what describe read, in describe's transaction."""
-        if token is None:
+        if token is None or swallowed is None:
+            self.stats['not_stored_unrecorded'] += 1
             return
         if swallowed:
             self.stats['not_stored_swallowed'] += 1
@@ -1816,7 +1913,12 @@ class CoreReaders:
         if found is None or c.in_transaction:
             return None, None, None
         memo = self._describe_memo
-        return (memo, *found) if memo.refresh(found[0], c, held['id']) else (None, None, None)
+        try:
+            usable = memo.refresh(found[0], c, held['id'])
+        except Exception:
+            log.debug('session-panel describe memo: off for this read', exc_info=True)
+            usable = False
+        return (memo, *found) if usable else (None, None, None)
 
     def _detail(self, c: sqlite3.Connection, card_id: str, board: str, replica: bool,
                 *, snapshot_at=None, parent_connection=...):
@@ -1913,7 +2015,7 @@ class CoreReaders:
                     diagnostic = describe(c, card_id, now=0)
                 finally:
                     c.set_trace_callback(None)
-                    swallowed = memo.after()
+                    swallowed = memo.after(token)
                 if isinstance(diagnostic, dict):
                     memo.put(self, memo_path, memo_ino, card_id, c, diagnostic, statements, token, swallowed)
             else:
@@ -2337,6 +2439,8 @@ def feed():
                 readers = None if getattr(_LOADER, 'facts_mode', 'legacy') == 'facts' else CoreReaders()
                 prev, new = core.PROCESS_FEED, core.Feed(readers, emit=_emit)
                 if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
+                    if getattr(prev, 'readers', None) is not readers:
+                        _close_describe_memo(prev)
                     try:
                         new.resume(prev)
                     except Exception:  # never leave the process without a running feed: start clean (clients reset)
@@ -2654,6 +2758,17 @@ def stop() -> None:
     f = _load_feed().PROCESS_FEED
     if f is not None:
         f.stopped.set()
+        _close_describe_memo(f)
+
+
+def _close_describe_memo(f) -> None:
+    """Release a stopped feed's describe memo (its share of the process's swallow recorder)."""
+    memo = getattr(getattr(f, 'readers', None), '_describe_memo', None)
+    if memo is not None:
+        try:
+            memo.close()
+        except Exception:
+            log.debug('session-panel describe memo: close failed', exc_info=True)
 
 
 MIN_PAUSE_S = 0.2
