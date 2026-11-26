@@ -374,6 +374,20 @@ def person_wait_id(channel: str, contact: str, thread: str = "", request_id: str
 _PERSON_EDIT: ContextVar = ContextVar('person_edit', default=None)
 
 
+def _save_people(session_id, records):
+    """Persist the person ledger, then refresh the chat's stored outcome: `person_provider` reads this ledger
+    for the outcome's controls, and core refreshes outcomes on no event for it (turn, notice, card, reap and
+    mute only). Trigger "notice", as user-steps' controls refresh: no special meaning in core's derivation."""
+    _people().save(session_id, records)
+    api = _outcome_api()
+    if api is None or 'person-dependencies' not in getattr(api, '_providers', {}):
+        return  # without the provider here a refresh would store an outcome missing these waits
+    try:
+        api.refresh_outcomes_quietly([session_id], 'notice')
+    except Exception:
+        log.warning('session-outcome: person-wait outcome refresh failed for %s', session_id, exc_info=True)
+
+
 def _person_records(session_id):
     active = _PERSON_EDIT.get()
     return active[1] if active and active[0] == session_id else _people().read(session_id)
@@ -655,7 +669,7 @@ def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) 
                 records[:] = list(by_id.values())
                 # Persist BEFORE declaring: even a core rejection/crash must not lose
                 # a request already sent. No dependency is closed on failure.
-                _people().save(session_id, records)
+                _save_people(session_id, records)
                 result['person_waits'] = updates
             outcome = {"kind": "waiting", "on": [{k: v for k, v in w.items() if k != '_person'} for w in spec["on"]]}
         else:
@@ -713,7 +727,7 @@ def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) 
                     r.update(state='cancelled' if c['cancelled'] else 'closed', closed_at=time.time(),
                              closure_receipt={'ref': c['evidence'], 'verified': c['verified'],
                                               'cancelled': c['cancelled'], 'observed_at': time.time()})
-            _people().save(session_id, records)
+            _save_people(session_id, records)
         _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
         if spec["kind"] == "decide" and made_steps:
