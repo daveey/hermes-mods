@@ -402,7 +402,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
         if flow_mods is not None:
             for slug, source_conn, source in sources:
                 try:
-                    _sibling('board_merge').arm_deadline(source_conn)
+                    _sibling('board_merge').arm_deadline(source_conn, phase='contexts')
                     for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
                         contexts[url].append(context)
                 except (OSError, RuntimeError, sqlite3.Error) as exc:
@@ -412,7 +412,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
             reader = _observations().reader(combined)
         for slug, source_conn, source in sources:
             try:
-                _sibling('board_merge').arm_deadline(source_conn)
+                _sibling('board_merge').arm_deadline(source_conn, phase='projection')
                 if slug in context_failures:
                     raise RuntimeError(context_failures[slug])
                 pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)

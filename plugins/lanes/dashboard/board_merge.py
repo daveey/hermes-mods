@@ -2,14 +2,33 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
+import logging
 import sqlite3
 import time
+from time import thread_time
 
 
-def arm_deadline(db):
+def arm_deadline(db, *, phase='open'):
     """Each board gets its own query budget, not time spent on sibling boards."""
-    deadline = time.monotonic() + 2
-    db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+    started = time.monotonic()
+    cpu_started = thread_time()
+    deadline = started + 2
+    reported = False
+
+    def progress():
+        nonlocal reported
+        expired = time.monotonic() > deadline
+        if expired and not reported:
+            reported = True
+            # SQLite reports only "interrupted" at the next statement. Identify
+            # this handler rather than attributing the failure to that statement
+            # or to another connection's cancellation/budget.
+            logging.getLogger(__name__).warning(
+                'lanes board_merge deadline expired: phase=%s wall=%.3fs thread_cpu=%.3fs',
+                phase, time.monotonic() - started, thread_time() - cpu_started)
+        return int(expired)
+
+    db.set_progress_handler(progress, 1000)
 
 
 @contextmanager

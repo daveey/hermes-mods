@@ -9,6 +9,30 @@ from fastapi.testclient import TestClient
 from test_view import load
 
 
+def test_board_deadline_identifies_expiring_handler(monkeypatch, caplog):
+    import sqlite3
+    from types import SimpleNamespace
+
+    api = load()
+    merge = api._sibling('board_merge')
+    clock = [100.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(merge, 'thread_time', lambda: 1.0)
+    query = ('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL '
+             'SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n')
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db)
+        clock[0] += 2.1
+        with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+            db.execute(query).fetchone()
+        assert 'lanes board_merge deadline expired' in caplog.text
+        assert 'wall=2.100s thread_cpu=0.000s' in caplog.text
+        caplog.clear()
+        merge.arm_deadline(db)
+        assert db.execute(query).fetchone()[0] == 50005000
+        assert not caplog.records
+
+
 @pytest.mark.parametrize('slow_pr', [False, True])
 def test_real_board_view_and_status_push(tmp_path, monkeypatch, slow_pr, request):
     kbc = pytest.importorskip('hermes_cli.kanban_db_connect')
