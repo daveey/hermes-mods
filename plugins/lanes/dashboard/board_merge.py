@@ -6,9 +6,11 @@ import sqlite3
 import time
 
 
-# Per-board query budget. 2 s was below the hub's normal flow cost (~2.1 s warm, load ~12), so every
-# refresh was interrupted and the strip lost all its categories; 8 s still bounds a wedged board.
-BOARD_READ_BUDGET_S = 8
+# Per-board query budget (wall clock). The hub's flow costs ~2.3 s in a quiet process but runs in the
+# Desktop backend's warm thread, which shares the GIL with a CPU-bound backend (~120%); 2 s and then 8 s
+# both interrupted every refresh and the strip lost all its categories. 30 s still bounds a wedged board,
+# and the 60 s warm refresh serves the cached view meanwhile.
+BOARD_READ_BUDGET_S = 30
 
 
 def arm_deadline(db):
