@@ -475,6 +475,20 @@ const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
   ...(section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+// Section -> shared card-square category (Desktop `CardCountSquare`), matching the row boxes' colours.
+const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
+export const pipCategory = pip => pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
+  : pip.wait_kind === 'deploy' ? 'violet' : pip.wait_kind === 'agent' || deliveryWait(pip) ? 'blue' : 'amber'
+// Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
+const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
+/** One numbered card square: the count inside an outline in the category's colour. */
+export function CountSquare({ category, count }) {
+  if (typeof sdk.CardCountSquare === 'function') return jsx(sdk.CardCountSquare, { category, count })
+  return jsx('span', { 'data-card-colour': category, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    boxSizing: 'border-box', height: 16, minWidth: 16, padding: '0 2px', borderRadius: 2, flex: 'none', fontSize: 10, lineHeight: 1,
+    fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary, var(--muted-foreground))', fontWeight: 400,
+    border: `1px solid ${SQUARE_BORDER[category] || SQUARE_BORDER.grey}` }, children: count })
+}
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -736,10 +750,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('span', { children: 'This session' })
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
-      ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
-        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip) }),
-        `${pip.count} ${pip.label}`
-      ] }, i)),
+      // Header counts are numbered card squares (the Desktop's shared look); the section words are the tooltip.
+      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, title: `${pip.count} ${pip.label}`, 'aria-label': `${pip.count} ${pip.label}`,
+        style: { display: 'inline-flex' }, children: jsx(CountSquare, { category: pipCategory(pip), count: pip.count }) }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),

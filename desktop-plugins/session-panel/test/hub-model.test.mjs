@@ -715,7 +715,11 @@ test('header counts/pips remain server values, not recomputed row totals', async
  const model = structuredClone(publicCases.all_sections.model)
  model.header.counts.running = 78; model.header.pips = [{ section: 'running', count: 91, label: 'hub value' }]
  await paint(m.renderModel(model))
- assert.equal(document.querySelector('[data-model-pip]').textContent, '91 hub value')
+ const pip = document.querySelector('[data-model-pip]')
+ // The hub count sits inside the numbered square; the section words move to the tooltip.
+ assert.equal(pip.textContent, '91')
+ assert.equal(pip.querySelector('[data-card-colour]').dataset.cardColour, 'blue')
+ assert.equal(pip.title, '91 hub value')
  assert.equal(document.querySelector('[data-model-section="running"] h3').textContent, 'In progress · 78')
 })
 test('hub renderer is unconditional, registers no settings, and switches cached scopes without raw reads', async () => {
