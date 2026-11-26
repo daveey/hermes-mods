@@ -1,3 +1,10 @@
 # Memo-hit latency acceptance
 
 Treat natural `unchanged=true` memo hits and latency as separate gates: a hit can still spend seconds in membership capture, local reconciliation or contention. Retain all raw cohorts and per-chat sample counts; if observed unchanged calls exceed the target, report FAIL and profile the successful hit path before another observation window. Do not infer that a corrected source contract has met the end-to-end latency target.
+
+## Complete-scan contention controls
+
+- Compare the entire pre-fix capture module with the entire corrected module under a real concurrent CPU-busy Python thread, not only warm decoder calls or a swapped inventory helper. Preserve both quiet and contended wall/thread-CPU pairs and semantic digest equality. Report extra quiet CPU separately from improved contended wall latency; a helper-only overhead bound cannot certify whole-capture cost.
+- Use deterministic boundary handshakes to regress excess SQLite/Python result handoffs, plus exact SHA-256 equivalence around native-update thresholds. Keep ordinary wall-time benchmarks as supporting evidence, not a flaky deterministic-test deadline.
+- When aggregating SQLite rows into byte-framed packets, compare against the original CAST(data AS BLOB) stream for embedded NULs, invalid UTF-8, TEXT/BLOB distinctions, NULL/numeric values, negative/sparse rowids and UTF-8/UTF-16 database encodings. SQLite concatenation is encoding-sensitive. Retain a complete legacy-reader fallback where packet framing is unsupported; after yielding any prefix, propagate later errors to unknown rather than restarting a partial inventory.
+- Retain a real read-transaction/concurrent-arrival control and actual production-index query plans. Batching transport must not become a membership/absence cache: every current publication still needs its exact current bytes read and hashed on each complete capture. A bounded diagnostic with zero unchanged calls is not unchanged-path acceptance.
