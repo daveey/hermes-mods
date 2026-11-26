@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
@@ -153,8 +154,13 @@ class DecisionInbox:
     """
     def __init__(self, path=None):
         self.path = Path(path) if path else _home() / 'user-steps' / 'decision-inbox.sqlite3'
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as c:
+        try:
+            from hermes_constants import mkdir_under_hermes_home
+        except ImportError:  # Standalone plugin without the core lifecycle fence.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            mkdir_under_hermes_home(self.path.parent)
+        with closing(self._connect()) as c, c:
             c.execute('CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, owner TEXT, intent TEXT)')
 
     def _connect(self):
