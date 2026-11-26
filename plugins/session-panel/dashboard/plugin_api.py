@@ -281,7 +281,7 @@ _SQL_QUALIFIED = re.compile(r'\b(?:FROM|JOIN)\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]
 _SQL_COMMA_JOIN = re.compile(
     r'\bFROM\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*(?:\s*\([^()]*\))?)'
     r'(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,', re.I)
-_SQL_STAR = re.compile(r'\bSELECT\s+(?:DISTINCT\s+)?(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*', re.I)
+_SQL_COUNT_STAR = re.compile(r'\bcount\s*\(\s*\*\s*\)', re.I)
 _PASS_IDS = itertools.count(1)
 
 
@@ -324,8 +324,10 @@ def _describe_statement(sql: str, watched=frozenset({'tasks', 'task_links', 'tas
     if template in _DESCRIBE_KEYED:
         ids = tuple(v.replace("''", "'") for v in _SQL_KEY.findall(text))
         return ('keyed', ids) if ids else ('unsafe', ())
-    if _SQL_STAR.search(template) or _bookkeeping().search(text):
-        # The triggers skip bookkeeping columns and heartbeat inserts: such a read moves without the revision.
+    if '*' in _SQL_COUNT_STAR.sub('', template) or 'task_events' in tables or _bookkeeping().search(text):
+        # The triggers skip bookkeeping columns and heartbeat inserts: a star anywhere (`t.*` too), any read of
+        # task_events not keyed by its card (count(*), MAX(id), EXISTS: heartbeats move them) or a named
+        # bookkeeping column moves without the revision.
         return 'rerun', ()
     return 'predicate', ()
 
@@ -495,13 +497,20 @@ class _DescribeMemo:
         except Exception:
             log.debug('session-panel describe memo: cursor unavailable for %s', path, exc_info=True)
             ids, cursor = changes.FULL, None
-        ok = cursor is not None and not self.closed
-        if ok and not self.recorder:
+        with self.lock:
+            ok, held = cursor is not None and not self.closed, self.recorder
+        if ok and not held:
             try:
-                self.recorder = _swallow_acquire()
+                got = _swallow_acquire()
             except Exception:
-                self.recorder = False
-            ok = self.recorder
+                got = False
+            with self.lock:
+                late = got and self.closed  # close() ran while acquiring: it could not release this user
+                if not late:
+                    self.recorder = got
+            if late:
+                _swallow_release()
+            ok = got and not late
         with self.lock:
             if ids is changes.FULL:
                 self._drop(path)
@@ -817,6 +826,12 @@ class CoreReaders:
             except sqlite3.Error:
                 pass
         self._local.conns = {}
+
+    def retire(self) -> None:
+        """This readers object is replaced and never used again: close this thread's connections and its describe
+        memo (its share of the process's swallow recorder). release() alone runs after every pass and keeps both."""
+        self.release()
+        self._describe_memo.close()
 
     def conn(self, path: Path) -> Optional[sqlite3.Connection]:
         ctx = self._explicit_home()

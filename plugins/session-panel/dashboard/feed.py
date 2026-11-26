@@ -552,7 +552,7 @@ class Feed:
             # The saved API constructed this object on the restart thread; release
             # its unused reader on that same thread. No old connection transfers.
             unused, self.readers = self.readers, module.AwaitingReaders()
-            unused.release()
+            getattr(unused, 'retire', unused.release)()  # never used again: its describe memo too
             loader = sys.modules.get('_session_panel_feed_loader')
             factory = SNAPSHOT_READER_FACTORY or getattr(loader, 'snapshot_reader_factory', None)
             # resume can be called by a genuine saved API while PROCESS_LOCK is
