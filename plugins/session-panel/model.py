@@ -948,9 +948,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         synced_row = row.get('synced_at')
         replica_row = bool(row.get('remote') or row.get('source') in ('replica', 'origin-obligation'))
-        # A worker-homed parked card: the hub holds only the synced replica row. Its board state is the owner's last
-        # report and nothing contradicts it, so say that (with the sync age) instead of "status unknown". A source
-        # that could not be read (partial_source_unknown), a missing/future sync clock or a non-parked state stays unknown.
+        # Retain the owner's last parked report and sync age as historical context,
+        # never as current wait/attention authority. Even a recent sync timestamp
+        # cannot override an explicit stale flag. Unreadable/absent/future clocks use
+        # the generic unknown path below.
         if (row.get('stale') and not row.get('partial_source_unknown') and replica_row and not human_owned(row)
                 and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo')
                 and type(synced_row) in (int, float) and 0 <= now - synced_row < 8.64e9):
@@ -959,7 +960,13 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
             v['parked'] = True
             v['queued'] = queued
-            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
+            v['evidence_state'] = 'unknown'
+            v['reason'] = 'source-stale'
+            v.pop('wait_kind', None)
+            v.pop('wait_eta', None)
+            historical = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
+            v['detail'] = f'status unknown · last known: {historical}'
+            v['details'].append('Task source freshness: stale; read current authoritative task state before acting.')
             if age_s <= 300:
                 v['detail'] += f' · on {gw} (synced {age_s}s ago)'
             else:
