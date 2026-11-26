@@ -2948,8 +2948,11 @@ async def changes(body: ChangesBody, request: Request):
             raise HTTPException(401, 'Unauthorized')
         wire, custody = current.changes_packet(body.sessions, since=body.since, epoch=body.epoch,
                             subscriber=body.subscriber, visible_session=body.visible_session)
+        delivered = tuple((value.publication, value.bundle,
+                           current._watch_tokens.get(value.publication['session'])) for value in custody)
         return current.receipt_module.completed_response(_WIRE_PREFIX + wire[1:], log=current.receipt_log,
-            stored=custody, authenticated=True, request_id=request_id)
+            stored=custody, authenticated=True, request_id=request_id,
+            on_success=lambda completed_ns: current._receipt_delivered(delivered, completed_ns))
     wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch,
                            subscriber=body.subscriber, visible_session=body.visible_session)
     return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')

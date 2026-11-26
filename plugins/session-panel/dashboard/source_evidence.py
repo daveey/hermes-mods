@@ -383,7 +383,7 @@ def _check_receipt_shape(A, i, r):
 
 
 def _index_receipts(A, by_event, caps):
-    receipts = {}
+    indexed = {}
     for i, r in by_event.get('source_received', ()):
         A.counts['source_received'] += 1
         shape = _check_receipt_shape(A, i, r)
@@ -412,13 +412,15 @@ def _index_receipts(A, by_event, caps):
         if shape is None:
             continue
         cid = shape[0]
-        if cid in receipts:
+        if cid in indexed:
             A.err('duplicate_receipt_id', cid)
             continue
-        receipts[cid] = dict(rec=(i, r), source=shape[1], version=shape[2], completed=shape[3],
+        if r.get('coordinator_epoch') != shape[2]['store_epoch_uuid']:
+            A.err('capture_epoch_mismatch', f'record {i}: coordinator_epoch differs from receipt version')
+        indexed[cid] = dict(rec=(i, r), source=shape[1], version=shape[2], completed=shape[3],
                              unknown=shape[4], attempt=att,
                              demands=A.entries(r['receipt']['coverage']['captured_demands'], 'captured demands'))
-    return receipts
+    return indexed
 
 
 # ---------------------------------------------------------------- admissions
@@ -467,6 +469,8 @@ def _attest(A, adm, receipts, where, publication):
                    f'{where}: admitted receipt_id {rid} has no source_received (further uses suppressed)')
             continue
         got.append(rc)
+        if publication and rc['rec'][1].get('feed_epoch') != adm.get('feed_epoch'):
+            A.err('capture_feed_epoch_mismatch', f'{where}: receipt {rid}')
         sk = A.canon(rc['source'])
         req = adm['rv'].get(sk)
         if req is not None:
@@ -640,11 +644,14 @@ def _check_projection(A, pid, d, adm_by_id):
     for k, (kk, v) in dp.items():
         if not isinstance(v, list):
             A.err('projection_dependency_mismatch', f'{w}: dependency value not a list'); ok = False; break
-    admv = adm_by_id.get(adm['id'])
-    if admv is not None and not _stable_equal(A, admv, adm):
+    admitted = adm_by_id.get(adm['id'], [])
+    if any(not _stable_equal(A, known, adm) for _, known in admitted):
         A.err('admission_identity_conflict', f'{w}: identity differs from admitted record'); ok = False
-    if admv is None:
+    if not admitted:
         A.err('projection_admission_missing', w); ok = False
+    attested = {rid for at, known in admitted if at <= s['monotonic_ns'] for rid in known['receipts']}
+    if not set(adm['receipts']) <= attested:
+        A.err('projection_receipt_admission_missing', w); ok = False
     if not _int(adm['a']['first_admitted_mono_ns']) or adm['a']['first_admitted_mono_ns'] > s['monotonic_ns']:
         A.err('projection_clock', f'{w}: admission first_admitted_mono_ns after projection_start'); ok = False
     for k, (kk, v) in pv.items():
@@ -660,19 +667,53 @@ def _check_projection(A, pid, d, adm_by_id):
 
 # ---------------------------------------------------------------- publications
 
+def _dependency_rows(A, record, dependencies, where):
+    """Displayed board identities must occur in the pinned source dependency map.
+
+    Empty lists remain valid for genuinely empty sources. Non-board runtime and
+    decision rows are not invented source dependencies.
+    """
+    keys = set()
+    for _, values in dependencies.values():
+        if not isinstance(values, list):
+            A.err('projection_dependency_mismatch', where); return
+        for key in values:
+            if not isinstance(key, dict) or key.get('type') != 'CardKey':
+                A.err('projection_dependency_mismatch', where); return
+            keys.add(A.canon([key.get(k) for k in ('card_id', 'gateway', 'profile', 'board')]))
+    try:
+        model = json.loads(base64.b64decode(record['payload_b64'], validate=True))['model']
+        stack = [model['sections'], model.get('groups', [])]
+        while stack:
+            if not A.tick():
+                return
+            item = stack.pop()
+            if isinstance(item, list):
+                stack.extend(item)
+            elif isinstance(item, dict):
+                if item.get('kind') in ('card', 'blocker'):
+                    identity = A.canon([item.get(k) for k in ('id', 'gateway', 'profile', 'board')])
+                    if identity not in keys:
+                        A.err('displayed_dependency_missing', f'{where}: {item.get("id")}')
+                else:
+                    stack.extend(item.values())
+    except (ValueError, KeyError, TypeError):
+        A.err('dependency_payload_invalid', where)
+
+
 PUB_FIELDS = ('admission', 'canonical_seq', 'chat', 'chat_rev', 'computed_at', 'computed_seq', 'covered_scopes',
               'dependencies', 'feed_epoch', 'missing_scopes', 'model_revision', 'publication_id',
               'session', 'source_vector', 'writer')
 
 
 def _check_publications(A, by_event, caps, receipts, writers, projections):
-    adm_seen = {}
+    adm_seen = defaultdict(list)
     for i, r in by_event.get('admitted', ()):
         a = r.get('admission')
         if isinstance(a, dict) and _str(a.get('id')):
             ap = _parse_quiet(A, a)
             if ap is not None:
-                adm_seen.setdefault(ap['id'], ap)
+                adm_seen[ap['id']].append((r['monotonic_ns'], ap))
     models = by_event.get('model_stored', ())
     A.counts['publications'] = len(models)
     pubs, seen_ids = [], set()
@@ -695,6 +736,7 @@ def _check_publications(A, by_event, caps, receipts, writers, projections):
         adm = _admission(A, p['admission'], w)
         if adm is None:
             continue
+        adm['feed_epoch'] = p['feed_epoch']
         cs = A.entries(p['covered_scopes'], w + ' covered_scopes')
         ms = A.entries(p['missing_scopes'], w + ' missing_scopes')
         dp = A.entries(p['dependencies'], w + ' dependencies')
@@ -708,12 +750,16 @@ def _check_publications(A, by_event, caps, receipts, writers, projections):
             A.err('publication_admission_mismatch', f'{w}: source_vector != admission.required_versions'); ok = False
         if not A.same(p['missing_scopes'], adm['a']['missing_scopes']):
             A.err('publication_admission_mismatch', f'{w}: missing_scopes != admission.missing_scopes'); ok = False
-        known = adm_seen.get(adm['id'])
-        if known is not None and not _stable_equal(A, known, adm):
+        known = adm_seen.get(adm['id'], [])
+        if any(not _stable_equal(A, item, adm) for _, item in known):
             A.err('admission_identity_conflict', f'{w}: differs from admitted record identity'); ok = False
         if adm['mv'] or adm['ms'] or p['missing_scopes'] != {}:
             A.counts['publications_with_missing_scopes'] += 1   # never authoritative absence
         _attest(A, adm, receipts, w, publication=True)
+        if not adm['mv'] and not adm['ms']:
+            _dependency_rows(A, r, dp, w)
+        else:
+            A.counts['dependency_rows_unvouched_missing_sources'] += 1
         pubs.append(dict(i=i, r=r, p=p, adm=adm, w=w, ok=ok))
     # writer chains
     spans = defaultdict(list)       # feed_epoch -> [(acquired, released, writer_id)]
