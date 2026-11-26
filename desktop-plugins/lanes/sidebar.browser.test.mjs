@@ -34,7 +34,7 @@ test('sidebar: one-row geometry, independent pointer/keyboard folds and remount 
         const ctx={rest:async()=>snap};
         sourceFor(ctx).subscribe=(_p,cb)=>{push=cb;if(snap)cb(snap);return Object.assign(()=>{},{refresh(){},update(){}})};
         window.remount=()=>{root?.unmount();root=createRoot(document.getElementById('root'));root.render(React.createElement(SidebarLanes,{ctx}))};
-        window.remount();
+        window.remount(); window.snapshot = snap; window.pushSnapshot = next => push(next);
         if(variant==='offline')setTimeout(()=>push(undefined,Error('offline')),50);
       };
     `, resolveDir: here }, bundle: true, write: false, format: 'iife', nodePaths: [resolve(dirname(require.resolve('react/package.json')), '..')],
@@ -58,12 +58,17 @@ test('sidebar: one-row geometry, independent pointer/keyboard folds and remount 
         return { section: section.dataset.sidebarSection, height:s.height, buttonHeight:b.height, top:s.top, buttonTop:b.top,
           overflow:document.documentElement.scrollWidth > innerWidth, children:section.children.length,
           summaryHeight:t.height, clipped:summary.scrollWidth>summary.clientWidth,
+          align:getComputedStyle(summary).textAlign,
+          gap:button.querySelector('.lanes-sb-chevron').getBoundingClientRect().left-t.right,
+          labelLeft:button.querySelector('.lanes-sb-label').getBoundingClientRect().left, buttonLeft:b.left,
           accessible:button.getAttribute('aria-description')===summary.textContent && summary.title===summary.textContent }
       }))
       for (const r of rows) {
         assert.equal(r.height, 24, JSON.stringify({width,variant,r}))
         assert.equal(r.buttonHeight, r.height); assert.equal(r.top, r.buttonTop)
         assert.equal(r.children, 1); assert.equal(r.summaryHeight, 24)
+        assert.equal(r.align, 'right', JSON.stringify({width,variant,r}))
+        assert.equal(r.gap, 7); assert.equal(r.labelLeft, r.buttonLeft)
         assert.equal(r.overflow, false); assert.equal(r.accessible, true)
         if (variant === 'long' && width <= 320) assert.equal(r.clipped, true)
       }
@@ -92,6 +97,28 @@ test('sidebar: one-row geometry, independent pointer/keyboard folds and remount 
       assert.equal(await lanes.getAttribute('aria-expanded'), 'false')
       await gov.focus(); await page.keyboard.press('Space')
       assert.equal(await page.locator('[data-sidebar-body]').count(), 0)
+    }
+    // Chromium's already-visible native title can retain its old string even
+    // after the title attribute changes. Retire that tooltip-owning node on a
+    // summary change, without replacing the focused/clickable heading itself.
+    await page.setViewportSize({ width: 800, height: 600 })
+    await page.evaluate(() => window.render('normal'))
+    for (const section of ['lanes', 'governors']) {
+      const summary = page.locator(`[data-sidebar-section=${section}] .lanes-sb-summary`)
+      await summary.hover()
+      await summary.evaluate(el => { window.previousSummary = el; window.previousHeading = el.parentElement })
+      await page.evaluate(() => window.pushSnapshot({ ...window.snapshot, flow_complete: false,
+        status: {}, totals: { not_ready: 270 },
+        governors: { ...window.snapshot.governors, idle_total: null, counts: { on: 2, off: 0, at_cap: 0, unknown: 39 } } }))
+      await page.waitForFunction(() => document.querySelector('[aria-label=LANES]').textContent.includes('270 waiting'))
+      const result = await summary.evaluate(el => ({ retired: !window.previousSummary.isConnected,
+        sameHeading: el.parentElement === window.previousHeading, text: el.textContent,
+        title: el.title, description: el.parentElement.getAttribute('aria-description') }))
+      assert.equal(result.retired, true, 'previous native-tooltip owner must be detached on changed summary')
+      assert.equal(result.sameHeading, true)
+      assert.equal(result.title, result.text); assert.equal(result.description, result.text)
+      assert.match(result.text, section === 'lanes' ? /Partial · — running · — held · — you · 270 waiting/ : /2 on · 0 off · 0 at cap · 39 unknown/)
+      await page.evaluate(() => window.render('normal'))
     }
     assert.deepEqual(errors, [])
     console.log('layout receipts:', JSON.stringify(receipts))

@@ -409,6 +409,9 @@ def test_missing_board_summary_is_unknown_not_zero(board, api, monkeypatch, tmp_
         partial = view(api)
         render(tmp_path, partial, 'partial-summary')
         assert partial['summary_complete'] is False
+        assert 'beta: fixture unavailable board' in partial['flow_error']
+        failed_scope = next(s for s in partial['governors']['scope'] if s['board'] == 'beta')
+        assert failed_scope['reason'] == 'fixture unavailable board'
         assert partial['totals']['not_ready'] is None
         assert all(row['not_ready'] is None and row['actual'] is None for row in partial['lanes'].values())
         monkeypatch.setattr(merge, 'read_board', original)

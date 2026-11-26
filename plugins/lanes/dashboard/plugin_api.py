@@ -356,6 +356,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
     current = gov._board(conn)
     pairs, snapshots = [], []
     source_failed = False
+    source_errors = []
     with ExitStack() as stack:
         sources = [(current, conn, evidence)]
         for meta in kb.list_boards(include_archived=False):
@@ -365,9 +366,10 @@ def _governed_sources(mods, conn, evidence, hours, window):
             try:
                 other = stack.enter_context(_sibling('board_merge').read_board(meta['db_path']))
                 sources.append((slug, other, stack.enter_context(read_view(other))))
-            except (OSError, RuntimeError, sqlite3.Error):
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
                 source_failed = True
-                snapshots.append(dict(board=slug, available=False, stale=True))
+                source_errors.append(f'{slug}: {exc}')
+                snapshots.append(dict(board=slug, available=False, stale=True, reason=str(exc)))
         # One immutable PR observation scope for the entire projection. Alternating
         # per-board reader() calls would evict the other boards' published values.
         contexts = defaultdict(list)
@@ -414,7 +416,8 @@ def _governed_sources(mods, conn, evidence, hours, window):
         if source_failed:
             raw['flow_complete'] = False
             raw['incomplete_status_lanes'] = list(snap.get('lanes', {}))
-            raw['partial_reason'] = (raw.get('partial_reason', '') + '; board source unavailable').lstrip('; ')
+            raw['partial_reason'] = '; '.join(filter(None, [raw.get('partial_reason', ''),
+                                                           *source_errors, 'board source unavailable']))
     raw['governors'] = _sibling('governors').project(snapshots, raw.get('cards', []), gov.registry(),
         adapter=_sibling('governors').read_adapter(get_hermes_home()))
     return snap, raw

@@ -1157,12 +1157,14 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
   const governorsText = !snap ? 'Loading governors…' : !gov ? 'Governor state unknown' :
     `${summaryValue(gov.counts?.on)} on · ${summaryValue(gov.counts?.off)} off · ${summaryValue(gov.counts?.at_cap)} at cap · ${summaryValue(gov.counts?.unknown)} unknown`
   const governorSummary = `${error ? `Governors offline · ${snap ? 'last known · ' : ''}` : ''}${governorsText}`
+  // Chromium can keep an already-open native title at the previous generation.
+  // Replace only its owning span when text changes; retain button focus/folds.
   const laneSummary = `${freshness}${snap?.flow_complete === false ? 'Partial · ' : ''}${snap ? totalsText : 'Loading lanes…'}`
   return h('section', { className: 'lanes-sidebar', 'data-slot': 'lanes-sidebar', 'data-offline': error ? '1' : '0' },
     h('div', { 'data-sidebar-section': 'lanes' },
     h('button', { className: 'lanes-sb-heading', 'aria-label': 'LANES', 'aria-description': laneSummary, 'aria-expanded': open, onClick: () => setOpen(!open) },
       h('span', { className: 'lanes-sb-label' }, 'Ⅲ LANES'),
-      h('span', { className: 'lanes-sb-summary', title: laneSummary,
+      h('span', { key: laneSummary, className: 'lanes-sb-summary', title: laneSummary,
         'data-sidebar-totals': true }, freshness, snap?.flow_complete === false ? 'Partial · ' : '',
         !snap ? 'Loading lanes…' : h(Fragment, null,
         h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`), ' · ',
@@ -1205,7 +1207,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
     h('div', { 'data-sidebar-section': 'governors' },
     h('button', { className: 'lanes-sb-heading', 'aria-label': 'GOVERNORS', 'aria-description': governorSummary, 'aria-expanded': governorsOpen, onClick: () => setGovernorsOpen(!governorsOpen) },
       h('span', { className: 'lanes-sb-label' }, 'GOVERNORS'),
-      h('span', { className: 'lanes-sb-summary', title: governorSummary }, governorSummary),
+      h('span', { key: governorSummary, className: 'lanes-sb-summary', title: governorSummary }, governorSummary),
       h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, governorsOpen ? '▾' : '▸')),
     governorsOpen ? h('div', { 'data-sidebar-body': 'governors', className: error && snap ? 'lanes-last-known' : '' },
       gov ? gov.rows.filter(g => g.state === 'on' || g.state === 'at_cap').map(g => h(GovernorLine, { key: g.id, row: g })) : h('div', null, snap ? 'Governor state unknown' : 'Loading governors…'),
@@ -1248,7 +1250,7 @@ const CSS = `
 .lanes-sidebar h4,.lanes-sb-heading{font-size:10px;letter-spacing:.1em;color:var(--ui-text-tertiary);margin:10px 0 6px}
 .lanes-sidebar .lanes-sb-heading{color:#8f99ff;font-weight:600;width:100%;display:flex;align-items:center;gap:7px;min-width:0;height:24px;margin:0;padding:0;white-space:nowrap;line-height:24px}
 .lanes-sb-label,.lanes-sb-chevron{flex:none;font-size:10px;letter-spacing:.1em}
-.lanes-sb-summary{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:normal;font-size:10px;font-weight:400;color:var(--ui-text-tertiary)}
+.lanes-sb-summary{flex:1;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:normal;font-size:10px;font-weight:400;color:var(--ui-text-tertiary)}
 
 .lanes-sb-heading[aria-label=GOVERNORS]{color:var(--ui-text-tertiary)}
 .lanes-sb-line{display:flex;align-items:center;gap:7px;width:100%;font-variant-numeric:tabular-nums}
