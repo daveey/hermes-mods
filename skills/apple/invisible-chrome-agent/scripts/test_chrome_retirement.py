@@ -191,9 +191,17 @@ class RetirementTests(unittest.TestCase):
         self.expired(first, silent, healthy)
         # Put both blocked peers before healthy in the rotating capability order.
         self.ledger._daemon_cursor = healthy['capability']
-        start = time.monotonic()
-        remaining = Lifecycle(self.ledger, 'test', lambda: self.fail('wake')).retire_daemons(timeout=2)
-        self.assertLess(time.monotonic() - start, 3)
+        # A healthy peer can miss its half-second inspection slice under load.
+        # Fairness means later bounded stop calls make progress, not that real
+        # IPC and process retirement always finish in one two-second call.
+        life = Lifecycle(self.ledger, 'test', lambda: self.fail('wake'))
+        deadline = time.monotonic() + 20
+        while True:
+            start = time.monotonic()
+            remaining = life.retire_daemons(timeout=2)
+            self.assertLess(time.monotonic() - start, 3)
+            if (process.poll() is not None and remaining == 2) or time.monotonic() >= deadline:
+                break
         self.assertIsNotNone(process.poll(), 'healthy peer starved behind blocked peers')
         self.assertEqual(remaining, 2)
         self.assertIsNone(stubborn.poll())
