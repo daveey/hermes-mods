@@ -158,11 +158,37 @@ test('the strip keeps 24 h hub history while the popover shows 7 d', () => {
   assert.equal(cm.slots[10], 'down')
 })
 
+test('one down spell whose reason changes is one outage', () => {
+  const start = NOW - 24 * H
+  const ev = [
+    { ts: (start - H) / 1000, state: 'up' },
+    { ts: (NOW - 4 * H) / 1000, state: 'down', reason: 'restart did not finish' },
+    { ts: (NOW - 3.5 * H) / 1000, state: 'down', reason: 'startup_failed' },
+    { ts: (NOW - 3 * H) / 1000, state: 'up' }]
+  const segs = m.buildSegments(ev, [{ start: NOW - 3.2 * H, end: NOW - 3 * H }], start, NOW)
+  assert.deepEqual(segs.map(s => s.state), ['up', 'down', 'up'])
+  assert.equal(segs[1].reason, 'restart did not finish → startup_failed → unreachable from this Mac')
+  assert.equal(m.summarize(segs, start, NOW).outages, 1)
+})
+
 test("today's 7 d row keeps the rest of the day as empty future space", () => {
   const dayStart = NOW - 20 * H, dayEnd = NOW + 4 * H
   const parts = m.bandParts([{ start: dayStart, end: NOW, state: 'up' }], dayStart, dayEnd, NOW)
   assert.deepEqual(parts.map(p => [p.state, (p.end - p.start) / H]), [['up', 20], ['future', 4]])
   assert.deepEqual(m.bandParts([{ start: dayStart, end: dayEnd, state: 'up' }], dayStart, dayEnd, dayEnd).map(p => p.state), ['up'])
+})
+
+test('minute refresh keeps both the popover range and the strip current', async () => {
+  host.state.gateways = { get: () => [{ id: 'hermes-hub', kind: 'ssh' }] }
+  const calls = []
+  const store = m.createStore({ rest: async p => { calls.push(p); return { events: [] } }, storage: { get: (k, f) => f, set: () => {} } })
+  await store.loadEvents('7d'); calls.length = 0
+  await m.refreshHistory(store); await tick()
+  assert.deepEqual(calls.sort(), ['/events?range=24h', '/events?range=7d'])
+  await store.loadEvents('24h'); calls.length = 0
+  await m.refreshHistory(store); await tick()
+  assert.deepEqual(calls, ['/events?range=24h'])
+  assert.ok(store.$day.get())
 })
 
 test('no hub connection: no requests, no chip', async () => {
