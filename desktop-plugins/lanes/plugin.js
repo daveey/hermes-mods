@@ -31,12 +31,23 @@ export const METER_COLORS = { running: '#388bfd', notReady: '#d4a72c', blocked: 
 // Card-state colours shared with the sidebar's card squares (Tailwind red-500, pink-500, emerald-500, sky-500, zinc-500).
 export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', gate: '#a855f7', worker: '#10b981', run: '#0ea5e9', dep: '#71717a' }
 export const LANE_COUNT_COLORS = { blocked: CARD_COLORS.you, running: CARD_COLORS.run, other: '#a1a1aa' }
-/** All-lanes strip counts: hub `status` key, words, colour (null = outlined, no fill). */
+/** All-lanes strip counts: hub `status` key, words, shared card-square category (Desktop `CardCountSquare`). */
 export const STATUS = [
-  ['you', 'blocked on you', CARD_COLORS.you], ['ext', 'waiting on external (CI, review, timer)', CARD_COLORS.ext],
-  ['gate', 'held at a gate', CARD_COLORS.gate], ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
-  ['dep', 'waiting on other cards', CARD_COLORS.dep], ['triage', 'in triage', null], ['other', 'other', null]
+  ['you', 'blocked on you', 'red'], ['ext', 'waiting on external (CI, review, timer)', 'pink'],
+  ['gate', 'held at a gate', 'violet'], ['worker', 'waiting for a worker', 'green'], ['run', 'running', 'blue'],
+  ['dep', 'waiting on other cards', 'grey'], ['triage', 'in triage', 'outline'], ['other', 'other', 'outline']
 ]
+// Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
+const SQUARE_BORDER = { red: '#ef4444', pink: '#ec4899', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#0ea5e9',
+  grey: '#71717a', violet: '#8b5cf6', unknown: '#71717a', outline: 'var(--ui-text-tertiary)', dashed: 'var(--ui-text-tertiary)' }
+/** One numbered card square: the count inside an outline in the category's colour. */
+export function CountSquare({ category, count }) {
+  if (typeof sdk.CardCountSquare === 'function') return h(sdk.CardCountSquare, { category, count })
+  return h('span', { 'data-card-colour': category, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    boxSizing: 'border-box', height: 16, minWidth: 16, padding: '0 2px', borderRadius: 2, flex: 'none', fontSize: 10, lineHeight: 1,
+    fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)',
+    border: `1px ${category === 'dashed' ? 'dashed' : 'solid'} ${SQUARE_BORDER[category] || SQUARE_BORDER.unknown}` } }, count)
+}
 /** The colour word a tooltip names for each count, so hovering says what the colour means. */
 export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
 // Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
@@ -832,11 +843,12 @@ export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
     m.total == null ? h('span', { className: 'hermes-lanes-dim' }, 'partial · ', summaryValue(m.total)) : null,
     h(LaneSpark, { tokens: s.tokens, scale }),
-    m.blocked > 0 ? h('span', { className: 'hermes-lanes-bd sq', 'data-count': 'blocked', style: { background: CARD_COLORS.you } }, m.blocked) : null,
-    m.running > 0 ? h('span', { className: 'hermes-lanes-bd cap', 'data-count': 'running' },
-      h('span', { style: { background: CARD_COLORS.run }, 'data-part': 'total-running' }, m.running),
-      over > 0 ? h('span', { style: { background: '#f59e0b' }, 'data-part': 'over', title: `${over} of ${m.running} running borrow idle capacity` }, `+${over} over`) : null) : null,
-    m.notReady > 0 ? h('span', { className: 'hermes-lanes-bd sq hollow', 'data-count': 'other' }, m.notReady) : null)
+    m.blocked > 0 ? h('span', { className: 'hermes-lanes-bd', 'data-count': 'blocked' }, h(CountSquare, { category: 'red', count: m.blocked })) : null,
+    m.running > 0 ? h('span', { className: 'hermes-lanes-bd', 'data-count': 'running' },
+      h('span', { className: 'hermes-lanes-bd', 'data-part': 'total-running' }, h(CountSquare, { category: 'blue', count: m.running })),
+      over > 0 ? h('span', { className: 'hermes-lanes-bd', 'data-part': 'over', title: `${over} of ${m.running} running borrow idle capacity` },
+        h(CountSquare, { category: 'amber', count: `+${over} over` })) : null) : null,
+    m.notReady > 0 ? h('span', { className: 'hermes-lanes-bd', 'data-count': 'other' }, h(CountSquare, { category: 'outline', count: m.notReady })) : null)
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
@@ -874,7 +886,7 @@ function StatusTotals({ status, gates, scope, picked, noCards, noCardsCount, any
       'data-selected': anySelected ? '0' : '1', title: 'All: clear every lane and category selection',
       onClick: (event) => { event.stopPropagation(); onAll() }
     }, 'all'),
-    items.map(([key, label, color]) => {
+    items.map(([key, label, category]) => {
       const on = picked.includes(key)
       const n = status[key] || 0
       return h('button', {
@@ -883,8 +895,7 @@ function StatusTotals({ status, gates, scope, picked, noCards, noCardsCount, any
         title: `${COLOR_WORDS[key]}: ${label}, ${plural(n, 'card')}${where}${key === 'gate' && gates?.length ? ` — ${gateLines(gates, scope ? scope.split(', ') : []).join('; ')}` : ''}. Click to ${on ? 'deselect' : 'select'}`,
         onClick: (event) => { event.stopPropagation(); onToggle(key) }
       },
-        h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
-        h('span', { className: 'hermes-lanes-n' }, n),
+        h('span', { className: 'hermes-lanes-n' }, h(CountSquare, { category, count: n })),
         h('span', { className: 'hermes-lanes-status-word' }, key === 'gate' && gates?.length ? gateWord(gates, scope) : label))
     }),
     noCardsCount == null ? null : h('button', {
@@ -893,8 +904,7 @@ function StatusTotals({ status, gates, scope, picked, noCards, noCardsCount, any
       title: `Dashed: sessions with no open cards, ${plural(noCardsCount, 'session')} in your list. Click to ${noCards ? 'deselect' : 'select'}`,
       onClick: (event) => { event.stopPropagation(); onNoCards() }
     },
-      h('span', { className: 'hermes-lanes-sw is-dashed', 'aria-hidden': 'true' }),
-      h('span', { className: 'hermes-lanes-n' }, noCardsCount),
+      h('span', { className: 'hermes-lanes-n' }, h(CountSquare, { category: 'dashed', count: noCardsCount })),
       h('span', { className: 'hermes-lanes-status-word' }, 'no cards')))
 }
 
@@ -1316,26 +1326,19 @@ const CSS = `
 .hermes-lanes-pill{gap:7px;white-space:nowrap}
 .hermes-lanes-pill.is-over,.hermes-lanes-pill.is-over[data-selected="1"]{border-color:rgba(245,158,11,.7)}
 .hermes-lanes-spark{flex:none;opacity:.9}
-.hermes-lanes-bd{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:15px;height:15px;padding:0 3px;font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;color:#fff;line-height:1}
-.hermes-lanes-bd.sq{border-radius:3px}
-.hermes-lanes-bd.hollow{background:transparent;border:1.3px solid #6b7079;color:#a1a1aa}
-.hermes-lanes-bd.cap{padding:0;border-radius:999px;overflow:hidden}
-.hermes-lanes-bd.cap span{display:inline-flex;align-items:center;height:15px;padding:0 4px}
+.hermes-lanes-bd{display:inline-flex;align-items:center;gap:2px}
 .hermes-lanes-strip-right{margin-left:auto;display:inline-flex;align-items:center}
 .hermes-lanes-strip-right+.hermes-lanes-status{margin-left:0}
 .hermes-lanes-pill[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
 .hermes-lanes-pill[data-dimmed="1"]{opacity:.45}
-.hermes-lanes-n{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:600}
+.hermes-lanes-n{display:inline-flex}
 .hermes-lanes-status{margin-left:auto;display:inline-flex;align-items:center;gap:2px;padding-left:10px;border-left:1px solid var(--ui-stroke-secondary);white-space:nowrap}
 .hermes-lanes-status-item{display:inline-flex;align-items:center;gap:4px}
 .hermes-lanes-cat{height:22px;padding:0 6px;border:1px solid transparent;border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-cat[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
 .hermes-lanes-cat[data-dimmed="1"]{opacity:.45}
 .hermes-lanes-all{font-size:11px;color:var(--ui-text-secondary)}
-.hermes-lanes-sw.is-dashed{border:1px dashed var(--ui-text-tertiary)}
 .hermes-lanes-status-word{display:none;color:var(--ui-text-tertiary);font-size:11px}
-.hermes-lanes-sw{width:8px;height:8px;border-radius:2px;flex:none;box-sizing:border-box}
-.hermes-lanes-sw.is-outline{border:1px solid var(--ui-text-tertiary)}
 .hermes-lanes-status+.hermes-lanes-toggle,.hermes-lanes-status+small+.hermes-lanes-toggle{margin-left:0}
 .hermes-lanes-toggle{margin-left:auto;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-body{max-height:60vh;overflow:auto}
