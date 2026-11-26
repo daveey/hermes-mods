@@ -42,9 +42,11 @@ reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix re
 Every `::user-step` marker opens a For-you request, so wrap only a current ask, and only once. Never wrap a status
 headline or summary that asks nothing: it opens a request with nothing to answer, which reads as a duplicate of the
 real ask until withdrawn. Never wrap an ask you already published with `action_request`: that opens a second,
-plan-less request. When revising a request that was published with `decisionCard`, resend
-`aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
-`scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
+plan-less request. When revising a request (reuse `requestId` + `expectedRevision`), resend its existing `aliases` unchanged: the
+`kanban` ref of a `decisionCard` request (else 422 "must retain exact producer card aliases") or the `user_step` ref
+of one minted by `session_outcome` (else 422 "Replacement must preserve aliases"); `aliases: []` is refused. Keep
+`scope.sourceRefs` too (dropping it gives 422 "Invalid object fields"). To upgrade a `session_outcome` decide tile into
+a plan approval, revise it this way rather than publishing a second request. Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
 Also list the blocked cards linked to this chat: ask-gate refuses the claim while any is blocked on the user. Answer
 each one the user's standing approvals cover yourself (comment the decision, unblock, read back) instead of
