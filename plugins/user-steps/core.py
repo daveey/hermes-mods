@@ -19,6 +19,7 @@ import stat
 import time
 import unicodedata
 import uuid
+import contextlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -52,6 +53,20 @@ def home() -> Path:
         return Path(get_hermes_home())
     except Exception:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def mkdir_live(path, *, parents=True):
+    """mkdir that never resurrects a deleted/tombstoned named profile (core's fence).
+
+    Only a missing core (standalone plugin tests) falls back to plain mkdir; a FileNotFoundError from the
+    fence is the refusal and propagates.
+    """
+    try:
+        from hermes_constants import mkdir_under_hermes_home  # type: ignore
+    except ImportError:
+        Path(path).mkdir(parents=parents, exist_ok=True)
+        return Path(path)
+    return mkdir_under_hermes_home(path)
 
 
 # ---- session lineage (compression rotates the stored id) -----------------------------------------------
@@ -162,7 +177,7 @@ class Ledger:
 
     @contextmanager
     def edit(self, root: str):
-        self.dir.mkdir(parents=True, exist_ok=True)
+        mkdir_live(self.dir)
         lock = open(self.dir / ".lock", "a+")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -2778,9 +2793,10 @@ class ActionStore:
         self.read_only = read_only
         if read_only:
             return  # presentation never initializes or migrates a producer's store
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_live(self.path.parent)
         self._ensure_wal()
-        with self._connect() as c:
+        # sqlite3's own context manager only commits; it never closes. Close explicitly or every store leaks a handle.
+        with contextlib.closing(self._connect()) as c, c:
             c.executescript('''
                 CREATE TABLE IF NOT EXISTS requests (
                   namespace TEXT, id TEXT, session TEXT, revision INTEGER, state TEXT, resolution TEXT,
@@ -3390,7 +3406,7 @@ class ActionStore:
         """
         key = hashlib.sha256(_json([owner, oid]).encode()).hexdigest()
         directory = self.path.parent / 'delivery-leases'
-        directory.mkdir(parents=True, exist_ok=True)
+        mkdir_live(directory)
         with (directory / key).open('a+') as lock:
             try:
                 mode = fcntl.LOCK_SH if dispatch else fcntl.LOCK_EX

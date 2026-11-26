@@ -2316,6 +2316,16 @@ def _explicit_readers(f):
     return readers if getattr(readers, 'home_context', None) is not None else None
 
 
+def _mkdir_live(path: Path) -> None:
+    """mkdir that never resurrects a deleted/tombstoned named profile; only a missing core falls back."""
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+    except ImportError:  # no core on the path (plugin-only test runs)
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    mkdir_under_hermes_home(path)
+
+
 def write_timing(f, path: Optional[Path] = None) -> bool:
     """Atomically write the feed's wall-clock timing (`Feed.timing`) as JSON. Best effort: never raises."""
     try:
@@ -2324,7 +2334,7 @@ def write_timing(f, path: Optional[Path] = None) -> bool:
         with f.lock:
             body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_live(path.parent)
         tmp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
         tmp.write_text(json.dumps(json_safe(body)), encoding='utf-8')
         os.replace(tmp, path)
@@ -2352,7 +2362,7 @@ def _locked(path: Path, timeout: float = 5.0):
     except ImportError:
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_live(path.parent)
     fd = os.open(path.with_name(path.name + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         deadline = time.monotonic() + timeout

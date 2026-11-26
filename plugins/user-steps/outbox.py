@@ -32,6 +32,14 @@ class Worker:
         self.configure(recover, retry, interval)
         self.thread = threading.Thread(target=self.run, name='user-steps-retrier', daemon=True)
 
+    def _proceed(self):
+        if self.live():
+            return True
+        with _LOCK:
+            if _WORKERS.get(self.key) is self:
+                _WORKERS.pop(self.key, None)
+        return False
+
     def configure(self, recover, retry, interval):
         self.context = contextvars.copy_context()
         self.recover = recover
@@ -40,6 +48,20 @@ class Worker:
         # busy-loop if configured with zero; scan no faster than once a second.
         self.interval = max(1.0, interval) if interval > 0 else 15.0
 
+    def live(self):
+        """False once this worker's pinned home is a deleted/missing named profile (never recreate it)."""
+        def check():
+            try:
+                from hermes_constants import assert_named_profile_home_live, get_hermes_home
+            except ImportError:  # standalone plugin run: no core fence
+                return True
+            try:
+                assert_named_profile_home_live(get_hermes_home())
+            except FileNotFoundError:
+                return False
+            return True
+        return self.context.run(check)
+
     def call(self, fn, ctx):
         try:
             ctx.run(fn)
@@ -47,9 +69,13 @@ class Worker:
             logging.getLogger('user-steps').exception('Decision outbox pass deferred')
 
     def run(self):
+        if not self._proceed():
+            return
         self.call(self.recover, self.context)
         while True:
             self.wake.wait(self.interval)
+            if not self._proceed():
+                return
             with _LOCK:
                 if not self.owners:
                     _WORKERS.pop(self.key, None)
