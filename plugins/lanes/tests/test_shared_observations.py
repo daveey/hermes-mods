@@ -183,6 +183,31 @@ def test_safe_corrupt_content_repairs_once_under_lock(tmp_path, raw):
     assert json.loads(path.read_text())['version'] == 1
 
 
+@pytest.mark.parametrize('timestamp', [10 ** 400, -(10 ** 400)])
+@pytest.mark.parametrize('cached_url', ['pr', 'unrelated'])
+def test_overflowing_timestamp_repairs_and_reuses_success(tmp_path, timestamp, cached_url):
+    shared = load('shared_observations')
+    path = tmp_path / 'values.json'
+    key = shared._key(cached_url, 'head')
+    path.write_text(json.dumps({'version': 1, 'entries': {
+        key: [timestamp, {'approved': True}, False]}}))
+    path.chmod(0o600)
+    calls = []
+    class Reader:
+        states = {'pr': 'OPEN'}
+        def prefetch(self, urls):
+            calls.append(tuple(urls))
+        def get(self, url):
+            return {'approved': False}
+    for _ in range(3):
+        result = shared.SharedObservations(tmp_path, clock=lambda: 1001).fetch(
+            {'pr': 'head'}, Reader, 600)
+        assert result == {'pr': (0, {'approved': False}, False)}
+    assert calls == [('pr',)]
+    assert json.loads(path.read_text())['entries'] == {
+        shared._key('pr', 'head'): [1001, {'approved': False}, False]}
+
+
 def test_storage_failure_uses_existing_observer_backoff_not_unshared_retry(tmp_path, monkeypatch):
     shared, obs = load('shared_observations'), load('observations')
     calls = []
