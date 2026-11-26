@@ -64,6 +64,60 @@ def test_failed_load_does_not_cache_partial_module(tmp_path):
     assert plugin._cache.module_key(tmp_path, "missing") not in sys.modules
 
 
+def test_concurrent_reload_and_failed_load_retry(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    first = file_module(HERE / 'module_cache.py')
+    second = file_module(HERE / 'module_cache.py')
+    source = tmp_path / 'probe.py'
+    source.write_text('VALUE = 1\n')
+    old = first.load_sibling(tmp_path, 'probe')
+    source.write_text('VALUE = 200\n')
+    os.utime(source, ns=(3_000_000_000, 3_000_000_000))
+    entered, release, called = threading.Event(), threading.Event(), threading.Event()
+    original_spec = importlib.util.spec_from_file_location
+    key = first.module_key(tmp_path, 'probe')
+    executions = []
+
+    def controlled_spec(name, path, *args, **kwargs):
+        spec = original_spec(name, path, *args, **kwargs)
+        if name == key:
+            assert spec and spec.loader
+            original_exec = spec.loader.exec_module
+
+            def execute(module):
+                executions.append(module)
+                if len(executions) == 1:
+                    entered.set()
+                    assert release.wait(5)
+                    raise RuntimeError('first reload failed')
+                original_exec(module)
+            spec.loader.exec_module = execute
+        return spec
+
+    def retry():
+        called.set()
+        return second.load_sibling(tmp_path, 'probe')
+
+    monkeypatch.setattr(importlib.util, 'spec_from_file_location', controlled_spec)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        failed = pool.submit(first.load_sibling, tmp_path, 'probe')
+        try:
+            assert entered.wait(5)
+            successful = pool.submit(retry)
+            assert called.wait(5)
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match='first reload failed'):
+            failed.result(5)
+        new = successful.result(5)
+    assert len(executions) == 2
+    assert new is not old and new.VALUE == 200
+    assert first.load_sibling(tmp_path, 'probe') is new
+    assert second.load_sibling(tmp_path, 'probe') is new
+
+
 def test_block_time_uses_loaded_second_opinion(monkeypatch):
     plugin = loader(HERE)
     so = plugin._load("second_opinion")

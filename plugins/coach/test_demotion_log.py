@@ -115,6 +115,60 @@ def test_concurrent_fresh_stores_decode_each_completed_line_once(tmp_path):
         assert loads.call_count == 3
 
 
+def test_concurrent_cold_modules_share_first_projection(tmp_path, monkeypatch):
+    """Two independently bootstrapped core helpers must share cold initialization."""
+    import sys
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    (tmp_path / 'log.jsonl').write_text(row(100) * 3)
+    spec = importlib.util.spec_from_file_location('cold_coach_core', HERE / 'core.py')
+    assert spec and spec.loader
+    other = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(other)
+    key = core._cache.module_key(HERE, 'demotion_log')
+    monkeypatch.delitem(sys.modules, key, raising=False)
+    entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    second_called = threading.Event()
+    original_spec = importlib.util.spec_from_file_location
+    executions = []
+
+    def gated_spec(name, path, *args, **kwargs):
+        spec = original_spec(name, path, *args, **kwargs)
+        if name == key:
+            original_exec = spec.loader.exec_module
+
+            def execute(module):
+                executions.append(module)
+                (entered if len(executions) == 1 else second_entered).set()
+                assert release.wait(5)
+                original_exec(module)
+            spec.loader.exec_module = execute
+        return spec
+
+    def second_call():
+        second_called.set()
+        return other.Store(tmp_path, clock=lambda: 101).demoted()
+
+    original_loads = json.loads
+    with patch.object(importlib.util, 'spec_from_file_location', side_effect=gated_spec), \
+            patch.object(json, 'loads', wraps=original_loads) as loads:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(core.Store(tmp_path, clock=lambda: 101).demoted)
+            try:
+                assert entered.wait(5)
+                second = pool.submit(second_call)
+                assert second_called.wait(5)
+                second_entered.wait(0.25)
+            finally:
+                release.set()
+            assert first.result(5) == second.result(5) == ['one']
+        assert len(executions) == 1
+        assert loads.call_count == 3
+
+
 def test_path_cache_is_bounded_and_retains_no_unrelated_payload(tmp_path):
     module = core._cache.load_sibling(core._HERE, 'demotion_log')
     for i in range(12):
