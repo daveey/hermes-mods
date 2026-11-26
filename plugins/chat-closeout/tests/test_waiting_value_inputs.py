@@ -9,15 +9,33 @@ from test_waiting_task_inputs import certified  # noqa: F401
 from test_host_idle_skip import clock  # noqa: F401
 
 
-def test_selected_comment_leaves_key_and_actual_waiting_reader_idle(certified, clock):
+@pytest.fixture(params=['installed', 'legacy', 'uncertified'])
+def settlement_only(certified, monkeypatch, request):
+    """Exercise narrow support and both conservative compatibility boundaries, without skips."""
+    from hermes_cli import kanban_task_change as tc
+    if request.param == 'legacy':
+        monkeypatch.delattr(tc, 'settlement_marks', raising=False)
+    elif request.param == 'uncertified':
+        monkeypatch.setattr(tc, 'settlement_marks', lambda *a: None, raising=False)
+    probe = getattr(tc, 'settlement_marks', None)
+    with sqlite3.connect(certified['board']) as conn:
+        conn.execute('BEGIN')
+        _, cursor = tc.changed_since(conn, None)
+        narrow = probe is not None and probe(conn, {'t_1', 't_2'}, cursor) is not None
+        conn.rollback()
+    return narrow
+
+
+def test_selected_comment_leaves_key_and_actual_waiting_reader_idle(certified, clock, settlement_only):
     key = plugin.waiting_inputs()
     assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
     reset(certified['work'])
     with sqlite3.connect(certified['board']) as conn:
         conn.execute("INSERT INTO task_comments VALUES (1,'t_1','bookkeeping','agent',100)")
-    assert plugin.waiting_inputs() == key
+    assert (plugin.waiting_inputs() == key) is settlement_only
     assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
-    assert certified['work'] == {'reconcile_done': [], 'read_cards': 0}
+    assert (certified['work']['read_cards'] == 0) is settlement_only
+    assert certified['work']['reconcile_done'] == []
 
 
 T = {'t_1', 't_2'}
@@ -38,7 +56,7 @@ def sql(board, *statements):
             conn.execute(*s) if isinstance(s, tuple) else conn.execute(s)
 
 
-def test_nonselected_fields_leave_key_and_answer_stable(certified, clock):
+def test_nonselected_fields_leave_key_and_answer_stable(certified, clock, settlement_only):
     """Comment, event, title, run summary and last_failure_error are not settlement values."""
     board = certified['board']
     sql(board, 'ALTER TABLE tasks ADD COLUMN last_failure_error TEXT',
@@ -55,10 +73,11 @@ def test_nonselected_fields_leave_key_and_answer_stable(certified, clock):
         "INSERT INTO task_runs VALUES (1,'t_1','summary')",
         "UPDATE tasks SET title='renamed' WHERE id='t_1'",
         "UPDATE tasks SET last_failure_error='boom' WHERE id='t_2'")
-    assert bkey(board) == board_key
-    assert plugin.waiting_inputs() == key
+    assert (bkey(board) == board_key) is settlement_only
+    assert (plugin.waiting_inputs() == key) is settlement_only
     assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
-    assert certified['work'] == {'reconcile_done': [], 'read_cards': 0}
+    assert (certified['work']['read_cards'] == 0) is settlement_only
+    assert certified['work']['reconcile_done'] == []
 
 
 @pytest.mark.parametrize('change, settled', [
@@ -130,15 +149,16 @@ def test_same_tail_on_second_board_collision(certified, clock, monkeypatch, tmp_
     assert plugin.waiting_inputs() != key  # returning values do not erase intervening generations
 
 
-def test_cold_and_warm_keys_equal_and_selected_set_changes(certified, clock):
+def test_cold_and_warm_keys_equal_and_selected_set_changes(certified, clock, settlement_only):
     board = certified['board']
     warm_small, warm_big = bkey(board, {'t_1'}), bkey(board, T)
     assert warm_small != warm_big  # growth is visible, then shrink returns exactly
     sql(board, "INSERT INTO task_comments VALUES (1,'t_1','c','agent',1)")
-    assert bkey(board, {'t_1'}) == warm_small
+    assert (bkey(board, {'t_1'}) == warm_small) is settlement_only
+    current_small, current_big = bkey(board, {'t_1'}), bkey(board, T)
     plugin._wi_reset()
-    assert bkey(board, T) == warm_big  # cold reader: no cursor/history
-    assert bkey(board, {'t_1'}) == warm_small
+    assert bkey(board, T) == current_big  # cold reader: no cursor/history in either mode
+    assert bkey(board, {'t_1'}) == current_small
 
 
 def test_optional_columns_null_float_text_blob_are_distinct_and_safe(certified, clock):
