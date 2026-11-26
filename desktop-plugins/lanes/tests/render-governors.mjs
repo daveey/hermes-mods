@@ -3,10 +3,21 @@ import { readFile } from 'node:fs/promises'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
 const { view, case: scenario, failed_lane, healthy_lane } = JSON.parse(await readFile(process.argv[2], 'utf8'))
 const P = await loadPlugin({ SIDEBAR_SECTIONS_AREA: 'sidebar.sections' })
+// These views came through the real dispatcher/producer. An absent category in
+// its row histogram is zero, not missing telemetry (unknown is its own state).
+const states = ['on', 'off', 'at_cap', 'unknown']
+const counts = Object.fromEntries(states.map(state => [state, view.governors.rows.filter(row => row.state === state).length]))
+assert.deepEqual(view.governors.counts, counts, 'producer publishes a complete state histogram, including zero buckets')
+const expected = `${counts.on} on · ${counts.off} off · ${counts.at_cap} at cap · ${counts.unknown} unknown`
 const pane = await mount(React.createElement(P.SidebarView, {
   snap: view, open: true, setOpen() {}, write() {}, onHeld() {}
 }))
 try {
+  const heading = pane.container.querySelector('[aria-label="GOVERNORS"]')
+  const summary = heading.querySelector('.lanes-sb-summary')
+  assert.equal(summary.textContent, expected)
+  assert.equal(summary.title, expected)
+  assert.equal(heading.getAttribute('aria-description'), expected)
   assert.ok(pane.container.querySelector('[data-slot="lanes-sidebar"]'))
   assert.ok(pane.container.querySelector('[data-sidebar-body="governors"]') === null, 'governors start minimized')
   await pane.click(pane.container.querySelector('[aria-label="GOVERNORS"]'))

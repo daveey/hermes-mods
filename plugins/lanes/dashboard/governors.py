@@ -22,6 +22,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                       age_s=snap.get('age_s'), available=fresh,
                       flow_available=snap.get('flow_available', True), truncated=bool(snap.get('truncated')))
         scope.append(source)
+        if snap.get('reason'):
+            source['reason'] = snap['reason']
         complete &= fresh and snap.get('flow_available', True)
         if fresh:
             idle += snap.get('idle_total') or 0
@@ -108,7 +110,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                 incomplete_lanes=incomplete_lanes,
                 idle_total=idle if complete else None,
                 known_idle_total=idle, charged_total=charged,
-                counts=dict(Counter(r['state'] for r in rows)),
+                counts={state: sum(r['state'] == state for r in rows)
+                        for state in ('on', 'off', 'at_cap', 'unknown')},
                 lane_reasons={lane: [dict(id=k, count=v) for k, v in counts.most_common()]
                               for lane, counts in by_lane.items()},
                 device_footnote=dict(state='known' if device_fresh else 'unknown', age_s=age,
