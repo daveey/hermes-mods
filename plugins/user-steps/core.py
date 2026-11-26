@@ -60,6 +60,43 @@ def _state_db(h: Optional[Path] = None) -> Path:
     return (h or home()) / "state.db"
 
 
+# The trigger core's outcome refresh records for a controls change: like a delivered notice, an event outside
+# any turn. Only "turn_end" carries special meaning in core's derivation; "notice" does not.
+CONTROLS_TRIGGER = "notice"
+
+
+def refresh_controls(state_db: Path, sessions) -> int:
+    """After a committed write to data session-outcome's `controls` providers read (this ledger's open steps,
+    the action store's requests/operations), refresh each affected chat's stored outcome. Core resolves a
+    session to its compression tip, as the provider is called with. Without that refresh nothing does: core
+    calls refresh_outcome only on turn, notice, card, reap and mute events.
+
+    Only when this process registered the user-steps provider: a refresh without it would derive and store an
+    outcome with no open asks. Never raises; returns how many refreshed."""
+    sids = [str(s) for s in dict.fromkeys(sessions or ()) if s]
+    if not sids or not Path(state_db).is_file():
+        return 0
+    try:
+        import hermes_state_outcome as outcome
+        from hermes_state import SessionDB
+    except Exception:
+        return 0  # no core outcome store here
+    if "user-steps" not in getattr(outcome, "_providers", {}):
+        logging.getLogger("user-steps").debug("controls refresh skipped: provider not registered in this process")
+        return 0
+    try:
+        with SessionDB(db_path=Path(state_db)) as db:
+            return outcome.refresh_outcomes_quietly(sids, CONTROLS_TRIGGER, db=db)
+    except Exception:
+        logging.getLogger("user-steps").warning("controls refresh failed for %s", sids, exc_info=True)
+        return 0
+
+
+def _open_controls(d: dict) -> str:
+    """What the provider reads from one ledger file: its open steps, every field."""
+    return json.dumps([x for x in d.get("steps") or () if x.get("status") == "open"], sort_keys=True, default=str)
+
+
 def _ro_connect(path, timeout=10):
     """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
     so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
@@ -171,6 +208,7 @@ class Ledger:
             except FileNotFoundError:
                 d = {"root": root, "steps": [], "card": None, "gen": 0}
             revision = d.get("revision", 0)
+            before = _open_controls(d)
             yield d
             # The writer, not the edit caller/model, owns this counter.
             d["revision"] = revision + 1
@@ -199,9 +237,12 @@ class Ledger:
                         "Ledger committed; directory durability could not be confirmed", exc_info=True)
             finally:
                 tmp.unlink(missing_ok=True)
+            changed = _open_controls(d) != before
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
+        if changed:  # committed and the lock released: refresh only when the open asks moved
+            refresh_controls(self.db or self.dir.parent / "state.db", [root])
 
     def _read_strict(self, root: str, *, legacy: bool = False, bounded: bool = True) -> dict:
         if not isinstance(root, str) or not root:
@@ -2863,16 +2904,59 @@ class ActionStore:
         finally:
             c.close()  # Ends the snapshot, including when decoding/validation fails.
 
+    # Per-connection TEMP triggers record the session of every row a transaction changes in the tables the
+    # controls provider reads (session-outcome/decision_obligations.py): requests (state, resolution,
+    # revision), revisions and aliases (via their request), operations (dispatch state in body). Nothing is
+    # added to the store's schema; a rolled-back transaction records nothing.
+    _TOUCH_SQL = """
+        CREATE TEMP TABLE IF NOT EXISTS _controls_touched(session TEXT);
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_req_i AFTER INSERT ON main.requests
+          BEGIN INSERT INTO _controls_touched VALUES (NEW.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_req_u AFTER UPDATE ON main.requests
+          WHEN OLD.state IS NOT NEW.state OR OLD.resolution IS NOT NEW.resolution
+            OR OLD.revision IS NOT NEW.revision OR OLD.session IS NOT NEW.session
+          BEGIN INSERT INTO _controls_touched VALUES (NEW.session); INSERT INTO _controls_touched VALUES (OLD.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_req_d AFTER DELETE ON main.requests
+          BEGIN INSERT INTO _controls_touched VALUES (OLD.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_i AFTER INSERT ON main.operations
+          BEGIN INSERT INTO _controls_touched VALUES (NEW.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_u AFTER UPDATE ON main.operations
+          WHEN OLD.body IS NOT NEW.body OR OLD.session IS NOT NEW.session
+          BEGIN INSERT INTO _controls_touched VALUES (NEW.session); INSERT INTO _controls_touched VALUES (OLD.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_d AFTER DELETE ON main.operations
+          BEGIN INSERT INTO _controls_touched VALUES (OLD.session); END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_rev_i AFTER INSERT ON main.revisions
+          BEGIN INSERT INTO _controls_touched SELECT session FROM requests WHERE namespace=NEW.namespace AND id=NEW.id; END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_alias_i AFTER INSERT ON main.aliases
+          BEGIN INSERT INTO _controls_touched SELECT session FROM requests WHERE namespace=NEW.namespace AND id=NEW.id; END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_alias_u AFTER UPDATE ON main.aliases
+          BEGIN INSERT INTO _controls_touched SELECT session FROM requests WHERE namespace=NEW.namespace AND id=NEW.id;
+                INSERT INTO _controls_touched SELECT session FROM requests WHERE namespace=OLD.namespace AND id=OLD.id; END;
+        CREATE TEMP TRIGGER IF NOT EXISTS _ct_alias_d AFTER DELETE ON main.aliases
+          BEGIN INSERT INTO _controls_touched SELECT session FROM requests WHERE namespace=OLD.namespace AND id=OLD.id; END;
+    """
+
     @contextmanager
     def _tx(self):
         c = self._connect()
+        touched = []
         try:
+            try:
+                c.executescript(self._TOUCH_SQL)
+                watching = True
+            except sqlite3.Error:
+                watching = False
+                logging.getLogger('user-steps').warning('user-steps: controls change tracking unavailable', exc_info=True)
             c.execute('BEGIN IMMEDIATE')
             yield c
             c.commit()
+            if watching:
+                touched = [r[0] for r in c.execute('SELECT DISTINCT session FROM _controls_touched')]
         except BaseException:
             c.rollback(); raise
         finally: c.close()
+        if touched:  # committed and the connection closed
+            refresh_controls(self.path.parent.parent / 'state.db', touched)
 
     @staticmethod
     def _ns(owner):
