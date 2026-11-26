@@ -1036,6 +1036,7 @@ export async function openUrl(url) {
 /** True while the focused chat's cached hub model carries the one status line for this answered request, so the
  *  decision queue (user-steps) stays silent about it. */
 export function showsDecision(requestId, route = panelRoute()) {
+  if (unsupportedFeed(route)) return false
   const model = decisionPresentation(cachedModel(route), route)
   return !!requestId && !!model && MODEL_SECTIONS.some(([section]) => model.sections?.[section]?.some(row => row?.decision?.request_id === requestId))
 }
