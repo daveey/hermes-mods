@@ -166,7 +166,10 @@ def _pr_contexts(db, flow_module, *, evidence=None):
                 return revision
             revision = newest(events)
             source = evidence.identity(row['id']) if evidence is not None and hasattr(evidence, 'identity') else identity
-            groups[url].append((row['id'], row['status'], row['completion_contract'], (source, revision)))
+            # Status belongs to the projection, not provider freshness: a local
+            # running -> scheduled transition cannot change GitHub's PR/head.
+            # Keep source, contract and explicit PR evidence in the key.
+            groups[url].append((row['id'], row['completion_contract'], (source, revision)))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
 
 

@@ -244,8 +244,10 @@ URL/context identities, cold/retry/expiry fills, invalidations and outcomes. It
 contains no raw URLs or board payloads, skips filesystem errors/contention and
 runs outside the observation lock. This diagnoses cross-process duplication and
 context churn without adding a watcher or changing refresh/error policy.
-Each URL binds to its cards' explicit PR/head evidence and contract/status; comments,
-dispatch skips/holds, wake bookkeeping and plain heartbeat/watch ticks do not evict it.
+Each URL binds to its cards' explicit PR/head evidence, contract and selected source;
+local card status changes, comments, dispatch skips/holds, wake bookkeeping and plain
+heartbeat/watch ticks do not evict it. Local status is recomputed and rendered on the
+next projection without a provider refill (including running → scheduled).
 A changed PR/head event on an owning card invalidates its old observation immediately on
 projection. Results completing after invalidation cannot resurrect old approval.
 Missing/expired/failed observations stay unknown under the existing classifier.
