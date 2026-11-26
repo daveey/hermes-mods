@@ -62,6 +62,22 @@ Regression coverage: `test_receipt_latency.py`, `test_receipt_commit.py`,
 `test_mounted_runtime.py` controls. Run the latter through `run-core-integration.sh`
 with an isolated compatible core; standalone skips are not integration proof.
 
+## Explicit approval replacing a projected choice
+
+An agent can expand a projected choice into a newer canonical approval revision.
+When that approval has no card aliases, it is delivered to its original owning
+chat through normal prompt admission, not through the older card projection.
+Local and remote reconciliation preserve this explicit approval before and after
+its decision; they neither republish the old choice nor cancel the new operation.
+The original projection remains immutable. Contextual `sourceRefs` never grant
+card mutation authority: the chat must separately apply the approved scope through
+supported operations. Ordinary externally edited choices, same/older revision
+mismatches and alias-bearing requests retain exact-binding rejection/retirement.
+
+Tests: `tests/test_kanban_mirror.py` exercises local/remote reconciliation, source
+departure, dispatch/readback and idempotent retry; `test_kanban_mirror_edges.py`
+retains the external-choice-edit refusal controls.
+
 ## Legacy ledgers without `revision` (migration note)
 
 Ledger files written before revisions existed have no `revision` key. They stay

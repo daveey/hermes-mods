@@ -63,6 +63,14 @@ def _remote_module():
 
 MISMATCH = "Request no longer matches its frozen server binding"
 
+
+def explicit_revision(request, binding):
+    """An explicit approval replacing a projected choice belongs to the owning chat."""
+    projected = json.loads(binding["request"])
+    return (request["revision"] > projected["revision"]
+            and request["kind"] == "approval" and projected["kind"] == "choice"
+            and not request["aliases"])
+
 # Change-keyed reconcile (design t_01a1d563324d7e8e card L). Desktop polls ``/requests`` per open chat and each
 # poll reconciled every board, every bound card (older owners' too) and the compression tip from scratch: ~0.18 s
 # of CPU and ~100 connection opens per poll on the hub with no blocked ask at all. Now:
@@ -421,6 +429,7 @@ def encoded(value):
 
 
 class Mirror:
+    explicit_revision = staticmethod(explicit_revision)
     exclusive_dispatch = True  # retirement and every card-delivery attempt share operation custody
 
     def __init__(
@@ -899,6 +908,8 @@ class Mirror:
             if binding is None:
                 return request  # unbound id: _publish proves it or rejects the conflict
             stored = self.store.get(owner, rid)
+            if explicit_revision(stored, binding):
+                return None  # the explicit ask is already in the store; do not republish its source
             resolution = stored.pop("resolution", None)
             state = stored["state"]
             if state in ("open", "needs_context"):
@@ -1323,6 +1334,8 @@ class Mirror:
             binding["board"], binding["task"], owner, presentation=False
         )
         request = self.store.get(owner, binding["request_id"])
+        if explicit_revision(request, binding):
+            return  # an explicit chat ask is not governed by its older source snapshot
         tip = self.tip(current["session"]) if current is not None else None
         if request["state"] not in ("open", "needs_context"):
             return
@@ -1387,6 +1400,8 @@ class Mirror:
         for binding in old:
             previous = dict(owner, storedSessionId=binding["session"])
             request = self.store.get(previous, binding["request_id"])
+            if explicit_revision(request, binding):
+                return False  # preserve original-owner approval; never remint its source choice
             if not request.get("resolution") and request["state"] in (
                 "open",
                 "needs_context",
@@ -1790,11 +1805,18 @@ class Delivery:
         self.mirror, self.ordinary = mirror, ordinary
 
     def _receiver(self, op):
-        return (
-            self.mirror
-            if self.mirror.binding(op["owner"], op["requestId"])
-            else self.ordinary
-        )
+        binding = self.mirror.binding(op["owner"], op["requestId"])
+        if not binding:
+            return self.ordinary
+        request = op["intent"]["request"]
+        # An explicit producer revision can expand a projected ask without
+        # rebinding the source card. Deliver that newer, alias-free request to
+        # its owning chat; sourceRefs are context, never mutation authority.
+        # Same/older revisions and card aliases still use the exact-binding
+        # verifier, so a mismatch cannot turn into an unchecked card mutation.
+        if explicit_revision(request, binding):
+            return self.ordinary
+        return self.mirror
 
     def deliver(self, op):
         return self._receiver(op).deliver(op)

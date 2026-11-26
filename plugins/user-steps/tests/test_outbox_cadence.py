@@ -38,7 +38,7 @@ def test_router_delivery_wrapper_serializes_terminal_settlement(tmp_path):
     calls = []
     class Mirror:
         def binding(self, owner, rid):
-            return True
+            return {'request': mod.encoded(op['intent']['request'])}
         def deliver(self, operation):
             calls.append(operation['operationId'])
             entered.set()
