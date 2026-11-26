@@ -41,6 +41,7 @@ import os
 import shutil
 import importlib.util
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -989,6 +990,35 @@ def _require_identity(core, argv=None):
             'after restoring the installed hermes launcher (hermes --print-runtime-command)', 503) from exc
 
 
+def register_controls_providers() -> bool:
+    """This cron writes asks (withdraw, retire, close) outside any gateway, so nothing registered the
+    outcome's `controls` providers here and core.refresh_controls skipped every refresh. Register
+    session-outcome's two providers in this process (not its tool, hooks or judge) when that plugin is
+    enabled on this home, so the refreshes the writes queue store the same controls a gateway would.
+    Importing the plugin module has no side effects (constants and functions only). True when registered."""
+    try:
+        import hermes_state_outcome as outcome
+    except Exception:
+        return False
+    providers = getattr(outcome, '_providers', {})
+    if 'user-steps' in providers and 'person-dependencies' in providers:
+        return True
+    try:
+        from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+        if 'session-outcome' not in _get_enabled_set() or 'session-outcome' in _get_disabled_set():
+            return False
+        path = Path(__file__).resolve().parent.parent / 'session-outcome' / '__init__.py'
+        spec = importlib.util.spec_from_file_location('user_steps_stale_watch_session_outcome', path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        outcome.register_outcome_provider('user-steps', plugin.provider)
+        outcome.register_outcome_provider('person-dependencies', plugin.person_provider)
+        return True
+    except Exception:
+        logging.getLogger('user-steps').warning('stale-watch: controls providers not registered', exc_info=True)
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--min-age', type=int, default=MIN_AGE, help='seconds since the user reply (default 3600)')
@@ -1012,6 +1042,8 @@ def main(argv=None):
     except core.ActionError as exc:
         print(json.dumps({'error': str(exc), 'status': exc.status}))
         return 2
+    if not a.dry_run:
+        register_controls_providers()  # before any write: their refreshes need the providers
     if a.withdraw or a.reviewed or a.retire_operation:
         try:
             store = _store(core)
