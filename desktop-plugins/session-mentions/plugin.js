@@ -613,14 +613,8 @@ function cachedRows() {
   return mergedRows.rows
 }
 
-export const CHANGE_DEBOUNCE_MS = 400
-export const CHANGE_REFRESH_MIN_MS = 30_000
-
-/** Delay before the trailing refresh a sessions.changed event arms: the debounce, stretched so
- *  forced refreshes are at least CHANGE_REFRESH_MIN_MS apart. */
-export function changeRefreshDelay(now, lastForcedAt, minGap = CHANGE_REFRESH_MIN_MS, debounceMs = CHANGE_DEBOUNCE_MS) {
-  return Math.max(debounceMs, lastForcedAt + minGap - now)
-}
+// While someone types @ and sessions keep changing, re-read the list at most this often.
+export const TYPING_REFRESH_MIN_MS = 5_000
 
 // Set by register(): refreshes the active connection now if a sessions.changed is pending.
 let flushPendingChange = () => {}
@@ -2072,28 +2066,24 @@ export default {
     // sessions.changed fires every ~1-2 s while any turn streams, and a forced fetch of the
     // active (primary) connection makes Desktop main fan /api/sessions out to EVERY connected
     // gateway, up to 5 pages each: ~1,500 backend list reads per 40 s on a 20-gateway Desktop
-    // (laptop-1 2026-10-30). The @ list only needs to be fresh when someone types @, so a change
-    // marks rows pending; idle refreshes are capped at one per CHANGE_REFRESH_MIN_MS, and
-    // provide() refreshes a pending change at once.
-    let debounce = null
+    // (laptop-1 2026-10-30). Capping that at one idle refresh per 30 s still polled: on a gateway
+    // where some session changes every second it was 74% of the hub's /api/profiles/sessions
+    // requests (2026-11-26), with nobody typing @. The @ list only needs to be fresh when it is
+    // used, so a change arms no timer: it marks rows pending and provide() refreshes them, at most
+    // once per TYPING_REFRESH_MIN_MS while changes keep arriving. A lost event is covered by
+    // refreshStale() in provide(), which re-reads rows older than STALE_MS.
     let lastForcedAt = 0
     let changePending = false
-    const forceActive = () => {
-      if (debounce) clearTimeout(debounce)
-      debounce = null
+    flushPendingChange = () => {
+      if (!changePending || Date.now() - lastForcedAt < TYPING_REFRESH_MIN_MS) return
       changePending = false
       lastForcedAt = Date.now()
       const active = activeConnectionId()
       const conn = connCache.rows.find(c => c.id === active)
       if (conn) void fetchRows(conn, true)
     }
-    flushPendingChange = () => {
-      if (changePending) forceActive()
-    }
     const onChanged = () => {
       changePending = true
-      if (debounce) return // the armed trailing refresh covers this change too
-      debounce = setTimeout(forceActive, changeRefreshDelay(Date.now(), lastForcedAt))
     }
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host.onEvent
     const off = subscribe('sessions.changed', onChanged)
@@ -2101,7 +2091,6 @@ export default {
     const offOutbox = subscribe(OUTBOX_EVENT, ev => void onOutboxEvent(ev).catch(() => {}))
 
     ctx.onDispose?.(() => {
-      if (debounce) clearTimeout(debounce)
       if (typeof off === 'function') off()
       if (typeof offOutbox === 'function') offOutbox()
       if (typeof ctx.setInterval !== 'function') timers.forEach(t => clearInterval(t))
