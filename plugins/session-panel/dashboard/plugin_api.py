@@ -889,18 +889,42 @@ class CoreReaders:
         finally:
             self._local.batch = previous
 
+    @contextmanager
+    def pass_scope(self):
+        """One feed pass on this thread: every chunk's `batch` shares the pass's card records, so a card held by
+        chats in several chunks is read once a pass, not once a chunk (738 reads for 439 cards in a 71-chat hub
+        pass, 2026-11-26). Thread-local, created by the pass and dropped when it ends: never a cross-pass memo.
+        A replaced board file clears the shared cards as it clears a chunk's. Content writes during the pass are seen by the next pass, as within one chunk before. [daveey]"""
+        if getattr(self._local, 'pass_reads', None) is not None:
+            yield
+            return
+        self._local.pass_reads = {'stamp': None, 'cards': {}}
+        try:
+            yield
+        finally:
+            self._local.pass_reads = None
+
+    def _file_stamp(self):
+        stamp = []
+        for path in self.files():
+            try:
+                st = os.stat(path)
+                stamp.append((str(path), st.st_dev, st.st_ino))
+            except FileNotFoundError:
+                stamp.append((str(path), None))
+        return stamp
+
     def _batch_scope(self):
         scope = getattr(self._local, 'batch', None)
         if scope is not None:
             # A pass is one bounded snapshot, not a global cache. Content writes are seen by the next tick;
-            # unrelated state.db traffic must not discard shared board work. Replacements invalidate at once.
-            stamp = []
-            for path in self.files():
-                try:
-                    st = os.stat(path)
-                    stamp.append((str(path), st.st_dev, st.st_ino))
-                except FileNotFoundError:
-                    stamp.append((str(path), None))
+            # unrelated state.db traffic must not discard shared board work. Replacements invalidate at once,
+            # including the feed pass's shared cards (`pass_scope`).
+            held = getattr(self._local, 'pass_reads', None)
+            stamp = self._file_stamp()
+            if held is not None and held['stamp'] != stamp:
+                held['cards'].clear()
+                held['stamp'] = stamp
             if scope.get('stamp') != stamp:
                 for name in ('local', 'members', 'remote', 'cards'):
                     scope[name].clear()
@@ -1382,13 +1406,15 @@ class CoreReaders:
         scope = self._batch_scope()
         if scope is None:
             return self._card(card_id, board)
+        held = getattr(self._local, 'pass_reads', None)
+        cards = held['cards'] if held is not None else scope['cards']
         key = (card_id, board)
-        if key not in scope['cards']:
+        if key not in cards:
             value = self._card(card_id, board)
             if value is None:
                 return None  # unavailable/missing is not a pass-wide negative cache
-            scope['cards'][key] = value
-        return copy.deepcopy(scope['cards'][key])
+            cards[key] = value
+        return copy.deepcopy(cards[key])
 
     def _card(self, card_id: str, board: str):
         """A slim `/api/plugins/kanban/tasks/<id>` answer: `{detail, board}`, or None when no board has it."""

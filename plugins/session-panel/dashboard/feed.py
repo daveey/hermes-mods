@@ -1800,6 +1800,15 @@ class Feed:
             return len(self._publish({}, heartbeat=True))
         started = time.monotonic()
         pushed, pending, tried = 0, set(dirty), set()
+        # One shared read scope for the whole pass, every chunk (readers without one keep per-chunk scopes).
+        pass_scope = getattr(self.readers, 'pass_scope', None)
+        with pass_scope() if callable(pass_scope) else nullcontext():
+            pushed = self._sweep(pending, tried)
+        self.last_tick_s = time.monotonic() - started
+        return pushed
+
+    def _sweep(self, pending: set, tried: set) -> int:
+        pushed = 0
         while pending and not self.stopped.is_set():
             if tried:
                 self._drain()  # a chat asked for while the last chunk computed: next, ahead of the sweep
@@ -1818,7 +1827,6 @@ class Feed:
             self._attempted.update(chunk)
             pending.difference_update(chunk)
             pushed += len(self._publish(self._compute_all(chunk, refresh=True), heartbeat=True))
-        self.last_tick_s = time.monotonic() - started
         return pushed
 
     # ── catch-up ────────────────────────────────────────────────────────────
