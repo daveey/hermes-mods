@@ -26,7 +26,13 @@ Before filing a physical, on-device or sign-in `human_request`:
    boards/profiles with `physical_ask_duplicate` and names the existing owner. It also catches identical legacy
    action+scope pairs, not paraphrases. It does **not** search remote gateways, serialize simultaneous filings,
    or automatically attach/modify cards. The caller must do the cross-gateway search and owner handoff.
-4. Re-read every prerequisite now. An installed build already satisfying the required feature version removes
+4. Re-read every prerequisite now. For an “open/connect Desktop” ask, compare the failing worker's relay context
+   with the managing origin's supported `cross_session` discovery before attributing failure to the device.
+   A worker with no Desktop draining its outbox can fail while the origin reaches the same Mac. If the origin
+   succeeds, retire the connection ask and route read-only evidence capture through that working context or an
+   existing Mac-local owner; do not requeue the unchanged worker route. Verify the capture's exact session and
+   artifacts separately: a live relay or claimed capture task is not native-panel acceptance.
+   An installed build already satisfying the required feature version removes
    the install/unlock-to-install ask, **not** the remaining on-device check. Never infer feature inclusion only
    from a larger build number across channels; verify lineage/bundle/device. A file's presence is not proof of
    its content, capture provenance or physical acceptance. Inspect those separately.
