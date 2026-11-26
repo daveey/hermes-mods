@@ -1049,9 +1049,12 @@ test('a new chat with no stored row yet is an empty queue, not an outage', async
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.doesNotMatch(el().textContent,/Action queue unavailable/)
  assert.equal(el().querySelector('[data-action-queue]'),null)
+ window.hermesDesktop.api=async()=>{throw Error('404: {"detail":"Plugin not found"}')}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.doesNotMatch(el().textContent,/Action queue unavailable/,'a profile without the user-steps backend (bots) has no queue')
  window.hermesDesktop.api=async()=>{throw Error('404: {"detail":"Not Found"}')}
  await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. plugin missing) still surface')
+ assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. a stale route) still surface')
  await show(null);delete window.hermesDesktop
 })
 

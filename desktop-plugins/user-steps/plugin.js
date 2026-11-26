@@ -889,7 +889,9 @@ export async function refreshRequests(call = api) {
     if (!currentRoute(route) || generation !== requestRead) return
     // A new chat has no stored row until its first turn lands: it cannot own asks yet, so this is an
     // empty queue, not an outage (the panel used to flash an error on every new session).
-    if (errorStatus(e) === 404 && /Unknown stored session/.test(str(e?.message))) {
+    // A profile without the user-steps backend (bot profiles enable only guards) answers 404 "Plugin not
+    // found": nothing there can mint asks, so it is an empty queue too. A bare "Not Found" still surfaces.
+    if (errorStatus(e) === 404 && /Unknown stored session|Plugin not found/.test(str(e?.message))) {
       canonical = { scope, requests: [], error: null }
       return publishCanonical()
     }
