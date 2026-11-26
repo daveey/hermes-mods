@@ -14,7 +14,9 @@ import dataclasses
 import errno
 import functools
 import hashlib
+import collections
 import copy
+import itertools
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -234,6 +236,242 @@ EXPLICIT_UNAVAILABLE_SCOPES = frozenset({
 })
 
 
+# Core describe() statements reviewed as id-keyed (2026-11-26 census of every statement it ran for 306 held hub
+# cards): each reads only rows of the task ids it binds, on tables whose writes mark those ids in core's per-task
+# change cursor (kanban_task_change). A memo entry depends on exactly the ids its describe bound.
+_DESCRIBE_KEYED = frozenset({
+    'SELECT * FROM tasks WHERE id=?',
+    'SELECT status FROM tasks WHERE id=?',
+    'SELECT containment_episode FROM tasks WHERE id=?',
+    'SELECT ? FROM tasks WHERE id=? AND tasks.status = ? AND COALESCE(tasks.block_kind, ?) = ? AND NOT EXISTS '
+    '(SELECT ? FROM task_runs hr WHERE hr.task_id = tasks.id) AND NOT EXISTS (SELECT ? FROM task_events he WHERE '
+    'he.task_id = tasks.id AND he.kind IN (?, ?, ?, ?, ?, ?))',
+    'SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id',
+    'SELECT * FROM task_events WHERE task_id=? AND kind=?',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?,?,?,?)',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?,?,?,?,?) ORDER BY id',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (' + ','.join('?' * 28) + ') ORDER BY created_at DESC,id DESC',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) AND CASE WHEN '
+    'json_valid(payload) THEN json_extract(payload,?) END IN (?,?)',
+    'SELECT ? FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) AND CASE WHEN '
+    'json_valid(payload) THEN json_extract(payload,?) END=? LIMIT ?',
+    'SELECT MIN(COALESCE(created_at,?)) FROM task_events WHERE task_id=? AND kind=?',
+    'SELECT MIN(COALESCE(created_at,?)) FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) '
+    'AND CASE WHEN json_valid(payload) THEN json_extract(payload,?) END IN (?,?)',
+    'SELECT created_at FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT ?',
+    'SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT ?',
+    'SELECT uid,task_id,kind,payload FROM task_events WHERE task_id=? AND kind IN (?,?,?)',
+    'SELECT * FROM task_events WHERE uid=? AND task_id=? AND kind=?',
+    # The joined run is the event's own run (task_runs writes mark the run's task, the same id).
+    'SELECT e.*,r.uid AS bound_run_uid FROM task_events e LEFT JOIN task_runs r ON r.id=e.run_id WHERE e.task_id=? '
+    'AND e.kind=?',
+    'SELECT * FROM task_runs WHERE id=? AND task_id=?',
+    'SELECT uid FROM task_runs WHERE id=? AND task_id=?',
+    'SELECT * FROM task_comments WHERE task_id=? AND uid=?',
+})
+# Tables no trigger covers. A statement that reads only these (and the schema) is re-run at every hit, inside the
+# hit's read transaction, and must return what it returned when the entry was stored: the entry is keyed on that
+# statement's own result, whatever its predicate.
+_DESCRIBE_UNTRIGGERED = frozenset({'kanban_failure_commands', 'kanban_actionability_commands', 'task_wake_checks',
+                                   'containment_observations', 'containment_delivery', 'kanban_sync_state'})
+# kanban_sync_state is read with `SELECT *` (sync_state()), but its readers in describe use only these columns; the
+# rest (cursor, pulled_at, hlc_last, ...) moves every few seconds. Verified by the shadow parity run, not proven.
+_SYNC_STATE_READ = 'SELECT mode, gateway_id, board_id FROM kanban_sync_state LIMIT 1'
+_SQL_LITERAL = re.compile(r"'(?:[^']|'')*'|\b\d+(?:\.\d+)?\b")
+_SQL_TABLE = re.compile(r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)', re.I)
+_SQL_TASK_ID = re.compile(r"'(t_[0-9A-Za-z_]+)'")
+_PASS_IDS = itertools.count(1)
+
+
+def _describe_statement(sql: str):
+    """('keyed', bound task ids) | ('untriggered', ()) | ('schema', ()) | ('predicate', ()) for one statement core
+    describe ran."""
+    text = sql.strip()
+    if not text or text.startswith('--') or text.upper().startswith(('PRAGMA', 'BEGIN', 'COMMIT', 'ROLLBACK')):
+        return 'schema', ()
+    template = ' '.join(_SQL_LITERAL.sub('?', text).split())
+    tables = set(_SQL_TABLE.findall(template))
+    if tables <= {'sqlite_master', 'pragma_table_info'}:
+        return 'schema', ()
+    if tables <= _DESCRIBE_UNTRIGGERED | {'sqlite_master', 'pragma_table_info'}:
+        return 'untriggered', ()
+    if template in _DESCRIBE_KEYED:
+        return 'keyed', tuple(_SQL_TASK_ID.findall(text))
+    return 'predicate', ()
+
+
+def _result_digest(c, sql: str) -> str:
+    rows = c.execute(sql).fetchall()
+    return hashlib.sha256(repr([tuple(r) for r in rows]).encode()).hexdigest()
+
+
+class _DescribeMemo:
+    """Core describe() results kept across feed passes, reused only while their inputs provably have not changed.
+    [daveey]
+
+    Hub 2026-11-26: describe was ~54% of the session-panel feed thread's context switches, mostly for cards whose
+    inputs had not moved since the last pass. An entry is (board file, card) -> the describe output and what it
+    read, classified statement by statement (_describe_statement):
+    - keyed reads (reviewed templates that read only rows of the task ids they bind, on trigger-covered tables): the
+      entry keeps those ids and the board's activity revision. A hit needs, in its own read transaction, the same
+      file (inode), the same schema_version, a consistent revision counter and no kanban_task_change row newer than
+      the entry for any of those ids (or the FULL mark);
+    - untriggered reads (tables no trigger covers): each statement is re-run in the hit's transaction and must
+      return the same rows (kanban_sync_state: mode, gateway_id, board_id only);
+    - a parent read from the board's replica (absent locally): the replica's change rows for those ids, likewise;
+    - any other statement is a predicate read: its result can change through cards it never bound, so the entry
+      needs the board's revision itself unchanged (any write to the board misses it);
+    - review cards also need config kanban.review_dispatch unchanged.
+    A hit that fails any check is a miss: describe runs afresh and replaces the entry. describe runs with now=0 and
+    reads no clock (2026-11-26 census), so nothing in an entry expires with time. Once per pass per board,
+    `refresh` reads core's change cursor: FULL (replaced file, new WAL generation, schema change, lost trigger
+    coverage) drops the board's entries and changed ids drop theirs, which only keeps the memo small; correctness
+    is the per-hit check. Bounded (LRU), locked, per readers object (a plugin reload starts empty), used only inside
+    a feed pass on the feed thread. No timer, no TTL, no connection of its own."""
+
+    CAP = 4096
+
+    def __init__(self, cap: int = CAP):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.entries: collections.OrderedDict = collections.OrderedDict()
+        self.boards: dict[str, dict] = {}
+        self.stats = collections.Counter()
+        self.verify = None  # parity harness hook: called (conn, card_id, cached) on every hit; None in production
+
+    def _drop(self, path=None, keep=None):
+        for key in [k for k, e in self.entries.items()
+                    if (path is None or k[0] == path) and (keep is None or not keep(e))]:
+            del self.entries[key]
+            self.stats['dropped'] += 1
+
+    def refresh(self, path: str, c, pass_id) -> bool:
+        """Once per pass per board: drop what core's change cursor says moved. True when the board can be memoized
+        (its triggers vouch for a cursor)."""
+        state = self.boards.get(path)
+        if state is not None and state['pass'] == pass_id:
+            return state['ok']
+        from hermes_cli import kanban_task_change as changes
+        try:
+            ids, cursor = changes.changed_since(c, state['cursor'] if state else None)
+        except Exception:
+            log.debug('session-panel describe memo: cursor unavailable for %s', path, exc_info=True)
+            ids, cursor = changes.FULL, None
+        with self.lock:
+            if ids is changes.FULL:
+                self._drop(path)
+            elif ids:
+                self._drop(path, keep=lambda e: not (e['deps'] & ids))
+            self.boards[path] = {'pass': pass_id, 'cursor': cursor, 'ok': cursor is not None}
+        return cursor is not None
+
+    @staticmethod
+    def _revision(c, ids=None, since=None):
+        from hermes_cli import kanban_activity_revision as rev
+        probe = ''
+        params: list = []
+        if ids is not None:
+            marks = ','.join('?' * (len(ids) + 1))
+            probe = (f', EXISTS(SELECT 1 FROM {rev.CHANGE_TABLE} WHERE rev > ? AND task_id IN ({marks}))')
+            params = [since, rev.FULL_MARK, *sorted(ids)]
+        row = c.execute(f'SELECT (SELECT schema_version FROM pragma_schema_version()), '
+                        f'(SELECT revision FROM {rev.REVISION_TABLE} WHERE id = 1), '
+                        f'(SELECT MAX(rev) FROM {rev.CHANGE_TABLE}){probe}', params).fetchone()
+        return tuple(row)
+
+    @staticmethod
+    def _review_dispatch():
+        from hermes_cli.kanban_actionability_sources import _review_dispatch
+        return _review_dispatch()
+
+    def get(self, readers, path: str, ino, card_id: str, c):
+        """The cached describe for `card_id`, validated in `c`'s current read transaction, else None."""
+        with self.lock:
+            entry = self.entries.get((path, card_id))
+        if entry is None:
+            self.stats['miss'] += 1
+            return None
+        try:
+            ok = entry['ino'] == ino
+            if ok:
+                schema, revision, top, moved = self._revision(c, entry['deps'], entry['revision'])
+                ok = (schema == entry['schema'] and revision is not None and revision == top
+                      and revision >= entry['revision'] and not moved
+                      and (not entry['predicate'] or revision == entry['revision']))
+            if ok:
+                ok = all(_result_digest(c, sql) == digest for sql, digest in entry['untriggered'])
+            if ok and entry['replica'] is not None:
+                rpath, rids, rrev, rschema = entry['replica']
+                rc = readers.conn(Path(rpath))
+                schema, revision, top, moved = self._revision(rc, rids, rrev) if rc is not None else (None,) * 4
+                ok = rc is not None and schema == rschema and revision == top and revision >= rrev and not moved
+            if ok and entry['review'] is not None:
+                ok = self._review_dispatch() == entry['review']
+        except Exception:
+            log.debug('session-panel describe memo: validation failed for %s', card_id, exc_info=True)
+            ok = False
+        if not ok:
+            self.stats['stale'] += 1
+            return None
+        with self.lock:
+            if (path, card_id) in self.entries:
+                self.entries.move_to_end((path, card_id))
+        self.stats['hit'] += 1
+        return copy.deepcopy(entry['value'])
+
+    def put(self, readers, path: str, ino, card_id: str, c, value, statements) -> None:
+        """Store `value` with what describe read, all checked in `c`'s current transaction (describe's own)."""
+        try:
+            deps, predicate, untriggered = {card_id}, False, {}
+            for sql in statements:
+                kind, ids = _describe_statement(sql)
+                if kind == 'predicate':
+                    predicate = True
+                elif kind == 'untriggered':
+                    text = sql.strip()
+                    if not text.upper().startswith('SELECT'):
+                        return
+                    if set(_SQL_TABLE.findall(text)) & {'kanban_sync_state'}:
+                        text = _SYNC_STATE_READ
+                    untriggered.setdefault(text, None)
+                deps.update(ids)
+            schema, revision, top, _ = self._revision(c, deps, 0)
+            if revision is None or revision != top:
+                return  # the counter cannot vouch for this file now
+            for text in untriggered:
+                untriggered[text] = _result_digest(c, text)
+            present = {r[0] for r in c.execute(
+                f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))})", sorted(deps))}
+            missing = deps - present
+            replica = None
+            if missing:
+                from hermes_cli import kanban_foreign_card as foreign
+                rpath = foreign.replica_path(path)
+                if rpath is not None:
+                    rc = readers.conn(Path(rpath))
+                    if rc is None:
+                        return
+                    rschema, rrev, rtop, _ = self._revision(rc, missing, 0)
+                    if rrev is None or rrev != rtop:
+                        return
+                    replica = (str(rpath), frozenset(missing), rrev, rschema)
+            review = self._review_dispatch() if value.get('status') == 'review' else None
+        except Exception:
+            log.debug('session-panel describe memo: not stored for %s', card_id, exc_info=True)
+            return
+        with self.lock:
+            if predicate:
+                self.stats['predicate'] += 1
+            self.entries[(path, card_id)] = {
+                'value': copy.deepcopy(value), 'ino': ino, 'deps': frozenset(deps), 'predicate': predicate,
+                'schema': schema, 'revision': revision, 'untriggered': tuple(untriggered.items()),
+                'replica': replica, 'review': review}
+            self.entries.move_to_end((path, card_id))
+            while len(self.entries) > self.cap:
+                self.entries.popitem(last=False)
+                self.stats['evicted'] += 1
+
+
 class CoreReaders:
     """Feed reads against this gateway's own boards, board replicas and state.db, read-only (query_only). Each thread has its own
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
@@ -252,6 +490,7 @@ class CoreReaders:
         self.installation = installation
         self._unavailable_lock = threading.Lock()
         self._unavailable_hits: set[str] = set()
+        self._describe_memo = _DescribeMemo()
         if home_context is not None:
             state_db = Path(home_context.home) / 'state.db'
             self.unavailable_scopes = EXPLICIT_UNAVAILABLE_SCOPES
@@ -908,7 +1147,7 @@ class CoreReaders:
         if getattr(self._local, 'pass_reads', None) is not None:
             yield
             return
-        self._local.pass_reads = {'stamp': None, 'cards': {}}
+        self._local.pass_reads = {'stamp': None, 'cards': {}, 'id': next(_PASS_IDS)}
         try:
             yield
         finally:
@@ -1470,6 +1709,19 @@ class CoreReaders:
                     return {'detail': detail, 'board': slug}
         return None
 
+    def _describe_memo_for(self, c):
+        """(memo, board file, its inode) inside a legacy feed pass on this thread when the board's change cursor is
+        available, else Nones: request threads and explicit-home readers always describe afresh."""
+        held = getattr(self._local, 'pass_reads', None)
+        if held is None or self._explicit_home() is not None:
+            return None, None, None
+        found = next(((key, ino) for key, (conn, ino) in (getattr(self._local, 'conns', None) or {}).items()
+                      if conn is c), None)
+        if found is None or c.in_transaction:
+            return None, None, None
+        memo = self._describe_memo
+        return (memo, *found) if memo.refresh(found[0], c, held['id']) else (None, None, None)
+
     def _detail(self, c: sqlite3.Connection, card_id: str, board: str, replica: bool,
                 *, snapshot_at=None, parent_connection=...):
         from hermes_cli import kanban_db
@@ -1547,12 +1799,27 @@ class CoreReaders:
                 out.update(extra)
             except Exception:
                 pass
+        memo, memo_path, memo_ino = self._describe_memo_for(c)
         owned_snapshot = not c.in_transaction
         try:
             if owned_snapshot:
                 c.execute('BEGIN')
             from hermes_cli.kanban_actionability_sources import describe
-            diagnostic = describe(c, card_id, now=0)
+            diagnostic = memo.get(self, memo_path, memo_ino, card_id, c) if memo is not None else None
+            if diagnostic is not None:
+                if memo.verify is not None:
+                    memo.verify(c, card_id, diagnostic)
+            elif memo is not None:
+                statements: list = []
+                c.set_trace_callback(statements.append)
+                try:
+                    diagnostic = describe(c, card_id, now=0)
+                finally:
+                    c.set_trace_callback(None)
+                if isinstance(diagnostic, dict):
+                    memo.put(self, memo_path, memo_ino, card_id, c, diagnostic, statements)
+            else:
+                diagnostic = describe(c, card_id, now=0)
             if isinstance(diagnostic, dict):
                 out['actionability'] = {**diagnostic, 'evidence_state': 'unknown'} if replica else diagnostic
         except Exception:
