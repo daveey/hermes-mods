@@ -1,11 +1,98 @@
 """Bounded event-driven controls work; no polling or refresh on the request thread."""
 import concurrent.futures
+import contextvars
 import sqlite3
 import threading
+from contextlib import closing
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_decisions import core, ROOT, OWNER, load_module, store, request
+
+
+def test_lineage_with_incomplete_core_schema_stays_on_current_chat(tmp_path):
+    pytest.importorskip('hermes_state_compression')
+    db = tmp_path / 'state.db'
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute('CREATE TABLE sessions(id TEXT, parent_session_id TEXT, end_reason TEXT, source TEXT, model_config TEXT)')
+        conn.executemany('INSERT INTO sessions VALUES (?,?,?,?,?)', [
+            ('root', None, 'compression', 'desktop', '{}'), ('tip', 'root', None, 'desktop', '{}')])
+    assert core.lineage('tip', db) == ['tip']
+
+
+def test_ledger_snapshot_failure_is_before_durable_replace(tmp_path, monkeypatch):
+    ledger = core.Ledger(tmp_path / 'ledger', tmp_path / 'state.db')
+    original = core._open_controls
+    count = 0
+    def snapshot(document):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise TypeError('snapshot unavailable')
+        return original(document)
+    monkeypatch.setattr(core, '_open_controls', snapshot)
+    with pytest.raises(TypeError, match='snapshot unavailable'):
+        with ledger.edit('root') as document:
+            document['card'] = 'changed'
+    assert not ledger.path('root').exists()
+
+
+def test_copied_context_submits_after_batch_exit(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(core.CONTROLS_REFRESHER, 'submit', lambda db, sessions: calls.append(set(sessions)))
+    with core.defer_controls_refresh():
+        core.queue_controls_refresh(tmp_path / 'state.db', ['before'])
+        copied = contextvars.copy_context()
+    copied.run(core.queue_controls_refresh, tmp_path / 'state.db', ['after'])
+    assert calls == [{'before'}, {'after'}]
+
+
+def test_dead_retrier_restarted_by_decision_does_not_keep_closed_batch(tmp_path, monkeypatch):
+    api = load_module('controls_dead_retrier_api', ROOT / 'dashboard' / 'plugin_api.py')
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    s = store(tmp_path)
+    r = s.create(OWNER, request())
+    assert core.flush_controls_refresh(5)
+    calls = []
+    for mod in (core, api._load('core')):
+        monkeypatch.setattr(mod.CONTROLS_REFRESHER, 'submit', lambda db, sessions: calls.append(set(sessions)))
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    class Receiver:
+        def deliver(self, operation):
+            entered.set()
+            assert release.wait(5)
+            return {'id': operation['operationId']}
+        def readback(self, operation, receipt):
+            finished.set()
+            return True
+    router = api.create_router(ledger_dir=tmp_path / 'ledger', state_db=tmp_path / 'state.db',
+        action_store=s, owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid), receiver=Receiver())
+    app = FastAPI(); app.include_router(router)
+    runtime = api._load('outbox')
+    with TestClient(app) as client:
+        try:
+            workers = [w for w in runtime._WORKERS.values() if router._delivery_token in w.owners]
+            assert len(workers) == 1
+            # Inject only the dead-retrier precondition; use the real route/store/replacement worker.
+            assert runtime.release(workers[0], router._delivery_token)
+            response = client.post(f'/requests/{r["requestId"]}/decisions', json=dict(
+                session=OWNER['storedSessionId'], expectedRevision=1, choiceId='approve', idempotencyKey='dead-retrier'))
+            assert response.status_code == 200
+            assert entered.wait(2)
+            initial_count = len(calls)
+            assert initial_count >= 1
+            release.set()
+            assert finished.wait(2)
+            # Join the replacement after its real delivery commit, not just receiver readback.
+            router.stop_delivery()
+            operation_id = response.json()['operation']['operationId']
+            assert s.operation(OWNER, operation_id)['operation']['dispatchState'] == 'delivered'
+            assert len(calls) > initial_count, 'delivered change must submit outside the exited request batch'
+        finally:
+            release.set()
+            router.stop_delivery()
+
 
 
 def test_burst_deduplicates_but_write_during_refresh_runs_again(tmp_path):

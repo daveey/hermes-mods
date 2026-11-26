@@ -209,19 +209,34 @@ def flush_controls_refresh(timeout=60.0):
     return CONTROLS_REFRESHER.flush(timeout)
 
 
+class _ControlsBatch:
+    """Shared across copied contexts, but only writable during its owning operation."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = True
+        self.pending = {}
+
+
 @contextmanager
 def defer_controls_refresh():
     """Collect committed changes until the outer operation has released locks and hinted delivery."""
     import sys
     var = sys.modules['_user_steps_controls_refresher'].batch
-    if var.get() is not None:
+    inherited = var.get()
+    if inherited is not None and inherited.active:
         yield
         return
-    pending = {}
-    token = var.set(pending)
+    batch = _ControlsBatch()
+    token = var.set(batch)
     try:
         yield
     finally:
+        # A retrier/task may have copied this context during hint_delivery(). Resetting this
+        # thread's ContextVar does not reset that copy. Close the shared batch atomically
+        # with enqueue admission: later writes must submit, never disappear into a dead dict.
+        with batch.lock:
+            batch.active = False
+            pending, batch.pending = batch.pending, {}
         var.reset(token)
         for db, sessions in pending.items():
             queue_controls_refresh(Path(db), sessions)
@@ -231,11 +246,13 @@ def queue_controls_refresh(state_db: Path, sessions) -> None:
     """Hand committed controls changes to the background refresher. Never raises."""
     try:
         import sys
-        pending = sys.modules['_user_steps_controls_refresher'].batch.get()
-        if pending is not None:
-            pending.setdefault(str(state_db), set()).update(sessions)
-        else:
-            CONTROLS_REFRESHER.submit(state_db, sessions)
+        batch = sys.modules['_user_steps_controls_refresher'].batch.get()
+        if batch is not None:
+            with batch.lock:
+                if batch.active:
+                    batch.pending.setdefault(str(state_db), set()).update(sessions)
+                    return
+        CONTROLS_REFRESHER.submit(state_db, sessions)
     except Exception:
         logging.getLogger("user-steps").warning("controls refresh not queued for %s", sessions, exc_info=True)
 
@@ -308,7 +325,11 @@ def lineage(session_id: str, db: Optional[Path] = None) -> list[str]:
                             config.get(k) is not None for k in ('_branched_from', '_reset_from', '_delegate_from'))):
                         break
                 else:
-                    selected = conn.execute(_CHAIN_STEP_SQL, (parent,)).fetchone()
+                    try:
+                        selected = conn.execute(_CHAIN_STEP_SQL, (parent,)).fetchone()
+                    except sqlite3.Error:
+                        # An incomplete/unavailable core schema cannot authorize a parent hop.
+                        break
                     if not selected or selected[0] != cur:
                         break
         out.append(parent)
@@ -387,6 +408,7 @@ class Ledger:
             d["revision"] = revision + 1
             d["updated"] = time.time()
             _validate_ledger(d, root)
+            after = _open_controls(d)  # all fallible snapshot work precedes durable replacement
             raw = json.dumps(d, ensure_ascii=False, indent=1, allow_nan=False).encode("utf-8")
 
             p = self.path(root)
@@ -410,7 +432,6 @@ class Ledger:
                         "Ledger committed; directory durability could not be confirmed", exc_info=True)
             finally:
                 tmp.unlink(missing_ok=True)
-            after = _open_controls(d)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
