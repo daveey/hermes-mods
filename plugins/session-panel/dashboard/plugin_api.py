@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import errno
 import functools
+import gzip
 import hashlib
 import collections
 import copy
@@ -32,7 +33,7 @@ import types
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import Response
@@ -3411,6 +3412,9 @@ class ChangesBody(BaseModel):
     sessions: list[str] = Field(default_factory=list, max_length=200)
     since: int = 0
     epoch: Optional[str] = None
+    # Body negotiation survives Desktop's IPC bridge, unlike renderer headers.
+    # Old clients omit it; old servers ignore it. Never alter the JSON model.
+    response_encoding: Optional[str] = Field(default=None, max_length=16)
 
 
 router = APIRouter()
@@ -3445,6 +3449,30 @@ if _serves_desktop():
     start_publication()
 
 
+def _gzip_changes(wire):
+    # Electron's existing gunzip decoder has a 16 MiB expansion limit. A POST
+    # cannot retry as identity after receipt, so fall back before compressing.
+    if not 16 * 1024 <= len(wire) <= 16 * 1024 * 1024:
+        return None
+    encoded = gzip.compress(wire, compresslevel=1, mtime=0)
+    return encoded if len(encoded) < len(wire) else None
+
+
+async def _changes_response(wire, encoding, request):
+    if encoding == 'gzip' and 16 * 1024 <= len(wire) <= 16 * 1024 * 1024:
+        try:
+            # Optional CPU work: never block the event loop or wait behind a
+            # busy feed lane. Saturation retains the existing identity answer.
+            encoded = await _on_lane('feed', _gzip_changes, wire, request=request, deadline=.05)
+        except HTTPException as error:
+            if error.status_code != 503:
+                raise
+            encoded = None
+        if encoded is not None:
+            return Response(encoded, media_type='application/json', headers={'Content-Encoding': 'gzip'})
+    return Response(wire, media_type='application/json')
+
+
 @router.post('/changes')
 async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
@@ -3453,9 +3481,12 @@ async def changes(body: ChangesBody, request: Request):
     external = _external_projection()
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
-        command = body.model_dump()
+        command = body.model_dump(exclude={'response_encoding'})
         command['_wire_identity'] = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
-        return projection_response(external, command)
+        response = projection_response(external, command)
+        if response.status_code == 200:
+            return await _changes_response(response.body, body.response_encoding, request)
+        return response
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this
@@ -3466,6 +3497,8 @@ async def changes(body: ChangesBody, request: Request):
                         media_type='application/json', headers={'Retry-After': '1'})
     current = f._current() if getattr(f, '_successor', None) is not None else f
     if getattr(current, 'receipt_log', None) is not None:
+        # This audit attests the exact emitted JSON bytes; keep it identity
+        # encoded until its custody format explicitly supports compression.
         # Private inclusion telemetry uses core's actual route-local admission,
         # not a client body flag/header assertion. No token/principal is logged.
         from hermes_cli.plugin_host_http_auth import admitted_for_sensitive_route
@@ -3485,7 +3518,7 @@ async def changes(body: ChangesBody, request: Request):
             on_success=lambda completed_ns: current._receipt_delivered(delivered, completed_ns))
     wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch,
                            subscriber=body.subscriber, visible_session=body.visible_session)
-    return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')
+    return await _changes_response(_WIRE_PREFIX + wire[1:], body.response_encoding, request)
 
 
 @router.get('/status')

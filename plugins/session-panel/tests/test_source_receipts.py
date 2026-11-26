@@ -242,7 +242,8 @@ def test_exact_inclusion_preserves_json_scalar_types(event, target, before, afte
 
 
 @pytest.mark.parametrize('mode', ['hosted', 'loopback'])
-def test_exact_scoped_route_inclusion_uses_core_admission_and_write(observed, monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('encoding', [None, 'gzip'])
+def test_exact_scoped_route_inclusion_uses_core_admission_and_write(observed, monkeypatch, tmp_path, mode, encoding):
     from fastapi import FastAPI
     from starlette.testclient import TestClient
     from hermes_cli.plugin_host_http_auth import with_hosted_admission
@@ -253,6 +254,9 @@ def test_exact_scoped_route_inclusion_uses_core_admission_and_write(observed, mo
     owner_api = sys.modules[type(r).__module__]
     monkeypatch.setattr(sys.modules[owner_api._FEED_KEY], 'PROCESS_FEED', f)
     monkeypatch.setattr(owner_api, '_request_profile', lambda: owner_api.LAUNCH_PROFILE)
+    async def no_transport_rewrite(*args, **kwargs):
+        raise AssertionError('receipt-enabled responses must bypass transport rewriting')
+    monkeypatch.setattr(owner_api, '_changes_response', no_transport_rewrite)
     app = FastAPI()
     app.state.auth_required = True
     app.include_router(owner_api.router)
@@ -277,8 +281,9 @@ def test_exact_scoped_route_inclusion_uses_core_admission_and_write(observed, mo
                 assert client.post('/changes', json={'sessions': ['S0']},
                                    headers={'X-Hermes-Session-Token': 'wrong-fixture-token'}).status_code == 401
         with TestClient(serving_app) as client:
-            response = client.post('/changes', json={'sessions': ['S0']}, headers=headers)
+            response = client.post('/changes', json={'sessions': ['S0'], 'response_encoding': encoding}, headers=headers)
         assert response.status_code == 200 and set(response.json()['bundles']) == {'S0'}
+        assert 'content-encoding' not in response.headers, 'receipt custody must stay exact emitted JSON'
         assert log.flush()
         rows = read_log(path)
         success, = [row for row in rows if row['event'] == 'catchup_success']
