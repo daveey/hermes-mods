@@ -1803,6 +1803,16 @@ class CoreReaders:
         path = self.state_db().parent / 'processes.json'
         return self._stat(path) if path.exists() else None
 
+    def runtime_fingerprints(self, lineages):
+        """session -> fingerprint of exactly the processes.json evidence `runtime_inputs` reads for it.
+
+        The decision lane re-captures a chat when its own fingerprint moves, never because another
+        chat's process (or an unchanged rewrite of the file) did. Same scope as `runtime_inputs`."""
+        self.require_scope('panel_runtime_inputs')
+        if self._explicit_home() is not None:
+            self._refuse('panel_runtime_inputs')
+        return self._panel_input_module().process_fingerprints(lineages)
+
     def runtime_inputs(self, session, lineage):
         """Background producer only: re-probe processes and publish canonical status.
 
