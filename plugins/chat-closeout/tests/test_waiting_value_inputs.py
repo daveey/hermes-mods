@@ -86,7 +86,7 @@ def test_reopen_and_reclose_restores_value_and_answer(certified, clock):
     assert bkey(board) != first
     assert 'c2' not in answer()
     sql(board, "UPDATE tasks SET status='done', completed_at=100.0 WHERE id='t_2'")
-    assert bkey(board) == first  # equal values, equal key, and the answer is correct
+    assert bkey(board) != first  # equal values, newer generation: never certify an intermediate answer
     assert answer() == {'c1': ['t_1'], 'c2': ['t_2']}
 
 
@@ -97,15 +97,15 @@ def test_selected_absence_insert_and_delete_reinsert(certified, clock):
     assert bkey(board, {'t_1', 'later'}) != missing
     present = bkey(board, {'t_1', 'later'})
     sql(board, "DELETE FROM tasks WHERE id='later'")
-    assert bkey(board, {'t_1', 'later'}) == missing
+    assert bkey(board, {'t_1', 'later'}) != missing  # retained delete generation
     sql(board, "INSERT INTO tasks VALUES ('later','y','done',NULL,1.0)")  # title differs, values identical
-    assert bkey(board, {'t_1', 'later'}) == present
+    assert bkey(board, {'t_1', 'later'}) != present
     baseline = bkey(board)
     assert 'c2' in answer()
     sql(board, "DELETE FROM tasks WHERE id='t_2'")
     assert 'c2' not in answer()
     sql(board, "INSERT INTO tasks VALUES ('t_2','new title','done',NULL,100.0)")
-    assert bkey(board) == baseline
+    assert bkey(board) != baseline
     assert 'c2' in answer()
 
 
@@ -127,7 +127,7 @@ def test_same_tail_on_second_board_collision(certified, clock, monkeypatch, tmp_
     sql(second, "UPDATE tasks SET status='done', completed_at=5.0 WHERE id='t_2'")
     assert plugin.waiting_inputs() != appeared
     sql(second, "DELETE FROM tasks WHERE id='t_2'")
-    assert plugin.waiting_inputs() == key  # real board-by-path values return
+    assert plugin.waiting_inputs() != key  # returning values do not erase intervening generations
 
 
 def test_cold_and_warm_keys_equal_and_selected_set_changes(certified, clock):
@@ -201,7 +201,7 @@ def test_large_tail_set_uses_fixed_task_value_statements(certified, monkeypatch)
     bkey(certified['board'], tails)
     assert len([s for s in statements if 'FROM tasks WHERE id IN' in s]) == 1
     assert not [s for s in statements if "id = 'missing" in s or 'id = ?' in s and 'tasks' in s]
-    assert len(statements) < 20
+    assert len(statements) <= 20  # value batch + independently certified generation batch; no per-tail SQL
 
 
 def test_production_value_query_uses_id_index(certified, monkeypatch):
