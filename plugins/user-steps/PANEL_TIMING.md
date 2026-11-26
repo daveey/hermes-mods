@@ -29,7 +29,16 @@ Key labels:
   open/execute/fetch/close boundaries in the read-only membership capture.
 - `inventory_scan`: complete streaming inventory read, hashing/cache lookup,
   decoding and membership selection. Every current publication is still read
-  and hashed, including those irrelevant to the current chat.
+  and hashed, including those irrelevant to the current chat. Replica transport
+  now uses rowid-ordered packets of at most 1024 rows in the same read transaction:
+  a small JSON header plus byte-length-framed original BLOB bytes, never JSON
+  decoding/re-encoding of task payloads. All packet SQL boundaries are measured
+  in full by `replica_sqlite` (not extrapolated row samples). SHA-256 is unchanged;
+  updates of at most 2047 bytes avoid a native GIL release for every publication.
+  No cache age, publication version or DB stamp certifies absence. Legacy
+  non-UTF-8 databases and first-packet SQLite feature/schema errors use the old
+  complete streaming reader; later errors never restart after a yielded prefix.
+  All remaining source/packet errors retain the existing fail-closed verdict.
 - `inventory_hash_sample`, `inventory_decode_sample`, `inventory_lock_sample`
   and `*_sqlite_row_sample`: **systematic 1/64 row probes**, identified by
   `row_sample_stride=64`. First row is sampled, then every 64th. These are raw
@@ -50,8 +59,9 @@ latency without pretending to separate SQLite's internal CPU and wait mechanisms
 The 27,000-publication regression exercises a warmed successful composed memo,
 checks unchanged/fail-closed semantics, and compares seven paired thread-CPU
 measurements (median extra traced CPU below 50 ms). Its frozen pre-attribution
-inventory helper and AST-equality control detect overhead added even when tracing
-is disabled; unsampled rows use exactly that bare-lock path. A full-module base
+inventory helper and AST-equality control detect added unsampled tracing overhead;
+only the separately byte-equivalence-tested digest scheduling expression is
+normalized, while the bare-lock/cache/decoder path remains identical. A full-module base
 comparison remains an independent review check, not a toggle-only control. The
 recorder ignores cross-thread stages if a copied context carries it to a child;
 thread-CPU/exclusive accounting applies only to the creating thread. Raw paired
