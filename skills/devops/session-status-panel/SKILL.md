@@ -141,6 +141,7 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - Before changing hierarchy guides, read `references/tree-guide-styles.md`; attribute presence is not computed-border proof.
 - Before owner-scoped reconciliation keys, read `references/membership-capture.md` (complete inputs, source modes, unknown fences and memo composition).
 - Before exact inclusion telemetry, read `references/exact-inclusion-custody.md` (immutable wire custody, actual ASGI writes and loss accounting).
+- When expiring cached task/diagnostic rows, test header pips/counts/wake colors and collapsed presentation as well as row removal. Preserve recorded-decision coverage: `showsDecision` must match the effective rendered model, or the companion queue can suppress a status the panel erased. Retain owner-qualified read-only `open_process` inspection. Run the public dependency-only Desktop glob too; `HERMES_DESKTOP_DIR` can be a standalone React/jsdom installation, not a core checkout.
 - Passing jsdom proves structure, not native pixels; screenshots prove pixels, not that a click was recorded.
 - Before changing waiting-row layout, read `references/waiting-row-legibility.md` (native elapsed-suffix visibility).
 
