@@ -166,7 +166,10 @@ def _pr_contexts(db, flow_module, *, evidence=None):
                 return revision
             revision = newest(events)
             source = evidence.identity(row['id']) if evidence is not None and hasattr(evidence, 'identity') else identity
-            groups[url].append((row['id'], row['status'], row['completion_contract'], (source, revision)))
+            # Status belongs to the projection, not provider freshness: a local
+            # running -> scheduled transition cannot change GitHub's PR/head.
+            # Keep source, contract and explicit PR evidence in the key.
+            groups[url].append((row['id'], row['completion_contract'], (source, revision)))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
 
 
@@ -322,7 +325,9 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             for card in raw.get('cards', []):
                 source_row = evidence.row(card['id'])
                 card['status'] = source_row['status'] if source_row else None
-            raw['attention'] = _attention_module().project(raw['cards'], evidence)
+            _stamp_chats(evidence.conn, raw.get('cards', []))
+            from hermes_cli import kanban_governors as gov
+            raw['attention'] = _attention_module().project(raw['cards'], evidence, board=gov._board(conn))
             pol = mods[1].policy()
             if pol is not None:
                 raw['strip_tokens'] = token_series(evidence.conn, pol)
@@ -343,6 +348,26 @@ def _sibling(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _stamp_chats(db, cards):
+    """Stamp each card with the chats linked to it (unreleased ``task_chat_links``), for the session filter."""
+    import sqlite3
+    ids = [c['id'] for c in cards if c.get('id')]
+    linked = {}
+    try:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for task, chat in db.execute(
+                    'SELECT task_id, chat_session FROM task_chat_links WHERE released=0 AND task_id IN '
+                    f'({",".join("?" * len(chunk))})', chunk):
+                if chat:
+                    linked.setdefault(task, []).append(chat)
+    except sqlite3.Error:
+        return  # older board without chat links: creator sessions only
+    for card in cards:
+        if card.get('id') in linked:
+            card['chats'] = sorted(set(linked[card['id']]))
 
 
 def _governed_sources(mods, conn, evidence, hours, window):
@@ -381,7 +406,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
         if flow_mods is not None:
             for slug, source_conn, source in sources:
                 try:
-                    _sibling('board_merge').arm_deadline(source_conn)
+                    _sibling('board_merge').arm_deadline(source_conn, phase='contexts')
                     for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
                         contexts[url].append(context)
                 except (OSError, RuntimeError, sqlite3.Error) as exc:
@@ -391,7 +416,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
             reader = _observations().reader(combined)
         for slug, source_conn, source in sources:
             try:
-                _sibling('board_merge').arm_deadline(source_conn)
+                _sibling('board_merge').arm_deadline(source_conn, phase='projection')
                 if slug in context_failures:
                     raise RuntimeError(context_failures[slug])
                 pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)

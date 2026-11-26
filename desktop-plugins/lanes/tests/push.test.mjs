@@ -45,9 +45,12 @@ test('strip: no colour square, zero lanes hidden, all-lanes status counts on the
     assert.deepEqual(items.map(i=>[i.dataset.status,i.querySelector('.hermes-lanes-n').textContent]),
       [['you','14'],['ext','43'],['worker','23'],['run','21'],['dep','37'],['triage','19']])
     assert.equal(items[0].title,'Red: blocked on you, 14 cards. Click to select')
-    const sw=(k)=>items.find(i=>i.dataset.status===k).querySelector('.hermes-lanes-sw').style.background
-    assert.equal(sw('you'),'rgb(239, 68, 68)'); assert.equal(sw('ext'),'rgb(236, 72, 153)'); assert.equal(sw('worker'),'rgb(16, 185, 129)')
-    assert.ok(items.find(i=>i.dataset.status==='triage').querySelector('.is-outline'))
+    // The number sits inside the category square: no separate swatch beside it.
+    const sq=(k)=>items.find(i=>i.dataset.status===k).querySelector('[data-card-colour]')
+    assert.deepEqual(['you','ext','worker','run','dep','triage'].map(k=>[sq(k).dataset.cardColour,sq(k).textContent]),
+      [['red','14'],['pink','43'],['green','23'],['blue','21'],['grey','37'],['outline','19']])
+    assert.equal(strip.querySelector('.hermes-lanes-sw'),null)
+    assert.equal(sq('you').style.borderColor,'rgb(239, 68, 68)'); assert.equal(sq('ext').style.borderColor,'rgb(236, 72, 153)')
   } finally { await view.close() }
 })
 
@@ -145,4 +148,20 @@ test('fallback poll reads nothing while the window is hidden', async () => {
   timers[0].fn(); await new Promise(r=>setTimeout(r,5))
   assert.equal(reads,before+1,'shown: the poll reads again')
   stop()
+})
+
+test('status squares render through the Desktop SDK CardCountSquare when it exists', async()=>{
+  const calls=[]
+  const CardCountSquare=({category,count})=>{ calls.push([category,count]); return React.createElement('i',{'data-sdk-square':category},count) }
+  const Q=await loadPlugin({CardCountSquare})
+  const snap={...fixture,lanes:{work:{running:2,not_ready:1,blocked_on_you:3,open:6}},status:{you:4,gate:2,triage:1}}
+  const view=await mount(React.createElement(Q.Lanes,{ctx:{rest:async()=>snap}}))
+  try {
+    const strip=view.container.querySelector('.hermes-lanes-mini')
+    assert.deepEqual([...strip.querySelectorAll('[data-status] [data-sdk-square]')].map(n=>[n.dataset.sdkSquare,n.textContent]),
+      [['red','4'],['violet','2'],['outline','1']])
+    assert.deepEqual([...strip.querySelectorAll('[data-lane-pill=work] [data-sdk-square]')].map(n=>[n.dataset.sdkSquare,n.textContent]),
+      [['red','3'],['blue','2'],['outline','1']])
+    assert.equal(strip.querySelector('[data-card-colour]'),null,'no local fallback when the SDK has the shared square')
+  } finally { await view.close() }
 })

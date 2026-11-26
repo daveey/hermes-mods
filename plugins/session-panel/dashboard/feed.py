@@ -97,6 +97,8 @@ def _takes_deadline(readers: Any) -> bool:
     except (TypeError, ValueError):
         return False
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
+RUNTIME_REPROBE_S = 45       # a chat holding live processes is re-probed this often; a failing capture's backoff cap
+RUNTIME_SUPERSEDED_S = 1     # a capture that lost its publication race is retried this soon
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
 RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
@@ -241,6 +243,15 @@ class _Stop(threading.Event):
             e = getattr(self._feed, name, None)
             if e is not None:
                 e.set()
+
+
+def _close_replaced_memo(readers) -> None:
+    """Close the describe memo of a readers object that is replaced and never used again (its share of the process's
+    swallow recorder). Read from the instance dict, not by attribute lookup: a retired reader must see no access
+    but release()."""
+    memo = getattr(readers, '__dict__', {}).get('_describe_memo')
+    if memo is not None:
+        memo.close()
 
 
 class Feed:
@@ -553,6 +564,7 @@ class Feed:
             # its unused reader on that same thread. No old connection transfers.
             unused, self.readers = self.readers, module.AwaitingReaders()
             unused.release()
+            _close_replaced_memo(unused)  # never used again: its describe memo too
             loader = sys.modules.get('_session_panel_feed_loader')
             factory = SNAPSHOT_READER_FACTORY or getattr(loader, 'snapshot_reader_factory', None)
             # resume can be called by a genuine saved API while PROCESS_LOCK is
@@ -919,21 +931,19 @@ class Feed:
             rd = self.readers if readers is None else readers
             now = self._last_decision = self.clock()
             runtime = getattr(rd, 'runtime_inputs', None)
-            runtime_stamp = getattr(rd, 'runtime_stamp', None)
-            stamp_now = runtime_stamp() if callable(runtime_stamp) else None
             runtime_seen = self.__dict__.setdefault('_runtime_seen', {})
-            runtime_due = ({s for s, b in held.items()
-                            if stamp_now != getattr(self, '_runtime_stamp', None)
-                            or (b.get('processes') and now - runtime_seen.get(s, 0) >= 45)}
-                           if callable(runtime) else set())
+            runtime_due, prints = self._runtime_due(rd, held, now) if callable(runtime) else (set(), {})
             files = getattr(rd, 'panel_files_stamp', None)
             moved = files() if callable(files) else None
             if (moved is not None and moved == self._decision_files and not failed and not runtime_due
                     and all(s in self._decision_seen for s in held)):
+                with self.lock:
+                    self._settle_runtime_clocks(now)  # the loop consumed the clocks that woke this pass
                 return 0  # nothing behind any held chat's decisions moved: no database opened this pass
             stamps = self._decision_stamps(rd, held)
             count = 0
-            runtime_superseded = False
+            settled = self.__dict__.setdefault('_runtime_fp', {})
+            retry = self.__dict__.setdefault('_runtime_retry', {})
             for s, base in held.items():
                 if self.stopped.is_set():
                     break
@@ -969,25 +979,94 @@ class Feed:
                                 # retain birth admission and retry even when empty.
                                 if current['bundle'].get('canonical_seq') == seq:
                                     runtime_seen[s] = now
+                                    settled[s] = prints.get(s)  # as of before the read: a later write is due next
+                                    retry.pop(s, None)
                                 else:
-                                    runtime_superseded = True
+                                    # This chat alone retries soon; its failure count is kept, others advance.
+                                    retry[s] = (retry.get(s, (0, 0))[0], now + RUNTIME_SUPERSEDED_S)
                 except Exception:
                     with self.lock:
                         self._decision_result(s, base, seq, failed=True)
+                        if s in runtime_due:
+                            attempts = retry.get(s, (0, 0))[0] + 1
+                            retry[s] = (attempts, now + min(RUNTIME_REPROBE_S, 0.1 * 2 ** min(attempts - 1, 16)))
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
             if not self.stopped.is_set():
                 self._decision_files = moved if stamps else None
-                if not self._decision_failures and not runtime_superseded:
-                    self._runtime_stamp = stamp_now
                 with self.lock:
-                    deadlines = [runtime_seen.get(s, now) + 45 for s, b in self.bundles.items()
-                                 if s in self.interest and s not in self._decision_failures and b['bundle'].get('processes')]
-                    if runtime_superseded:
-                        deadlines.append(now + 1)
-                    self._runtime_retry_at = min(deadlines) if deadlines else None
+                    self._settle_runtime_clocks(now)
             return count
         finally:
             self._decision_lock.release()
+
+    def _runtime_due(self, readers, held: dict, now: float) -> tuple[set, dict]:
+        """Which held chats the runtime lane re-captures this pass, and the per-chat fingerprints it read.
+
+        Per chat, never all at once: a chat is due when its own processes.json evidence moved since its
+        last settled capture (birth, exit, losing its last process, a field core reads), when it holds
+        live processes and RUNTIME_REPROBE_S passed (pid liveness is a kernel probe, not a file field),
+        or when its own failure/superseded retry clock came due. A rewrite that leaves a chat's evidence
+        unchanged, and another chat's process, leave it alone; a failing chat waits on its own backoff."""
+        seen = self.__dict__.setdefault('_runtime_seen', {})
+        settled = self.__dict__.setdefault('_runtime_fp', {})
+        retry = self.__dict__.setdefault('_runtime_retry', {})
+        for gone in [s for s in (*seen, *settled, *retry) if s not in held]:
+            seen.pop(gone, None), settled.pop(gone, None), retry.pop(gone, None)
+        prints = self._runtime_fingerprints(readers, held, now)
+        due = set()
+        for s, b in held.items():
+            pending = retry.get(s)
+            if pending is not None:
+                if now >= pending[1]:
+                    due.add(s)
+                continue
+            if prints is not None and prints.get(s) != settled.get(s):
+                due.add(s)
+            elif b.get('processes') and now - seen.get(s, 0) >= RUNTIME_REPROBE_S:
+                due.add(s)
+        return due, prints or {}
+
+    def _runtime_fingerprints(self, readers, held: dict, now: float):
+        """session -> fingerprint (None: no evidence; also a never-captured chat's settled value), or None
+        when unreadable this pass. Readers without per-chat fingerprints give every chat the one file stamp
+        (the earlier rule, still settled per chat). A failed read makes no chat due by evidence and retries
+        on its own backoff."""
+        fingerprints = getattr(readers, 'runtime_fingerprints', None)
+        try:
+            if callable(fingerprints):
+                prints = fingerprints({s: list(b['lineage']) for s, b in held.items()})
+            else:
+                stamp = getattr(readers, 'runtime_stamp', None)
+                value = stamp() if callable(stamp) else None
+                prints = {s: value for s in held}
+            self._runtime_fp_failures = 0
+            return prints
+        except Exception:
+            self._runtime_fp_failures = attempts = getattr(self, '_runtime_fp_failures', 0) + 1
+            self._runtime_fp_retry_at = now + min(RUNTIME_REPROBE_S, 2 ** min(attempts - 1, 16))
+            log.debug('session-panel runtime fingerprints failed', exc_info=True)
+            return None
+
+    def _settle_runtime_clocks(self, now: float) -> None:
+        """Arm the runtime lane's next wake from per-chat state. Caller holds self.lock.
+
+        Live-process re-probes and superseded retries are the runtime clock; a failed capture's backoff
+        joins the decision lane's failure clock, which the loop consumes and the next pass re-arms."""
+        seen = self.__dict__.setdefault('_runtime_seen', {})
+        retry = self.__dict__.setdefault('_runtime_retry', {})
+        live = {s for s, b in self.bundles.items() if s in self.interest}
+        deadlines = [seen.get(s, now) + RUNTIME_REPROBE_S for s in live
+                     if s not in retry and self.bundles[s]['bundle'].get('processes')]
+        failing = []
+        for s, (attempts, at) in retry.items():
+            if s in live:
+                (failing if attempts else deadlines).append(at)
+        if getattr(self, '_runtime_fp_failures', 0):
+            deadlines.append(self._runtime_fp_retry_at)
+        self._runtime_retry_at = min(deadlines) if deadlines else None
+        if failing:
+            earlier = self._decision_retry_at
+            self._decision_retry_at = min(failing) if earlier is None else min(earlier, *failing)
 
     @staticmethod
     def _decision_stamps(readers, held: dict) -> dict:

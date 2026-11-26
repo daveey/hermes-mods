@@ -57,6 +57,51 @@ def test_native_ci_receipt_does_not_require_shell_command(env, bad):
     env.conn.commit()
     assert bool(env.findings(rule='BS-long-wait',card=tid)) == bool(bad)
 
+@pytest.mark.parametrize('bad', [None, 'no_widen', 'wrong_run', 'bool_run', 'wrong_head',
+    'wrong_repo', 'empty_pending', 'bad_pending', 'old_widen', 'future_watch',
+    'old_watch', 'stale', 'failed', 'broken', 'lost', 'condition_met', 'overdue',
+    'ambiguous_watch', 'ambiguous_widen', 'history_overflow', 'arrival_remap',
+    'old_park_remap', 'ambiguous_park', 'future_park'])
+def test_completed_component_does_not_complete_widened_commit_wait(env, monkeypatch, bad):
+    tid = F.legacy_probe_wait(env.conn, env.now, waited_s=10000)
+    ref = 'https://github.com/example/project/actions/runs/123'
+    sha = 'a' * 40
+    env.conn.execute("UPDATE task_events SET payload=json_set(json_remove(payload,'$.wake_check'),'$.awaiting',json(?)) WHERE task_id=? AND kind='scheduled'", (json.dumps({'kind':'ci','ref':ref}),tid))
+    widen = {'from_run':123,'head_sha':sha,'pending_runs':[124,125],'since':env.now-1000}
+    watch = {'adapter':'github_run','url':'https://github.com/example/project/commit/'+sha,'health':'ok','state':'external_running','observed_at':env.now-20,'next_due_at':env.now+280,'every':300,'consecutive_failures':0}
+    for case, key, value in [('wrong_run','from_run',999),('bool_run','from_run',True),('wrong_head','head_sha','b'*40),('empty_pending','pending_runs',[]),('bad_pending','pending_runs',[True])]:
+        if bad == case: widen[key] = value
+    if bad == 'wrong_repo': watch['url'] = 'https://github.com/other/project/commit/'+sha
+    if bad == 'future_watch': watch['observed_at'] = env.now+1
+    if bad == 'stale': watch.update(observed_at=env.now-2000,next_due_at=env.now-1700)
+    widen_at = env.now-(20000 if bad=='old_widen' else 900)
+    watch_at = env.now-(1000 if bad=='old_watch' else 10)
+    if bad != 'no_widen': F.event(env.conn, tid, 'ci_wait_widened', widen, at=widen_at)
+    if bad == 'arrival_remap':
+        # An old receipt arriving later cannot hide the newer immutable watch.
+        F.event(env.conn, tid, 'external_watch', watch, at=watch_at)
+        F.event(env.conn, tid, 'external_watch', {'health':'error'}, at=env.now-500)
+    else: F.event(env.conn, tid, 'external_watch', watch, at=watch_at)
+    if bad == 'ambiguous_watch': F.event(env.conn, tid, 'external_watch', watch, at=watch_at)
+    if bad == 'ambiguous_widen': F.event(env.conn, tid, 'ci_wait_widened', widen, at=widen_at)
+    if bad == 'history_overflow':
+        for offset in range(100): F.event(env.conn,tid,'external_watch',watch,at=env.now-100-offset)
+    if bad in ('broken','lost','condition_met'):
+        F.event(env.conn,tid,{'broken':'wake_check_broken','lost':'wake_check_lost','condition_met':'condition_met'}[bad],{},at=env.now-5)
+    if bad in ('old_park_remap', 'ambiguous_park', 'future_park'):
+        original = env.conn.execute("SELECT id,payload,created_at FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
+        at = {'old_park_remap':env.now-500, 'ambiguous_park':original[2], 'future_park':env.now+1}[bad]
+        F.event(env.conn, tid, 'scheduled', json.loads(original[1]), at=at)
+        if bad == 'old_park_remap':
+            # Only arrival ID changes: immutable old episode and new park stay intact.
+            newest = env.conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0]
+            env.conn.execute('UPDATE task_events SET id=? WHERE id=?', (newest+100000,original[0]))
+    if bad == 'overdue': env.conn.execute("UPDATE task_events SET payload=json_set(payload,'$.wake_at',?) WHERE task_id=? AND kind='scheduled'",(env.now-1,tid))
+    env.conn.commit()
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':{'url':ref,'status':'completed','conclusion':'failure' if bad=='failed' else 'success','headSha':sha},'happened':True,'happened_at':env.now-1000})
+    assert bool(env.findings(rule='BS-long-wait', card=tid)) == (bad not in (None,'arrival_remap'))
+
+
 @pytest.mark.parametrize('unknown', [True, False])
 def test_unknown_coverage_is_not_positive_unfinished_work(env, monkeypatch, unknown):
     row={'id':'quiet','kind':'unresolved','reason':'card_read_failed' if unknown else 'unfinished_work','status':{'kind':'unresolved','coverage':{'state':'unknown' if unknown else 'complete'}}}

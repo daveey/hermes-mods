@@ -134,6 +134,28 @@ def test_cross_board_host_slots_and_release(board, api, monkeypatch, tmp_path):
         render(tmp_path, view(api), 'host-released')
 
 
+def test_cross_board_attention_refs_use_source_board(board, api):
+    from hermes_cli.kanban_db_sync import apply_sync_schema_steps
+
+    config(board)
+    kb.create_board('bb')
+    hr = {'action': 'Reply A or B. Unblock = use the choice; archive = drop it.',
+          'why_human': 'Only you can choose', 'interaction': 'reply',
+          'scope': 'Fixture choice', 'evidence': 'Two supported alternatives'}
+    with kbc.connect(board='bb') as conn:
+        # Chat membership is sync-owned; ordinary fixture boards omit that table.
+        apply_sync_schema_steps(conn)
+        tid = kb.create_task(conn, title='Choose route', assignee='default', tenant='babybear')
+        assert kb.block_task(conn, tid, kind='needs_input', reason='Choose route', human_request=hr,
+                             expected_run_id=kb.get_task(conn, tid).current_run_id)
+    body = view(api)
+    assert body['attention']['available'], body['attention']
+    row, = body['attention']['rows']
+    assert row['id'] == tid
+    assert row['target']['board'] == 'bb'
+    assert row['key'].split(':')[-2:] == ['bb', tid]
+
+
 def test_observer_contexts_cover_all_boards_once(board, api, monkeypatch):
     config(board)
     kb.create_board('beta')
@@ -357,7 +379,11 @@ def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_pa
 
 @pytest.mark.parametrize('failed_board', ['default', 'beta'])
 def test_slow_board_does_not_expire_healthy_sibling(board, api, monkeypatch, tmp_path, failed_board):
-    import threading
+    from types import SimpleNamespace
+    # Advance only the board reader's CPU clock: no busy loop or global time patch.
+    merge = api._sibling('board_merge')
+    clock = [0.0]
+    monkeypatch.setattr(merge, 'thread_time', lambda: clock[0])
     config(board)
     core_fixtures._usage(monkeypatch, [10])
     kb.create_board('beta')
@@ -369,9 +395,9 @@ def test_slow_board_does_not_expire_healthy_sibling(board, api, monkeypatch, tmp
         original = api.flow_core()[1].snapshot
         def slow(conn, *args, **kwargs):
             if gov._board(conn) == failed_board:
-                threading.Event().wait(2.2)
+                clock[0] += 3600  # Well beyond any board budget, without sleeping.
                 # Exercise SQLite's real expired progress handler, not a synthetic exception.
-                conn.execute('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n').fetchone()
+                conn.execute('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) SELECT sum(x) FROM n').fetchone()
             return original(conn, *args, **kwargs)
         monkeypatch.setattr(api.flow_core()[1], 'snapshot', slow)
         body = view(api)

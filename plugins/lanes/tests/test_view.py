@@ -90,6 +90,37 @@ def test_collapsed_view_maps_open_cards_to_their_sessions(monkeypatch):
         's1': {'a': {'you': 1, 'run': 1}, 'b': {'dep': 1}}, 's2': {'b': {'gate': 1}}}
 
 
+def test_session_map_counts_cards_under_their_linked_chats(monkeypatch):
+    # A card whose creator is no sidebar chat (automation, another gateway's id) still belongs to the chats
+    # linked to it; a card created in a chat and also linked there counts once.
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    cards = [dict(id='t_1', lane='a', reason='slot', source={'kind': 'session', 'id': 'local-x'}, chats=['s1']),
+             dict(id='t_2', lane='a', reason='slot', source={'kind': 'automation', 'id': 't_0'}, chats=['s1', 's2']),
+             dict(id='t_3', lane='b', reason='run', source={'kind': 'session', 'id': 's2'}, chats=['s2']),
+             dict(id='t_4', lane='b', reason='run', source={'kind': 'automation', 'id': 't_0'})]
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {'a': {'open': 2}, 'b': {'open': 2}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
+    assert api.lane_view(6, '6h', False)['sessions'] == {
+        'local-x': {'a': {'worker': 1}}, 's1': {'a': {'worker': 2}},
+        's2': {'a': {'worker': 1}, 'b': {'run': 1}}}
+
+
+def test_stamp_chats_reads_only_unreleased_links():
+    import sqlite3
+    api = load()
+    db = sqlite3.connect(':memory:')
+    db.execute('CREATE TABLE task_chat_links (task_id TEXT, chat_gateway TEXT, chat_profile TEXT, '
+               'chat_session TEXT, released INTEGER)')
+    db.executemany('INSERT INTO task_chat_links VALUES (?,?,?,?,?)', [
+        ('t_1', 'hub', None, 's1', 0), ('t_1', 'hub', None, 's1', 1), ('t_1', 'hub', None, 'old', 1),
+        ('t_2', 'mac', 'default', 's2', 0)])
+    cards = [dict(id='t_1'), dict(id='t_2'), dict(id='t_3')]
+    api._stamp_chats(db, cards)
+    assert [c.get('chats') for c in cards] == [['s1'], ['s2'], None]
+    api._stamp_chats(sqlite3.connect(':memory:'), [dict(id='t_1')])  # no links table: no error
+
+
 def test_view_names_each_gate_and_who_filed_its_unlinked_cards(monkeypatch):
     api = load()
     monkeypatch.setattr(api, 'core', lambda: None)

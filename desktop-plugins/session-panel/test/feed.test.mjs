@@ -5,7 +5,7 @@ import { register } from 'node:module'
 register('data:text/javascript,' + encodeURIComponent(`
 export async function resolve(spec, ctx, next) {
  if (spec === '@hermes/plugin-sdk') return { url: 'data:text/javascript,export const COMPOSER_AREAS={top:"composer.top"};const a=v=>({get:()=>v});export const host={state:{focusedStoredSessionId:a("S1"),focusedSessionOwner:a({connectionId:"C1",profile:"default"}),connectionId:a("C1"),profile:a("default")}};export const useValue=()=>null', shortCircuit: true }
- if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useEffect=()=>{};export const useState=v=>[v,()=>{}];export const jsx=()=>null;export const jsxs=()=>null', shortCircuit: true }
+ if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useEffect=()=>{};export const useState=v=>[v,()=>{}];export const jsx=(type,props)=>({type,props});export const jsxs=jsx', shortCircuit: true }
  return next(spec, ctx)
 }
 export async function load(u,c,n) {
@@ -87,6 +87,25 @@ test('first heartbeat makes feed live and requests a full catch-up; models never
  assert.equal(calls.at(-1).body.since, 0)
  assert.deepEqual(m.cachedModel(route()), before)
  assert.equal(m.feedIsLive(route(), Date.now() + m.FEED_STALE_MS + 1), false)
+})
+for (const why of ['404', 'profile_unsupported']) test(`unsupported feed renders a route-qualified alert: ${why}`, async () => {
+ reply = () => { if (why === '404') throw Error('404: Not Found'); return { profile_unsupported: true } }
+ await m.feedCatchUp(target())
+ const panel = m.Panel()
+ assert.equal(panel.props.role, 'alert')
+ assert.match(panel.props.children, /isn't served for profile default on C1/)
+ assert.ok(!JSON.stringify(panel).includes('taking longer'))
+ assert.equal(m.covers(route()), false)
+ assert.equal(m.covers(route('S1', 'C2')), false, 'no model on another gateway')
+ m.ingestBundle('C1', 'default', bundle())
+ assert.equal(m.covers(route()), false, 'unsupported feed overrides old cached data')
+ assert.equal(m.Panel().props.role, 'alert')
+ m.ingestBundle('C2', 'work', bundle())
+ assert.equal(m.covers(route('S1', 'C2', 'work')), true, 'coverage is route-qualified')
+ await m.feedCatchUp(target(), { nowMs: Date.now() + 11 * 60_000 })
+ reply = () => answer({ bundles: { S1: bundle() } })
+ await m.feedCatchUp(target(), { nowMs: Date.now() + 22 * 60_000 })
+ assert.equal(m.covers(route()), true, 'recovered supported feed covers again')
 })
 test('404/unsupported profile backs off; transient failures are retried', async () => {
  reply = () => { throw Error('404: Not Found') }

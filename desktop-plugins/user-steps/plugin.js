@@ -12,8 +12,8 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 15
-// The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
+const VERSION = 17
+// The composer chrome is user-select:none app-wide; the companion queue and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
 const BASE = '/api/plugins/user-steps'
@@ -101,98 +101,6 @@ const short = (s, n = 140) => {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t
 }
 
-/** "asked 5 min ago" for a request's ISO-8601 createdAt; '' when absent or unparseable (legacy rows).
- *  Clock skew (a createdAt in the future) reads as just now. */
-export function askedAgo(createdAt, now = Date.now()) {
-  const at = typeof createdAt === 'string' && createdAt.trim() ? Date.parse(createdAt) : NaN
-  if (!Number.isFinite(at) || !Number.isFinite(now)) return ''
-  const min = Math.floor(Math.max(0, now - at) / 60_000)
-  if (min < 1) return 'asked just now'
-  if (min < 60) return `asked ${min} min ago`
-  const h = Math.floor(min / 60)
-  return h < 24 ? `asked ${h} h ago` : `asked ${Math.floor(h / 24)} d ago`
-}
-
-/** The buttons a step offers. kind 'submit' sends `text` as a visible user turn then resolves with `resolution`;
- *  kind 'draft' prefills the composer and leaves the step open (the reply resolves it). */
-export function actionsFor(step) {
-  const t = short(step?.text)
-  switch (step?.kind) {
-    case 'approve':
-      return [
-        { label: 'Do it', primary: true, kind: 'submit', text: `Go: ${t}`, resolution: 'Go' },
-        { label: 'No', kind: 'submit', text: `No: ${t}`, resolution: 'No' }
-      ]
-    case 'do':
-      return [
-        { label: 'Done', primary: true, kind: 'submit', text: `\u2713 Done: ${t}`, resolution: 'Done' },
-        { label: 'Can\u2019t', kind: 'submit', text: `\u2717 Can\u2019t: ${t}`, resolution: 'Can\u2019t' }
-      ]
-    case 'choose': {
-      const opts = (Array.isArray(step.options) ? step.options : []).map(str).filter(Boolean)
-      if (opts.length >= 2)
-        return opts.map((o, i) => ({ label: o, primary: i === 0, kind: 'submit', text: `Chose: ${o} \u2014 ${t}`, resolution: `Chose: ${o}` }))
-      return [{ label: 'Reply\u2026', primary: true, kind: 'draft', text: `Re: ${t} \u2014 ` }]
-    }
-    default:
-      return [{ label: 'Reply\u2026', primary: true, kind: 'draft', text: `Re: ${t} \u2014 ` }]
-  }
-}
-
-/** Run one action. Returns 'sent' | 'drafted' | 'no-composer'. Resolve only after the turn was handed to a
- *  visible composer, so a failed click never closes a step silently. Deps are injectable for tests. */
-export async function performAction(step, action, sessionId, deps = {}) {
-  const composer = deps.composer || host.composer
-  const call = deps.call || api
-  if (action.kind === 'draft') {
-    const ok = await composer?.setDraft?.(sessionId, action.text)
-    composer?.focus?.(sessionId)
-    return ok === false ? 'no-composer' : 'drafted'
-  }
-  throw new Error('Legacy actions cannot authorize or resolve work. Request a complete canonical action.')
-}
-
-/** Defense against old/malformed blocked-panel snapshots. Presentation, not authorization. */
-export function actionableCard(item) {
-  if (!item || item.loaded === false || ['transient', 'dependency', 'time'].includes(item.kind)) return false
-  const r = item.human_request
-  return !!r && typeof r === 'object' && !Array.isArray(r) &&
-    ['approval', 'reply', 'user_terminal', 'physical', 'external'].includes(r.interaction) &&
-    ['action', 'why_human', 'scope', 'evidence'].every(k => typeof r[k] === 'string' && r[k].trim())
-}
-
-/** Ledger steps then validated Kanban requests, oldest first; omit the rolling card. */
-export function projectStrip(ledger, kanbanItems) {
-  // the chat's own rolling cards (current + already archived: blocked-panel's snapshot can lag the archive)
-  const own = new Set([str(ledger?.card?.id), ...(Array.isArray(ledger?.own_cards) ? ledger.own_cards.map(str) : [])].filter(Boolean))
-  const steps = (Array.isArray(ledger?.steps) ? ledger.steps : [])
-    .filter(s => s?.id && (s.status || 'open') === 'open')
-    .slice()
-    .sort((a, b) => (Number(a.created) || 0) - (Number(b.created) || 0))
-    .map(s => ({ type: 'step', key: `s:${s.id}`, step: s, actions: actionsFor(s) }))
-  const cards = (Array.isArray(kanbanItems) ? kanbanItems : [])
-    .filter(it => it?.id && actionableCard(it) && !(own.has(str(it.id)) &&
-      str(it.connectionId || it.gateway) === str(ledger?.connectionId) &&
-      (it.board || 'default') === (ledger?.card?.board || 'default')))
-    .slice()
-    .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
-    .map(it => ({ type: 'card', key: `c:${it.connectionId || it.gateway ? `${it.connectionId || it.gateway}:` : ''}${it.profile ? `${it.profile}:` : ''}${it.board || 'default'}:${it.id}`, item: it }))
-  return [...steps, ...cards]
-}
-
-/** First line of what a blocked card wants (blocked-panel's checklist when available). */
-export function cardSummary(item, checklist, askSummary) {
-  try {
-    // Only validated explicit requests enter this projection, never task descriptions.
-    if (typeof askSummary === 'function') return short(askSummary(item, item.rewritten), 160)
-    const list = typeof checklist === 'function' ? checklist(item, item.rewritten) : null
-    if (list?.steps?.length) return short(list.steps[0], 160)
-  } catch {
-    /* fall through */
-  }
-  return short(item?.text || item?.title, 160)
-}
-
 // ── data ────────────────────────────────────────────────────────────────────
 
 function activeConnection() {
@@ -220,7 +128,6 @@ const focusedId = () => {
 
 let snapshot = { stored: null, ledger: { steps: [], card: null }, kanban: [], issues: [], ok: null }
 const subs = new Set()
-let timer = null
 let running = null // scope of the read in flight; a read for another chat starts at once instead of queueing
 let rerun = false
 let unsubKanban = null
@@ -228,40 +135,9 @@ const stepCache = new Map() // id → { at, step }
 // Last-known ledger/kanban/issues per chat (memory, newest LEDGER_CACHE_MAX), painted on a switch before the read.
 const LEDGER_CACHE_MAX = 100
 const ledgerCache = new Map()
-export const resetLedgerCacheForTests = () => ledgerCache.clear()
+
 
 const emit = () => subs.forEach(fn => fn(snapshot))
-
-// Agent issues need nothing from the user, so the user may dismiss them. The key includes the failure time, so a
-// NEW failure on the same card shows again; a dismissed one stays hidden across reloads (localStorage).
-const DISMISS_KEY = 'hermes.userSteps.dismissedIssues.v1'
-const DISMISS_CAP = 300
-let dismissed = null
-export const issueKey = i => JSON.stringify([i?.gatewayId || i?.gateway || i?.connectionId || '', i?.profile || '', i?.board || 'default', i?.id, i?.at ?? ''])
-function dismissedSet() {
-  if (dismissed) return dismissed
-  try {
-    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(DISMISS_KEY) : null
-    dismissed = new Set(Array.isArray(JSON.parse(raw || '[]')) ? JSON.parse(raw || '[]') : [])
-  } catch {
-    dismissed = new Set()
-  }
-  return dismissed
-}
-export function isDismissed(issue) {
-  return dismissedSet().has(issueKey(issue))
-}
-export function dismissIssues(list) {
-  const set = dismissedSet()
-  for (const i of list || []) set.add(issueKey(i))
-  const keep = [...set].slice(-DISMISS_CAP)
-  dismissed = new Set(keep)
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(DISMISS_KEY, JSON.stringify(keep))
-  } catch {}
-  snapshot = { ...snapshot }
-  emit()
-}
 
 function blockedPanel() {
   return typeof window !== 'undefined' ? window.__blockedPanel : null
@@ -318,7 +194,7 @@ export async function refresh(call = api) {
       if (host.state?.focusedSessionOwner && !connectionId) throw Error('Session owner unavailable')
       const r = await call(`${BASE}/steps?session=${encodeURIComponent(stored)}`, { ...route, timeoutMs: 6_000 })
       // A connection switch may keep the same session ID. Drop the old owner's
-      // response before it can populate either the strip or the step cache.
+      // response before it can populate either the shared snapshot or the step cache.
       if (!currentRoute(route)) {
         rerun = true
         return
@@ -357,23 +233,7 @@ export async function refresh(call = api) {
   }
 }
 
-export const getSnapshot = () => snapshot
 
-function subscribe(fn) {
-  subs.add(fn)
-  if (!timer) {
-    const poll = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
-    timer = setInterval(poll, POLL_MS)
-    void refresh()
-  }
-  return () => {
-    subs.delete(fn)
-    if (!subs.size && timer) {
-      clearInterval(timer)
-      timer = null
-    }
-  }
-}
 
 /** GET /step for a directive id (cached 5 s so a re-render doesn't refetch). `call` injectable for tests. */
 export async function fetchStep(id, session, call = api) {
@@ -389,25 +249,24 @@ export async function fetchStep(id, session, call = api) {
   return step
 }
 
-export const clearStepCache = () => stepCache.clear()
+
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
 const AMBER = 'var(--warning, #d29922)'
-const btn = (primary = false) => ({
+const btn = () => ({
   minHeight: 44,
   minWidth: 44,
   padding: '2px 10px',
   borderRadius: 6,
-  border: `1px solid ${primary ? AMBER : 'color-mix(in srgb, var(--border, #8884) 90%, transparent)'}`,
-  background: primary ? `color-mix(in srgb, ${AMBER} 22%, transparent)` : 'transparent',
+  border: '1px solid color-mix(in srgb, var(--border, #8884) 90%, transparent)',
+  background: 'transparent',
   color: 'var(--foreground, inherit)',
   fontSize: 11.5,
   lineHeight: '18px',
   cursor: 'pointer',
   fontFamily: 'inherit'
 })
-const KIND_ICON = { approve: 'codicon-question', do: 'codicon-checklist', choose: 'codicon-list-selection', input: 'codicon-comment' }
 
 let osApi = null // ctx.os, set in register()
 let previewApi = null // ctx.openPreview (fork core), set in register()
@@ -466,16 +325,6 @@ function notify(kind, message) {
   }
 }
 
-// Legacy references answer in chat; there is no user button for requesting agent work.
-function replyInChat(text) {
-  const session = focusedId()
-  void host.composer?.setDraft?.(session, `Re: ${text}\n`)
-  host.composer?.focus?.(session)
-}
-function StepButtons({ step }) {
-  return jsx('button', { type: 'button', style: actionStyle, onClick: () => replyInChat(step.text), children: 'Reply in chat' })
-}
-
 /** The in-message framed box for `::user-step{...}`. */
 export function StepBox({ attrs, streaming, deps }) {
   useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
@@ -485,8 +334,7 @@ export function StepBox({ attrs, streaming, deps }) {
   const [state, setState] = useState({ loading: true, steps: [], failed: false, scope })
   const [tick, setTick] = useState(0)
   const key = ids.join(',')
-  // Re-read when the shared snapshot changes: a click in the strip (or the model resolving the step) must flip
-  // this box too. Listening only; the poll timer belongs to the strip.
+  // Re-read when the shared snapshot changes: decisions and ledger refreshes update this receipt too.
   useEffect(() => {
     const fn = () => setTick(t => t + 1)
     subs.add(fn)
@@ -558,101 +406,6 @@ export function StepBox({ attrs, streaming, deps }) {
 }
 
 const rowStyle = { display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 0', borderTop: '1px solid color-mix(in srgb, var(--border, #8884) 60%, transparent)' }
-
-function CardRow({ item }) {
-  const bp = blockedPanel()
-  // Lead with what the card asks the user to do (its validated human_request), never its agent-written title.
-  const r = item.human_request || {}
-  const action = str(r.action).trim() || str(item.text).trim()
-  const why = str(r.why_human).trim()
-  return jsxs('div', { 'data-user-steps-card': item.id, style: rowStyle, children: [
-    jsx('strong', { 'data-user-steps-card-action': '', style: { overflowWrap: 'anywhere' }, children: jsx(Linked, { text: `Do this: ${action}` }) }),
-    why && jsx('div', { 'data-user-steps-card-why': '', style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12.5, opacity: 0.85 }, children: `Why you: ${why}` }),
-    jsxs('small', { children: ['Next: answer in chat or open the card. This is not an approval button.', jsx('span', { title: str(item.title), style: { opacity: 0.6 }, children: ` (card ${item.id})` })] }),
-    jsxs('div', { style: flowStyle, children: [typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: actionStyle, onClick: () => bp.openCard(item), children: 'Open card' })] })
-  ] })
-}
-
-/** A card parked by a worker/dispatcher failure: an agent issue, never a task for the user. */
-export function IssueRow({ issue }) {
-  const bp = blockedPanel()
-  return jsxs('div', {
-    'data-user-steps-issue': issue.id,
-    style: rowStyle,
-    children: [
-      jsxs('div', {
-        style: { display: 'flex', gap: 6, alignItems: 'baseline', minWidth: 0 },
-        children: [
-          jsx('i', { 'aria-hidden': true, className: 'codicon codicon-warning', style: { opacity: 0.7, flex: 'none' } }),
-          jsx('span', { style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }, title: issue.title, children: issue.title }),
-          jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', opacity: 0.6 }, children: issue.id })
-        ]
-      }),
-      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: issue.reason }),
-      jsx('div', { 'data-user-steps-owner': true, style: { fontSize: 11.5 }, children: `Owner: ${issue.owner || 'unassigned'}` }),
-      jsxs('div', {
-        style: { display: 'flex', gap: 6, alignItems: 'center' },
-        children: [
-          jsx('span', { style: { fontSize: 11.5, opacity: 0.75 }, children: 'No action required from you.' }),
-          typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: { ...btn(), marginLeft: 'auto' }, onClick: () => bp.openCard(issue), children: 'Open card' }),
-          jsx('button', { type: 'button', 'data-user-steps-dismiss': issue.id, style: { ...btn(), ...(typeof bp?.openCard === 'function' ? {} : { marginLeft: 'auto' }) }, title: 'Hide this agent issue (a new failure on this card shows again)', onClick: () => dismissIssues([issue]), children: 'Dismiss' })
-        ]
-      })
-    ]
-  })
-}
-
-function StepRow({ step, sessionId }) {
-  return jsxs('div', {
-    'data-user-steps-step': step.id,
-    style: rowStyle,
-    children: [
-      jsxs('div', {
-        style: { display: 'flex', gap: 6, alignItems: 'baseline' },
-        children: [
-          jsx('i', { 'aria-hidden': true, className: `codicon ${KIND_ICON[step.kind] || 'codicon-comment'}`, style: { color: AMBER, flex: 'none' } }),
-          jsx('span', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: step.text }) })
-        ]
-      }),
-      jsx(StepButtons, { step, deps: { sessionId } })
-    ]
-  })
-}
-
-/** Same Kanban card by exact qualified identity: id + board + owner (connection, else gateway) + profile. A
- *  missing owner or profile on either side is not a match (fail open to showing both, never to merging). */
-export function sameCard(a, b) {
-  if (!a || !b || !str(a.id) || str(a.id) !== str(b.id)) return false
-  if ((str(a.board) || 'default') !== (str(b.board) || 'default')) return false
-  const ca = str(a.connectionId), cb = str(b.connectionId)
-  if (ca && cb) { if (ca !== cb) return false } else {
-    const ga = str(a.gatewayId || a.gateway), gb = str(b.gatewayId || b.gateway)
-    if (!ga || !gb || ga !== gb) return false
-  }
-  return !!str(a.profile) && str(a.profile) === str(b.profile)
-}
-
-export function Strip({ hideCards = [] } = {}) {
-  const [snap, setSnap] = useState(snapshot)
-  const focused = useValue(host.state.focusedStoredSessionId)
-  useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
-  useValue(host.state.profile || host.state.focusedStoredSessionId)
-  const route = decisionRoute(), scope = routeKey(route)
-  useEffect(() => subscribe(setSnap), [])
-  useEffect(() => { void refresh() }, [focused, scope])
-  if (!focused || snap.stored !== focused || (snap.scope && snap.scope !== scope)) return null
-  const requests = canonical.scope === scope ? canonical.requests : []
-  const hidden = Array.isArray(hideCards) ? hideCards : []
-  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !(row.type === 'card' && hidden.some(c => sameCard(c, row.item)))).filter(row => row.type === 'card'
-    ? !requestsForSource(requests, { gatewayId: row.item.gatewayId || row.item.gateway, profile: row.item.profile, type: 'kanban', board: row.item.board, id: row.item.id }).length
-    : !requestForSource(requests, { gatewayId: row.step.requestOwner?.gatewayId || row.step.gatewayId || row.step.owner?.gatewayId, profile: row.step.requestOwner?.profile || row.step.profile || row.step.owner?.profile, type: 'user_step', id: row.step.id }))
-  const issues = (snap.issues || []).filter(i => !isDismissed(i))
-  if (!rows.length && !issues.length) return null
-  return jsxs('div', { 'data-slot': 'user-steps', style: { ...SELECTABLE, minWidth: 0, color: 'var(--foreground)' }, children: [
-    rows.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Earlier asks (${rows.length}) — answer these in chat` }), ...rows.map(r => r.type === 'step' ? jsx(StepRow, { step: r.step }, r.key) : jsx(CardRow, { item: r.item }, r.key))] }),
-    issues.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent issues (${issues.length}) — nothing needed from you` }), jsx('button', { type: 'button', 'data-user-steps-dismiss-all': true, style: actionStyle, onClick: () => dismissIssues(issues), children: 'Dismiss agent issues' }), ...issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`))] })
-  ] })
-}
 
 // Canonical v2 decisions. The server, not composer text or card status, records authorization.
 export const requestKey = r => r?.owner?.gatewayId && r?.owner?.profile && r?.requestId
@@ -762,7 +515,7 @@ let canonical = { scope: null, requests: [], error: null }
 // own read lands, so nothing is ever answered from a cached revision.
 const CANONICAL_CACHE_MAX = 100
 const canonicalCache = new Map()
-export const resetCanonicalCacheForTests = () => { canonicalCache.clear(); canonical = { scope: null, requests: [], error: null } }
+
 const canonicalSubs = new Set()
 const readbacks = new Set()
 let requestRead = 0
@@ -827,7 +580,7 @@ function ownerFeatures(route, call = api) {
   pings.set(scope, entry)
   return entry.promise
 }
-export const clearFeatureCache = () => { pings.clear(); pinged.clear() }
+
 /** Background warm for a chat that is NOT focused: read its asks and ledger into the per-chat caches only. A cached
  *  ask is painted stale with every decision control locked until the chat's own read lands, so warming never makes
  *  anything answerable. Invalid or failed reads leave the caches alone. */
@@ -859,7 +612,7 @@ export async function warm(route, call = api) {
   }
   return ok
 }
-export const cachedRequests = scope => canonicalCache.get(scope) || null
+
 
 export async function refreshRequests(call = api) {
   const generation = ++requestRead
@@ -889,7 +642,9 @@ export async function refreshRequests(call = api) {
     if (!currentRoute(route) || generation !== requestRead) return
     // A new chat has no stored row until its first turn lands: it cannot own asks yet, so this is an
     // empty queue, not an outage (the panel used to flash an error on every new session).
-    if (errorStatus(e) === 404 && /Unknown stored session/.test(str(e?.message))) {
+    // A profile without the user-steps backend (bot profiles enable only guards) answers 404 "Plugin not
+    // found": nothing there can mint asks, so it is an empty queue too. A bare "Not Found" still surfaces.
+    if (errorStatus(e) === 404 && /Unknown stored session|Plugin not found/.test(str(e?.message))) {
       canonical = { scope, requests: [], error: null }
       return publishCanonical()
     }
@@ -937,25 +692,10 @@ const errorStatus = e => e?.status || e?.statusCode || e?.response?.status || Nu
 const actionStyle = { ...btn(), minHeight: 44, minWidth: 44, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
 const flowStyle = { display: 'flex', flexWrap: 'wrap', gap: 8 }
 const planStyle = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', minWidth: 0 }
-const SUCCESS = 'var(--success, #3fb950)'
-const DANGER = 'var(--destructive, #f85149)'
-const sectionLabel = { margin: '10px 0 6px', fontSize: 12, fontWeight: 700 }
-const choiceStyle = effect => ({ ...actionStyle, fontSize: 12.5, fontWeight: effect === 'approve' ? 700 : 500,
-  borderColor: effect === 'approve' ? SUCCESS : effect === 'decline' ? DANGER : 'var(--border)',
-  background: effect === 'approve' ? `color-mix(in srgb, ${SUCCESS} 22%, var(--card))` : 'transparent',
-  color: effect === 'decline' ? DANGER : 'var(--foreground)' })
-const primaryStyle = { ...actionStyle, fontSize: 12.5, fontWeight: 600, borderColor: 'transparent', color: 'var(--primary-foreground, #fff)', background: 'var(--primary, #3b82f6)' }
-// A full-width option row: label + why. The agent's pick is outlined in the accent and marked Recommended;
-// approve/decline keep their success/danger edge so a risky pick still reads as one.
-const optionStyle = c => ({ ...actionStyle, display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 2, width: '100%', boxSizing: 'border-box',
-  textAlign: 'left', padding: '8px 12px', borderRadius: 8, fontWeight: 400, color: 'var(--foreground)', cursor: 'pointer',
-  borderColor: c.recommended === true ? 'var(--primary, var(--accent))' : c.effect === 'approve' ? SUCCESS : c.effect === 'decline' ? DANGER : 'var(--border)',
-  background: c.recommended === true ? 'color-mix(in srgb, var(--primary, var(--accent)) 10%, transparent)' : 'transparent' })
-const recommendedPill = { padding: '1px 7px', borderRadius: 999, fontSize: 11, fontWeight: 600, color: 'var(--primary-foreground, #fff)', background: 'var(--primary, var(--accent))' }
 const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
 // Missing plan/step = agent work. It never counts as something "for you".
 export const agentPending = r => !!r.resolution || !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
-const choiceLabel = (c, choices, kind) => kind !== 'approval' ? (c.authorizes === true ? `✓ ${c.label}` : c.label) : c.effect === 'approve' && c.label !== 'Go' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && c.label !== 'Change plan' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
+const choiceLabel = (c, choices, kind) => kind !== 'approval' ? (c.authorizes === true ? `✓ ${c.label}` : c.label) : c.effect === 'revise' && c.label !== 'Change plan' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
 const WITHDRAW_REASON = 'Dismissed in Desktop as not needed'
 const WITHDRAW_TITLE = 'Remove this ask without deciding; nothing is sent to the agent'
 const withdrawing = new Set() // tile keys with a withdraw POST in flight: one per tile, also across two mounted tiles
@@ -981,7 +721,7 @@ const failedText = op => sessionBusy(op)
 // withdraw and the recorded-decision status with Check status / Retry. The panel never decides without a canonical
 // request, and its decisions land here as `resolution`, so readback recovery needs no panel cooperation.
 export const panelActive = () => typeof window !== 'undefined' && !!window.__sessionPanel?.active
-export function DecisionRow({ request, route, call = api, unavailable = false, companion = false }) {
+export function DecisionRow({ request, route, call = api, unavailable = false }) {
   const key = `${routeKey(route)}:${requestKey(request)}`
   const [state, setState] = useState(() => {
     const decision = recoverIntent(key, request)
@@ -1196,7 +936,6 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
     : question && !shown.length ? 'Answer in chat — this question closes once your reply is recorded there. No permission is granted.' : ''
   const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: sessionBusy(state.operation) ? 'Decision recorded; waiting for the session to finish its current turn.' : 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   const delivering = !!r.resolution && !['confirmed','cancelled'].includes(state.phase)
-  const age = askedAgo(r.createdAt)
   // What picking an option does, in one line: the producer's own explain, else what the stored scope already says.
   // The generic "grants no permission" outcome is not repeated per option.
   const explainOf = c => typeof c.explain === 'string' && c.explain.trim() ? c.explain.trim()
@@ -1204,50 +943,20 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
     : r.kind === 'approval' && ['approve','decline'].includes(c.effect) ? str(r.outcomes?.[c.effect]).trim() : ''
   const recommended = shown.find(c => c.recommended === true)
   const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown
-  const explained = ordered.filter(c => !needsText(c) && explainOf(c))
-  const primary = c => recommended ? c === recommended : c.effect === 'approve' || c.authorizes === true
-  // Questions: each explained option is its own full-width button. Approvals keep their Approve/Decline row.
-  const optionButtons = question
-  // Under the panel an unlocked row offers only the choices that need typed text.
-  const own = companion ? ordered.filter(needsText) : ordered
+  const own = ordered.filter(needsText)
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
-  const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
-  const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
-  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired, !!r.choices?.some(c => c?.effect === 'approve'))}` }, i)) })] })
-  const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
-  const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
   // Nothing for this plugin to draw under the panel: the panel already shows the ask and posts its plain options.
   if (remoteRetiring(r, state.operation)) return jsx('div', { 'data-remote-retiring': '', role: 'status', children: r.delivery?.text || 'Delivering…' })
-  if (companion && !locked && state.phase === 'idle' && !own.length && !approvalPending && !canWithdraw && !editing && !state.error && !dismissal.note && !dismissal.error) return null
+  if (!locked && state.phase === 'idle' && !own.length && !approvalPending && !canWithdraw && !editing && !state.error && !dismissal.note && !dismissal.error) return null
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    !companion && jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
-      jsx('span', { 'data-action-kind': r.kind, style: { padding: '0 6px', borderRadius: 4, color: r.kind === 'approval' ? AMBER : 'var(--muted-foreground)', background: `color-mix(in srgb, ${r.kind === 'approval' ? AMBER : 'var(--muted-foreground)'} 14%, transparent)` }, children: kindLabel }),
-      age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: `${new Date(r.createdAt).toLocaleString()} · revision ${r.revision}`, style: { flex: 'none' }, children: age })
-    ] }),
     jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
-    !locked && !companion && (explained.length
-      ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
-      : jsxs('div', { style: { display: 'contents' }, children: [scopeView, (limitsView || exclusionsView) && fold('Limits and exclusions', [limitsView, exclusionsView])] })),
-    // Explained options ARE the buttons: what it is, what happens, and the agent's pick, in one target.
-    !locked && !companion && optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', role: 'group', 'aria-label': 'Options', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('button', { type: 'button', 'data-decision-option': c.id, 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, 'aria-label': `${choiceLabel(c, choices, r.kind)}${c.recommended === true ? ' (recommended)' : ''}: ${explainOf(c)}`, style: optionStyle(c), disabled: choiceDisabled(c), onClick: () => void send(c), children: [
-      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, rowGap: 2 }, children: [
-        jsx('span', { 'data-option-label': '', style: { fontWeight: 600, fontSize: 13.5 }, children: choiceLabel(c, choices, r.kind) }),
-        c.recommended === true && jsx('span', { 'data-recommended': '', style: recommendedPill, children: 'Recommended' })
-      ] }),
-      jsx('span', { 'data-option-explain': '', style: { display: 'block', color: 'var(--muted-foreground)', fontSize: 12.5, fontWeight: 400, lineHeight: 1.45 }, children: explainOf(c) })
-    ] }, c.id)) }),
-    !locked && !companion && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
-      jsx('strong', { style: { fontWeight: 600 }, children: choiceLabel(c, choices, r.kind) }),
-      c.recommended === true && jsx('span', { 'data-recommended': '', style: { marginLeft: 6, fontSize: 11, color: 'var(--primary, var(--accent))' }, children: 'recommended' }),
-      jsx('div', { style: { color: 'var(--muted-foreground)', fontSize: 12.5 }, children: jsx(MessageTextContent, { media: false, text: explainOf(c) }) })
-    ] }, c.id)) }),
     !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', style: delivering ? { color: 'var(--muted-foreground)' } : undefined, children: delivering ? `Delivering to chat… ${phaseText}` : phaseText }),
     state.phase === 'confirmed' && jsx('div', { 'data-owner-phase': ownerPhase(state.consumer), children: ownerPhaseText(state.consumer) }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: delivering ? 'status' : 'alert', style: delivering ? { color: 'var(--muted-foreground)' } : undefined, children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      ...own.filter(c => companion || !optionButtons || !explained.includes(c)).map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: choiceDisabled(c), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.recommended === true && !needsText(c) && !explained.includes(c) ? `${choiceLabel(c, choices, r.kind)} · Recommended` : choiceLabel(c, choices, r.kind) }, c.id)),
+      ...own.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: explainOf(c) || c.label, style: { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' }, disabled: choiceDisabled(c), onClick: e => { trigger.current = e.currentTarget; setEditing(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
         // An owner without the withdraw route (older backend) can only hide it on this device.
@@ -1265,7 +974,6 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
   ] })
 }
 
-const MINIMIZED_KEY = 'hermes.userSteps.minimized.v1'
 // A plan-less ask is agent work; the user may hide it. Keyed by revision, so a revised ask (the plan) shows again.
 const DISMISSED_REQ_KEY = 'hermes.userSteps.dismissedRequests.v1'
 function readDismissedRequests() {
@@ -1283,12 +991,6 @@ function askAgentForPlan(r, route) {
   const what = r.kind === 'approval' ? 'the full plan' : 'the complete step'
   void host.composer?.setDraft?.(session, `Please post ${what} for "${r.title}" (what exactly you will do, and its limits) so I can decide.\n`)
   host.composer?.focus?.(session)
-}
-function readMinimized() {
-  try { const v = JSON.parse(window.localStorage.getItem(MINIMIZED_KEY) || '[]'); return Array.isArray(v) ? v.filter(k => typeof k === 'string') : [] } catch { return [] }
-}
-function writeMinimized(keys) {
-  try { if (keys.length) window.localStorage.setItem(MINIMIZED_KEY, JSON.stringify(keys.slice(-200))); else window.localStorage.removeItem(MINIMIZED_KEY) } catch {}
 }
 /** A recorded decision whose delivery is failed/pending/unconfirmed stays on screen (with Retry) until confirmed. */
 function remoteRetiring(r, op) {
@@ -1333,13 +1035,24 @@ export function hasQueuePresentation() {
   return !!decisionRoute().session && canonical.scope === scope && canonical.requests.some(r => representedInQueue(scope, r))
 }
 
+/** Desktop loads disk plugins asynchronously, so the panel gets `panelWait.ms` after this plugin registers before its
+ * absence counts as a failure. Then: an explicit error, not a substitute view. */
+export const panelWait = { ms: 10000, since: 0 }
+export const PANEL_MISSING_TEXT = 'Session panel did not load, so this chat\u2019s status and decisions can\u2019t be shown. ' +
+  'Check Settings \u203a Plugins for session-panel, or desktop.log for \u201cruntime load failed (session-panel)\u201d.'
+export function PanelMissing() {
+  const [, tick] = useState(0)
+  useEffect(() => { const t = setInterval(() => tick(v => v + 1), 1000); return () => clearInterval(t) }, [])
+  if (panelActive() || Date.now() - panelWait.since < panelWait.ms) return null
+  const n = openAskCount()
+  return jsx('div', { role: 'alert', 'data-user-steps-panel-missing': '', style: { width: '100%', boxSizing: 'border-box', padding: 10, border: '1px solid var(--destructive, #ef4444)', borderRadius: 8, color: 'var(--foreground)', fontSize: 13 },
+    children: PANEL_MISSING_TEXT + (n ? ` ${n} decision${n === 1 ? ' is' : 's are'} waiting.` : '') })
+}
+
 export const queuePoll = { ms: POLL_MS }
-// `embedded`: drawn inside the session panel, which supplies the frame, heading and minimize control.
-export function ActionQueue({ embedded = false, audience = 'all', companion = panelActive() } = {}) {
-  embedded = embedded || companion // the panel owns the frame, heading and minimize control
-  const [snap, setSnap] = useState(canonical), [filter, setFilter] = useState('')
-  const [minimizedKeys, setMinimizedState] = useState(readMinimized)
-  const setMinimized = keys => { writeMinimized(keys); setMinimizedState(keys) }
+// The session panel owns the frame, headings, options and minimize control.
+export function ActionQueue({ audience = 'all' } = {}) {
+  const [snap, setSnap] = useState(canonical)
   useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
   useValue(host.state.profile || host.state.focusedStoredSessionId)
@@ -1347,41 +1060,23 @@ export function ActionQueue({ embedded = false, audience = 'all', companion = pa
   const route = decisionRoute(), scope = routeKey(route)
   useEffect(() => { canonicalSubs.add(setSnap); return () => canonicalSubs.delete(setSnap) }, [])
   useEffect(() => { void refreshRequests() }, [scope])
-  // The legacy strip's timer normally drives request reads and delivery readback; under the panel it is not mounted.
   useEffect(() => {
-    if (!companion) return
     const t = setInterval(() => { if (typeof document === 'undefined' || !document.hidden) void refreshRequests() }, queuePoll.ms)
     return () => clearInterval(t)
-  }, [companion])
+  }, [])
   if (!route.session || snap.scope !== scope) return null
-  // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
-  // own legacy references through requestForSource.
-  const needsReadback = r => requestNeedsReadback(scope, r)
-  // Under the session panel an answered ask whose delivery is merely pending (or waiting out a busy turn) is one
-  // status line on its card/ask row, not a block here. Only a real delivery failure or unknown outcome stays,
-  // with Check status / Retry.
+  // The panel carries ordinary pending delivery; genuine failures/unknown outcomes keep recovery here.
   const panelCarries = r => {
-    if (!companion || !r.resolution || typeof window === 'undefined' || !window.__sessionPanel?.showsDecision?.(r.requestId)) return false
+    if (!r.resolution || typeof window === 'undefined' || !window.__sessionPanel?.showsDecision?.(r.requestId)) return false
     const op = operations.get(`${scope}:${requestKey(r)}`)
     return !(op?.phase === 'unknown' || (op?.phase === 'failed' && !sessionBusy(op)) || op?.error && !sessionBusy(op))
   }
   const requests = snap.requests.filter(r => representedInQueue(scope, r) && !panelCarries(r) && (audience === 'all' || (audience === 'agent') === agentPending(r)))
   if (!requests.length && (!snap.error || audience === 'agent')) return null
-  const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
-  // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
-  // revision) reopens the panel so a fresh ask is never hidden. Persisted so it survives reloads and chat switches.
-  const openKeys = requests.map(r => `${requestKey(r)}#${r.revision}`)
-  const minimized = !embedded && !snap.error && openKeys.length > 0 && openKeys.every(k => minimizedKeys.includes(k))
-  return jsxs('section', { 'data-action-queue': '', 'data-embedded': embedded ? '' : undefined, 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: embedded ? { ...SELECTABLE, width: '100%', minWidth: 0, color: 'var(--foreground)' } : { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
-    jsx('style', { children: '[data-action-queue] [data-streamdown="strong"]{font-weight:600}[data-decision-outcome]{margin:4px 0}[data-decision-outcome] .aui-md,[data-decision-outcome] .aui-md>div,[data-decision-outcome] p{display:inline;margin:0}[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-scope] :is(pre,table){max-width:100%;overflow:auto}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
-    !embedded && jsxs('div', { 'data-action-queue-header': '', style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
-      jsx('h2', { style: { margin: 0, fontSize: 14, flex: '0 1 auto', minWidth: 0, overflowWrap: 'anywhere' }, children: (n => n ? `For you (${n})` : `Waiting on the agent (${requests.length}) — nothing needed from you`)(requests.filter(r => !r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r)).length) }),
-      minimized && jsx('span', { 'data-action-queue-summary': '', style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12.5, color: 'var(--muted-foreground)' }, children: requests.map(r => r.title).join(' · ') }),
-      jsx('button', { type: 'button', 'data-action-queue-toggle': '', 'aria-expanded': !minimized, 'aria-label': minimized ? 'Expand decisions' : 'Minimize decisions', title: minimized ? 'Expand' : 'Minimize (reopens when a new decision arrives)', onClick: () => setMinimized(minimized ? minimizedKeys.filter(k => !openKeys.includes(k)) : [...new Set([...minimizedKeys, ...openKeys])]), style: { ...btn(), marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${minimized ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
-    ] }),
-    !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
-    !minimized && !companion && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map((r, i) => jsx(DecisionRow, { request: r, route, companion, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
+  return jsxs('section', { 'data-action-queue': '', 'data-embedded': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, color: 'var(--foreground)' }, children: [
+    jsx('style', { children: '[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
+    snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
+    jsx('div', { 'data-action-queue-body': '', style: { maxHeight: 'none', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: requests.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 
@@ -1464,15 +1159,16 @@ export default {
   register(ctx) {
     osApi = ctx?.os || null
     previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
-    // With the session panel loaded it draws every ask (options, card tiles, Open card). This plugin then keeps only
-    // the compact companion queue (free text, pending-delivery Check/Retry, plan request, withdraw), never the
-    // legacy earlier-ask / agent-issue strip.
-    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => panelActive() ? jsx('div', { style: { minWidth: 0, width: '100%' }, children: jsx(ActionQueue, { companion: true }) }) : jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, { companion: false }), jsx(Strip, {})] }) })
+    // The session panel draws every ask (options, card tiles, Open card); this plugin keeps only the compact companion
+    // queue (free text, pending-delivery Check/Retry, plan request, withdraw). Without the panel it shows an error,
+    // never the old standalone queue + strip: a silent fallback hid a broken panel load behind an outdated view.
+    panelWait.since = Date.now()
+    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => panelActive() ? jsx(ActionQueue, {}) : jsx(PanelMissing, {}) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, requestsForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestsForSource(canonical.requests, source) : [], presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount, openAskKeys }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, requestsForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestsForSource(canonical.requests, source) : [], presentationForSource, hasQueuePresentation, ActionQueue, openAskCount, openAskKeys }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)
@@ -1480,8 +1176,6 @@ export default {
       signalDecisionChanges()
       unsubKanban?.()
       unsubKanban = null
-      if (timer) clearInterval(timer)
-      timer = null
     }
   }
 }

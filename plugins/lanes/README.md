@@ -44,9 +44,14 @@ companion additive Desktop SDK seams; an unhandled browser event is not a filter
 With the companion core API, `needs_you(card)` classifies both lane cards and
 session-panel attention. Historical block kinds alone are not current asks.
 The lane snapshot carries `attention.rows` from the same card evidence as
-`status.you`, including active chat subscriptions. The Desktop's **Unlinked asks**
-section shows red, read-only card links for headless asks and for cards whose
-linked chat is not represented by a visible `needs_you` card entry. This last
+`status.you`, including active chat subscriptions. Each attention key and target
+carries the source board before aggregation, so secondary-board asks match exact
+`board/id` references. The Desktop's **Asks outside chats** section shows red,
+read-only card links for headless asks and for cards whose linked chat is not
+represented by a visible red `needs_you` card entry on its exact gateway/profile.
+Muted chats remain muted, but their uncovered asks stay red here. Offline cached
+rows cannot suppress asks: their stored canonical payload is not live red paint.
+Each fallback names why it remains outside visible chat coverage. This last
 coverage partition is necessarily client-local (sidebar filters are local); it
 does not reclassify or change the server total. It never creates decision
 requests, restores retired consent controls, or grants permission to execute.
@@ -244,8 +249,10 @@ URL/context identities, cold/retry/expiry fills, invalidations and outcomes. It
 contains no raw URLs or board payloads, skips filesystem errors/contention and
 runs outside the observation lock. This diagnoses cross-process duplication and
 context churn without adding a watcher or changing refresh/error policy.
-Each URL binds to its cards' explicit PR/head evidence and contract/status; comments,
-dispatch skips/holds, wake bookkeeping and plain heartbeat/watch ticks do not evict it.
+Each URL binds to its cards' explicit PR/head evidence, contract and selected source;
+local card status changes, comments, dispatch skips/holds, wake bookkeeping and plain
+heartbeat/watch ticks do not evict it. Local status is recomputed and rendered on the
+next projection without a provider refill (including running → scheduled).
 A changed PR/head event on an owning card invalidates its old observation immediately on
 projection. Results completing after invalidation cannot resurrect old approval.
 Missing/expired/failed observations stay unknown under the existing classifier.

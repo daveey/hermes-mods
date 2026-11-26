@@ -97,4 +97,9 @@ class PanelProducer:
 
     def close(self):
         self.feed.stopped.set()
-        self.readers.release()
+        # Never used again: retire() also closes the describe memo (its recorder user); older readers just release.
+        retire = getattr(self.readers, 'retire', None)
+        if callable(retire):
+            retire()
+        else:
+            self.readers.release()

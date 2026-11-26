@@ -14,7 +14,9 @@ import dataclasses
 import errno
 import functools
 import hashlib
+import collections
 import copy
+import itertools
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -234,6 +236,444 @@ EXPLICIT_UNAVAILABLE_SCOPES = frozenset({
 })
 
 
+# Core describe() statements reviewed as id-keyed (2026-11-26 census of every statement it ran for 306 held hub
+# cards): each reads only rows of the task ids it binds, on tables whose writes mark those ids in core's per-task
+# change cursor (kanban_task_change). A memo entry depends on exactly the ids its describe bound.
+_DESCRIBE_KEYED = frozenset({
+    'SELECT * FROM tasks WHERE id=?',
+    'SELECT status FROM tasks WHERE id=?',
+    'SELECT containment_episode FROM tasks WHERE id=?',
+    'SELECT ? FROM tasks WHERE id=? AND tasks.status = ? AND COALESCE(tasks.block_kind, ?) = ? AND NOT EXISTS '
+    '(SELECT ? FROM task_runs hr WHERE hr.task_id = tasks.id) AND NOT EXISTS (SELECT ? FROM task_events he WHERE '
+    'he.task_id = tasks.id AND he.kind IN (?, ?, ?, ?, ?, ?))',
+    'SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id',
+    'SELECT * FROM task_events WHERE task_id=? AND kind=?',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?,?,?,?)',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?,?,?,?,?) ORDER BY id',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (' + ','.join('?' * 28) + ') ORDER BY created_at DESC,id DESC',
+    'SELECT * FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) AND CASE WHEN '
+    'json_valid(payload) THEN json_extract(payload,?) END IN (?,?)',
+    'SELECT ? FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) AND CASE WHEN '
+    'json_valid(payload) THEN json_extract(payload,?) END=? LIMIT ?',
+    'SELECT MIN(COALESCE(created_at,?)) FROM task_events WHERE task_id=? AND kind=?',
+    'SELECT MIN(COALESCE(created_at,?)) FROM task_events WHERE task_id=? AND kind IN (?,?) AND json_valid(payload) '
+    'AND CASE WHEN json_valid(payload) THEN json_extract(payload,?) END IN (?,?)',
+    'SELECT created_at FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT ?',
+    'SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT ?',
+    'SELECT uid,task_id,kind,payload FROM task_events WHERE task_id=? AND kind IN (?,?,?)',
+    'SELECT * FROM task_events WHERE uid=? AND task_id=? AND kind=?',
+    # The joined run is the event's own run (task_runs writes mark the run's task, the same id).
+    'SELECT e.*,r.uid AS bound_run_uid FROM task_events e LEFT JOIN task_runs r ON r.id=e.run_id WHERE e.task_id=? '
+    'AND e.kind=?',
+    'SELECT * FROM task_runs WHERE id=? AND task_id=?',
+    'SELECT uid FROM task_runs WHERE id=? AND task_id=?',
+    'SELECT * FROM task_comments WHERE task_id=? AND uid=?',
+})
+# Schema reads: covered by the entry's schema_version.
+_SCHEMA_TABLES = frozenset({'sqlite_master', 'sqlite_schema', 'pragma_table_info', 'pragma_schema_version'})
+# kanban_sync_state is read with `SELECT *` (sync_state()), but describe's readers use only these columns; the rest
+# (cursor, pulled_at, hlc_last, ...) moves every few seconds. Verified by shadow parity, not proven.
+_SYNC_STATE_READ = 'SELECT mode, gateway_id, board_id FROM kanban_sync_state LIMIT 1'
+_SQL_LITERAL = re.compile(r"'(?:[^']|'')*'|\b\d+(?:\.\d+)?\b")
+_SQL_KEY = re.compile(r"\b(?:id|task_id|child_id|parent_id)\s*=\s*'((?:[^']|'')*)'", re.I)
+_SQL_SOURCE = re.compile(r'\b(?:FROM|JOIN)\s+("(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*|\()', re.I)
+_SQL_QUALIFIED = re.compile(r'\b(?:FROM|JOIN)\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)\s*\.', re.I)
+_SQL_COMMA_JOIN = re.compile(
+    r'\bFROM\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*(?:\s*\([^()]*\))?)'
+    r'(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,', re.I)
+_SQL_COUNT_STAR = re.compile(r'\bcount\s*\(\s*\*\s*\)', re.I)
+_PASS_IDS = itertools.count(1)
+
+
+def _sql_table(token: str) -> str:
+    if token[:1] in '"`[':
+        token = token[1:-1].replace('""', '"')
+    return token.lower()
+
+
+def _describe_statement(sql: str, watched=frozenset({'tasks', 'task_links', 'task_runs', 'task_events',
+                                                     'task_comments'})):
+    """(kind, dependency ids) for one statement core describe ran on the board connection:
+    - 'schema': transaction control, PRAGMA, or schema tables only (the entry's schema_version covers them);
+    - 'keyed' + the ids it binds to an id/task_id/child_id/parent_id column (any id format): a reviewed template
+      reading only rows of those ids, on tables whose writes mark the ids in kanban_task_change (`watched`: core's
+      rev.tables_for(board)); a keyed template that binds no id literal is 'unsafe';
+    - 'rerun': reads any table outside `watched` (no trigger marks its writes): re-run at every hit, whatever its
+      predicate, and its rows must match;
+    - 'predicate': any other read of watched tables only: the entry needs the board's revision itself unchanged;
+    - 'unsafe': anything the parser cannot vouch for (comma join, schema-qualified name, a write, no table found):
+      the entry is not stored."""
+    text = sql.strip()
+    if not text or text.startswith('--'):
+        return 'schema', ()
+    head = text.split(None, 1)[0].upper()
+    if head in ('PRAGMA', 'BEGIN', 'COMMIT', 'ROLLBACK', 'END'):
+        return 'schema', ()
+    if head not in ('SELECT', 'WITH'):
+        return 'unsafe', ()
+    template = ' '.join(_SQL_LITERAL.sub('?', text).split())
+    if _SQL_COMMA_JOIN.search(template) or _SQL_QUALIFIED.search(template):
+        return 'unsafe', ()
+    tables = {_sql_table(t) for t in _SQL_SOURCE.findall(template) if t != '('}
+    if not tables:
+        return ('schema', ()) if 'FROM' not in template.upper() else ('unsafe', ())
+    if tables <= _SCHEMA_TABLES:
+        return 'schema', ()
+    if tables - _SCHEMA_TABLES - set(watched):
+        return 'rerun', ()
+    if template in _DESCRIBE_KEYED:
+        ids = tuple(v.replace("''", "'") for v in _SQL_KEY.findall(text))
+        return ('keyed', ids) if ids else ('unsafe', ())
+    if '*' in _SQL_COUNT_STAR.sub('', template) or 'task_events' in tables or _bookkeeping().search(text):
+        # The triggers skip bookkeeping columns and heartbeat inserts: a star anywhere (`t.*` too), any read of
+        # task_events not keyed by its card (count(*), MAX(id), EXISTS: heartbeats move them) or a named
+        # bookkeeping column moves without the revision.
+        return 'rerun', ()
+    return 'predicate', ()
+
+
+@functools.lru_cache(maxsize=1)
+def _bookkeeping():
+    """Columns and event kinds core's revision triggers deliberately do not mark (claims, leases, heartbeats)."""
+    try:
+        from hermes_cli import kanban_activity_revision as rev
+        names = set().union(*rev.BOOKKEEPING_COLUMNS.values()) | set(rev.UNREAD_EVENT_KINDS)
+    except Exception:
+        names = {'claim_lock', 'claim_expires', 'last_heartbeat_at', 'worker_pid', 'worker_started_at',
+                 'lease_holder', 'lease_expires', 'lease_version', 'sync_version', 'field_hlc', 'heartbeat'}
+    return re.compile(r'\b(?:' + '|'.join(sorted(map(re.escape, names))) + r')\b', re.I)
+
+
+def _result_digest(c, sql: str) -> str:
+    rows = c.execute(sql).fetchall()
+    return hashlib.sha256(repr([tuple(r) for r in rows]).encode()).hexdigest()
+
+
+# One recorder per PROCESS, shared by every module generation (plugin reloads overlap: an old pass can still run
+# while the new generation starts): its thread-local hits, lock, installed tool id, user count and the single
+# callback live in this sys.modules namespace, never in a module generation.
+_SWALLOW = sys.modules.setdefault('_session_panel_describe_swallow', types.ModuleType('_session_panel_describe_swallow'))
+_SWALLOW.__dict__.setdefault('lock', threading.Lock())
+_SWALLOW.__dict__.setdefault('local', threading.local())
+_SWALLOW.__dict__.setdefault('tool', None)
+_SWALLOW.__dict__.setdefault('users', 0)
+_SWALLOW.__dict__.setdefault('epoch', 0)
+_SWALLOW_NAME = 'session-panel-describe-memo'
+_SWALLOW_IDS = (3, 4)  # sys.monitoring reserves 0 (debugger), 1 (coverage), 2 (profiler) and 5 (optimizer)
+
+
+def _swallow_acquire() -> bool:
+    """Count one more user of the process's swallow recorder, installing it on first use: a sys.monitoring
+    EXCEPTION_HANDLED hook that notes, for a thread that asked (`_swallow_begin`), every exception handled inside
+    core's hermes_cli package. describe() swallows evidence errors (an unreadable replica, a failed read) into a
+    degraded row, which must not be memoized. False (and nothing counted) when it cannot be installed: no
+    sys.monitoring, neither unreserved tool id free, or any error installing it. The memo is then off."""
+    monitoring = getattr(sys, 'monitoring', None)
+    if monitoring is None:
+        return False
+    ns = _SWALLOW
+    with ns.lock:
+        try:
+            if ns.tool is None or monitoring.get_tool(ns.tool) != _SWALLOW_NAME:
+                tool = next((i for i in _SWALLOW_IDS if monitoring.get_tool(i) in (None, _SWALLOW_NAME)), None)
+                if tool is None:
+                    return False
+                if monitoring.get_tool(tool) is None:
+                    monitoring.use_tool_id(tool, _SWALLOW_NAME)
+                import hermes_cli
+                core = os.path.dirname(os.path.abspath(hermes_cli.__file__)) + os.sep
+                local = ns.local
+
+                def handled(code, offset, exc, _core=core, _local=local):
+                    hits = getattr(_local, 'hits', None)
+                    if hits is not None and code.co_filename.startswith(_core):
+                        hits.append(f'{type(exc).__name__} in {code.co_name}')
+                monitoring.register_callback(tool, monitoring.events.EXCEPTION_HANDLED, handled)
+                monitoring.set_events(tool, monitoring.get_events(tool) | monitoring.events.EXCEPTION_HANDLED)
+                ns.tool = tool
+                ns.epoch += 1
+            ns.users += 1
+            return True
+        except Exception:
+            log.debug('session-panel describe memo: swallow recorder unavailable', exc_info=True)
+            return False
+
+
+def _swallow_release() -> None:
+    """One user fewer; the last one removes the hook and frees the tool id (no cost or module reference after the
+    feed stops)."""
+    monitoring = getattr(sys, 'monitoring', None)
+    ns = _SWALLOW
+    with ns.lock:
+        ns.users = max(0, ns.users - 1)
+        if ns.users or ns.tool is None or monitoring is None:
+            return
+        tool, ns.tool = ns.tool, None
+        ns.epoch += 1
+        try:
+            if monitoring.get_tool(tool) == _SWALLOW_NAME:
+                monitoring.set_events(tool, 0)
+                monitoring.register_callback(tool, monitoring.events.EXCEPTION_HANDLED, None)
+                monitoring.free_tool_id(tool)
+        except Exception:
+            log.debug('session-panel describe memo: swallow recorder not freed', exc_info=True)
+
+
+def _swallow_begin():
+    """Start recording for this thread; returns the recorder epoch (None when no recorder is installed)."""
+    ns = _SWALLOW
+    ns.local.hits = []
+    return ns.epoch if ns.tool is not None else None
+
+
+def _swallow_end(epoch):
+    """This thread's recorded swallows, or None when the recorder was not installed for the whole window."""
+    ns = _SWALLOW
+    hits, ns.local.hits = getattr(ns.local, 'hits', None), None
+    if epoch is None or ns.tool is None or ns.epoch != epoch:
+        return None
+    return hits
+
+
+class _DescribeMemo:
+    """Core describe() results kept across feed passes, reused only while their inputs provably have not changed.
+    [daveey]
+
+    Hub 2026-11-26: describe was ~54% of the session-panel feed thread's context switches, mostly for cards whose
+    inputs had not moved since the last pass. An entry is (board file, card) -> the describe output and what it
+    read, statement by statement (_describe_statement). A hit needs, in its own read transaction:
+    - the same board inode and schema_version, a consistent revision counter (counter == newest change row) and no
+      kanban_task_change row newer than the entry for any id a keyed statement bound (nor the FULL mark);
+    - every 'rerun' statement (any table outside core's watched set: untriggered tables, quarantine, ...) returns
+      the same rows again (kanban_sync_state: mode, gateway_id, board_id only);
+    - with a 'predicate' statement, the board's revision itself unchanged;
+    - for ids absent from the board (a parent describe looked up in the replica): the same replica answer
+      (`kanban_foreign_card.replica_path`: None, or the same file by dev/ino, openable, same schema_version) and no
+      replica change row for those ids since the replica revision read BEFORE describe ran;
+    - for a review card, kanban.review_dispatch as read before describe ran.
+    Not stored: an entry whose describe swallowed an exception inside core (a degraded row: _swallow_acquire), read
+    with an 'unsafe' statement, or whose board or replica counter could not vouch. A failed check is a miss and
+    describes afresh. describe runs with now=0 and reads no clock (2026-11-26 census), so nothing expires with
+    time. Once per pass per board the change cursor drops moved entries (FULL drops the board); that keeps the memo
+    small, the per-hit check keeps it correct. Bounded (LRU), locked, per readers object (a plugin reload starts
+    empty), used only inside a feed pass on the feed thread. No timer, no TTL, no connection of its own."""
+
+    CAP = 4096
+
+    def __init__(self, cap: int = CAP):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.entries: collections.OrderedDict = collections.OrderedDict()
+        self.boards: dict[str, dict] = {}
+        self.stats = collections.Counter()
+        self.verify = None  # parity harness hook: called (conn, card_id, cached) on every hit; None in production
+        self.recorder = False  # holds one user of the process's swallow recorder
+        self.closed = False
+
+    def close(self) -> None:
+        """The feed stopped: release the swallow recorder and turn the memo off."""
+        with self.lock:
+            self.closed = True
+            self.entries.clear()
+            held, self.recorder = self.recorder, False
+        if held:
+            _swallow_release()
+
+    def _drop(self, path=None, keep=None):
+        for key in [k for k, e in self.entries.items()
+                    if (path is None or k[0] == path) and (keep is None or not keep(e))]:
+            del self.entries[key]
+            self.stats['dropped'] += 1
+
+    def refresh(self, path: str, c, pass_id) -> bool:
+        """Once per pass per board: drop what core's change cursor says moved. True when the board can be memoized
+        (its triggers vouch for a cursor and the swallow watch is installed)."""
+        state = self.boards.get(path)
+        if state is not None and state['pass'] == pass_id:
+            return state['ok']
+        from hermes_cli import kanban_task_change as changes
+        try:
+            ids, cursor = changes.changed_since(c, state['cursor'] if state else None)
+        except Exception:
+            log.debug('session-panel describe memo: cursor unavailable for %s', path, exc_info=True)
+            ids, cursor = changes.FULL, None
+        with self.lock:
+            ok, held = cursor is not None and not self.closed, self.recorder
+        if ok and not held:
+            try:
+                got = _swallow_acquire()
+            except Exception:
+                got = False
+            with self.lock:
+                late = got and self.closed  # close() ran while acquiring: it could not release this user
+                if not late:
+                    self.recorder = got
+            if late:
+                _swallow_release()
+            ok = got and not late
+        with self.lock:
+            if ids is changes.FULL:
+                self._drop(path)
+            elif ids:
+                self._drop(path, keep=lambda e: not (e['deps'] & ids))
+            self.boards[path] = {'pass': pass_id, 'cursor': cursor, 'ok': ok}
+        return ok
+
+    @staticmethod
+    def _revision(c, ids=None, since=None):
+        from hermes_cli import kanban_activity_revision as rev
+        probe = ''
+        params: list = []
+        if ids is not None:
+            marks = ','.join('?' * (len(ids) + 1))
+            probe = f', EXISTS(SELECT 1 FROM {rev.CHANGE_TABLE} WHERE rev > ? AND task_id IN ({marks}))'
+            params = [since, rev.FULL_MARK, *sorted(ids)]
+        row = c.execute(f'SELECT (SELECT schema_version FROM pragma_schema_version()), '
+                        f'(SELECT revision FROM {rev.REVISION_TABLE} WHERE id = 1), '
+                        f'(SELECT MAX(rev) FROM {rev.CHANGE_TABLE}){probe}', params).fetchone()
+        return tuple(row)
+
+    @staticmethod
+    def _review_dispatch():
+        from hermes_cli.kanban_actionability_sources import _review_dispatch
+        return _review_dispatch()
+
+    @staticmethod
+    def _replica_state(readers, path: str, ids=None, since=None):
+        """The replica as describe would find it now, read on ONE connection inside one read transaction:
+        (('none',) | ('file', path, dev, ino, schema, revision), moved) where moved says whether any of `ids` has a
+        change row newer than `since`; (None, None) when it exists but cannot vouch (unopenable, counter
+        inconsistent, or the connection's file is not the one at the path before and after the read)."""
+        from hermes_cli import kanban_foreign_card as foreign
+        rpath = foreign.replica_path(path)
+        if rpath is None:
+            return ('none',), False
+        rc = readers.conn(Path(rpath))
+        opened = (getattr(readers._local, 'conns', None) or {}).get(str(Path(rpath)))
+        if rc is None or opened is None or opened[0] is not rc:
+            return None, None
+        own = not rc.in_transaction
+        try:
+            if own:
+                rc.execute('BEGIN')
+            first = os.stat(rpath)
+            row = _DescribeMemo._revision(rc, ids if ids is not None else (), since if since is not None else 0)
+            second = os.stat(rpath)
+        finally:
+            if own and rc.in_transaction:
+                rc.rollback()
+        schema, revision, top, moved = row
+        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino) and first.st_ino == opened[1]
+        if not same or revision is None or revision != top:
+            return None, None
+        return ('file', str(rpath), first.st_dev, first.st_ino, schema, revision), bool(moved)
+
+    def before(self, readers, path: str):
+        """Read before describe runs: what an entry is stored against (replica, review config), and arm the
+        swallow watch for this thread. Returns a token for `put`, or None when nothing can be stored."""
+        try:
+            token = {'replica': self._replica_state(readers, path)[0], 'review': self._review_dispatch()}
+        except Exception:
+            log.debug('session-panel describe memo: pre-read failed for %s', path, exc_info=True)
+            return None
+        token['epoch'] = _swallow_begin()
+        return token
+
+    @staticmethod
+    def after(token):
+        """Swallows recorded during describe, or None when they could not all be recorded (no store)."""
+        return _swallow_end(token['epoch'] if token is not None else None)
+
+    def get(self, readers, path: str, ino, card_id: str, c):
+        """The cached describe for `card_id`, validated in `c`'s current read transaction, else None."""
+        with self.lock:
+            entry = self.entries.get((path, card_id))
+        if entry is None:
+            self.stats['miss'] += 1
+            return None
+        try:
+            ok = entry['ino'] == ino
+            if ok:
+                schema, revision, top, moved = self._revision(c, entry['deps'], entry['revision'])
+                ok = (schema == entry['schema'] and revision is not None and revision == top
+                      and revision >= entry['revision'] and not moved
+                      and (not entry['predicate'] or revision == entry['revision']))
+            if ok:
+                ok = all(_result_digest(c, sql) == digest for sql, digest in entry['rerun'])
+            if ok and entry['missing']:
+                replica = entry['replica']
+                if replica[0] == 'none':
+                    ok = self._replica_state(readers, path)[0] == ('none',)
+                else:
+                    now, moved = self._replica_state(readers, path, entry['missing'], replica[5])
+                    ok = (now is not None and now[0] == 'file' and now[1:5] == replica[1:5]
+                          and now[5] >= replica[5] and not moved)
+            if ok and entry['review'] is not None:
+                ok = self._review_dispatch() == entry['review']
+        except Exception:
+            log.debug('session-panel describe memo: validation failed for %s', card_id, exc_info=True)
+            ok = False
+        if not ok:
+            self.stats['stale'] += 1
+            return None
+        with self.lock:
+            if (path, card_id) in self.entries:
+                self.entries.move_to_end((path, card_id))
+        self.stats['hit'] += 1
+        return copy.deepcopy(entry['value'])
+
+    def put(self, readers, path: str, ino, card_id: str, c, value, statements, token, swallowed) -> None:
+        """Store `value` against `token` (read before describe) and what describe read, in describe's transaction."""
+        if token is None or swallowed is None:
+            self.stats['not_stored_unrecorded'] += 1
+            return
+        if swallowed:
+            self.stats['not_stored_swallowed'] += 1
+            return
+        try:
+            from hermes_cli import kanban_activity_revision as rev
+            watched = frozenset(rev.tables_for(path))
+            deps, predicate, rerun = {card_id}, False, {}
+            for sql in statements:
+                kind, ids = _describe_statement(sql, watched)
+                if kind == 'unsafe':
+                    self.stats['not_stored_unsafe'] += 1
+                    return
+                if kind == 'predicate':
+                    predicate = True
+                elif kind == 'rerun':
+                    text = sql.strip()
+                    if {_sql_table(t) for t in _SQL_SOURCE.findall(text) if t != '('} == {'kanban_sync_state'}:
+                        text = _SYNC_STATE_READ
+                    rerun.setdefault(text, None)
+                deps.update(ids)
+            schema, revision, top, _ = self._revision(c, deps, 0)
+            if revision is None or revision != top:
+                return  # the counter cannot vouch for this file now
+            for text in rerun:
+                rerun[text] = _result_digest(c, text)
+            present = {r[0] for r in c.execute(
+                f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))})", sorted(deps))}
+            missing = frozenset(deps - present)
+            if missing and token['replica'] is None:
+                return  # describe may have read a replica that cannot vouch
+            review = token['review'] if value.get('status') == 'review' else None
+        except Exception:
+            log.debug('session-panel describe memo: not stored for %s', card_id, exc_info=True)
+            return
+        with self.lock:
+            if predicate:
+                self.stats['predicate'] += 1
+            self.entries[(path, card_id)] = {
+                'value': copy.deepcopy(value), 'ino': ino, 'deps': frozenset(deps), 'predicate': predicate,
+                'schema': schema, 'revision': revision, 'rerun': tuple(rerun.items()),
+                'missing': missing, 'replica': token['replica'] if missing else None, 'review': review}
+            self.entries.move_to_end((path, card_id))
+            while len(self.entries) > self.cap:
+                self.entries.popitem(last=False)
+                self.stats['evicted'] += 1
+
+
 class CoreReaders:
     """Feed reads against this gateway's own boards, board replicas and state.db, read-only (query_only). Each thread has its own
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
@@ -252,6 +692,7 @@ class CoreReaders:
         self.installation = installation
         self._unavailable_lock = threading.Lock()
         self._unavailable_hits: set[str] = set()
+        self._describe_memo = _DescribeMemo()
         if home_context is not None:
             state_db = Path(home_context.home) / 'state.db'
             self.unavailable_scopes = EXPLICIT_UNAVAILABLE_SCOPES
@@ -385,6 +826,12 @@ class CoreReaders:
             except sqlite3.Error:
                 pass
         self._local.conns = {}
+
+    def retire(self) -> None:
+        """This readers object is replaced and never used again: close this thread's connections and its describe
+        memo (its share of the process's swallow recorder). release() alone runs after every pass and keeps both."""
+        self.release()
+        self._describe_memo.close()
 
     def conn(self, path: Path) -> Optional[sqlite3.Connection]:
         ctx = self._explicit_home()
@@ -908,7 +1355,7 @@ class CoreReaders:
         if getattr(self._local, 'pass_reads', None) is not None:
             yield
             return
-        self._local.pass_reads = {'stamp': None, 'cards': {}}
+        self._local.pass_reads = {'stamp': None, 'cards': {}, 'id': next(_PASS_IDS)}
         try:
             yield
         finally:
@@ -1141,8 +1588,11 @@ class CoreReaders:
 
     def watch_paths(self) -> list[Path]:
         """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
-        return self.board_paths() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3',
-                                    self.state_db().parent / 'processes.json'] + self.external_paths()
+        home = self.state_db().parent
+        # Every profile's process checkpoint, as core's process inventory reads them (a write wakes the lane).
+        checkpoints = [home / 'processes.json'] + sorted((home / 'profiles').glob('*/processes.json'))
+        return self.board_paths() + [self.state_db(), home / 'user-steps' / 'actions.sqlite3'] + checkpoints \
+            + self.external_paths()
 
     def external_paths(self) -> list[Path]:
         """Origin receipts and hub replicas are inputs, not task-event boards."""
@@ -1356,6 +1806,35 @@ class CoreReaders:
         path = self.state_db().parent / 'processes.json'
         return self._stat(path) if path.exists() else None
 
+    def runtime_fingerprints(self, lineages):
+        """session -> fingerprint of exactly the processes.json evidence `runtime_inputs` reads for it.
+
+        The decision lane re-captures a chat when its own fingerprint moves, never because another
+        chat's process (or an unchanged rewrite of the file) did. Same scope as `runtime_inputs`."""
+        self.require_scope('panel_runtime_inputs')
+        if self._explicit_home() is not None:
+            self._refuse('panel_runtime_inputs')
+        mod = self._panel_input_module()
+        key = (tuple((str(p), self._stat(p)) for p in mod.checkpoint_paths()),
+               tuple(sorted((s, tuple(ids)) for s, ids in lineages.items())))
+        memo = getattr(self, '_fingerprint_memo', None)
+        if memo is not None and memo[0] == key:
+            return dict(memo[1])  # no checkpoint and no lineage moved: no lineage reads either
+        prints = mod.process_fingerprints(lineages, core_lineage=self._core_lineages(lineages))
+        self._fingerprint_memo = (key, prints)
+        return dict(prints)
+
+    def _core_lineages(self, lineages):
+        """session -> the ids refresh_outcome reads processes for: core's compression lineage of the chat's tip
+        (ancestors and descendants), which the panel lineage (parent ancestors) does not always cover."""
+        import hermes_state_outcome as so
+        from hermes_state import SessionDB
+        out = {}
+        with SessionDB(db_path=self.state_db(), read_only=True) as db:
+            for session in lineages:
+                out[session] = so._lineage_ids(db, so._tip(db, session))
+        return out
+
     def runtime_inputs(self, session, lineage):
         """Background producer only: re-probe processes and publish canonical status.
 
@@ -1367,6 +1846,9 @@ class CoreReaders:
             self._refuse('panel_runtime_inputs')
         from hermes_state import SessionDB
         from hermes_state_outcome import refresh_outcome
+        # Core's process inventory keeps a 3 s cache. A capture is admitted because evidence moved (often a
+        # process exit), so refresh_outcome must probe now, not certify the warm pre-exit cache.
+        self._panel_input_module().invalidate_process_cache()
         with SessionDB(db_path=self.state_db()) as db:
             if db.get_session(session) is None:
                 return {'outcome_json': {}, 'processes': []}
@@ -1470,6 +1952,24 @@ class CoreReaders:
                     return {'detail': detail, 'board': slug}
         return None
 
+    def _describe_memo_for(self, c):
+        """(memo, board file, its inode) inside a legacy feed pass on this thread when the board's change cursor is
+        available, else Nones: request threads and explicit-home readers always describe afresh."""
+        held = getattr(self._local, 'pass_reads', None)
+        if held is None or self._explicit_home() is not None:
+            return None, None, None
+        found = next(((key, ino) for key, (conn, ino) in (getattr(self._local, 'conns', None) or {}).items()
+                      if conn is c), None)
+        if found is None or c.in_transaction:
+            return None, None, None
+        memo = self._describe_memo
+        try:
+            usable = memo.refresh(found[0], c, held['id'])
+        except Exception:
+            log.debug('session-panel describe memo: off for this read', exc_info=True)
+            usable = False
+        return (memo, *found) if usable else (None, None, None)
+
     def _detail(self, c: sqlite3.Connection, card_id: str, board: str, replica: bool,
                 *, snapshot_at=None, parent_connection=...):
         from hermes_cli import kanban_db
@@ -1547,12 +2047,29 @@ class CoreReaders:
                 out.update(extra)
             except Exception:
                 pass
+        memo, memo_path, memo_ino = self._describe_memo_for(c)
         owned_snapshot = not c.in_transaction
         try:
             if owned_snapshot:
                 c.execute('BEGIN')
             from hermes_cli.kanban_actionability_sources import describe
-            diagnostic = describe(c, card_id, now=0)
+            diagnostic = memo.get(self, memo_path, memo_ino, card_id, c) if memo is not None else None
+            if diagnostic is not None:
+                if memo.verify is not None:
+                    memo.verify(c, card_id, diagnostic)
+            elif memo is not None:
+                statements: list = []
+                token = memo.before(self, memo_path)
+                c.set_trace_callback(statements.append)
+                try:
+                    diagnostic = describe(c, card_id, now=0)
+                finally:
+                    c.set_trace_callback(None)
+                    swallowed = memo.after(token)
+                if isinstance(diagnostic, dict):
+                    memo.put(self, memo_path, memo_ino, card_id, c, diagnostic, statements, token, swallowed)
+            else:
+                diagnostic = describe(c, card_id, now=0)
             if isinstance(diagnostic, dict):
                 out['actionability'] = {**diagnostic, 'evidence_state': 'unknown'} if replica else diagnostic
         except Exception:
@@ -1972,6 +2489,8 @@ def feed():
                 readers = None if getattr(_LOADER, 'facts_mode', 'legacy') == 'facts' else CoreReaders()
                 prev, new = core.PROCESS_FEED, core.Feed(readers, emit=_emit)
                 if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
+                    if getattr(prev, 'readers', None) is not readers:
+                        _close_describe_memo(prev)
                     try:
                         new.resume(prev)
                     except Exception:  # never leave the process without a running feed: start clean (clients reset)
@@ -2289,6 +2808,17 @@ def stop() -> None:
     f = _load_feed().PROCESS_FEED
     if f is not None:
         f.stopped.set()
+        _close_describe_memo(f)
+
+
+def _close_describe_memo(f) -> None:
+    """Release a stopped feed's describe memo (its share of the process's swallow recorder)."""
+    memo = getattr(getattr(f, 'readers', None), '_describe_memo', None)
+    if memo is not None:
+        try:
+            memo.close()
+        except Exception:
+            log.debug('session-panel describe memo: close failed', exc_info=True)
 
 
 MIN_PAUSE_S = 0.2

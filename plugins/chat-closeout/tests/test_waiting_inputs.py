@@ -105,6 +105,7 @@ def test_replica_grouped_keys_equal_existing_values_and_clock_boundaries(now):
             wi.digest([['gw', 'default', wi._fresh(1000.0, now, 300.0)]]),
             [None, False, 0 <= now - 1000.0, now - 1000.0 <= wi.REPLICA_FRESH_S,
              now - 1000.0 > wi.HUB_STALE_AFTER_S],
+            wi.digest([]),
         ])
     actual = watch.keys(now, tail_sets=groups)
     assert actual == expected

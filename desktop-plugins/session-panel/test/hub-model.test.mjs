@@ -402,6 +402,57 @@ test('absolute timestamps render 38m and started 38 min ago at the local clock',
  assert.equal(JSON.stringify(model), before, 'local repaint never changes the cached wire model')
 })
 
+test('running elapsed text is allowed to wrap instead of overflowing the panel', async () => {
+ const {model,now}=cases.elapsed_layout
+ await paint(m.renderModel(model,{now}))
+ const detail=document.querySelector('[data-run-meta]')
+ assert.match(detail.textContent,/ · 7m$/)
+ assert.equal(detail.style.whiteSpace,'normal')
+ assert.equal(detail.style.maxWidth,'100%')
+ assert.equal(detail.style.overflowWrap,'anywhere')
+ assert.equal(detail.parentElement.style.flexWrap,'wrap')
+})
+
+test('mounted feed timing survives local ticks, replacement, session switch and remount without changing evidence', async () => {
+ await paint(null); m.resetFeedForTests()
+ const originalNow = Date.now, originalInterval = globalThis.setInterval, originalClear = globalThis.clearInterval
+ const hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden')
+ const ticks = new Map(); let next = 0, now = cases.elapsed_layout.now
+ Date.now = () => now * 1000
+ globalThis.setInterval = (fn, ms) => { const id = ++next; ticks.set(id, {fn, ms}); return id }
+ globalThis.clearInterval = id => ticks.delete(id)
+ Object.defineProperty(document, 'hidden', {value:false, configurable:true})
+ window.hermesDesktop = {api:async () => ({feed:'timing',epoch:'timing',rev:1,bundles:{}})}
+ try {
+  for (const name of ['elapsed_layout', 'eta_ci_normal', 'eta_deploy_normal', 'eta_clock_normal']) {
+   current = {connectionId:'conn',profile:'default',session:`timing-${name}`}
+   const model=structuredClone(cases[name].model), original=JSON.stringify(model)
+   await React.act(async () => m.ingestBundle(current.connectionId,current.profile,{session:current.session,model}))
+   await paint(J.jsx(m.Panel, {}))
+   const read = () => document.querySelector(name === 'elapsed_layout' ? '[data-row-detail]' : '[data-wait-eta]')?.textContent
+   now=cases[name].now
+   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   const before=read(); assert.ok(before)
+   now+=60
+   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   assert.notEqual(read(),before)
+   const after=read()
+   // A replacement is the same wire snapshot, not a preformatted JS imitation.
+   await React.act(async () => m.ingestBundle(current.connectionId,current.profile,{session:current.session,model:structuredClone(model)}))
+   assert.equal(read(),after)
+   await paint(null); await paint(J.jsx(m.Panel, {}))
+   assert.equal(read(),after)
+   assert.equal(JSON.stringify(model),original)
+  }
+ } finally {
+  await paint(null); m.resetFeedForTests(); Date.now=originalNow
+  globalThis.setInterval=originalInterval; globalThis.clearInterval=originalClear
+  if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor); else delete document.hidden
+  delete window.hermesDesktop
+  current={connectionId:'conn',profile:'default',session:'chat'}
+ }
+})
+
 test('clock text boundaries, invalid values and legacy strings stay presentation-only', () => {
  const now = 1800000000
  assert.equal(m.formatClockText([{timestamp: now - 59, format: 'ago'}], now), 'just now')
@@ -700,7 +751,11 @@ test('header counts/pips remain server values, not recomputed row totals', async
  const model = structuredClone(publicCases.all_sections.model)
  model.header.counts.running = 78; model.header.pips = [{ section: 'running', count: 91, label: 'hub value' }]
  await paint(m.renderModel(model))
- assert.equal(document.querySelector('[data-model-pip]').textContent, '91 hub value')
+ const pip = document.querySelector('[data-model-pip]')
+ // The hub count sits inside the numbered square; the section words move to the tooltip.
+ assert.equal(pip.textContent, '91')
+ assert.equal(pip.querySelector('[data-card-colour]').dataset.cardColour, 'blue')
+ assert.equal(pip.title, '91 hub value')
  assert.equal(document.querySelector('[data-model-section="running"] h3').textContent, 'In progress · 78')
 })
 test('hub renderer is unconditional, registers no settings, and switches cached scopes without raw reads', async () => {

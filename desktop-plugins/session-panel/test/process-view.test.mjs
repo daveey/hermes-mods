@@ -15,12 +15,12 @@ export async function resolve(s,c,n){
  const stubs={
  'react':'const R=globalThis.processViewHarness.React;export const useState=R.useState,useEffect=R.useEffect',
  'react/jsx-runtime':'const J=globalThis.processViewHarness.J;export const jsx=J.jsx,jsxs=J.jsxs',
- '@hermes/plugin-sdk':'const H=globalThis.processViewHarness,R=H.React;export const host=H.host,Dialog=p=>R.createElement("div",null,p.children),DialogContent=p=>R.createElement("div",{"data-process-view":p["data-process-view"]},p.children),DialogHeader=p=>R.createElement("header",null,p.children),DialogTitle=p=>R.createElement("h2",null,p.children),DialogDescription=p=>R.createElement("p",null,p.children)'
+ '@hermes/plugin-sdk':'const H=globalThis.processViewHarness,R=H.React;export const COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get?.(),host=H.host,Dialog=p=>R.createElement("div",null,p.children),DialogContent=p=>R.createElement("div",{"data-process-view":p["data-process-view"]},p.children),DialogHeader=p=>R.createElement("header",null,p.children),DialogTitle=p=>R.createElement("h2",null,p.children),DialogDescription=p=>R.createElement("p",null,p.children)'
  };return stubs[s]?{url:'data:text/javascript,'+encodeURIComponent(stubs[s]),shortCircuit:true}:n(s,c)
 }
-export async function load(u,c,n){if(u.endsWith('/process-view.js')){const fs=await import('node:fs/promises');return{format:'module',source:await fs.readFile(new URL(u),'utf8'),shortCircuit:true}}return n(u,c)}
+export async function load(u,c,n){if(u.endsWith('/plugin.js')){const fs=await import('node:fs/promises');return{format:'module',source:await fs.readFile(new URL(u),'utf8'),shortCircuit:true}}return n(u,c)}
 `))
-const {processRoute,readProcessView,ProcessView}=await import('../process-view.js')
+const {processRoute,readProcessView,ProcessView}=await import('../plugin.js')
 const target=Object.freeze({id:'proc_owned',session:'stored-owner',gateway:'owner',profile:'work',title:'sleep 600'})
 const gateways=[{id:'owner-connection',kind:'remote'},{id:'ambient',kind:'local'}]
 const bridge={connectionForHubGateway:g=>g==='owner'?'owner-connection':null}

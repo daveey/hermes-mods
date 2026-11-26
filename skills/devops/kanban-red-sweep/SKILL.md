@@ -84,9 +84,10 @@ or its newest comments name a decision card the owner already filed, file no ask
 in the report. Report **unlinked** (no links, or all released) and
 **reaped-only** cards separately: no chat will ever pick them up.
 
-Then for each card read the latest ~6 `task_events` and the last 2 `task_comments`. The latest comment often
-already says "resolved", "green again" or "replacement found". The block reason alone (newest `blocked` event payload, not a `tasks`
-column) is stale evidence.
+For a session-wide unblock, inspect every linked triage card, including spend holds without a human block_kind—not just the latest notice. Walk delivery prerequisites and read each blocker on its home gateway; do not expand to a fleet sweep unless requested. A prior release can be
+superseded by a later STOP, while reviews on a parallel branch keep arriving. Record the actual blocking card,
+restriction, renewal authority and next deliverable before acting; verify its new run after release. Report
+parallel PR progress separately, never as evidence that the blocked delivery chain resumed.
 For a card from a recurring reporter, also list newer cards with the same title or `created_by`: a done sibling
 may have settled the question. Then read the files it claims on disk, since a redeploy from the tracked source
 can revert a worker's local edit after the card reported it.
@@ -131,6 +132,11 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   Plain `triage` (no hold) also refuses `not_held`: use `hermes kanban [--board B] promote <id> "<reason>"`.
   A card you expect to stop again (a narrow run override against a multi-run rollout) gets a wider
   `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
+  Its limits are window totals that include spend already recorded, so pass spent + the extra you mean (the refusal
+  prints both numbers); a bare `--runs 30` below what's spent trips the card at once.
+  A released card that then sits `ready` with workers logging `skipped_ineligible(refusal_exhausted)` has no
+  unrefused provider left right now: on a worker, `kanban_provider_walls.active_walls()` shows which peers are
+  walled and until when. It starts by itself when the wall ends, so comment that time; don't bump, move or release it again.
   `unblock` only re-triages a spend hold. Fallback without `release`: re-scope comment, `renew-scope --episode <stop
   uid> --mandate-comment <cid>`, then `promote --seen <cid>`.
   Release on a worker-homed card this chat created (run via `hub-worker-exec <w>`) is refused `not_scope_authority`
@@ -175,10 +181,10 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 - A card you unblock may sit `ready` behind a full worker pool. First read where it really is: `hermes kanban show <id>`
   prints the dispatcher's own queue line (`waiting for a local slot: ~N ahead (k on other boards sharing these slots),
   r/limit running`). Don't go by a priority-sorted `ready` list: cards that other cards wait on run ahead of any
-  priority, and boards on one host share its slots. Then, in the same turn, set
-  `hermes kanban edit <id> --priority <above the ready head>` for every card you unblock (guessed decisions too).
-  A bump below the head leaves the card unstarted, and the board flags it to the chat after 30 min. No priority
-  gets past cards that others wait on: move a portable card instead, or do its step here. If the hub or a worker is full, move a portable card to the whole pool, never to one named worker:
+  priority, and boards on one host share its slots. For `matching_pool_busy` with recent same-label claims,
+  retain placement and capabilities: a priority bump cannot repair a dependency or create capacity. Read the
+  current priority before any justified edit; verify a claimed run separately from a successful edit. Move only
+  a genuinely host-pinned portable card to the whole pool, never merely to another busy named worker:
   `hermes kanban move <id> --pool --reason "..."` (= `--runs-on pool:worker`; pool membership is the Board label
   `pool:worker`, on workers whose core has PR #1247). A `machine:<worker>` pin waits again as soon as that worker
   fills or is held. Pin one worker only

@@ -1,9 +1,11 @@
-// Regression: every `sessions.changed` (every ~1-2 s while any turn streams) forced a full session
-// re-read of the active connection 400 ms later. On the primary connection Desktop main fans that
-// read out to every connected gateway (up to 5 pages each): a 40 s audit on a 20-gateway Desktop saw
-// 43 forced reads -> ~1,500 backend /api/sessions requests. Fix: a change only marks rows pending;
-// forced refreshes are at least CHANGE_REFRESH_MIN_MS apart, and typing @ (provide) refreshes a
-// pending change at once so the list is still fresh when it is used.
+// Regression: `sessions.changed` re-read the whole session list of the active connection on a timer.
+// First every 400 ms (a 40 s audit on a 20-gateway Desktop saw ~1,500 backend list requests), then, after
+// the first fix, once per 30 s. On a gateway where some session changes every second that 30 s cap is a
+// poll: the hub's request stats showed 74% of its `GET /api/profiles/sessions` traffic was this plugin
+// re-reading 433 rows (one 500-row request, or five paged ones through a registry connection) with nobody
+// typing `@`. Fix: a change only marks the rows pending. Typing `@` (provide) refreshes a pending change,
+// at most once per TYPING_REFRESH_MIN_MS, and rows older than a minute refresh on provide() even when the
+// change event was lost.
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import { test } from 'node:test'
@@ -44,42 +46,87 @@ async function boot() {
   return { mod, sessions, handlers, reads: () => sessionReads, dispose: () => disposers.forEach(fn => fn()) }
 }
 
-test('a stream of sessions.changed events forces at most one session re-read per window', async () => {
+/** Run `fn` with Date.now() moved `ms` ahead: the plugin sees a later wall clock. */
+async function later(ms, fn) {
+  const real = Date.now
+  Date.now = () => real() + ms
+  try {
+    return await fn()
+  } finally {
+    Date.now = real
+  }
+}
+
+test('sessions.changed events alone never re-read the session list', async () => {
   const { handlers, reads, dispose } = await boot()
   await sleep(50) // register()'s initial stale fetch lands
   const baseline = reads()
-  // One event every 450 ms for ~2.7 s: the old 400 ms debounce re-read after each of them.
+  // One event every 450 ms for ~2.7 s: the 400 ms debounce re-read after the first of them.
   for (let i = 0; i < 6; i++) {
     handlers['sessions.changed']()
     await sleep(450)
   }
-  const forced = reads() - baseline
-  assert.ok(forced <= 1, `expected at most 1 forced re-read in the window, got ${forced}`)
+  assert.equal(reads() - baseline, 0, 'a change with nobody typing @ must not read the list')
   dispose()
 })
 
-test('typing @ after a pending change refreshes at once', async () => {
+test('typing @ after a change refreshes at once, and only once per change', async () => {
   const { sessions, handlers, reads, dispose } = await boot()
   await sleep(50)
+  const baseline = reads()
   handlers['sessions.changed']()
-  await sleep(450) // first change refreshes after the debounce
-  const afterFirst = reads()
-  handlers['sessions.changed']() // now throttled: no read for CHANGE_REFRESH_MIN_MS
-  await sleep(450)
-  assert.equal(reads(), afterFirst, 'a throttled change must not re-read on its own yet')
   sessions.provide('the')
   await sleep(30)
-  assert.equal(reads(), afterFirst + 1, 'provide() must refresh the pending change immediately')
+  assert.equal(reads(), baseline + 1, 'provide() must refresh the pending change immediately')
   sessions.provide('them')
   await sleep(30)
-  assert.equal(reads(), afterFirst + 1, 'no pending change: further keystrokes must not re-read')
+  assert.equal(reads(), baseline + 1, 'no pending change: further keystrokes must not re-read')
   dispose()
 })
 
-test('changeRefreshDelay keeps the debounce when idle and stretches it inside the window', async () => {
-  const { mod } = await boot()
-  const { changeRefreshDelay, CHANGE_REFRESH_MIN_MS, CHANGE_DEBOUNCE_MS } = mod
-  assert.equal(changeRefreshDelay(1_000_000, 0), CHANGE_DEBOUNCE_MS)
-  assert.equal(changeRefreshDelay(1_000_000, 1_000_000 - 5_000), CHANGE_REFRESH_MIN_MS - 5_000)
-  assert.equal(changeRefreshDelay(1_000_000, 1_000_000 - CHANGE_REFRESH_MIN_MS - 1), CHANGE_DEBOUNCE_MS)
+test('changes that keep arriving while typing refresh at most once per TYPING_REFRESH_MIN_MS', async () => {
+  const { mod, sessions, handlers, reads, dispose } = await boot()
+  await sleep(50)
+  const baseline = reads()
+  handlers['sessions.changed']()
+  sessions.provide('t')
+  await sleep(30)
+  for (const q of ['th', 'the', 'them']) {
+    handlers['sessions.changed']()
+    sessions.provide(q)
+    await sleep(30)
+  }
+  assert.equal(reads(), baseline + 1, 'keystrokes inside the window share one refresh')
+  assert.ok(mod.TYPING_REFRESH_MIN_MS >= 1_000 && mod.TYPING_REFRESH_MIN_MS < 60_000)
+  await later(mod.TYPING_REFRESH_MIN_MS + 1, async () => {
+    sessions.provide('theme')
+    await sleep(30)
+  })
+  assert.equal(reads(), baseline + 2, 'the change left pending is refreshed by the first keystroke after the window')
+  dispose()
+})
+
+test('a lost sessions.changed is covered: provide() re-reads rows older than a minute', async () => {
+  const { sessions, reads, dispose } = await boot()
+  await sleep(50)
+  const baseline = reads()
+  sessions.provide('the')
+  await sleep(30)
+  assert.equal(reads(), baseline, 'fresh rows and no change: no read')
+  await later(61_000, async () => {
+    sessions.provide('the')
+    await sleep(30)
+  })
+  assert.equal(reads(), baseline + 1, 'stale rows must be re-read with no change event at all')
+  dispose()
+})
+
+test('a pending change arms no timer: nothing reads after dispose()', async () => {
+  const { handlers, reads, dispose } = await boot()
+  await sleep(50)
+  const baseline = reads()
+  handlers['sessions.changed']()
+  dispose()
+  await sleep(500)
+  assert.equal(reads(), baseline)
 })

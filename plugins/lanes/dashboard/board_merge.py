@@ -2,14 +2,52 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
+import logging
 import sqlite3
+import threading
 import time
+from time import thread_time
 
 
-def arm_deadline(db):
-    """Each board gets its own query budget, not time spent on sibling boards."""
-    deadline = time.monotonic() + 2
-    db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+# A board's budget is the CPU its own reader thread spent. A wall-clock deadline
+# also charged the board for every other thread's turn at the interpreter lock:
+# in a busy backend a healthy 0.3 s read was interrupted after 2 s of waiting.
+BUDGET_CPU_SECONDS = 2
+# Starvation backstop only: the read snapshot pins the board's WAL, so even a
+# reader that is not at fault must not hold it open indefinitely.
+SNAPSHOT_WALL_SECONDS = 30
+# SQLite calls back into Python (reacquiring the interpreter lock) once per this
+# many VM steps. At 1000 a contended reader queued for the lock every few
+# microseconds of work, so the check itself consumed the budget it enforced.
+CHECK_EVERY_VM_STEPS = 100_000
+
+
+def arm_deadline(db, *, phase='open'):
+    """Each board gets its own query budget, not time spent on sibling boards or other threads."""
+    started = time.monotonic()
+    owner = threading.get_ident()
+    cpu_started = thread_time()
+    reported = False
+
+    def progress():
+        nonlocal reported, owner, cpu_started
+        if threading.get_ident() != owner:
+            # Thread CPU clocks are per thread: restart the budget for a new reader.
+            owner, cpu_started = threading.get_ident(), thread_time()
+        spent = thread_time() - cpu_started
+        waited = time.monotonic() - started
+        expired = spent > BUDGET_CPU_SECONDS or waited > SNAPSHOT_WALL_SECONDS
+        if expired and not reported:
+            reported = True
+            # SQLite reports only "interrupted" at the next statement. Identify
+            # this handler rather than attributing the failure to that statement
+            # or to another connection's cancellation/budget.
+            logging.getLogger(__name__).warning(
+                'lanes board_merge deadline expired: phase=%s wall=%.3fs thread_cpu=%.3fs',
+                phase, waited, spent)
+        return int(expired)
+
+    db.set_progress_handler(progress, CHECK_EVERY_VM_STEPS)
 
 
 @contextmanager

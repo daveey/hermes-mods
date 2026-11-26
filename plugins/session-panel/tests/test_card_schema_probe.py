@@ -52,24 +52,20 @@ def test_ready_since_matches_the_pragma_probe(api, board, monkeypatch):
     assert api._task_columns(r.conn(path)) == frozenset(cols)
 
 
-def _hide_panel_schema_helper(api, monkeypatch):
-    """Simulate the panel's optional import, not a broken mixed-version core.
-
-    Current actionability also imports table_columns. Poisoning sys.modules makes
-    that independent real producer fail and changes the complete card payload.
-    Keep it running; only the panel's compatibility lookup should see ImportError.
-    """
+def _hide_panel_helper(api, monkeypatch):
+    # Simulate an older panel/core seam, not a broken current core: actionability
+    # also imports this helper and must remain equivalent across these reads.
     original = builtins.__import__
     attempts = []
 
-    def importing(name, globals=None, locals=None, fromlist=(), level=0):
+    def import_for_panel(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'hermes_cli.kanban_table_columns' and (globals or {}).get('__name__') == api.__name__:
             attempts.append(name)
             raise ImportError('older panel core has no table-columns helper')
         return original(name, globals, locals, fromlist, level)
 
-    monkeypatch.setattr(builtins, '__import__', importing)
-    return attempts, original
+    monkeypatch.setattr(builtins, '__import__', import_for_panel)
+    return attempts
 
 
 def test_older_core_without_the_helper_keeps_the_pragma(api, board, monkeypatch):
@@ -77,7 +73,7 @@ def test_older_core_without_the_helper_keeps_the_pragma(api, board, monkeypatch)
     tid = _ready_card(conn)
     r = readers_for(api, path, monkeypatch)
     with_helper = r.card(tid, 'default')
-    attempts, _ = _hide_panel_schema_helper(api, monkeypatch)
+    attempts = _hide_panel_helper(api, monkeypatch)
     monkeypatch.setattr(api, '_TABLE_COLUMNS', None)  # a fresh process on that older core
     r2 = readers_for(api, path, monkeypatch)
     seen = _traced(r2, path)
@@ -90,13 +86,13 @@ def test_a_missing_helper_is_looked_up_once_per_process(api, board, monkeypatch)
     path, conn = board
     tid = _ready_card(conn)
     monkeypatch.setattr(api, '_TABLE_COLUMNS', None)
-    attempts, original = _hide_panel_schema_helper(api, monkeypatch)
     r = readers_for(api, path, monkeypatch)
-    expected = r.card(tid, 'default')
-    assert api._TABLE_COLUMNS is False
-    assert attempts == ['hermes_cli.kanban_table_columns']
+    with monkeypatch.context() as hidden:
+        attempts = _hide_panel_helper(api, hidden)
+        expected = r.card(tid, 'default')
+        assert api._TABLE_COLUMNS is False
+        assert attempts == ['hermes_cli.kanban_table_columns']
     # The helper "appears" later in the process: the cached answer stands, the PRAGMA fallback keeps working.
-    monkeypatch.setattr(builtins, '__import__', original)
     seen = _traced(r, path)
     assert r.card(tid, 'default') == expected
     assert any('PRAGMA table_info(tasks)' in s for s in seen)

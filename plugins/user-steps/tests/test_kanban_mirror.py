@@ -100,6 +100,75 @@ def fixture(tmp_path):
     return mirror, store, path, hr
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_explicit_revision_dispatches_without_reusing_old_projection(tmp_path, remote):
+    mirror, store, path, hr = fixture(tmp_path)
+    rows = []
+    if remote:
+        from test_remote_card_courier import remote_row
+        mirror.boards = {}
+        rows = [remote_row(hr)]
+        mirror.remote.cards = lambda owner: rows
+    mirror.reconcile(OWNER)
+    projected = store.requests(OWNER)[0]
+    replacement = dict(projected, title="Expanded approval", kind="approval",
+                       choices=[dict(id="approve", label="Approve expanded scope", effect="approve")],
+                       outcomes=dict(approve="Deliver approval to the owning chat", revise="Prepare a replacement"))
+    revised = store.revise(OWNER, projected["requestId"], 1, replacement)
+    mirror.reconcile(OWNER)  # housekeeping before the click must preserve the explicit ask
+    assert store.requests(OWNER) == [revised]
+    if not remote:
+        successor = dict(OWNER, storedSessionId="session-b")
+        mirror.tip = lambda sid: "session-b"
+        mirror.reconcile(successor)
+        assert store.requests(OWNER) == [revised]
+        assert not store.requests(successor)
+    op = store.decide(OWNER, dict(requestId=revised["requestId"], expectedRevision=2,
+                                choiceId="approve", idempotencyKey="explicit-revision"))["operation"]
+    mod = load_module("revision_delivery_test", ROOT / "kanban_mirror.py")
+    calls = []
+
+    class Ordinary:
+        def deliver(self, operation):
+            calls.append(operation["operationId"])
+            return dict(destination="owning_chat", deliveryId=operation["operationId"])
+
+        def readback(self, operation, receipt):
+            return receipt == dict(destination="owning_chat", deliveryId=operation["operationId"])
+
+    receiver = mod.Delivery(mirror, Ordinary())
+    mirror.reconcile(OWNER)  # pending decisions must not be cancelled by old projection upkeep
+    if remote:
+        rows.clear()  # even source departure is contextual, not authority over the explicit revision
+        mirror.reconcile(OWNER)
+    result = store.dispatch(OWNER, op["operationId"], receiver)
+    assert result["operation"]["dispatchState"] == "delivered"
+    assert store.dispatch(OWNER, op["operationId"], receiver) == result
+    assert calls == [op["operationId"]]
+    with sqlite3.connect(path) as c:
+        assert c.execute("SELECT status FROM tasks").fetchone()[0] == "blocked"
+        assert not c.execute("SELECT * FROM task_comments").fetchall()
+    # The projection remains bound to its original request, never rewritten to issue authority.
+    assert json.loads(mirror.binding(OWNER, projected["requestId"])["request"]) == projected
+
+
+@pytest.mark.parametrize("revision,with_alias", [(0, False), (1, False), (2, True)])
+def test_mismatched_projection_cannot_fall_back_at_same_or_older_revision(tmp_path, revision, with_alias):
+    mirror, store, _, _ = fixture(tmp_path)
+    mirror.reconcile(OWNER)
+    projected = store.requests(OWNER)[0]
+    op = decide(store, projected)
+    op = json.loads(json.dumps(op))
+    op["intent"]["request"]["title"] = "Altered request"
+    op["intent"]["request"]["revision"] = revision
+    if with_alias:
+        op["intent"]["request"]["aliases"] = [dict(type="kanban", id="t_test", board="default")]
+    mod = load_module("revision_refusal_test", ROOT / "kanban_mirror.py")
+    ordinary = SimpleNamespace(deliver=lambda _: pytest.fail("unsafe ordinary fallback"))
+    with pytest.raises(core.ActionError, match="Exact server projection binding required"):
+        mod.Delivery(mirror, ordinary).deliver(op)
+
+
 def decide(store, request, index=1):
     ch = request["choices"][index]
     return store.decide(

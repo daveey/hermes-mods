@@ -26,7 +26,7 @@ test('unlinked red rows share pushed snapshot, exclude linked asks and clear aft
   store.publish({ attention: { available: true, rows }, status: { you: 2 } })
   const view = await mount(React.createElement(P.UnlinkedAsks, { ctx }))
   try {
-    assert.equal(view.container.querySelector('h3').textContent, 'Unlinked asks · 1')
+    assert.equal(view.container.querySelector('h3').textContent, 'Asks outside chats · 1')
     assert.equal(view.container.querySelectorAll('button').length, 1)
     assert.equal(view.container.querySelector('button').textContent, 'Choose route')
     assert.equal(view.container.querySelector('button').style.color, 'rgb(239, 68, 68)')
@@ -164,6 +164,49 @@ test('mounted canonical presentation contract keeps four grey-linked asks red in
       assert.equal((paintedRed ? new Set(session.needs_you.map(ask => ask.ref)).size : 0) + fallback, snap.status.you)
       assert.equal(Q.hasRedAskCoverage(session), paintedRed, 'coverage agrees with actual core canonical selector')
     }
+  } finally { await pane.close() }
+})
+
+test('same-id sessions only cover the ask on its linked gateway', () => {
+  const row = { id: 'ask', target: { board: 'bb' }, links: [
+    { chat_gateway: 'edge-b', chat_profile: null, chat_session: 'kanban_owner_terminal' }] }
+  const session = gateway => ({ id: 'kanban_owner_terminal', connection_id: `conn-${gateway}`,
+    outcome: { status: { ...outcome().status, identity: {
+      gateway, profile: 'default', session_id: 'kanban_owner_terminal', owner_epoch: 'epoch' } } },
+    needs_you: [{ kind: 'card', ref: 'bb/ask' }] })
+  const a = session('edge-a'), b = session('edge-b')
+  const view = { attention: { available: true, rows: [row] } }
+  assert.deepEqual(P.uncoveredAsks(view, [a]), [row], 'foreign twin cannot suppress fallback')
+  assert.deepEqual(P.uncoveredAsks(view, [a, b]), [])
+  assert.deepEqual(P.uncoveredAsks(view, [b, a]), [])
+})
+
+test('muted and offline owners remain red fallbacks with explicit reasons', async () => {
+  const row = { id: 'ask', key: 'default/ask', title: 'Choose route', links: [
+    { chat_gateway: 'example', chat_profile: 'default', chat_session: 'chat' }] }
+  const sessions = [{ id: 'chat', outcome: outcome('blocked'), muted: true,
+    needs_you: [{ kind: 'card', ref: 'default/ask' }] }]
+  const Q = await loadPlugin({ useSidebarSessions: () => sessions,
+    SidebarSection: ({ label, children }) => React.createElement('section', null, label, children),
+    SidebarSectionRow: ({ label, meta, tip, accentColor }) => React.createElement('span',
+      { 'data-ask': '1', title: tip, style: { color: accentColor } }, label, meta) })
+  const ctx = {}, store = Q.attentionStore(ctx)
+  const snap = { attention: { available: true, rows: [row] } }
+  Q.sourceFor(ctx).subscribe = () => Object.assign(() => {}, { update() {}, refresh() {} })
+  store.publish(snap)
+  const pane = await mount(React.createElement(Q.UnlinkedAsks, { ctx }))
+  try {
+    assert.match(pane.container.textContent, /Asks outside chats/)
+    assert.match(pane.container.textContent, /Chat muted/)
+    assert.equal(pane.container.querySelector('[data-ask]').style.color, 'rgb(239, 68, 68)')
+    sessions[0] = { id: 'chat', outcome: outcome(), offline_cached: true }
+    await React.act(async () => store.publish({ ...snap }))
+    assert.match(pane.container.textContent, /Chat offline/)
+    // Live SDK recents may be red while the actual sidebar hook has a cached
+    // copy with the same canonical revision and without needs_you.
+    sessions[0] = { id: 'chat', outcome: outcome(), needs_you: [{ kind: 'card', ref: 'default/ask' }] }
+    await React.act(async () => store.publish({ ...snap }))
+    assert.ok(pane.container.querySelector('[data-ask]') === null)
   } finally { await pane.close() }
 })
 

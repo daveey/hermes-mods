@@ -1,8 +1,10 @@
 // With the hub session panel loaded it draws every ask's options and posts plain-option decisions. This plugin keeps
 // only what the panel cannot: free-text decisions (revise / Other), pending-delivery Check/Retry readback recovery,
 // the plan-less ask (composer draft) and "Not needed" withdraw. These tests pin that retained behaviour.
+import './fixtures/cache-hooks.mjs'
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { createRequire, register } from 'node:module'
 import { resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -37,25 +39,35 @@ after(async () => { await React.act(async () => root.unmount()); dom.window.clos
 const panelOn = () => { window.__sessionPanel = { active: true } }
 const panelOff = () => { delete window.__sessionPanel }
 
+test('runtime source contains no unreachable legacy view or test-only exports', () => {
+ const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+ for (const name of ['Strip', 'StepRow', 'CardRow', 'IssueRow', 'StepButtons', 'actionsFor', 'performAction', 'projectStrip', 'sameCard', 'cardSummary', 'actionableCard', 'askedAgo', 'readMinimized', 'writeMinimized', 'choiceStyle', 'optionStyle', 'primaryStyle', 'recommendedPill', 'resetLedgerCacheForTests', 'getSnapshot', 'clearStepCache', 'resetCanonicalCacheForTests', 'clearFeatureCache', 'cachedRequests']) {
+  assert.doesNotMatch(source, new RegExp(`\\b${name}\\b`), name)
+ }
+ assert.doesNotMatch(source, /!companion|companion\s*[=:]|data-action-queue-header|Filter decisions/)
+})
+
 test('companion row draws no plan, options or card tiles, only the text-needing choice', async () => {
  const r = approval()
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}), companion: true }))
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
  const text = el().textContent
  for (const s of ['EXACT-PLAN-TEXT', 'LIMIT-4-HOURS', 'EXCLUDED-SPEND', 'Stage A only']) assert.ok(!text.includes(s), s)
  assert.deepEqual(labels(), ['Request changes'])
- for (const sel of ['[data-decision-option]', '[data-clarify-row]', '[data-choice-letter]', '[data-action-scope]']) assert.equal(el().querySelector(sel), null, sel)
+ for (const sel of ['[data-decision-option]', '[data-clarify-row]', '[data-choice-letter]', '[data-action-scope]']) assert.ok(el().querySelector(sel) === null, sel)
 })
 
 test('companion: revise text is edited and posted unchanged', async () => {
  const r = approval(), calls = []
  const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'op-rev', dispatchState: 'pending' } } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, companion: true }))
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
  await click('Request changes')
  assert.equal(document.activeElement, el().querySelector('textarea'))
  assert.equal(btn('Send revision').disabled, true, 'empty text cannot be sent')
  await type('Add a rollback step')
  await click('Send revision')
- const post = calls.find(([, o]) => o.method === 'POST')
+ const posts = calls.filter(([, o]) => o.method === 'POST'); assert.equal(posts.length, 1)
+ const post = posts[0]
+ assert.equal(post[1].connectionId, 'C1'); assert.equal(post[1].profile, 'default')
  assert.equal(post[0], `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
  const { idempotencyKey, ...payload } = post[1].body
  assert.ok(idempotencyKey)
@@ -65,12 +77,17 @@ test('companion: revise text is edited and posted unchanged', async () => {
 test('companion: a card question keeps Other (type your answer) and posts the typed text; plain options are the panel\'s', async () => {
  const r = question(), calls = []
  const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'op-other', dispatchState: 'pending' } } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, companion: true }))
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
  assert.deepEqual(labels(), ['Other'])
  assert.ok(!el().textContent.includes('CARD-DETAILS'))
  await click('Other'); await type('Use purple'); await click('Send answer')
- const post = calls.find(([, o]) => o.method === 'POST')
- assert.equal(post[1].body.choiceId, 'answer-text'); assert.equal(post[1].body.revisionText, 'Use purple'); assert.equal(post[1].body.expectedRevision, 1)
+ const posts = calls.filter(([, o]) => o.method === 'POST'); assert.equal(posts.length, 1)
+ const post = posts[0]
+ assert.equal(post[0], `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
+ assert.equal(post[1].connectionId, 'C1'); assert.equal(post[1].profile, 'default')
+ const { idempotencyKey, ...payload } = post[1].body
+ assert.ok(idempotencyKey)
+ assert.deepEqual(payload, { session: 'S1', expectedRevision: 1, choiceId: 'answer-text', revisionText: 'Use purple' })
 })
 
 test('companion: pending delivery keeps Check status and Retry (same operation) with the decision locked', async () => {
@@ -88,14 +105,14 @@ test('companion: pending delivery keeps Check status and Retry (same operation) 
  }
  window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
  await m.refreshRequests(call)
- await show(React.createElement(m.ActionQueue, { key: 'pending', embedded: true, companion: true }))
+ await show(React.createElement(m.ActionQueue, { key: 'pending' }))
  assert.ok(el().querySelector('[data-action-request]'), 'a recorded-but-unconfirmed decision stays on screen under the panel')
  assert.match(el().textContent, /delivery unconfirmed/i)
  assert.ok(btn('Check status') && btn('Retry'))
  assert.ok(!labels().some(l => /Request changes|Approve/.test(l)), 'no new decision while one is recorded')
  await click('Retry')
  assert.deepEqual(seen.filter(([, mth]) => mth === 'POST').map(([p]) => p.replace(/\?.*/, '')), ['/api/plugins/user-steps/operations/op-pending/retry'])
- assert.equal(el().querySelector('[data-action-request]'), null, 'confirmed delivery clears the row')
+ assert.ok(el().querySelector('[data-action-request]') === null, 'confirmed delivery clears the row')
  delete window.hermesDesktop
 })
 
@@ -150,11 +167,11 @@ test('audit: a recorded decision the panel carries has no queue block; the same 
  window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
  window.__sessionPanel = { active: true, showsDecision: id => id === r.requestId }
  await m.refreshRequests(call)
- await show(React.createElement(m.ActionQueue, { key: 'carried', embedded: true, companion: true }))
- assert.equal(el().querySelector('[data-action-request]'), null, 'the panel row is the one status line')
+ await show(React.createElement(m.ActionQueue, { key: 'carried' }))
+ assert.ok(el().querySelector('[data-action-request]') === null, 'the panel row is the one status line')
  assert.doesNotMatch(el().textContent, /Delivering to chat|Recorded choice|Check status|Retry|unresolved/)
  window.__sessionPanel = { active: true, showsDecision: () => false }
- await show(React.createElement(m.ActionQueue, { key: 'uncarried', embedded: true, companion: true }))
+ await show(React.createElement(m.ActionQueue, { key: 'uncarried' }))
  assert.ok(el().querySelector('[data-action-request]'), 'a decision the panel does not show still surfaces here')
  delete window.hermesDesktop
  if (before) window.__sessionPanel = before; else panelOff()
@@ -177,9 +194,9 @@ for (const outcome of ['failed', 'unknown']) test(`companion: panel-carried ${ou
  try {
   await m.refreshRequests(call)
   // The panel posts the decision; its durable readback has already established the recovery phase.
-  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, companion: true }))
+  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
   assert.match(el().textContent, outcome === 'failed' ? /delivery unconfirmed/i : /outcome unknown/i)
-  await show(React.createElement(m.ActionQueue, { key: `recovery-${outcome}`, embedded: true, companion: true }))
+  await show(React.createElement(m.ActionQueue, { key: `recovery-${outcome}` }))
   assert.ok(el().querySelector('[data-action-request]'), `${outcome}: panel status must not hide recovery`)
   assert.ok(btn('Check status') && btn('Retry'), `${outcome}: both recovery controls remain`)
   assert.ok(!labels().some(l => /Request changes|Approve/.test(l)), 'recorded decisions stay locked')
@@ -217,7 +234,7 @@ test('transcript StepBox hides a recorded decision under the panel but keeps an 
 test('companion: a plan-less ask still offers Ask agent for the plan (composer draft) and draws no Approve', async () => {
  const r = approval({ title: 'No plan', scope: { complete: false, markdown: '', sourceRefs: [] } })
  drafts.length = 0
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}), companion: true }))
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
  assert.ok(!labels().includes('Approve') && !labels().includes('Request changes'))
  await click('Ask agent for the plan')
  assert.equal(drafts.length, 1)
@@ -228,7 +245,7 @@ test('companion: Not needed withdraw is kept when the owner advertises it', asyn
  m.clearFeatureCache(); m.resetCanonicalCacheForTests()
  const r = approval({ title: 'Withdraw me' }), calls = []
  const call = async (path, opts = {}) => { calls.push([path, opts]); if (path.endsWith('/ping')) return { features: ['withdraw'] }; return { request: { ...r, state: 'withdrawn' }, requests: [] } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, companion: true }))
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
  await React.act(async () => { await flush(); await flush() })
  await click('Not needed')
  const w = calls.find(([p]) => p.endsWith('/withdraw'))
@@ -241,30 +258,43 @@ test('companion: a plain open ask with nothing only this plugin can do draws no 
  const r = question({ choices: [{ id: 'c0', label: 'Red', effect: 'answer' }, { id: 'c1', label: 'Green', effect: 'answer' }] })
  await m.refreshRequests(async () => ({ requests: [r] }))
  window.hermesDesktop = { api: async ({ path }) => path.endsWith('/ping') ? { features: [] } : { requests: [r] } }
- await show(React.createElement(m.ActionQueue, { key: 'idle', embedded: true, companion: true }))
+ await show(React.createElement(m.ActionQueue, { key: 'idle' }))
  await React.act(async () => { await flush(); await flush() })
- assert.equal(el().querySelector('[data-action-request]'), null)
+ assert.ok(el().querySelector('[data-action-request]') === null)
  assert.equal(el().textContent.includes('Which color?'), false)
  delete window.hermesDesktop
 })
 
-test('without the panel the full row (plan, options, Approve) is unchanged', async () => {
- const r = approval()
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
- assert.ok(el().textContent.includes('EXACT-PLAN-TEXT')); assert.ok(labels().includes('Approve'))
+
+test('registered strip: without the panel it renders an error, never the old standalone queue or legacy strip', async () => {
+ const areas = [], dispose = m.default.register({ register: a => areas.push(a) }), wait = m.panelWait.ms
+ try {
+  const strip = areas.find(a => a.id === 'strip')
+  assert.equal(strip.render().type, m.PanelMissing, 'no fallback view')
+  await show(strip.render())
+  assert.equal(el().textContent, '', 'quiet while the panel may still be loading')
+  m.panelWait.ms = 0
+  await show(strip.render())
+  const alert = el().querySelector('[data-user-steps-panel-missing][role=alert]')
+  assert.ok(alert, 'error shown once the load window passes')
+  assert.match(alert.textContent, /Session panel did not load/)
+  assert.ok(el().querySelector('[data-action-queue]') === null)
+  assert.ok(el().querySelector('[data-user-steps-step], [data-user-steps-card]') === null)
+  panelOn()
+  await show(m.default && React.createElement(m.PanelMissing))
+  assert.ok(el().querySelector('[data-user-steps-panel-missing]') === null, 'a panel that loads late clears the error')
+ } finally { m.panelWait.ms = wait; panelOff(); dispose(); await show(null) }
 })
 
 test('registered strip: with the panel loaded it keeps the queue but never the legacy card/step tiles', async () => {
  const areas = [], dispose = m.default.register({ register: a => areas.push(a) })
  try {
   const strip = areas.find(a => a.id === 'strip')
-  const standalone = strip.render().props.children
-  assert.deepEqual(standalone.map(k => k.type), [m.ActionQueue, m.Strip], 'standalone: queue and legacy strip')
-  assert.equal(standalone[0].props.companion, false)
   panelOn()
-  const withPanel = strip.render().props.children
+  const withPanel = strip.render()
   assert.equal(withPanel.type, m.ActionQueue, 'panel loaded: only the queue, no legacy Strip')
-  assert.equal(withPanel.props.companion, true)
+  assert.deepEqual(withPanel.props, {})
+  assert.equal('Strip' in window.__userSteps, false)
  } finally { panelOff(); dispose() }
 })
 
@@ -275,7 +305,7 @@ test('companion queue polls requests itself (the legacy Strip that used to drive
  m.queuePoll.ms = 20
  Object.defineProperty(document, 'hidden', { value: false, configurable: true })
  try {
-  await show(React.createElement(m.ActionQueue, { key: 'poll', companion: true }))
+  await show(React.createElement(m.ActionQueue, { key: 'poll' }))
   const first = reads
   await React.act(async () => { await new Promise(res => setTimeout(res, 150)) })
   assert.ok(reads >= first + 2, `polled again (${first} -> ${reads})`)

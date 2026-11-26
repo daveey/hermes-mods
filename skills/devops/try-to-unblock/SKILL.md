@@ -133,7 +133,7 @@ Stop at the first rung that works. Each rung is something agents may do without 
 | d. Do it differently | Does a different route reach the same acceptance without the blocked step (another host, a test fixture, a read-only proof, a scratch environment, a smaller scope)? Not for a provider safety refusal (`safety_refused`): rewording, promoting or splitting the same work into a new card is routing around it. Promote is refused, and the split card's worker stops it as `scope_stopped`. | Re-plan on the card and continue. On a safety refusal, go to rung g: David picks between applying for provider access and dropping that approach for a different design. |
 | e. Someone else's work | Is it waiting on another card, CI, a deploy or a time? | `parents=[...]` or `kanban_schedule`, never a human block. |
 | f. Human-only, but automatable handoff | Does it need David's hands only to type a password or click a dialog? | `run_in_user_terminal` / `remote_approve_dialog` / `browser_focus` (asking-the-user). That is a live step, not a parked card. |
-| g. Scope/acceptance change | Does finishing require lowering the card's acceptance criteria, spending beyond budget, or giving up the goal? | Only this rung, and true human-only steps (physical device, his own re-auth, publishing as him, other people), justify a card. |
+| g. Scope/acceptance change | Does finishing require lowering the card's acceptance criteria, spending beyond budget, or giving up the goal? A "keep acceptance or waive it" pick where you recommend keeping it is not an acceptance change, and neither is a no-soak/no-more-runs limit set by an operator or spend reviewer that blocks the original acceptance. The owning chat lifts that limit narrowly and records a bounded decision (ask-gate refuses the ask as `owner_recommendation_hold`). | Only this rung, and true human-only steps (physical device, his own re-auth, publishing as him, other people), justify a card. |
 
 ### Bounded repeat attempts: the creator or orchestrator decides
 
@@ -200,6 +200,14 @@ authority needed rather than treating every spent attempt as a new approval requ
   their owners, noting the edge on their release card. Until core matches the Board (t_01a2060b18ab218d), core keeps
   promoting such a child and the Board keeps demoting it (`claim_rejected parents_not_done`), so re-point in the
   same turn as the archive.
+
+- **David answers the ask** → before writing his verdict or acting on it, re-read the held card's live status
+  (`hermes kanban why <id>`). His other chats may have disposed of it minutes earlier, for example by archiving it.
+  If they did, his two instructions conflict: record his new answer as evidence only, tell him the card's current
+  state, and offer the reversal. Don't act on the archived card, because each write there then needs a
+  correcting comment. Once the source is archived, the system moves its spend-stop escalation card to triage,
+  where `kanban complete` refuses it ("unknown id or terminal state"). Close it with `hermes kanban archive <id>`
+  and withdraw its `action_request` asks.
 
 ## 5. Leave a trail
 

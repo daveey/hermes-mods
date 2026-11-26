@@ -1,3 +1,4 @@
+import './fixtures/cache-hooks.mjs'
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire, register } from 'node:module'
@@ -22,6 +23,15 @@ const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
 const click = async label => React.act(async () => { const b = [...el().querySelectorAll('button')].find(b => (b.querySelector('[data-option-label]')?.textContent ?? b.textContent) === label); assert.ok(b, label); b.click(); await flush() })
+const type = async text => { const input = el().querySelector('textarea'); assert.ok(input, 'text editor'); await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(input, text); input.dispatchEvent(new dom.window.Event('input', { bubbles: true })); await flush() }) }
+const revise = async (text = 'Change the CPU limit') => { await click('Request changes'); await type(text); await click('Send revision') }
+const assertRevisionPost = ([path, opts], r, text = 'Change the CPU limit') => {
+ assert.equal(path, `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
+ assert.equal(opts.connectionId, route.connectionId); assert.equal(opts.profile, route.profile)
+ const { idempotencyKey, ...payload } = opts.body
+ assert.equal(typeof idempotencyKey, 'string'); assert.ok(idempotencyKey.length > 0)
+ assert.deepEqual(payload, { session: route.session, expectedRevision: r.revision, choiceId: 'edit', revisionText: text })
+}
 const owner = { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' }
 const alias = { gatewayId: 'G1', profile: 'default', type: 'kanban', board: 'ops', id: 'same' }
 const request = extra => ({ schemaVersion: 2, owner, requestId: '00000000-0000-4000-8000-000000000001', revision: 1, kind: 'approval', title: 'Stage A', scope: { complete: true, markdown: 'Exact adapter files, correctness tests and deliverables.\n' + 'Full inline plan. '.repeat(300), sourceRefs: [] }, limits: [{ key: 'CPU', value: '≤4 CPU core-hours' }, { key: 'RAM', value: '≤4 GiB RAM' }, { key: 'GPU', value: '≤2 existing GPU-hours', permissionRequired: 'owner permission' }], exclusions: ['No rentals or new spend', 'Full training needs separate budget approval'], outcomes: { approve: 'Stage A only', revise: 'Work remains blocked', decline: 'No execution' }, choices: [{ id: 'yes', label: 'Approve Stage A', effect: 'approve' }, { id: 'edit', label: 'Revise', effect: 'revise' }, { id: 'no', label: 'Decline', effect: 'decline' }], aliases: [alias], state: 'open', ...extra })
@@ -38,12 +48,13 @@ test('canonical projection uses exact identity and qualified aliases only', () =
  assert.equal(m.requestForSource([r], { ...alias, id: 'similar title' }), null)
 })
 
-test('missing scope disables approve; exact limits and long scope stay inline; receipt is passive', async () => {
+test('missing scope offers only agent completion; receipt stays passive', async () => {
  const r = request({ scope: { complete: false, markdown: 'Missing exact plan', sourceRefs: [] } })
  await show(React.createElement(m.DecisionRow, { request: r, route, call: async () => ({}) }))
- assert.equal([...el().querySelectorAll('button')].some(b => b.textContent === 'Approve'), false, 'no greyed-out Approve for a plan-less ask')
+ assert.equal([...el().querySelectorAll('button')].some(b => b.textContent === 'Request changes'), false, 'no greyed-out Approve for a plan-less ask')
  assert.doesNotMatch(el().textContent, /keep work blocked|Work stays blocked/)
- for (const s of ['≤4 CPU core-hours','≤4 GiB RAM','owner permission','Full training needs separate budget approval']) assert.ok(el().textContent.includes(s))
+ assert.deepEqual([...el().querySelectorAll('button')].map(b => b.textContent), ['Ask agent for the plan', 'Dismiss'])
+ assert.ok(el().querySelector('[data-action-scope], [data-action-limits]') === null, 'the panel owns plan rendering')
  for (const b of el().querySelectorAll('button')) assert.equal(b.style.minHeight, '44px')
  await show(React.createElement(m.StepBox, { attrs: { id: 'us_abcdef01', s: 'S1', t: 'Original receipt ~/plan.md' }, deps: { call: async () => ({ step: { id: 'us_abcdef01', text: 'Original', status: 'open' } }) } }))
  assert.equal(el().querySelectorAll('button').length, 0)
@@ -64,8 +75,8 @@ test('boolean permissionRequired (the backend contract since 4affdc54) is valid 
  assert.doesNotMatch(el().textContent, /Action queue unavailable/)
  assert.match(el().textContent, /Grow the disk further\?/)
  await show(React.createElement(m.DecisionRow, { request: freshRequest({ limits: [{ key: 'size', value: '600 GiB', permissionRequired: true }, { key: 'cost', value: '+$16', permissionRequired: false }] }), route, call: async () => ({}) }))
- const items = [...el().querySelectorAll('[data-action-limits] li')].map(li => li.textContent)
- assert.deepEqual(items, ['size: 600 GiB — permission: granted if you approve', 'cost: +$16'])
+ assert.deepEqual([...el().querySelectorAll('button')].map(b => b.textContent), ['Request changes'], 'valid boolean limits retain the companion text path')
+ assert.ok(el().querySelector('[data-action-limits]') === null)
  await show(null); delete window.hermesDesktop
 })
 
@@ -89,11 +100,12 @@ test('queue timeout names the route, explains read-only recovery, and preserves 
  assert.match(alert.textContent, /Reload actions.*does not submit or resend a decision/)
  assert.match(alert.textContent, /10000ms/)
  assert.match(el().textContent, /Keep this pending ask/)
- const decision = [...el().querySelectorAll('[data-decision-effect="approve"]')]
+ const decision = [...el().querySelectorAll('[data-decision-effect="revise"]')]
+ assert.equal(decision.length,1,'cached companion control stays visible')
  assert.ok(decision.every(b => b.disabled), 'cached ask has no enabled approval control')
  failure = false
  await click('Reload actions')
- assert.equal(el().querySelector('[role="alert"]'), null)
+ assert.ok(el().querySelector('[role="alert"]') === null)
  assert.equal(calls.some(c => c.method === 'POST'), false, 'reload is only a read, not delivery retry')
  await show(null); delete window.hermesDesktop
 })
@@ -107,28 +119,6 @@ test('queue capacity refusal remains visible and explains that the read never st
  await show(null); delete window.hermesDesktop
 })
 
-test('scoped approval preserves Go and Change plan labels and posts the bound Go choice', async () => {
- const r = freshRequest({ revision: 7, choices: [{ id: 'go', label: 'Go', effect: 'approve' }, { id: 'change-plan', label: 'Change plan', effect: 'revise' }] })
- const calls = []
- const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'go-label', dispatchState: 'pending' } } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
- const labels = [...el().querySelectorAll('button')].map(b => b.textContent)
- assert.ok(labels.includes('Go'))
- assert.ok(labels.includes('Change plan'))
- assert.ok(!labels.includes('Approve'))
- assert.ok(!labels.includes('Request changes'))
- await click('Go')
- const posts = calls.filter(([, opts]) => opts.method === 'POST')
- assert.equal(posts.length, 1)
- const [path, opts] = posts[0]
- assert.equal(path, `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
- assert.equal(opts.connectionId, route.connectionId)
- assert.equal(opts.profile, route.profile)
- assert.equal(opts.body.choiceId, 'go')
- assert.equal(opts.body.expectedRevision, r.revision)
- assert.equal(opts.body.session, route.session)
- await show(null)
-})
 
 test('revise focuses inline, validates, Escape restores focus; keyboard submits durable revision', async () => {
  const calls = []; let op = null; const r = freshRequest()
@@ -138,31 +128,33 @@ test('revise focuses inline, validates, Escape restores focus; keyboard submits 
  let input = el().querySelector('textarea'); assert.equal(document.activeElement, input)
  assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Send revision').disabled, true)
  await React.act(async () => { input.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await flush() })
- assert.equal(el().querySelector('textarea'), null); assert.equal(document.activeElement.textContent, 'Request changes')
+ assert.ok(el().querySelector('textarea') === null); assert.equal(document.activeElement.textContent, 'Request changes')
  await click('Request changes'); input = el().querySelector('textarea')
  await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype,'value').set.call(input,'Change the CPU limit'); input.dispatchEvent(new dom.window.Event('input',{bubbles:true})); await flush() })
  await React.act(async () => { input.dispatchEvent(new dom.window.KeyboardEvent('keydown',{key:'Enter',ctrlKey:true,bubbles:true})); await flush() })
  const posts = calls.filter(([,o]) => o.method === 'POST'); assert.equal(posts.length,1)
- assert.equal(posts[0][1].body.revisionText,'Change the CPU limit'); assert.equal(posts[0][1].body.choiceId,'edit')
+ assertRevisionPost(posts[0], r)
  assert.match(el().textContent,/recorded.*pending/i); assert.doesNotMatch(el().textContent,/Confirmed/)
 })
 
 test('lost response is reconciled before retry; same key; only readback confirms delivered', async () => {
  const calls = []; const r = freshRequest(); let attempts = 0
- const call = async (path, opts={}) => { calls.push([path,opts]); if(opts.method==='POST'){ attempts++; if(attempts===1) throw Error('lost response'); return { operation:{operationId:'op1',state:'delivered'},request:r } } if(path.includes('/operations?')) return {operation:null,request:r}; return {operation:{operationId:'op1',state:'delivered'},request:{...r,state:'resolved',resolution:{choiceId:'yes',operationId:'op1',revision:1}}} }
+ const call = async (path, opts={}) => { calls.push([path,opts]); if(opts.method==='POST'){ attempts++; if(attempts===1) throw Error('lost response'); return { operation:{operationId:'op1',state:'delivered'},request:r } } if(path.includes('/operations?')) return {operation:null,request:r}; return {operation:{operationId:'op1',state:'delivered'},request:{...r,state:'resolved',resolution:{choiceId:'edit',operationId:'op1',revision:1}}} }
  await show(React.createElement(m.DecisionRow,{key:'retry',request:r,route,call}))
- await click('Approve'); assert.match(el().textContent,/unknown|lost response/i)
+ await revise(); assert.match(el().textContent,/unknown|lost response/i)
  await click('Retry')
  const posts=calls.filter(([,o])=>o.method==='POST'); assert.equal(posts.length,2)
- assert.equal(posts[0][1].body.idempotencyKey,posts[1][1].body.idempotencyKey)
+ posts.forEach(post => assertRevisionPost(post, r))
+ assert.deepEqual(posts[0][1].body,posts[1][1].body)
  assert.ok(calls.findIndex(([p])=>p.includes('/operations?')) < calls.findIndex(([,o])=>o===posts[1][1]))
  assert.match(el().textContent,/Confirmed/)
 })
 
 test('late decision response after profile switch cannot update another pane', async () => {
- let finish; const r=request(); const call=()=>new Promise(resolve=>{finish=resolve})
+ let finish; const r=request(); const calls=[]; const call=(path,opts={})=>{calls.push([path,opts]);return new Promise(resolve=>{finish=resolve})}
  await show(React.createElement(m.DecisionRow,{key:'race',request:r,route,call}))
- await click('Decline'); host.state.focusedSessionOwner.value={connectionId:'C1',profile:'other'}
+ await revise(); assertRevisionPost(calls.find(([,o])=>o.method==='POST'),r)
+ host.state.focusedSessionOwner.value={connectionId:'C1',profile:'other'}
  await React.act(async()=>{finish({operation:{operationId:'late',state:'delivered'},request:{...r,state:'resolved'}});await flush()})
  assert.doesNotMatch(el().textContent,/Confirmed/)
  host.state.focusedSessionOwner.value={connectionId:'C1',profile:'default'}
@@ -172,48 +164,50 @@ test('double clicks and two mounted tiles submit once; failed delivery remains l
  const r=freshRequest(); let finish; const calls=[]
  const call=async(path,opts={})=>{calls.push([path,opts]); if(opts.method==='POST') return new Promise(resolve=>{finish=resolve}); return {operation:{operationId:'partial',dispatchState:'delivery_failed'},request:r}}
  await show(React.createElement('div',{},[React.createElement(m.DecisionRow,{key:'tile-a',request:r,route,call}),React.createElement(m.DecisionRow,{key:'tile-b',request:r,route,call})]))
- await React.act(async()=>{const buttons=[...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve'); buttons[0].click();buttons[0].click();buttons[1].click();await flush()})
+ await React.act(async()=>{for (const b of [...el().querySelectorAll('button')].filter(b=>b.textContent==='Request changes')) b.click();await flush()})
+ await React.act(async()=>{for (const input of el().querySelectorAll('textarea')) { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype,'value').set.call(input,'Change the CPU limit');input.dispatchEvent(new dom.window.Event('input',{bubbles:true})) };await flush()})
+ await React.act(async()=>{const buttons=[...el().querySelectorAll('button')].filter(b=>b.textContent==='Send revision');buttons[0].click();buttons[0].click();buttons[1].click();await flush()})
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,1)
  const [path,opts]=calls.find(([,o])=>o.method==='POST')
  assert.equal(path,`/api/plugins/user-steps/requests/${r.requestId}/decisions`)
  assert.equal(opts.connectionId,'C1');assert.equal(opts.profile,'default')
- assert.equal(opts.body.choiceId,'yes');assert.equal(opts.body.expectedRevision,1);assert.equal(opts.body.session,'S1')
+ assert.deepEqual({...opts.body,idempotencyKey:undefined},{session:'S1',expectedRevision:1,choiceId:'edit',revisionText:'Change the CPU limit',idempotencyKey:undefined});assert.ok(opts.body.idempotencyKey)
  await React.act(async()=>{finish({operation:{operationId:'partial',dispatchState:'delivery_failed'},request:r});await flush()})
  assert.equal(el().querySelectorAll('[role="alert"]').length,2)
  assert.doesNotMatch(el().textContent,/Confirmed/)
- assert.equal([...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve').length,0)
+ assert.equal([...el().querySelectorAll('button')].filter(b=>b.textContent==='Request changes').length,0)
 })
 
 test('409 reads changed scope, preserves revision text, requires fresh decision', async () => {
  const r=freshRequest(); const next={...r,revision:2,scope:{...r.scope,markdown:'New exact scope'}}
  const calls=[]; const call=async(path,opts={})=>{calls.push([path,opts]);if(opts.method==='POST')throw Object.assign(Error('conflict'),{status:409});return {request:next}}
  await show(React.createElement(m.DecisionRow,{key:'conflict',request:r,route,call}))
- await click('Approve')
- assert.match(el().textContent,/New exact scope/);assert.match(el().textContent,/review required/i)
+ await revise()
+ assert.match(el().textContent,/review required/i)
+ assert.ok(el().querySelector('[data-action-scope]') === null, 'updated scope remains panel-owned')
+ assert.equal(el().querySelector('textarea').value,'Change the CPU limit','409 preserves the typed revision')
  assert.doesNotMatch(el().textContent,/Confirmed/)
- await click('Decline')
- assert.equal(calls.filter(([,o])=>o.method==='POST')[1][1].body.expectedRevision,2)
+ if(el().querySelector('textarea')) await click('Cancel')
+ await revise('Review the changed scope first')
+ const posts=calls.filter(([,o])=>o.method==='POST');assert.equal(posts.length,2)
+ assert.deepEqual({...posts[1][1].body,idempotencyKey:undefined},{session:'S1',expectedRevision:2,choiceId:'edit',revisionText:'Review the changed scope first',idempotencyKey:undefined})
+ assert.notEqual(posts[0][1].body.idempotencyKey,posts[1][1].body.idempotencyKey)
 })
 
-test('queue registration uses canonical region; aliases suppress only exact references and progress', async()=>{
- const r=freshRequest(); r.aliases.push({gatewayId:'G1',profile:'default',type:'user_step',id:'us_12345678'})
- const cards=[{id:'same',board:'ops',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Original card',human_request:{interaction:'approval',action:'Approve',why_human:'owner',scope:'stage',evidence:'record'}},{id:'same',board:'other',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Separate board',human_request:{interaction:'approval',action:'Approve the separate board stage',why_human:'owner',scope:'stage',evidence:'record'}}]
- window.__blockedPanel={snapshot:{stored:'S1',items:cards}}
- window.hermesDesktop={api:async({path})=>path.includes('/requests')?{requests:[r,r]}:{steps:[{id:'us_12345678',gatewayId:'G1',profile:'default',text:'Original step',status:'open'}]}}
+test('canonical bridge qualifies aliases and suppresses only matching blocked progress', async()=>{
+ const r=freshRequest();r.aliases.push({gatewayId:'G1',profile:'default',type:'user_step',id:'us_12345678'})
  const registrations=[];const dispose=m.default.register({register:c=>registrations.push(c)})
- await React.act(async()=>{await m.refreshRequests();await m.refresh()})
- await show(registrations[0].render())
- assert.equal(el().querySelectorAll('[data-action-request]').length,1)
- assert.equal(el().querySelectorAll('[data-user-steps-step]').length,0)
- assert.equal(el().querySelectorAll('[data-user-steps-card]').length,1)
- // 90a4031b: cards render the requested step, not card text; the other board's own ask survives
- assert.match(el().querySelector('[data-user-steps-card-action]').textContent,/Approve the separate board stage/)
- assert.equal(el().querySelector('[data-action-scope]').textContent,r.scope.markdown)
- const progress=await import('../../session-tasks/plugin.js')
- const chip={kind:'kanban',gatewayId:'G1',profile:'default',board:'ops',id:'same',state:'blocked'}
- assert.equal(progress.progressChips([chip]).length,0)
- assert.equal(progress.progressChips([{...chip,board:'other'},{...chip,state:'running'},{kind:'bg'}]).length,3)
- await show(null);dispose();delete window.hermesDesktop;delete window.__blockedPanel
+ try {
+  await m.refreshRequests(async()=>({requests:[r,r]}))
+  assert.equal(window.__userSteps.requestForSource(alias),r)
+  assert.equal(window.__userSteps.requestForSource({...alias,board:'other'}),null)
+  assert.equal(window.__userSteps.requestForSource({gatewayId:'G1',profile:'default',type:'user_step',id:'us_12345678'}),r)
+  assert.equal('Strip' in window.__userSteps,false)
+  const progress=await import('../../session-tasks/plugin.js')
+  const chip={kind:'kanban',gatewayId:'G1',profile:'default',board:'ops',id:'same',state:'blocked'}
+  assert.equal(progress.progressChips([chip]).length,0)
+  assert.equal(progress.progressChips([{...chip,board:'other'},{...chip,state:'running'},{kind:'bg'}]).length,3)
+ } finally { dispose() }
 })
 
 test('out of order same-session refresh and owner switches do not publish stale requests',async()=>{
@@ -232,7 +226,7 @@ test('out of order same-session refresh and owner switches do not publish stale 
 })
 
 test('cold reload recovers retry key but confirms only server readback; malformed requests fail closed',async()=>{
- const r=freshRequest();const d={session:'S1',expectedRevision:1,choiceId:'yes',idempotencyKey:'retained-client-key'}
+ const r=freshRequest();const d={session:'S1',expectedRevision:1,choiceId:'edit',revisionText:'Change the CPU limit',idempotencyKey:'retained-client-key'}
  const key=JSON.stringify(['C1','default','S1'])+':'+m.requestKey(r)
  window.localStorage.setItem('hermes.actionIntent.v2:'+key,JSON.stringify(d))
  const calls=[];const cold=await import('../plugin.js?cold-reload')
@@ -241,21 +235,23 @@ test('cold reload recovers retry key but confirms only server readback; malforme
  assert.match(el().textContent,/recorded.*pending/i)
  assert.ok(calls[0][0].includes('idempotencyKey=retained-client-key'))
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,0)
- assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'),false)
+ assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Request changes'),false)
  for(const change of [{limits:null},{choices:[{id:'x',label:'Go',effect:'execute'}]},{scope:null},{requestId:'malformed'}])assert.equal(cold.projectRequests([{...r,...change}]).length,0)
  await show(null)
 })
 
 test('operation lookup 404 permits same-key resend; failed or mismatched readback never confirms',async()=>{
- const r=freshRequest();let posts=0;const bodies=[]
+ const r=freshRequest();let posts=0;const bodies=[],calls=[]
  const call=async(path,opts={})=>{
+  calls.push([path,opts])
   if(opts.method==='POST'){posts++;bodies.push(opts.body);if(posts===1)throw Error('connection lost');return {operation:{operationId:'mismatch',dispatchState:'delivered'},request:r}}
   if(path.includes('/operations?'))throw Object.assign(Error('not found'),{status:404})
-  return {operation:{operationId:'mismatch',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'wrong',choiceId:'yes',revision:1}}}
+  return {operation:{operationId:'mismatch',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'wrong',choiceId:'edit',revision:1}}}
  }
  await show(React.createElement(m.DecisionRow,{key:'404',request:r,route,call}))
- await click('Approve');await click('Retry')
- assert.equal(posts,2);assert.equal(bodies[0].idempotencyKey,bodies[1].idempotencyKey)
+ await revise();await click('Retry')
+ assert.equal(posts,2);assert.deepEqual(bodies[0],bodies[1])
+ calls.filter(([,opts])=>opts.method==='POST').forEach(post=>assertRevisionPost(post,r))
  assert.doesNotMatch(el().textContent,/Confirmed/);assert.match(el().textContent,/unknown/i)
 })
 
@@ -263,9 +259,9 @@ test('confirmed readback fans out to passive qualified transcript receipt withou
  const r=freshRequest();r.aliases.push({gatewayId:'G1',profile:'default',type:'user_step',id:'us_87654321'})
  await m.refreshRequests(async()=>({requests:[r]}))
  const step={id:'us_87654321',status:'open',text:'Original request',requestId:r.requestId,requestOwner:owner}
- const call=async(path,opts={})=>path.includes('/step?')?{step}:opts.method==='POST'?{operation:{operationId:'receipt',dispatchState:'delivered'},request:r}:{operation:{operationId:'receipt',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'receipt',choiceId:'yes',revision:1}}}
+ const call=async(path,opts={})=>path.includes('/step?')?{step}:opts.method==='POST'?{operation:{operationId:'receipt',dispatchState:'delivered'},request:r}:{operation:{operationId:'receipt',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'receipt',choiceId:'edit',revision:1}}}
  await show(React.createElement('div',{},[React.createElement(m.DecisionRow,{key:'row',request:r,route,call}),React.createElement(m.StepBox,{key:'receipt',attrs:{id:step.id,s:'S1',t:'Exact original transcript text'},deps:{call}})]))
- await click('Approve')
+ await revise()
  const receipt=el().querySelector('[data-user-step]')
  assert.match(receipt.textContent,/Confirmed/)
  assert.equal(receipt.querySelector('[data-user-step-text]').textContent,'Exact original transcript text')
@@ -273,7 +269,7 @@ test('confirmed readback fans out to passive qualified transcript receipt withou
 })
 
 test('pending operation from another window retries exact server operation without a local intent',async()=>{
- const r=freshRequest({resolution:{operationId:'crash-op',choiceId:'yes',revision:1}})
+ const r=freshRequest({resolution:{operationId:'crash-op',choiceId:'edit',revision:1}})
  let delivered=false;const calls=[]
  const call=async(path,opts={})=>{calls.push([path,opts]);if(opts.method==='POST'){assert.match(path,/\/operations\/crash-op\/retry\?session=S1$/);assert.equal(opts.body,undefined);delivered=true}
  return {operation:{operationId:'crash-op',dispatchState:delivered?'delivered':'pending'},request:{...r,state:delivered?'resolved':'open'}}}
@@ -285,7 +281,7 @@ test('pending operation from another window retries exact server operation witho
 })
 
 test('cancelled dispatch is not success or retry; replacement revision requires fresh permission', async()=>{
- const r=freshRequest({state:'cancelled',resolution:{operationId:'cancel-op',choiceId:'yes',revision:1}})
+ const r=freshRequest({state:'cancelled',resolution:{operationId:'cancel-op',choiceId:'edit',revision:1}})
  const calls=[]
  const call=async(path,opts={})=>{calls.push([path,opts]);return {operation:{operationId:'cancel-op',dispatchState:'cancelled'},request:r}}
  await show(React.createElement(m.DecisionRow,{key:'cancel-recovery',request:r,route,call}))
@@ -295,38 +291,11 @@ test('cancelled dispatch is not success or retry; replacement revision requires 
  assert.match(el().textContent,/replacement revision/i)
  const next={...r,revision:2,state:'open',resolution:undefined}
  await show(React.createElement(m.DecisionRow,{key:'cancel-recovery',request:next,route,call}))
- assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'))
+ assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Request changes'))
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,0)
 })
 
-test('multiple approval alternatives retain distinct labels and exact choice IDs',async()=>{
- const r=freshRequest({kind:'choice',choices:[{id:'draft',label:'Open draft PR',effect:'approve'},{id:'ready',label:'Open ready PR',effect:'approve'},{id:'revise',label:'Revise',effect:'revise'}]})
- const calls=[]
- const call=async(path,opts={})=>{calls.push([path,opts]);return {request:r,operation:{operationId:'multi',dispatchState:'pending'}}}
- await show(React.createElement(m.DecisionRow,{key:'multiple',request:r,route,call}))
- assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'),false)
- assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Open draft PR'))
- await click('Open ready PR')
- assert.equal(calls.filter(([,o])=>o.method==='POST').length,1)
- assert.equal(calls.find(([,o])=>o.method==='POST')[1].body.choiceId,'ready')
-})
 
-test('clarifications preserve labels and concrete answers submit without free text',async()=>{
- for (const kind of ['choice','input']) {
-  const r=freshRequest({kind,scope:{complete:true,markdown:'Which format?',sourceRefs:[]},outcomes:{answer:'Answer only, no execution.'},choices:[{id:'json',label:'JSON document',effect:'answer'},{id:'answer-text',label:'Something else',effect:'answer'}]})
-  assert.equal(m.validRequest(r),true)
-  const calls=[];const call=async(path,opts={})=>{calls.push([path,opts]);return {request:r,operation:{operationId:'answer-'+kind,dispatchState:'pending'}}}
-  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call}))
-  assert.equal(el().querySelector('[data-approval-blocked]'),null)
-  assert.equal(el().querySelector('[data-action-scope]').getAttribute('aria-label'),'Question')
-  assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['JSON document','Something else'])
-  await click('JSON document')
-  assert.equal(el().querySelector('textarea'),null)
-  const posts=calls.filter(([,o])=>o.method==='POST');assert.equal(posts.length,1)
-  assert.equal(posts[0][1].body.choiceId,'json');assert.equal(posts[0][1].body.revisionText,'JSON document')
-  assert.equal(posts[0][1].body.expectedRevision,1)
- }
-})
 
 test('answer-text focuses and validates free text, then sends an answer rather than revision',async()=>{
  const r=freshRequest({kind:'input',outcomes:{answer:'Answer only.'},choices:[{id:'answer-text',label:'Type an answer',effect:'answer'}]})
@@ -350,7 +319,7 @@ test('incomplete approvals await agent completion while legacy clarification lab
    assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/asked you to approve this without a plan/)
    assert.deepEqual(labels,['Ask agent for the plan','Dismiss'])
   }else{
-   assert.equal(el().querySelector('[data-approval-blocked]'),null)
+   assert.ok(el().querySelector('[data-approval-blocked]') === null)
    assert.deepEqual(labels,['Explain the target'])
   }
  }
@@ -367,26 +336,26 @@ test('legacy "Request complete action" placeholder never renders for any kind (D
   else if(kind==='external_step') assert.deepEqual(labels,['Ask agent for the full step','Dismiss'])
   else assert.deepEqual(labels,[],kind)
   if(['approval','external_step'].includes(kind)) assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/without a (plan|complete step)/)
-  else assert.match(el().querySelector('[data-approval-blocked]').textContent,/Answer in chat/)
+  else assert.ok(el().querySelector('[data-action-request]') === null, 'the panel owns questions with no companion controls')
  }
 })
 
-test('incomplete external steps await agent completion; complete external steps keep their choices',async()=>{
+test('incomplete external steps await agent completion; complete steps retain only typed changes',async()=>{
  const pending=freshRequest({kind:'external_step',state:'needs_context',scope:{complete:false,markdown:'Plug in the cable',sourceRefs:[]},choices:[{id:'ctx',label:'Explain',effect:'revise'}]})
  await show(React.createElement(m.DecisionRow,{key:pending.requestId,request:pending,route,call:async()=>assert.fail('no submission')}))
  assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['Ask agent for the full step','Dismiss'])
  const done=freshRequest({kind:'external_step',choices:[{id:'did',label:'I did it',effect:'approve'},{id:'edit',label:'Change it',effect:'revise'}]})
  await show(React.createElement(m.DecisionRow,{key:done.requestId,request:done,route,call:async()=>assert.fail('no submission')}))
- assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['I did it','Change it'])
- assert.equal(el().querySelector('[data-agent-completion-pending]'),null)
+ assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['Change it'])
+ assert.ok(el().querySelector('[data-agent-completion-pending]') === null)
 })
 
-test('For you hides closed and superseded requests but retains operation readback until terminal confirmation',async()=>{
+test('companion hides closed and superseded requests but retains operation readback until terminal confirmation',async()=>{
  const closed=freshRequest({state:'resolved',title:'Old resolved'}),superseded=freshRequest({state:'superseded',title:'Old superseded'}),cancelled=freshRequest({state:'cancelled',title:'Old cancelled'})
  // Recorded, not yet delivered (backend writes state='resolved' only on confirmed delivery).
- const pending=freshRequest({state:'open',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'yes',revision:1}})
+ const pending=freshRequest({state:'open',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'edit',revision:1}})
  // An old answer the backend already marks resolved is terminal: never shown, never re-read.
- const delivered0=freshRequest({state:'resolved',title:'Old delivered answer',resolution:{operationId:'old-delivered',choiceId:'yes',revision:1}})
+ const delivered0=freshRequest({state:'resolved',title:'Old delivered answer',resolution:{operationId:'old-delivered',choiceId:'edit',revision:1}})
  let delivered=false;const reads=[]
  window.hermesDesktop={api:async({path})=>{if(path.includes('/operations/')){reads.push(path);return {request:delivered?{...pending,state:'resolved'}:pending,operation:{operationId:'queue-readback',dispatchState:delivered?'delivered':'pending'}}}return {requests:[closed,superseded,cancelled,delivered0,pending]}}}
  await show(React.createElement(m.ActionQueue,{key:'closed-filter'}))
@@ -394,21 +363,21 @@ test('For you hides closed and superseded requests but retains operation readbac
  assert.match(el().textContent,/Pending receipt/);assert.doesNotMatch(el().textContent,/Old resolved|Old superseded|Old cancelled|Old delivered answer/)
  assert.ok(reads.length>0);assert.ok(reads.every(p=>!p.includes('old-delivered')),'terminal answer is not re-read')
  delivered=true;await click('Check status')
- assert.equal(el().querySelector('[data-action-queue]'),null)
+ assert.ok(el().querySelector('[data-action-queue]') === null)
  await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.equal(el().querySelector('[data-action-queue]'),null,'confirmed receipt stays out on refresh')
+ assert.ok(el().querySelector('[data-action-queue]') === null,'confirmed receipt stays out on refresh')
  await show(null);delete window.hermesDesktop
 })
 
-for (const companion of [false, true]) test(`remote retirement retains nonterminal custody without controls (hub companion=${companion})`, async()=>{
- const r=freshRequest({state:'cancelled',title:'Retiring answer',resolution:{operationId:`retiring-${companion}`,choiceId:'yes',revision:1},delivery:{state:'delivering',text:'Delivery to remote not confirmed (120 min)',unconfirmed:true}})
+test('remote retirement retains nonterminal custody without controls', async()=>{
+ const r=freshRequest({state:'cancelled',title:'Retiring answer',resolution:{operationId:'retiring-companion',choiceId:'edit',revision:1},delivery:{state:'delivering',text:'Delivery to remote not confirmed (120 min)',unconfirmed:true}})
  let terminal=false; const reads=[]
  window.hermesDesktop={api:async({path,method})=>{
   assert.ok(!method || method === 'GET', 'retirement never retries or submits')
   if(path.includes('/operations/')) { reads.push(path); return {request:terminal?{...r,state:'resolved',delivery:undefined}:r,operation:{operationId:r.resolution.operationId,dispatchState:terminal?'delivered':'cancelled',...(!terminal?{retired:{evidence:'remote-retiring'}}:{})}} }
   return {requests:[terminal?{...r,state:'resolved',delivery:undefined}:r]}
  }}
- await show(React.createElement(m.ActionQueue,{key:`retiring-${companion}`,companion}))
+ await show(React.createElement(m.ActionQueue,{key:'retiring-companion'}))
  assert.equal(el().querySelectorAll('[data-remote-retiring]').length,1)
  assert.equal(el().querySelector('[data-remote-retiring]').textContent,r.delivery.text)
  assert.equal(el().querySelector('[data-remote-retiring]').querySelectorAll('button').length,0)
@@ -419,7 +388,7 @@ for (const companion of [false, true]) test(`remote retirement retains nontermin
  assert.ok(reads.length>before, 'retiring operations keep readback polling')
  terminal=true
  await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.equal(el().querySelector('[data-action-queue]'),null)
+ assert.ok(el().querySelector('[data-action-queue]') === null)
  await show(null);delete window.hermesDesktop
 })
 
@@ -431,7 +400,7 @@ test('a background read the Desktop skipped (slow link / settling after wake) ke
  window.hermesDesktop.api=async()=>{throw Error("Error invoking remote method 'hermes:api': PowerSettlingError: Background read skipped: the connection to this backend is slow; the next poll retries.")}
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.doesNotMatch(el().textContent,/Action queue unavailable/)
- assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Approve').disabled,false)
+ assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Request changes').disabled,false)
  window.hermesDesktop.api=async()=>{throw Error('backend unavailable')}
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Action queue unavailable/,'a real failure still surfaces')
@@ -445,14 +414,14 @@ test('backend failure and malformed owner render inline errors and disable cache
  window.hermesDesktop.api=async()=>{throw Error('backend unavailable')}
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Action queue unavailable/)
- assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Approve').disabled,true)
+ assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Request changes').disabled,true)
  window.hermesDesktop.api=async()=>({requests:[{...r,owner:{...owner,storedSessionId:'sibling-session'}}]})
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Invalid action request owner/)
  await show(null);delete window.hermesDesktop
 })
 
-test('backfilled legacy rows: real Diplomacy options, Done for user steps, agent-pending approvals not counted For you',async()=>{
+test('backfilled legacy rows retain typed answers and agent-plan requests, not panel-owned options',async()=>{
  const span="Should it make a clearly labeled animation rebuilt from the replay's recorded moves, or should web Diplomacy be left out of the clip set?"
  const diplo=freshRequest({kind:'choice',title:'Decide whether web Diplomacy gets a labeled animation',revision:2,scope:{complete:true,markdown:span,sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. This does not grant execution permission.'},choices:[{id:'answer-0',label:"Make a clearly labeled animation rebuilt from the replay's recorded moves",effect:'answer'},{id:'answer-1',label:'Should web Diplomacy be left out of the clip set',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
  const step=freshRequest({kind:'external_step',title:'Record your voice',revision:2,scope:{complete:true,markdown:'Record your voice, then say ready.',sourceRefs:[]},outcomes:{answer:'Tell the agent. This does not grant execution permission.'},choices:[{id:'answer-done',label:'Done',effect:'answer'},{id:'answer-text',label:"Can't do it / reply in your own words",effect:'answer'}]})
@@ -460,64 +429,42 @@ test('backfilled legacy rows: real Diplomacy options, Done for user steps, agent
  window.hermesDesktop={api:async()=>({requests:[diplo,step,ap]})}
  await show(React.createElement(m.ActionQueue,{key:'backfilled'}))
  assert.doesNotMatch(el().textContent,/Request complete action/)
- assert.match(el().querySelector('h2').textContent,/^For you \(2\)$/)
+ assert.ok(el().querySelector('h2') === null)
  const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
- for(const want of ["Make a clearly labeled animation rebuilt from the replay's recorded moves",'Should web Diplomacy be left out of the clip set','Answer in your own words','Done',"Can't do it / reply in your own words"]) assert.ok(labels.includes(want),want)
+ for(const want of ['Answer in your own words',"Can't do it / reply in your own words",'Ask agent for the plan','Dismiss']) assert.ok(labels.includes(want),want)
+ for(const absent of ['Done',"Make a clearly labeled animation rebuilt from the replay's recorded moves",'Should web Diplomacy be left out of the clip set']) assert.ok(!labels.includes(absent),absent)
  assert.ok(!labels.includes('Request changes'),'agent-pending approval has no revise button')
  const apRow=[...el().querySelectorAll('[data-action-request]')].find(a=>a.getAttribute('aria-label')==='Consent to a disconnect')
  assert.match(apRow.textContent,/asked you to approve this without a plan/)
  assert.doesNotMatch(apRow.textContent,/Request changes:/,'no revise outcome line while the plan is missing')
  window.hermesDesktop={api:async()=>({requests:[ap]})}
  await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.match(el().querySelector('h2').textContent,/^Waiting on the agent \(1\)/)
+ assert.ok(el().querySelector('h2') === null);assert.equal(el().querySelectorAll('[data-action-request]').length,1)
  await show(null);delete window.hermesDesktop
 })
 
-test('panel minimizes to one header line, stays minimized across remount, and reopens for a new request',async()=>{
- window.localStorage.clear()
- const a=freshRequest({title:'Put the doc on the hub'})
- let list=[a]
- window.hermesDesktop={api:async()=>({requests:list})}
- await show(React.createElement(m.ActionQueue,{key:'min-1'}))
- const toggle=()=>el().querySelector('[data-action-queue-toggle]')
- assert.equal(toggle().getAttribute('aria-expanded'),'true')
- assert.ok(el().querySelector('[data-action-request]'))
- await React.act(async()=>{toggle().click();await flush()})
- assert.equal(toggle().getAttribute('aria-expanded'),'false')
- assert.equal(el().querySelector('[data-action-request]'),null,'body hidden')
- assert.match(el().querySelector('h2').textContent,/^For you \(1\)$/)
- assert.match(el().querySelector('[data-action-queue-summary]').textContent,/Put the doc on the hub/)
- await show(null);await show(React.createElement(m.ActionQueue,{key:'min-2'}))
- assert.equal(el().querySelector('[data-action-request]'),null,'minimized survives remount')
- list=[a,freshRequest({title:'Brand new ask'})]
- await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.equal(el().querySelectorAll('[data-action-request]').length,2,'new request reopens the panel')
- await React.act(async()=>{toggle().click();await flush()})
- await React.act(async()=>{toggle().click();await flush()})
- assert.equal(el().querySelectorAll('[data-action-request]').length,2,'expand restores body')
- await show(null);delete window.hermesDesktop;window.localStorage.clear()
-})
 
-test('busy session: approve collapses the row, auto-retries the same operation until delivered, then confirms',async()=>{
+test('busy session: typed revision auto-retries the same operation until delivered, then confirms',async()=>{
  m.autoRetry && (m.autoRetry.ms=20)
  const r=freshRequest(); const calls=[]; let delivered=false
  const busyOp={operationId:'busy-op',dispatchState:'failed',error:'Session is busy with another turn; this decision is delivered automatically when it ends.'}
- const resolved={...r,state:'resolved',resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}
+ const resolved={...r,state:'resolved',resolution:{choiceId:'edit',operationId:'busy-op',revision:1}}
  const call=async(path,opts={})=>{calls.push([path,opts])
   if(path.includes('/retry')){delivered=true;return {}}
-  if(opts.method==='POST') return {operation:busyOp,request:{...r,resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}}
-  return delivered?{operation:{...busyOp,dispatchState:'delivered',error:undefined},request:resolved}:{operation:busyOp,request:{...r,resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}}}
+  if(opts.method==='POST') return {operation:busyOp,request:{...r,resolution:{choiceId:'edit',operationId:'busy-op',revision:1}}}
+  return delivered?{operation:{...busyOp,dispatchState:'delivered',error:undefined},request:resolved}:{operation:busyOp,request:{...r,resolution:{choiceId:'edit',operationId:'busy-op',revision:1}}}}
  await show(React.createElement(m.DecisionRow,{key:'busy',request:r,route,call}))
- assert.ok(el().querySelector('[data-action-scope]'),'plan shown before deciding')
- await click('Approve')
+ assert.ok(el().querySelector('[data-action-scope]') === null,'plan remains panel-owned')
+ await revise()
  assert.match(el().textContent,/session is busy/i)
- assert.equal(el().querySelector('[data-action-scope]'),null,'plan collapses once decided')
+ assert.ok(el().querySelector('[data-action-scope]') === null,'plan collapses once decided')
  assert.doesNotMatch(el().textContent,/≤4 GiB RAM/)
  await React.act(async()=>{await new Promise(res=>setTimeout(res,80))})
  const retries=calls.filter(([p])=>p.includes('/retry'))
  assert.equal(retries.length,1,'one automatic retry of the same operation')
  assert.match(retries[0][0],/operations\/busy-op\/retry/)
- assert.equal(calls.filter(([p,o])=>o.method==='POST'&&p.includes('/decisions')).length,1,'no second decision')
+ const decisions=calls.filter(([p,o])=>o.method==='POST'&&p.includes('/decisions'))
+ assert.equal(decisions.length,1,'no second decision');assertRevisionPost(decisions[0],r)
  assert.match(el().textContent,/Confirmed/)
  m.autoRetry && (m.autoRetry.ms=15000)
 })
@@ -540,26 +487,7 @@ test('plan-less approval: Ask agent for the plan drafts the ask, Dismiss hides i
  host.composer.setDraft=prev;window.localStorage.clear();await show(null);delete window.hermesDesktop
 })
 
-test('reported PR question renders its real option as a button plus a free-text answer (desktop-1321064734)',async()=>{
- const r=freshRequest({kind:'choice',title:'Choose: open a PR or something else',scope:{complete:true,markdown:'Do you mean open a pull request implementing these strategy changes, or something else?',sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. This does not grant execution permission.'},choices:[{id:'answer-0',label:'Open a pull request implementing these strategy changes',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
- await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>({})}))
- const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
- assert.equal(labels.length,2);assert.ok(labels[0].includes('Open a pull request'))
- assert.equal(el().querySelector('[data-agent-completion-pending]'),null)
- assert.doesNotMatch(el().textContent,/full exact plan|Work stays blocked/)
-})
 
-test('run-timing question marks its go options as approving (self-heal agent-aa8d66631c)',async()=>{
- const r=freshRequest({kind:'choice',title:'When should I run the migration?',scope:{complete:true,markdown:'When should I run the Mac mini launcher migration: now, when idle, or later?',sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. Options marked ✓ approve running exactly the scope above; any other answer (and free text) grants no execution permission.'},choices:[{id:'answer-0',label:'now',effect:'answer',authorizes:true},{id:'answer-1',label:'later',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
- assert.equal(m.validRequest(r),true)
- await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>({})}))
- const labels=[...el().querySelectorAll('button[data-decision-effect]')].map(b=>b.querySelector('[data-option-label]')?.textContent ?? b.textContent)
- assert.deepEqual(labels,['✓ now','later','Answer in your own words'])
- // the go option says it approves, inside its own button; the others carry no such line (no per-option disclaimer either)
- assert.equal(el().querySelector('button[data-decision-option="answer-0"]').textContent,'✓ nowApproves running exactly the plan above.')
- assert.equal(el().querySelector('[data-decision-option="answer-1"]'),null)
- assert.doesNotMatch(el().textContent,/grants no execution permission/)
-})
 
 // ── Withdrawn asks: retired without a decision; nothing is sent to the agent ──
 const withdrawnBy = (by, reason) => ({ by, reason, at: '2026-10-27T11:00:00+00:00' })
@@ -589,11 +517,11 @@ test('withdrawn requests are read explicitly but never rendered or counted; all 
  assert.ok(paths.filter(p => p.includes('/requests?')).every(p => p === QUEUE_READ), 'every queue read asks for withdrawn rows')
  assert.deepEqual([...el().querySelectorAll('[data-action-request]')].map(a => a.getAttribute('aria-label')), ['Still needed', 'Needs context'])
  // v10: an approval still waiting for its plan is agent work, shown but not counted For you.
- assert.equal(el().querySelector('[data-action-queue] h2').textContent, 'For you (1)')
+ assert.ok(el().querySelector('h2') === null, 'panel owns the heading')
  assert.doesNotMatch(el().textContent, /Moot ask|Action queue unavailable/)
  list = [gone]
  await React.act(async () => { await m.refreshRequests(); await flush() })
- assert.equal(el().querySelector('[data-action-queue]'), null)
+ assert.ok(el().querySelector('[data-action-queue]') === null)
  assert.equal(el().innerHTML, '')
  await show(null); delete window.hermesDesktop
 })
@@ -646,9 +574,10 @@ test('a withdrawn ask does not resurface as a legacy reference or a blocked prog
  window.hermesDesktop = { api: async ({ path }) => path.includes('/requests?') ? { requests: [gone] } : path.includes('/steps?') ? { steps: [] } : {} }
  const registrations = []; const dispose = m.default.register({ register: c => registrations.push(c) })
  await React.act(async () => { await m.refreshRequests(); await m.refresh() })
- await show(registrations[0].render())
- assert.equal(el().querySelector('[data-action-request]'), null)
- assert.equal(el().querySelector('[data-user-steps-card]'), null, 'its aliased card stays suppressed')
+ await show(React.createElement('div',null,React.createElement(m.ActionQueue)))
+ assert.ok(el().querySelector('[data-action-request]') === null)
+ assert.equal(window.__userSteps.requestForSource(alias)?.requestId,gone.requestId,'withdrawn alias remains retired in the bridge')
+ assert.equal(window.__userSteps.openAskCount(),0)
  assert.equal(el().textContent, '')
  const progress = await import('../../session-tasks/plugin.js')
  assert.equal(progress.progressChips([{ kind: 'kanban', gatewayId: 'G1', profile: 'default', board: 'ops', id: 'same', state: 'blocked' }]).length, 0)
@@ -670,7 +599,7 @@ test('Not needed withdraws once through the owner route even on double click, th
  const tile = [...el().querySelectorAll('article')].find(a => a.getAttribute('aria-label') === 'Stale ask')
  const button = [...tile.querySelectorAll('button')].find(b => b.textContent === 'Not needed')
  assert.ok(button, 'an open ask offers Not needed')
- assert.deepEqual([...button.parentElement.children].map(b => b.textContent), ['Approve', 'Request changes', 'Decline', 'Not needed'], 'after the decision buttons')
+ assert.deepEqual([...button.parentElement.children].map(b => b.textContent), ['Request changes', 'Not needed'], 'after the decision buttons')
  assert.equal(button.style.minHeight, '44px'); assert.equal(button.style.whiteSpace, 'normal')
  assert.equal(button.title, 'Remove this ask without deciding; nothing is sent to the agent')
  button.focus()
@@ -683,15 +612,16 @@ test('Not needed withdraws once through the owner route even on double click, th
  assert.deepEqual(opts.body, { session: 'S1', expectedRevision: 1, reason: 'Dismissed in Desktop as not needed' })
  assert.equal(button.disabled, true)
  assert.ok([...tile.querySelectorAll('[data-decision-effect]')].every(b => b.disabled), 'no decision while withdrawing')
- await click('Approve')
+ await React.act(async()=>{tile.querySelector('[data-decision-effect=revise]').click();await flush()})
  assert.equal(posts().length, 1)
+ assert.ok(tile.querySelector('textarea') === null)
  const sent = calls.length
  const gone = { ...r, state: 'withdrawn', withdrawal: withdrawnBy('user', 'Dismissed in Desktop as not needed') }
  list = [gone, keep]
  await React.act(async () => { finish({ request: gone }); await flush(); await flush() })
  assert.ok(calls.slice(sent).some(([p, o]) => p === QUEUE_READ && !o.method), 'refreshes the queue after withdrawing')
  assert.deepEqual([...el().querySelectorAll('article')].map(a => a.getAttribute('aria-label')), ['Live ask'])
- assert.equal(el().querySelector('[data-action-queue] h2').textContent, 'For you (1)')
+ assert.ok(el().querySelector('h2') === null, 'panel owns the heading')
  assert.equal(document.activeElement.getAttribute('aria-label'), 'Live ask', 'keyboard focus stays in the queue')
  assert.equal(posts().length, 1)
  assert.equal(calls.filter(([p]) => p.endsWith('/ping')).length, 1, 'one ping for the scope')
@@ -705,12 +635,12 @@ test('Not needed is not offered while a decision is submitting, pending or recor
  const call = async (path, opts = {}) => { calls.push([path, opts]); if (path.endsWith('/ping')) return pingWithdraw; if (opts.method === 'POST') return new Promise(resolve => { finish = resolve }); return pending }
  await show(React.createElement(m.DecisionRow, { key: 'withdraw-lock', request: r, route, call }))
  assert.equal(offered(), true, 'offered while undecided')
- await click('Approve')
+ await revise()
  assert.equal(offered(), false, 'hidden while the decision is submitting')
  await React.act(async () => { finish(pending); await flush() })
  assert.match(el().textContent, /delivery pending/)
  assert.equal(offered(), false, 'hidden while delivery is pending')
- const resolution = { operationId: 'op-recorded', choiceId: 'yes', revision: 1 }
+ const resolution = { operationId: 'op-recorded', choiceId: 'edit', revision: 1 }
  for (const recorded of [askable({ resolution }), askable({ state: 'resolved', resolution }), askable({ state: 'superseded' }), askable({ state: 'cancelled' })]) {
   const readback = async path => path.endsWith('/ping') ? pingWithdraw : { operation: { operationId: 'op-recorded', state: 'pending' }, request: recorded }
   await show(React.createElement(m.DecisionRow, { key: `recorded-${recorded.requestId}`, request: recorded, route, call: readback }))
@@ -752,32 +682,16 @@ test('Not needed: a 409 refreshes with an inline note; other failures keep the t
  await click('Not needed')
  assert.ok(calls.some(([p, o]) => p === QUEUE_READ && !o.method), 'refreshed after the 409')
  assert.equal(el().querySelector('[data-withdraw-note]')?.textContent, 'This ask changed or was already decided; refreshed.')
- assert.equal(el().querySelector('[role="alert"]'), null)
+ assert.ok(el().querySelector('[role="alert"]') === null)
  failure = Error('backend unavailable')
  await click('Not needed')
  assert.match(el().querySelector('[role="alert"]')?.textContent || '', /backend unavailable/)
- assert.equal(el().querySelector('[data-withdraw-note]'), null)
+ assert.ok(el().querySelector('[data-withdraw-note]') === null)
  assert.ok(el().querySelector('[data-action-request]'), 'tile kept')
  assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Not needed')?.disabled, false, 'can try again')
  assert.equal(calls.filter(([, o]) => o.method === 'POST').length, 2)
 })
 
-test('askedAgo reads just now, minutes, hours and days; the tile shows it above the title only when createdAt is known', async () => {
- const now = Date.parse('2026-10-27T12:00:00Z'), ago = ms => new Date(now - ms).toISOString()
- const cases = [[0, 'asked just now'], [59_999, 'asked just now'], [60_000, 'asked 1 min ago'], [59 * 60_000 + 59_000, 'asked 59 min ago'], [3_600_000, 'asked 1 h ago'], [23 * 3_600_000 + 3_599_000, 'asked 23 h ago'], [86_400_000, 'asked 1 d ago'], [9 * 86_400_000 + 5_000, 'asked 9 d ago'], [-120_000, 'asked just now']]
- for (const [ms, text] of cases) assert.equal(m.askedAgo?.(ago(ms), now), text, `${ms} ms`)
- assert.equal(m.askedAgo?.('2026-10-27T10:59:59.123456+00:00', now), 'asked 1 h ago', 'backend isoformat parses')
- for (const missing of [undefined, null, '', 'not a date', now]) assert.equal(m.askedAgo?.(missing, now), '', String(missing))
- const aged = freshRequest({ title: 'Aged ask', createdAt: new Date(Date.now() - 5 * 60_000 - 5_000).toISOString() })
- await show(React.createElement(m.DecisionRow, { key: 'aged', request: aged, route, call: async () => ({}) }))
- const age = el().querySelector('[data-asked-age]')
- assert.equal(age?.textContent, 'asked 5 min ago')
- assert.equal(age.closest('[data-action-meta]')?.nextElementSibling, el().querySelector('h3'), 'on the line right above the title')
- assert.equal(age.getAttribute('datetime'), aged.createdAt)
- assert.equal(el().querySelector('h3').textContent, 'Aged ask')
- await show(React.createElement(m.DecisionRow, { key: 'unaged', request: freshRequest({ title: 'Legacy row' }), route, call: async () => ({}) }))
- assert.equal(el().querySelector('[data-asked-age]'), null)
-})
 
 test('a cached owner answer expires, so an owner that restarts onto a newer plugin gets Not needed', async () => {
  m.clearFeatureCache?.()
@@ -812,15 +726,15 @@ test('a withdrawn ask with a stranded retry intent never renders Check status or
  } }
  await show(React.createElement(m.ActionQueue, { key: 'stranded' }))
  await React.act(async () => { await m.refreshRequests(); await flush() })
- await React.act(async () => { [...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').click(); await flush(); await flush() })
+ await revise()
  assert.equal(intents().length, 1, 'the lost POST left a retry intent')
  list = [{ ...r, state: 'withdrawn', withdrawal: withdrawnBy('system', 'Card finished') }]
  await React.act(async () => { await m.refreshRequests(); await flush() })
- assert.equal(el().querySelector('article'), null, 'no tile, so no Check status or Retry')
+ assert.ok(el().querySelector('article') === null, 'no tile, so no Check status or Retry')
  assert.deepEqual(intents(), [], 'the dead intent is dropped')
  await show(null); await show(React.createElement(m.ActionQueue, { key: 'stranded-2' }))
  await React.act(async () => { await m.refreshRequests(); await flush() })
- assert.equal(el().querySelector('article'), null, 'still gone after a remount')
+ assert.ok(el().querySelector('article') === null, 'still gone after a remount')
  assert.equal(posts.length, 1, 'no further decision POST')
  await show(null); delete window.hermesDesktop; window.localStorage.clear()
 })
@@ -842,7 +756,7 @@ test('Not needed is never offered for a request bound to a decision card', async
  const bound = { ...base, aliases: [{ gatewayId: base.owner.gatewayId, profile: base.owner.profile, type: 'kanban', board: 'default', id: 't_f6f6f6f6' }] }
  const call = async path => path.endsWith('/ping') ? pingWithdraw : {}
  await show(React.createElement(m.DecisionRow, { key: 'bound', request: bound, route, call }))
- assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Approve'), 'still decidable')
+ assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Request changes'), 'still decidable')
  assert.equal(offered(), false)
  await show(null)
 })
@@ -863,61 +777,13 @@ test('withdrawing the last tile hands keyboard focus back to the composer', asyn
   const button = [...el().querySelectorAll('button')].find(b => b.textContent === 'Not needed')
   button.focus()
   await React.act(async () => { button.click(); await flush(); await flush() })
-  assert.equal(el().querySelector('article'), null)
+  assert.ok(el().querySelector('article') === null)
   assert.deepEqual(focused, ['S1'])
  } finally { host.composer.focus = prev; await show(null); delete window.hermesDesktop }
 })
 
-test('explained options: one line each, the recommended one first and primary, plan folded behind Full plan', async () => {
- const r = freshRequest({ title: 'Switch gen-3 and gen-4 to on-demand?', choices: [
-  { id: 'no', label: 'Keep spot', effect: 'decline', explain: 'No cost change; slots stay reclaimable.' },
-  { id: 'edit', label: 'Revise', effect: 'revise' },
-  { id: 'yes', label: 'Approve', effect: 'approve', explain: '+$500/month; 6 runner slots back today.', recommended: true }] })
- assert.equal(m.validRequest(r), true)
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
- const options = [...el().querySelectorAll('[data-decision-option]')]
- assert.deepEqual(options.map(o => o.getAttribute('data-decision-option')), ['yes', 'no'], 'recommended first; free-text revise has no line')
- assert.equal(options[0].textContent, 'Approverecommended+$500/month; 6 runner slots back today.')
- const buttons = [...el().querySelectorAll('button[data-decision-effect]')]
- assert.deepEqual(buttons.map(b => b.textContent), ['Approve', 'Keep spot', 'Request changes'])
- assert.deepEqual(buttons.map(b => b.hasAttribute('data-primary')), [true, false, false], 'exactly one primary button')
- const fold = el().querySelector('[data-action-fold]')
- assert.equal(fold.querySelector('summary').textContent, 'Full plan and limits')
- assert.ok(fold.contains(el().querySelector('[data-action-scope]')) && fold.contains(el().querySelector('[data-action-limits]')))
- assert.equal(fold.open, false, 'folded until opened')
- assert.doesNotMatch(el().textContent, /Revision 1|Read this|Your decision/)
- assert.equal(el().querySelector('[data-action-kind]').textContent, 'Approval')
-})
 
-test('a lettered question shows each option as one button with its meaning, the recommended one first and marked', async () => {
- const sent = []
- const r = freshRequest({ kind: 'choice', title: 'How should the build lock treat the six macOS services?', limits: [], exclusions: [], scope: { complete: true, markdown: 'Reply A, B, C or D on the card.', sourceRefs: [] }, outcomes: { answer: 'Send this answer to the agent. This does not grant execution permission.' }, choices: [
-  { id: 'answer-0', label: 'A \u2014 root launchd attribution', effect: 'answer', explain: 'Allow a narrow root-owned read-only helper; keeps the exclusion.', recommended: true },
-  { id: 'answer-1', label: 'B \u2014 disclosed Apple-service class', effect: 'answer', explain: 'Exempt exact Apple binaries; weaker.' },
-  { id: 'answer-text', label: 'Answer in your own words', effect: 'answer' }] })
- assert.equal(m.validRequest(r), true)
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async (path, init) => { if (init?.method === 'POST') sent.push(JSON.parse(init.body)); return {} } }))
- const rows = [...el().querySelectorAll('[data-decision-options] > button')]
- assert.deepEqual(rows.map(b => b.getAttribute('data-decision-option')), ['answer-0', 'answer-1'])
- assert.equal(rows[0].querySelector('[data-option-label]').textContent, 'A \u2014 root launchd attribution')
- assert.equal(rows[0].querySelector('[data-recommended]').textContent, 'Recommended')
- assert.equal(rows[1].querySelector('[data-recommended]'), null)
- assert.match(rows[0].querySelector('[data-option-explain]').textContent, /narrow root-owned/)
- assert.match(rows[0].getAttribute('aria-label'), /^A \u2014 root launchd attribution \(recommended\): Allow/)
- // no separate bare button repeats an explained option; free text stays in the bottom row
- const bottom = [...el().querySelectorAll('button[data-decision-effect]')].filter(b => !b.hasAttribute('data-decision-option')).map(b => b.textContent)
- assert.deepEqual(bottom, ['Answer in your own words'])
-})
 
-test('a legacy question without explanations keeps its question inline and adds no option lines', async () => {
- const r = freshRequest({ kind: 'choice', title: 'Switch or keep spot?', limits: [], exclusions: [], scope: { complete: true, markdown: 'Switch gen-3 or keep spot?', sourceRefs: [] }, outcomes: { answer: 'Send this answer to the agent. This does not grant execution permission.' }, choices: [{ id: 'answer-0', label: 'Switch gen-3', effect: 'answer' }, { id: 'answer-1', label: 'Keep spot', effect: 'answer' }, { id: 'answer-text', label: 'Answer in your own words', effect: 'answer' }] })
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
- assert.equal(el().querySelector('[data-action-fold]'), null)
- assert.equal(el().querySelector('[data-action-scope]').textContent, 'Switch gen-3 or keep spot?')
- assert.equal(el().querySelectorAll('[data-decision-option]').length, 0)
- assert.doesNotMatch(el().textContent, /does not grant execution permission/)
- assert.equal(el().querySelector('[data-action-kind]').textContent, 'Question')
-})
 
 test('validRequest mirrors the server: explain is non-empty text, recommended is true on at most one choice', () => {
  const base = request().choices
@@ -933,13 +799,14 @@ test('with the session panel loaded, the strip keeps only the compact companion 
  const dispose = m.default.register({ register: a => areas.push(a) })
  try {
   const strip = areas.find(a => a.id === 'strip')
-  assert.notEqual(strip.render(), null, 'draws itself without the panel')
   window.__sessionPanel = { active: true }
   const drawn = strip.render()
-  assert.equal(drawn.props.children.type, m.ActionQueue, 'the companion queue stays: free text, Retry, plan request, withdraw')
-  assert.equal(drawn.props.children.props.companion, true)
+  assert.equal(drawn.type, m.ActionQueue, 'the companion queue stays: free text, Retry, plan request, withdraw')
+  assert.deepEqual(drawn.props, {})
   assert.equal(window.__userSteps.ActionQueue, m.ActionQueue)
-  assert.equal(window.__userSteps.Strip, m.Strip)
+  assert.equal('Strip' in window.__userSteps, false)
+  assert.equal('Strip' in m, false)
+  assert.equal('askedAgo' in m, false)
   assert.equal(typeof window.__userSteps.openAskCount, 'function')
  } finally { delete window.__sessionPanel; dispose() }
 })
@@ -957,14 +824,14 @@ test('openAskKeys bridge preserves qualified revision identity and exactly match
   assert.equal(bridge.openAskKeys, m.openAskKeys, 'registration exports the real identity function')
   const live = freshRequest({ title: 'Synthetic bridge ask' })
   const remote = { ...live, owner: { ...owner, gatewayId: 'G2' } }
-  const pending = freshRequest({ resolution: { operationId: 'bridge-pending', choiceId: 'yes', revision: 1 } })
+  const pending = freshRequest({ resolution: { operationId: 'bridge-pending', choiceId: 'edit', revision: 1 } })
   const dismissed = freshRequest()
   m.dismissRequest(dismissed)
   const ignored = [
    dismissed,
    freshRequest({ scope: { complete: false, markdown: '', sourceRefs: [] } }),
    freshRequest({ state: 'withdrawn' }),
-   ...['resolved', 'superseded', 'cancelled'].map(state => freshRequest({ state, resolution: { operationId: `bridge-${state}`, choiceId: 'yes', revision: 1 } }))
+   ...['resolved', 'superseded', 'cancelled'].map(state => freshRequest({ state, resolution: { operationId: `bridge-${state}`, choiceId: 'edit', revision: 1 } }))
   ]
   const rows = [...ignored, pending, remote, live, live]
   const key = (r, scope = ['C1', 'default', 'S1']) => `${JSON.stringify(scope)}:${JSON.stringify([r.owner.gatewayId, r.owner.profile, r.requestId])}:${r.revision}`
@@ -996,15 +863,15 @@ test('openAskKeys bridge preserves qualified revision identity and exactly match
  }
 })
 
-test('embedded queue drops its own frame, heading and minimize control', async () => {
+test('companion queue has no frame, heading, filter or minimize control', async () => {
  const r = freshRequest({ title: 'Embedded ask' })
  const calls = []
  const call = async (path, opts) => { calls.push(path); if (path.includes('/ping')) return { ok: true, api: 2, features: [] }; return { requests: [r] } }
  await m.refreshRequests(call)
- await show(React.createElement(m.ActionQueue, { key: 'embedded', embedded: true }))
+ await show(React.createElement(m.ActionQueue, { key: 'embedded' }))
  const section = el().querySelector('[data-action-queue]')
- assert.ok(section.hasAttribute('data-embedded'))
- assert.equal(section.querySelector('[data-action-queue-header]'), null)
+ assert.ok(el().querySelector('h2, [aria-label="Filter decisions"], [data-action-queue-toggle]') === null)
+ assert.ok(section.querySelector('[data-action-queue-header]') === null)
  assert.equal(section.style.border, '')
  assert.equal(el().querySelector('h3').textContent, 'Embedded ask')
  assert.equal(m.openAskCount(), 1)
@@ -1013,7 +880,7 @@ test('embedded queue drops its own frame, heading and minimize control', async (
 test('failed recorded decision is not a human ask but stays visible with Retry until confirmed', async () => {
  await show(null)
  const r = freshRequest({ title: 'Failing ask' })
- const resolution = { operationId: 'op-failed-visible', choiceId: 'yes', revision: 1 }
+ const resolution = { operationId: 'op-failed-visible', choiceId: 'edit', revision: 1 }
  const recorded = { ...r, resolution } // core retains open state until delivery confirms
  let delivered = false; const posts = []
  const call = async (path, opts = {}) => {
@@ -1025,7 +892,7 @@ test('failed recorded decision is not a human ask but stays visible with Retry u
  }
  window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
  await m.refreshRequests(call)
- await show(React.createElement(m.ActionQueue, { key: 'failed-visible', embedded: true }))
+ await show(React.createElement(m.ActionQueue, { key: 'failed-visible' }))
  assert.equal(m.openAskCount(), 0, 'recorded open decision needs agent delivery, not another choice')
  assert.match(el().textContent, /delivery unconfirmed/i)
  assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Retry'))
@@ -1033,11 +900,11 @@ test('failed recorded decision is not a human ask but stays visible with Retry u
  assert.equal(posts.length, 1)
  assert.match(posts[0], /operations\/op-failed-visible\/retry/)
  assert.equal(m.openAskCount(), 0, 'confirmed decision clears')
- assert.equal(el().querySelector('[data-action-request]'), null)
+ assert.ok(el().querySelector('[data-action-request]') === null)
 })
 
 test('historical confirmed decisions do not resurrect the attention count on a cold renderer', async () => {
- const r = freshRequest({ state: 'resolved', resolution: { operationId: 'old-delivered', choiceId: 'yes', revision: 1 } })
+ const r = freshRequest({ state: 'resolved', resolution: { operationId: 'old-delivered', choiceId: 'edit', revision: 1 } })
  await m.refreshRequests(async () => ({ requests: [r] }))
  assert.equal(m.openAskCount(), 0)
  await show(null)
@@ -1048,10 +915,13 @@ test('a new chat with no stored row yet is an empty queue, not an outage', async
  await show(React.createElement(m.ActionQueue,{key:'unstored'}))
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.doesNotMatch(el().textContent,/Action queue unavailable/)
- assert.equal(el().querySelector('[data-action-queue]'),null)
+ assert.ok(el().querySelector('[data-action-queue]') === null)
+ window.hermesDesktop.api=async()=>{throw Error('404: {"detail":"Plugin not found"}')}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.doesNotMatch(el().textContent,/Action queue unavailable/,'a profile without the user-steps backend (bots) has no queue')
  window.hermesDesktop.api=async()=>{throw Error('404: {"detail":"Not Found"}')}
  await React.act(async()=>{await m.refreshRequests();await flush()})
- assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. plugin missing) still surface')
+ assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. a stale route) still surface')
  await show(null);delete window.hermesDesktop
 })
 
@@ -1077,9 +947,9 @@ test('owner phase: delivery alone is not acknowledgment; only owner receipts cha
  const paths=[]
  const call=async(path,opts={})=>{paths.push(path)
   if(path.includes('/receipts'))return consumer
-  return opts.method==='POST'?{operation:{operationId:'ownerop',dispatchState:'delivered'},request:r}:{operation:{operationId:'ownerop',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'yes',revision:1}}}}
+  return opts.method==='POST'?{operation:{operationId:'ownerop',dispatchState:'delivered'},request:r}:{operation:{operationId:'ownerop',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'edit',revision:1}}}}
  await show(React.createElement(m.DecisionRow,{request:r,route,call}))
- await click('Approve')
+ await revise()
  await React.act(async()=>{await flush();await flush()})
  const phase=()=>el().querySelector('[data-owner-phase]')
  assert.match(el().textContent,/Confirmed — decision delivered/)
@@ -1087,7 +957,7 @@ test('owner phase: delivery alone is not acknowledgment; only owner receipts cha
  assert.match(phase().textContent,/No owner acknowledgment recorded/)
  assert.ok(paths.some(p=>/\/operations\/ownerop\/receipts\?/.test(p)))
  consumer=applied
- await React.act(async()=>{await m.refreshRequests(async()=>({requests:[{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'yes',revision:1}}]}));await flush();await flush()})
+ await React.act(async()=>{await m.refreshRequests(async()=>({requests:[{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'edit',revision:1}}]}));await flush();await flush()})
  assert.equal(phase().dataset.ownerPhase,'applied');assert.match(phase().textContent,/commit abc123/)
  await show(null)
 })
@@ -1227,7 +1097,7 @@ test('a revisited chat counts and shows its last-known asks at once, decisions l
     assert.equal(m.openAskCount(), 1, 'counted before the read answers')
     await show(React.createElement(m.ActionQueue, { key: 'cached-revisit' }))
     assert.match(el().textContent, /Cached ask/)
-    const approve = () => [...el().querySelectorAll('button')].find(b => b.textContent === 'Approve')
+    const approve = () => [...el().querySelectorAll('button')].find(b => b.textContent === 'Request changes')
     assert.equal(approve().disabled, true, 'a cached revision is never answerable')
     await React.act(async () => { pending.forEach(res => res({ requests: [r] })); await read; await flush() })
     assert.equal(approve().disabled, false, 'the fresh read unlocks it')
@@ -1260,8 +1130,8 @@ test('warm caches another chat\'s asks (validated) without touching the focused 
     const read = m.refreshRequests(hang)
     assert.equal(m.openAskCount(), 1, 'warmed ask counted on the first switch')
     await show(React.createElement(m.ActionQueue, { key: 'warm-switch' }))
-    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').disabled, true, 'locked until the live read')
+    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Request changes').disabled, true, 'locked until the live read')
     await React.act(async () => { pending.forEach(res => res({ requests: [bg] })); await read; await flush() })
-    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').disabled, false)
+    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Request changes').disabled, false)
   } finally { await show(null); delete window.hermesDesktop; host.state.focusedStoredSessionId.value = 'S1' }
 })

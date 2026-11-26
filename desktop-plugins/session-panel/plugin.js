@@ -4,7 +4,54 @@ import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import * as sdk from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { ProcessView, processRoute } from './process-view.js'
+
+// Desktop's runtime loader accepts only @hermes/plugin-sdk and react imports: a sibling module
+// (`./x.js`) fails the whole plugin load, so the process viewer lives here, not in its own file.
+/** Resolve once per explicit open. Never fall back to the active backend for a named owner. */
+export function processRoute(target, bridge, gateways) {
+  if (!target?.id || !target.session || !target.gateway || !target.profile) throw Error('Process owner is unavailable.')
+  const connectionId = bridge?.connectionForHubGateway?.(target.gateway)
+  const gateway = gateways?.find(g => g?.id === connectionId)
+  if (!connectionId || !gateway) throw Error('The gateway that holds this process is not connected.')
+  return Object.freeze({ connectionId, mode: gateway.kind === 'local' ? 'local' : 'remote',
+    profile: target.profile, targetProfile: target.profile })
+}
+
+/** Existing owner-scoped RPCs only; no shell, kill, log acknowledgement or ambient request. */
+export async function readProcessView(target, route, request) {
+  const attached = await request(route, 'session.resume', {session_id: target.session, lazy: true, omit_messages: true}, 30000, {spawnPriority: 'foreground'})
+  if (attached?.stored_session_id !== target.session || !attached?.session_id) throw Error('The owning session changed. Refresh the panel before opening this process.')
+  const result = await request(route, 'process.list', {session_id: attached.session_id}, 10000)
+  if (!Array.isArray(result?.processes)) throw Error('Process status is unavailable.')
+  const process = result.processes.find(p => p?.session_id === target.id)
+  if (!process) throw Error('This process is no longer in the owning session’s live inventory. Its output may have expired.')
+  return {id: target.id, command: String(process.command || target.id), status: String(process.status || 'unknown'),
+    output: typeof process.output_tail === 'string' ? process.output_tail : '', exit_code: process.exit_code}
+}
+
+/** Read-only, explicit-refresh process viewer. Closing/switching owner cancels late presentation. */
+export function ProcessView({target, route, onClose}) {
+  const [value, setValue] = useState(null), [error, setError] = useState(null), [retry, setRetry] = useState(0)
+  useEffect(() => {
+    let active = true
+    setValue(null); setError(null)
+    void readProcessView(target, route, (...args) => sdk.host.requestProfile(...args))
+      .then(v => {if (active) setValue(v)}, e => {if (active) setError(String(e?.message || e))})
+    return () => {active = false}
+  }, [target, route, retry])
+  const {Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription} = sdk
+  if (!Dialog || !DialogContent || !DialogTitle) return null
+  return jsx(Dialog, {open: true, onOpenChange: open => {if (!open) onClose()}, children:
+    jsxs(DialogContent, {'data-process-view': target.id, children: [
+      jsx(DialogHeader || 'div', {children: jsx(DialogTitle, {children: value?.command || target.title || target.id})}),
+      jsx(DialogDescription || 'p', {children: `${target.gateway} / ${target.profile} · ${target.id}`}),
+      target.detail && jsx('p', {'data-process-snapshot': '', children: `Panel observation at open: ${target.detail}`}),
+      jsx('div', {role: 'status', children: error || (value ? value.status + (value.exit_code == null ? '' : ` · exit ${value.exit_code}`) : 'Loading process…')}),
+      value && jsx('pre', {'data-process-output': '', style: {whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: '50vh'}, children: value.output || 'No output yet.'}),
+      jsx('button', {type: 'button', onClick: () => setRetry(n => n + 1), children: 'Refresh'}),
+      jsx('button', {type: 'button', onClick: onClose, children: 'Close'})
+    ]})})
+}
 
 // Identical in the two standalone disk plugins; matches core lib/wait-eta.ts.
 export function formatWaitDuration(seconds) {
@@ -40,7 +87,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v26-live-processes'
+const VERSION = 'session-panel-v28-timing-wrap'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -122,6 +169,11 @@ const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', p
 // `[panel-feed] <connection>/<profile> <state> ...`.
 const feedLog = msg => { try { window.hermesDesktop?.logLine?.(`[panel-feed] ${msg}`) } catch {} }
 const tasksBridge = () => (typeof window !== 'undefined' ? window.__sessionTasks : null)
+const unsupportedFeed = route => feeds.get(connKey(route?.connectionId, route?.profile))?.unsupported === true
+/** Only replace the task strip when this exact chat has a renderable model. */
+export function covers(route) {
+  return !!route?.connectionId && !!route?.session && !unsupportedFeed(route) && !!cachedModel(route)
+}
 /** True while `route`'s gateway feed pushes (or heartbeats) reach this window. */
 export function feedIsLive(route, nowMs = Date.now()) {
   const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
@@ -219,7 +271,8 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
   const unsupported = why => {
     if (!st?.unsupported) feedLog(`${target.connectionId}/${profile} no-feed ${why}`)
-    feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, at: nowMs })
+    feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, reason: why, at: nowMs })
+    modelChanged()
     return false
   }
   const sameFeed = !reset && st && !st.unsupported
@@ -237,7 +290,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
     log('feed catch-up failed', target.connectionId, e?.message || e)
     return false
   }
-  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? `profile ${r.profile}` : 'no epoch')
+  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? 'profile_unsupported' : 'no epoch')
   const cur = feeds.get(key)
   if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
     // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
@@ -255,6 +308,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
   feeds.set(key, next)
+  if (cur?.unsupported) modelChanged()
   if (cur?.epoch !== r.epoch || cur?.feed !== r.feed) feedLog(`${target.connectionId}/${profile} registered feed=${r.feed} epoch=${r.epoch} rev=${next.rev} watching=${target.sessions.length} bundles=${Object.keys(r.bundles || {}).length}`)
   next.fresh = cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.fresh || [] : []
   for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, r)
@@ -421,6 +475,20 @@ const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
   ...(section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+// Section -> shared card-square category (Desktop `CardCountSquare`), matching the row boxes' colours.
+const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
+export const pipCategory = pip => pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
+  : pip.wait_kind === 'deploy' ? 'violet' : pip.wait_kind === 'agent' || deliveryWait(pip) ? 'blue' : 'amber'
+// Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
+const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
+/** One numbered card square: the count inside an outline in the category's colour. */
+export function CountSquare({ category, count }) {
+  if (typeof sdk.CardCountSquare === 'function') return jsx(sdk.CardCountSquare, { category, count })
+  return jsx('span', { 'data-card-colour': category, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    boxSizing: 'border-box', height: 16, minWidth: 16, padding: '0 2px', borderRadius: 2, flex: 'none', fontSize: 10, lineHeight: 1,
+    fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary, var(--muted-foreground))', fontWeight: 400,
+    border: `1px solid ${SQUARE_BORDER[category] || SQUARE_BORDER.grey}` }, children: count })
+}
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -674,12 +742,13 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
-        jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, ...(section === 'waiting' ? { flexWrap: 'wrap', rowGap: 1 } : {}) }, children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, flexWrap: 'wrap', rowGap: 1 }, children: [
           jsx('strong', { 'data-ask-title': '', title: hover, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
           inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || detail,
-            // Waiting copy carries the accountable actor and triage age. Keep
-            // all of it readable, rather than ellipsizing the trailing age.
-            style: { ...muted, flex: compact ? '0 1 auto' : 'none', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : {}), whiteSpace: 'nowrap', ...(section === 'waiting' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
+            // Runtime ends in an elapsed clock. An unshrinkable metadata line
+            // can extend past the clipped panel even though its DOM text exists.
+            // Wrap the entire detail when necessary; never ellipsize its clock.
+            style: { ...muted, flex: '0 1 auto', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : { maxWidth: '100%', overflowWrap: 'anywhere' }), whiteSpace: compact ? 'nowrap' : 'normal', ...(section === 'waiting' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
         ] }),
         !inline && detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: detail }),
         // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.
@@ -743,10 +812,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('span', { children: 'This session' })
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
-      ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
-        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip) }),
-        `${pip.count} ${pip.label}`
-      ] }, i)),
+      // Header counts are numbered card squares (the Desktop's shared look); the section words are the tooltip.
+      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, title: `${pip.count} ${pip.label}`, 'aria-label': `${pip.count} ${pip.label}`,
+        style: { display: 'inline-flex' }, children: jsx(CountSquare, { category: pipCategory(pip), count: pip.count }) }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
@@ -1044,6 +1112,7 @@ export async function openUrl(url) {
 /** True while the focused chat's cached hub model carries the one status line for this answered request, so the
  *  decision queue (user-steps) stays silent about it. */
 export function showsDecision(requestId, route = panelRoute()) {
+  if (unsupportedFeed(route)) return false
   const model = decisionPresentation(cachedModel(route), route)
   return !!requestId && !!model && MODEL_SECTIONS.some(([section]) => model.sections?.[section]?.some(row => row?.decision?.request_id === requestId))
 }
@@ -1112,6 +1181,8 @@ export function Panel() {
   const model = decisionPresentation(cachedModel(route), route)
   useEffect(() => { observeDecisionRender(route, model) })
   if (!route.session) return null
+  if (unsupportedFeed(route)) return jsx('div', { role: 'alert', 'data-session-panel-error': '',
+    children: `Session panel isn't served for profile ${route.profile || 'default'} on ${route.connectionId}: ${feeds.get(connKey(route.connectionId, route.profile)).reason}. Linked task status remains in the task strip.` })
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
   const panel = renderModel(model, {
@@ -1151,7 +1222,7 @@ export default {
   name: 'Session Panel',
   register(ctx) {
     osApi = ctx?.os || null
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, covers, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null

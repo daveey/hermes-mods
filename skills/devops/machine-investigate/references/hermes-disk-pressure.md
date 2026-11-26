@@ -17,8 +17,25 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 4. **Map each directory to its owning card's status.** Workspace and evidence directories are named by task id.
    Read the `tasks` table from `~/.hermes/kanban.db` and every `~/.hermes/kanban/**/kanban.db`, opened
    read-only (`file:...?mode=ro`). A directory with no task row is unknown, not abandoned.
-5. **Find live writers** by sampling `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone
-   don't show which process is writing.
+5. **Take the fill rate and the writers from the disk guard's journal first** (hub:
+   `journalctl -u hub-disk-guard.service -o short-unix --since -10h`). Its JSON `usage` events give free space
+   after each pass, and its `writers` events the top writers per pass. Fit the rate over hours of post-pass values
+   before quoting days-to-floor: free space swings by GBs between passes (write bursts, ~1 GB reclaims), so two
+   samples minutes apart can misstate a slow trend several-fold. For a writer the journal doesn't name, sample
+   `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone don't show which process is writing. Capture ancestry, cwd, owned service and open-file allocation in the same
+   bounded sample: a short-lived runner can disappear before a later pass. IO deltas are not retained disk growth;
+   compare simultaneous filesystem deltas and deduplicate regular-file device/inode allocation, excluding memfd.
+6. **Delete a "redundant" copy only from an exact manifest.** List every exact path first (a `.gz` beside its
+   snapshot, a relocation's source). Verify each kept destination exists, its sha256 matches the mapping
+   (`manifest.json` where there is one), and no process has either path as cwd or open fd. A relocation receipt
+   or an original-path symlink is not deletion authorization: keep existing holds until the manifest names each
+   path, then comment on any open card that references it.
+
+For alert-owner rearming, bind the observed scheduled status and park-event identity to the supported lifecycle
+writer's transaction precondition. A separate status SELECT followed by generic unblock can release a changed
+blocked owner or a successor park. Preserve normal unread-comment/spend/parent/review/worker gates; record a
+successful delivery marker atomically with the admitted lifecycle change. Exercise real disposable-board
+interleavings, not only subprocess mocks, and do not count parent-gated or review-only outcomes as live delivery.
 
 ## Worker nodes (worker-N)
 
@@ -81,9 +98,7 @@ Inventory both `~/.cache/uv` and `~/.hermes/cache/uv`; runtime configuration can
   it as cwd or an open fd. Fix it at the source with a pid-tagged name plus a sweep of dead siblings.
 - **`cache/gc-trash`**: `purge_trash` only runs when that GC pass moved something, so old entries can sit there.
   Its contents are already marked for deletion.
-- **`kanban/evidence/<task>`**: nothing cleans it up. Before deleting a redundant copy, such as a `.gz` next to
-  the decompressed snapshot, verify that the kept copy's sha256 still matches `manifest.json`. Then comment on
-  any open card that references the path.
+- **`kanban/evidence/<task>`**: nothing cleans it up. Delete redundant copies there only by Order step 6.
 
 Most of the remaining space is usually live work: research artifacts, open-card workspaces, models and containers.
 When cleanups keep landing above ~80% used, the lasting fix is capacity (a David-only spend ask), not another

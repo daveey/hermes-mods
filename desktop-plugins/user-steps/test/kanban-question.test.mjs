@@ -21,10 +21,20 @@ const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
 const click = async label => React.act(async () => { const b = [...el().querySelectorAll('button')].find(x => x.textContent === label); assert.ok(b, label); b.click(); await flush() })
+const answerOther = async () => {
+ await click('Other')
+ const input = el().querySelector('textarea')
+ await React.act(async () => {
+  Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(input, 'Green')
+  input.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  await flush()
+ })
+ await click('Send answer')
+}
 const owner = { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' }
 const route = { connectionId: 'C1', profile: 'default', session: 'S1' }
 let serial = 0
-const request = extra => ({ schemaVersion: 2, owner, requestId: `00000000-0000-4000-8000-${String(++serial).padStart(12, '0')}`, revision: 1, kind: 'choice', title: 'Raw card title t_example', scope: { complete: true, markdown: 'Unblock = continue; archive = abandon. No commands run from this panel.', sourceRefs: [] }, limits: [], exclusions: [], outcomes: { answer: 'Record answer' }, choices: ['Red','Green','Blue'].map((label, i) => ({ id: `card-${i}`, label, effect: 'answer' })), aliases: [], state: 'open', presentation: { kind: 'kanban-question', question: 'Which color should we use?', details: 'Original context and evidence. Unblock = continue; archive = abandon.', recommendedChoiceId: 'card-1', other: true }, ...extra })
+const request = extra => ({ schemaVersion: 2, owner, requestId: `00000000-0000-4000-8000-${String(++serial).padStart(12, '0')}`, revision: 1, kind: 'choice', title: 'Raw card title t_example', scope: { complete: true, markdown: 'Unblock = continue; archive = abandon. No commands run from this panel.', sourceRefs: [] }, limits: [], exclusions: [], outcomes: { answer: 'Record answer' }, choices: [...['Red','Green','Blue'].map((label, i) => ({ id: `card-${i}`, label, effect: 'answer' })), { id: 'answer-text', label: 'Other', effect: 'answer' }], aliases: [], state: 'open', presentation: { kind: 'kanban-question', question: 'Which color should we use?', details: 'Original context and evidence. Unblock = continue; archive = abandon.', recommendedChoiceId: 'card-1', other: true }, ...extra })
 after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
 
 
@@ -35,12 +45,12 @@ test('card-question asks draw no card UI here; the choice posts the unchanged pa
  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
  for (const sel of ['[data-clarify-question]', '[data-clarify-row]', '[data-choice-letter]', '[data-ask-situation]', '[data-ask-only-you]', '[data-recommended-row]'])
   assert.equal(el().querySelector(sel), null, sel)
- await click('Green')
+ await answerOther()
  const post = calls.find(([,o]) => o.method === 'POST')
  assert.equal(post[0], `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
  const { idempotencyKey, ...payload } = post[1].body
  assert.ok(idempotencyKey)
- assert.deepEqual(payload, { session: 'S1', expectedRevision: 1, choiceId: 'card-1', revisionText: 'Green' })
+ assert.deepEqual(payload, { session: 'S1', expectedRevision: 1, choiceId: 'answer-text', revisionText: 'Green' })
 })
 
 test('dismissRequest still hides one request locally and updates the queue count without a write', async () => {
@@ -67,7 +77,7 @@ test('a recorded decision makes blocked-panel read the cards itself (forced), no
   const call = async () => ({ request: r, operation: { operationId: 'op-force', dispatchState: 'pending' } })
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-force`, request: r, route, call }))
   assert.deepEqual(forced, [], 'nothing before the action')
-  await click('Green')
+  await answerOther()
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [true])
   assert.equal(m.refreshBlockedAfterAction(null), false, 'no blocked-panel: nothing to do')
@@ -83,7 +93,7 @@ test('a recorded decision forces blocked-panel\'s refresh even when the delivery
    throw new Error('operation read timed out')
   }
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-throw`, request: r, route, call }))
-  await click('Green')
+  await answerOther()
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [true], 'forced once, after the POST, despite the failed read')
  } finally { delete window.__blockedPanel }
@@ -95,7 +105,7 @@ test('a decision whose POST fails does not force a refresh (nothing changed)', a
  try {
   const call = async () => { throw new Error('offline') }
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-fail`, request: r, route, call }))
-  await click('Green')
+  await answerOther()
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [])
  } finally { delete window.__blockedPanel }

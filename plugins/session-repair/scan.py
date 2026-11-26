@@ -931,12 +931,16 @@ def rule_parent_done(card: Card, src: Sources) -> Optional[Finding]:
         try:
             from hermes_cli import kanban_db
             from hermes_cli import kanban_db_sync as sync
-            states = dict(kanban_db.parent_states(c, card.id, remote=sync.has_remote_parents(c)))
+            remote = sync.has_remote_parents(c)
+            states = dict(kanban_db.parent_states(c, card.id, remote=remote))
+            # Terminal status does not release a parent's independent execution
+            # restriction. Reuse core's actual dependency predicate, not prose.
+            blocked_parents = any(kanban_db.parent_blocks(c, pid, st) for pid, st in states.items())
             held = _promotion_held(c, card)
         except Exception as e:  # noqa: BLE001
             src.error(f'parent_states {card.board}/{card.id}', e)
             return None
-        if held or not states or any(st not in SATISFIED for st in states.values()):
+        if held or blocked_parents or not states or any(st not in SATISFIED for st in states.values()):
             return None
         times = [(_parent_state(c, p) or {}).get('completed_at') for p in states]
         last = max((t for t in times if t is not None), default=None)
@@ -1185,6 +1189,74 @@ def healthy_future_park(card: Card, park: dict, now: float) -> bool:
     return False
 
 
+def healthy_widened_ci_wait(card: Card, park: dict, live: dict, now: float) -> bool:
+    """A completed component is not completion of core's same-head aggregate watch."""
+    payload = park['payload']
+    awaited = payload.get('awaiting') or {}
+    state = live.get('state')
+    if (card.status != 'scheduled' or (_num(payload.get('wake_at')) or 0) <= now
+            or payload.get('wake_check') or not isinstance(awaited, dict)
+            or awaited.get('kind') != 'ci' or not isinstance(state, dict)
+            or state.get('status') != 'completed' or state.get('conclusion') != 'success'):
+        return False
+    ref = awaited.get('ref')
+    match = re.fullmatch(r'https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)', str(ref))
+    sha = state.get('headSha')
+    if (not match or state.get('url') != ref or not isinstance(sha, str)
+            or not re.fullmatch(r'[0-9a-f]{40}', sha)):
+        return False
+    # The caller's legacy park selector uses arrival IDs. Do not let an older
+    # remapped park lend its widening to a newer, unwidened episode.
+    kinds = tuple(_core_wait()[0])
+    newest = card.conn.execute(
+        f"SELECT id,created_at FROM task_events WHERE task_id=? AND kind IN ({','.join('?' for _ in kinds)}) "
+        "ORDER BY created_at DESC LIMIT 2", (card.id, *kinds)).fetchall()
+    if (not newest or newest[0][0] != park['id'] or type(newest[0][1]) is not int
+            or not 0 <= newest[0][1] <= now
+            or len(newest) == 2 and newest[0][1] == newest[1][1]):
+        return False
+    rows = card.conn.execute("""SELECT id, kind, payload, created_at, run_id FROM task_events
+        WHERE task_id=? AND created_at>? AND created_at<=? AND kind IN
+        ('ci_wait_widened','external_watch','wake_check_broken','wake_check_lost',
+         'wake_check_stale','condition_met') ORDER BY created_at DESC LIMIT 101""",
+        (card.id, park['at'], now)).fetchall()
+    if len(rows) == 101:
+        return False  # incomplete history cannot establish absence of an adverse event
+    events = [{'id': r[0], 'kind': r[1], 'payload': _json(r[2]) or {}, 'at': r[3]}
+              for r in rows]
+    # Compare immutable time, not replica-local arrival IDs. Ambiguous chronology
+    # or any adverse event remains eligible; no source receipt is created here.
+    if not all(isinstance(e['payload'], dict) for e in events):
+        return False
+    watches = [e for e in events if e['kind'] == 'external_watch']
+    widened = [e for e in events if e['kind'] == 'ci_wait_widened']
+    if not watches or not widened:
+        return False
+    watch = max(watches, key=lambda e: e['at'])
+    widen = max(widened, key=lambda e: e['at'])
+    if (sum(e['at'] == watch['at'] for e in watches) != 1
+            or sum(e['at'] == widen['at'] for e in widened) != 1
+            or not widen['at'] < watch['at']
+            or any(e['kind'] not in ('external_watch', 'ci_wait_widened') for e in events)):
+        return False
+    data, bound = watch['payload'], widen['payload']
+    pending_runs = bound.get('pending_runs')
+    since = _num(bound.get('since'))
+    if (type(bound.get('from_run')) is not int or bound['from_run'] != int(match[2])
+            or bound.get('head_sha') != sha or not isinstance(pending_runs, list)
+            or not pending_runs or not all(type(n) is int and n > 0 for n in pending_runs)
+            or since is None or not park['at'] <= since <= widen['at']
+            or data.get('adapter') != 'github_run'
+            or data.get('url') != f'https://github.com/{match[1]}/commit/{sha}'):
+        return False
+    observed, due, every = (_num(data.get(k)) for k in ('observed_at', 'next_due_at', 'every'))
+    return (data.get('health') == 'ok' and data.get('state') == 'external_running'
+            and data.get('consecutive_failures') == 0 and observed is not None
+            and every is not None and 0 < every <= 21600 and due is not None
+            and widen['at'] <= observed <= watch['at'] <= now
+            and observed <= due <= observed + every + 900 and now <= due + 900)
+
+
 def reassessment_target(awaited: dict, live: dict, now: Optional[float] = None) -> Optional[dict]:
     """Derive identity/revision from an independent producer read, never receipt JSON.
 
@@ -1351,6 +1423,8 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         live = {'state': producer, 'last_event_at': at, 'happened': False}
     elif kind in ('ci', 'deploy', 'external'):
         live = src.producer_state(kind, ref)
+    if healthy_widened_ci_wait(card, park, live, src.now):
+        return None
     if live.get('happened') and park['payload'].get('wake_check') and re.fullmatch(
             r'https://github\.com/[^/]+/[^/]+/pull/\d+(?:[/?#].*)?', str(ref)):
         # The explicit probe owns the condition (merge queue, installed ancestry,

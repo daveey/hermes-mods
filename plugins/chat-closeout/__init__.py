@@ -1879,7 +1879,7 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
     """Portable selected-task evidence, NOT the host's history-dependent scoped token.
 
     Core certifies trigger coverage, revision continuity and file identity in the SAME snapshot as our
-    indexed task marks. The global revision is only a certification gate, never a returned value. FULL
+    indexed settlement values and monotonic generations. The global revision is only a certification gate. FULL
     after a previous observation forces a fresh pass (restore/regression/reinstall); a cold reader can
     independently build the same key. No certifier on an older core means no memo/adoption, not silence.
     """
@@ -1895,15 +1895,40 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
                 if cursor is None:
                     cache.pop(ident, None)
                     raise wi.Unportable("uncertified waiting task inputs")
-                selected = sorted(tails | {rev.FULL_MARK})
-                # One indexed lookup per board, not one SQL statement per watched task. Keep missing
-                # marks and ordering in the portable key exactly as before, in this same snapshot.
-                found = dict(conn.execute(
-                    f"SELECT task_id, rev FROM {rev.CHANGE_TABLE} WHERE task_id IN "
-                    "(SELECT value FROM json_each(?))", (json.dumps(selected),)).fetchall())
-                marks = [[tail, (found[tail],) if tail in found else None] for tail in selected]
+                # Revisions certify the snapshot, but a selected task's comment/run/title
+                # change is not a settlement change. Key the light reader's actual values.
+                # Keep the unknown-change mark and schema/file identity as fail-fresh gates.
+                full_mark = conn.execute(
+                    f"SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?", (rev.FULL_MARK,)).fetchone()
+                cols = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+                if not {'id', 'status'} <= cols:
+                    raise wi.Unportable('waiting tasks schema unavailable')
+                bk = 'block_kind' if 'block_kind' in cols else 'NULL'
+                comp = 'completed_at' if 'completed_at' in cols else 'NULL'
+                selected = sorted(tails)
+                rows = conn.execute(
+                    f'SELECT id, status, {bk}, {comp} FROM tasks WHERE id IN '
+                    '(SELECT value FROM json_each(?))', (json.dumps(selected),)).fetchall()
+                # SQLite scalars may include malformed-but-readable blobs or nonfinite
+                # floats. Preserve storage types without a JSON TypeError or lossy str().
+                found = {r[0]: [[type(v).__name__, v.hex() if isinstance(v, (bytes, float)) else v]
+                                for v in r] for r in rows}
+                values = [[tail, found.get(tail)] for tail in selected]
+                # Values can return to A after a source read of B. Every outer holder/publication
+                # must observe that intervening write, even across two declarations or an expired hit.
+                # New cores certify settlement-only generations; older cores retain broad marks.
+                narrow = getattr(tc, 'settlement_marks', None)
+                marks = narrow(conn, selected, cursor) if narrow is not None else None
+                generation_kind = 'settlement' if marks is not None else 'broad'
+                if marks is None:
+                    marks = dict(conn.execute(
+                        f'SELECT task_id, rev FROM {rev.CHANGE_TABLE} WHERE task_id IN '
+                        '(SELECT value FROM json_each(?))', (json.dumps(selected),)))
+                # A pre-install task has no mark; a first nonsettlement comment can create a
+                # default-zero mark. Those are the same generation, not a semantic write.
+                generations = [[tail, marks.get(tail, 0)] for tail in selected]
                 # changed_since rechecks path/shm identity after its read, including when the caller owns
-                # the transaction. Repeat after the marks, so a replacement during their read is unknown.
+                # the transaction. Repeat after the values/generations, so a replacement is unknown.
                 _changed, final = tc.changed_since(conn, cursor, tables=tables)
                 if final != cursor:
                     cache.pop(ident, None)
@@ -1915,9 +1940,10 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
         cache[ident] = cursor
         if previous is not None and changed is tc.FULL:
             raise wi.Unportable("waiting board requires full refresh")
-        return wi.strict_digest(["tasks-v1", cursor.dev, cursor.ino, cursor.shm,
+        return wi.strict_digest(["settlement-values-v2", cursor.dev, cursor.ino, cursor.shm,
                                  cursor.schema_version, cursor.tables,
-                                 [[tail, list(mark) if mark is not None else None] for tail, mark in marks]])
+                                 list(full_mark) if full_mark is not None else None, values,
+                                 generation_kind, generations])
 
 
 def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None,

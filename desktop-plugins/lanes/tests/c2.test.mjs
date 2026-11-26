@@ -30,11 +30,14 @@ test('C2 squares, total capsule, amber overage annotation and unchanged selectio
   const view = await mount(React.createElement(P.MiniPill, { row, scale: 2000, onToggle: n => clicked.push(n) }))
   try {
     const pill = view.container.querySelector('button')
-    assert.equal(pill.querySelector('.sq:not(.hollow)').textContent, '11')
-    assert.equal(pill.querySelector('.cap').textContent, '7+5 over')
+    assert.equal(pill.querySelector('[data-count=blocked]').textContent, '11')
+    assert.equal(pill.querySelector('[data-count=running]').textContent, '7+5 over')
     assert.equal(pill.querySelector('[data-part=total-running]').textContent, '7')
     assert.equal(pill.querySelector('[data-part=over]').textContent, '+5 over')
-    assert.equal(pill.querySelector('.hollow').textContent, '127')
+    assert.equal(pill.querySelector('[data-count=other]').textContent, '127')
+    // Each number sits inside its category square (the shared numbered card-square look).
+    assert.deepEqual([...pill.querySelectorAll('[data-card-colour]')].map(n => [n.dataset.cardColour, n.textContent]),
+      [['red', '11'], ['blue', '7'], ['amber', '+5 over'], ['outline', '127']])
     assert.ok(pill.classList.contains('is-over'))
     assert.match(pill.title, /tok\/m avg over 6 h\n11 blocked on you\n7 running · fair share 2 of 8/)
     assert.match(pill.title, /OVER by 5: borrowing idle slots — idle have nothing ready; 6 h actual 70% vs 25% target/)

@@ -9,6 +9,112 @@ from fastapi.testclient import TestClient
 from test_view import load
 
 
+QUERY = ('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL '
+         'SELECT x+1 FROM n WHERE x<{rows}) SELECT sum(x) FROM n')
+
+
+def test_board_deadline_identifies_expiring_handler(monkeypatch, caplog):
+    import sqlite3
+    from types import SimpleNamespace
+
+    api = load()
+    merge = api._sibling('board_merge')
+    clock, cpu = [100.0], [1.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(merge, 'thread_time', lambda: cpu[0])
+    query = QUERY.format(rows=100000)
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db)
+        clock[0] += 2.5
+        cpu[0] += 2.1
+        with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+            db.execute(query).fetchone()
+        assert 'lanes board_merge deadline expired' in caplog.text
+        assert 'wall=2.500s thread_cpu=2.100s' in caplog.text
+        caplog.clear()
+        merge.arm_deadline(db)
+        assert db.execute(query).fetchone()[0] == 5000050000
+        assert not caplog.records
+
+
+def test_board_deadline_does_not_charge_time_spent_waiting_for_other_threads(monkeypatch, caplog):
+    """Live failure: wall=2.0s thread_cpu=0.3s reads were interrupted in a busy backend."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    api = load()
+    merge = api._sibling('board_merge')
+    clock, cpu = [100.0], [1.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(merge, 'thread_time', lambda: cpu[0])
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db, phase='contexts')
+        clock[0] += 10    # five old deadlines: other threads held the interpreter lock
+        cpu[0] += 0.3     # this reader did 0.3 s of work
+        assert db.execute(QUERY.format(rows=100000)).fetchone()[0] == 5000050000
+        assert not caplog.records
+        # The snapshot still pins the WAL: starvation has a far backstop, and says so.
+        clock[0] += 3600
+        with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+            db.execute(QUERY.format(rows=100000)).fetchone()
+        assert 'phase=contexts wall=3610.000s thread_cpu=0.300s' in caplog.text
+
+
+def test_board_deadline_check_does_not_queue_for_the_interpreter_lock_every_few_steps(monkeypatch):
+    """Each check reacquires the GIL; thousands per query starve a contended reader."""
+    import sqlite3
+
+    api = load()
+    merge = api._sibling('board_merge')
+    calls = [0]
+
+    def counted():
+        calls[0] += 1
+        return 1.0
+    monkeypatch.setattr(merge, 'thread_time', counted)
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db)
+        armed = calls[0]
+        assert db.execute(QUERY.format(rows=200000)).fetchone()[0] == 20000100000
+        checks = calls[0] - armed
+        assert 1 <= checks <= 100, checks
+
+
+def test_board_deadline_restarts_for_another_reader_thread(monkeypatch):
+    import sqlite3
+    import threading
+
+    api = load()
+    merge = api._sibling('board_merge')
+    cpu = {threading.get_ident(): 50.0}  # the arming thread has a long CPU history
+    monkeypatch.setattr(merge, 'thread_time', lambda: cpu.get(threading.get_ident(), 0.0))
+    result = []
+    with contextlib.closing(sqlite3.connect(':memory:', check_same_thread=False)) as db:
+        merge.arm_deadline(db)
+        worker = threading.Thread(target=lambda: result.append(
+            db.execute(QUERY.format(rows=100000)).fetchone()[0]))
+        worker.start()
+        worker.join()
+    assert result == [5000050000]
+
+
+def test_governor_receipt_that_did_not_observe_a_governor_is_unknown_not_a_crash():
+    """Storage-admission aborts publish cards=None for every governor they did not reach."""
+    api = load()
+    governors = api._sibling('governors')
+    registry = [dict(id='storage_admission', label='Storage admission', kind='hold', threshold='budget'),
+                dict(id='llm_pool', label='LLM pool', kind='hold', threshold='pool')]
+    snapshot = dict(board='default', available=True, stale=False, idle_total=None, cards={}, governors=[
+        dict(governor='llm_pool', kind='hold', active=None, cards=None, card_ids=[], since=None, unknown=True),
+        dict(governor='storage_admission', kind='hold', active=True, cards=2, card_ids=['t_a', 't_b'], since=5.0)])
+    projected = governors.project([snapshot], [], registry)
+    rows = {row['id']: row for row in projected['rows']}
+    assert rows['llm_pool']['cards_charged'] == 0
+    assert rows['llm_pool']['partial'] is True
+    assert rows['llm_pool']['state'] == 'unknown', 'an unobserved governor is never painted off'
+    assert rows['storage_admission']['cards_charged'] == 2
+
+
 @pytest.mark.parametrize('slow_pr', [False, True])
 def test_real_board_view_and_status_push(tmp_path, monkeypatch, slow_pr, request):
     kbc = pytest.importorskip('hermes_cli.kanban_db_connect')
