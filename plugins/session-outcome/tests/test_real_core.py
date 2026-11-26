@@ -510,3 +510,44 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
             {'id': wid, 'verified': True, 'evidence': 'https://example.com/tests/green'}]}, session_id='tip'))['ok']
         assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip'}).json() == {'records': []}
         assert plugin._people().read('chat')[0]['state'] == 'closed'
+
+
+def test_closing_a_person_wait_refreshes_the_stored_outcome_without_a_turn(real, tmp_path, monkeypatch):
+    """The person ledger is `person_provider`'s source for the outcome's controls; core refreshes on no event
+    for it. Closing the wait (saved after the declaration) must reach the stored outcome on its own."""
+    import json
+    from hermes_state import SessionDB
+    so, plugin = real
+    monkeypatch.setattr(so, '_live_turn', lambda *a: False)
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    plugin._llm = lambda *a: 'YES'
+    person = {'kind': 'person', 'contact': 'Slack @ExampleOperator', 'channel': 'slack',
+              'thread': 'https://example.com/thread/9', 'request_id': 'request-9',
+              'response': 'confirm the window', 'next_step': 'schedule it'}
+    sent = json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))
+    wid = sent['outcome']['on'][0]['id']
+    assert wid in json.dumps(so.get_outcome('chat')['status'])
+    calls = []
+    quietly = so.refresh_outcomes_quietly
+    monkeypatch.setattr(so, 'refresh_outcomes_quietly', lambda s, t, **k: calls.append((list(s), t)) or quietly(s, t, **k))
+    seen = json.loads(plugin.handle({'kind': 'wait', 'on': [
+        {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply/9'}]}, session_id='chat'))
+    assert seen['ok'], seen
+    with SessionDB(db_path=tmp_path / 'state.db') as db:
+        db.append_message('chat', role='assistant', content=SUMMARY)
+    closed = json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
+        {'id': wid, 'verified': True, 'evidence': 'https://example.com/check/9'}]}, session_id='chat'))
+    assert closed['ok'], closed
+    assert ('chat'.split(), 'notice') in calls
+    assert wid not in json.dumps(so.get_outcome('chat')['status']), 'closed wait still in the stored controls'
+
+
+def test_no_person_refresh_without_the_provider_in_this_process(real, monkeypatch):
+    import json
+    so, plugin = real
+    so._providers.pop('person-dependencies')
+    calls = []
+    monkeypatch.setattr(so, 'refresh_outcomes_quietly', lambda *a, **k: calls.append(a))
+    with plugin._people().edit('chat') as records:
+        plugin._save_people('chat', records)
+    assert calls == []
