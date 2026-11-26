@@ -114,9 +114,12 @@ for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service')
         cases[f'eta_{kind}_{suffix}'] = f.bundle(f.task(status='scheduled', wait={
             'wait_state': 'external_running', 'waiting_on': on, 'waiting_since': f.NOW - waited,
             'waited_since': f.NOW - waited, 'expected_s': expected, 'estimate_source': 'fixture history'}))
+for _name, _on in (('clock_reason', 'the clock until 2027-01-15 08:01 UTC (Event watch on hub-hosted original owners; backstop at nightly mini rollout 10:30Z)'),
+                   ('clock_unreasoned', 'the clock until 2027-01-15 08:01 UTC')):
+    cases[_name] = f.bundle(f.task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': _on, 'waiting_since': f.NOW - 300}))
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
 print(json.dumps({**{name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
-    wire=name in ('relative_clock', 'elapsed_layout', 'aged_parked') or name.startswith(('agent_held_', 'eta_'))), 'now': f.NOW} for name, b in cases.items()},
+    wire=name in ('relative_clock', 'elapsed_layout', 'aged_parked', 'clock_reason', 'clock_unreasoned') or name.startswith(('agent_held_', 'eta_'))), 'now': f.NOW} for name, b in cases.items()},
     **{'header_clock_' + name: case for name, case in f.header_clock_cases().items()}}))

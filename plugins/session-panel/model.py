@@ -329,13 +329,22 @@ def wait_info(row, now, *, wire=False):
     since = number(wait.get('waiting_since'))
     if not on:
         return {'text': '', 'raw': '', 'urls': []}
-    match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b', on)
+    match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b(?:\s*\((.*)\)\s*$)?', on, re.S)
     if match:
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
-        prefix = f'waiting {relative(since, "elapsed") if wire else short_dur(now - since)} · ' if 0 < since <= now else ''
+        # The prerequisite is the producer's own `awaiting.why`; the clock is only when it is next checked.
+        why = flat(match[3] or '')
+        full = why
+        if len(why) > 40:  # the full wording stays in Details
+            why = why[:39].rstrip() + '…'
+        lead = f'waiting on {why}' if why else 'reason unavailable'
+        age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
         if due >= now:
-            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta}
-        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta}
+            timer = f'{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})'
+        else:
+            timer = f'{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})'
+        return {'text': f'{lead}{age} · {timer}', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta,
+                'prerequisite': full or None, 'next_actor': 'the clock (timed check)'}
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
     age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
@@ -923,6 +932,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['wait_eta'] = wi['eta']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
+        if wi.get('next_actor') and wi['text'] == on:
+            v['details'].append(f'Waiting reason: {wi["prerequisite"] or "unavailable (the park recorded none)"}')
+            v['details'].append(f'Next actor: {wi["next_actor"]}; the time shown is the next check, not the prerequisite')
         # A CI wait links its first run from the word "CI" in the detail line (`inline`), not a separate button.
         ci = wi['text'].startswith('waiting on CI')
         v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if ci else 'Open link', 'url': u,

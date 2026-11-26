@@ -38,6 +38,16 @@ const root = createRoot(document.getElementById('root'))
 const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
+for (const [name, lead] of [['clock_reason', /waiting on Event watch on hub-hosted/], ['clock_unreasoned', /reason unavailable/]]) {
+  test(`clock wait ${name} paints the prerequisite before the timer`, async () => {
+    const { model, now } = publicCases[name]
+    await paint(m.renderModel(model, { now }))
+    const detail = document.querySelector('[data-row-detail]').textContent
+    assert.match(detail, lead)
+    assert.match(detail, /left \(until/)
+    assert.ok(detail.search(lead) < detail.search(/left \(until/), 'prerequisite precedes the next-check time')
+  })
+}
 test('aged parked board data keeps its status and age in the panel and task chip', async () => {
   const { model, now } = publicCases.aged_parked
   const row = model.sections.waiting[0]
