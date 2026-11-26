@@ -1,8 +1,8 @@
 // LLM split (design option B, ~/design/llm-split/board.html): a titlebar chip that shows the router's traffic split
 // between the subscription pools next to their quota share, and a click-open panel whose drag bar sets the split.
 // Click (or Enter on the focused chip) opens the panel; the titlebar tooltip names it.
-// Chip: mini stacked bar (traffic) with a tick at Claude's quota share, "13:86" (Claude:GPT traffic %), one word
-// (auto · manual · ANT over · GPT over · ANT dry). Panel: per-pool accounts, Quota bar, draggable Traffic bar, Auto|Manual.
+// Chip: mini stacked bar (traffic) with a tick at Claude's quota share, "13:86:1:0" (Claude:GPT:Grok:Gemini traffic %),
+// plus a word only when something is wrong (ANT dry · off). No over/under-quota verdict: the user doesn't want it. Panel: per-pool accounts, Quota bar, draggable Traffic bar, Auto|Manual.
 // Data: GET/PUT /api/plugins/llm-split/v1/split (plugins/llm-split/core.py). Dragging = manual (PUT on release);
 // Auto = weights follow quota (the gateway re-applies every 5 min). Mounted as a titleBar.tools.right item so the app's
 // own titlebar buttons stay on plugin pages.
@@ -11,10 +11,10 @@ import { createElement as h, useState, useEffect, useRef, useCallback } from 're
 
 export const POLL_MS = 60000
 export const KEY_COMMIT_MS = 400
-export const OVER_PTS = 5 // |traffic - quota| below this reads as "manual" (matches quota)
 export const CHIP_SPAN = 8 // the chip is 8 titlebar cells wide (8 x 24 px; the core's span cap)
 export const QUERY_KEY = ['llm-split', 'split']
-const ANT = 'anthropic', GPT = 'openai-codex', GRK = 'xai-oauth'
+const ANT = 'anthropic', GPT = 'openai-codex', GRK = 'xai-oauth', GEM = 'gemini'
+export const RATIO_ORDER = [ANT, GPT, GRK, GEM] // chip ratio: Claude:GPT:Grok:Gemini (0 for a pool that isn't routed)
 export const COLORS = { [ANT]: '#d97757', [GPT]: '#3fb8a0', [GRK]: '#9aa0a6' }
 const SHORT = { [ANT]: 'ANT', [GPT]: 'GPT', [GRK]: 'GRK' }
 const DRY = '#f85149', TIGHT = '#d29922', OK = '#7aa2f7'
@@ -35,31 +35,26 @@ export function validSnapshot(s) {
   return !!s && Array.isArray(s.pools) && !!s.traffic && typeof s.traffic.share === 'object' && !!s.quota
 }
 
-// What the chip says: the shares, and a verdict.
+// What the chip says: the shares, and a word only when Claude's quota is dry.
 export function summarize(snap, draft) {
   const traffic = draft || snap.traffic.share || {}
   const quota = snap.quota.share || {}
   const hasQuota = Object.keys(quota).length > 0
   const mode = draft ? 'manual' : snap.mode
-  const over = (traffic[ANT] || 0) - (quota[ANT] || 0)
-  let word = mode, tone = 'mute'
-  if (hasQuota && (snap.quota.dry || []).includes(ANT)) { word = 'ANT dry'; tone = 'bad' }
-  else if (mode === 'auto') { word = 'auto'; tone = 'ok' }
-  else if (hasQuota && Math.abs(over) >= OVER_PTS) { word = over > 0 ? 'ANT over' : 'GPT over'; tone = 'warn' }
-  else word = 'manual'
-  return { traffic, quota, hasQuota, mode, over, word, tone }
+  const dry = hasQuota && (snap.quota.dry || []).includes(ANT)
+  return { traffic, quota, hasQuota, mode, word: dry ? 'ANT dry' : '', tone: dry ? 'bad' : 'mute' }
 }
+
+export const ratio = (share) => RATIO_ORDER.map((p) => pct(share[p])).join(':')
 
 export function noteFor(sum) {
   if (sum.mode === 'auto') return 'Follows quota, re-checked every 5 min'
-  if (!sum.hasQuota) return 'No quota reading on this host'
-  if (Math.abs(sum.over) < OVER_PTS) return 'Matches quota'
-  return `${sum.over > 0 ? '+' : ''}${pct(sum.over)}% Claude vs quota`
+  return 'Manual split'
 }
 
 export function titleFor(sum) {
   const t = sum.traffic, q = sum.quota
-  const traffic = `Traffic Claude ${pct(t[ANT])}% · GPT ${pct(t[GPT])}%${t[GRK] ? ` · Grok ${pct(t[GRK])}%` : ''}`
+  const traffic = `Traffic Claude ${pct(t[ANT])}% · GPT ${pct(t[GPT])}% · Grok ${pct(t[GRK])}% · Gemini ${pct(t[GEM])}%`
   const quota = sum.hasQuota ? `Quota Claude ${pct(q[ANT])}% · GPT ${pct(q[GPT])}%` : 'Quota unknown'
   return `${traffic}\n${quota}\n${sum.mode === 'auto' ? 'Auto: split follows quota' : 'Manual split'}`
 }
@@ -255,7 +250,7 @@ export function Chip({ ctx }) {
   if (!snap) {
     return h('span', { className: 'llms-chip dim', 'data-testid': 'llm-split-chip',
       'data-state-text': q.error ? `unavailable: ${q.error.message || q.error}` : 'loading' },
-      h('span', { className: 'llms-mini' }), h('span', { className: 'llms-num' }, '–:–'),
+      h('span', { className: 'llms-mini' }), h('span', { className: 'llms-num' }, '–:–:–:–'),
       q.error && h('span', { className: 'llms-word bad' }, 'off'))
   }
   const sum = summarize(snap, draft)
@@ -267,8 +262,8 @@ export function Chip({ ctx }) {
       h('span', { ref: triggerRef, className: 'llms-chip', 'data-testid': 'llm-split-chip', 'aria-label': titleFor(sum) },
         h('span', { className: 'llms-mini' }, h(Segments, { share: sum.traffic, order }),
           sum.hasQuota && h('i', { className: 'llms-qm', style: { left: `${sum.quota[ANT] || 0}%` } })),
-        h('span', { className: 'llms-num' }, `${pct(sum.traffic[ANT])}:${pct(sum.traffic[GPT])}`),
-        h('span', { className: `llms-word ${sum.tone}` }, sum.word))),
+        h('span', { className: 'llms-num' }, ratio(sum.traffic)),
+        sum.word && h('span', { className: `llms-word ${sum.tone}` }, sum.word))),
     h(PopoverContent, { ref: panelRef, align: 'end', sideOffset: 6, className: 'llms-pop',
       onClick: stop, onPointerDown: stop, onPointerMove: stop, onPointerUp: stop,
       onFocus: stop, // portal focus must not open the outer titlebar Tooltip
@@ -321,7 +316,7 @@ export function tool(ctx) {
   return {
     id: 'llm-split',
     label: 'LLM split',
-    title: 'Claude ⇄ GPT ⇄ Grok: traffic split vs quota. Click to adjust',
+    title: 'Claude:GPT:Grok:Gemini traffic split. Click to adjust',
     span: CHIP_SPAN, // titlebar cells this tool takes (cores without `span` reserve one)
     className: 'llms-tool',
     icon: h(Chip, { ctx }),

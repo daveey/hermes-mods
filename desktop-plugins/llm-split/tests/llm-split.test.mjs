@@ -49,17 +49,15 @@ test('splitAt keeps Grok, clamps, gives GPT the rest', () => {
   assert.deepEqual(P.splitAt(-5, 0), { anthropic: 0, 'openai-codex': 100, 'xai-oauth': 0 })
 })
 
-test('summarize: verdict words', () => {
-  assert.equal(P.summarize(snap()).word, 'ANT over')            // 33 traffic vs 13 quota
-  assert.equal(P.summarize(snap({ mode: 'auto' })).word, 'auto')
-  assert.equal(P.summarize(snap(), { anthropic: 15, 'openai-codex': 84, 'xai-oauth': 1 }).word, 'manual')
-  assert.equal(P.summarize(snap(), { anthropic: 2, 'openai-codex': 97, 'xai-oauth': 1 }).word, 'GPT over')
+test('summarize: no over/under verdict, only ANT dry', () => {
+  assert.equal(P.summarize(snap()).word, '')                    // 33 traffic vs 13 quota: no "ANT over"
+  assert.equal(P.summarize(snap({ mode: 'auto' })).word, '')
+  assert.equal(P.summarize(snap(), { anthropic: 2, 'openai-codex': 97, 'xai-oauth': 1 }).word, '') // no "GPT over"
   const dry = snap({ quota: { ...snap().quota, dry: ['anthropic'], share: { anthropic: 0, 'openai-codex': 100 } } })
   assert.equal(P.summarize(dry).word, 'ANT dry')
-  const none = snap({ quota: { source: null, at: null, share: {}, dry: [] } })
-  assert.equal(P.summarize(none).word, 'manual')
-  assert.equal(P.noteFor(P.summarize(none)), 'No quota reading on this host')
-  assert.equal(P.noteFor(P.summarize(snap())), '+20% Claude vs quota')
+  assert.equal(P.noteFor(P.summarize(snap())), 'Manual split')
+  assert.equal(P.ratio({ anthropic: 4, 'openai-codex': 94.4, 'xai-oauth': 1 }), '4:94:1:0')
+  assert.equal(P.ratio({ anthropic: 10, 'openai-codex': 70, 'xai-oauth': 5, gemini: 15 }), '10:70:5:15')
 })
 
 test('validSnapshot rejects junk', () => {
@@ -86,15 +84,16 @@ test('register: one titleBar.tools.right item, 8 cells wide right of throughput,
 test('chip renders the split and verdict; click opens the panel with quota, traffic and accounts', async () => {
   const ctx = fakeCtx(snap())
   const m = await mount(h(P.Chip, { ctx }))
-  assert.equal(chip().querySelector('.llms-num').textContent, '33:33')
-  assert.equal(chip().querySelector('.llms-word').textContent, 'ANT over')
+  assert.equal(chip().querySelector('.llms-num').textContent, '33:33:33:0')
+  assert.equal(chip().querySelector('.llms-word'), null)
   assert.ok(chip().querySelector('.llms-qm').style.left.startsWith('13.1'))
   await m.click(chip())
   assert.ok(bar(), 'panel open')
   const text = document.body.textContent
   assert.match(text, /Claude2\/10 readyquota 13%traffic 33%/)
   assert.match(text, /GPT10\/12 readyquota 86%/)
-  assert.match(text, /\+20% Claude vs quota/)
+  assert.doesNotMatch(text, /vs quota/)
+  assert.match(text, /Manual split/)
   assert.match(text, /weights 1:1:1/)
   await m.close()
 })
@@ -109,13 +108,13 @@ test('drag on the traffic bar sets a manual split and PUTs it on release', async
   const fire = async (type, x) => React.act(async () => b.dispatchEvent(new PE(type, { bubbles: true, cancelable: true, clientX: x, button: 0 })))
   await fire('pointerdown', 140)       // 20%
   await fire('pointermove', 150)       // 25% while dragging: chip reads the draft
-  assert.equal(chip().querySelector('.llms-num').textContent, '25:42')
+  assert.equal(chip().querySelector('.llms-num').textContent, '25:42:33:0')
   await fire('pointerup', 160)         // 30%
   await m.flush()
   const put = ctx.calls.find((c) => c.method === 'PUT')
   assert.ok(put, 'PUT sent')
   assert.deepEqual(put.body, { mode: 'manual', share: { anthropic: 30, 'openai-codex': 36.7, 'xai-oauth': 33.3 } })
-  assert.equal(chip().querySelector('.llms-num').textContent, '30:37')
+  assert.equal(chip().querySelector('.llms-num').textContent, '30:37:33:0')
   assert.equal(ctx.calls.filter((c) => c.method === 'PUT').length, 1, 'moves do not PUT')
   await m.close()
 })
@@ -168,8 +167,8 @@ test('Auto button PUTs mode auto and the chip says auto', async () => {
   await m.click(chip())
   await m.click(button('Auto'))
   assert.deepEqual(ctx.calls.at(-1), { path: '/v1/split', method: 'PUT', body: { mode: 'auto' } })
-  assert.equal(chip().querySelector('.llms-word').textContent, 'auto')
-  assert.equal(chip().querySelector('.llms-num').textContent, '13:86')
+  assert.equal(chip().querySelector('.llms-word'), null)
+  assert.equal(chip().querySelector('.llms-num').textContent, '13:86:1:0')
   assert.match(document.body.textContent, /Follows quota, re-checked every 5 min/)
   await m.close()
 })
@@ -204,7 +203,7 @@ test('a failed PUT shows the error and reverts the draft', async () => {
 test('backend down: chip shows a dim placeholder, no crash', async () => {
   const ctx = fakeCtx(new Error('404'))
   const m = await mount(h(P.Chip, { ctx }))
-  assert.equal(chip().querySelector('.llms-num').textContent, '–:–')
+  assert.equal(chip().querySelector('.llms-num').textContent, '–:–:–:–')
   assert.equal(chip().querySelector('.llms-word').textContent, 'off')
   await m.close()
 })
