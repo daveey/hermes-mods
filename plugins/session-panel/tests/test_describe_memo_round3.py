@@ -80,3 +80,36 @@ def test_a_replaced_reader_memo_is_closed_without_touching_the_reader(graph, api
         def __getattr__(self, name):
             raise AssertionError('retired reader used: ' + name)
     core._close_replaced_memo(Retired())
+
+
+def _producer_module():
+    import importlib.util
+    import sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        '_spf_producer_provider_test', Path(__file__).resolve().parents[1] / 'dashboard' / 'producer_provider.py')
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules['_spf_producer_provider_test'] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_producer_close_drops_its_recorder_user(api):
+    producer = _producer_module().PanelProducer(api)
+    producer.readers._describe_memo.recorder = api._swallow_acquire()  # as its first pass would
+    assert api._SWALLOW.users == 1
+    producer.close()
+    assert api._SWALLOW.users == 0 and api._SWALLOW.tool is None
+    assert producer.readers._describe_memo.closed
+
+
+def test_producer_close_still_releases_a_reader_without_retire(api):
+    producer = _producer_module().PanelProducer(api)
+    released = []
+
+    class OldReaders:
+        def release(self):
+            released.append(1)
+    producer.readers = OldReaders()
+    producer.close()
+    assert released == [1]
