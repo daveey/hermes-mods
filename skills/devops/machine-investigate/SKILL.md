@@ -81,6 +81,12 @@ For a gateway restart use
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
 its fail-open discovery and lexical limits are not permission to bypass it.
 
+## Historical Linux OOM attribution
+
+Separate every incident carried on an OOM card: one open watcher card can accumulate deliberate private-cgroup tests and unrelated global kills. Read both `oom_memcg` and `task_memcg`; a disappeared transient unit's `MemoryMax=infinity` is not its historical budget. Recover rotated journal evidence from retained `/var/log/kern.log` and `/var/log/syslog`, including the kernel's usage/limit lines and systemd's launched command. Attribute SSH-session victims through session start time, sshd source address and the source host's agent transcript; the hub's own transcript database cannot explain work launched remotely.
+
+For benchmark contention spinners, never use an infinite list comprehension to burn CPU: it retains an unbounded list. A scalar loop preserves contention without accumulated objects. Verify the actual target AST in an isolated subprocess with a low `RLIMIT_AS`, so the unsafe control raises `MemoryError` instead of inducing another kernel OOM; compare it with the corrected target and live benchmark RSS/progress. Do not import or rerun an entire live-data harness merely to exercise its spinner, and do not signal an active benchmark or restart unrelated services.
+
 ## Heap attribution coverage
 
 For loop-watch owner censuses, check both deadline and owner-label coverage before choosing a retainer to fix. `truncated: false` alone does not mean attribution is complete: a saturated owner table can hide the largest structures in `<other owners>`. Require `labels_truncated: false` on newer reports; on older reports inspect the owner count against the implementation's cap. Keep Python shallow-object bytes distinct from physical footprint (native buffers and allocator slack are excluded), and do not rerun a consumed one-shot by clearing its lifetime sentinel. Use natural process replacement for the next live scan.
