@@ -243,6 +243,15 @@ class _Stop(threading.Event):
                 e.set()
 
 
+def _close_replaced_memo(readers) -> None:
+    """Close the describe memo of a readers object that is replaced and never used again (its share of the process's
+    swallow recorder). Read from the instance dict, not by attribute lookup: a retired reader must see no access
+    but release()."""
+    memo = getattr(readers, '__dict__', {}).get('_describe_memo')
+    if memo is not None:
+        memo.close()
+
+
 class Feed:
     """One feed per gateway process (one profile: the process's own)."""
     decision_projection = staticmethod(decision_projection)
@@ -552,7 +561,8 @@ class Feed:
             # The saved API constructed this object on the restart thread; release
             # its unused reader on that same thread. No old connection transfers.
             unused, self.readers = self.readers, module.AwaitingReaders()
-            getattr(unused, 'retire', unused.release)()  # never used again: its describe memo too
+            unused.release()
+            _close_replaced_memo(unused)  # never used again: its describe memo too
             loader = sys.modules.get('_session_panel_feed_loader')
             factory = SNAPSHOT_READER_FACTORY or getattr(loader, 'snapshot_reader_factory', None)
             # resume can be called by a genuine saved API while PROCESS_LOCK is

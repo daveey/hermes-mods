@@ -67,3 +67,16 @@ def test_an_unkeyed_event_aggregate_misses_on_a_heartbeat(graph, board, monkeypa
     c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (local,))
     c.commit()  # a heartbeat moves no revision
     assert run_pass(r, local)['newest'] > before
+
+
+def test_a_replaced_reader_memo_is_closed_without_touching_the_reader(graph, api):
+    r, local, _, _ = graph
+    run_pass(r, local)
+    core = api._load_feed()
+    core._close_replaced_memo(r)
+    assert r._describe_memo.closed and api._SWALLOW.users == 0
+
+    class Retired:  # a saved API's reader: any access but release() is a failure
+        def __getattr__(self, name):
+            raise AssertionError('retired reader used: ' + name)
+    core._close_replaced_memo(Retired())
