@@ -2,6 +2,19 @@
 
 One nudge bus for Hermes, so coaching panels never pile up. It has two channels.
 
+### Demotion-log projection
+
+`Store.demoted()` retains only dismissal timestamps/rule names in a process-local,
+eight-path projection. Each call verifies the complete retained prefix by SHA-256
+before reusing it; appended complete lines are decoded once, and an unterminated
+tail is always reparsed. Rewrites, rotation, truncation and moving clock cutoffs
+remain visible. This avoids repeatedly decoding historical payloads on state polls
+without truncating the log, persisting an index, changing demotion policy or serving
+a TTL-stale result. `Store.read_log()` retains its existing full-history behavior.
+The first projection still scans the log; later checks still read/hash its bytes.
+Coverage: `test_demotion_log.py` checks reuse across fresh Store instances, append,
+rewrites/rotation/truncation, partial tails, clock rollback and legacy errors.
+
 ### Deleted SQLite sidecar monitor
 
 `stranded_sqlite_watch.py` scans Linux procfs for retained deleted database WAL/SHM descriptors.
