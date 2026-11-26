@@ -1434,8 +1434,8 @@ class CoreReaders:
         except Exception:
             d['wake_check'] = None
         try:  # core's GET /tasks/<id> adds it (plugins/kanban `_ready_since`): the ready card's "waiting N min"
-            cols = {r[1] for r in c.execute('PRAGMA table_info(tasks)')}
-            row = c.execute('SELECT ready_since FROM tasks WHERE id = ?', (card_id,)).fetchone() if 'ready_since' in cols else None
+            row = c.execute('SELECT ready_since FROM tasks WHERE id = ?', (card_id,)).fetchone() \
+                if 'ready_since' in _task_columns(c) else None
             d['ready_since'] = row[0] if row else None
         except sqlite3.Error:
             d['ready_since'] = None
@@ -1544,6 +1544,18 @@ def _diagnostic_refs(detail):
                 if isinstance(named, (list, tuple)):
                     refs.extend(named)
     return {ref for ref in refs if isinstance(ref, str) and ref}
+
+
+def _task_columns(c: sqlite3.Connection) -> frozenset:
+    """`tasks` column names in one result row (core `kanban_table_columns`), not `PRAGMA table_info`'s one row per
+    column: 59 on the hub board, and CPython hands the GIL back on each, once per card per feed pass (~36k
+    handoffs a pass on 2026-11-26). Same names, same connection and snapshot; an older core without the helper
+    keeps the PRAGMA. [daveey]"""
+    try:
+        from hermes_cli.kanban_table_columns import table_columns
+    except ImportError:
+        return frozenset(r[1] for r in c.execute('PRAGMA table_info(tasks)'))
+    return table_columns(c, 'tasks')
 
 
 def _newest_events(c: sqlite3.Connection, card_id: str) -> list:
