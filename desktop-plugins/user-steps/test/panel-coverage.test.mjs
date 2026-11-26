@@ -25,7 +25,7 @@ const show = async node => React.act(async () => { root.render(node); await new 
 after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
 
 test('unsupported panel retains companion decision status; healthy and recovered cache suppress duplication', async () => {
- queue.clearFeatureCache(); queue.resetCanonicalCacheForTests(); panel.resetFeedForTests()
+ panel.resetFeedForTests()
  const request = { schemaVersion: 2, owner: { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' },
   requestId: '00000000-0000-4000-8000-000000000001', revision: 1, kind: 'approval', title: 'Retained decision status',
   scope: { complete: true, markdown: 'Stage A', sourceRefs: [] }, limits: [], exclusions: [],
