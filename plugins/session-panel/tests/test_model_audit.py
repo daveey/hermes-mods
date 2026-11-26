@@ -128,8 +128,8 @@ def test_reported_running_never_masks_real_expired_or_nonrunning_observation(obs
 
 def test_parked_remote_rows_show_their_true_state_without_a_provenance_tail():
     pytest.importorskip('hermes_cli.execution_observations')
-    for status, shown in (('scheduled', 'scheduled · its owner has not published what wakes it'), ('triage', "waiting on this chat's agent to decide: review the held scope and choose the next step · in triage · entry time unavailable"),
-                          ('todo', 'not started')):
+    for status, shown in (('scheduled', 'scheduled · execution reason unknown'), ('triage', 'blocked · execution reason unknown · next actor/action not published · in triage · entry time unavailable'),
+                          ('todo', 'not started · execution reason unknown')):
         row = task(f't_{status}', status, gateway='worker-a1', remote=True, source='replica', synced_at=NOW - 5)
         row['execution_observations'] = [placeholder(row)]
         m = model.reduce_panel(bundle(row), now=NOW)
@@ -146,7 +146,8 @@ def test_parked_board_status_survives_old_bundle_with_explicit_age(status, age):
     project = lambda r, **kw: {'state': 'unknown', 'unknown_reason': 'no_run_identity'}
     result = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW, projector=project)
     out = next(r for s in result['sections'].values() for r in s)
-    assert out['parked'] is True
+    # Ready has no native parked lifecycle: missing evidence cannot create one.
+    assert bool(out.get('parked')) is (status != 'ready')
     assert 'status unknown' not in out['detail']
     assert ('panel data' in out['detail']) is (age > 60)
     assert out['evidence_state'] == 'unknown'

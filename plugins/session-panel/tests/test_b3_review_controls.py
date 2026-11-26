@@ -5,7 +5,7 @@ import json
 import sys
 
 import pytest
-from test_source_evidence import measured, graph, api, board, se
+from test_source_evidence import measured, graph, api, board, se, source_before_projection
 from test_source_oracle import expectations, analyze
 from test_coordinator_observation import observed
 from test_source_coordinator_core import drain
@@ -122,6 +122,7 @@ def test_real_reducer_offlist_blocker_defeats_absence(graph, board, monkeypatch,
     feed.install_receipts(log)
     feed.watch(['S0', 'S1'])
     lane = feed.compose_board_sources(lambda: r, gateway='local-test', profile='default')
+    source_before_projection(lane, log, monkeypatch)
     try:
         parent = kanban_db.create_task(conn, title='Off-list blocker', session_id='other', initial_status='running')
         for title in ('First child', 'Second child'):
