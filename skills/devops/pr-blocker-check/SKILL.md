@@ -79,11 +79,13 @@ is to give gate jobs `if: ${{ !cancelled() }}` and run them on a light runner la
 workflow file, so open PRs keep the old behavior until they rebase.
 
 Before asking the user anything, check live state again (the head may have changed, a rebase may have reset
-approval) and put the proof in the ask. Before any merge, bypass or "no review is possible" ask, also list the
-open PRs that touch the same file (`gh pr list --state open --search "<file or error text>"`) and read each one's
-reviews and commit statuses (`gh api repos/O/R/commits/<head>/statuses`): a second chat often opened the same fix,
-and one with an exact-head approval or a `claude-code/reviewed-merge` status lands by its owner's own route, so the
-ask is moot. Agree with that owner which PR lands; the other then conflicts and keeps only its extra parts.
+approval) and put the proof in the ask. Before filing a review, hand-off or post-land card for a fix PR, and before
+any merge, bypass or "no review is possible" ask, also list the other PRs for the same fix, open or merged since
+it opened (`gh pr list --state all --search "<file or error text>"`; main's commits on the file:
+`gh api "repos/O/R/commits?sha=main&path=<file>&since=<createdAt>"`), and read each open one's reviews and commit
+statuses (`gh api repos/O/R/commits/<head>/statuses`): a second chat often opened, or already landed, the same fix.
+A landed one makes this PR moot (verify that one instead and tell this PR's owner); an open one with an exact-head
+approval or a `claude-code/reviewed-merge` status lands by its owner's own route, so the ask is moot. Agree with that owner which PR lands; the other then conflicts and keeps only its extra parts.
 
 ## Telling the user when it merges
 
