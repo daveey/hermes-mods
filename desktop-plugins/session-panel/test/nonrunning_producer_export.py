@@ -24,6 +24,7 @@ spec.loader.exec_module(producer)
 svc = producer.svc
 gws = producer.gws
 kanban_home = producer.kanban_home
+enforced_accounting = producer.enforced_accounting
 
 
 def export(request, bundle, now, name, *, waiting=False, summary=None):
@@ -109,4 +110,20 @@ def test_lifecycle_export(kanban_home, request, tmp_path, kind, summary):
         value = {'current': {'model': model, 'now': now},
                  'expected': {'lifecycle': kind, 'summary': summary}}
         Path(request.config.option.xmlpath).with_name(kind + '.json').write_text(json.dumps(value))
+        if kind == 'schedule':
+            # A canonical own-turn status is independent from this real parked task.
+            fixture_spec = importlib.util.spec_from_file_location('header_fixture', producer_file.with_name('test_model.py'))
+            assert fixture_spec is not None and fixture_spec.loader is not None
+            fixture = importlib.util.module_from_spec(fixture_spec)
+            fixture_spec.loader.exec_module(fixture)
+            outcome = fixture.canonical_outcome('running')
+            outcome['status']['presentation']['reason_codes'] = ['own_turn_active']
+            bundle['outcome_json'] = outcome
+            active = producer.panel.reduce_panel(bundle, now=now, wire=True)
+            active['freshness'] = model['freshness']
+            assert active['header']['counts']['running'] == 0
+            value = {'current': {'model': active, 'now': now}, 'expected': {
+                'lifecycle': 'chat_activity', 'summary': summary,
+                'header': 'chat active · task execution shown below'}}
+            Path(request.config.option.xmlpath).with_name('chat_activity.json').write_text(json.dumps(value))
 

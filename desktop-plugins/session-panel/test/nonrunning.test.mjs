@@ -41,7 +41,7 @@ if (process.env.HERMES_PANEL_NONRUNNING_CASES) {
   assert.equal(run.status, 0, `real producer failed: ${run.error || ''}\n${run.stdout}\n${run.stderr}`)
   families = ['local', 'transport', 'local-gateway_draining', 'transport-gateway_draining',
    'local-update_admission_hold', 'transport-update_admission_hold', 'local-start_gate', 'transport-start_gate',
-   'capacity', 'schedule', 'human', 'startup', 'unobserved_review']
+   'capacity', 'schedule', 'human', 'startup', 'unobserved_review', 'chat_activity']
    .map(name => [name, JSON.parse(readFileSync(join(output, name + '.json'), 'utf8'))])
  } finally { rmSync(output, { recursive: true, force: true }) }
 }
@@ -60,6 +60,11 @@ for (const [family, cases] of families) for (const kind of (cases.expected?.life
    await paint(m.renderModel(model, { now: clock }))
    const text = document.body.textContent
    assert.ok(text.includes(cases.expected.summary), text)
+   if (cases.expected.header) {
+    assert.ok(text.includes(cases.expected.header), text)
+    assert.doesNotMatch(text, /running · this chat/)
+    assert.equal(model.header.counts.running, 0)
+   }
    assert.ok(document.querySelector('[data-row-pip="stuck"]') === null)
    assert.equal(document.querySelector('[data-ask-row]') !== null, cases.expected.lifecycle === 'human')
    assert.equal(JSON.stringify(model), before)

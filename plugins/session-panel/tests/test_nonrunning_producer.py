@@ -30,6 +30,16 @@ from tests.hermes_cli import test_kanban_nonrunning_transport as remote_helpers
 svc = remote_helpers.svc
 gws = remote_helpers.gws
 kanban_home = accounting.kanban_home
+
+
+@pytest.fixture(autouse=True)
+def enforced_accounting(monkeypatch):
+    # External suites do not inherit core's tests/conftest.py. Exercise the
+    # opt-in refusal branch without changing any deployed/default gate policy.
+    from hermes_cli import kanban_usage_accounting
+    monkeypatch.setattr(kanban_usage_accounting, 'DEFAULT_MODE', 'enforce', raising=False)
+
+
 spec = importlib.util.spec_from_file_location('nonrunning_panel_model', Path(__file__).resolve().parents[1] / 'model.py')
 panel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(panel)

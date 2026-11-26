@@ -11,6 +11,7 @@ assert spec is not None and spec.loader is not None
 producers = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(producers)
 kanban_home = producers.kanban_home
+enforced_accounting = producers.enforced_accounting
 panel = producers.panel
 kb = producers.kb
 
@@ -147,6 +148,27 @@ def test_real_startup_rejection_exposes_failure_not_unspecified_triage(kanban_ho
         assert 'this chat’s agent' not in str(model)
         assert "this chat's agent" not in str(model)
         assert 'waiting to be specified' not in str(model)
+
+
+@pytest.mark.parametrize('kind', ['schedule', 'human', 'startup'])
+@pytest.mark.parametrize('flag', ['stale', 'partial_source_unknown'])
+def test_real_native_wait_does_not_survive_unavailable_remote_source(kanban_home, tmp_path, kind, flag):
+    with producers.kbc.connect_closing() as conn:
+        bundle, now = (actual_startup(conn, tmp_path / 'workspace') if kind == 'startup'
+                       else globals()['actual_' + kind](conn))
+        row = bundle['tasks'][0]
+        row.update(remote=True, source='replica', synced_at=now - 600)
+        row[flag] = True if flag == 'stale' else 'origin_ledger_unavailable'
+        value = panel.reduce_panel(bundle, now=now)
+        assert not value['sections']['needs_you'] and not value['sections']['stuck']
+        assert value['sections']['waiting'][0]['evidence_state'] == 'unknown'
+        assert 'status unknown' in value['sections']['waiting'][0]['detail']
+        # Recovering the same source restores the actual native wait, not a new ask.
+        row.pop(flag)
+        row['synced_at'] = now
+        recovered = panel.reduce_panel(bundle, now=now)
+        assert bool(recovered['sections']['needs_you']) == (kind == 'human')
+        assert ('worker could not be launched' in str(recovered)) == (kind == 'startup')
 
 
 @pytest.mark.parametrize('kind', ['schedule', 'human', 'startup'])
