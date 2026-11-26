@@ -218,13 +218,30 @@ test('without the panel the full row (plan, options, Approve) is unchanged', asy
  assert.ok(el().textContent.includes('EXACT-PLAN-TEXT')); assert.ok(labels().includes('Approve'))
 })
 
+test('registered strip: without the panel it renders an error, never the old standalone queue or legacy strip', async () => {
+ const areas = [], dispose = m.default.register({ register: a => areas.push(a) }), wait = m.panelWait.ms
+ try {
+  const strip = areas.find(a => a.id === 'strip')
+  assert.equal(strip.render().type, m.PanelMissing, 'no fallback view')
+  await show(strip.render())
+  assert.equal(el().textContent, '', 'quiet while the panel may still be loading')
+  m.panelWait.ms = 0
+  await show(strip.render())
+  const alert = el().querySelector('[data-user-steps-panel-missing][role=alert]')
+  assert.ok(alert, 'error shown once the load window passes')
+  assert.match(alert.textContent, /Session panel did not load/)
+  assert.equal(el().querySelector('[data-action-queue]'), null)
+  assert.equal(el().querySelector('[data-user-steps-step], [data-user-steps-card]'), null)
+  panelOn()
+  await show(m.default && React.createElement(m.PanelMissing))
+  assert.equal(el().querySelector('[data-user-steps-panel-missing]'), null, 'a panel that loads late clears the error')
+ } finally { m.panelWait.ms = wait; panelOff(); dispose(); await show(null) }
+})
+
 test('registered strip: with the panel loaded it keeps the queue but never the legacy card/step tiles', async () => {
  const areas = [], dispose = m.default.register({ register: a => areas.push(a) })
  try {
   const strip = areas.find(a => a.id === 'strip')
-  const standalone = strip.render().props.children
-  assert.deepEqual(standalone.map(k => k.type), [m.ActionQueue, m.Strip], 'standalone: queue and legacy strip')
-  assert.equal(standalone[0].props.companion, false)
   panelOn()
   const withPanel = strip.render().props.children
   assert.equal(withPanel.type, m.ActionQueue, 'panel loaded: only the queue, no legacy Strip')
