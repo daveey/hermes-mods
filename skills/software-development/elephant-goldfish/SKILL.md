@@ -171,6 +171,8 @@ untouched.
 
 ## Pitfalls
 
+- A builtin dict is not automatically callback-free: lookup against a colliding stored nonexact-string key can invoke that key's equality. For lock-held raw module metadata, require a bounded one-pass item traversal, exact-key type checks before comparison, no validate-then-lookup race, explicit mutation refusal and aggregate traversal limits. Specify telemetry counter increments, unavailable/absent envelopes, time origins and overflow settlement before calling the implementation plan decision-complete.
+
 - For diagnostic CPU partitions, trace the existing envelope before naming a subdivision: reader-open CPU may already be subtracted from a probe counter. Specify activation, nested ownership, exceptional intervals and publication overhead separately. For an `outer=False` mutation test, inspect the accounting sink: an enclosing scope can suppress accidental `outer=True`, masking the mutant. Assert the emitted flag or exercise an eligible depth-zero case with nonzero CPU, alongside enclosing-total invariance tests.
 
 - When an owner freezes scope and excludes a dependency, distinguish an honest partial deliverable from whole-contract acceptance before review. If source demonstrates the excluded dependency can destroy supported results, report the exact path and stop for the scope owner; do not grow another certification subsystem or replay unchanged review cycles. Process/lease zero proves no active work, not delivery of completed results: a direct run-end lease release can succeed while the completion outbox remains pending. Check whether an existing manual preflight actually runs on the autoscaler path and inspects finished rows before treating it as mitigation.
