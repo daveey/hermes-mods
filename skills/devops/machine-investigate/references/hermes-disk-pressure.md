@@ -17,8 +17,12 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 4. **Map each directory to its owning card's status.** Workspace and evidence directories are named by task id.
    Read the `tasks` table from `~/.hermes/kanban.db` and every `~/.hermes/kanban/**/kanban.db`, opened
    read-only (`file:...?mode=ro`). A directory with no task row is unknown, not abandoned.
-5. **Find live writers** by sampling `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone
-   don't show which process is writing.
+5. **Take the fill rate and the writers from the disk guard's journal first** (hub:
+   `journalctl -u hub-disk-guard.service -o short-unix --since -10h`). Its JSON `usage` events give free space
+   after each pass, and its `writers` events the top writers per pass. Fit the rate over hours of post-pass values
+   before quoting days-to-floor: free space swings by GBs between passes (write bursts, ~1 GB reclaims), so two
+   samples minutes apart can misstate a slow trend several-fold. For a writer the journal doesn't name, sample
+   `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone don't show which process is writing.
 6. **Delete a "redundant" copy only from an exact manifest.** List every exact path first (a `.gz` beside its
    snapshot, a relocation's source). Verify each kept destination exists, its sha256 matches the mapping
    (`manifest.json` where there is one), and no process has either path as cwd or open fd. A relocation receipt
