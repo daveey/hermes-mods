@@ -183,7 +183,10 @@ def _observations():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.Observations(Reader, trace=_sibling('observation_trace').observer_trace)
+    from hermes_constants import get_hermes_home
+    shared = _sibling('shared_observations').SharedObservations(
+        Path(get_hermes_home()) / 'cache' / 'lanes-pr-observations-v1')
+    return module.Observations(Reader, trace=_sibling('observation_trace').observer_trace, shared=shared)
 
 
 @lru_cache(maxsize=1)

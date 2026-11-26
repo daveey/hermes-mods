@@ -220,12 +220,24 @@ projection, source rebuild, identity/session fences, no-spawn auth, EOF during a
 hung projection, independent heartbeats and fresh bounded fallback. Private captured
 board backups are tested separately and never checked into this repository.
 
-PR network observation runs in one process-shared, bounded background worker,
+PR network observation runs in a bounded background worker per process,
 not the stream or GET request. A report consumes an immutable published reader.
-Entries expire 600 seconds after read **start** for OPEN PRs and 3600 seconds for
+Independent gateway, mounted API and projector processes also share successful
+observations under `$HERMES_HOME/cache/lanes-pr-observations-v1`. A private stable
+file lock serializes fills across those processes; atomic data replacement and
+bounded lock waiting preserve crash recovery without blocking request threads.
+This cache is home-scoped, capped at 1024 URL/context entries and 4 MiB; a reusable
+staging file bounds crash leftovers to one file. It stores hashed URL/context
+keys and display flags, not board payloads. Separate homes never share it.
+Entries expire 600 seconds after the original network read **start** for OPEN PRs
+and 3600 seconds for
 MERGED/CLOSED PRs (CLOSED recognition requires the additive core Reader state seam).
 Expiry/publication wakes the stream's normal hash-deduplicated path; all-failed
 batches retain exponential retry backoff. Failed reads are not cached as observations.
+A shared hit retains the original age rather than renewing the local TTL. Exact
+board context changes cannot consume an old-context shared entry. Lock timeout or
+unsafe/unwritable storage uses the existing observer backoff, never an unshared
+network fallback; safe malformed content is replaced under the fill lock.
 A best-effort diagnostic ring at `$HERMES_HOME/logs/lanes-pr-observations.json`
 retains at most 256 records (256 KiB). It records process/cache identities, hashed
 URL/context identities, cold/retry/expiry fills, invalidations and outcomes. It
