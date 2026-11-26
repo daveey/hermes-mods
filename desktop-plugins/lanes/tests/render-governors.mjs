@@ -37,6 +37,14 @@ try {
     assert.equal(gate.dataset.state, 'on')
     assert.match(gate.textContent, /1 held/)
     assert.match(gate.textContent, /2/)
+    // Lane-gated cards are only a subset of dispatch governor charges.
+    const laneHeading = pane.container.querySelector('[aria-label="LANES"]')
+    const laneSummary = laneHeading.querySelector('.lanes-sb-summary')
+    assert.match(laneSummary.textContent, /2 governor-held/)
+    assert.equal(laneSummary.title, laneSummary.textContent)
+    assert.equal(laneHeading.getAttribute('aria-description'), laneSummary.textContent)
+    assert.equal(view.totals.held, 1)
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /2 governor-held/)
   } else if (scenario === 'host') {
     const line = pane.container.querySelector('[data-governor="host_slots"]')
     assert.equal(line.dataset.state, 'on')
@@ -48,7 +56,7 @@ try {
   } else if (scenario === 'overlap') {
     assert.match(pane.container.querySelector('[data-governor="placement"]').textContent, /1 held/)
     assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
-    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 held/)
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 governor-held/)
   } else if (scenario === 'partial-summary') {
     // The same real projection must stay honest in both SDK mounts.
     const old = await loadPlugin()

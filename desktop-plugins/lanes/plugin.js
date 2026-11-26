@@ -1153,7 +1153,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
   const idle = snap?.sidebar?.idle_lanes || []
   const status = snap?.status || {}
   const freshness = error ? `Lanes offline - retrying · ${snap ? 'last known · ' : ''}` : ''
-  const totalsText = `${summaryValue(status.run)} running · ${gov?.idle_total ?? '—'} held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
+  const totalsText = `${summaryValue(status.run)} running · ${gov?.idle_total ?? '—'} governor-held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
   const governorsText = !snap ? 'Loading governors…' : !gov ? 'Governor state unknown' :
     `${summaryValue(gov.counts?.on)} on · ${summaryValue(gov.counts?.off)} off · ${summaryValue(gov.counts?.at_cap)} at cap · ${summaryValue(gov.counts?.unknown)} unknown`
   const governorSummary = `${error ? `Governors offline · ${snap ? 'last known · ' : ''}` : ''}${governorsText}`
@@ -1168,7 +1168,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
         'data-sidebar-totals': true }, freshness, snap?.flow_complete === false ? 'Partial · ' : '',
         !snap ? 'Loading lanes…' : h(Fragment, null,
         h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`), ' · ',
-        h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} held`), ' · ',
+        h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} governor-held`), ' · ',
         h('span', { style: { color: CARD_COLORS.you } }, `${summaryValue(status.you)} you`), ' · ',
         h('span', null, `${summaryValue(snap.totals?.not_ready)} waiting`))),
       h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, open ? '▾' : '▸')),
