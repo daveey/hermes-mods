@@ -30,6 +30,21 @@ A bundle without a supported model invalidates
 only its own cached scope. Cached models are last-known presentation, not proof
 that a worker is still running; heartbeats never recompute their work states.
 
+## Timing visibility
+
+Running metadata stays compact when it fits and wraps within the row when it
+would otherwise push the trailing elapsed runtime outside the panel. Local clock
+ticks only format the producer's absolute timestamps; they do not renew evidence.
+CI/deploy/timer readouts retain waited/expected/remaining (or overdue) values;
+missing estimates remain `?`/`—`, not predicted completion times for running work.
+
+Regression coverage: `test/hub-model.test.mjs` exercises the real Python producer,
+mounted Panel ticks, snapshot replacement, scope switching and remount. Run
+`timing.browser.test.mjs` with isolated `HERMES_DESKTOP_DIR` dependencies (CI deps
+plus esbuild/playwright and Chromium) for actual timing-text bounds at
+1100/700/420px, including nested-row renderer controls. This is Chromium fixture
+proof, not a capture of the user's native Desktop.
+
 ## Request-backed decisions
 
 Request-backed asks require a canonical request ID, exact revision, decision
