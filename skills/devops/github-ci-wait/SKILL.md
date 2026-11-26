@@ -160,7 +160,10 @@ Before an immutable-release acceptance check, read `references/immutable-release
 
 ## Authenticated native artifact head binding
 
-When a verifier binds GitHub Actions `head_sha` to a native artifact manifest's actual checkout, explicitly check out `github.event.pull_request.head.sha || github.sha` in every producing/aggregating job. Default `pull_request` checkout uses the synthetic merge commit, so otherwise a genuine successful run cannot satisfy exact-head artifact verification. Keep merge-group execution required to test the merged result. Never relabel a test harness executable as the production tool: select the non-test `bin` compiler artifact, execute that exact retained binary, and retain its source export separately from its executable digest. Mark synthetic other-architecture fixtures as fixtures, not native execution evidence.
+Before repairing workflow/source-generation mismatches, read `references/workflow-source-compatibility.md`.
+
+Before binding GitHub run heads to native manifests, read `references/native-artifact-head-binding.md`.
+
 
 ## Dependency mirror proof portability
 
