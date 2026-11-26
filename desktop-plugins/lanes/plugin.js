@@ -33,9 +33,10 @@ export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', gate: '#a855f7', wo
 export const LANE_COUNT_COLORS = { blocked: CARD_COLORS.you, running: CARD_COLORS.run, other: '#a1a1aa' }
 /** All-lanes strip counts: hub `status` key, words, shared card-square category (Desktop `CardCountSquare`). */
 export const STATUS = [
-  ['you', 'blocked on you', 'red'], ['ext', 'waiting on external (CI, review, timer)', 'pink'],
+  ['you', 'blocked on you', 'red'], ['ext', 'waiting on CI, review or deploy', 'pink'],
   ['gate', 'held at a gate', 'violet'], ['worker', 'waiting for a worker', 'green'], ['run', 'running', 'blue'],
-  ['dep', 'waiting on other cards', 'grey'], ['triage', 'in triage', 'outline'], ['other', 'other', 'outline']
+  ['dep', 'waiting on other cards', 'grey'],
+  ['park', 'parked on a timer or outside event', 'amber'], ['triage', 'in triage', 'outline'], ['other', 'other', 'outline']
 ]
 // Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
 const SQUARE_BORDER = { red: '#ef4444', pink: '#ec4899', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#0ea5e9',
@@ -49,7 +50,7 @@ export function CountSquare({ category, count }) {
     border: `1px ${category === 'dashed' ? 'dashed' : 'solid'} ${SQUARE_BORDER[category] || SQUARE_BORDER.unknown}` } }, count)
 }
 /** The colour word a tooltip names for each count, so hovering says what the colour means. */
-export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
+export const COLOR_WORDS = { you: 'Red', ext: 'Pink', gate: 'Purple', worker: 'Green', run: 'Blue', dep: 'Grey', park: 'Yellow', triage: 'Outline', other: 'Outline' }
 // Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
 export const SESSION_FILTER_AREA = sdk.SESSION_FILTER_AREA || ''
 // Desktops with the Sessions tab-strip slot (beside Sessions / Bots) take the counts, "not live" and the expand
