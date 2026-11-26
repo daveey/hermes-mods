@@ -931,12 +931,16 @@ def rule_parent_done(card: Card, src: Sources) -> Optional[Finding]:
         try:
             from hermes_cli import kanban_db
             from hermes_cli import kanban_db_sync as sync
-            states = dict(kanban_db.parent_states(c, card.id, remote=sync.has_remote_parents(c)))
+            remote = sync.has_remote_parents(c)
+            states = dict(kanban_db.parent_states(c, card.id, remote=remote))
+            # Terminal status does not release a parent's independent execution
+            # restriction. Reuse core's actual dependency predicate, not prose.
+            blocked_parents = any(kanban_db.parent_blocks(c, pid, st) for pid, st in states.items())
             held = _promotion_held(c, card)
         except Exception as e:  # noqa: BLE001
             src.error(f'parent_states {card.board}/{card.id}', e)
             return None
-        if held or not states or any(st not in SATISFIED for st in states.values()):
+        if held or blocked_parents or not states or any(st not in SATISFIED for st in states.values()):
             return None
         times = [(_parent_state(c, p) or {}).get('completed_at') for p in states]
         last = max((t for t in times if t is not None), default=None)
@@ -1200,6 +1204,16 @@ def healthy_widened_ci_wait(card: Card, park: dict, live: dict, now: float) -> b
     sha = state.get('headSha')
     if (not match or state.get('url') != ref or not isinstance(sha, str)
             or not re.fullmatch(r'[0-9a-f]{40}', sha)):
+        return False
+    # The caller's legacy park selector uses arrival IDs. Do not let an older
+    # remapped park lend its widening to a newer, unwidened episode.
+    kinds = tuple(_core_wait()[0])
+    newest = card.conn.execute(
+        f"SELECT id,created_at FROM task_events WHERE task_id=? AND kind IN ({','.join('?' for _ in kinds)}) "
+        "ORDER BY created_at DESC LIMIT 2", (card.id, *kinds)).fetchall()
+    if (not newest or newest[0][0] != park['id'] or type(newest[0][1]) is not int
+            or not 0 <= newest[0][1] <= now
+            or len(newest) == 2 and newest[0][1] == newest[1][1]):
         return False
     rows = card.conn.execute("""SELECT id, kind, payload, created_at, run_id FROM task_events
         WHERE task_id=? AND created_at>? AND created_at<=? AND kind IN

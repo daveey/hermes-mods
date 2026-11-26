@@ -60,7 +60,8 @@ def test_native_ci_receipt_does_not_require_shell_command(env, bad):
 @pytest.mark.parametrize('bad', [None, 'no_widen', 'wrong_run', 'bool_run', 'wrong_head',
     'wrong_repo', 'empty_pending', 'bad_pending', 'old_widen', 'future_watch',
     'old_watch', 'stale', 'failed', 'broken', 'lost', 'condition_met', 'overdue',
-    'ambiguous_watch', 'ambiguous_widen', 'history_overflow', 'arrival_remap'])
+    'ambiguous_watch', 'ambiguous_widen', 'history_overflow', 'arrival_remap',
+    'old_park_remap', 'ambiguous_park', 'future_park'])
 def test_completed_component_does_not_complete_widened_commit_wait(env, monkeypatch, bad):
     tid = F.legacy_probe_wait(env.conn, env.now, waited_s=10000)
     ref = 'https://github.com/example/project/actions/runs/123'
@@ -87,6 +88,14 @@ def test_completed_component_does_not_complete_widened_commit_wait(env, monkeypa
         for offset in range(100): F.event(env.conn,tid,'external_watch',watch,at=env.now-100-offset)
     if bad in ('broken','lost','condition_met'):
         F.event(env.conn,tid,{'broken':'wake_check_broken','lost':'wake_check_lost','condition_met':'condition_met'}[bad],{},at=env.now-5)
+    if bad in ('old_park_remap', 'ambiguous_park', 'future_park'):
+        original = env.conn.execute("SELECT id,payload,created_at FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
+        at = {'old_park_remap':env.now-500, 'ambiguous_park':original[2], 'future_park':env.now+1}[bad]
+        F.event(env.conn, tid, 'scheduled', json.loads(original[1]), at=at)
+        if bad == 'old_park_remap':
+            # Only arrival ID changes: immutable old episode and new park stay intact.
+            newest = env.conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0]
+            env.conn.execute('UPDATE task_events SET id=? WHERE id=?', (newest+100000,original[0]))
     if bad == 'overdue': env.conn.execute("UPDATE task_events SET payload=json_set(payload,'$.wake_at',?) WHERE task_id=? AND kind='scheduled'",(env.now-1,tid))
     env.conn.commit()
     monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':{'url':ref,'status':'completed','conclusion':'failure' if bad=='failed' else 'success','headSha':sha},'happened':True,'happened_at':env.now-1000})
