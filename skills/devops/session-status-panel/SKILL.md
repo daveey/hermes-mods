@@ -25,10 +25,8 @@ Compute classification and wording on the backend; render that snapshot on Deskt
 
 ## When to Use
 
-- The status panel shows a wrong section, count, title, option or recommendation.
-- Add a field to the session panel, or understand how an unblock card renders.
-- Verify the same local, remote-gateway and triage ask layout.
-- For writing the ask itself, load `generate-unblock-card`; this skill owns the rendering contract.
+- Fix the reported surface: the left session list is not the task panel. Keep stuck-only sessions visible; show active review waits teal with elapsed time at right even when chat is idle. Test inclusion, status and timer separately in ordinary and Background rows.
+- For ask text, load `generate-unblock-card`.
 
 ## Prerequisites
 
