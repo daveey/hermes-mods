@@ -2,6 +2,8 @@
 
 Treat natural `unchanged=true` memo hits and latency as separate gates: a hit can still spend seconds in membership capture, local reconciliation or contention. Retain all raw cohorts and per-chat sample counts; if observed unchanged calls exceed the target, report FAIL and profile the successful hit path before another observation window. Do not infer that a corrected source contract has met the end-to-end latency target.
 
+For a PID-pinned collector, check route continuity before accepting even its first timing row: a warmed successor can become active while the old producer still writes timing files. A nominal 30-minute summary with passing unchanged samples is NO_PROOF if the route switched before that window or the target retired during it. Preserve route timestamps, process birth, unit journal, first/last completions and every raw cohort; do not treat a static retired-target file as live coverage or start a replacement after an explicit one-window mandate without owner disposition.
+
 ## Complete-scan contention controls
 
 - Compare the entire pre-fix capture module with the entire corrected module under a real concurrent CPU-busy Python thread, not only warm decoder calls or a swapped inventory helper. Preserve both quiet and contended wall/thread-CPU pairs and semantic digest equality. Report extra quiet CPU separately from improved contended wall latency; a helper-only overhead bound cannot certify whole-capture cost.
