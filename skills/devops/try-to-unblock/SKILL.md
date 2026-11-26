@@ -59,7 +59,10 @@ Before writing an ask, look for one that already exists. A decision card the own
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
 because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
 means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
-`ended_at`: `ws_orphan_reap` leaves it set on chats still in use.
+`ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A failed `cross_session` send ("no connected
+Desktop can reach") only means the message didn't arrive; the owner is not dead. Read the session's
+`last_activity_at` in `~/.hermes/state.db` and the card's newest events before filing anything: an owner who is
+still active often renews within minutes of its own stop notice.
 
 For an authorized continuation, run `hermes kanban release <id> --runs <allowance> --note '<goal and boundaries>' --json`
 from the owning chat; it records the mandate, renews applicable scope/budget and promotes. Read the stop and ledger
