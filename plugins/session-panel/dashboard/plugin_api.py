@@ -1579,16 +1579,24 @@ def _diagnostic_refs(detail):
     return {ref for ref in refs if isinstance(ref, str) and ref}
 
 
+_TABLE_COLUMNS = None  # core's one-row column reader, or False once this process found it missing
+
+
 def _task_columns(c: sqlite3.Connection) -> frozenset:
     """`tasks` column names in one result row (core `kanban_table_columns`), not `PRAGMA table_info`'s one row per
     column: 59 on the hub board, and CPython hands the GIL back on each, once per card per feed pass (~36k
     handoffs a pass on 2026-11-26). Same names, same connection and snapshot; an older core without the helper
-    keeps the PRAGMA. [daveey]"""
-    try:
-        from hermes_cli.kanban_table_columns import table_columns
-    except ImportError:
+    keeps the PRAGMA, and its failed import is looked up once per process, not once per card. [daveey]"""
+    global _TABLE_COLUMNS
+    if _TABLE_COLUMNS is None:
+        try:
+            from hermes_cli.kanban_table_columns import table_columns
+        except ImportError:
+            table_columns = False
+        _TABLE_COLUMNS = table_columns
+    if _TABLE_COLUMNS is False:
         return frozenset(r[1] for r in c.execute('PRAGMA table_info(tasks)'))
-    return table_columns(c, 'tasks')
+    return _TABLE_COLUMNS(c, 'tasks')
 
 
 def _newest_events(c: sqlite3.Connection, card_id: str) -> list:

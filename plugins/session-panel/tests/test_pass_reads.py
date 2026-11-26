@@ -6,6 +6,7 @@ the pass.
 import contextlib
 
 from test_core_readers import api, board  # noqa: F401  (fixtures)
+from test_core_readers import kanban_db
 from test_reader_batch import graph, stable  # noqa: F401  (fixture)
 
 
@@ -100,3 +101,38 @@ def test_a_feed_tick_reads_a_shared_card_once_across_its_chunks(graph, api, monk
         held = f.bundles[s]['bundle']
         assert _diff(_clockless(mine['tasks']), _clockless(held['tasks'])) == []
         assert _diff(_clockless(mine['cards']), _clockless(held['cards'])) == []
+
+
+def test_an_in_place_write_between_chunks_is_refreshed_by_the_next_tick(graph, board, api, monkeypatch):
+    """The pass_scope contract: a content write during a pass (same file, same inode) may leave later chunks of THAT
+    pass on the card read earlier in it, and the next tick re-dirties and refreshes every chat holding the card."""
+    r, local, _, _ = graph
+    path, c = board
+    core = api._load_feed()
+    monkeypatch.setattr(core, 'CHUNK', 2)
+    sessions = [f'S{i}' for i in range(6)]
+    f = core.Feed(r, emit=lambda _: None)
+    f.watch(sessions)
+    inode = path.stat().st_ino
+    original = f._compute_all
+    chunks = []
+
+    def compute_all(chunk, **kwargs):
+        out = original(chunk, **kwargs)
+        chunks.append(list(chunk))
+        if len(chunks) == 1:
+            c.execute('UPDATE tasks SET title=? WHERE id=?', ('Retitled mid-pass', local))
+            c.commit()
+        return out
+    monkeypatch.setattr(f, '_compute_all', compute_all)
+    f.tick()
+    assert len(chunks) >= 2 and path.stat().st_ino == inode
+
+    def title(s):
+        return f.bundles[s]['bundle']['cards'][local]['detail']['task']['title']
+    assert {title(s) for s in sessions} == {'Shared local ready card'}  # one read for the whole pass
+    chunks.clear()
+    f.tick()
+    assert sorted(s for chunk in chunks for s in chunk) == sessions  # every holder re-dirtied
+    assert {title(s) for s in sessions} == {'Retitled mid-pass'}
+    assert kanban_db.get_task(c, local).title == 'Retitled mid-pass'

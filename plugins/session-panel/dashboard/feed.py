@@ -1672,6 +1672,9 @@ class Feed:
         chunks)."""
         owner = getattr(self, '_source_coordinator', None)
         if owner is not None:
+            # The source-coordinator path (PendingSourceOwner / compose_board_sources) returns here, before the
+            # sweep's readers.pass_scope(): it does not share card reads across chunks or stamp board files once per
+            # chunk. Unchanged on purpose; it is not the live path (hub 2026-11-26).
             return owner.tick()
         now = self._last_pass = self.clock()
         self._wake.clear()  # before the drain: a request or write after this point wakes the next pass

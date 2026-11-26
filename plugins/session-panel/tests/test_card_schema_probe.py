@@ -58,7 +58,24 @@ def test_older_core_without_the_helper_keeps_the_pragma(api, board, monkeypatch)
     r = readers_for(api, path, monkeypatch)
     with_helper = r.card(tid, 'default')
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_table_columns', None)  # import now raises ImportError
+    monkeypatch.setattr(api, '_TABLE_COLUMNS', None)  # a fresh process on that older core
     r2 = readers_for(api, path, monkeypatch)
     seen = _traced(r2, path)
     assert r2.card(tid, 'default') == with_helper
     assert any('PRAGMA table_info(tasks)' in s for s in seen)
+
+
+def test_a_missing_helper_is_looked_up_once_per_process(api, board, monkeypatch):
+    path, conn = board
+    tid = _ready_card(conn)
+    monkeypatch.setattr(api, '_TABLE_COLUMNS', None)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_table_columns', None)  # older core: import raises
+    r = readers_for(api, path, monkeypatch)
+    expected = r.card(tid, 'default')
+    assert api._TABLE_COLUMNS is False
+    # The helper "appears" later in the process: the cached answer stands, the PRAGMA fallback keeps working.
+    monkeypatch.delitem(sys.modules, 'hermes_cli.kanban_table_columns')
+    seen = _traced(r, path)
+    assert r.card(tid, 'default') == expected
+    assert any('PRAGMA table_info(tasks)' in s for s in seen)
+    assert api._TABLE_COLUMNS is False

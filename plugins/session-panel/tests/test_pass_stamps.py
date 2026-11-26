@@ -26,7 +26,7 @@ def test_a_pass_stamps_the_board_files_once_per_chunk(graph, monkeypatch):
         with r.batch(['S2', 'S3']):
             for _ in range(5):
                 r.card(local, 'default')
-    assert len(stamps) <= 2, len(stamps)
+    assert len(stamps) == 2, len(stamps)  # exactly one per chunk: none at all is a failure too
 
 
 def test_outside_a_pass_every_read_still_checks_for_replacement(graph, monkeypatch):
