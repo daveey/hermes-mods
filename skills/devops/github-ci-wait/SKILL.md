@@ -73,6 +73,7 @@ S=<this skill dir>/scripts/wait_for_ci.py
 python3 -B $S <sha>                                   # every workflow that ran on a commit containing <sha> passes
 python3 -B $S <sha> --workflow ci.yml                 # just this workflow (repeatable)
 python3 -B $S <sha> --workflow release.yml --tag-glob 'v*'   # released: a v* tag contains <sha>
+python3 -B $S <sha> --branch <pr-head-branch>         # unmerged PR: sha positional AND its head branch, else exit 3 / `no runs`
 python3 -B $S <sha> --once                            # one check: exit 0 done, 1 finished red, 2 not yet
 python3 -B $S --run-id 41967431576 --expect 41967436628:native-guard=failure   # exact dispatched runs (below)
 ```
