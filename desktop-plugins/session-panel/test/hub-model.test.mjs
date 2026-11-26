@@ -425,14 +425,23 @@ test('mounted feed timing survives local ticks, replacement, session switch and 
  window.hermesDesktop = {api:async () => ({feed:'timing',epoch:'timing',rev:1,bundles:{}})}
  try {
   for (const name of ['elapsed_layout', 'eta_ci_normal', 'eta_deploy_normal', 'eta_clock_normal']) {
+   now=cases[name].now
    current = {connectionId:'conn',profile:'default',session:`timing-${name}`}
    const model=structuredClone(cases[name].model), original=JSON.stringify(model)
    await React.act(async () => m.ingestBundle(current.connectionId,current.profile,{session:current.session,model}))
    await paint(J.jsx(m.Panel, {}))
+   // Cache and HTTP catch-up alone do not attest a live source. Exercise the
+   // real heartbeat path; never bypass freshness just to retain a timing label.
+   if (name !== 'elapsed_layout') assert.ok(document.querySelector('[data-wait-eta]') === null)
+   await React.act(async () => {
+    await m.feedCatchUp({...current,sessions:[current.session]})
+    m.onFeedEvent({payload:{feed:'timing',profile:'default',epoch:'timing',rev:1,heartbeat:true,fresh:[current.session]}})
+   })
+   assert.ok(m.feedVouches(current), `${name}: heartbeat must vouch for focused session`)
    const read = () => document.querySelector(name === 'elapsed_layout' ? '[data-row-detail]' : '[data-wait-eta]')?.textContent
    now=cases[name].now
    await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
-   const before=read(); assert.ok(before)
+   const before=read(); assert.ok(before, `${name}: ${document.body.textContent}`)
    now+=60
    await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
    assert.notEqual(read(),before)
@@ -442,7 +451,15 @@ test('mounted feed timing survives local ticks, replacement, session switch and 
    assert.equal(read(),after)
    await paint(null); await paint(J.jsx(m.Panel, {}))
    assert.equal(read(),after)
+   // Local repaint cannot keep an ETA alive after the independent source TTL.
+   now+=1
+   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   if (name !== 'elapsed_layout') {
+    assert.ok(document.querySelector('[data-wait-eta]') === null)
+    assert.match(document.querySelector('[data-row-detail]').textContent, /status unknown · last known:/)
+   }
    assert.equal(JSON.stringify(model),original)
+   await paint(null)
   }
  } finally {
   await paint(null); m.resetFeedForTests(); Date.now=originalNow
