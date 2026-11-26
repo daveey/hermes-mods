@@ -17,7 +17,7 @@ def panel_model():
     return module
 
 
-def project(cards, evidence):
+def project(cards, evidence, *, board=None):
     model = panel_model()
     rows = []
     for card in cards:
@@ -26,6 +26,10 @@ def project(cards, evidence):
         raw = card.get('attention')
         if not isinstance(raw, dict):
             return {'available': False, 'rows': [], 'reason': 'Attention needs the companion core update'}
+        # The flow's raw attention object predates aggregate board stamping.
+        # Qualify before ask/key/target projection, not after boards are merged.
+        if board is not None:
+            raw = {**raw, 'board': board}
         if not model.human_owned(raw):
             return {'available': False, 'rows': [], 'reason': 'Attention snapshot is incompatible'}
         db = evidence.connection(card['id'])

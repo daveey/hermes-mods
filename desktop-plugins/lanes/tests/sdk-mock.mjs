@@ -31,9 +31,10 @@ const sdk = {
   PopoverContent: P.Content
 }
 globalThis.__lanesSdk = sdk
+let generation = 0
 export async function loadPlugin(extraSdk = {}) {
   const current = { ...sdk, ...extraSdk }
-  const key = `__lanesSdk${Object.keys(extraSdk).join('_')}`
+  const key = `__lanesSdk${++generation}_${Object.keys(extraSdk).join('_')}`
   globalThis[key] = current
   const sdkURL = `data:text/javascript;base64,${Buffer.from(
     Object.keys(current).map((k) => `export const ${k}=globalThis[${JSON.stringify(key)}].${k}`).join(';')

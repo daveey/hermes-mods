@@ -300,12 +300,34 @@ export function hasRedAskCoverage(session) {
     status.presentation?.stripe === 'stuck' && strings(status.presentation?.reason_codes))
 }
 
+// The wire identity names a gateway, not a Desktop connection alias. Preserve
+// both same-id owners; a foreign twin is never evidence for a linked chat.
+export function isAskOwner(row, session) {
+  if (!row.links?.length) return true // legacy snapshots have only card refs
+  const identity = session.outcome?.status?.identity
+  if (!identity) return false
+  const ids = new Set([session.id, session._lineage_root_id, ...(session._lineage_ids || [])])
+  return row.links.some(link => ids.has(link.chat_session) &&
+    link.chat_gateway === identity.gateway &&
+    (link.chat_profile || 'default') === identity.profile)
+}
+
+export function askCoverageReason(row, sessions, match = () => true) {
+  if (!row.links?.length || row.unlinked) return 'No linked chat'
+  const owners = (sessions || []).filter(session => isAskOwner(row, session))
+  if (!owners.length) return 'Linked chat not visible'
+  if (owners.every(session => session.muted || session.outcome?.status?.kind === 'muted')) return 'Chat muted'
+  if (owners.every(session => session.offline_cached)) return 'Chat offline'
+  if (owners.every(session => !match(session))) return 'Chat filtered out'
+  return 'Chat not showing this ask in red'
+}
+
 export function uncoveredAsks(view, sessions, match = () => true) {
   if (!view?.attention?.available) return []
   // SDK rows precede plugin filters. Apply the very same registered matcher
   // before treating a chat as coverage; otherwise a lane-hidden ask disappears.
   return view.attention.rows.filter(row => sessions == null ? row.unlinked :
-    !sessions.some(session => match(session) && hasRedAskCoverage(session) && (session.needs_you || []).some(ask =>
+    !sessions.some(session => match(session) && isAskOwner(row, session) && hasRedAskCoverage(session) && (session.needs_you || []).some(ask =>
       ask.kind === 'card' && ask.ref === `${row.target?.board || 'default'}/${row.id}`)))
 }
 
@@ -323,10 +345,14 @@ export function UnlinkedAsks({ ctx }) {
   const rows = uncoveredAsks(view, sessions, store.sessionMatch)
   if (!rows.length || !sdk.SidebarSection || !sdk.SidebarSectionRow) return null
   return h('div', { 'data-unlinked-asks': '1', 'data-needs-you-count': rows.length },
-    h(sdk.SidebarSection, { label: 'Unlinked asks', count: rows.length, open, onToggle: () => setOpen(v => !v) },
-      rows.map(row => h(sdk.SidebarSectionRow, { key: row.key, label: row.title,
-        accentColor: CARD_COLORS.you, meta: row.lane, tip: `${row.title}\n${row.id}`,
-        onSelect: () => openCard(row.id, sourceFor(ctx).target()?.connectionId || undefined) }))))
+    h(sdk.SidebarSection, { label: 'Asks outside chats', count: rows.length, open, onToggle: () => setOpen(v => !v) },
+      rows.map(row => {
+        const reason = askCoverageReason(row, sessions, store.sessionMatch)
+        return h('div', { key: row.key, 'data-uncovered-ask': row.id, 'data-ask-coverage-reason': reason },
+          h(sdk.SidebarSectionRow, { label: row.title,
+            accentColor: CARD_COLORS.you, meta: reason, tip: `${row.title}\n${reason}\n${row.id}`,
+            onSelect: () => openCard(row.id, sourceFor(ctx).target()?.connectionId || undefined) }))
+      })))
 }
 
 // One source per plugin ctx, not per mount: the status bar remounts contributions often.

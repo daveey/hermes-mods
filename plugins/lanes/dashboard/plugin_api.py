@@ -326,7 +326,8 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
                 source_row = evidence.row(card['id'])
                 card['status'] = source_row['status'] if source_row else None
             _stamp_chats(evidence.conn, raw.get('cards', []))
-            raw['attention'] = _attention_module().project(raw['cards'], evidence)
+            from hermes_cli import kanban_governors as gov
+            raw['attention'] = _attention_module().project(raw['cards'], evidence, board=gov._board(conn))
             pol = mods[1].policy()
             if pol is not None:
                 raw['strip_tokens'] = token_series(evidence.conn, pol)

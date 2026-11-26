@@ -134,6 +134,28 @@ def test_cross_board_host_slots_and_release(board, api, monkeypatch, tmp_path):
         render(tmp_path, view(api), 'host-released')
 
 
+def test_cross_board_attention_refs_use_source_board(board, api):
+    from hermes_cli.kanban_db_sync import apply_sync_schema_steps
+
+    config(board)
+    kb.create_board('bb')
+    hr = {'action': 'Reply A or B. Unblock = use the choice; archive = drop it.',
+          'why_human': 'Only you can choose', 'interaction': 'reply',
+          'scope': 'Fixture choice', 'evidence': 'Two supported alternatives'}
+    with kbc.connect(board='bb') as conn:
+        # Chat membership is sync-owned; ordinary fixture boards omit that table.
+        apply_sync_schema_steps(conn)
+        tid = kb.create_task(conn, title='Choose route', assignee='default', tenant='babybear')
+        assert kb.block_task(conn, tid, kind='needs_input', reason='Choose route', human_request=hr,
+                             expected_run_id=kb.get_task(conn, tid).current_run_id)
+    body = view(api)
+    assert body['attention']['available'], body['attention']
+    row, = body['attention']['rows']
+    assert row['id'] == tid
+    assert row['target']['board'] == 'bb'
+    assert row['key'].split(':')[-2:] == ['bb', tid]
+
+
 def test_observer_contexts_cover_all_boards_once(board, api, monkeypatch):
     config(board)
     kb.create_board('beta')

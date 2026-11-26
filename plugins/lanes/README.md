@@ -44,9 +44,14 @@ companion additive Desktop SDK seams; an unhandled browser event is not a filter
 With the companion core API, `needs_you(card)` classifies both lane cards and
 session-panel attention. Historical block kinds alone are not current asks.
 The lane snapshot carries `attention.rows` from the same card evidence as
-`status.you`, including active chat subscriptions. The Desktop's **Unlinked asks**
-section shows red, read-only card links for headless asks and for cards whose
-linked chat is not represented by a visible `needs_you` card entry. This last
+`status.you`, including active chat subscriptions. Each attention key and target
+carries the source board before aggregation, so secondary-board asks match exact
+`board/id` references. The Desktop's **Asks outside chats** section shows red,
+read-only card links for headless asks and for cards whose linked chat is not
+represented by a visible red `needs_you` card entry on its exact gateway/profile.
+Muted chats remain muted, but their uncovered asks stay red here. Offline cached
+rows cannot suppress asks: their stored canonical payload is not live red paint.
+Each fallback names why it remains outside visible chat coverage. This last
 coverage partition is necessarily client-local (sidebar filters are local); it
 does not reclassify or change the server total. It never creates decision
 requests, restores retired consent controls, or grants permission to execute.
