@@ -62,6 +62,7 @@ def real(tmp_path, monkeypatch):
     plugin.register(type("Ctx", (), {"register_tool": lambda *a, **k: None,
                                      "register_hook": lambda *a, **k: None})())
     yield so, plugin
+    _drain(plugin)  # a queued person refresh must not run into the next test's state
     so._reset_hooks_for_tests()
 
 
@@ -483,6 +484,7 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
               'thread': 'https://example.com/thread/123', 'request_id': 'request-123',
               'response': 'deploy example', 'next_step': 'verify example'}
     assert json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))['ok']
+    _drain(plugin)  # the queued refresh must finish before compression and the next declaration share the db
     wid = plugin._open_person_waits('chat')[0]['id']
     with SessionDB() as db:
         db.end_session('chat', end_reason='compressed')
@@ -505,7 +507,8 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
         assert response.json()['records'][0]['thread'] == person['thread']
         assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': ','.join(str(n) for n in range(33))}).status_code == 400
         update = {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply'}
-        assert json.loads(plugin.handle({'kind': 'wait', 'on': [update]}, session_id='tip'))['ok']
+        r = json.loads(plugin.handle({'kind': 'wait', 'on': [update]}, session_id='tip')); assert r['ok'], r
+        _drain(plugin)
         assert json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
             {'id': wid, 'verified': True, 'evidence': 'https://example.com/tests/green'}]}, session_id='tip'))['ok']
         assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip'}).json() == {'records': []}
@@ -526,20 +529,82 @@ def test_closing_a_person_wait_refreshes_the_stored_outcome_without_a_turn(real,
               'response': 'confirm the window', 'next_step': 'schedule it'}
     sent = json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))
     wid = sent['outcome']['on'][0]['id']
+    so.refresh_outcome('chat', trigger='manual')  # seed the stored outcome directly: the assertion below is the close
     assert wid in json.dumps(so.get_outcome('chat')['status'])
-    calls = []
-    quietly = so.refresh_outcomes_quietly
-    monkeypatch.setattr(so, 'refresh_outcomes_quietly', lambda s, t, **k: calls.append((list(s), t)) or quietly(s, t, **k))
     seen = json.loads(plugin.handle({'kind': 'wait', 'on': [
         {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply/9'}]}, session_id='chat'))
     assert seen['ok'], seen
+    _drain(plugin)
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.append_message('chat', role='assistant', content=SUMMARY)
     closed = json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
         {'id': wid, 'verified': True, 'evidence': 'https://example.com/check/9'}]}, session_id='chat'))
     assert closed['ok'], closed
-    assert ('chat'.split(), 'notice') in calls
+    _drain(plugin)  # the close's refresh runs on user-steps' worker; wait for it explicitly
     assert wid not in json.dumps(so.get_outcome('chat')['status']), 'closed wait still in the stored controls'
+
+
+def _drain(plugin):
+    """Wait for user-steps' one background controls worker to finish what is queued (explicit, never a sleep)."""
+    us = plugin._user_steps()
+    flush = getattr(us, 'flush_controls_refresh', None) or getattr(us, 'flush')
+    assert flush(timeout=20) is not False, 'controls refresh worker did not drain'
+
+
+def test_person_refresh_is_queued_after_the_ledger_lock_and_once_per_operation(real, monkeypatch):
+    """One queue call per operation, made after the flock is released; never a synchronous core refresh."""
+    import fcntl
+    import json
+    so, plugin = real
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    monkeypatch.setattr(so, 'refresh_outcomes_quietly',
+                        lambda *a, **k: pytest.fail('person save refreshed synchronously'))
+    us = plugin._user_steps()
+    queued = []
+
+    def queue(db, sessions):
+        with plugin._people().path('chat').with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if handle still holds the ledger lock
+        queued.append((str(db), list(sessions)))
+
+    monkeypatch.setattr(us, 'queue_controls_refresh', queue, raising=False)
+    persons = [{'kind': 'person', 'contact': 'Slack @ExampleOperator', 'channel': 'slack',
+                'thread': f'https://example.com/thread/{n}', 'request_id': f'request-q{n}',
+                'response': 'confirm', 'next_step': 'schedule'} for n in (1, 2)]
+    assert json.loads(plugin.handle({'kind': 'wait', 'on': persons}, session_id='chat'))['ok']
+    assert len(queued) == 1 and queued[0][1] == ['chat'] and queued[0][0].endswith('state.db')
+
+
+def test_compression_tip_person_wait_refreshes_the_stored_outcome(real, tmp_path, monkeypatch):
+    """Ledger is keyed by the compression root; a save through the tip must still reach the tip's stored outcome."""
+    import json
+    from hermes_state import SessionDB
+    so, plugin = real
+    monkeypatch.setattr(so, '_live_turn', lambda *a: False)
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    plugin._llm = lambda *a: 'YES'
+    person = {'kind': 'person', 'contact': 'Slack @ExampleOperator', 'channel': 'slack',
+              'thread': 'https://example.com/thread/c', 'request_id': 'request-c',
+              'response': 'confirm', 'next_step': 'schedule'}
+    wid = json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))['outcome']['on'][0]['id']
+    with SessionDB(db_path=tmp_path / 'state.db') as db:
+        db.end_session('chat', end_reason='compressed')
+        db.create_session('tip', source='desktop', parent_session_id='chat')
+        db.append_message('tip', role='user', content='Check example')
+        db.append_message('tip', role='assistant', content=SUMMARY)
+    seen = json.loads(plugin.handle({'kind': 'wait', 'on': [
+        {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply/c'}]}, session_id='tip'))
+    assert seen['ok'], seen
+    _drain(plugin)
+    assert plugin._people().read('chat')[0]['state'] == 'verifying'  # root-keyed ledger
+    so.refresh_outcome('tip', trigger='manual')  # seed directly, so a missing refresh fails at the close below
+    status = json.dumps(so.get_outcome('tip')['status'])
+    assert wid in status and '"session_id": "tip"' in status, status
+    closed = json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
+        {'id': wid, 'verified': True, 'evidence': 'https://example.com/check/c'}]}, session_id='tip'))
+    assert closed['ok'], closed
+    _drain(plugin)
+    assert wid not in json.dumps(so.get_outcome('tip')['status']), 'closed wait still in the tip controls'
 
 
 def test_no_person_refresh_without_the_provider_in_this_process(real, monkeypatch):
@@ -548,6 +613,7 @@ def test_no_person_refresh_without_the_provider_in_this_process(real, monkeypatc
     so._providers.pop('person-dependencies')
     calls = []
     monkeypatch.setattr(so, 'refresh_outcomes_quietly', lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(plugin._user_steps(), 'queue_controls_refresh', lambda *a: calls.append(a), raising=False)
     with plugin._people().edit('chat') as records:
         plugin._save_people('chat', records)
     assert calls == []
