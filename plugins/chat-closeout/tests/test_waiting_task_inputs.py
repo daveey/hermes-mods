@@ -121,14 +121,15 @@ def test_large_watched_set_reads_marks_in_one_query(certified, monkeypatch):
     key = plugin._waiting_board_key(certified['board'], tails)
     cursor = plugin._wi['waiting_boards'][(str(certified['board']), None)]
     with sqlite3.connect(certified['board']) as conn:
-        marks = [[tail, conn.execute(f'SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?', (tail,)).fetchone()]
-                 for tail in sorted(tails | {rev.FULL_MARK})]
-    expected = plugin.wi.strict_digest(['tasks-v1', cursor.dev, cursor.ino, cursor.shm,
-                                      cursor.schema_version, cursor.tables,
-                                      [[tail, list(mark) if mark is not None else None] for tail, mark in marks]])
-    assert key == expected  # exact old key, including absent and FULL marks
-    keyed = [sql for sql in statements if f'FROM {rev.CHANGE_TABLE} WHERE task_id' in sql]
-    assert len(keyed) == 1, f'{len(keyed)} mark SELECTs for one waiting board'
+        full = conn.execute(f'SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?', (rev.FULL_MARK,)).fetchone()
+    present = {tail: [['str', tail], ['str', 'done'], ['NoneType', None], ['float', (100.0).hex()]]
+               for tail in ('t_1', 't_2')}
+    expected = plugin.wi.strict_digest(['settlement-values-v1', cursor.dev, cursor.ino, cursor.shm,
+                                      cursor.schema_version, cursor.tables, list(full),
+                                      [[tail, present.get(tail)] for tail in sorted(tails)]])
+    assert key == expected  # typed light values, explicit absence, unchanged certified identity
+    keyed = [sql for sql in statements if 'FROM tasks WHERE id IN' in sql]
+    assert len(keyed) == 1, f'{len(keyed)} value SELECTs for one waiting board'
 
 
 @pytest.mark.parametrize('kind', ['heartbeat', 'comment', 'status'])
