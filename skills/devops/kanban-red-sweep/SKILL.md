@@ -84,8 +84,7 @@ or its newest comments name a decision card the owner already filed, file no ask
 in the report. Report **unlinked** (no links, or all released) and
 **reaped-only** cards separately: no chat will ever pick them up.
 
-For a session-wide unblock, walk each delivery card to its first unfinished prerequisite; read that card's
-current actionability, latest owner decision and execution receipt on its home gateway. A prior release can be
+For a session-wide unblock, inspect every linked triage card, including spend holds without a human block_kind—not just the latest notice. Walk delivery prerequisites and read each blocker on its home gateway; do not expand to a fleet sweep unless requested. A prior release can be
 superseded by a later STOP, while reviews on a parallel branch keep arriving. Record the actual blocking card,
 restriction, renewal authority and next deliverable before acting; verify its new run after release. Report
 parallel PR progress separately, never as evidence that the blocked delivery chain resumed.
