@@ -283,7 +283,9 @@ def test_contained_hold_preserves_release_actor_and_shared_held_group():
     assert len(m['groups']) == 1
     assert m['groups'][0]['section'] == 'waiting'
     assert m['groups'][0]['wait_kind'] == 'agent'
-    assert "this chat's agent" in m['groups'][0]['detail']
+    # Bare triage on an upstream row is not evidence that this chat owns release.
+    assert 'execution reason unknown' in m['groups'][0]['detail']
+    assert "this chat's agent" not in m['groups'][0]['detail']
 
 
 def test_click_admission_is_canonical_owner_bound_and_revisioned():
@@ -386,7 +388,7 @@ def test_running_precedence_explains_independent_own_turn():
     outcome['status']['presentation']['reason_codes'] = ['own_turn_active']
     value = model.reduce_panel(bundle(task(status='running', stale=True), outcome_json=outcome), now=NOW)
     assert value['header']['state'] == 'running'
-    assert value['header']['label'] == 'running · this chat’s agent is replying'
+    assert value['header']['label'] == 'chat active · task execution shown below'
     assert value['header']['counts']['running'] == 0
 
 
@@ -502,7 +504,7 @@ def test_block_loop_triage_live_ask_but_no_block_kind_guessing():
     m = model.reduce_panel(bundle(task(block_kind='needs_input')), now=NOW)
     assert not m['sections']['needs_you']
     row = m['sections']['waiting'][0]
-    assert row['detail'] == 'blocked · no reason published'
+    assert row['detail'] == 'blocked · execution reason unknown'
     assert not row['detail'].endswith('board status')
     assert [s for s in row['details'] if not s.startswith('Actionability')] == ['Board status; no live run evidence for this card.']  # unchanged provenance, additive diagnostics only
     assert row['actionability']['evidence_state'] == 'unknown'

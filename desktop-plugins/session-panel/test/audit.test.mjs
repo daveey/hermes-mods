@@ -231,7 +231,10 @@ print(json.dumps(f.reduce_panel({'tasks':[card],'requests':[old,live]}, now=1795
   m.ingestBundle('conn', 'default', { session: 'chat', model: real })
   await paint(React.createElement(m.Panel))
   assert.equal(m.showsDecision('req-old'), true)
-  assert.equal(document.querySelector('[data-ask-row] [data-decision-status="req-old"]')?.textContent, real.sections.needs_you[0].decision.text)
+  // Cached task asks expire, but their independently recorded delivery receipt
+  // remains visible; companion suppression must not swallow the sole status.
+  assert.ok(document.querySelector('[data-ask-row]') === null)
+  assert.equal(document.querySelector('[data-decision-status="req-old"]')?.textContent, real.sections.needs_you[0].decision.text)
   await paint(null); m.resetFeedForTests()
 })
 
