@@ -130,6 +130,18 @@ def test_stale_row_vouches_for_no_reason_or_actor():
     assert not any(d.startswith(('Waiting reason:', 'Next actor:', 'Next check:')) for d in painted['details'])
 
 
+@pytest.mark.parametrize('historical', ['replica', 'aged'])
+def test_historical_row_does_not_publish_current_prerequisite(historical):
+    row = _clock_row(CLOCK, prerequisite=WHY, next_actor='the clock (timed check)')
+    if historical == 'replica':
+        row.update(remote=True, stale=True, synced_at=NOW - 900)
+    b = bundle(row, computed_at=NOW - 120 if historical == 'aged' else NOW)
+    painted = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert 'wait_reason' not in painted and 'wait_next_actor' not in painted
+    assert not any(d.startswith(('Waiting reason:', 'Next actor:', 'Next check:')) for d in painted['details'])
+    assert 'as of' in painted['detail']
+
+
 def test_clock_reason_does_not_churn_the_wire_revision():
     row = _clock_row(CLOCK, prerequisite=WHY, watching=WATCHED, next_actor='cards (event watch)', backstop_at=NOW + 600)
     a = model.reduce_panel(bundle(row), now=NOW, wire=True)

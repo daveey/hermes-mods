@@ -1008,6 +1008,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             else:
                 v.pop('wait_kind', None)
                 v.pop('wait_eta', None)
+                v.pop('wait_reason', None)
+                v.pop('wait_next_actor', None)
+                v['details'] = [d for d in v['details'] if not d.startswith(('Waiting reason:', 'Next actor:', 'Next check:'))]
                 v['detail'] += f' · as of {pacific(synced_row)}, {gw} not synced for {max(1, age_s // 60)} min'
                 v['details'].append('Historical board status: the owner has not synced recently; this does not establish current execution.')
             v['details'].append(f"Reported by {gw}'s board; no live run evidence reached this gateway.")
@@ -1097,6 +1100,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
             v['details'].append(provenance)
             if aged_parked:
+                v.pop('wait_reason', None)
+                v.pop('wait_next_actor', None)
+                v['details'] = [d for d in v['details'] if not d.startswith(('Waiting reason:', 'Next actor:', 'Next check:'))]
                 if now - read_at > HISTORICAL_DELIVERY_S or v.get('wait_kind') not in DELIVERY_KINDS:
                     v.pop('wait_kind', None)
                     v.pop('wait_eta', None)
