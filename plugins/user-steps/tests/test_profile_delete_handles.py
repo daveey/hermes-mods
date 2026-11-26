@@ -182,3 +182,99 @@ def test_poller_runs_normally_for_live_profile(tmp_path, monkeypatch):
         assert worker.thread.is_alive()
     finally:
         assert runtime.release(worker, token)
+
+
+def test_decision_inbox_does_not_recreate_deleted_profile(tmp_path):
+    home = _deleted_profile(tmp_path)
+    cards = _load('profile_delete_cards', 'cards.py')
+    with pytest.raises(FileNotFoundError):
+        cards.DecisionInbox(home / 'user-steps' / 'decision-inbox.sqlite3')
+    assert not home.exists()
+
+
+def test_decision_inbox_schema_closes_every_connection(tmp_path, monkeypatch):
+    cards = _load('profile_delete_cards_close', 'cards.py')
+    TrackedConnection.opened = []
+    real = sqlite3.connect
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real(*a, **{**kw, 'factory': TrackedConnection}))
+    inbox = cards.DecisionInbox(tmp_path / 'inbox.sqlite3')
+    assert TrackedConnection.opened
+    assert all(c.closed for c in TrackedConnection.opened)
+    c = real(inbox.path)
+    try:
+        assert c.execute("select count(*) from sqlite_master where name='deliveries'").fetchone()[0] == 1
+    finally:
+        c.close()
+
+
+def test_decision_inbox_schema_failure_closes_connection(tmp_path, monkeypatch):
+    cards = _load('profile_delete_cards_failure', 'cards.py')
+    TrackedConnection.opened = []
+
+    class Broken(TrackedConnection):
+        def execute(self, sql, *args):
+            if sql.startswith('CREATE TABLE'):
+                raise sqlite3.OperationalError('fixture schema failure')
+            return super().execute(sql, *args)
+
+    real = sqlite3.connect
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real(*a, **{**kw, 'factory': Broken}))
+    with pytest.raises(sqlite3.OperationalError, match='fixture schema failure'):
+        cards.DecisionInbox(tmp_path / 'inbox.sqlite3')
+    assert TrackedConnection.opened
+    assert all(c.closed for c in TrackedConnection.opened)
+
+
+def test_router_inflight_recovery_does_not_resurrect_profile(tmp_path, monkeypatch):
+    """Real router lifespan/outbox enters while live; deletion interrupts the admitted pass."""
+    import asyncio
+    import shutil
+
+    constants = _fence()
+    home = tmp_path / '.hermes' / 'profiles' / 'inflight'
+    home.mkdir(parents=True)
+    (home / 'config.yaml').write_text('x: 1\n')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    api = _load('profile_delete_router', 'dashboard/plugin_api.py')
+    runtime_core = api._load('core')
+    store = runtime_core.ActionStore()
+    own = {'storedSessionId': 's1'}
+    entered, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    attempted, reconciled = [], []
+    original_inbox = api._load('cards').DecisionInbox
+
+    def inbox(*args, **kwargs):
+        attempted.append(True)
+        try:
+            return original_inbox(*args, **kwargs)
+        finally:
+            finished.set()
+
+    def pending():
+        entered.set()
+        assert resume.wait(10), 'test did not release admitted pass'
+        return [dict(own)]
+
+    monkeypatch.setattr(store, 'pending_owners', pending)
+    monkeypatch.setattr(store, 'reconcile', lambda *a, **kw: reconciled.append(True) or [])
+    monkeypatch.setattr(store, 'backfill_legacy', lambda *a, **kw: None)
+    monkeypatch.setattr(runtime_core, 'validate_owner', lambda o: None)
+    monkeypatch.setattr(api._load('cards'), 'DecisionInbox', inbox)
+    router = api.create_router(action_store=store, owner_resolver=lambda s: dict(own))
+
+    async def exercise():
+        try:
+            async with router.lifespan_context(None):
+                assert await asyncio.to_thread(entered.wait, 10)
+                constants.mark_named_profile_deleted(home)
+                shutil.rmtree(home)
+                resume.set()
+                assert await asyncio.to_thread(finished.wait, 10), 'delivery receiver was never reached'
+        finally:
+            resume.set()
+            router.stop_delivery()
+
+    asyncio.run(exercise())
+    assert attempted, 'test missed the real receiver construction'
+    assert not reconciled, 'delivery must be refused after retirement'
+    assert not home.exists()
