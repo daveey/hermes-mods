@@ -37,6 +37,8 @@ recurs: the count is what triggers promotion. One line per entry; no prose parag
 
 ## Wiring a cron job
 
+Keep source-board collection/comment routing separate from promotion-card routing: a lesson harvested from a restricted project board is still personal maintenance. In `family_state_tick.py`, promotion creates use explicit `--board default --tenant personal` and clear inherited `HERMES_KANBAN_DB`/`HERMES_KANBAN_BOARD`; collection and comments retain their manifest target. Verify with a source-board promotion trigger, not just a silent tick or comment-route test.
+
 For family harvests, preserve the `harvest-v2` HTML-comment checkpoint in the file preamble.
 It commits consumed run IDs and visible state in one atomic replacement under a lock; run IDs are not completion
 order. Use `show --slice` for worker context so the checkpoint is omitted. A malformed legacy cursor fails closed.
