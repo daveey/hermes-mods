@@ -131,6 +131,11 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   Plain `triage` (no hold) also refuses `not_held`: use `hermes kanban [--board B] promote <id> "<reason>"`.
   A card you expect to stop again (a narrow run override against a multi-run rollout) gets a wider
   `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
+  Its limits are window totals that include spend already recorded, so pass spent + the extra you mean (the refusal
+  prints both numbers); a bare `--runs 30` below what's spent trips the card at once.
+  A released card that then sits `ready` with workers logging `skipped_ineligible(refusal_exhausted)` has no
+  unrefused provider left right now: on a worker, `kanban_provider_walls.active_walls()` shows which peers are
+  walled and until when. It starts by itself when the wall ends, so comment that time; don't bump, move or release it again.
   `unblock` only re-triages a spend hold. Fallback without `release`: re-scope comment, `renew-scope --episode <stop
   uid> --mandate-comment <cid>`, then `promote --seen <cid>`.
   Release on a worker-homed card this chat created (run via `hub-worker-exec <w>`) is refused `not_scope_authority`
