@@ -27,7 +27,7 @@ def _project(raw):
         if not isinstance(row, dict):
             return None
         ts = row.get('ts', 0)
-        if not isinstance(ts, (int, float)) or not math.isfinite(ts):
+        if not isinstance(ts, (int, float)) or (isinstance(ts, float) and not math.isfinite(ts)):
             return None  # preserve legacy comparison errors via the caller
         if row.get('event') == 'choice' and row.get('choice') == 'dismissed':
             rule = row.get('rule')

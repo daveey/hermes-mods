@@ -124,3 +124,8 @@ def test_path_cache_is_bounded_and_retains_no_unrelated_payload(tmp_path):
         assert core.Store(root, clock=lambda: 101).demoted() == ['one']
     assert len(module._entries) <= 8
     assert 'private' not in repr(module._entries)
+
+
+def test_arbitrary_precision_integer_timestamp_retains_legacy_behavior(tmp_path):
+    (tmp_path / 'log.jsonl').write_text(row(10 ** 1000) * 3)
+    assert core.Store(tmp_path, clock=lambda: 101).demoted() == ['one']
