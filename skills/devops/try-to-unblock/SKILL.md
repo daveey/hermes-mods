@@ -201,6 +201,14 @@ authority needed rather than treating every spent attempt as a new approval requ
   promoting such a child and the Board keeps demoting it (`claim_rejected parents_not_done`), so re-point in the
   same turn as the archive.
 
+- **David answers the ask** → before writing his verdict or acting on it, re-read the held card's live status
+  (`hermes kanban why <id>`). His other chats may have disposed of it minutes earlier, for example by archiving it.
+  If they did, his two instructions conflict: record his new answer as evidence only, tell him the card's current
+  state, and offer the reversal. Don't act on the archived card, because each write there then needs a
+  correcting comment. Once the source is archived, the system moves its spend-stop escalation card to triage,
+  where `kanban complete` refuses it ("unknown id or terminal state"). Close it with `hermes kanban archive <id>`
+  and withdraw its `action_request` asks.
+
 ## 5. Leave a trail
 
 For a new disposition, record the rung and exact supporting evidence once on the card, then read it back.
