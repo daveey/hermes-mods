@@ -104,6 +104,13 @@ same-episode `wake_check_alive` or `external_watch` evidence without executing p
 its cadence (remote alive receipts are rate-limited to three hours); failures, mismatched commands, stale
 receipts and overdue deadlines remain eligible. A merged PR is not deployment completion when a healthy
 installation probe is still waiting. The owner-wake transaction rechecks this guard as well.
+When core widens a completed successful workflow to its commit's remaining workflows,
+a same-episode `ci_wait_widened` must bind the original run and independently read head,
+then a fresh healthy `github_run` receipt must bind that exact repository/commit.
+That is a monitored aggregate wait, not completed-producer evidence. Missing, stale,
+ambiguous, adverse or mismatched evidence stays eligible, as does a failed component.
+The bounded read uses immutable timestamps rather than replica-local arrival IDs;
+no source event, reassessment certificate or execution authority is created.
 
 A missing nudge comment receipt remains `delivery_unknown`, is never resent, and makes the tick fail.
 Only a fresh exact-target read showing a dispatcher `condition_met` with `external_result` after the
