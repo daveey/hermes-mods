@@ -4,6 +4,13 @@ Treat natural `unchanged=true` memo hits and latency as separate gates: a hit ca
 
 For a PID-pinned collector, check route continuity before accepting even its first timing row: a warmed successor can become active while the old producer still writes timing files. A nominal 30-minute summary with passing unchanged samples is NO_PROOF if the route switched before that window or the target retired during it. Preserve route timestamps, process birth, unit journal, first/last completions and every raw cohort; do not treat a static retired-target file as live coverage or start a replacement after an explicit one-window mandate without owner disposition.
 
+## Diagnose before another correction
+
+- Account every unchanged/nondeferred call, including subsecond calls, alongside nearby changed and deferred controls. Verify exclusive wall/thread-CPU totals and reader/preflight/residual identities before ranking stages; do not discard small cohorts or extrapolate systematic row samples into exact totals.
+- Treat aggregate SQLite labels as boundary localization, not causal attribution: open/schema/execute/fetch/close can have different remedies. If existing evidence cannot distinguish them, propose static operation substages and fixed private cardinality counters before speculative caching or batching. Process CPU and thread population provide context, not proof of GIL contention or DB-lock wait.
+- Match offline controls to the composed path: a large replica with one small shadow board and a stubbed local reconciler does not cover multiple full-schema boards or whole-serve wall p95. Result-handoff bounds and CPU ceilings complement, never replace, routed natural acceptance.
+- Never hold a newly added timing frame across a generator yield. Preserve LIFO nesting and exact totals on abandonment, exceptions and legacy fallback; keep nonthrowing overflow accounting. Compare full-module old/new quiet and busy-thread wall/CPU plus fresh-process peak memory before accepting diagnostic overhead.
+
 ## Complete-scan contention controls
 
 - Compare the entire pre-fix capture module with the entire corrected module under a real concurrent CPU-busy Python thread, not only warm decoder calls or a swapped inventory helper. Preserve both quiet and contended wall/thread-CPU pairs and semantic digest equality. Report extra quiet CPU separately from improved contended wall latency; a helper-only overhead bound cannot certify whole-capture cost.
