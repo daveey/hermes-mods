@@ -322,6 +322,7 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             for card in raw.get('cards', []):
                 source_row = evidence.row(card['id'])
                 card['status'] = source_row['status'] if source_row else None
+            _stamp_chats(evidence.conn, raw.get('cards', []))
             raw['attention'] = _attention_module().project(raw['cards'], evidence)
             pol = mods[1].policy()
             if pol is not None:
@@ -343,6 +344,26 @@ def _sibling(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _stamp_chats(db, cards):
+    """Stamp each card with the chats linked to it (unreleased ``task_chat_links``), for the session filter."""
+    import sqlite3
+    ids = [c['id'] for c in cards if c.get('id')]
+    linked = {}
+    try:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for task, chat in db.execute(
+                    'SELECT task_id, chat_session FROM task_chat_links WHERE released=0 AND task_id IN '
+                    f'({",".join("?" * len(chunk))})', chunk):
+                if chat:
+                    linked.setdefault(task, []).append(chat)
+    except sqlite3.Error:
+        return  # older board without chat links: creator sessions only
+    for card in cards:
+        if card.get('id') in linked:
+            card['chats'] = sorted(set(linked[card['id']]))
 
 
 def _governed_sources(mods, conn, evidence, hours, window):

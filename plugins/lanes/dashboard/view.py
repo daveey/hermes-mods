@@ -63,17 +63,26 @@ def gates(cards, lanes):
 
 
 
+def card_chats(card):
+    """Every chat a card belongs to: its creator session plus each chat linked to it (``chats``, from
+    ``task_chat_links``). A card filed for a chat by automation or another gateway's session has a creator id
+    that is no sidebar row, so counting the creator alone dropped it from the strip's session filter."""
+    src = card.get('source') or {}
+    ids = [src['id']] if src.get('kind') == 'session' and src.get('id') else []
+    ids += [s for s in card.get('chats') or () if isinstance(s, str) and s]
+    return list(dict.fromkeys(ids))
+
+
 def session_counts(cards):
-    """Open cards per originating chat session: {session_id: {lane: {status: n}}}, for the strip's session filter."""
+    """Open cards per chat session: {session_id: {lane: {status: n}}}, for the strip's session filter."""
     out = {}
     for c in cards:
-        src = c.get('source') or {}
-        if src.get('kind') != 'session' or not src.get('id') or not c.get('lane'):
+        if not c.get('lane'):
             continue
-        lanes = out.setdefault(src['id'], {})
-        cats = lanes.setdefault(c['lane'], {})
         key = status_of(c.get('reason'))
-        cats[key] = cats.get(key, 0) + 1
+        for sid in card_chats(c):
+            cats = out.setdefault(sid, {}).setdefault(c['lane'], {})
+            cats[key] = cats.get(key, 0) + 1
     return out
 
 
