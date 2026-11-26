@@ -121,8 +121,21 @@ def test_real_factory_wires_private_trace_without_network(tmp_path, monkeypatch)
     poke(store, {url: context})
     raw = (root / 'logs' / 'lanes-pr-observations.json').read_text()
     rows = json.loads(raw)
-    assert [row['event'] for row in rows] == ['fill', 'result']
+    assert [row['event'] for row in rows] == ['fill', 'provider_fill', 'result']
     assert rows[-1]['outcome'] == 'success'
     assert url not in raw and context not in raw
     assert all(len(row['url']) == len(row['context']) == 16 for row in rows)
     assert store.thread is None
+    assert store.shared.directory == root / 'cache' / 'lanes-pr-observations-v1'
+    assert (store.shared.directory / 'values.json').is_file()
+    # A distinct mounted API generation must consume the persisted observation.
+    api._observations.cache_clear()
+    second = api._observations()
+    def unexpected_provider():
+        pytest.fail('second API generation refilled a fresh shared observation')
+    second.factory = unexpected_provider
+    poke(second, {url: context})
+    assert second.reader({url: context}).get(url)['approved']
+    assert second.thread is None
+    events = [row['event'] for row in json.loads((root / 'logs' / 'lanes-pr-observations.json').read_text())]
+    assert events[-3:] == ['fill', 'shared_hit', 'result']

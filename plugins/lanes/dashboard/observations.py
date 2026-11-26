@@ -34,7 +34,8 @@ class Published:
 
 
 class Observations:
-    def __init__(self, factory, ttl=TTL_S, clock=time.monotonic, trace=None):
+    def __init__(self, factory, ttl=TTL_S, clock=time.monotonic, trace=None, shared=None):
+        self.shared = shared
         self.factory, self.ttl, self.clock = factory, ttl, clock
         self.trace = trace
         self.cache_id = uuid.uuid4().hex
@@ -131,13 +132,21 @@ class Observations:
             values = {}
             terminal = set()
             failed = False
+            starts = {}
             try:
-                reader = self.factory()  # core's whole-batch 30s network budget
-                reader.prefetch(job)
-                values = {url: copy.deepcopy(reader.get(url)) for url in job}
-                states = getattr(reader, "states", {})
-                terminal = {url for url in job if states.get(url) in ("MERGED", "CLOSED")
-                            or values[url].get("merged") is True}
+                if self.shared is not None:
+                    fetched = self.shared.fetch(job, self.factory, self.ttl, trace=self._trace)
+                    received = self.clock()
+                    values = {url: copy.deepcopy(item[1]) for url, item in fetched.items()}
+                    starts = {url: received - item[0] for url, item in fetched.items()}
+                    terminal = {url for url, item in fetched.items() if item[2]}
+                else:
+                    reader = self.factory()  # core's whole-batch 30s network budget
+                    reader.prefetch(job)
+                    values = {url: copy.deepcopy(reader.get(url)) for url in job}
+                    states = getattr(reader, "states", {})
+                    terminal = {url for url in job if states.get(url) in ("MERGED", "CLOSED")
+                                or values[url].get("merged") is True}
             except Exception:
                 failed = True
                 logging.getLogger(__name__).exception('Lanes PR observation failed')
@@ -151,7 +160,7 @@ class Observations:
                 before = self._fresh_values()
                 for url, ctx in job.items():
                     if self.contexts.get(url) == ctx and (values.get(url) or url in terminal):
-                        self.values[url] = (ctx, started, values[url])
+                        self.values[url] = (ctx, starts.get(url, started), values[url])
                         self.terminal.discard(url)
                         if url in terminal:
                             self.terminal.add(url)
