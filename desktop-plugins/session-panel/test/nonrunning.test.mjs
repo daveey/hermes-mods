@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire, register } from 'node:module'
 import { resolve, dirname, join } from 'node:path'
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
@@ -33,6 +33,14 @@ if (process.env.HERMES_PANEL_NONRUNNING_CASES) {
 } else {
  const desktop = resolve(process.env.HERMES_DESKTOP_DIR || `${homedir()}/.hermes/hermes-agent/apps/desktop`)
  const core = resolve(desktop, '../..')
+ const compatible = ['scripts/run_tests.sh', 'hermes_cli/kanban_nonrunning_reason.py',
+  'tests/hermes_cli/test_kanban_nonrunning_transport.py'].every(name => existsSync(join(core, name)))
+ if (!compatible) {
+  assert.notEqual(process.env.HERMES_PANEL_REQUIRE_CORE, '1', 'required actual core integration checkout missing')
+  test('real producer integration requires compatible Hermes core (public dependency-only lane)',
+   { skip: 'HERMES_DESKTOP_DIR supplies UI dependencies only; run with HERMES_PANEL_REQUIRE_CORE=1 and compatible core for enforced integration' }, () => {})
+  families = []
+ } else {
  const output = mkdtempSync(join(process.env.TMPDIR || homedir(), 'panel-nonrunning-'))
  try {
   const producer = join(dirname(fileURLToPath(import.meta.url)), 'nonrunning_producer_export.py')
@@ -44,6 +52,7 @@ if (process.env.HERMES_PANEL_NONRUNNING_CASES) {
    'capacity', 'schedule', 'human', 'startup', 'unobserved_review', 'chat_activity']
    .map(name => [name, JSON.parse(readFileSync(join(output, name + '.json'), 'utf8'))])
  } finally { rmSync(output, { recursive: true, force: true }) }
+ }
 }
 for (const [family, cases] of families) for (const kind of (cases.expected?.lifecycle ? ['current'] : ['current', 'expired', 'cached_expired'])) {
  test(`real ${family} producer -> reducer -> mounted renderer: ${kind}`, async () => {

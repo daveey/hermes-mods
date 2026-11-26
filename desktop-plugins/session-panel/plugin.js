@@ -485,6 +485,21 @@ export function clockRow(row, now = Date.now() / 1000) {
   }
   return result
 }
+/** Withdraw expired row presentation, never rewrite canonical status or source clocks. */
+function expiryPresentation(model, sections, diagnosticExpired = false) {
+  const counts = { ...model.header.counts }
+  for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
+  const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
+  const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
+  const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => ({
+    section, label: model.header.pips.find(p => p.section === section)?.label || label, count: counts[section],
+    ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {})
+  }))
+  const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
+    !counts.needs_you && !counts.stuck && !counts.running
+  return { ...model, sections, header: { ...model.header, counts, pips, wait_kind: waitKind, wait_eta: null,
+    ...(withdrawnDerived ? { state: 'unknown', label: 'execution reason unknown' } : {}) } }
+}
 /** Expiration can withdraw diagnostic attention, never create execution or human authority. */
 export function expireDiagnostics(model, now) {
   let sections = null
@@ -498,7 +513,7 @@ export function expireDiagnostics(model, now) {
       sections.ready.push(clocked)
     }
   }
-  return sections ? { ...model, sections } : model
+  return sections ? expiryPresentation(model, sections, true) : model
 }
 /** One source clock for header and row freshness; heartbeats cannot renew computed_at. */
 export function modelFreshness(model, { now = Date.now() / 1000, vouched = null } = {}) {
@@ -521,10 +536,10 @@ export function expireNativeWaits(model, now, vouched) {
     sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
       detail: `status unknown · last known: ${old.detail || key}`,
       details: ['Task source freshness: stale; read current authoritative task state before acting.'],
-      actions: row.actions.filter(a => a.kind === 'open_card' || a.kind === 'open_session' || a.kind === 'open_url'),
-      options: [], decision: null, wait_kind: null, clock_text: null })
+      actions: row.actions.filter(a => ['open_card', 'open_session', 'open_url', 'open_process'].includes(a.kind)),
+      options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null })
   }
-  return { ...model, sections }
+  return expiryPresentation(model, sections)
 }
 /** The three right-click entries for a row, in order. `action` is null when the row has nothing to open there
  *  (no owning chat, no dependency, or the owning chat is the one already in focus). */
