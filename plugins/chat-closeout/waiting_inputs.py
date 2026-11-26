@@ -209,6 +209,7 @@ class ReplicaWatch:
         # (gw, key) -> (tail, digest, observed_at, raw text hash)
         self.rows: dict[tuple[str, str], tuple[str, str, Any, str]] = {}
         self.gateways: dict[str, list[tuple[str, Any, float]]] = {}  # gw -> [(scope digest, observed_at, window)]
+        self.listed: frozenset[str] = frozenset()  # core removed-owner finality reads all task/gateway membership
         self.meta: Optional[dict] = None
         self.ok = False
         self.rebuilds = 0
@@ -276,6 +277,11 @@ class ReplicaWatch:
     def _read_gateways(self, conn: sqlite3.Connection) -> None:
         self.gateways = {str(gw): self._scopes(data) for gw, data in conn.execute(
             "SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'")}
+        # Exactly core kanban_origin_ledger._listed_gateways: even an unrelated
+        # task or a non-info gateway row withdraws a removed owner's final word.
+        # Read in the same transaction as selected task rows and heartbeat/meta.
+        self.listed = frozenset(str(r[0]) for r in conn.execute(
+            "SELECT DISTINCT gw FROM replica WHERE coll IN ('gateway','tasks')"))
 
     def _rebuild(self, conn: sqlite3.Connection, tails: frozenset) -> None:
         self.seqs, self.aggs, self.cursor = {}, {}, {}
@@ -382,6 +388,7 @@ class ReplicaWatch:
             snapshot = list(self.rows.items())
             scopes = sorted([gw, s, _fresh(at, now, w)] for gw, lst in self.gateways.items() for s, at, w in lst)
             meta = dict(self.meta or {})
+            listed = sorted(self.listed)
         raw = meta.get("last_ok")
         try:
             last_ok = float(raw) if raw not in (None, "") else None
@@ -391,13 +398,14 @@ class ReplicaWatch:
         verdict = [meta.get("offline_since") or None, last_ok is None, 0 <= now - lo, now - lo <= REPLICA_FRESH_S,
                    last_ok is not None and now - last_ok > stale_after]
         scope_digest = digest(scopes)
+        listed_digest = digest(listed)
         out = []
         for tails in groups:
             own = [(k, v) for k, v in snapshot if tails is None or v[0] in tails]
             rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in own)
             owners = sorted([gw, key, _fresh(o, now, REPLICA_FRESH_S)]
                             for (gw, key), (_t, _d, o, _r) in own if o is not None)
-            out.append([digest(rows), digest(owners), scope_digest, list(verdict)])
+            out.append([digest(rows), digest(owners), scope_digest, list(verdict), listed_digest])
         return out
 
 
