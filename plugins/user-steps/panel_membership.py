@@ -8,6 +8,7 @@ from contextlib import closing, contextmanager, nullcontext
 import hashlib
 import json
 import math
+import sqlite3
 import threading
 from collections import OrderedDict
 
@@ -34,9 +35,24 @@ def _inventory_lock(timing):
         _INVENTORY_LOCK.release()
 
 
+def _inventory_digest(raw):
+    # hashlib releases the GIL for inputs >=2048 bytes. A full replica has tens
+    # of thousands of such publications; preserve SHA-256 exactly without a
+    # native handoff per row when other serve threads are CPU busy.
+    raw = raw if isinstance(raw, bytes) else raw.encode()
+    if len(raw) <= 2047:
+        return hashlib.sha256(raw).digest()
+    digest = hashlib.sha256()
+    view = memoryview(raw)
+    for offset in range(0, len(raw), 2047):
+        digest.update(view[offset:offset + 2047])
+    return digest.digest()
+
+
 def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
-    # Keep the unsampled hot path identical to the pre-instrumentation reader.
-    digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+    # Bare-lock/cache path remains the pre-instrumentation path; only digest
+    # scheduling changes (same bytes, algorithm and storage-class qualification).
+    digest = _inventory_digest(raw)
     cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
     with _INVENTORY_LOCK:
         value = _INVENTORY.get(cache_key)
@@ -64,7 +80,7 @@ def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
 
 def _inventory_sampled(raw, key, gateway, profile, linked_sessions, storage_type, timing):
     with _stage(timing, 'inventory_hash_sample'):
-        digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+        digest = _inventory_digest(raw)
     cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
     with _inventory_lock(timing):
         value = _INVENTORY.get(cache_key)
@@ -89,6 +105,59 @@ def _inventory_sampled(raw, key, gateway, profile, linked_sessions, storage_type
         while len(_INVENTORY) > _INVENTORY_MAX:
             _INVENTORY.popitem(last=False)
     return value
+
+def _inventory_rows(replica):
+    """Read every current byte in the caller's transaction, 1024 rows per hop.
+
+    SQLite concatenation preserves bytes, including NUL/invalid UTF-8: only the
+    small JSON header is text. CAST the final packet to BLOB before the driver
+    sees it. Length framing is unambiguous even when a payload contains headers.
+    This is transport batching, never a cached membership/absence certificate.
+    """
+    if replica.execute('PRAGMA encoding').fetchone()[0] != 'UTF-8':
+        # SQLite concatenation is database-encoding-sensitive. Preserve the
+        # original CAST/driver path on legacy non-UTF-8 databases.
+        yield from replica.execute(
+            "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'")
+        return
+    last = None
+    while True:
+        where = '' if last is None else ' AND rowid > ?'
+        query = (
+            "SELECT CAST(group_concat(json_array(scan_rowid,gw,key,version,typeof(data),"
+            "coalesce(length(CAST(data AS BLOB)),0)) || char(10) || "
+            "coalesce(CAST(data AS BLOB),x''), '') AS BLOB) FROM "
+            "(SELECT rowid AS scan_rowid,gw,key,data,version FROM replica "
+            "WHERE coll='tasks'" + where + " ORDER BY rowid LIMIT 1024)")
+        try:
+            packet = replica.execute(query, () if last is None else (last,)).fetchone()[0]
+        except sqlite3.Error:
+            if last is not None:
+                raise
+            # Optional old schemas/SQLite features retain the original complete
+            # reader. Never restart after yielding a prefix of the inventory.
+            yield from replica.execute(
+                "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'")
+            return
+        if packet is None:
+            return
+        if not isinstance(packet, bytes) or not packet:
+            raise ValueError('invalid inventory packet')
+        offset = 0
+        while offset < len(packet):
+            end = packet.index(b'\n', offset)
+            rid, gw, key, version, storage_type, size = json.loads(packet[offset:end])
+            if (type(rid) is not int or last is not None and rid <= last
+                    or type(size) is not int or size < 0):
+                raise ValueError('invalid inventory frame')
+            offset = end + 1
+            end = offset + size
+            if end > len(packet):
+                raise ValueError('truncated inventory frame')
+            raw = packet[offset:end] if storage_type != 'null' else None
+            offset, last = end, rid
+            yield gw, key, raw, version, storage_type
+
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
@@ -272,8 +341,7 @@ def capture(owner, *, gateway, state_path, replica_path, ledger_path, connect,
             # selected inventory must see arrivals, removals and legacy twins.
             candidates, direct = [], set()
             with _stage(timing, 'inventory_scan'):
-                for index, (gw, key, raw, version, storage_type) in enumerate(replica.execute(
-                        "SELECT gw,key,CAST(data AS BLOB),version,typeof(data) FROM replica WHERE coll='tasks'")):
+                for index, (gw, key, raw, version, storage_type) in enumerate(_inventory_rows(replica)):
                     # Keep full scans unchanged; row-level hash/decode/lock
                     # attribution is a systematic 1/64 sample to bound overhead.
                     if timing is not None and index % 64 == 0:
