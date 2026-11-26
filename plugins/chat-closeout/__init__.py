@@ -1895,13 +1895,25 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
                 if cursor is None:
                     cache.pop(ident, None)
                     raise wi.Unportable("uncertified waiting task inputs")
-                selected = sorted(tails | {rev.FULL_MARK})
-                # One indexed lookup per board, not one SQL statement per watched task. Keep missing
-                # marks and ordering in the portable key exactly as before, in this same snapshot.
-                found = dict(conn.execute(
-                    f"SELECT task_id, rev FROM {rev.CHANGE_TABLE} WHERE task_id IN "
-                    "(SELECT value FROM json_each(?))", (json.dumps(selected),)).fetchall())
-                marks = [[tail, (found[tail],) if tail in found else None] for tail in selected]
+                # Revisions certify the snapshot, but a selected task's comment/run/title
+                # change is not a settlement change. Key the light reader's actual values.
+                # Keep the unknown-change mark and schema/file identity as fail-fresh gates.
+                full_mark = conn.execute(
+                    f"SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?", (rev.FULL_MARK,)).fetchone()
+                cols = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+                if not {'id', 'status'} <= cols:
+                    raise wi.Unportable('waiting tasks schema unavailable')
+                bk = 'block_kind' if 'block_kind' in cols else 'NULL'
+                comp = 'completed_at' if 'completed_at' in cols else 'NULL'
+                selected = sorted(tails)
+                rows = conn.execute(
+                    f'SELECT id, status, {bk}, {comp} FROM tasks WHERE id IN '
+                    '(SELECT value FROM json_each(?))', (json.dumps(selected),)).fetchall()
+                # SQLite scalars may include malformed-but-readable blobs or nonfinite
+                # floats. Preserve storage types without a JSON TypeError or lossy str().
+                found = {r[0]: [[type(v).__name__, v.hex() if isinstance(v, (bytes, float)) else v]
+                                for v in r] for r in rows}
+                values = [[tail, found.get(tail)] for tail in selected]
                 # changed_since rechecks path/shm identity after its read, including when the caller owns
                 # the transaction. Repeat after the marks, so a replacement during their read is unknown.
                 _changed, final = tc.changed_since(conn, cursor, tables=tables)
@@ -1915,9 +1927,9 @@ def _waiting_board_key(path: Path, tails: set[str], tables=None) -> str:
         cache[ident] = cursor
         if previous is not None and changed is tc.FULL:
             raise wi.Unportable("waiting board requires full refresh")
-        return wi.strict_digest(["tasks-v1", cursor.dev, cursor.ino, cursor.shm,
+        return wi.strict_digest(["settlement-values-v1", cursor.dev, cursor.ino, cursor.shm,
                                  cursor.schema_version, cursor.tables,
-                                 [[tail, list(mark) if mark is not None else None] for tail, mark in marks]])
+                                 list(full_mark) if full_mark is not None else None, values])
 
 
 def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None,
