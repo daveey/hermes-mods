@@ -50,9 +50,8 @@ class Procs:
 CHATS = ['S1', 'S2', 'S3']
 
 
-def setup(catchup=float('inf')):
+def setup():
     f, r, pushed, clock = make()
-    f.runtime_catchup_s = catchup  # (a)-(f) isolate the evidence rules; the catch-up has its own tests below
     p = Procs(r, clock)
     f.changes(CHATS)
     assert p.captured(f) == []  # nothing owned, nothing written: no capture
@@ -200,48 +199,3 @@ def test_forgotten_chats_leave_no_runtime_state():
         f._forget(s)
     p.captured(f)
     assert not (set(f._runtime_seen) | set(f._runtime_fp) | set(f._runtime_retry)) & {'S1', 'S2'}
-
-
-def test_catchup_recaptures_every_chat_within_one_period_spread_never_all_at_once():
-    """Outcome inputs with no event-driven refresh (registered control providers) heal within one period."""
-    from test_feed import feedmod
-    period = 900.0
-    f, r, pushed, clock = make()
-    f.runtime_catchup_s = period
-    p = Procs(r, clock)
-    chats = [f'C{i:02d}' for i in range(60)]
-    f.changes(chats)
-    start = clock['now']
-    last, per_pass = {}, []
-    while clock['now'] < start + 3 * period:
-        calls = p.captured(f)
-        per_pass.append(len(calls))
-        for s in calls:
-            assert s not in last or clock['now'] - last[s] >= period - 1e-6, 'no evidence moved: catch-up only'
-            last[s] = clock['now']
-        wake = f._runtime_catchup_at
-        assert wake is not None and f._runtime_retry_at is None  # its own clock, not the re-probe clock
-        clock['now'] = max(clock['now'] + 1, wake)  # the lane wakes on that clock
-        if clock['now'] > start + period:
-            assert all(clock['now'] - last.get(s, start) <= period + 1 for s in chats), 'every chat within one period'
-    assert max(per_pass) <= 2, f'spread across passes, never all at once: {max(per_pass)}'
-    total = sum(per_pass)
-    assert 2 * len(chats) <= total <= 3 * len(chats) + 1, total  # one per chat per period
-    assert feedmod.RUNTIME_CATCHUP_S == 15 * 60
-
-
-def test_catchup_clock_resets_on_any_capture_and_skips_failing_chats():
-    f, p, clock = setup(catchup=900.0)
-    p.write(S1=['proc_a'])
-    assert p.captured(f) == ['S1']
-    assert f._runtime_catchup['S1'] == clock['now'] + 900
-    p.write(S1=[])
-    clock['now'] += 10
-    assert p.captured(f) == ['S1']
-    assert f._runtime_catchup['S1'] == clock['now'] + 900  # an evidence capture also settles the catch-up
-    p.fail.add('S2')
-    clock['now'] = max(f._runtime_catchup['S2'], f._runtime_catchup['S3'])
-    assert sorted(p.captured(f) + p.captured(f)) == ['S2', 'S3']  # one chat per pass at this size
-    assert f._runtime_catchup['S2'] <= clock['now'], 'a failed catch-up is not settled'
-    assert 'S2' in f._runtime_retry  # it retries on its own backoff, not every pass
-    assert p.captured(f) == []

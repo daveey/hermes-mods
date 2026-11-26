@@ -99,12 +99,6 @@ to its lineage; `inputs.PROCESS_CHECKPOINT_FIELDS`), on its own 45-second re-pro
 it holds processes, or on its own retry clock (1 s after losing a publication race; a
 failed capture backs off from 0.1 s to at most 45 s). A rewrite that leaves its evidence
 unchanged, another chat's process, or another chat's failure never makes it due.
-Outcome inputs core refreshes on no event of its own (`controls`: the outcome
-providers registered by session-outcome, i.e. open user-steps and person waits) get a
-bounded catch-up: every watched chat is re-captured at least once per 15 minutes
-(`RUNTIME_CATCHUP_S`), on its own clock (`_runtime_catchup_at`), first deadlines phased
-per chat and at most one chat in 30 per pass, so catch-ups spread and never come all at
-once (76 chats: about 5 captures a minute).
 The refreshed canonical `outcome_json.status` remains the one state envelope shared
 by the panel header and Desktop sidebar; rows do not implement a competing status
 classifier. Intentional process termination can leave a failed receipt requiring

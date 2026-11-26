@@ -99,8 +99,6 @@ def _takes_deadline(readers: Any) -> bool:
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 RUNTIME_REPROBE_S = 45       # a chat holding live processes is re-probed this often; a failing capture's backoff cap
 RUNTIME_SUPERSEDED_S = 1     # a capture that lost its publication race is retried this soon
-RUNTIME_CATCHUP_S = 15 * 60  # every watched chat is re-captured at least this often, whatever its evidence did
-RUNTIME_CATCHUP_SHARE = 30   # at most one chat in this many is caught up by one pass (never all at once)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
 RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
@@ -983,7 +981,6 @@ class Feed:
                                     runtime_seen[s] = now
                                     settled[s] = prints.get(s)  # as of before the read: a later write is due next
                                     retry.pop(s, None)
-                                    self._runtime_catchup[s] = now + self.runtime_catchup_s
                                 else:
                                     # This chat alone retries soon; its failure count is kept, others advance.
                                     retry[s] = (retry.get(s, (0, 0))[0], now + RUNTIME_SUPERSEDED_S)
@@ -1013,13 +1010,8 @@ class Feed:
         seen = self.__dict__.setdefault('_runtime_seen', {})
         settled = self.__dict__.setdefault('_runtime_fp', {})
         retry = self.__dict__.setdefault('_runtime_retry', {})
-        catchup = self.__dict__.setdefault('_runtime_catchup', {})
-        for gone in [s for s in (*seen, *settled, *retry, *catchup) if s not in held]:
-            seen.pop(gone, None), settled.pop(gone, None), retry.pop(gone, None), catchup.pop(gone, None)
-        period = self.runtime_catchup_s
-        for s in held:
-            if s not in catchup:  # a stable phase per chat spreads first catch-ups evenly over one period
-                catchup[s] = now + period * self._catchup_phase(s)
+        for gone in [s for s in (*seen, *settled, *retry) if s not in held]:
+            seen.pop(gone, None), settled.pop(gone, None), retry.pop(gone, None)
         prints = self._runtime_fingerprints(readers, held, now)
         due = set()
         for s, b in held.items():
@@ -1032,17 +1024,7 @@ class Feed:
                 due.add(s)
             elif b.get('processes') and now - seen.get(s, 0) >= RUNTIME_REPROBE_S:
                 due.add(s)
-        # Bounded catch-up: inputs with no event-driven refresh (e.g. outcome controls from registered
-        # providers) are never stale longer than one period. Oldest deadline first, a few per pass.
-        overdue = sorted((catchup[s], s) for s in held if s not in due and s not in retry and now >= catchup[s])
-        due.update(s for _, s in overdue[:max(1, -(-len(held) // RUNTIME_CATCHUP_SHARE))])
         return due, prints or {}
-
-    runtime_catchup_s = RUNTIME_CATCHUP_S
-
-    @staticmethod
-    def _catchup_phase(session: str) -> float:
-        return (int(hashlib.sha256(session.encode()).hexdigest()[:8], 16) + 1) / 2 ** 32
 
     def _runtime_fingerprints(self, readers, held: dict, now: float):
         """session -> fingerprint (None: no evidence; also a never-captured chat's settled value), or None
@@ -1082,9 +1064,6 @@ class Feed:
         if getattr(self, '_runtime_fp_failures', 0):
             deadlines.append(self._runtime_fp_retry_at)
         self._runtime_retry_at = min(deadlines) if deadlines else None
-        catchup = [at for s, at in self.__dict__.setdefault('_runtime_catchup', {}).items()
-                   if s in live and s not in retry]
-        self._runtime_catchup_at = min(catchup) if catchup else None  # its own clock: see RUNTIME_CATCHUP_S
         if failing:
             earlier = self._decision_retry_at
             self._decision_retry_at = min(failing) if earlier is None else min(earlier, *failing)

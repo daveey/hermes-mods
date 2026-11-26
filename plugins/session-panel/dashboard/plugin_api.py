@@ -3191,12 +3191,9 @@ def _run_decisions(f) -> None:
                 # Startup, explicit registration and source events only. A
                 # refused watcher must never turn this lane into a poller.
                 # Failed reads retry finitely. Only known live processes own a
-                # timed kernel re-probe; otherwise a chat is re-captured on its own
-                # evidence, plus one bounded catch-up per RUNTIME_CATCHUP_S (spread
-                # across chats) for outcome inputs core refreshes on no event.
+                # timed kernel re-probe; idle chats remain event-driven.
                 deadlines = [at for at in (getattr(f, '_decision_retry_at', None),
-                                           getattr(f, '_runtime_retry_at', None),
-                                           getattr(f, '_runtime_catchup_at', None)) if at is not None]
+                                           getattr(f, '_runtime_retry_at', None)) if at is not None]
                 retry_at = min(deadlines) if deadlines else None
                 if retry_at is None:
                     f._decide.wait()
