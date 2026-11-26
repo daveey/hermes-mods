@@ -69,6 +69,29 @@ Final lifecycle/population acceptance and B3 activation/performance/native proof
 are required, not implied by source or cached hashes. No wire version or Desktop
 classification changes.
 
+## Non-running task reasons
+
+An active chat is labelled `chat active · task execution shown below`; it does not
+assert that a linked task's worker is executing. The canonical header state and
+execution identity remain unchanged. Task rows retain their own evidence and the
+panel's independent source-data age.
+
+Ready tasks may carry an optional source-qualified `non_running_reason`. A current
+refusal is shown as blocked with its fixed cause, evidence freshness and next
+actor/action; an actual capacity or observer-local drain/start gate stays waiting.
+Missing, stale, replaced, conflicting or truncated evidence says `execution reason
+unknown`, never an invented capacity wait or human request. Diagnostic expiry is
+independent of execution phase/identity and never renews a worker lease.
+
+Native schedule, human, startup and review lifecycles remain authoritative only
+for their source snapshot. When that snapshot expires in a cached renderer, native
+task rows become historical `status unknown · last known: …`, withdraw stuck pips,
+wake/ETA colouring and task-decision actions, and retain read-only navigation.
+A fresh source restores the current native wait. This never clears a stored hold.
+The self-contained `test/nonrunning.test.mjs` harness runs real disposable core
+producers through the reducer and mounts the actual renderer; these tests are not
+proof of native on-screen pixels or a deployed gateway.
+
 ## Runtime process evidence
 
 A process row with complete owner coordinates exposes **Open process** in its

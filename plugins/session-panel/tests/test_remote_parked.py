@@ -1,4 +1,4 @@
-"""Worker-homed parked cards show the synced board state, not "status unknown"."""
+"""Stale worker-homed cards retain historical state, not current wait authority."""
 from test_model import NOW, bundle, model, task
 
 
@@ -13,7 +13,10 @@ def rows(m):
 def test_remote_scheduled_fresh_sync_reads_parked_with_gateway_and_age():
     m = model.reduce_panel(bundle(remote(stale=True, synced_at=NOW - 20)), now=NOW)
     row = rows(m)[0]
-    assert 'status unknown' not in row['detail']
+    assert row['detail'].startswith('status unknown · last known:')
+    assert row['evidence_state'] == 'unknown'
+    assert not row.get('wait_kind') and not row.get('wait_eta')
+    assert not m['sections']['needs_you'] and not m['sections']['stuck']
     assert 'scheduled' in row['detail']
     assert 'on worker-a3 (synced 20s ago)' in row['detail']
     assert row['parked'] is True
@@ -22,7 +25,10 @@ def test_remote_scheduled_fresh_sync_reads_parked_with_gateway_and_age():
 def test_remote_scheduled_stale_sync_reads_aged_board_state():
     m = model.reduce_panel(bundle(remote(stale=True, synced_at=NOW - 1200)), now=NOW)
     row = rows(m)[0]
-    assert 'status unknown' not in row['detail']
+    assert row['detail'].startswith('status unknown · last known:')
+    assert row['evidence_state'] == 'unknown'
+    assert not row.get('wait_kind') and not row.get('wait_eta')
+    assert not m['sections']['needs_you'] and not m['sections']['stuck']
     assert 'scheduled' in row['detail']
     assert 'as of ' in row['detail'] and 'worker-a3 not synced for 20 min' in row['detail']
 
