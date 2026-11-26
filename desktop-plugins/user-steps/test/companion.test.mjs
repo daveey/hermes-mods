@@ -99,6 +99,42 @@ test('companion: pending delivery keeps Check status and Retry (same operation) 
  delete window.hermesDesktop
 })
 
+test('real panel plus companion retains the sole recorded receipt through source expiry and recovery', async () => {
+ await show(null); m.clearFeatureCache(); m.resetCanonicalCacheForTests()
+ const panel = await import('../../session-panel/plugin.js')
+ panel.resetFeedForTests()
+ const previous = window.__sessionPanel
+ const r = approval({ resolution: { operationId: 'op-real-expiry', choiceId: 'yes', revision: 1 } })
+ const now = Date.now() / 1000
+ const sections = { needs_you: [], stuck: [], running: [], waiting: [], ready: [], done: [] }
+ sections.waiting.push({ key: 'receipt-card', kind: 'card', source: 'card', id: 't_receipt', title: 'Recorded card',
+  detail: 'waiting', details: [], actions: [], options: [], request_id: null,
+  decision: { request_id: r.requestId, text: 'Decision recorded · delivery pending' } })
+ const model = { version: 1, header: { counts: Object.fromEntries(Object.keys(sections).map(k => [k, k === 'waiting' ? 1 : 0])), pips: [] },
+  sections, freshness: { computed_at: now, ttl_s: 60, trusted: true } }
+ const call = async path => path.endsWith('/ping') ? { features: [] } : { requests: [r] }
+ window.hermesDesktop = { api: ({ path }) => call(path) }
+ window.__sessionPanel = { active: true, showsDecision: id => panel.showsDecision(id, route) }
+ try {
+  await m.refreshRequests(call)
+  for (const [name, clock] of [['fresh', now], ['expired', now + 61], ['recovered', now]]) {
+   panel.ingestBundle(route.connectionId, route.profile, { session: route.session, model })
+   await show(React.createElement(React.Fragment, null,
+    panel.renderModel(model, { now: clock }),
+    React.createElement(m.ActionQueue, { key: name, embedded: true, companion: true })))
+   assert.equal(panel.showsDecision(r.requestId, route), true)
+   assert.equal(el().querySelectorAll('[data-decision-status]').length, 1, name)
+   assert.match(el().querySelector('[data-decision-status]').textContent, /Decision recorded/)
+   assert.ok(el().querySelector('[data-action-request]') === null, 'sole receipt is in panel, not lost or duplicated')
+   assert.ok(el().querySelector('[data-choice-letter]') === null)
+   await show(null)
+  }
+ } finally {
+  await show(null); panel.resetFeedForTests(); delete window.hermesDesktop
+  if (previous) window.__sessionPanel = previous; else panelOff()
+ }
+})
+
 test('audit: a recorded decision the panel carries has no queue block; the same decision shows when the panel does not carry it', async () => {
  m.clearFeatureCache(); m.resetCanonicalCacheForTests()
  const before = window.__sessionPanel
