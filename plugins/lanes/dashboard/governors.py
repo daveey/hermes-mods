@@ -63,8 +63,11 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         ident = entry['id']
         observations = groups[ident]
         known = [(r, s, b) for r, s, b in observations if s['available']]
-        count = sum(r.get('cards', 0) for r, _, _ in known)
+        # A receipt that did not observe this governor reports cards=None
+        # (storage-admission abort): unknown, never a zero and never a crash.
+        count = sum(r.get('cards') or 0 for r, _, _ in known)
         unknown = not complete or not known
+        unknown |= any(r.get('unknown') or r.get('cards', 0) is None for r, _, _ in known)
         # Unreached global checks must never be painted as off.
         unknown |= any(g.get('verdict') == 'unknown' for _, _, b in known
                        for g in b.get('globals') or [] if g['governor'] == ident)
