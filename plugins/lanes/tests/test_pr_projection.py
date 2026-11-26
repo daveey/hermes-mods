@@ -129,6 +129,51 @@ def test_busy_board_still_publishes(board, head_kind):
     assert pr_of(api.flow('6h'))[0] != 'merge', 'new PR/head evidence reused old approval'
 
 
+@pytest.mark.parametrize('through_shared_store', [False, True])
+def test_local_status_transition_renders_without_provider_refill(board, monkeypatch, through_shared_store):
+    """Running -> scheduled changes presentation, not the PR4077 provider evidence."""
+    from hermes_cli import kanban_lanes_flow as flow
+    api, connect, calls = board
+    monkeypatch.setenv('FAKE_GH_SLEEP', '0')
+    observer = api._observations()
+    if not through_shared_store:
+        observer.shared = None
+    with connect() as conn:
+        conn.execute("UPDATE tasks SET status='running' WHERE id='t_pr'")
+        conn.commit()
+    first = api.lane_view(6, '6h', True)
+    assert first['totals']['running'] == 1
+    observer.join(10)
+    assert len(calls) == 2
+    with connect() as conn:
+        before = api._pr_contexts(conn, flow, evidence=flow.Evidence(conn))
+    for status in ('scheduled', 'ready', 'running', 'scheduled'):
+        with connect() as conn:
+            conn.execute("UPDATE tasks SET status=? WHERE id='t_pr'", (status,))
+            conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr',?,?,?)",
+                         (status, int(time.time()), json.dumps({'awaiting': {'kind': 'clock', 'why': 'fixture'}})))
+            conn.commit()
+        api._written()
+        rendered = api.lane_view(6, '6h', True)
+        observer.join(10)
+        # Assert presentation independently of the provider key/call budget.
+        assert rendered['totals']['running'] == int(status == 'running')
+        card = next(c for c in rendered['flow']['cards'] if c['id'] == 't_pr')
+        assert card['status'] == status
+        assert len(calls) == 2, 'local status changes refetched unchanged GitHub evidence'
+        with connect() as conn:
+            assert api._pr_contexts(conn, flow, evidence=flow.Evidence(conn)) == before
+    # An actual PR/head event must still discard the cached approval immediately.
+    with connect() as conn:
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr','external_watch',?,?)",
+                     (int(time.time()), json.dumps({'metadata': {'head_sha': 'new-head'}})))
+        conn.commit()
+    api._written()
+    api.flow('6h')
+    observer.join(10)
+    assert len(calls) == 4
+
+
 @pytest.mark.parametrize('kind', ['commented', 'respawn_guarded', 'dispatch_skipped', 'wake_episode_started'])
 def test_same_card_dispatch_churn_reuses_pr_observation(board, monkeypatch, kind):
     api, connect, calls = board

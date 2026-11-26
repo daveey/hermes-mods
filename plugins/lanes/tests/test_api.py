@@ -286,3 +286,34 @@ def test_unreadable_or_invalid_config_is_a_reason_not_a_crash(api, core, error):
     assert client.get("/v1/held").status_code == 409
     assert client.put("/v1/lanes/product", json={"share": 1}).status_code == 409
     assert client.post("/v1/held/t_1/admit", json={}).status_code == 409
+
+
+@pytest.mark.parametrize('head_field', ['head', 'head_sha', 'headRefOid', 'published_pr', 'reviewed_pr'])
+def test_provider_key_ignores_local_status_but_keeps_pr_evidence(api, head_field):
+    """Core-free public-CI check of the actual context builder, with a private DB."""
+    import json
+    import sqlite3
+    from types import SimpleNamespace
+
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        db.row_factory = sqlite3.Row
+        db.executescript('CREATE TABLE tasks(id,status,completion_contract); '
+                         'CREATE TABLE task_events(id INTEGER PRIMARY KEY,task_id,kind,payload);')
+        url = 'https://github.com/example/repo/pull/1'
+        db.execute("INSERT INTO tasks VALUES('fixture','running',?)", (url,))
+        db.execute("INSERT INTO task_events(task_id,kind,payload) VALUES('fixture','created',?)",
+                   (json.dumps({'metadata': {'published_pr': url, 'head': 'old'}}),))
+        flow = SimpleNamespace(_payload=lambda event: json.loads(event['payload']))
+        def key():
+            evidence = SimpleNamespace(rows=db.execute('SELECT * FROM tasks').fetchall(),
+                events=lambda tid: db.execute('SELECT * FROM task_events WHERE task_id=?', (tid,)).fetchall(),
+                pr_url=lambda row: row['completion_contract'])
+            return api._pr_contexts(db, flow, evidence=evidence)
+        initial = key()
+        for status in ('scheduled', 'ready', 'running'):
+            db.execute('UPDATE tasks SET status=?', (status,))
+            db.execute("INSERT INTO task_events(task_id,kind,payload) VALUES('fixture',?,'{}')", (status,))
+            assert key() == initial
+        db.execute("INSERT INTO task_events(task_id,kind,payload) VALUES('fixture','external_watch',?)",
+                   (json.dumps({'metadata': {head_field: 'new'}}),))
+        assert key() != initial, 'explicit provider evidence must still invalidate'
