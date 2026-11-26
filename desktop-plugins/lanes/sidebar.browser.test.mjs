@@ -117,7 +117,7 @@ test('sidebar: one-row geometry, independent pointer/keyboard folds and remount 
       assert.equal(result.retired, true, 'previous native-tooltip owner must be detached on changed summary')
       assert.equal(result.sameHeading, true)
       assert.equal(result.title, result.text); assert.equal(result.description, result.text)
-      assert.match(result.text, section === 'lanes' ? /Partial · — running · — held · — you · 270 waiting/ : /2 on · 0 off · 0 at cap · 39 unknown/)
+      assert.match(result.text, section === 'lanes' ? /Partial · — running · — governor-held · — you · 270 waiting/ : /2 on · 0 off · 0 at cap · 39 unknown/)
       await page.evaluate(() => window.render('normal'))
     }
     assert.deepEqual(errors, [])

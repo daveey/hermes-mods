@@ -1153,6 +1153,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
   const idle = snap?.sidebar?.idle_lanes || []
   const status = snap?.status || {}
   const freshness = error ? `Lanes offline - retrying · ${snap ? 'last known · ' : ''}` : ''
+  // Dispatcher charges include dependency/schedule waits, not just totals.held's lane-gated cards.
   const totalsText = `${summaryValue(status.run)} running · ${gov?.idle_total ?? '—'} governor-held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
   const governorsText = !snap ? 'Loading governors…' : !gov ? 'Governor state unknown' :
     `${summaryValue(gov.counts?.on)} on · ${summaryValue(gov.counts?.off)} off · ${summaryValue(gov.counts?.at_cap)} at cap · ${summaryValue(gov.counts?.unknown)} unknown`
