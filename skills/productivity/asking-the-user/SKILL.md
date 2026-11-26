@@ -147,18 +147,16 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
 - `run_in_user_terminal` returning `ok:false` with "`<device>` claimed the request but sent no answer in time" is still
   pending, not failed: call it again with only the `job_id` it returned (the request id) and a wait; never resend
   the command, which would run it twice.
-- Never resend a relayed command whose outcome you have not read, whatever the reason the result is missing: a
-  tool result replaced by `[interrupted by Hermes update ...: re-run if still needed]`, a `no answer in time`, a
-  `courier: offline` pending, a compaction that dropped the job_id, a `result lost:` reply, or `could not reach the user-terminal plugin on <mac>`
-  (HTTP 500, then `Gateway draining (update_paused)` on a job_id poll) during that Mac's update drain: the window
-  had already run, and a job_id poll after the drain returned `ran`. The window on the
-  Mac keeps running through Desktop restarts and courier reconnects. Recover in this order: call again with the
-  job_id (a courier request id from `session_mentions/claimed/` works too); calling again with the identical
-  command from the same session is safe, because the gateway polls the earlier start (`not_resent: true`)
-  instead of sending it; on `result lost:` verify by the command's side effect (the Terraform state, the merged
-  PR, the file) and report that. Only after verifying it did not run, send it again. Why: an update pause can
-  stamp over the real result, and a poll by request id then reads "unknown job_id", which looks like "never ran"
-  while the command is still finishing.
+- Recover an owner-terminal job before resending: poll its `job_id` (a courier id from
+  `session_mentions/claimed/` also works). Missing output, update drains and unknown ids do not prove nonexecution;
+  the Mac window can survive reconnects. An identical command from the same session can recover the existing
+  start (`not_resent: true`). If its result is lost, inspect actual side effects before retrying.
+  When David cannot see the terminal, focus the exact job rather than repeat the ask. If focus reports an
+  ended/withdrawn job, read its final output: expiry at a pre-write approval prompt is different from partial
+  execution. If the step remains needed and nonexecution is confirmed, reopen the guarded recipe, focus the new
+  window, and record the replacement job id on the SAME owning card. When only recovering an expired window for
+  an unchanged ask, reuse its approval card; a request to show the window grants no execution consent. This
+  prevents a persistent blocked card from pointing to an expired terminal that no longer exists.
 - `run_in_user_terminal` refusing with "`<mac>` has no Hermes Desktop connected to this gateway right now (live
   Desktops: ...)" means that Mac is asleep or offline (confirm: `tailnet_exec` to it times out). Don't re-call it
   each turn: file one blocked `physical` card ("wake the Mac with Hermes Desktop running") whose `resolved_check`
