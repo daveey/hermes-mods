@@ -220,6 +220,20 @@ def test_core_deliberate_holds_are_not_findings(env, monkeypatch):
     none(env, 'BS-parent-done', tid)
 
 
+@pytest.mark.parametrize('status', ['done', 'archived'])
+@pytest.mark.parametrize('cause', ['scope_stopped', 'safety_refusal'])
+def test_terminal_but_restricted_parent_does_not_authorize_promotion(env, status, cause):
+    from hermes_cli import kanban_db
+    tid = F.todo_parents_done(env.conn, env.now)
+    pid = kanban_db.parent_states(env.conn, tid)[0][0]
+    env.conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, pid))
+    F.event(env.conn, pid, 'spend_budget_triaged', {'cause': cause}, at=env.now - 1800)
+    assert kanban_db.unsatisfied_parents(env.conn, tid)  # real core, not a mocked status
+    before = env.conn.total_changes
+    none(env, 'BS-parent-done', tid)
+    assert env.conn.total_changes == before
+
+
 def test_worker_copies_are_skipped_by_every_rule(env, monkeypatch):
     tids = [F.todo_parents_done(env.conn, env.now), F.overdue_clock(env.conn, env.now),
             F.blocked_no_reason(env.conn, env.now), F.running_quiet(env.conn, env.now)]
