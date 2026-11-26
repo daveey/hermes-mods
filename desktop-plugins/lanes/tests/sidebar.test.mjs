@@ -137,7 +137,7 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
   await P.sourceFor(t.ctx).read(6, '6h', true)
   const pane = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
   try {
-    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
+    assert.match(pane.container.textContent, /7 running · 31 governor-held · 3 you · 41 waiting/)
     assert.doesNotMatch(pane.container.textContent, /\$12.34 today/)
     assert.ok(pane.container.querySelector('.lanes-share-bar') === null)
     assert.ok(pane.container.querySelector('[data-governor]') === null)
@@ -166,7 +166,7 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
       body: { share: 30, max_workers: null, cards_per_day: 24, usd_per_day: 80.25, paused: true } }])
     await React.act(async () => t.push(undefined, Error('unreachable')))
     assert.match(pane.container.textContent, /Lanes offline - retrying/)
-    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
+    assert.match(pane.container.textContent, /7 running · 31 governor-held · 3 you · 41 waiting/)
     assert.ok(pane.container.querySelector('.lanes-last-known'))
     assert.ok(pane.container.querySelector('button[type=submit]').disabled)
   } finally { await pane.close() }

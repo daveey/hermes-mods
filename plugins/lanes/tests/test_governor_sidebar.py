@@ -108,7 +108,11 @@ def test_lane_gate_real_counts(board, api, monkeypatch, tmp_path):
                               creator_task_id=parent, created_by='default')
         core_fixtures._tick(conn)
         assert gov.snapshot(conn)['cards'][held]['governor'] == 'lane_gate'
-        render(tmp_path, view(api), 'gate')
+        body = view(api)
+        assert body['totals']['held'] == 1
+        assert body['governors']['idle_total'] == 2
+        assert {card['id'] for card in body['lanes']['babybear']['held_cards']} == {parent, held}
+        render(tmp_path, body, 'gate')
 
 
 def test_cross_board_host_slots_and_release(board, api, monkeypatch, tmp_path):
