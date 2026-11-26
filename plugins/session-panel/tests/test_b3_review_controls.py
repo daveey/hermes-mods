@@ -105,9 +105,35 @@ def test_superseded_emit_after_http_delivery_has_no_prior(observed, monkeypatch,
     assert result['no_change_evidence']['invalid'] > 0
 
 
-def test_real_reducer_offlist_blocker_defeats_absence(graph, board, monkeypatch, tmp_path):
+@pytest.mark.parametrize('cold_before_acquisition', [False, True])
+def test_real_reducer_offlist_blocker_defeats_absence(graph, board, monkeypatch, tmp_path, cold_before_acquisition):
     from hermes_cli import kanban_db
     from test_feed import feedmod
+    if cold_before_acquisition:
+        import threading
+        coordinator = feedmod.Feed._source_module().SourceCoordinator
+        projected = threading.Event()
+        register, capture, project = coordinator._register, coordinator._capture_one, coordinator._project
+
+        def register_first(self, *args, **kwargs):
+            result = register(self, *args, **kwargs)
+            self.service()
+            assert projected.wait(5), 'cold projection never ran after registration'
+            return result
+
+        def capture_after_projection(self, *args, **kwargs):
+            assert projected.wait(10), 'cold projection never ran'
+            return capture(self, *args, **kwargs)
+
+        def project_first(self, session):
+            try:
+                return project(self, session)
+            finally:
+                projected.set()
+
+        monkeypatch.setattr(coordinator, '_register', register_first)
+        monkeypatch.setattr(coordinator, '_capture_one', capture_after_projection)
+        monkeypatch.setattr(coordinator, '_project', project_first)
     r, _, _, _ = graph
     _, conn = board
     oracle_module = A.load_sibling('source_oracle.py')
@@ -144,4 +170,18 @@ def test_real_reducer_offlist_blocker_defeats_absence(graph, board, monkeypatch,
     assert oracle.report()['verdict'] == 'FAIL'
     audit = se.audit(rows)
     assert audit['valid'], audit
+    if cold_before_acquisition:
+        cold = [row for row in rows if row['event'] == 'model_stored'
+                and row['publication']['source_vector'] == {}]
+        assert cold and all(row['publication']['missing_scopes'] for row in cold)
+        assert any(row['event'] == 'projection_start' and row['pinned_versions'] == {} for row in rows)
+        # Empty pins are valid unknown coverage, never fabricated absence.
+        bad = copy.deepcopy(rows)
+        next(row for row in bad if row['event'] == 'model_stored'
+             and row['publication']['source_vector'] == {})['publication']['missing_scopes'] = {}
+        assert not se.audit(bad)['valid']
+        bad = copy.deepcopy(rows)
+        next(row for row in bad if row['event'] == 'projection_start'
+             and row['pinned_versions'] == {})['pinned_versions'] = None
+        assert not se.audit(bad)['valid']
 
