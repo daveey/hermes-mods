@@ -32,6 +32,7 @@ const UP = 'up'
 const RESTARTING = 'restarting'
 const DOWN = 'down'
 const NONE = 'none'
+const FUTURE = 'future'
 const RANK = { [NONE]: 0, [UP]: 1, [RESTARTING]: 2, [DOWN]: 3 }
 const COLOR = { [UP]: 'var(--hs-g)', [RESTARTING]: 'var(--hs-y)', [DOWN]: 'var(--hs-r)', [NONE]: 'var(--hs-n)' }
 const WORD = { [UP]: 'up', [RESTARTING]: 'restarting', [DOWN]: 'unreachable' }
@@ -104,7 +105,8 @@ export const chipCounter = (state, ms) => (state === RESTARTING ? fmtClock(ms) :
 
 /** What the chip shows: the hub's own answer, or "unreachable" after FAILS_FOR_UNREACHABLE misses. */
 export function deriveState({ status, fails, lastOkAt, firstFailAt }, now) {
-  if (fails >= FAILS_FOR_UNREACHABLE || (!status && fails > 0)) {
+  // Two misses in a row, also on a cold start: one dropped poll is not an outage.
+  if (fails >= FAILS_FOR_UNREACHABLE) {
     return { state: DOWN, since: lastOkAt || firstFailAt || now, reason: 'no reply from the hub', unreachable: true }
   }
   if (!status) return null
@@ -208,6 +210,8 @@ const isHidden = () => typeof document !== 'undefined' && !!document.hidden
 export function createStore(ctx) {
   const $poll = atom({ status: null, fails: 0, lastOkAt: 0, firstFailAt: 0 })
   const $events = atom({ range: '24h', data: null, error: null })
+  // The chip's strip always reads the last 24 h, whatever range the popover shows.
+  const $day = atom(null)
   const $now = atom(Date.now())
   let spans = (() => { try { return ctx.storage?.get?.('spans', []) || [] } catch { return [] } })()
   const $spans = atom(spans)
@@ -251,11 +255,23 @@ export function createStore(ctx) {
     $events.set({ ...$events.get(), range })
     return Promise.resolve()
       .then(() => ctx.rest(`/events?range=${encodeURIComponent(range)}`, { connectionId, passive: true }))
-      .then(d => { if ($events.get().range === range) $events.set({ range, data: d, error: null }) })
+      .then(d => {
+        if (range === '24h') $day.set(d)
+        if ($events.get().range === range) $events.set({ range, data: d, error: null })
+      })
       .catch(e => { if ($events.get().range === range) $events.set({ range, data: $events.get().data, error: String(e?.message || e) }) })
   }
 
-  return { $poll, $events, $now, $spans, refresh, loadEvents, conn }
+  const loadDay = () => {
+    const connectionId = conn()
+    if (!connectionId) return Promise.resolve()
+    return Promise.resolve()
+      .then(() => ctx.rest('/events?range=24h', { connectionId, passive: true }))
+      .then(d => $day.set(d))
+      .catch(() => {})
+  }
+
+  return { $poll, $events, $day, $now, $spans, refresh, loadEvents, loadDay, conn }
 }
 
 // ── view ──────────────────────────────────────────────────────────────────
@@ -268,8 +284,8 @@ function Strip({ slots }) {
   })
 }
 
-function Band({ segments, start, end, now }) {
-  const total = end - start
+/** Band pieces over [start, end]: gaps are 'none', time after `now` is 'future' (keeps its width). */
+export function bandParts(segments, start, end, now) {
   const parts = []
   let cursor = start
   for (const s of segments) {
@@ -281,11 +297,20 @@ function Band({ segments, start, end, now }) {
     cursor = b
   }
   if (cursor < Math.min(end, now)) parts.push({ start: cursor, end: Math.min(end, now), state: NONE })
+  // Today's row: the rest of the day hasn't happened yet; keep its width so elapsed time isn't stretched.
+  const later = Math.max(cursor, Math.min(end, now))
+  if (end > later) parts.push({ start: later, end, state: FUTURE })
+  return parts
+}
+
+function Band({ segments, start, end, now }) {
+  const total = end - start
+  const parts = bandParts(segments, start, end, now)
   return jsx('div', {
     className: 'hs-band',
     children: parts.map((p, i) => jsx('span', {
-      style: { flex: (p.end - p.start) / total, background: p.state === NONE ? 'transparent' : COLOR[p.state] },
-      title: p.state === NONE
+      style: { flex: (p.end - p.start) / total, background: p.state === NONE || p.state === FUTURE ? 'transparent' : COLOR[p.state] },
+      title: p.state === FUTURE ? 'later today' : p.state === NONE
         ? `no data · ${fmtTime(p.start, now)} → ${fmtTime(p.end, now)}`
         : `${WORD[p.state]} · ${fmtTime(p.start, now)} → ${p.end >= now - 1000 ? 'now' : fmtTime(p.end, now)} · ${fmtSpan(p.end - p.start)}${p.reason ? ` · ${p.reason}` : ''}`
     }, i))
@@ -385,17 +410,17 @@ function Popup({ store, cur, now }) {
   })
 }
 
-export function chipModel(poll, events, spans, now) {
+export function chipModel(poll, day, spans, now) {
   const cur = deriveState(poll, now)
   if (!cur) return null
   const start = now - DAY_MS
-  const segs = buildSegments(events?.range === '24h' ? events?.data?.events : null, spans, start, now)
+  const segs = buildSegments(day?.events, spans, start, now)
   // the current state always paints the newest slot, even before history loads
   segs.push({ start: Math.max(cur.since, start), end: now, state: cur.state, reason: cur.reason })
   const slots = stripSlots(segs, start, now)
   const counter = chipCounter(cur.state, now - cur.since)
   const label = `Hub ${WORD[cur.state]} ${counter}`
-  const sum = summarize(buildSegments(events?.data?.events, spans, start, now), start, now)
+  const sum = summarize(buildSegments(day?.events, spans, start, now), start, now)
   const sub = cur.state === UP
     ? `${sum.restarts} restart${sum.restarts === 1 ? '' : 's'}, ${sum.outages} outage${sum.outages === 1 ? '' : 's'} in 24 h`
     : `${cur.reason || ''}${cur.reason ? ' · ' : ''}since ${fmtTime(cur.since, now)}`
@@ -404,12 +429,12 @@ export function chipModel(poll, events, spans, now) {
 
 function Chip({ store }) {
   const poll = useValue(store.$poll)
-  const events = useValue(store.$events)
+  const day = useValue(store.$day)
   const spans = useValue(store.$spans)
   const now = useValue(store.$now)
   const [open, setOpen] = useOpen()
   if (!store.conn()) return null
-  const m = chipModel(poll, events, spans, now)
+  const m = chipModel(poll, day, spans, now)
   if (!m) return null
   const durColor = m.cur.state === UP ? undefined : COLOR[m.cur.state]
   return jsxs(Popover, {
@@ -463,9 +488,9 @@ export default {
     }
     const store = createStore(ctx)
     store.refresh()
-    store.loadEvents('24h')
+    store.loadDay()
     ctx.setInterval(() => { if (!isHidden() || store.$poll.get().fails > 0) store.refresh() }, POLL_MS)
-    ctx.setInterval(() => { if (!isHidden()) store.loadEvents() }, EVENTS_POLL_MS)
+    ctx.setInterval(() => { if (!isHidden()) store.loadDay() }, EVENTS_POLL_MS)
     ctx.setInterval(() => { if (!isHidden()) store.$now.set(Date.now()) }, 1000)
     if (typeof document !== 'undefined' && document.addEventListener) {
       const onVis = () => { if (!isHidden()) { store.$now.set(Date.now()); store.refresh() } }

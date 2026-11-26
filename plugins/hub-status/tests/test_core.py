@@ -101,6 +101,22 @@ def test_log_escalates_stuck_restart(tmp_path):
     assert [(e["state"], e["ts"]) for e in log.read()] == [(RESTARTING, 100), (DOWN, 410)]
 
 
+def test_new_restart_after_a_failure_gets_a_fresh_grace(tmp_path):
+    log = core.EventLog(tmp_path)
+    core.observe(log, 100, RESTARTING, "draining", 7, None)
+    core.observe(log, 410, RESTARTING, "draining", 7, None)  # stuck -> down
+    core.observe(log, 500, DOWN, "startup_failed", None, None)  # a real failure replaces the stuck latch
+    added = core.observe(log, 600, RESTARTING, "starting", None, None)  # operator restarts it
+    assert [(e["state"], e["ts"]) for e in added] == [(RESTARTING, 600)]
+    # the down spell is still timed from its start, across both logged reasons
+    home = tmp_path / "home"
+    (home / "hub-status").mkdir(parents=True)
+    for e in log.read()[:3]:
+        core.EventLog(home / "hub-status").append(e)
+    s = core.status(home, now=550, unit_fn=lambda: None)
+    assert (s["state"], s["since"]) == (DOWN, 410)
+
+
 def test_trim_keeps_thirty_days_and_lead_state(tmp_path):
     log = core.EventLog(tmp_path)
     now = 100 * 86400
