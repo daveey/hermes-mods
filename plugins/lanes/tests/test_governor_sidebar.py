@@ -357,7 +357,11 @@ def test_partial_flow_status_is_unknown_not_zero(board, api, monkeypatch, tmp_pa
 
 @pytest.mark.parametrize('failed_board', ['default', 'beta'])
 def test_slow_board_does_not_expire_healthy_sibling(board, api, monkeypatch, tmp_path, failed_board):
-    import threading
+    from types import SimpleNamespace
+    # Advance only the board reader's clock: no wall-time sleep or global time patch.
+    merge = api._sibling('board_merge')
+    clock = [0.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
     config(board)
     core_fixtures._usage(monkeypatch, [10])
     kb.create_board('beta')
@@ -369,7 +373,7 @@ def test_slow_board_does_not_expire_healthy_sibling(board, api, monkeypatch, tmp
         original = api.flow_core()[1].snapshot
         def slow(conn, *args, **kwargs):
             if gov._board(conn) == failed_board:
-                threading.Event().wait(2.2)
+                clock[0] += 3600  # Well beyond any board budget, without sleeping.
                 # Exercise SQLite's real expired progress handler, not a synthetic exception.
                 conn.execute('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n').fetchone()
             return original(conn, *args, **kwargs)
