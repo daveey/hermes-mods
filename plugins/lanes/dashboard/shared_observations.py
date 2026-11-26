@@ -103,7 +103,7 @@ class SharedObservations:
                         or not (row[1] or row[2])):
                     raise ValueError('Invalid PR observation row')
             return entries
-        except (ValueError, RecursionError):
+        except (ValueError, RecursionError, OverflowError):
             # A safe but malformed cache is replaceable, not a permanent outage.
             # The fill lock ensures only one process performs the repair/read.
             logging.getLogger(__name__).warning('Replacing malformed PR observation cache')
