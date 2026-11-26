@@ -81,6 +81,10 @@ For a gateway restart use
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
 its fail-open discovery and lexical limits are not permission to bypass it.
 
+## Cache-retention native verification
+
+Exercise the production holder-census implementation in a disposable native build/delete/rebuild fixture, not only an injected empty holder set. A collector's own open directory fd can otherwise make every candidate look busy. If closing that fd for the census, reopen with no-follow and verify the original directory identity before fd-relative deletion. Keep native regeneration proof, live dry-run eligibility and actual production reclamation as distinct evidence.
+
 ## Historical Linux OOM attribution
 
 Separate every incident carried on an OOM card: one open watcher card can accumulate deliberate private-cgroup tests and unrelated global kills. Read both `oom_memcg` and `task_memcg`; a disappeared transient unit's `MemoryMax=infinity` is not its historical budget. Recover rotated journal evidence from retained `/var/log/kern.log` and `/var/log/syslog`, including the kernel's usage/limit lines and systemd's launched command. Attribute SSH-session victims through session start time, sshd source address and the source host's agent transcript; the hub's own transcript database cannot explain work launched remotely.
