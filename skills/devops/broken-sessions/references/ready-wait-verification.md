@@ -1,7 +1,9 @@
 # Is a "ready, no worker" card really unclaimed?
 
 Start with `hermes kanban governors` (hub, a few seconds). It lists every hold with its card count and ids: lane
-gate, labels/pickup, Board lease, open parents, scheduled. A gated lane's held cards count as "waiting for a worker"
+gate, labels/pickup, Board lease, open parents, scheduled. Then compare ready `pool:worker` cards on the hub with
+running runs: dozens ready while the fitting workers sit at 0 active runs is a fleet pickup stall, not this card's
+problem. Find its open fix card (titles with "pickup") and comment there; don't bump this card's priority again. A gated lane's held cards count as "waiting for a worker"
 (green) on the Desktop strip, so a big green number is usually lane-gate holds (`hermes kanban lanes show` /
 `lanes held`), not stuck ready cards. Read it before digging through the Desktop source or the per-card `why`.
 

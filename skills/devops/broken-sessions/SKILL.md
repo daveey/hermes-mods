@@ -119,8 +119,8 @@ unless it is a timed hold whose `until` has passed. Otherwise, by core's queue v
 skips via `kanban_show` on that worker, skill hermes-workers). **Done when:** the card is claimed, or its queue
 note names a real reason (pacing, quota, placement).
 
-**Hand fix for a long ready wait:** `references/ready-wait-verification.md` (stale hub view first, then why
-nothing claims it, whether it is still wanted, re-placement, foreign cards).
+**Hand fix for a long ready wait:** `references/ready-wait-verification.md` (read it before bumping priority: a
+priority bump rarely moves a card into the pickup window; stale hub view, re-placement, foreign cards).
 
 ## BS-overdue-wake: a park whose wake never fired
 
