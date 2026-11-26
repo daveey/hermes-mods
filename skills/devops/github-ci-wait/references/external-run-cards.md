@@ -51,6 +51,10 @@ and do not hide it behind a filter pipeline. `wait_for_ci.py` itself does not pa
 retains its existing CLI exit contract; the wake-check wrapper owns translation and structured
 output.
 
+## Whole-commit wait measurement
+
+Audit widened waits per parking episode, ending at its first condition/clock wake or other wait-ending event; do not attribute a later park's result to the old widening. Split shell-probe wakes from native commit results, and distinguish explicit 60-minute `external_result.outcome=pending` caps from shorter `wake_at` clock backstops. Deduplicate dispatcher comments by next run before counting no-op reparks. Separate same-SHA workflow waits from PR-head-to-merge-group checks and train submission/landing progress. Report positive `wake_event.created_at - wake_at` latency explicitly: polling explains it but cannot satisfy literal zero-lateness acceptance. No failure observed during active widened episodes means that failure path was not exercised, not independently proven timely.
+
 ## Auditing which cards wait on CI
 
 There is no CLI filter for this; read the live board read-only via
