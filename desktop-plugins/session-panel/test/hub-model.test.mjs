@@ -38,16 +38,31 @@ const root = createRoot(document.getElementById('root'))
 const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
-for (const [name, lead] of [['clock_reason', /waiting on Event watch on hub-hosted/], ['clock_unreasoned', /reason unavailable/]]) {
+for (const [name, lead] of [['clock_reason', /waiting on Event watch on service owners/], ['clock_unreasoned', /reason unavailable/]]) {
   test(`clock wait ${name} paints the prerequisite before the timer`, async () => {
     const { model, now } = publicCases[name]
     await paint(m.renderModel(model, { now }))
     const detail = document.querySelector('[data-row-detail]').textContent
     assert.match(detail, lead)
-    assert.match(detail, /left \(until/)
+    assert.match(detail, /left \(until 2027-01-15 00:01 PST\)/)
+    assert.match(document.querySelector('[data-ask-title]').title, /Next actor: the clock \(timed check\)/)
+    assert.match(document.querySelector('[data-ask-title]').title, /Next check: the clock at 2027-01-15 00:01 PST/)
     assert.ok(detail.search(lead) < detail.search(/left \(until/), 'prerequisite precedes the next-check time')
   })
 }
+test('probe watch renders named actors and a complete separate backstop', async () => {
+  const { model, now } = publicCases.clock_probe
+  await paint(m.renderModel(model, { now }))
+  const detail = document.querySelector('[data-row-detail]').textContent
+  assert.match(detail, /waiting on Service rollout/)
+  assert.match(detail, /watching 2 cards/)
+  assert.match(detail, /left \(backstop 2027-01-15 00:01 PST\)/)
+  assert.match(detail, /long-worker.example.com/)
+  const hover = document.querySelector('[data-ask-title]').title
+  assert.match(hover, /Next actor: cards t_0000000000000001, t_0000000000000002 \(event watch\)/)
+  assert.match(hover, /Next check: clock backstop at 2027-01-15 00:01 PST/)
+  assert.doesNotMatch(hover, /Next actor: the clock/)
+})
 test('aged parked board data keeps its status and age in the panel and task chip', async () => {
   const { model, now } = publicCases.aged_parked
   const row = model.sections.waiting[0]

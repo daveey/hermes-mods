@@ -305,6 +305,31 @@ def observation(row, now, kind, projector=None):
 _URL = re.compile(r'https?://[^\s)\]]+')
 _HASHY = re.compile(r'\b(?:core|mods)?(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b(?:…|\.\.\.)?')
 WAIT_MAX = 100  # one short phrase; the full text is a Details line
+REASON_MIN = 32  # a clock row shows at least this much of its prerequisite, whatever the timer and location take
+REASON_FULL = 500
+
+
+def _recorded(wait):
+    """The park's own structured facts (core `kanban_wait_info.park_semantics`), type-checked; absent on older cores."""
+    def words(key):
+        return flat(wait.get(key))[:REASON_FULL] if isinstance(wait.get(key), str) else ''
+    watching = wait.get('watching')
+    backstop = wait.get('backstop_at')
+    return {'reason': words('prerequisite'), 'actor': words('next_actor'),
+            'watching': [w for w in watching if isinstance(w, str)] if isinstance(watching, list) else [],
+            'backstop': backstop if isinstance(backstop, (int, float)) and not isinstance(backstop, bool) and backstop > 0 else None}
+
+
+def clock_line(clock, location=''):
+    """`waiting on <reason> · <timer>`: the reason takes what the timer and location leave of WAIT_MAX (never
+    under REASON_MIN); the timer and location are never clipped. No reason says so instead of naming a cause."""
+    reason, tail = flat(_HASHY.sub('', _URL.sub('', clock['reason']))), clock['tail']
+    if not reason:
+        return f'waiting · reason unavailable · {tail}{location}'
+    room = max(REASON_MIN, WAIT_MAX - len('waiting on  · ') - len(_relative._TOKEN.sub('00h 00m', tail)) - len(location))
+    if len(reason) > room:
+        reason = reason[:room - 1].rstrip() + '…'
+    return f'waiting on {reason} · {tail}{location}'
 
 
 def _pr_number(row, urls, on):
@@ -329,22 +354,29 @@ def wait_info(row, now, *, wire=False):
     since = number(wait.get('waiting_since'))
     if not on:
         return {'text': '', 'raw': '', 'urls': []}
-    match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b(?:\s*\((.*)\)\s*$)?', on, re.S)
+    match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b', on)
+    recorded = _recorded(wait)
     if match:
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
         # The prerequisite is the producer's own `awaiting.why`; the clock is only when it is next checked.
-        why = flat(match[3] or '')
-        full = why
-        if len(why) > 40:  # the full wording stays in Details
-            why = why[:39].rstrip() + '…'
-        lead = f'waiting on {why}' if why else 'reason unavailable'
-        age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
+        # Cores before `park_semantics` carry it only inside the label, after the time (cut at 80 characters).
+        rest = on[match.end():].strip()
+        legacy = flat(rest[1:-1] if rest.startswith('(') and rest.endswith(')') else rest)
+        reason = recorded['reason'] or legacy
+        actor = recorded['actor'] or 'the clock (timed check)'
+        backstop = bool(recorded['backstop'])
+        watched = recorded['watching']
+        watch = (f'watching {len(watched)} card{"" if len(watched) == 1 else "s"}' if watched else
+                 'watching ' + actor.split(' (')[0] if backstop else '')
+        age = f'{relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
         if due >= now:
-            timer = f'{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})'
+            timer = f'{relative(due, "remaining") if wire else short_dur(due - now)} left ({"backstop" if backstop else "until"} {pacific(due)})'
         else:
-            timer = f'{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})'
-        return {'text': f'{lead}{age} · {timer}', 'raw': on if on != match[0] else '', 'urls': [], 'kind': 'clock', 'eta': eta,
-                'prerequisite': full or None, 'next_actor': 'the clock (timed check)'}
+            timer = f'{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} ({"backstop " if backstop else ""}was due {pacific(due)})'
+        clock = {'reason': reason, 'tail': ' · '.join(p for p in (watch, age, timer) if p)}
+        return {'text': clock_line(clock), 'clock': clock, 'raw': on if on != match[0] and not recorded['reason'] else '',
+                'urls': [], 'kind': 'clock', 'eta': eta, 'prerequisite': reason, 'next_actor': actor,
+                'next_check': f'{"clock backstop" if backstop else "the clock"} at {pacific(due)}'}
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
     age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
@@ -364,7 +396,9 @@ def wait_info(row, now, *, wire=False):
         if len(body) > WAIT_MAX:
             body = body[:WAIT_MAX - 1].rstrip() + '…'
         phrase = f'waiting on {body}' if body else 'waiting'
-    return {'text': phrase + age, 'raw': on, 'urls': urls[:1], **({'kind': kind, 'eta': eta} if kind else {})}
+    return {'text': phrase + age, 'raw': on, 'urls': urls[:1], **({'kind': kind, 'eta': eta} if kind else {}),
+            **({'prerequisite': recorded['reason']} if recorded['reason'] else {}),
+            **({'next_actor': recorded['actor']} if recorded['actor'] else {})}
 
 
 def wait_target(row, bundle, detail):
@@ -907,7 +941,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             canonical = re.match(r'(?:the clock until|ci\b|deploy\b)', text(obj(row.get('wait')).get('waiting_on')), re.I)
             base = wi['text'] if canonical else why or wi['text']
             cap = max(24, WAIT_MAX - len(location))
-            wi['text'] = (_relative.clip(base, cap) if wire else (base if len(base) <= cap else base[:cap - 1].rstrip() + '…')) + location
+            if canonical and wi.get('clock'):
+                # A clock row budgets its reason, never its timer: the next-check time stays whole beside the location.
+                wi['text'] = clock_line(wi['clock'], location)
+            else:
+                wi['text'] = (_relative.clip(base, cap) if wire else (base if len(base) <= cap else base[:cap - 1].rstrip() + '…')) + location
         if dependency:
             title = clean(dependency['title'])
             title = title if len(title) <= WAIT_MAX else title[:WAIT_MAX - 1].rstrip() + '…'
@@ -932,9 +970,17 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['wait_eta'] = wi['eta']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
-        if wi.get('next_actor') and wi['text'] == on:
-            v['details'].append(f'Waiting reason: {wi["prerequisite"] or "unavailable (the park recorded none)"}')
-            v['details'].append(f'Next actor: {wi["next_actor"]}; the time shown is the next check, not the prerequisite')
+        # The park's own recorded prerequisite and next actor, apart from the time it is next checked. A line a
+        # dependency replaced still keeps them here: they describe this card's park, not the card it waits on.
+        if state in ('scheduled', 'blocked') and (wi.get('prerequisite') or wi.get('kind') == 'clock'):
+            v['details'].append(f'Waiting reason: {wi.get("prerequisite") or "unavailable (the park recorded none)"}')
+            if wi.get('prerequisite'):
+                v['wait_reason'] = wi['prerequisite']
+        if state in ('scheduled', 'blocked') and wi.get('next_actor'):
+            v['wait_next_actor'] = wi['next_actor']
+            v['details'].append(f'Next actor: {wi["next_actor"]}')
+            if wi.get('next_check'):
+                v['details'].append(f'Next check: {wi["next_check"]} (when it is looked at again, not what it waits for)')
         # A CI wait links its first run from the word "CI" in the detail line (`inline`), not a separate button.
         ci = wi['text'].startswith('waiting on CI')
         v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if ci else 'Open link', 'url': u,
@@ -969,6 +1015,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         if row.get('stale') or row.get('partial_source_unknown'):
             v.pop('wait_kind', None)
+            v.pop('wait_reason', None)  # a card that could not be re-read vouches for no current reason or actor
+            v.pop('wait_next_actor', None)
+            v['details'] = [d for d in v['details'] if not d.startswith(('Waiting reason:', 'Next actor:', 'Next check:'))]
             v['evidence_state'] = 'unknown'
             v['detail'] = f'status unknown · last known: {state or "unknown"}; waiting for status from {row.get("gateway") or "the card’s owner"}'
             v['details'].append('The card could not be re-read. Its owner’s agent acts next; unavailable status is not a request for you.')
@@ -1058,6 +1107,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
         if unknown:
             v.pop('wait_kind', None)
+            v.pop('wait_reason', None)
+            v.pop('wait_next_actor', None)
+            v['details'] = [d for d in v['details'] if not d.startswith(('Waiting reason:', 'Next actor:', 'Next check:'))]
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
         if state == 'running' and progress and now - progress >= STUCK_S:

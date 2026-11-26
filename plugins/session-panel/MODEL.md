@@ -17,6 +17,25 @@ the readout without network reads or model revisions. Missing estimates show
 producer's estimate source. Older payloads lacking a park timestamp retain pips.
 Double-clicking the readout retains the owner-qualified Open card action.
 
+## Recorded waiting prerequisite
+
+Scheduled/blocked rows may expose `wait_reason` and `wait_next_actor` strings.
+They project the owner's canonical wait annotation (`prerequisite`, `next_actor`),
+not an execution permission or a second persisted reason store. Core derives the
+annotation from existing `awaiting` and wake-check evidence. A probe watch's
+`watching` list names recorded card IDs; it does not invent titles, owner coordinates,
+or navigation actions for those IDs. The existing hierarchy/actions remain authoritative.
+
+Clock detail lines put a concise prerequisite before the elapsed/countdown text.
+`backstop_at` distinguishes a timed fallback from the actual watched producer.
+Reason clipping never clips the timer or owner location; the row may exceed the
+ordinary phrase budget to retain them. Details retain the bounded full reason,
+next actor, and separately labelled next check. Older cores retain a label-only
+compatibility path; absent reasons explicitly say `reason unavailable`.
+Unknown/stale evidence does not attest a current reason or next actor. Recovery
+out of the park clears these fields. Relative ticks still use wire templates,
+not semantic revisions or network reads.
+
 ## Relative display text
 
 The feed calls `reduce_panel(..., wire=True)`. A row (or its `decision`)
