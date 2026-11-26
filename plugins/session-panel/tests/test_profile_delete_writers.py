@@ -98,6 +98,9 @@ def test_running_producer_and_quarantine_poll_preserve_deleted_home(tmp_path, mo
     monkeypatch.setattr(api, 'SNAPSHOT_EVERY_S', 0)
     monkeypatch.setattr(api, '_event_driven', lambda f: True)
     monkeypatch.setattr(api, '_settle', lambda f, last: None)
+    # Holding an admitted pass across deletion is synchronization, not producer
+    # work. Do not turn scheduler delay into unrelated duty-rest deferrals/saves.
+    monkeypatch.setattr(api, 'DUTY_REST_RATIO', 0)
     writes, passes, permits, errors = (queue.Queue() for _ in range(4))
     released, adapter_closed = threading.Event(), threading.Event()
     f = _feed()
@@ -135,7 +138,10 @@ def test_running_producer_and_quarantine_poll_preserve_deleted_home(tmp_path, mo
 
     def quarantine_poller():
         while not poll_stop.is_set():
-            command = poll_commands.get(timeout=10)
+            try:
+                command = poll_commands.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if command == 'stop':
                 return
             try:
