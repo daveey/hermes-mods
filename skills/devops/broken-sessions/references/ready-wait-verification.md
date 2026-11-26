@@ -19,6 +19,9 @@ stays silent here because a recorded skip explains the wait. First check that ea
 fix/decision card whose target is already `done` is moot, so comment and archive it. File the lease refusal on a
 dispatcher card for the rest.
 
+The hub's `why`/`kanban_show` often says only `labels_mismatch`, which is normal for the hub and is not the real refusal. Get each worker's own verdict in one call: `~/.hermes/bin/hub-worker-exec all -- 'sudo -iu ubuntu bash -lc "timeout 40 hermes kanban why <id> | sed -n 1,4p"'`. The line `stopped by Board lease … origin=local, reason=<x>` names the refusal. Moving the card to `pool:worker` does not fix a refusal that every worker gives.
+- `reason=usage_accounting_pending`: earlier runs have no final usage receipt. Typical causes are a core-update reclaim that SIGKILLed a worker, or a run that ended rate_limited, continued or blocked. List them on the hub with `kanban_usage_accounting.pending(conn, <id>)`, opening `~/.hermes/kanban.db` read-only (`file:…?mode=ro`, `uri=True`). This is a money path. There is no operator settle command: never reset history or renew spend to get around it. Find the open accounting-repair card (search titles for "usage accounting") and add the run ids there in one comment. Then add one comment to the stuck card that names the repair card, so its owner stops re-placing it.
+
 `Held cards: <id>=decision_pending` in those worker logs means an open spend-stop episode still holds the card in the
 workers' view, while the hub list shows `ready` and `hermes kanban why` says `triage: nothing holds it`. The hub's
 `kanban_show` queue note (labels_mismatch, "do not re-place") hides this, so grep the worker logs first. If the stop
