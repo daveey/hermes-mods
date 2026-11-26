@@ -1,3 +1,5 @@
 # Waiting-row legibility
 
 Keep actor, cause and triage age readable together. An ellipsized detail capped to a percentage can hide a trailing elapsed suffix even when DOM text is correct. Exercise actual Chromium text bounds at 1100/700/420px with long nested-row copy. Let detail wrap below the compact title rather than adding a second parser or clock. Verify the numeric age in native pixels after deployment.
+
+Apply the same geometry check to running metadata: `flex:none` plus `white-space:nowrap` can push the elapsed suffix beyond the panel's clipping ancestor without losing any DOM text. Exercise the real reducer's wire templates through the actual renderer, including long machine/model names, snapshot replacement, remount and local ticks. Keep CI/deploy/timer normal, overdue and missing-estimate controls beside the elapsed regression; a formatter pass is not visibility proof. `desktop-plugins/session-panel/timing.browser.test.mjs` supplies the owned Chromium loop, while the mounted `test/hub-model.test.mjs` guards timing persistence and wrapping in the public Desktop workflow.
