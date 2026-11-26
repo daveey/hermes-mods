@@ -95,7 +95,7 @@ When the panel disagrees with the board ("nothing running", missing dependency, 
 
 ## Pitfalls and verification
 
-- Panel gone entirely (only the bare user-steps "For you" queue with Unblock/Archive shows) means the plugin failed to load: grep the Mac's `~/.hermes/logs/desktop.log` for `runtime load failed (session-panel)` first. Desktop's runtime loader accepts only `@hermes/plugin-sdk` and `react*` imports (core `sdkImportMap`), so never split a desktop `plugin.js` into sibling modules: Node tests resolve `./x.js` and stay green while Desktop drops the whole plugin (`test/runtime-imports.test.mjs` guards it).
+- If the panel vanishes, check `desktop.log` for `runtime load failed (session-panel)`. Show an error, never the legacy "For you" fallback; unsupported gateway/profile routes must error rather than retry forever. Desktop accepts only core `sdkImportMap` specifiers, not sibling imports: Node resolves those while Desktop drops the plugin. Keep `test/runtime-imports.test.mjs` aligned with core's lexical scanner, not a line-anchored regex: strings/comments cause false positives while mid-line/dynamic imports escape. Verify parity against actual core and retain a forbidden-import RED control.
 
 Before claiming BoardLane load reduction, read `references/aggregate-board-load.md` (per-session versus global duty; churn-complete thread measurement).
 
