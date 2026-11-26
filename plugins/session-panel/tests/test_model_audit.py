@@ -140,14 +140,21 @@ def test_parked_remote_rows_show_their_true_state_without_a_provenance_tail():
 
 @pytest.mark.parametrize('status', ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'])
 @pytest.mark.parametrize('age', [30, 60, 120])
-def test_parked_board_status_survives_old_bundle_with_explicit_age(status, age):
+@pytest.mark.parametrize('core_present', [False, True], ids=['legacy-no-core', 'core-diagnostic'])
+def test_parked_board_status_survives_old_bundle_with_explicit_age(status, age, core_present, monkeypatch):
+    if core_present:
+        pytest.importorskip('hermes_cli.kanban_nonrunning_reason')
+    else:
+        monkeypatch.setattr(model, 'diagnostic', lambda row, now: None)
     row = task(status=status)
     row['execution_observations'] = [placeholder(row)]
     project = lambda r, **kw: {'state': 'unknown', 'unknown_reason': 'no_run_identity'}
     result = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW, projector=project)
     out = next(r for s in result['sections'].values() for r in s)
-    # Ready has no native parked lifecycle: missing evidence cannot create one.
-    assert bool(out.get('parked')) is (status != 'ready')
+    # The legacy optional-core-absent adapter marks queued ready rows parked;
+    # the diagnostic adapter returns an explicit unknown without that marker.
+    # Neither path may fabricate an execution cause or refresh the panel clock.
+    assert bool(out.get('parked')) is (status != 'ready' or not core_present)
     assert 'status unknown' not in out['detail']
     assert ('panel data' in out['detail']) is (age > 60)
     assert out['evidence_state'] == 'unknown'

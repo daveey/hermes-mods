@@ -1052,8 +1052,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 sections['ready'].append(v)
             # Panel acquisition and dispatcher diagnosis have independent clocks.
             # Even a current diagnosis cannot make an old panel snapshot fresh.
-            if now > read_at + 60:
-                age = relative(read_at, 'elapsed') if wire else short_dur(now - read_at)
+            # Wire freshness is rendered from its source timestamp in the client;
+            # adding text at an age threshold would publish clock-only revisions.
+            if not wire and now > read_at + 60:
+                age = short_dur(now - read_at)
                 v['detail'] += f' · as of {pacific(read_at)} (panel data {age} old)'
                 v['details'].append('Historical board status: the panel data is over 60 seconds old; this does not establish current execution or producer liveness.')
             continue
