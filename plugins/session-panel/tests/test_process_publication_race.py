@@ -4,6 +4,30 @@ import pytest
 from test_process_refresh import setup
 
 
+@pytest.mark.parametrize('has_process_source', [False, True])
+@pytest.mark.parametrize('interactive', [False, True])
+def test_decision_only_noop_preserves_runtime_source_presence(has_process_source, interactive):
+    from test_feed import make
+    f, r, pushed, clock = make()
+    inputs = {'outcome_json': {}, 'requests': []}
+    if has_process_source:
+        inputs['processes'] = []
+    r.panel_inputs = lambda *args: dict(inputs)
+    r.decision_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    f.changes(['S1'])
+    revision, pushes = f.rev, len(pushed)
+    for _ in range(3):
+        if interactive:
+            f.refresh_decision('S1', readers=r)
+        else:
+            assert f.refresh_decisions() == 0
+        held = f.bundles['S1']['bundle']
+        assert ('processes' in held) is has_process_source
+        if has_process_source:
+            assert held['processes'] == []
+        assert (f.rev, len(pushed)) == (revision, pushes)
+
+
 @pytest.mark.parametrize('exiting', [False, True])
 def test_superseded_runtime_capture_retries_birth_and_exit(exiting):
     f, r, clock, calls = setup()

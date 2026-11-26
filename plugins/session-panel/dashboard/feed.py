@@ -1142,10 +1142,11 @@ class Feed:
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
-        if canonical_only and 'processes' not in bundle:
+        if canonical_only and 'processes' not in bundle and 'processes' in prev['bundle']:
             # Decision-only readers have no runtime authority. Carry at commit,
             # not at read start, so they cannot restore a pre-birth/exit snapshot.
-            bundle = {**bundle, 'processes': prev['bundle'].get('processes', [])}
+            # Preserve absence too: no runtime producer is not a known empty read.
+            bundle = {**bundle, 'processes': prev['bundle']['processes']}
         board_refresh = not observation_only and (authoritative or board_current or not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0))
         merged = canonical_only
         if prev and not authoritative:
