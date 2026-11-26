@@ -137,7 +137,9 @@ def test_response_custody_requires_actual_authenticated_write(auth, fail):
     m, log = receipts(), MemoryLog()
     p, bundle = model_record(log)
     body = m.encode({'epoch': 'feed', 'bundles': {'S': bundle}})
-    response = m.completed_response(body, log=log, publications=[p], authenticated=auth, request_id='server-request')
+    completed = []
+    response = m.completed_response(body, log=log, publications=[p], authenticated=auth,
+        request_id='server-request', on_success=completed.append)
     assert len(log.events) == 1, 'construction incorrectly acknowledged a response'
     sent = []
     async def send(message):
@@ -156,9 +158,11 @@ def test_response_custody_requires_actual_authenticated_write(auth, fail):
         assert len(success) == 1
         assert base64.b64decode(success[0]['payload_b64']) == sent[-1]['body'] == body
         assert success[0]['write_completed_ns']
+        assert completed == [success[0]['write_completed_ns']]
         assert m.validate_records(log.events) == {'valid': True, 'errors': [], 'stored': 1, 'fulfilled': 1, 'server_emitted': 0, 'authenticated_catchup': 1, 'unmatched': []}
     else:
         assert not success and log.events[-1]['event'] == 'catchup_error'
+        assert not completed
         assert m.validate_records(log.events)['fulfilled'] == 0
 
 

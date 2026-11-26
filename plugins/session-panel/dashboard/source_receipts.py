@@ -250,7 +250,7 @@ def stored_model(feed, session, held, bundle):
     return StoredModel(encode(publication(feed, session, held)), bundle)
 
 
-def completed_response(body, *, log, authenticated, request_id, publications=None, stored=(), media_type='application/json'):
+def completed_response(body, *, log, authenticated, request_id, publications=None, stored=(), media_type='application/json', on_success=None):
     """Snapshot exact HTTP payload; acknowledge only after successful final send.
 
     Authentication is supplied by the server's core guard, never request fields.
@@ -286,10 +286,13 @@ def completed_response(body, *, log, authenticated, request_id, publications=Non
             exact = (written_bytes == payload['serialized_bytes']
                      and written_hash.hexdigest() == payload['payload_sha256'])
             if completed and exact and authenticated is True:
+                completed_ns = time.monotonic_ns()
                 log.record('catchup_success', request_id=request_id, response_id=response_id,
-                    authenticated=True, kind='model', write_completed_ns=time.monotonic_ns(),
+                    authenticated=True, kind='model', write_completed_ns=completed_ns,
                     publications=json.loads(fixed_publications) if fixed_publications is not None
                                  else [value.publication for value in fixed_stored], **payload)
+                if on_success is not None:
+                    on_success(completed_ns)
             else:
                 log.record('catchup_error', request_id=request_id, response_id=response_id,
                     authenticated=authenticated is True, error='unauthenticated_inexact_or_incomplete_write',

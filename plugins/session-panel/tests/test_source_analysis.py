@@ -525,6 +525,7 @@ def test_real_coordinator_receiptlog_analysis(api, board, monkeypatch, tmp_path)
     from test_source_stage_receipts import setup, drain, kanban_db
     from test_source_receipts import receipts, identity, read_log
     conn, readers, feed, lane, _ = setup(api, board, monkeypatch)
+
     real = receipts()
     log = real.ReceiptLog(tmp_path / 'analyzer-real-stages.jsonl', identity=identity())
     monkeypatch.setattr(lane, '_receipt_log', lambda: log)
@@ -541,7 +542,13 @@ def test_real_coordinator_receiptlog_analysis(api, board, monkeypatch, tmp_path)
     admissions = [r['admission'] for r in rows if r['event'] == 'admitted']
     assert len({a['id'] for a in admissions}) < len(admissions), 'must exercise coalescing'
     result = A.analyze_records(rows, receipts=real)
-    assert result['inputs_valid'], (result['integrity_errors'], result['records'])
+    # This setup has an unenrolled canonical row owner ('') while compose pins
+    # source dependencies to 'fixture'. Keep stage accounting, but never certify
+    # the inconsistent owner as complete evidence. The fully owner-qualified
+    # real CoreReaders/SQL positive is test_source_evidence's measured fixture.
+    assert not result['inputs_valid']
+    assert any(audit['counts']['error_codes'].get('displayed_dependency_missing')
+               for audit in result['evidence_audits'].values())
     assert result['events']['total'] > 0
     # setup uses an arbitrary lambda callback, NOT the exact server-emission
     # adapter. Storage and callback return cannot certify model inclusion.

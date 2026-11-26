@@ -325,6 +325,8 @@ class Feed:
         self._wire_sources = {}
         self.receipt_log = self.receipt_module = None  # explicit private measurement only; never default activation
         self._receipt_emitted = {}  # at most one exact successful model per current watched session
+        self._receipt_delivery_times = {}
+        self._receipt_delivery_lock = threading.Lock()
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
         self._publish_wire()
 
@@ -591,7 +593,9 @@ class Feed:
 
     def _forget(self, s: str) -> None:
         self._watch_tokens.pop(s, None)
-        self._receipt_emitted.pop(s, None)
+        with self._receipt_delivery_lock:
+            self._receipt_emitted.pop(s, None)
+            self._receipt_delivery_times.pop(s, None)
         self._board_failures.discard(s)
         self._board_capture_failures.discard(s)
         self._decision_failures.discard(s)
@@ -1288,9 +1292,10 @@ class Feed:
                             model_bytes = prior_publication = None
                             if not did_change and self.receipt_log is not None:
                                 model_bytes = self.receipt_module.semantic_model(self.bundles[s]['bundle'])
-                                prior_publication = self.receipt_module.unchanged_predecessor(
-                                    self._receipt_emitted.get(s), epoch=self.epoch,
-                                    token=self._watch_tokens.get(s), model=model_bytes)
+                                with self._receipt_delivery_lock:
+                                    prior_publication = self.receipt_module.unchanged_predecessor(
+                                        self._receipt_emitted.get(s), epoch=self.epoch,
+                                        token=self._watch_tokens.get(s), model=model_bytes)
                             _results[s] = projection_module.PublishResult('stored' if did_change else 'no_change', did_change,
                                 revision=self.bundles[s]['rev'], prior_successful_publication=prior_publication,
                                 identical_model=model_bytes)
@@ -1331,16 +1336,12 @@ class Feed:
                                 **self.receipt_module.payload_fields(actual))
                             # A transform may keep a session but change its bytes.
                             # Remember only exact inclusion after the real adapter returned.
-                            self._receipt_emitted = {s: v for s, v in self._receipt_emitted.items()
-                                                     if s in self.interest}
-                            for p in included:
-                                s = p['session']
-                                sent = transformed['bundles'][s]
-                                if (transformed.get('epoch') == self.epoch
-                                        and self.receipt_module.encode(sent)
-                                            == self.receipt_module.encode(json.loads(receipt_entries[s][2]))):
-                                    self._receipt_emitted[s] = (self.epoch, self._watch_tokens.get(s),
-                                        self.receipt_module.semantic_model(sent), self.receipt_module.encode(p))
+                            self._receipt_delivered(
+                                [(p, receipt_entries[p['session']][2], self._watch_tokens.get(p['session']))
+                                 for p in included if transformed.get('epoch') == self.epoch
+                                 and self.receipt_module.encode(transformed['bundles'][p['session']])
+                                     == self.receipt_module.encode(json.loads(receipt_entries[p['session']][2]))],
+                                callback_completed)
                     self.last_emit = now
                     if _results is not None:
                         for s in changed:
@@ -1355,6 +1356,23 @@ class Feed:
                         self.receipt_log.record('emit_error', error=type(exc).__name__, sessions=list(changed))
                     log.debug('session-panel feed: push failed', exc_info=True)
             return changed
+
+    def _receipt_delivered(self, entries, completed_ns):
+        """Both transports share latest exact-delivery custody, not latest storage.
+
+        ASGI completion races the writer. Freeze tokens/bytes before sending and
+        order by actual completion, not callback arrival; no Feed/SQL lock or I/O.
+        """
+        with self._receipt_delivery_lock:
+            for publication, bundle, token in entries:
+                session = publication['session']
+                if (publication['feed_epoch'] != self.epoch or token is None
+                        or self._watch_tokens.get(session) is not token
+                        or completed_ns <= self._receipt_delivery_times.get(session, -1)):
+                    continue
+                self._receipt_delivery_times[session] = completed_ns
+                self._receipt_emitted[session] = (self.epoch, token,
+                    self.receipt_module.semantic_model(json.loads(bundle)), self.receipt_module.encode(publication))
 
     def _note_publish(self, changed: dict) -> None:
         """Wall-clock record of a push that carried bundles: the latest, and the last RECENT_PUBLISHES with the

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+from bisect import bisect_right
 
 SCHEMA = 'panel-semantic-expectations/1'
 SECTIONS = ('needs_you', 'stuck', 'running', 'waiting', 'ready', 'done')
@@ -64,6 +65,8 @@ class Oracle:
                         raise ValueError('expectation owner')
                     if any(not isinstance(owner[k], str) for k in OWNER):
                         raise ValueError('expectation owner strings')
+                    if owner['key'] != ':'.join(owner[k] for k in ('gateway', 'profile', 'board', 'id')):
+                        raise ValueError('expectation owner key is not canonical')
                     identity = canon(owner)
                     if identity in seen:
                         raise ValueError('duplicate expected row')
@@ -135,7 +138,8 @@ class Oracle:
                 owner = expected['owner']
                 # Same key with contradictory owner is not an absent success.
                 collisions = [(section, row) for section, row in located
-                              if isinstance(row, dict) and row.get('key') == owner['key']]
+                              if isinstance(row, dict) and (row.get('key') == owner['key']
+                                  or all(row.get(k) == owner[k] for k in ('id', 'gateway', 'profile', 'board')))]
                 hits = [(section, row) for section, row in collisions
                         if canon({k: row.get(k) for k in OWNER}) == canon(owner)]
                 if expected['section'] is None:
@@ -182,9 +186,13 @@ def audit_no_change(records, successful, stored):
     predecessors cannot attest equivalence. No synthetic success is manufactured.
     """
     prior = {}
+    deliveries = {}
     for item in successful:
         key = (item['window'], item['key'])
         prior[key] = min(prior.get(key, item['time']), item['time'])
+        owner = (item['window'], item['key'][0], item['key'][2])
+        deliveries.setdefault(owner, {}).setdefault(item['time'], set()).add(item['key'])
+    delivery_index = {owner: (sorted(times), times) for owner, times in deliveries.items()}
     current_models = {}
     for row in records:
         if row['event'] == 'model_stored':
@@ -210,6 +218,10 @@ def audit_no_change(records, successful, stored):
                             and canon(r['publication']) == canon(publication))
             if success_at > row['monotonic_ns']:
                 raise ValueError('predecessor is not prior')
+            times, keys = delivery_index[(row['window_id'], key[0], key[2])]
+            pos = bisect_right(times, row['monotonic_ns']) - 1
+            if pos < 0 or keys[times[pos]] != {key}:
+                raise ValueError('predecessor is not latest successful delivery')
             current = row['admission']
             old = publication['admission']
             for field in ('chat', 'watch_token', 'lineage_generation'):

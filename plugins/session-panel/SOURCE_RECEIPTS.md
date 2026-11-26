@@ -195,6 +195,29 @@ unserved age. Their original age and
 closed-window lower bound (or open-window censoring) remain in the denominator,
 independently of the per-source receipt-event series.
 
+## B3a review custody refinements (UNACTIVATED)
+
+- An unchanged-model predecessor is the session's latest actual exact delivery
+  across server emission and authenticated ASGI catch-up, not just any historical
+  identical emission. Failed pushes and storage do not establish delivery. The
+  per-watch cache orders completion clocks and forget retires its entries. The
+  offline audit independently rejects a superseded predecessor; it never creates
+  an inclusion sample for `no_change`.
+- Every receipt named by a projection must appear in that endpoint's admitted
+  records before projection start. Coalesced admission IDs retain all receipt
+  observations, while stable identity still must agree. Capture record feed and
+  coordinator epochs join to publication and receipt version respectively.
+  Capture owner tokens establish only the within-capture owner fence; they are
+  not independently projected identity evidence.
+- For a source-complete publication, each displayed card/blocker owner must occur
+  in its dependency map. Empty source lists remain legitimate when no displayed
+  card depends on them. Missing-source bootstrap/carried publications are counted
+  separately as unvouched, never authoritative absence. Unknown/contradictory
+  row owners fail closed rather than being repaired from a convenient source key.
+- Manifest owner keys must be canonical. Absence compares actual owner coordinates
+  as well as keys, including real reducer `blocker:` groups; group decoration
+  cannot hide a displayed owner.
+
 ## Remaining acceptance and rollback
 
 B2b-ii still requires its complete original regression/population matrix, full
