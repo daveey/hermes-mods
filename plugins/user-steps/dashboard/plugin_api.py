@@ -585,13 +585,13 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             payload['requestId'] = request_id
             # Only this producer can supply the supplemental informational choice.
             producer = mirror()
-            recorded = (producer.decide_other(own, payload)
-                        if payload['choiceId'] == 'answer-text' and producer.binding(own, request_id)
-                        else st.decide(own, payload))  # durable commit BEFORE receiver effects
-            committed = time.monotonic()
-            # A committed operation is the receipt. Executor delivery is durable
-            # outbox work and may take seconds; a lost hint is recovered by scans.
-            hint_delivery()
+            with _load('core').defer_controls_refresh():
+                recorded = (producer.decide_other(own, payload)
+                            if payload['choiceId'] == 'answer-text' and producer.binding(own, request_id)
+                            else st.decide(own, payload))  # durable commit BEFORE receiver effects
+                committed = time.monotonic()
+                # Hint delivery before scheduling the coalesced controls refresh.
+                hint_delivery()
             logging.getLogger('user-steps').info(
                 'Decision timing operation=%s queue_ms=%.1f record_ms=%.1f hint_ms=%.1f',
                 recorded['operation']['operationId'], (started-received)*1000,

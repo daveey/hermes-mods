@@ -8,6 +8,7 @@ Pure-ish functions + small classes so tests need no Hermes runtime:
 """
 from __future__ import annotations
 
+import atexit
 import fcntl
 import hashlib
 import json
@@ -16,6 +17,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import time
 import unicodedata
 import uuid
@@ -107,9 +109,162 @@ def refresh_controls(state_db: Path, sessions) -> int:
         return 0
 
 
+class ControlsRefresher:
+    """One background worker per process: callers (HTTP routes, tool calls, the cron) never wait on state.db.
+
+    Each committed change submits (state_db, session). A key already pending is not queued again, and a key is
+    removed from the queue BEFORE its refresh runs, so a change committed during that refresh queues it once
+    more: every committed change is followed by a refresh that started after it. The queue holds at most
+    `cap` keys; overflow for a home coarsens its pending keys to one full-store invalidation. Only cap distinct
+    homes apply queue-slot backpressure; no caller ever performs an outcome refresh. Pending work is drained
+    at normal interpreter exit (including the short-lived cron), bounded by `drain_s`."""
+
+    def __init__(self, cap: int = 4096, drain_s: float = 60.0, refresh=None):
+        self.cap, self.drain_s = cap, drain_s
+        self._refresh = refresh or refresh_controls
+        self._cond = threading.Condition()
+        self._pending: dict = {}
+        self._busy = 0
+        self._thread = None
+        self.stats = {"submitted": 0, "deduplicated": 0, "refreshed": 0, "overflow": 0}
+
+    def submit(self, state_db, sessions) -> None:
+        keys = [(str(state_db), str(s)) for s in dict.fromkeys(sessions or ()) if s]
+        if not keys:
+            return
+        with self._cond:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="user-steps-controls-refresh", daemon=True)
+                self._thread.start()
+            for key in keys:
+                self.stats["submitted"] += 1
+                all_key = (key[0], None)
+                if key in self._pending or all_key in self._pending:
+                    self.stats["deduplicated"] += 1
+                    continue
+                if len(self._pending) >= self.cap:
+                    # Coarsen this home's invalidation to a full-store refresh, not caller-thread I/O.
+                    same_db = [k for k in self._pending if k[0] == key[0]]
+                    if same_db:
+                        for k in same_db:
+                            del self._pending[k]
+                        self._pending[all_key] = None
+                        self.stats["overflow"] += 1
+                        continue
+                    # Only possible with cap distinct homes: bounded backpressure, never drop work.
+                    self._cond.notify_all()
+                    self._cond.wait_for(lambda: len(self._pending) < self.cap)
+                self._pending[key] = None
+            self._cond.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                db = next(iter(self._pending))[0]
+                batch = [k for k in self._pending if k[0] == db]
+                for k in batch:
+                    del self._pending[k]
+                self._busy += 1
+                self._cond.notify_all()
+            try:
+                sids = [sid for _, sid in batch]
+                if None in sids:
+                    from contextlib import closing
+                    with closing(_ro_connect(db)) as conn:
+                        sids = [r[0] for r in conn.execute('SELECT id FROM sessions')]
+                self._refresh(Path(db), sids)
+                self.stats["refreshed"] += len(batch)
+            except Exception:
+                logging.getLogger("user-steps").warning("controls refresh worker failed", exc_info=True)
+            finally:
+                with self._cond:
+                    self._busy -= 1
+                    self._cond.notify_all()
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait until every submitted refresh ran; False on timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while self._pending or self._busy:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def _after_fork(self) -> None:
+        self._cond = threading.Condition()
+        self._pending, self._busy, self._thread = {}, 0, None
+
+
+def _process_refresher() -> ControlsRefresher:
+    """One worker per process, shared by every loaded copy of this module (the user-steps plugin, its dashboard,
+    and session-outcome each load core.py under their own name)."""
+    import sys
+    import types
+    candidate = types.ModuleType("_user_steps_controls_refresher")
+    candidate.instance = ControlsRefresher()
+    from contextvars import ContextVar
+    candidate.batch = ContextVar('controls_refresh_batch', default=None)
+    holder = sys.modules.setdefault("_user_steps_controls_refresher", candidate)
+    if holder is candidate:
+        worker = holder.instance
+        atexit.register(lambda: worker.flush(worker.drain_s))
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=worker._after_fork)
+    return holder.instance
+
+
+CONTROLS_REFRESHER = _process_refresher()
+
+
+def flush_controls_refresh(timeout=60.0):
+    return CONTROLS_REFRESHER.flush(timeout)
+
+
+@contextmanager
+def defer_controls_refresh():
+    """Collect committed changes until the outer operation has released locks and hinted delivery."""
+    import sys
+    var = sys.modules['_user_steps_controls_refresher'].batch
+    if var.get() is not None:
+        yield
+        return
+    pending = {}
+    token = var.set(pending)
+    try:
+        yield
+    finally:
+        var.reset(token)
+        for db, sessions in pending.items():
+            queue_controls_refresh(Path(db), sessions)
+
+
+def queue_controls_refresh(state_db: Path, sessions) -> None:
+    """Hand committed controls changes to the background refresher. Never raises."""
+    try:
+        import sys
+        pending = sys.modules['_user_steps_controls_refresher'].batch.get()
+        if pending is not None:
+            pending.setdefault(str(state_db), set()).update(sessions)
+        else:
+            CONTROLS_REFRESHER.submit(state_db, sessions)
+    except Exception:
+        logging.getLogger("user-steps").warning("controls refresh not queued for %s", sessions, exc_info=True)
+
+
 def _open_controls(d: dict) -> str:
     """What the provider reads from one ledger file: its open steps, every field."""
     return json.dumps([x for x in d.get("steps") or () if x.get("status") == "open"], sort_keys=True, default=str)
+
+
+def _step_sessions(*docs) -> set:
+    """The chats whose provider shows this ledger file's open steps: each step's own chat. A reset or branch
+    fork shares its parent's ledger root here, but core gives it its own outcome (its own tip): refreshing the
+    root alone would reach only the main chain's tip."""
+    return {str(x.get("session")) for d in docs for x in json.loads(d) if x.get("session")}
 
 
 def _ro_connect(path, timeout=10):
@@ -153,6 +308,24 @@ def lineage(session_id: str, db: Optional[Path] = None) -> list[str]:
         pr = _row(db, parent)
         if not pr or "compress" not in str(pr[2] or "").lower():
             break
+        # Use core's own forward selector where its full schema is available. This also excludes
+        # explicit/reset/delegate/tool forks and non-preferred siblings, just like refresh_outcome.
+        from contextlib import closing
+        with closing(_ro_connect(db, timeout=2)) as conn:
+            columns = {r[1] for r in conn.execute('PRAGMA table_info(sessions)')}
+            if 'model_config' in columns:
+                try:
+                    from hermes_state_compression import _CHAIN_STEP_SQL
+                except ImportError:
+                    meta = conn.execute('SELECT model_config FROM sessions WHERE id=?', (cur,)).fetchone()
+                    config = json.loads(meta[0] or '{}') if meta else {}
+                    if (pr[2] != 'compression' or r[3] == 'tool' or any(
+                            config.get(k) is not None for k in ('_branched_from', '_reset_from', '_delegate_from'))):
+                        break
+                else:
+                    selected = conn.execute(_CHAIN_STEP_SQL, (parent,)).fetchone()
+                    if not selected or selected[0] != cur:
+                        break
         out.append(parent)
         cur = parent
     return out
@@ -252,12 +425,13 @@ class Ledger:
                         "Ledger committed; directory durability could not be confirmed", exc_info=True)
             finally:
                 tmp.unlink(missing_ok=True)
-            changed = _open_controls(d) != before
+            after = _open_controls(d)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
-        if changed:  # committed and the lock released: refresh only when the open asks moved
-            refresh_controls(self.db or self.dir.parent / "state.db", [root])
+        if after != before:  # committed and the lock released: refresh only when the open asks moved
+            queue_controls_refresh(self.db or self.dir.parent / "state.db",
+                                   [root, *sorted(_step_sessions(before, after))])
 
     def _read_strict(self, root: str, *, legacy: bool = False, bounded: bool = True) -> dict:
         if not isinstance(root, str) or not root:
@@ -2922,8 +3096,9 @@ class ActionStore:
 
     # Per-connection TEMP triggers record the session of every row a transaction changes in the tables the
     # controls provider reads (session-outcome/decision_obligations.py): requests (state, resolution,
-    # revision), revisions and aliases (via their request), operations (dispatch state in body). Nothing is
-    # added to the store's schema; a rolled-back transaction records nothing.
+    # revision), revisions and aliases (via their request), operations (only the body fields the provider
+    # reads: dispatchState, intent, owner; a delivery retry's attempt bookkeeping is not a change). Nothing
+    # is added to the store's schema; a rolled-back transaction records nothing.
     _TOUCH_SQL = """
         CREATE TEMP TABLE IF NOT EXISTS _controls_touched(session TEXT);
         CREATE TEMP TRIGGER IF NOT EXISTS _ct_req_i AFTER INSERT ON main.requests
@@ -2937,7 +3112,10 @@ class ActionStore:
         CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_i AFTER INSERT ON main.operations
           BEGIN INSERT INTO _controls_touched VALUES (NEW.session); END;
         CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_u AFTER UPDATE ON main.operations
-          WHEN OLD.body IS NOT NEW.body OR OLD.session IS NOT NEW.session
+          WHEN json_extract(OLD.body, '$.dispatchState') IS NOT json_extract(NEW.body, '$.dispatchState')
+            OR json_extract(OLD.body, '$.intent') IS NOT json_extract(NEW.body, '$.intent')
+            OR json_extract(OLD.body, '$.owner') IS NOT json_extract(NEW.body, '$.owner')
+            OR OLD.session IS NOT NEW.session
           BEGIN INSERT INTO _controls_touched VALUES (NEW.session); INSERT INTO _controls_touched VALUES (OLD.session); END;
         CREATE TEMP TRIGGER IF NOT EXISTS _ct_op_d AFTER DELETE ON main.operations
           BEGIN INSERT INTO _controls_touched VALUES (OLD.session); END;
@@ -2965,14 +3143,16 @@ class ActionStore:
                 logging.getLogger('user-steps').warning('user-steps: controls change tracking unavailable', exc_info=True)
             c.execute('BEGIN IMMEDIATE')
             yield c
-            c.commit()
             if watching:
+                # Tracking failure here rolls back; no post-commit read can fail a durable write.
                 touched = [r[0] for r in c.execute('SELECT DISTINCT session FROM _controls_touched')]
+            c.commit()
         except BaseException:
+            touched = []
             c.rollback(); raise
         finally: c.close()
         if touched:  # committed and the connection closed
-            refresh_controls(self.path.parent.parent / 'state.db', touched)
+            queue_controls_refresh(self.path.parent.parent / 'state.db', touched)
 
     @staticmethod
     def _ns(owner):

@@ -5,6 +5,24 @@ composer. This extends the existing user-steps ledger; it does not add a competi
 queue. Transcript directives are passive receipts retaining their original text.
 Agent progress remains separate and collapsed.
 
+## Event-driven outcome controls
+
+Committed ledger/request changes enqueue a stored-outcome refresh; retry-only operation metadata does not.
+One process-wide worker deduplicates pending chats, reruns a chat changed during its refresh, and caps pending
+keys at 4096. Overflow for one home coarsens to a full-store invalidation on that worker (not caller-thread
+refresh); 4096 distinct homes apply queue-slot backpressure. There is no controls polling or timed catch-up.
+REST decisions enqueue after their delivery hint. `session_outcome` batches all its writes until the person
+ledger lock is released. Normal process exit drains queued work for up to 60 seconds; abrupt process death
+or an unavailable outcome provider is not a durable delivery guarantee.
+
+The standalone stale-watch writer registers the two session-outcome providers before writes, only when that
+plugin is enabled for the current home. It does not register the tool, turn hooks or LLM judge. Compression
+attribution follows core's continuation selector, excluding explicit, reset, delegate and tool forks.
+
+Tests: `tests/test_controls_refresh.py` uses the real provider/store for ledger, requests, compression/fork
+attribution, retry bookkeeping and stale-watch registration. `tests/test_controls_worker.py` checks bounded
+coalescing, in-flight requeue, a held-refresh REST receipt and pre-commit change-list reads.
+
 ## Confirmation asks
 
 For yes/go confirmation, use `action_request` with the full exact plan in
