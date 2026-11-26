@@ -87,7 +87,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v27-route-coverage'
+const VERSION = 'session-panel-v28-timing-wrap'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -666,12 +666,13 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
-        jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, ...(section === 'waiting' ? { flexWrap: 'wrap', rowGap: 1 } : {}) }, children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, flexWrap: 'wrap', rowGap: 1 }, children: [
           jsx('strong', { 'data-ask-title': '', title: hover, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
           inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || detail,
-            // Waiting copy carries the accountable actor and triage age. Keep
-            // all of it readable, rather than ellipsizing the trailing age.
-            style: { ...muted, flex: compact ? '0 1 auto' : 'none', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : {}), whiteSpace: 'nowrap', ...(section === 'waiting' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
+            // Runtime ends in an elapsed clock. An unshrinkable metadata line
+            // can extend past the clipped panel even though its DOM text exists.
+            // Wrap the entire detail when necessary; never ellipsize its clock.
+            style: { ...muted, flex: '0 1 auto', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : { maxWidth: '100%', overflowWrap: 'anywhere' }), whiteSpace: compact ? 'nowrap' : 'normal', ...(section === 'waiting' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
         ] }),
         !inline && detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: detail }),
         // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.
