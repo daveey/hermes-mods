@@ -63,6 +63,19 @@ hint, CLI options, board selection, remote fallback, worker and non-worker hooks
 prefixes, help, a check that the hook builds no parser, and, when core imports, a drift
 check of the static option lists and of the reader's results against core's parser).
 
+## Sidebar classification cost
+
+The sidebar memoizes only the pure dropped-work text classification, keyed by the
+exact classifier function, summary and title. The LRU retains at most 1024 entries;
+inputs over 16384 combined characters bypass it. Database-dependent verdicts are
+not cached here: ACK insertion/deletion, link/creator changes, follow-up statuses
+and replica arrival/removal remain fresh. The worker completion gates still use
+the literal classifier. This is not a complete semantic input declaration and
+does not suppress the holder's conservative database-dependent refreshes.
+
+`tests/test_attention_classification_cache.py` covers repeat/changed text,
+classifier replacement, bounded/oversized retention, and mutations after warming.
+
 ## What it does
 
 Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call` hook refuses (E and F: any session):

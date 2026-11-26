@@ -1030,10 +1030,27 @@ def attention_next_deadline() -> None:
 needs_attention.attention_pass = attention_pass  # type: ignore[attr-defined]
 
 
+@lru_cache(maxsize=1024)
+def _attention_classification(classifier, summary: str, title: str) -> bool:
+    """Cache pure text classification, never the database-dependent attention verdict.
+
+    Keep the function object in the key so replacement cannot reuse an older policy.
+    Callers bypass texts over 16K characters, bounding retention as well as entry count.
+    """
+    return bool(classifier(summary, title))
+
+
+def _attention_dropped_work(summary: str, title: str) -> bool:
+    classifier = dropped_work_in_handoff
+    if len(summary) + len(title) > 16384:
+        return bool(classifier(summary, title))
+    return _attention_classification(classifier, summary, title)
+
+
 def _needs_attention(card: dict[str, Any], paths: Optional[list[Path]]) -> bool:
     tid = str(card.get("id") or "")
     summary, title = str(card.get("summary") or ""), str(card.get("title") or "")
-    if not tid or not dropped_work_in_handoff(summary, title):
+    if not tid or not _attention_dropped_work(summary, title):
         return False
     if paths is None:
         state = _pass.state
