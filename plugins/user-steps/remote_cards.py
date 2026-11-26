@@ -304,6 +304,9 @@ class Remote(DeliveryPresentation):
                 held_targets.add(target)
                 continue
             request = m.store.get(owner, binding['request_id'])
+            if m.explicit_revision(request, binding):
+                held_targets.add(target)  # explicit chat revision owns this ask now
+                continue
             snap = current.get(target)
             # Custody survives display identity: an original generation can return
             # while its answer is retiring. Observe it before the display shortcut.
