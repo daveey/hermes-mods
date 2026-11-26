@@ -3,8 +3,8 @@
 `_detail` runs for every held card on every feed pass. `PRAGMA table_info(tasks)` hands Python one row per column
 (59 on the hub board) and CPython releases the GIL on each, so the probe alone was ~36k handoffs a hub pass.
 """
+import builtins
 import sqlite3
-import sys
 
 import pytest
 
@@ -52,16 +52,33 @@ def test_ready_since_matches_the_pragma_probe(api, board, monkeypatch):
     assert api._task_columns(r.conn(path)) == frozenset(cols)
 
 
+def _hide_panel_helper(api, monkeypatch):
+    # Simulate an older panel/core seam, not a broken current core: actionability
+    # also imports this helper and must remain equivalent across these reads.
+    original = builtins.__import__
+    attempts = []
+
+    def import_for_panel(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'hermes_cli.kanban_table_columns' and (globals or {}).get('__name__') == api.__name__:
+            attempts.append(name)
+            raise ImportError('older panel core has no table-columns helper')
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, '__import__', import_for_panel)
+    return attempts
+
+
 def test_older_core_without_the_helper_keeps_the_pragma(api, board, monkeypatch):
     path, conn = board
     tid = _ready_card(conn)
     r = readers_for(api, path, monkeypatch)
     with_helper = r.card(tid, 'default')
-    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_table_columns', None)  # import now raises ImportError
+    attempts = _hide_panel_helper(api, monkeypatch)
     monkeypatch.setattr(api, '_TABLE_COLUMNS', None)  # a fresh process on that older core
     r2 = readers_for(api, path, monkeypatch)
     seen = _traced(r2, path)
     assert r2.card(tid, 'default') == with_helper
+    assert attempts == ['hermes_cli.kanban_table_columns']
     assert any('PRAGMA table_info(tasks)' in s for s in seen)
 
 
@@ -69,12 +86,13 @@ def test_a_missing_helper_is_looked_up_once_per_process(api, board, monkeypatch)
     path, conn = board
     tid = _ready_card(conn)
     monkeypatch.setattr(api, '_TABLE_COLUMNS', None)
-    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_table_columns', None)  # older core: import raises
     r = readers_for(api, path, monkeypatch)
-    expected = r.card(tid, 'default')
-    assert api._TABLE_COLUMNS is False
+    with monkeypatch.context() as hidden:
+        attempts = _hide_panel_helper(api, hidden)
+        expected = r.card(tid, 'default')
+        assert api._TABLE_COLUMNS is False
+        assert attempts == ['hermes_cli.kanban_table_columns']
     # The helper "appears" later in the process: the cached answer stands, the PRAGMA fallback keeps working.
-    monkeypatch.delitem(sys.modules, 'hermes_cli.kanban_table_columns')
     seen = _traced(r, path)
     assert r.card(tid, 'default') == expected
     assert any('PRAGMA table_info(tasks)' in s for s in seen)
