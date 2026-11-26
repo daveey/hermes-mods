@@ -470,7 +470,35 @@ export function clockRow(row, now = Date.now() / 1000) {
   for (const key of ['detail', 'nested_detail', 'text']) if (row.clock_text?.[key]) result[key] = formatClockText(row.clock_text[key], now)
   if (row.clock_text?.details) result.details = row.clock_text.details.map(parts => formatClockText(parts, now))
   if (row.decision) result.decision = clockRow(row.decision, now)
+  const reason = row.non_running_reason
+  if (reason && reason.freshness === 'current') {
+    const at = reason.observed_at, until = reason.valid_until
+    if (!Number.isFinite(at) || !Number.isFinite(until) || !Number.isFinite(now) || now < at || now >= Math.min(until, at + 180)) {
+      result.non_running_reason = { freshness: 'unknown', disposition: 'unknown', actor: 'unknown',
+        observed_at: at, valid_until: until, unknown_reason: 'dispatcher_evidence_stale' }
+      result.reason = 'reason-unknown'
+      result.detail = 'ready · execution reason unknown'
+      result.evidence_state = 'unknown'
+      result.details = ['Reason freshness: unknown', 'The dispatcher evidence has expired; inspect fresh authoritative evidence.']
+      delete result.clock_text
+    }
+  }
   return result
+}
+/** Expiration can withdraw diagnostic attention, never create execution or human authority. */
+export function expireDiagnostics(model, now) {
+  let sections = null
+  for (const [key, rows] of Object.entries(model.sections || {})) {
+    for (const row of rows) {
+      if (!row.non_running_reason || row.non_running_reason.freshness !== 'current') continue
+      const clocked = clockRow(row, now)
+      if (clocked.non_running_reason?.freshness !== 'unknown') continue
+      sections ||= Object.fromEntries(Object.entries(model.sections).map(([k, v]) => [k, [...v]]))
+      sections[key] = sections[key].filter(v => v !== row)
+      sections.ready.push(clocked)
+    }
+  }
+  return sections ? { ...model, sections } : model
 }
 /** One source clock for header and row freshness; heartbeats cannot renew computed_at. */
 export function modelFreshness(model, { now = Date.now() / 1000, vouched = null } = {}) {
@@ -479,6 +507,24 @@ export function modelFreshness(model, { now = Date.now() / 1000, vouched = null 
   const age = Number.isFinite(f.computed_at) ? now - f.computed_at : null
   const ttl = Number.isFinite(f.ttl_s) && f.ttl_s > 0 ? Math.min(60, f.ttl_s) : 60
   return { stale: age === null || age < 0 || age > ttl || vouched === false || (vouched !== true && f.trusted !== true), age }
+}
+/** Cached native task waits lose attention/action authority with their source snapshot. */
+export function expireNativeWaits(model, now, vouched) {
+  if (!modelFreshness(model, { now, vouched }).stale) return model
+  const sections = Object.fromEntries(Object.entries(model.sections).map(([key, rows]) => [key, []]))
+  for (const [key, rows] of Object.entries(model.sections)) for (const row of rows) {
+    if (key === 'done' || row.kind !== 'card' || row.non_running_reason) {
+      sections[key].push(row)
+      continue
+    }
+    const old = clockRow(row, now)
+    sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
+      detail: `status unknown · last known: ${old.detail || key}`,
+      details: ['Task source freshness: stale; read current authoritative task state before acting.'],
+      actions: row.actions.filter(a => a.kind === 'open_card' || a.kind === 'open_session' || a.kind === 'open_url'),
+      options: [], decision: null, wait_kind: null, clock_text: null })
+  }
+  return { ...model, sections }
 }
 /** The three right-click entries for a row, in order. `action` is null when the row has nothing to open there
  *  (no owning chat, no dependency, or the owning chat is the one already in focus). */
@@ -498,6 +544,7 @@ export function rowMenuItems(row, currentSession = null) {
 }
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null } = {}) {
   if (!validModel(model)) return null
+  model = expireNativeWaits(expireDiagnostics(model, now), now, vouched)
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
   const freshness = modelFreshness(model, { now, vouched })

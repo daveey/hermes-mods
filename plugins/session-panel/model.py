@@ -632,6 +632,11 @@ def spend_overdue_text(row, bundle, now, *, wire=False):
 
 
 def agent_hold_text(row, bundle):
+    wait = obj(row.get('wait'))
+    if wait.get('next_actor') and wait.get('next_action') and wait.get('waiting_on'):
+        # Preserve the authoritative wait producer's actor/action. A coordinating
+        # chat turn does not establish that its own agent owns this recovery.
+        return 'waiting on ' + flat(wait['waiting_on']) + ' · next: ' + flat(wait['next_action'])
     authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
     if authority.get('id'):
         task = obj(obj(obj(obj(bundle.get('cards')).get(authority['id'])).get('detail')).get('task'))
@@ -650,6 +655,8 @@ def agent_hold_text(row, bundle):
     if review:
         return ((cause + ' · ' if cause else '') +
                 f"reviewer escalated: {review['reason'] or reason} · waiting on this chat's agent to decide")
+    if not wait_reason(row, bundle) and not cause:
+        return 'blocked · execution reason unknown · next actor/action not published'
     return (cause + ' · ' if cause else '') + "waiting on this chat's agent to decide: " + reason
 
 
@@ -751,14 +758,22 @@ def _parked(row, on):
     unpublished = not on or 'did not publish' in on
     if not unpublished:
         return on
-    if state == 'triage':
-        return 'in triage · waiting to be specified and promoted'
-    if state == 'review':
-        return 'waiting for review'
     if up.get('id'):
         return 'waiting on parent card'
-    return {'todo': 'waiting on its parent cards', 'scheduled': 'scheduled · its owner has not published what wakes it',
-            'blocked': 'blocked · no reason published'}.get(state, state or 'status unknown')
+    return f'{state or "status unknown"} · execution reason unknown'
+
+
+def diagnostic(row, now):
+    """A task-scoped diagnostic is independent of an execution generation.
+
+    The acquisition path owns writer authentication. Selection here must never
+    infer execution identity or turn a machine restriction into fleet authority.
+    """
+    try:
+        from hermes_cli.kanban_nonrunning_reason import select
+    except ImportError:
+        return None  # older core; no invented reason or execution identity
+    return select(row.get('execution_observations'), row, now=now)
 
 
 def _ready(row, detail, now, *, wire=False):
@@ -768,9 +783,9 @@ def _ready(row, detail, now, *, wire=False):
         return 'ready · Waiting for admission to lane'
     if note:
         return f'ready · {note}'
-    since = seconds(row.get('ready_since'))
-    age = relative(since, 'elapsed') if wire else short_dur(now - since)
-    return f'ready · waiting{f" {age}" if since else ""} for a worker to claim it'
+    # Ready is a stored lane, not evidence that worker capacity is the cause.
+    # Also used by stale-replica and older-core paths without a diagnostic selector.
+    return 'ready · execution reason unknown'
 
 
 def route_model(row, detail):
@@ -824,7 +839,7 @@ def header_label(state, status):
                 'linked_work_unsuccessful': 'linked work needs attention', 'turn_unsettled': 'turn outcome unknown',
                 'notice_tail': 'reply pending'}.get(reason, 'status unknown')
     if state == 'running' and 'own_turn_active' in codes:
-        return 'running · this chat’s agent is replying'
+        return 'chat active · task execution shown below'
     return state.replace('needs-you', 'needs you')
 
 
@@ -944,7 +959,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
             v['parked'] = True
             v['queued'] = queued
-            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
+            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
             if age_s <= 300:
                 v['detail'] += f' · on {gw} (synced {age_s}s ago)'
             else:
@@ -1011,6 +1026,24 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if look == 'stalled':
             v.update(reason='stalled', detail=f'stalled: {on or "agent-owned wait over 2 h"}')
             sections['stuck'].append(v); continue
+        why = diagnostic(row, now)
+        if state == 'ready' and why is not None:
+            v['non_running_reason'] = why
+            v['evidence_state'] = 'unknown'  # diagnostic evidence is not execution proof
+            v['details'].append(f'Reason freshness: {why.get("freshness") or "unknown"}')
+            if why.get('observed_at') is not None:
+                v['details'].append(f'Dispatcher evidence as of {pacific(why["observed_at"])}')
+            v['details'].append(f'Next actor: {why.get("actor") or "unknown"}')
+            v['details'].append(text(why.get('next_action')))
+            if why.get('freshness') == 'current':
+                blocked = why.get('disposition') == 'blocked'
+                v.update(reason='admission-blocked' if blocked else 'admission-wait',
+                         detail=f'{"blocked" if blocked else "ready"} · {why["summary"]}')
+                sections['stuck' if blocked else 'ready'].append(v)
+            else:
+                v.update(reason='reason-unknown', detail='ready · execution reason unknown')
+                sections['ready'].append(v)
+            continue
         ev = observation(row, now, 'card', projector)
         unknown = ev.get('state') == 'unknown'
         reason = ev.get('unknown_reason') or 'unknown'
@@ -1033,7 +1066,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and (fresh or aged_parked):
             v['parked'] = True
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
-            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
+            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
             v['details'].append(provenance)
             if aged_parked:
                 if now - read_at > HISTORICAL_DELIVERY_S or v.get('wait_kind') not in DELIVERY_KINDS:
