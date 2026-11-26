@@ -149,12 +149,16 @@ export function buildSegments(events, spans, start, now) {
     next.push({ start: a, end: b, state: DOWN, reason: 'unreachable from this Mac', local: true })
     segs = next.sort((x, y) => x.start - y.start)
   }
-  // merge touching segments in the same state
+  // One spell per state: touching segments in the same state merge (a down spell whose
+  // reason changed is still one outage); the reasons are kept in order.
   const merged = []
   for (const s of segs) {
     const p = merged[merged.length - 1]
-    if (p && p.state === s.state && p.end >= s.start && p.reason === s.reason) p.end = Math.max(p.end, s.end)
-    else merged.push({ ...s })
+    if (p && p.state === s.state && p.end >= s.start) {
+      p.end = Math.max(p.end, s.end)
+      if (s.reason && !p.reason.split(' → ').includes(s.reason)) p.reason = p.reason ? `${p.reason} → ${s.reason}` : s.reason
+      if (s.local) p.local = true
+    } else merged.push({ ...s })
   }
   return merged
 }
@@ -410,6 +414,12 @@ function Popup({ store, cur, now }) {
   })
 }
 
+/** Minute refresh: the popover's selected range, plus the strip's 24 h when the popover shows another range. */
+export function refreshHistory(store) {
+  if (store.$events.get().range !== '24h') store.loadDay()
+  return store.loadEvents()
+}
+
 export function chipModel(poll, day, spans, now) {
   const cur = deriveState(poll, now)
   if (!cur) return null
@@ -490,7 +500,8 @@ export default {
     store.refresh()
     store.loadDay()
     ctx.setInterval(() => { if (!isHidden() || store.$poll.get().fails > 0) store.refresh() }, POLL_MS)
-    ctx.setInterval(() => { if (!isHidden()) store.loadDay() }, EVENTS_POLL_MS)
+    // The popover's history (any range) refreshes too; a 24 h load also feeds the strip.
+    ctx.setInterval(() => { if (!isHidden()) refreshHistory(store) }, EVENTS_POLL_MS)
     ctx.setInterval(() => { if (!isHidden()) store.$now.set(Date.now()) }, 1000)
     if (typeof document !== 'undefined' && document.addEventListener) {
       const onVis = () => { if (!isHidden()) { store.$now.set(Date.now()); store.refresh() } }
