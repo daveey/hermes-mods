@@ -12,7 +12,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 15
+const VERSION = 16
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -1335,6 +1335,20 @@ export function hasQueuePresentation() {
   return !!decisionRoute().session && canonical.scope === scope && canonical.requests.some(r => representedInQueue(scope, r))
 }
 
+/** Desktop loads disk plugins asynchronously, so the panel gets `panelWait.ms` after this plugin registers before its
+ * absence counts as a failure. Then: an explicit error, not a substitute view. */
+export const panelWait = { ms: 10000, since: 0 }
+export const PANEL_MISSING_TEXT = 'Session panel did not load, so this chat\u2019s status and decisions can\u2019t be shown. ' +
+  'Check Settings \u203a Plugins for session-panel, or desktop.log for \u201cruntime load failed (session-panel)\u201d.'
+export function PanelMissing() {
+  const [, tick] = useState(0)
+  useEffect(() => { const t = setInterval(() => tick(v => v + 1), 1000); return () => clearInterval(t) }, [])
+  if (panelActive() || Date.now() - panelWait.since < panelWait.ms) return null
+  const n = openAskCount()
+  return jsx('div', { role: 'alert', 'data-user-steps-panel-missing': '', style: { width: '100%', boxSizing: 'border-box', padding: 10, border: '1px solid var(--destructive, #ef4444)', borderRadius: 8, color: 'var(--foreground)', fontSize: 13 },
+    children: PANEL_MISSING_TEXT + (n ? ` ${n} decision${n === 1 ? ' is' : 's are'} waiting.` : '') })
+}
+
 export const queuePoll = { ms: POLL_MS }
 // `embedded`: drawn inside the session panel, which supplies the frame, heading and minimize control.
 export function ActionQueue({ embedded = false, audience = 'all', companion = panelActive() } = {}) {
@@ -1466,10 +1480,11 @@ export default {
   register(ctx) {
     osApi = ctx?.os || null
     previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
-    // With the session panel loaded it draws every ask (options, card tiles, Open card). This plugin then keeps only
-    // the compact companion queue (free text, pending-delivery Check/Retry, plan request, withdraw), never the
-    // legacy earlier-ask / agent-issue strip.
-    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => panelActive() ? jsx('div', { style: { minWidth: 0, width: '100%' }, children: jsx(ActionQueue, { companion: true }) }) : jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, { companion: false }), jsx(Strip, {})] }) })
+    // The session panel draws every ask (options, card tiles, Open card); this plugin keeps only the compact companion
+    // queue (free text, pending-delivery Check/Retry, plan request, withdraw). Without the panel it shows an error,
+    // never the old standalone queue + strip: a silent fallback hid a broken panel load behind an outdated view.
+    panelWait.since = Date.now()
+    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => panelActive() ? jsx('div', { style: { minWidth: 0, width: '100%' }, children: jsx(ActionQueue, { companion: true }) }) : jsx(PanelMissing, {}) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }

@@ -202,7 +202,7 @@ test('queue registration uses canonical region; aliases suppress only exact refe
  window.hermesDesktop={api:async({path})=>path.includes('/requests')?{requests:[r,r]}:{steps:[{id:'us_12345678',gatewayId:'G1',profile:'default',text:'Original step',status:'open'}]}}
  const registrations=[];const dispose=m.default.register({register:c=>registrations.push(c)})
  await React.act(async()=>{await m.refreshRequests();await m.refresh()})
- await show(registrations[0].render())
+ await show(React.createElement('div',null,React.createElement(m.ActionQueue,{companion:false}),React.createElement(m.Strip)))
  assert.equal(el().querySelectorAll('[data-action-request]').length,1)
  assert.equal(el().querySelectorAll('[data-user-steps-step]').length,0)
  assert.equal(el().querySelectorAll('[data-user-steps-card]').length,1)
@@ -646,7 +646,7 @@ test('a withdrawn ask does not resurface as a legacy reference or a blocked prog
  window.hermesDesktop = { api: async ({ path }) => path.includes('/requests?') ? { requests: [gone] } : path.includes('/steps?') ? { steps: [] } : {} }
  const registrations = []; const dispose = m.default.register({ register: c => registrations.push(c) })
  await React.act(async () => { await m.refreshRequests(); await m.refresh() })
- await show(registrations[0].render())
+ await show(React.createElement('div',null,React.createElement(m.ActionQueue,{companion:false}),React.createElement(m.Strip)))
  assert.equal(el().querySelector('[data-action-request]'), null)
  assert.equal(el().querySelector('[data-user-steps-card]'), null, 'its aliased card stays suppressed')
  assert.equal(el().textContent, '')
@@ -933,7 +933,6 @@ test('with the session panel loaded, the strip keeps only the compact companion 
  const dispose = m.default.register({ register: a => areas.push(a) })
  try {
   const strip = areas.find(a => a.id === 'strip')
-  assert.notEqual(strip.render(), null, 'draws itself without the panel')
   window.__sessionPanel = { active: true }
   const drawn = strip.render()
   assert.equal(drawn.props.children.type, m.ActionQueue, 'the companion queue stays: free text, Retry, plan request, withdraw')
