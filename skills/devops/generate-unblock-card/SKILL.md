@@ -114,7 +114,7 @@ untried approaches within the unchanged limits; it can find one. If none fits, n
 the ask changes in `why_human` and the card body, for example "lowers the approved targets (links 0.2, memory
 128 MiB) or ends the goal unmet". Never offer "redesign" as an option.
 
-**An optional ask is offered once, ever.** AGENTS.md's offer-once rule (silence = default, never restated) is enforced by the ask-gate repeat hold, and it counts an ask you filed and later withdrew. A withdrawal comment must therefore state the default that now holds, never "this question comes back if X". The re-filing is refused (`repeat/completion lacks grounded subject/action equivalence`), and the worker was told to expect a change that never comes. Later numbers that favour the old recommendation are gate status in your report, not a new ask.
+**An optional ask is offered once, ever, and a withdrawn ask counts.** The ask-gate repeat hold refuses re-filing it (`human_request not verified (unverified): repeat`). So a withdrawal comment states the default that now holds, never "this comes back if X": that promise leaves the worker expecting a change that cannot come. Later numbers that favour the old recommendation are gate status in your report, not a new ask.
 
 **Scope that is already a contract.** A PR approval (`scope` = `owner/repo#12 head abc1234`, pr-approval grammar)
 or a physical ask (`DEVICE:` / `HUMAN_STEP:` / `OBSERVATION:` / `EVIDENCE:` lines) keeps that scope exactly; the
