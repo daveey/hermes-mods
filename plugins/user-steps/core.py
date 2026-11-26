@@ -328,25 +328,25 @@ def lineage(session_id: str, db: Optional[Path] = None) -> list[str]:
         # Use core's own forward selector where its full schema is available. This also excludes
         # explicit/reset/delegate/tool forks and non-preferred siblings, just like refresh_outcome.
         from contextlib import closing
-        with closing(_ro_connect(db, timeout=2)) as conn:
-            columns = {r[1] for r in conn.execute('PRAGMA table_info(sessions)')}
-            if 'model_config' in columns:
-                try:
-                    from hermes_state_compression import _CHAIN_STEP_SQL
-                except ImportError:
-                    meta = conn.execute('SELECT model_config FROM sessions WHERE id=?', (cur,)).fetchone()
-                    config = json.loads(meta[0] or '{}') if meta else {}
-                    if (pr[2] != 'compression' or r[3] == 'tool' or any(
-                            config.get(k) is not None for k in ('_branched_from', '_reset_from', '_delegate_from'))):
-                        break
-                else:
+        try:
+            with closing(_ro_connect(db, timeout=2)) as conn:
+                columns = {r[1] for r in conn.execute('PRAGMA table_info(sessions)')}
+                if 'model_config' in columns:
                     try:
+                        from hermes_state_compression import _CHAIN_STEP_SQL
+                    except ImportError:
+                        meta = conn.execute('SELECT model_config FROM sessions WHERE id=?', (cur,)).fetchone()
+                        config = json.loads(meta[0] or '{}') if meta else {}
+                        if (pr[2] != 'compression' or r[3] == 'tool' or any(
+                                config.get(k) is not None for k in ('_branched_from', '_reset_from', '_delegate_from'))):
+                            break
+                    else:
                         selected = conn.execute(_CHAIN_STEP_SQL, (parent,)).fetchone()
-                    except sqlite3.Error:
-                        # An incomplete/unavailable core schema cannot authorize a parent hop.
-                        break
-                    if not selected or selected[0] != cur:
-                        break
+                        if not selected or selected[0] != cur:
+                            break
+        except sqlite3.Error:
+            # Opening, schema inspection and either selector must all fail closed.
+            break
         out.append(parent)
         cur = parent
     return out
