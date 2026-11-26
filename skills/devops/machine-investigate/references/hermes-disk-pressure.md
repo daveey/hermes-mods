@@ -19,6 +19,11 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
    read-only (`file:...?mode=ro`). A directory with no task row is unknown, not abandoned.
 5. **Find live writers** by sampling `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone
    don't show which process is writing.
+6. **Delete a "redundant" copy only from an exact manifest.** List every exact path first (a `.gz` beside its
+   snapshot, a relocation's source). Verify each kept destination exists, its sha256 matches the mapping
+   (`manifest.json` where there is one), and no process has either path as cwd or open fd. A relocation receipt
+   or an original-path symlink is not deletion authorization: keep existing holds until the manifest names each
+   path, then comment on any open card that references it.
 
 ## Worker nodes (worker-N)
 
@@ -81,9 +86,7 @@ Inventory both `~/.cache/uv` and `~/.hermes/cache/uv`; runtime configuration can
   it as cwd or an open fd. Fix it at the source with a pid-tagged name plus a sweep of dead siblings.
 - **`cache/gc-trash`**: `purge_trash` only runs when that GC pass moved something, so old entries can sit there.
   Its contents are already marked for deletion.
-- **`kanban/evidence/<task>`**: nothing cleans it up. Before deleting a redundant copy, such as a `.gz` next to
-  the decompressed snapshot, verify that the kept copy's sha256 still matches `manifest.json`. Then comment on
-  any open card that references the path.
+- **`kanban/evidence/<task>`**: nothing cleans it up. Delete redundant copies there only by Order step 6.
 
 Most of the remaining space is usually live work: research artifacts, open-card workspaces, models and containers.
 When cleanups keep landing above ~80% used, the lasting fix is capacity (a David-only spend ask), not another
