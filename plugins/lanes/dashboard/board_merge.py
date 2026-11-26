@@ -6,9 +6,14 @@ import sqlite3
 import time
 
 
+# Per-board query budget. 2 s was below the hub's normal flow cost (~2.1 s warm, load ~12), so every
+# refresh was interrupted and the strip lost all its categories; 8 s still bounds a wedged board.
+BOARD_READ_BUDGET_S = 8
+
+
 def arm_deadline(db):
     """Each board gets its own query budget, not time spent on sibling boards."""
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + BOARD_READ_BUDGET_S
     db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
 
 
