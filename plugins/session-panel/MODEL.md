@@ -99,6 +99,10 @@ to its lineage; `inputs.PROCESS_CHECKPOINT_FIELDS`), on its own 45-second re-pro
 it holds processes, or on its own retry clock (1 s after losing a publication race; a
 failed capture backs off from 0.1 s to at most 45 s). A rewrite that leaves its evidence
 unchanged, another chat's process, or another chat's failure never makes it due.
+The fingerprint covers sandbox-scope entries too, and the union of the panel lineage and
+core's compression lineage of the chat's tip (what refresh_outcome reads); every profile's
+checkpoint is watched. A capture invalidates core's 3-second process cache before
+refresh_outcome, so an exit that made the chat due is never certified from the warm cache.
 The refreshed canonical `outcome_json.status` remains the one state envelope shared
 by the panel header and Desktop sidebar; rows do not implement a competing status
 classifier. Intentional process termination can leave a failed receipt requiring

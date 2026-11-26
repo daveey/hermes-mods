@@ -1588,8 +1588,11 @@ class CoreReaders:
 
     def watch_paths(self) -> list[Path]:
         """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
-        return self.board_paths() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3',
-                                    self.state_db().parent / 'processes.json'] + self.external_paths()
+        home = self.state_db().parent
+        # Every profile's process checkpoint, as core's process inventory reads them (a write wakes the lane).
+        checkpoints = [home / 'processes.json'] + sorted((home / 'profiles').glob('*/processes.json'))
+        return self.board_paths() + [self.state_db(), home / 'user-steps' / 'actions.sqlite3'] + checkpoints \
+            + self.external_paths()
 
     def external_paths(self) -> list[Path]:
         """Origin receipts and hub replicas are inputs, not task-event boards."""
@@ -1811,7 +1814,26 @@ class CoreReaders:
         self.require_scope('panel_runtime_inputs')
         if self._explicit_home() is not None:
             self._refuse('panel_runtime_inputs')
-        return self._panel_input_module().process_fingerprints(lineages)
+        mod = self._panel_input_module()
+        key = (tuple((str(p), self._stat(p)) for p in mod.checkpoint_paths()),
+               tuple(sorted((s, tuple(ids)) for s, ids in lineages.items())))
+        memo = getattr(self, '_fingerprint_memo', None)
+        if memo is not None and memo[0] == key:
+            return dict(memo[1])  # no checkpoint and no lineage moved: no lineage reads either
+        prints = mod.process_fingerprints(lineages, core_lineage=self._core_lineages(lineages))
+        self._fingerprint_memo = (key, prints)
+        return dict(prints)
+
+    def _core_lineages(self, lineages):
+        """session -> the ids refresh_outcome reads processes for: core's compression lineage of the chat's tip
+        (ancestors and descendants), which the panel lineage (parent ancestors) does not always cover."""
+        import hermes_state_outcome as so
+        from hermes_state import SessionDB
+        out = {}
+        with SessionDB(db_path=self.state_db(), read_only=True) as db:
+            for session in lineages:
+                out[session] = so._lineage_ids(db, so._tip(db, session))
+        return out
 
     def runtime_inputs(self, session, lineage):
         """Background producer only: re-probe processes and publish canonical status.
@@ -1824,6 +1846,9 @@ class CoreReaders:
             self._refuse('panel_runtime_inputs')
         from hermes_state import SessionDB
         from hermes_state_outcome import refresh_outcome
+        # Core's process inventory keeps a 3 s cache. A capture is admitted because evidence moved (often a
+        # process exit), so refresh_outcome must probe now, not certify the warm pre-exit cache.
+        self._panel_input_module().invalidate_process_cache()
         with SessionDB(db_path=self.state_db()) as db:
             if db.get_session(session) is None:
                 return {'outcome_json': {}, 'processes': []}

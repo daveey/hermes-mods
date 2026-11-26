@@ -55,12 +55,23 @@ PROCESS_CHECKPOINT_FIELDS = ('pid_scope', 'pid', 'host_start_time', 'session_id'
                              'session_key', 'parent_session_id', 'owner_task_id', 'task_id', 'sandbox_key')
 
 
-def process_fingerprints(lineages):
+def invalidate_process_cache():
+    importlib.import_module('hermes_cli.process_session_activity')._invalidate_cache()
+
+
+def checkpoint_paths():
+    """The process checkpoints core's inventory reads (its own `_checkpoint_paths`)."""
+    return importlib.import_module('hermes_cli.process_session_activity')._checkpoint_paths()
+
+
+def process_fingerprints(lineages, core_lineage=None):
     """session -> a hashable value that changes whenever the processes.json evidence runtime_inputs reads
     for that chat may have: the read fields of every host entry core attributes to the chat's lineage
     (core's own `_owner_ids`), per checkpoint file (the file names the entry's profile). None when the
     chat owns no entry. A kernel probe (pid still alive) is not a file field: the producer's timed
-    re-probe of a chat holding processes covers it."""
+    re-probe of a chat holding processes covers it. Sandbox-scope (non-host) entries count too: core's
+    checkpoint status reads them. `core_lineage` (session -> ids) adds the compression lineage
+    refresh_outcome reads to the panel lineage."""
     producer = importlib.import_module('hermes_cli.process_session_activity')
     by_owner = {}
     for path in producer._checkpoint_paths():
@@ -69,14 +80,15 @@ def process_fingerprints(lineages):
         except Exception:
             continue  # core reads an unreadable checkpoint as no entries; so does this
         for item in entries if isinstance(entries, list) else ():
-            if not isinstance(item, dict) or item.get('pid_scope', 'host') != 'host':
-                continue  # core never reads a non-host entry past this test
+            if not isinstance(item, dict):
+                continue
             evidence = (str(path), json.dumps([item.get(k) for k in PROCESS_CHECKPOINT_FIELDS], default=str))
             for owner in producer._owner_ids(item):
                 by_owner.setdefault(owner, set()).add(evidence)
     out = {}
     for session, lineage in lineages.items():
-        found = set().union(*(by_owner.get(i, ()) for i in dict.fromkeys([session, *lineage])))
+        ids = dict.fromkeys([session, *lineage, *((core_lineage or {}).get(session) or ())])
+        found = set().union(*(by_owner.get(i, ()) for i in ids))
         out[session] = tuple(sorted(found)) if found else None
     return out
 
