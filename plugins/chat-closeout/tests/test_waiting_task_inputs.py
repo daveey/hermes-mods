@@ -102,7 +102,7 @@ def test_waiting_fallback_logs_source_without_private_reason(certified, monkeypa
     assert plugin._inputs_local.failed and plugin._inputs_local.hit is None
 
 
-def test_large_watched_set_reads_marks_in_one_query(certified, monkeypatch):
+def test_large_watched_set_reads_settlement_values_in_one_query(certified, monkeypatch):
     """The live waiting ledger watches about 1200 tails, not just the two in the tiny fixture."""
     import contextlib
     from hermes_cli import kanban_activity_revision as rev
@@ -122,11 +122,19 @@ def test_large_watched_set_reads_marks_in_one_query(certified, monkeypatch):
     cursor = plugin._wi['waiting_boards'][(str(certified['board']), None)]
     with sqlite3.connect(certified['board']) as conn:
         full = conn.execute(f'SELECT rev FROM {rev.CHANGE_TABLE} WHERE task_id = ?', (rev.FULL_MARK,)).fetchone()
+        from hermes_cli import kanban_task_change as tc
+        conn.execute('BEGIN')
+        marks = tc.settlement_marks(conn, tails, cursor) if hasattr(tc, 'settlement_marks') else None
+        kind = 'settlement' if marks is not None else 'broad'
+        if marks is None:
+            marks = dict(conn.execute(f'SELECT task_id, rev FROM {rev.CHANGE_TABLE}'))
+        conn.rollback()
     present = {tail: [['str', tail], ['str', 'done'], ['NoneType', None], ['float', (100.0).hex()]]
                for tail in ('t_1', 't_2')}
-    expected = plugin.wi.strict_digest(['settlement-values-v1', cursor.dev, cursor.ino, cursor.shm,
+    expected = plugin.wi.strict_digest(['settlement-values-v2', cursor.dev, cursor.ino, cursor.shm,
                                       cursor.schema_version, cursor.tables, list(full),
-                                      [[tail, present.get(tail)] for tail in sorted(tails)]])
+                                      [[tail, present.get(tail)] for tail in sorted(tails)],
+                                      kind, [[tail, marks.get(tail, 0)] for tail in sorted(tails)]])
     assert key == expected  # typed light values, explicit absence, unchanged certified identity
     keyed = [sql for sql in statements if 'FROM tasks WHERE id IN' in sql]
     assert len(keyed) == 1, f'{len(keyed)} value SELECTs for one waiting board'
