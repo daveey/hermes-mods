@@ -304,6 +304,11 @@ def protected_processes(host=None) -> dict:
     try:
         if host:
             opts, dest = host
+            # A destination follows the caller's --, not our option allowlist.
+            # Never reinterpret an option-shaped operand as inspection options.
+            if dest.startswith('-'):
+                logger.warning("backend-restart-guard refused unsafe SSH destination")
+                return {}
             # Execute this same discovery code on the target, not local PID guesses.
             source = Path(__file__).read_text()
             source += '\nprint(json.dumps(protected_processes()))\n'
@@ -313,7 +318,7 @@ def protected_processes(host=None) -> dict:
             try:
                 res = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes",
                                       "-o", f"ConnectTimeout={REMOTE_CONNECT_TIMEOUT}",
-                                      "-o", "ClearAllForwardings=yes", *safe_opts, dest, "python3 -"], input=source,
+                                      "-o", "ClearAllForwardings=yes", *safe_opts, "--", dest, "python3 -"], input=source,
                                      capture_output=True, text=True, timeout=REMOTE_CONNECT_TIMEOUT + 5)
             except subprocess.TimeoutExpired:
                 logger.warning("backend-restart-guard PID discovery failed open: remote %s timed out after %ss",
@@ -449,6 +454,8 @@ def _signal_argv(argv: list, depth=0, host=None) -> Optional[str]:
                 return _signal_shell(args[i + 1], depth + 1, host)
     if prog == 'ssh':
         opts, dest, command = _ssh_parts(args)
+        if dest.startswith('-'):
+            return 'unsafe SSH destination; option-shaped operands cannot be inspected'
         return _signal_shell(command, depth + 1, (opts, dest))
     if re.fullmatch(r'python(?:3(?:\.\d+)?)?', prog) and '-c' in args:
         i = args.index('-c')
