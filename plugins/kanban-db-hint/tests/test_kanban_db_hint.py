@@ -206,6 +206,14 @@ def test_shell_and_markdown_path_payload_not_recommended():
         assert path not in json.loads(out)["hint"]
 
 
+def test_db_path_at_end_of_diagnostic_is_preserved():
+    raw = "Refusing to open corrupt kanban DB at /x/kanban.db"
+    data = json.loads(hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw})))
+    assert data["error"] == raw
+    assert "sqlite3 -readonly /x/kanban.db 'pragma quick_check'" in data["hint"]
+    assert "<board db>" not in data["hint"]
+
+
 def test_db_sidecar_and_backup_suffixes_do_not_guess_live_path():
     for suffix in (".corrupt.bak", "-wal", "-shm"):
         raw = f"Refusing to open corrupt kanban DB at /x/kanban.db{suffix}: bad"
