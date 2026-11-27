@@ -1003,32 +1003,39 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
     board_db = board_db_path(str(owner.get("board") or "default")) if owner.get("kind") == "card" else None
     cursor = board_event_cursor(board_db) if board_db else None  # before the job exists: later events are newer
     job = jobs_dir() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
-    job.mkdir(parents=True)
-    (job / "cmd.sh").write_text(command.rstrip("\n") + "\n")
-    (job / "cmd_display.txt").write_text(visible(command.rstrip("\n")) + "\n")
-    (job / "reason.txt").write_text(reason.strip() + "\n" if reason.strip() else "")
-    (job / "reason_display.txt").write_text(visible(reason.strip()) + "\n" if reason.strip() else "")
-    (job / "cwd.txt").write_text(cwd)
-    (job / "cwd_display.txt").write_text(visible(cwd))
+    job.mkdir(mode=0o700, parents=True)
+
+    def write(name: str, text: str) -> None:
+        # Set privacy at creation, not with chmod after plaintext has been exposed.
+        fd = os.open(job / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+
+    write("cmd.sh", command.rstrip("\n") + "\n")
+    write("cmd_display.txt", visible(command.rstrip("\n")) + "\n")
+    write("reason.txt", reason.strip() + "\n" if reason.strip() else "")
+    write("reason_display.txt", visible(reason.strip()) + "\n" if reason.strip() else "")
+    write("cwd.txt", cwd)
+    write("cwd_display.txt", visible(cwd))
     full, short = origin_lines(origin)
     if full:
-        (job / "origin.txt").write_text(full)
-        (job / "origin_short.txt").write_text(short + "\n")
+        write("origin.txt", full)
+        write("origin_short.txt", short + "\n")
     if confirm is None:
         mode = confirm_mode()
         confirm = mode == "all" or (mode == "remote" and bool(full))
     if confirm:
-        (job / "confirm").write_text("1\n")
-    (job / "runner.sh").write_text(RUNNER)
-    (job / "watchdog.sh").write_text(_watchdog_script())
-    (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
-    (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
+        write("confirm", "1\n")
+    write("runner.sh", RUNNER)
+    write("watchdog.sh", _watchdog_script())
+    write("status.json", json.dumps({"status": "waiting_for_user"}))
+    write("meta.json", json.dumps({"command": command, "reason": reason, "cwd": cwd,
                                                 "origin": origin if full else None, "created": time.time(),
                                                 "owner": owner, "home": str(_home().resolve()), "board_db": board_db,
                                                 "board_event_cursor": cursor,
                                                 "max_wait_minutes": max_wait_minutes(),
                                                 "reattach_grace_minutes": reattach_grace_minutes()}))
-    (job / "owner.json").write_text(json.dumps(_legacy_owner(owner, board_db)))
+    write("owner.json", json.dumps(_legacy_owner(owner, board_db)))
     return job
 
 
@@ -2811,6 +2818,9 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
 
 def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
+        refusal = owner_refusal(session_id)
+        if refusal:
+            return _err(refusal)
         attached: dict = {}
         withdraw = str(args.get("action") or "").strip().lower() == "withdraw"
         if str(args.get("action") or "").strip().lower() == "focus":
@@ -3283,35 +3293,12 @@ def _sender(session_id: str | None) -> dict:
     return info
 
 
-_RELAY_FILES: Any = None
-
-
-def _relay_files() -> Any:
-    """session-mentions' relay_files (the courier's outbox protocol), loaded from the sibling plugin dir; None when
-    that plugin is not installed next to user-terminal."""
-    global _RELAY_FILES
-    if _RELAY_FILES is None:
-        import importlib.util
-        here = Path(__file__)
-        for d in (here.parent.parent, here.resolve().parent.parent):  # ~/.hermes/plugins, or the checkout
-            src = d / "session-mentions" / "relay_files.py"
-            if src.is_file():
-                spec = importlib.util.spec_from_file_location("_user_terminal_relay_files", src)
-                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-                spec.loader.exec_module(mod)  # type: ignore[union-attr]
-                _RELAY_FILES = mod
-                break
-    return _RELAY_FILES
-
-
 def _take_back(path: Path) -> bool:
-    """relay_files.take_back: True only when this call took the request out of the outbox, so no courier did.
+    """Atomically take an unclaimed outbox request back without loading another plugin.
 
-    A session-mentions without take_back (an older plugin next to this one) or none at all gets the same
-    os.replace take-back inline: an unlink racing the courier's claim can also succeed on APFS."""
-    shared = getattr(_relay_files(), "take_back", None)
-    if shared is not None:
-        return bool(shared(path))
+    A courier claims with os.replace too: only one rename wins, unlike unlink on APFS.
+    The hidden non-JSON taken file is never offered to a courier and is deleted at once.
+    """
     taken = path.with_name(f".{path.stem}.taken")
     try:
         os.replace(path, taken)

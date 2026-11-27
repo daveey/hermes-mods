@@ -48,6 +48,7 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
 
 @pytest.fixture(autouse=True)
 def _confirm_env(monkeypatch):
+    monkeypatch.setenv("HERMES_PLATFORM", "cli")  # local-handler cases are owner CLI calls
     # This suite tests direct terminal fallback. Responsibility routing has its own
     # suite; never discover a developer's installed app behind mocked subprocesses.
     monkeypatch.setattr(ut, "_signed_opener_python", lambda: None, raising=False)
@@ -1519,19 +1520,13 @@ def test_relay_once_claimed_at_the_pickup_deadline_waits_for_its_answer(remote, 
     assert not _outbox(base)
 
 
-@pytest.mark.parametrize("loaded", [None, "no take_back"])
-def test_take_back_falls_back_inline_when_session_mentions_lacks_it(monkeypatch, tmp_path, loaded):
-    """Version skew: session-mentions missing, or an older one without take_back. Still an os.replace take-back."""
-    monkeypatch.setattr(ut, "_relay_files", lambda: None if loaded is None else object())
+def test_take_back_is_self_contained(tmp_path):
+    """Always use the local os.replace protocol, independent of sibling installation/version."""
     path = tmp_path / "r.json"
     path.write_text("{}")
     assert ut._take_back(path) is True
-    assert not list(tmp_path.iterdir())  # neither the request nor its taken copy is left
-    assert ut._take_back(path) is False  # gone (claimed or taken): not ours
-
-
-def test_take_back_uses_session_mentions_relay_files():
-    assert ut._relay_files().take_back.__module__ == "_user_terminal_relay_files"
+    assert not list(tmp_path.iterdir())
+    assert ut._take_back(path) is False
 
 
 @pytest.mark.parametrize("pickup_s", [1.0, 30.0])
