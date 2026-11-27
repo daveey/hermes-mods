@@ -1013,7 +1013,7 @@ test('mixed waits: each row box keeps its own category; the square is amber whil
  assert.equal(effective.header.pips.find(p => p.section === 'waiting').last_wait_kind, 'agent')
  assert.equal(m.pipCategory(effective.header.pips.find(p => p.section === 'waiting')), 'blue')
 })
-for (const name of ['ci', 'spend', 'triage']) test(`expired stuck ${name} never inherits a blue waiting category`, { skip: !publicCases[`palette_stuck_${name}`] }, async () => {
+for (const name of ['ci', 'spend', 'triage', 'aged_triage']) test(`expired stuck ${name} never inherits a blue waiting category`, { skip: !publicCases[`palette_stuck_${name}`] }, async () => {
  const { model, now } = publicCases[`palette_stuck_${name}`]
  assert.equal(model.sections.stuck.length, 1)
  const before = JSON.stringify(model)

@@ -140,7 +140,7 @@ cases['palette_mixed'] = f.bundle(f.task('t_ci', status='scheduled', wait=dict(P
                                   f.task('t_plain', status='blocked'))
 from test_wait_palette import stalled_cases, withdrawal_cases
 for name, b in stalled_cases():
-    if name != 'triage' or f.AGED:
+    if not name.endswith('triage') or f.AGED:
         cases['palette_stuck_' + name] = b
 for name, b, _ in withdrawal_cases():
     cases['palette_' + name] = b
