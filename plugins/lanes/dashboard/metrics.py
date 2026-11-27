@@ -72,10 +72,11 @@ def fleet_slots():
 
 
 def present(view, slots):
-    """All chart scales and hypothetical cap counts are hub-owned, after board merge.
+    """Observed chart visuals are hub-owned, after board merge.
 
-    Forecast red means observed running demand exceeds the draft cap, not a
-    historical rejection. Unknown samples stay unknown in every preview.
+    Draft-cap previews are pure presentation computed client-side from each
+    cell's observed ``running`` value (precomputing every cap cost ~1.65MB per
+    variant). Legacy ``previews`` are stripped so they never ship.
     """
     view = deepcopy(view)
     view['fleet_slots'] = slots
@@ -88,18 +89,12 @@ def present(view, slots):
         ticks.pop('previews', None)
         cells = ticks['cells']
         peak = max((c.get('running') or 0 for c in cells), default=0) or 1
-        def visual(cell, cap, forecast=False):
+        def visual(cell, cap):
             cell = dict(cell)
             running = cell.get('running')
-            if forecast:
-                cell.update(cap=cap, forecast=True)
             if running is None:
                 cell.update(state='unknown', visual=dict(height=1, opacity=1))
                 return cell
-            if forecast:
-                cell['state'] = ('rejecting' if cap is not None and running > cap else
-                                 'full' if cap is not None and running >= cap and running else
-                                 'partial' if running else 'empty')
             scale = cap if cap is not None and cap > 0 else peak
             ratio = min(1, running / scale)
             cell['visual'] = dict(height=(max(.15, ratio) if cell['state'] == 'partial' else
@@ -107,15 +102,6 @@ def present(view, slots):
                                   opacity=.25 + .5 * ratio if cell['state'] == 'partial' else 1)
             return cell
         ticks['cells'] = [visual(c, c.get('cap')) for c in cells]
-        if type(slots) is int and slots >= 0:
-            previews = {}
-            for cap in [*range(slots + 1), None]:
-                previews['unlimited' if cap is None else str(cap)] = dict(
-                    cells=[visual(c, cap, True) for c in cells], total=len(cells),
-                    affected=sum(c.get('running') is not None and cap is not None and c['running'] > cap for c in cells),
-                    unknown=sum(c.get('running') is None for c in cells),
-                    now=row.get('status', {}).get('run'))
-            ticks['previews'] = previews
     return view
 
 

@@ -32,6 +32,11 @@ try {
     await pointer('pointerdown', fraction * 200)
     assert.equal(writes.length, cap === 2 ? 0 : cap === null ? 1 : 2, 'release-only commit')
     await pointer('pointerup', fraction * 200)
+    // The pointer handler starts an async HTTP write; React event flushing is not its receipt.
+    const expectedWrites = cap === 2 ? 1 : cap === null ? 2 : 3
+    const writeDeadline = Date.now() + 10000
+    while (writes.length < expectedWrites && Date.now() < writeDeadline) await pane.flush()
+    assert.equal(writes.length, expectedWrites, 'real PUT completed')
     assert.equal(writes.at(-1).max_workers, cap)
     assert.equal(slider.dataset.saving, '1', 'HTTP receipt is not push confirmation')
     // The producer confirmation can follow the PUT; the slider must retain saving meanwhile.

@@ -6,7 +6,7 @@ const P = await loadPlugin({ SIDEBAR_SECTIONS_TOP_AREA: 'sidebar.sections.top', 
 const T0 = Date.UTC(2026, 10, 27, 0, 0) / 1000
 const cell = (i, over = {}) => ({ t: T0 + i * 1800, state: 'empty', running: 0, cap: 4, rejected: 0, rejection_unknown: false, visual: { height: 0, opacity: 1 }, ...over })
 const cellsOf = (fn = () => ({})) => Array.from({ length: 48 }, (_, i) => cell(i, fn(i)))
-const preview = (affected, now, mark = 'rejecting') => ({ cells: cellsOf(i => i < affected ? { state: mark, rejected: 2, visual: { height: 1, opacity: 1 } } : {}), affected, total: 48, now })
+
 const snapshot = (over = {}, rowOver = {}) => ({ configured: true, fleet_slots: 6, status: { run: 2, you: 1 }, totals: { not_ready: 3 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
   governors: { idle_total: 0, rows: [], counts: { on: 0, off: 0 } },
@@ -15,8 +15,7 @@ const snapshot = (over = {}, rowOver = {}) => ({ configured: true, fleet_slots: 
     ticks: { window: '24h', bucket_s: 1800, cap: 4, cells: cellsOf(i => i === 1 ? { state: 'partial', running: 1, visual: { height: .4, opacity: .5 } }
       : i === 2 ? { state: 'full', running: 4, visual: { height: 1, opacity: 1 } }
       : i === 3 ? { state: 'rejecting', running: 4, rejected: 3, visual: { height: 1, opacity: 1 } }
-      : i === 4 ? { state: 'rejecting', running: 4, rejection_unknown: true, visual: { height: 1, opacity: 1 } } : {}),
-    previews: { 0: preview(48, 3), 2: preview(9, 3), 5: preview(1, 3), unlimited: { cells: cellsOf(), affected: 0, total: 48, now: 3 } } },
+      : i === 4 ? { state: 'rejecting', running: 4, rejection_unknown: true, visual: { height: 1, opacity: 1 } } : {}) },
     ...rowOver } }, ...over })
 
 function setup(body = snapshot(), { failWrite = false } = {}) {
@@ -116,7 +115,7 @@ test('totals-only subscriber starts with the sidebar window; legacy window key i
   } finally { await pane.close(); localStorage.clear() }
 })
 
-test('dragging recolours from server previews with caption, commits on release only, and holds draft until hub confirms', async () => {
+test('dragging recolours supplied running peaks with caption, commits on release only, and holds draft until hub confirms', async () => {
   const t = setup(); const { pane, slider } = await open(t)
   try {
     const before = pane.container.querySelector('.lanes-ticks').outerHTML
@@ -124,12 +123,12 @@ test('dragging recolours from server previews with caption, commits on release o
     await pointer(pane, slider, 'pointerdown', 2 / 6 * 0.97) // stop 2
     assert.equal(slider.getAttribute('aria-valuenow'), '2')
     assert.notEqual(pane.container.querySelector('.lanes-ticks').outerHTML, before)
-    assert.equal(pane.container.querySelectorAll('[data-tick="rejecting"]').length, 9)
-    assert.equal(pane.container.querySelector('[data-caption]').textContent, 'cap 2 would have turned cards away in 9 of 48 periods (now 3) · release to save')
+    assert.equal(pane.container.querySelectorAll('[data-tick="rejecting"]').length, 3)
+    assert.equal(pane.container.querySelector('[data-caption]').textContent, 'cap 2 would have turned cards away in 3 of 48 periods (now 2) · release to save')
     assert.match(pane.container.querySelector('.lanes-pending').textContent, /cap 2/)
     await pointer(pane, slider, 'pointermove', 5 / 6 * 0.97)
-    assert.equal(pane.container.querySelectorAll('[data-tick="rejecting"]').length, 1)
-    assert.match(pane.container.querySelector('[data-caption]').textContent, /^cap 5 would have turned cards away in 1 of 48/)
+    assert.equal(pane.container.querySelectorAll('[data-tick="rejecting"]').length, 0)
+    assert.match(pane.container.querySelector('[data-caption]').textContent, /^cap 5 would have turned cards away in 0 of 48/)
     assert.equal(t.writes.length, 0, 'no write while dragging')
     assert.equal(t.updates.length, calls, 'no forecast or stream request while dragging')
     await pointer(pane, slider, 'pointerup', 2 / 6 * 0.97)
@@ -205,6 +204,36 @@ test('keyboard: arrows step, Home is 0, End is infinity, commit on key release, 
     await key('keyup', 'ArrowDown')
     assert.deepEqual(t.writes.at(-1), ['/v1/lanes/work', { max_workers: 6 }])
   } finally { await pane.close(); localStorage.clear() }
+})
+
+test('missing lane limits are unknown, disabled and never infinity', async () => {
+  for (const limits of [undefined, null, {}]) {
+    const t = setup(snapshot({ flow_error: 'board-a: interrupted' }, { limits })); const { pane, slider } = await open(t)
+    try {
+      assert.equal(slider.getAttribute('aria-disabled'), 'true')
+      assert.equal(slider.getAttribute('aria-valuenow'), null)
+      assert.match(slider.title, /board-a: interrupted/)
+      assert.match(slider.getAttribute('aria-valuetext'), /Cap unknown/)
+      assert.doesNotMatch(slider.textContent, /∞/)
+      assert.equal(slider.textContent, '—')
+      await pointer(pane, slider, 'pointerdown', .5); await pointer(pane, slider, 'pointerup', .5)
+      await pane.event(slider, 'keydown', { key: 'End' }); await pane.event(slider, 'keyup', { key: 'End' })
+      assert.equal(t.writes.length, 0)
+    } finally { await pane.close(); localStorage.clear() }
+  }
+})
+
+test('draft recolour preserves unknowns, zero cap and uncapped own-peak scales without mutating hub cells', () => {
+  const ticks = { cells: [cell(0), cell(1, { running: 2 }), cell(2, { running: 4 }), cell(3, { running: null, rejected: null })] }
+  const before = JSON.stringify(ticks)
+  const zero = P.capPreview(ticks, 0, 2)
+  assert.deepEqual(zero.cells.map(c => c.state), ['empty', 'rejecting', 'rejecting', 'unknown'])
+  assert.equal(zero.affected, 2); assert.equal(zero.unknown, 1)
+  const unlimited = P.capPreview(ticks, null, 2)
+  assert.deepEqual(unlimited.cells.map(c => c.state), ['empty', 'partial', 'partial', 'unknown'])
+  assert.equal(unlimited.cells[1].visual.height, .5)
+  assert.equal(unlimited.cells[2].visual.height, 1)
+  assert.equal(JSON.stringify(ticks), before)
 })
 
 test('slider is disabled for unknown fleet slots and while offline', async () => {

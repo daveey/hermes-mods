@@ -22,6 +22,24 @@ configured = base.configured
 person = base.person
 
 
+def test_failed_flow_limits_disabled_through_real_projection_dom(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    node_tests = root / 'desktop-plugins/lanes/tests'
+    if not shutil.which('node') or not (node_tests / 'node_modules/jsdom').exists():
+        pytest.skip('pinned Node DOM dependencies unavailable')
+    api = api_module()
+    snap = dict(configured=True, lanes={'babybear': dict(target=.3, actual=.2, open=1)},
+                flow_complete=False, flow_error='board-a: interrupted')
+    projected = api._sibling('view').project(snap, dict(configured=False, reason='board-a: interrupted'), True)
+    presented = api._sibling('metrics').present(projected, 24)
+    assert 'limits' not in presented['lanes']['babybear']
+    path = tmp_path / 'failed-flow.json'
+    path.write_text(json.dumps(presented))
+    result = subprocess.run(['node', str(node_tests / 'render-unknown-cap.mjs'), str(path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_real_dispatcher_red_dom_and_pointer_api_core_readback(conn, configured, monkeypatch):
     root = Path(__file__).resolve().parents[3]
     node_tests = root / 'desktop-plugins/lanes/tests'

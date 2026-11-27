@@ -1,6 +1,7 @@
-"""Hub-owned chart visuals and draft-cap previews retain observation provenance."""
+"""Hub-owned chart visuals; draft-cap previews are computed client-side from per-cell running values."""
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -39,38 +40,22 @@ def test_actual_visual_states_scales_and_missing_samples():
     assert out['lanes']['missing'] == dict(ticks=None, spend=None)
 
 
-def test_hub_previews_every_stop_counts_and_unknown_provenance():
+def test_draft_cap_previews_are_client_side_running_values_retained():
     cells = [cell(0, state='empty'), cell(1), cell(2), cell(3),
              cell(None, state='unknown', rejected=None), cell(1, state='rejecting', rejected=4)]
-    before = snapshot(cells)
-    out = load().present(before, 3)
+    out = load().present(snapshot(cells), 3)
     ticks = out['lanes']['work']['ticks']
-    previews = ticks['previews']
-    assert list(previews) == ['0', '1', '2', '3', 'unlimited']
-    assert [p['affected'] for p in previews.values()] == [4, 2, 1, 0, 0]
-    for key, preview in previews.items():
-        cap = None if key == 'unlimited' else int(key)
-        assert preview['total'] == 6 and preview['unknown'] == 1 and preview['now'] == 3
-        for original, forecast in zip(cells, preview['cells']):
-            assert forecast['cap'] == cap and forecast['forecast'] is True
-            assert forecast['running'] == original['running']
-            assert forecast['rejected'] == original['rejected']  # never invent historical rejections
-        assert preview['cells'][4]['state'] == 'unknown'
-        assert preview['cells'][4]['visual'] == dict(height=1, opacity=1)
-    assert [c['state'] for c in previews['2']['cells']] == [
-        'empty', 'partial', 'full', 'rejecting', 'unknown', 'partial']
-    assert [c['state'] for c in previews['0']['cells']] == [
-        'empty', 'rejecting', 'rejecting', 'rejecting', 'unknown', 'rejecting']
-    assert [c['state'] for c in previews['unlimited']['cells']] == [
-        'empty', 'partial', 'partial', 'partial', 'unknown', 'partial']
-    assert previews['2']['cells'][1]['visual'] == dict(height=.5, opacity=.5)
-    assert previews['unlimited']['cells'][1]['visual']['height'] == pytest.approx(1 / 3)
-    # Actual historical rejections remain red; unlimited draft isn't an actual rejection.
+    assert 'previews' not in ticks and out['fleet_slots'] == 3
+    # The client recolours from these observed values; no invented rejections.
+    for original, rendered in zip(cells, ticks['cells']):
+        assert rendered['running'] == original['running']
+        assert rendered['rejected'] == original['rejected']
+        assert 'forecast' not in rendered
+    assert ticks['cells'][4]['visual'] == dict(height=1, opacity=1)
     assert ticks['cells'][-1]['state'] == 'rejecting'
-    assert 'forecast' not in ticks['cells'][-1]
 
 
-def test_present_is_nonmutating_and_does_not_alias_cached_inputs_or_previews():
+def test_present_is_nonmutating_and_does_not_alias_cached_inputs():
     source = snapshot([cell(1), cell(None, rejected=None)])
     original = deepcopy(source)
     metrics = load()
@@ -80,32 +65,27 @@ def test_present_is_nonmutating_and_does_not_alias_cached_inputs_or_previews():
     out['lanes']['work']['status']['run'] = 999
     out['lanes']['work']['spend']['hour'] = 999
     out['lanes']['work']['limits']['max_workers'] = 999
-    ticks = out['lanes']['work']['ticks']
-    ticks['previews']['1']['cells'][0]['visual']['height'] = 999
-    assert ticks['previews']['2']['cells'][0]['visual']['height'] != 999
-    assert ticks['cells'][0]['visual']['height'] != 999
+    out['lanes']['work']['ticks']['cells'][0]['visual']['height'] = 999
     assert source == original
     assert metrics.present(source, 2) == metrics.present(source, 2)
 
 
-@pytest.mark.parametrize('slots', [None, -1, True, 2.5, '3'])
-def test_unknown_or_invalid_capacity_clears_old_previews_without_mutation(slots):
+@pytest.mark.parametrize('slots', [None, -1, True, 2.5, '3', 0, 24])
+def test_legacy_cached_previews_are_stripped_without_mutation(slots):
     metrics = load()
     known = metrics.present(snapshot([cell(1)]), 2)
+    known['lanes']['work']['ticks']['previews'] = {'0': {}}
     old = deepcopy(known)
-    unknown = metrics.present(known, slots)
-    assert 'previews' not in unknown['lanes']['work']['ticks']
+    out = metrics.present(known, slots)
+    assert 'previews' not in out['lanes']['work']['ticks']
     assert known == old
 
 
-@pytest.mark.parametrize('cells', [[], [cell(None, state='unknown', rejected=None)]])
-def test_zero_capacity_empty_and_all_unknown_series(cells):
-    ticks = load().present(snapshot(cells), 0)['lanes']['work']['ticks']
-    assert list(ticks['previews']) == ['0', 'unlimited']
-    for preview in ticks['previews'].values():
-        assert preview['total'] == len(cells)
-        assert preview['unknown'] == len(cells)
-        assert preview['affected'] == 0
+def test_payload_size_at_24_slots_typical_lanes_under_200kb():
+    cells = [cell(i % 5, cap=24) for i in range(48)]
+    view = {'lanes': {f'lane{i}': snapshot(cells)['lanes']['work'] for i in range(12)}}
+    size = len(json.dumps(load().present(view, 24)).encode())
+    assert size < 200_000, size
 
 
 def test_partial_visual_has_visible_floor_and_bounded_ratio():
