@@ -114,6 +114,55 @@ for (const age of [601, 6 * 86400]) {
   assert.equal(window.getComputedStyle(document.querySelector('[data-row-pip="stuck"]')).backgroundColor, 'rgb(248, 81, 73)')
  })
 }
+const groupRow = model => (model.groups || []).find(g => g.kind === 'blocker' && g.status === 'triage')
+for (const age of [599, 601]) {
+ test(`real CoreReaders -> reducer -> panel: shared-blocker group triage age ${age}`, { skip: !cases[`composed_triage_group_${age}`] }, async () => {
+  const { model, now } = cases[`composed_triage_group_${age}`]
+  const red = age > 600, group = groupRow(model)
+  assert.ok(group, 'the triage parent is a shared-blocker group, not a session row')
+  assert.equal(group.attention === 'triage_overdue', red)
+  assert.equal(model.header.attention === 'triage_overdue', red)
+  await paint(m.renderModel(model, { now }))
+  const box = document.querySelector(`[data-tree-node="${group.key}"] [data-row-pip]`)
+  assert.equal(window.getComputedStyle(box).backgroundColor === 'rgb(248, 81, 73)', red)
+  assert.equal(document.querySelector('[data-session-status]').style.color === 'var(--color-red-500)', red)
+  assert.doesNotMatch(document.body.textContent, /Needs you|Needs your decision/)
+ })
+}
+test('stale snapshot clears an overdue shared-blocker group in its box, text and header', { skip: !cases.composed_triage_group_601 }, async () => {
+  const { model, now } = cases.composed_triage_group_601
+  const before = JSON.stringify(model), key = groupRow(model).key
+  const effective = m.expireNativeWaits(model, now, false)
+  assert.ok((effective.groups || []).every(g => g.attention !== 'triage_overdue'))
+  assert.equal(effective.header.attention, undefined)
+  await paint(m.renderModel(model, { now, vouched: false }))
+  for (const box of document.querySelectorAll('[data-row-pip]'))
+   assert.notEqual(window.getComputedStyle(box).backgroundColor, 'rgb(248, 81, 73)', 'stale group claims no fresh operational red')
+  const text = document.querySelector(`[data-tree-node="${key}"]`).textContent
+  assert.match(text, /status unknown · last known: overdue triage · /)
+  assert.doesNotMatch(document.body.textContent.replaceAll('last known: overdue triage · ', ''), /overdue triage/)
+  assert.notEqual(document.querySelector('[data-session-status]').style.color, 'var(--color-red-500)')
+  assert.equal(JSON.stringify(model), before)
+  // Recovery: a fresh snapshot paints the group's backend red again.
+  await paint(m.renderModel(model, { now }))
+  assert.equal(window.getComputedStyle(document.querySelector(`[data-tree-node="${key}"] [data-row-pip]`)).backgroundColor, 'rgb(248, 81, 73)')
+})
+test('an expiring dispatcher diagnostic keeps a fresh group-only overdue header red', { skip: !cases.composed_triage_group_601 }, async () => {
+  const { model: source, now } = cases.composed_triage_group_601
+  const model = structuredClone(source)
+  assert.ok(model.sections.stuck.every(row => row.attention !== 'triage_overdue'), 'only the group carries overdue attention')
+  // An unrelated ready row whose current dispatcher reason outlives its 180 s window.
+  model.sections.ready.push({ key: 'card:diag', id: 't_diag', kind: 'card', title: 'Diagnostic', detail: 'ready', details: [], actions: [],
+    non_running_reason: { freshness: 'current', disposition: 'eligible', actor: 'dispatcher', observed_at: now - 500, valid_until: now + 1000 } })
+  model.header.counts.ready = (model.header.counts.ready || 0) + 1
+  const expired = m.expireDiagnostics(model, now)
+  assert.equal(expired.sections.ready.at(-1).non_running_reason.freshness, 'unknown', 'the diagnostic really expired')
+  assert.equal(expired.header.attention, 'triage_overdue')
+  assert.match(expired.header.label, /^overdue triage · /)
+  await paint(m.renderModel(model, { now }))
+  assert.equal(document.querySelector('[data-session-status]').style.color, 'var(--color-red-500)')
+  assert.equal(window.getComputedStyle(document.querySelector(`[data-tree-node="${groupRow(model).key}"] [data-row-pip]`)).backgroundColor, 'rgb(248, 81, 73)')
+})
 for (const diagnostic of [false, true]) for (const collapsed of [false, true]) {
  test(`expiry withdraws header attention and wait metadata diagnostic=${diagnostic} collapsed=${collapsed}`, async () => {
   const model = structuredClone(Object.values(cases).find(c => c.model?.sections?.needs_you?.length).model)
@@ -785,7 +834,7 @@ for (const [name, fixture] of Object.entries(publicCases).filter(([name]) => nam
  })
 }
 
-for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('header_clock_') && !name.startsWith('retiring_') && !name.startsWith('tree_') && !name.startsWith('shared_human_'))) {
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('header_clock_') && !name.startsWith('retiring_') && !name.startsWith('tree_') && !name.startsWith('shared_human_') && !name.startsWith('composed_triage_group_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')

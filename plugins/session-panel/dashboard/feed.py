@@ -279,6 +279,7 @@ class Feed:
         self._panel_subscribers = {}  # mounted-panel id -> (session, lease expiry)
         self._board_dirty = set()
         self._board_failures = set()
+        self._triage_fired = frozenset()  # triage-age crossings already re-reduced (see _triage_crossed)
         self._board_capture_failures = set()  # only a successful strict recapture may clear these
         self._board = threading.Event()
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
@@ -1586,12 +1587,14 @@ class Feed:
         # re-reduced for never re-arms the wake (bounded: one age pass per crossing, then normal cadence).
         with self.lock:
             due = [at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)]
-        fired = getattr(self, '_triage_fired', frozenset())
+        fired = self._triage_fired
         return min((at for at in due if at > now or at not in fired), default=None)
 
     def _triage_crossed(self, now):
         """Record the crossings an age pass is about to repaint."""
         with self.lock:
+            # Replaced wholesale: only deadlines that are currently past are retained, so the latch
+            # stays bounded and a later re-entry (a new, future deadline) arms normally.
             self._triage_fired = frozenset(
                 at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)
                 if at <= now)
