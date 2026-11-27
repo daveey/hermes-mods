@@ -34,6 +34,10 @@ operation. Label any cross-window proportional allocation as a sensitivity scena
 not a basis for skipping real work. Do not blanket-exclude syscalls: SQLite `pread` chains identify useful
 candidate work even though they do not establish time actually on CPU.
 
+## Isolated before/after replay
+
+When a live historical baseline is incomplete, keep controlled source replay separate from live Mac recovery. Pin pre/post source and dependencies, snapshot fixture SQLite stores with the backup API, hash identical inputs before each fresh process, and use a fixed offered schedule in balanced ABBA order with real monotonic and CPU clocks. Record service time and offer lateness separately. If retained evidence has expired, disclose any fixed evidence-wall-time replay: it does not prove live freshness or cache expiry. Preserve failed setup/pilot runs outside the qualifying series. Compare normalized output semantics explicitly, naming omitted clock fields; identical hashes do not prove those fields. Classify derived projection-cache writes separately from authoritative input mutations, and verify both arms produce the same derived state. A reader benchmark does not measure an HTTP endpoint that only serves previously published cache; exercise its real producer/publication boundary before claiming endpoint responsiveness.
+
 ## Wait classification and regression tests
 
 Match exact leaf names, not caller substrings or all symbols ending in `_trap`.
