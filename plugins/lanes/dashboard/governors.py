@@ -177,6 +177,16 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                               readings=[dict(board=s['board'], lane=r.get('scope'), reading=r.get('reading'),
                                              threshold=r.get('threshold'), detail=r.get('detail'),
                                              cards=r.get('cards', 0)) for r, s in items]))
+        # Acceptance 5: every fault governor is one red "can't start" chip, never one chip per cause.
+        faults = [c for c in chips if c['group'] == 'fault']
+        if faults:
+            merged = dict(faults[0], id='fault', name="can't start", count=sum(c['count'] for c in faults),
+                          reading=None, detail=None, readings=[],
+                          members=[dict(id=c['id'], name=c['name'], count=c['count']) for c in faults])
+            chips = [merged] + [c for c in chips if c['group'] != 'fault']
+        # Priority: red fault > budget > lane dial; the renderer keeps this order and never reorders by count.
+        order = {'fault': 0, 'lane_dial': 1, 'budget': 2}
+        chips.sort(key=lambda c: (order.get(c['group'], 3), -c['count'], c['id']))
         if chips:
             holds[lane] = chips
     stops = {ident for ident, observations in groups.items() for r, s, b in observations if s['available']
@@ -190,8 +200,12 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                               threshold=row['threshold'], group=group, clears=row['clears'], stop=stop,
                               readings=row['readings'], detail=row['detail'], since=row['since']))
     fleet.sort(key=lambda f: (f['group'] != 'safety', not f['stop'], -f['count'], f['id']))
-    stale_sources = [dict(board=s['board'], reason=s.get('reason') or 'stale dispatcher snapshot') for s in scope
-                     if not s['available'] or not s['accounting_available'] or not s['flow_available']]
+    stale_sources = [dict(board=s['board'], reason=s.get('reason') or (
+                         'governor receipts truncated' if s.get('truncated') else 'stale dispatcher snapshot'))
+                     for s in scope
+                     if not s['available'] or not s['accounting_available'] or not s['flow_available'] or s['truncated']]
+    if unsupported:
+        stale_sources.append(dict(board='dispatcher', reason='unsupported governor id: ' + ', '.join(unsupported)))
     held_total = sum(r['cards_charged'] for r in rows if GROUPS.get(r['id']) in DIALS)
     if charged != idle or unsupported:
         complete = lane_complete = False

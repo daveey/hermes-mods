@@ -142,8 +142,11 @@ def test_case5_fault_and_budget_cards_count_as_you_not_held():
                          cards, REGISTRY)
     assert result['held_total'] == 0
     chips = {c['id']: c for c in result['holds']['alpha']}
-    assert set(chips) == {'unassigned', 'model_pin', 'spend_budget'}
-    assert chips['unassigned']['group'] == 'fault' and chips['spend_budget']['group'] == 'budget'
+    assert set(chips) == {'fault', 'spend_budget'}  # one red can't-start chip for every fault cause
+    assert chips['fault']['count'] == 2 and chips['fault']['group'] == 'fault'
+    assert {m['id'] for m in chips['fault']['members']} == {'unassigned', 'model_pin'}
+    assert [c['id'] for c in result['holds']['alpha']] == ['fault', 'spend_budget']  # priority, not count
+    assert chips['spend_budget']['group'] == 'budget'
     assert all(c['needs_you'] for c in chips.values())
     body = project_view(result, cards)
     assert body['status']['you'] == 3 and body['lanes']['alpha']['governor_held'] == 0
@@ -164,3 +167,34 @@ def test_card_derived_dial_counts_come_from_charges_and_chip_has_no_invented_rea
     assert [(c['id'], c['count'], c['reading']) for c in result['holds']['alpha']] == [('lane_paused', 1, None)]
     assert result['held_total'] == 2
     assert project_view(result, cards)['lanes']['alpha']['governor_held'] == 2
+
+
+def test_fault_chip_outranks_a_bigger_lane_dial():
+    charges = {'t1': dict(governor='unassigned')}
+    cards = [dict(id='t1', board='main', lane='alpha', step='ready', reason='slot')]
+    gate = row('lane_gate', 9, scope='alpha', reading=10, threshold=50)
+    result = gov.project([snap('main', [gate, row('unassigned', 1)], 10, cards=charges)], cards, REGISTRY)
+    assert [c['id'] for c in result['holds']['alpha']] == ['fault', 'lane_gate']
+
+
+def test_truncated_and_unsupported_sources_are_named_not_anonymous_stale():
+    s = snap('main', [row('unassigned', 5)], 5, truncated=True, cards={'t1': dict(governor='unassigned')})
+    cards = [dict(id='t1', board='main', lane='alpha', step='ready', reason='slot')]
+    result = gov.project([s], cards, REGISTRY)
+    assert [(x['board'], x['reason']) for x in result['stale_sources']] == [('main', 'governor receipts truncated')]
+    result = gov.project([snap('main', [row('from_the_future', 1)], 1)], [], REGISTRY)
+    assert [x['board'] for x in result['stale_sources']] == ['dispatcher']
+    assert 'from_the_future' in result['stale_sources'][0]['reason']
+
+
+def test_flow_unavailable_board_is_a_named_stale_source():
+    s = snap('main', [], 0, flow_available=False, flow_reason='flow timed out')
+    result = gov.project([s], [], REGISTRY)
+    assert [x['board'] for x in result['stale_sources']] == ['main']
+    assert 'flow timed out' in result['stale_sources'][0]['reason']
+
+
+def test_fleet_stop_needs_a_stopped_safety_governor_not_a_capped_fleet_dial():
+    capped = gov.project([snap('main', [row('host_slots', 3, reading=1, threshold=1)], 3)],
+                         [], REGISTRY)
+    assert capped['fleet_stop'] is False and capped['fleet'][0]['id'] == 'host_slots'

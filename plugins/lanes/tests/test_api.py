@@ -318,3 +318,32 @@ def test_provider_key_ignores_local_status_but_keeps_pr_evidence(api, head_field
         db.execute("INSERT INTO task_events(task_id,kind,payload) VALUES('fixture','external_watch',?)",
                    (json.dumps({'metadata': {head_field: 'new'}}),))
         assert key() != initial, 'explicit provider evidence must still invalidate'
+
+
+def test_clearing_admit_per_day_is_an_explicit_removal_not_a_noop(api, core, monkeypatch):
+    removed = []
+    monkeypatch.setattr(api, "_unset_admit_per_day", lambda lane: removed.append(lane))
+    api.change("product", {"admit_per_day": None})
+    assert removed == ["product"] and not core.sets  # set_lane would reject "nothing to set"
+    api.change("product", {"share": 30, "admit_per_day": None})
+    assert removed == ["product", "product"] and core.sets == [("product", {"share": 30, "admit_per_day": None, "paused": None})]
+
+
+def test_core_backed_admit_per_day_clear_reads_back(api, tmp_path, monkeypatch):
+    pytest.importorskip("hermes_cli.kanban_lanes_cli")
+    import yaml
+    from hermes_cli import kanban_lanes as lanes, kanban_lanes_cli as cli
+    from hermes_cli import kanban_db_connect as kbc
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"kanban": {"admission": {"lanes": {
+        "product": {"share": 20, "admit_per_day": 17}, "other": {"share": 10}}}}}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "core", lambda: (kbc, lanes, cli))
+    monkeypatch.setattr(api, "read", lambda *a, **k: {})
+    assert lanes.policy().lanes["product"].admit_per_day == 17
+    api.change("product", {"share": 30, "admit_per_day": None})  # clear + another field
+    after = lanes.policy().lanes["product"]
+    assert after.admit_per_day is None and after.share == 30
+    cli.set_lane("product", admit_per_day=9)
+    api.change("product", {"admit_per_day": None})  # clear alone
+    assert lanes.policy().lanes["product"].admit_per_day is None

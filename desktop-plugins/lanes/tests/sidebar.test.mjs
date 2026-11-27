@@ -54,7 +54,7 @@ for (const stopped of [true, false]) test(`safety stop ${stopped ? 'shows' : 'cl
   const pane = await mount(React.createElement(P.SidebarView, { snap, error: '', open: true, setOpen() {} }))
   try {
     assert.equal(pane.container.querySelectorAll('[data-fleet-governor]').length, stopped ? 1 : 0)
-    assert.equal(pane.container.querySelectorAll('[data-fleet-stop]').length, stopped ? 2 : 0)
+    assert.equal(pane.container.querySelectorAll('[data-lane-hold="fleet_stop"]').length, stopped ? 2 : 0)
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /0 held/)
     if (stopped) {
       const line = pane.container.querySelector('[data-fleet-governor="core_update_drain"]')
@@ -254,4 +254,74 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
     assert.ok(pane.container.querySelector('.lanes-last-known'))
     assert.ok(pane.container.querySelector('button[type=submit]').disabled)
   } finally { await pane.close() }
+})
+
+const fault = { id: 'fault', name: "can't start", group: 'fault', count: 2, members: [{ id: 'unassigned', name: 'Unassigned', count: 1 }, { id: 'model_pin', name: 'Model pin', count: 1 }] }
+const budget = { id: 'spend_budget', name: 'Spend budget', group: 'budget', count: 1 }
+const chipIds = pane => [...pane.container.querySelectorAll('[data-lane-hold]')].map(e => e.dataset.laneHold)
+
+test('chip priority is fault > fleet stop > lane dial > budget, never by count', async () => {
+  const pane = await mount(React.createElement(P.LaneHolds, { row: { governor_held: 9, fleet_stop: true, holds: [{ ...gate, count: 99 }, budget, fault] } }))
+  try {
+    // Two chips painted; the hidden remainder is one "+N" badge whose tooltip names them.
+    assert.deepEqual(chipIds(pane), ['fault', 'fleet_stop'])
+    const wide = pane.container.querySelector('.lanes-hold-more-wide')
+    assert.equal(wide.textContent, '+2'); assert.match(wide.title, /Lane gate/); assert.match(wide.title, /needs decision/)
+    const narrow = pane.container.querySelector('.lanes-hold-more-narrow')
+    assert.equal(narrow.textContent, '+3'); assert.equal(narrow.closest('[data-lane-hold]').dataset.laneHold, 'fault')
+    assert.match(narrow.title, /fleet stop/)
+  } finally { await pane.close() }
+})
+
+test('a fault chip keeps its place ahead of a bigger lane dial, with full text in tooltip and aria-label', async () => {
+  const pane = await mount(React.createElement(P.LaneHolds, { row: { governor_held: 9, holds: [{ ...gate, count: 9 }, fault] } }))
+  try {
+    assert.deepEqual(chipIds(pane), ['fault', 'lane_gate'])
+    const chip = pane.container.querySelector('[data-lane-hold="fault"]')
+    assert.match(chip.textContent, /2 can't start/)
+    assert.match(chip.getAttribute('aria-label'), /2 can't start.*1 Unassigned.*1 Model pin/)
+    const dial = pane.container.querySelector('[data-lane-hold="lane_gate"]')
+    assert.match(dial.getAttribute('aria-label'), /Lane gate 10\/50 · 64|Lane gate 10\/50 · 9/)
+    assert.equal(dial.querySelector('[data-hold-count]').textContent, '9')
+  } finally { await pane.close() }
+})
+
+const controlRow = { share: 20, admit_per_day: 17, holds: [], limits: {} }
+const typeInto = async (view, label, value) => {
+  const input = view.container.querySelector(`[aria-label="${label}"]`)
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'value').set.call(input, value)
+    input.dispatchEvent(new globalThis.window.Event('input', { bubbles: true }))
+  })
+}
+const submit = async view => { await React.act(async () => { view.container.querySelector('form').dispatchEvent(new globalThis.window.Event('submit', { bubbles: true, cancelable: true })) }); await view.flush() }
+
+test('clearing admit/day writes an explicit null, and Saved shows only after the snapshot reflects it', async () => {
+  const writes = []
+  let setRow
+  const Harness = () => { const [row, set] = React.useState(controlRow); setRow = set
+    return React.createElement(P.LaneControls, { name: 'work', row, write: async (_lane, body) => { writes.push(body) } }) }
+  const view = await mount(React.createElement(Harness))
+  try {
+    await typeInto(view, 'work admit / day', '')
+    await submit(view)
+    assert.deepEqual(writes, [{ admit_per_day: null }])
+    assert.doesNotMatch(view.container.textContent, /Saved/, 'snapshot still shows 17')
+    assert.match(view.container.textContent, /Saving…/)
+    await React.act(async () => setRow({ ...controlRow, admit_per_day: null }))
+    await view.flush()
+    assert.match(view.container.textContent, /Saved/)
+    assert.equal(view.container.querySelector('[aria-label="work admit / day"]').value, '')
+  } finally { await view.close() }
+})
+
+test('an unchanged form or a rejected write never shows Saved', async () => {
+  const view = await mount(React.createElement(P.LaneControls, { name: 'work', row: controlRow, write: async () => { throw new Error('409 rejected') } }))
+  try {
+    await submit(view)
+    assert.match(view.container.textContent, /No change/); assert.doesNotMatch(view.container.textContent, /Saved/)
+    await typeInto(view, 'work admit / day', '')
+    await submit(view)
+    assert.match(view.container.textContent, /409 rejected/); assert.doesNotMatch(view.container.textContent, /Saved/)
+  } finally { await view.close() }
 })

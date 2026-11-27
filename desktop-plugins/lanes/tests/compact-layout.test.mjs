@@ -22,12 +22,15 @@ const lane = (name, i) => ({ share: 20, actual: .2, target: .3, status: { run: 2
   holds: i ? [{ id: 'lane_gate', name: 'Lane gate', group: 'lane_dial', count: 64, reading: 10, threshold: 50 }] : [],
   waits: { parents: 42, scheduled: 40, deploy_ci: 20, triage: 6 }, limits: { max_workers: 4 }, boards: ['a'],
   spend: { hour: 123.45, day: 1234.5, week: 98765.43 }, ticks: { window: '24h', bucket_s: 1800, cap: 4, cells, previews: {} } })
-const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes', 'overcap']
+const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes', 'overcap', 'faulty']
 const snap = { configured: true, fleet_slots: 39, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
   governors: { held_total: 65, fleet: [{ id: 'host_slots', name: 'Host slots full', group: 'fleet_dial', count: 1, reading: 7, threshold: 7 }],
     stale_sources: [{ board: 'alpha', reason: 'stale dispatcher snapshot' }, { board: 'beta', reason: 'tick aborted at storage_admission' }], rows: [] },
-  lanes: Object.fromEntries(names.map((n, i) => [n, n === 'overcap' ? { ...lane(n, 0), status: { run: 6, you: 0 }, limits: { max_workers: 2 }, ticks: { ...lane(n, 0).ticks, cap: 2 } } : lane(n, i)])) }
+  lanes: Object.fromEntries(names.map((n, i) => [n, n === 'overcap' ? { ...lane(n, 0), status: { run: 6, you: 0 }, limits: { max_workers: 2 }, ticks: { ...lane(n, 0).ticks, cap: 2 } } : n === 'faulty' ? { ...lane(n, 1), fleet_stop: true, holds: [
+    { id: 'lane_gate', name: 'Lane gate', group: 'lane_dial', count: 99, reading: 10, threshold: 50 },
+    { id: 'spend_budget', name: 'Spend budget', group: 'budget', count: 1 },
+    { id: 'fault', name: "can't start", group: 'fault', count: 2, members: [{ id: 'unassigned', name: 'Unassigned', count: 2 }] }] } : lane(n, i)])) }
 
 test('compact sidebar: 38px two-line rows, no overflow/wrap, day-only at 360, toolbar+totals fit', { skip: !CHROME && !process.env.CI && 'no Chrome' }, async () => {
   assert.ok(CHROME, 'CI must provide Chrome for the compact layout test')
@@ -52,8 +55,11 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       nameLines: Math.round(r(row.querySelector('.lanes-row-name')).height / parseFloat(getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight === 'normal' ? 15 : getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight)),
       nameWrapped: row.querySelector('.lanes-row-name').getClientRects().length > 1 || r(row.querySelector('.lanes-row-name')).height > 20,
       chipWrapped: vis(row.querySelector('.lanes-row-chip')) && r(row.querySelector('.lanes-row-chip')).height > 32,
-      countClipped: [...row.querySelectorAll('.lanes-hold-count')].filter(c => !(vis(c) && inside(r(c), r(c.closest('.lanes-row-chip'))))).map(c => c.textContent),
-      countPainted: [...row.querySelectorAll('.lanes-hold-count')].map(c => c.textContent),
+      countClipped: [...row.querySelectorAll('.lanes-hold-count')].filter(c => vis(c.closest('.lanes-hold'))).filter(c => !(vis(c) && inside(r(c), r(c.closest('.lanes-row-chip'))))).map(c => c.textContent),
+      countPainted: [...row.querySelectorAll('.lanes-hold-count')].filter(vis).map(c => c.textContent),
+      chips: [...row.querySelectorAll('.lanes-hold')].filter(vis).map(c => ({ id: c.dataset.laneHold, w: r(c).width, h: r(c).height,
+        label: c.getAttribute('aria-label'), clip: c.scrollWidth > c.clientWidth + .5 && !c.querySelector('.lanes-hold-name') })),
+      badges: [...row.querySelectorAll('.lanes-hold-more')].filter(vis).map(b => b.textContent),
       costWrapped: [...cost.children].filter(vis).filter(c => r(c).height > 19.5).map(c => c.className),
       costScrollOverflow: cost.scrollWidth > cost.clientWidth + .5,
       cost: ['h', 'd', 'w'].map(k => vis(cost.querySelector('.lanes-cost-' + k))),
@@ -103,7 +109,19 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
         assert.deepEqual(row.chartOverflow, [], 'chart descendant overlaps sibling column: ' + id)
         assert.ok(!row.nameWrapped && !row.chipWrapped && row.costWrapped.length === 0 && !row.costScrollOverflow, 'wrapping/overflow: ' + id)
         assert.deepEqual(row.countClipped, [], 'hold count clipped: ' + id)
-        if (row.countPainted.length) assert.ok(row.countPainted.includes('64'), 'hold count 64 painted: ' + id)
+        if (row.name === 'faulty') {
+          // Priority fault > fleet stop > dial > budget: the fault chip is first at every width, never pushed out
+          // by the bigger dial; at <=360 exactly one chip plus a "+3" badge, above that two chips plus "+2".
+          assert.equal(row.chips[0].id, 'fault', 'fault chip first: ' + id)
+          assert.ok(row.countPainted.includes('2'), 'fault count painted: ' + id)
+          assert.deepEqual(row.chips.map(c => c.id), r.w <= 360 ? ['fault'] : ['fault', 'fleet_stop'], 'chips shown: ' + id)
+          assert.deepEqual(row.badges, [r.w <= 360 ? '+3' : '+2'], 'overflow badge: ' + id)
+        } else if (row.countPainted.length) assert.ok(row.countPainted.includes('64'), 'hold count 64 painted: ' + id)
+        for (const chip of row.chips) {
+          assert.ok(chip.w >= 40, `chip ${chip.id} wider than 40px (${chip.w}): ` + id)
+          assert.ok(chip.h >= 15, `chip ${chip.id} not squashed (${chip.h}px): ` + id)
+          assert.ok(chip.label, 'chip has full aria-label: ' + id)
+        }
         assert.equal(row.tickH, 14, 'chart ticks 14px: ' + id)
         assert.ok(row.tickAbovePips, 'ticks on top, pips below: ' + id)
         if (row.name === 'overcap') assert.ok(['11', '10'].every(k => row.pipStates.includes(k)), 'overcap lane shows running and over-cap pips: ' + id)
