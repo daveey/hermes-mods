@@ -125,7 +125,7 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
   Spend-held or scope-stopped card: from its owning chat, one step on its home gateway:
   `hermes kanban release <id> [--runs N] [--seen <newest comment id>] --note "<user's words + goal>"`, then read back status.
-  Re-read events first: the board's spend reviewer may already have re-granted it, and release then refuses `not_held`.
+  Check grants and claims: `not_held` can coexist with `spend_budget_exhausted`; reconcile limits below, not another release.
   A refusal that prints an unread comment (`budget_decision_unread`, "After reading: ... --seen <cid>") wants that
   comment read and its id passed as `--seen`, not the newest id: an owner may have re-scoped in it.
   `safety_restricted` (provider safety refusal) has no release route: leave it held, never reword or resubmit the
@@ -133,8 +133,8 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   Plain `triage` (no hold) also refuses `not_held`: use `hermes kanban [--board B] promote <id> "<reason>"`.
   A card you expect to stop again (a narrow run override against a multi-run rollout) gets a wider
   `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
-  Its limits are window totals that include spend already recorded, so pass spent + the extra you mean (the refusal
-  prints both numbers); a bare `--runs 30` below what's spent trips the card at once.
+  Limits include recorded spend: use spent + additional allowance without resetting usage. A reviewer grant
+  below usage leaves a ready card unclaimable; verify a bound executor after correction.
   A released card that then sits `ready` with workers logging `skipped_ineligible(refusal_exhausted)` has no
   unrefused provider left right now: on a worker, `kanban_provider_walls.active_walls()` shows which peers are
   walled and until when. It starts by itself when the wall ends, so comment that time; don't bump, move or release it again.
