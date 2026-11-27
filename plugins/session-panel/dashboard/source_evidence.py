@@ -623,7 +623,9 @@ def _check_projection(A, pid, d, adm_by_id):
     adm = _admission(A, e.get('admission'), w)
     if adm is None:
         return None
-    pv = A.entries(s['pinned_versions'], w + ' pinned_versions', allow_empty_dict=False)
+    # Before the first acquisition every source can be explicitly missing; the
+    # matching admission then legitimately pins an empty version map.
+    pv = A.entries(s['pinned_versions'], w + ' pinned_versions')
     cs = A.entries(e['covered_scopes'], w + ' covered_scopes')
     ms = A.entries(e['missing_scopes'], w + ' missing_scopes')
     dp = A.entries(e['dependencies'], w + ' dependencies')
@@ -740,7 +742,7 @@ def _check_publications(A, by_event, caps, receipts, writers, projections):
         cs = A.entries(p['covered_scopes'], w + ' covered_scopes')
         ms = A.entries(p['missing_scopes'], w + ' missing_scopes')
         dp = A.entries(p['dependencies'], w + ' dependencies')
-        sv = A.entries(p['source_vector'], w + ' source_vector', allow_empty_dict=False)
+        sv = A.entries(p['source_vector'], w + ' source_vector')
         if None in (cs, ms, dp, sv):
             continue
         ok = True

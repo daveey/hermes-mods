@@ -279,7 +279,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   let r
   try {
     r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs: 15_000,
-      body: { sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null } })
+      body: { sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null, response_encoding: 'gzip' } })
   } catch (e) {
     // The Desktop bridge rejects a 404 with "404: ...": this gateway has no backend half.
     if (/^404\b/.test(String(e?.message || ''))) return unsupported('404')
@@ -358,7 +358,7 @@ export async function feedPeek(target, { timeoutMs = 5_000 } = {}) {
   let r
   try {
     r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs,
-      body: { sessions: target.sessions.slice(0, 200), since: 0, epoch: st.epoch } })
+      body: { sessions: target.sessions.slice(0, 200), since: 0, epoch: st.epoch, response_encoding: 'gzip' } })
   } catch (e) {
     log('feed peek failed', target.connectionId, e?.message || e)
     return false
@@ -475,6 +475,20 @@ const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
   ...(section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+// Section -> shared card-square category (Desktop `CardCountSquare`), matching the row boxes' colours.
+const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
+export const pipCategory = pip => pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
+  : pip.wait_kind === 'deploy' ? 'violet' : pip.wait_kind === 'agent' || deliveryWait(pip) ? 'blue' : 'amber'
+// Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
+const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
+/** One numbered card square: the count inside an outline in the category's colour. */
+export function CountSquare({ category, count }) {
+  if (typeof sdk.CardCountSquare === 'function') return jsx(sdk.CardCountSquare, { category, count })
+  return jsx('span', { 'data-card-colour': category, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    boxSizing: 'border-box', height: 16, minWidth: 16, padding: '0 2px', borderRadius: 2, flex: 'none', fontSize: 10, lineHeight: 1,
+    fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary, var(--muted-foreground))', fontWeight: 400,
+    border: `1px solid ${SQUARE_BORDER[category] || SQUARE_BORDER.grey}` }, children: count })
+}
 const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
 const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
@@ -524,7 +538,50 @@ export function clockRow(row, now = Date.now() / 1000) {
   for (const key of ['detail', 'nested_detail', 'text']) if (row.clock_text?.[key]) result[key] = formatClockText(row.clock_text[key], now)
   if (row.clock_text?.details) result.details = row.clock_text.details.map(parts => formatClockText(parts, now))
   if (row.decision) result.decision = clockRow(row.decision, now)
+  const reason = row.non_running_reason
+  if (reason && reason.freshness === 'current') {
+    const at = reason.observed_at, until = reason.valid_until
+    if (!Number.isFinite(at) || !Number.isFinite(until) || !Number.isFinite(now) || now < at || now >= Math.min(until, at + 180)) {
+      result.non_running_reason = { freshness: 'unknown', disposition: 'unknown', actor: 'unknown',
+        observed_at: at, valid_until: until, unknown_reason: 'dispatcher_evidence_stale' }
+      result.reason = 'reason-unknown'
+      result.detail = 'ready · execution reason unknown'
+      result.evidence_state = 'unknown'
+      result.details = ['Reason freshness: unknown', 'The dispatcher evidence has expired; inspect fresh authoritative evidence.']
+      delete result.clock_text
+    }
+  }
   return result
+}
+/** Withdraw expired row presentation, never rewrite canonical status or source clocks. */
+function expiryPresentation(model, sections, diagnosticExpired = false) {
+  const counts = { ...model.header.counts }
+  for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
+  const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
+  const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
+  const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => ({
+    section, label: model.header.pips.find(p => p.section === section)?.label || label, count: counts[section],
+    ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {})
+  }))
+  const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
+    !counts.needs_you && !counts.stuck && !counts.running
+  return { ...model, sections, header: { ...model.header, counts, pips, wait_kind: waitKind, wait_eta: null,
+    ...(withdrawnDerived ? { state: 'unknown', label: 'execution reason unknown' } : {}) } }
+}
+/** Expiration can withdraw diagnostic attention, never create execution or human authority. */
+export function expireDiagnostics(model, now) {
+  let sections = null
+  for (const [key, rows] of Object.entries(model.sections || {})) {
+    for (const row of rows) {
+      if (!row.non_running_reason || row.non_running_reason.freshness !== 'current') continue
+      const clocked = clockRow(row, now)
+      if (clocked.non_running_reason?.freshness !== 'unknown') continue
+      sections ||= Object.fromEntries(Object.entries(model.sections).map(([k, v]) => [k, [...v]]))
+      sections[key] = sections[key].filter(v => v !== row)
+      sections.ready.push(clocked)
+    }
+  }
+  return sections ? expiryPresentation(model, sections, true) : model
 }
 /** One source clock for header and row freshness; heartbeats cannot renew computed_at. */
 export function modelFreshness(model, { now = Date.now() / 1000, vouched = null } = {}) {
@@ -533,6 +590,24 @@ export function modelFreshness(model, { now = Date.now() / 1000, vouched = null 
   const age = Number.isFinite(f.computed_at) ? now - f.computed_at : null
   const ttl = Number.isFinite(f.ttl_s) && f.ttl_s > 0 ? Math.min(60, f.ttl_s) : 60
   return { stale: age === null || age < 0 || age > ttl || vouched === false || (vouched !== true && f.trusted !== true), age }
+}
+/** Cached native task waits lose attention/action authority with their source snapshot. */
+export function expireNativeWaits(model, now, vouched) {
+  if (!modelFreshness(model, { now, vouched }).stale) return model
+  const sections = Object.fromEntries(Object.entries(model.sections).map(([key, rows]) => [key, []]))
+  for (const [key, rows] of Object.entries(model.sections)) for (const row of rows) {
+    if (key === 'done' || row.kind !== 'card' || row.non_running_reason) {
+      sections[key].push(row)
+      continue
+    }
+    const old = clockRow(row, now)
+    sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
+      detail: `status unknown · last known: ${old.detail || key}`,
+      details: ['Task source freshness: stale; read current authoritative task state before acting.'],
+      actions: row.actions.filter(a => ['open_card', 'open_session', 'open_url', 'open_process'].includes(a.kind)),
+      options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null })
+  }
+  return expiryPresentation(model, sections)
 }
 /** The three right-click entries for a row, in order. `action` is null when the row has nothing to open there
  *  (no owning chat, no dependency, or the owning chat is the one already in focus). */
@@ -552,6 +627,7 @@ export function rowMenuItems(row, currentSession = null) {
 }
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null } = {}) {
   if (!validModel(model)) return null
+  model = expireNativeWaits(expireDiagnostics(model, now), now, vouched)
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
   const freshness = modelFreshness(model, { now, vouched })
@@ -736,10 +812,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('span', { children: 'This session' })
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
-      ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
-        jsx('span', { 'aria-hidden': true, style: box(pip.section, pip) }),
-        `${pip.count} ${pip.label}`
-      ] }, i)),
+      // Header counts are numbered card squares (the Desktop's shared look); the section words are the tooltip.
+      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, title: `${pip.count} ${pip.label}`, 'aria-label': `${pip.count} ${pip.label}`,
+        style: { display: 'inline-flex' }, children: jsx(CountSquare, { category: pipCategory(pip), count: pip.count }) }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),

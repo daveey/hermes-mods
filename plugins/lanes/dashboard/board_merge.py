@@ -12,7 +12,16 @@ from time import thread_time
 # A board's budget is the CPU its own reader thread spent. A wall-clock deadline
 # also charged the board for every other thread's turn at the interpreter lock:
 # in a busy backend a healthy 0.3 s read was interrupted after 2 s of waiting.
-BUDGET_CPU_SECONDS = 2
+#
+# The budget stops a pathological board, so it sits several times above an
+# honest read, not beside it. Measured on the hub (358 open cards, 97k event
+# payloads): one phase of the default board costs 1.1 s of reader CPU in an idle
+# process and 2.0-2.7 s in the busy backend, where every lock hand-off costs
+# cache. At 2 s that board lost about one refresh in three.
+BUDGET_CPU_SECONDS = 10
+# Say so once when an honest read has grown to this share of the budget, while
+# it still completes: the next growth would otherwise surface as an empty strip.
+WARN_BUDGET_SHARE = .5
 # Starvation backstop only: the read snapshot pins the board's WAL, so even a
 # reader that is not at fault must not hold it open indefinitely.
 SNAPSHOT_WALL_SECONDS = 30
@@ -27,16 +36,21 @@ def arm_deadline(db, *, phase='open'):
     started = time.monotonic()
     owner = threading.get_ident()
     cpu_started = thread_time()
-    reported = False
+    reported = warned = False
 
     def progress():
-        nonlocal reported, owner, cpu_started
+        nonlocal reported, warned, owner, cpu_started
         if threading.get_ident() != owner:
             # Thread CPU clocks are per thread: restart the budget for a new reader.
             owner, cpu_started = threading.get_ident(), thread_time()
         spent = thread_time() - cpu_started
         waited = time.monotonic() - started
         expired = spent > BUDGET_CPU_SECONDS or waited > SNAPSHOT_WALL_SECONDS
+        if not expired and not warned and spent > BUDGET_CPU_SECONDS * WARN_BUDGET_SHARE:
+            warned = True
+            logging.getLogger(__name__).warning(
+                'lanes board_merge budget half used: phase=%s wall=%.3fs thread_cpu=%.3fs of %ss',
+                phase, waited, spent, BUDGET_CPU_SECONDS)
         if expired and not reported:
             reported = True
             # SQLite reports only "interrupted" at the next statement. Identify

@@ -86,6 +86,42 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+for (const diagnostic of [false, true]) for (const collapsed of [false, true]) {
+ test(`expiry withdraws header attention and wait metadata diagnostic=${diagnostic} collapsed=${collapsed}`, async () => {
+  const model = structuredClone(Object.values(cases).find(c => c.model?.sections?.needs_you?.length).model)
+  const row = model.sections.needs_you[0]
+  for (const key of Object.keys(model.sections)) model.sections[key] = []
+  const section = diagnostic ? 'stuck' : 'needs_you'
+  model.sections[section] = [row]
+  model.header.counts = Object.fromEntries(Object.keys(model.sections).map(k => [k, k === section ? 1 : 0]))
+  model.header.pips = [{ section, count: 1, label: section, wait_kind: 'ci' }]
+  model.header.wait_kind = 'ci'; model.header.wait_eta = { wait_kind: 'ci', waited_since: 900, expected_s: 50 }
+  model.header.source = 'derived'; model.header.status = null; model.header.state = section; model.header.label = section
+  model.freshness = { computed_at: diagnostic ? 1000 : 900, ttl_s: 60, trusted: true }
+  row.kind = 'card'; row.actions ||= []; row.decision = null
+  if (diagnostic) row.non_running_reason = { freshness: 'current', observed_at: 800, valid_until: 980 }
+  else delete row.non_running_reason
+  const before = JSON.stringify(model)
+  await paint(m.renderModel(model, { now: 1000, collapsed }))
+  assert.equal(document.querySelector(`[data-model-count="${section}"]`).textContent, '0')
+  assert.ok(document.querySelector(`[data-model-pip="${section}"]`) === null, 'expired attention pip withdrawn')
+  const destination = diagnostic ? 'ready' : 'waiting'
+  assert.equal(document.querySelector(`[data-model-count="${destination}"]`).textContent, '1')
+  const effective = m.expireNativeWaits(m.expireDiagnostics(model, 1000), 1000)
+  assert.equal(effective.header.wait_kind, null)
+  assert.equal(effective.header.wait_eta, null)
+  if (diagnostic) {
+   assert.equal(effective.header.state, 'unknown')
+   assert.equal(document.querySelector('[data-session-status]').textContent, 'execution reason unknown')
+  }
+  assert.equal(JSON.stringify(model), before)
+  // Source recovery restores the untouched canonical classification.
+  if (diagnostic) row.non_running_reason = { freshness: 'current', observed_at: 999, valid_until: 1100 }
+  else model.freshness.computed_at = 1000
+  await paint(m.renderModel(model, { now: 1000, collapsed }))
+  assert.equal(document.querySelector(`[data-model-count="${section}"]`).textContent, '1')
+ })
+}
 test('mounted legacy cached running header fails closed before any heartbeat', async () => {
  await paint(null); m.resetFeedForTests()
  current = { connectionId: 'legacy', profile: 'default', session: 'legacy-chat' }
@@ -298,7 +334,7 @@ for (const kind of ['ci', 'deploy', 'clock']) {
  })
 }
 for (const [name, expected] of [['source_unavailable', "status unknown · couldn't read linked cards"],
- ['own_turn_unknown_remote', 'running · this chat’s agent is replying'], ['genuine_interruption', 'interrupted']]) {
+ ['own_turn_unknown_remote', 'chat active · task execution shown below'], ['genuine_interruption', 'interrupted']]) {
  test(`shared status evidence ${name}: canonical reason reaches the actual header and unknown row`, async () => {
   const { model, now } = cases[name]
   await paint(m.renderModel(model, { now }))
@@ -414,14 +450,23 @@ test('mounted feed timing survives local ticks, replacement, session switch and 
  window.hermesDesktop = {api:async () => ({feed:'timing',epoch:'timing',rev:1,bundles:{}})}
  try {
   for (const name of ['elapsed_layout', 'eta_ci_normal', 'eta_deploy_normal', 'eta_clock_normal']) {
+   now=cases[name].now
    current = {connectionId:'conn',profile:'default',session:`timing-${name}`}
    const model=structuredClone(cases[name].model), original=JSON.stringify(model)
    await React.act(async () => m.ingestBundle(current.connectionId,current.profile,{session:current.session,model}))
    await paint(J.jsx(m.Panel, {}))
+   // Cache and HTTP catch-up alone do not attest a live source. Exercise the
+   // real heartbeat path; never bypass freshness just to retain a timing label.
+   if (name !== 'elapsed_layout') assert.ok(document.querySelector('[data-wait-eta]') === null)
+   await React.act(async () => {
+    await m.feedCatchUp({...current,sessions:[current.session]})
+    m.onFeedEvent({payload:{feed:'timing',profile:'default',epoch:'timing',rev:1,heartbeat:true,fresh:[current.session]}})
+   })
+   assert.ok(m.feedVouches(current), `${name}: heartbeat must vouch for focused session`)
    const read = () => document.querySelector(name === 'elapsed_layout' ? '[data-row-detail]' : '[data-wait-eta]')?.textContent
    now=cases[name].now
    await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
-   const before=read(); assert.ok(before)
+   const before=read(); assert.ok(before, `${name}: ${document.body.textContent}`)
    now+=60
    await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
    assert.notEqual(read(),before)
@@ -431,7 +476,28 @@ test('mounted feed timing survives local ticks, replacement, session switch and 
    assert.equal(read(),after)
    await paint(null); await paint(J.jsx(m.Panel, {}))
    assert.equal(read(),after)
+   // Local repaint cannot keep an ETA alive after the independent source TTL.
+   now+=1
+   await React.act(async () => {
+    // Renew transport independently. Expired source evidence must stay expired
+    // even while the owning Feed continues delivering live heartbeats.
+    m.onFeedEvent({payload:{feed:'timing',profile:'default',epoch:'timing',rev:1,heartbeat:true,fresh:[current.session]}})
+    for(const t of ticks.values()) if(t.ms===1000)t.fn()
+   })
+   assert.ok(m.feedVouches(current), `${name}: transport is still fresh at source expiry`)
+   assert.deepEqual(model.freshness, {trusted:true,computed_at:cases[name].now,ttl_s:60})
+   if (name !== 'elapsed_layout') {
+    assert.ok(document.querySelector('[data-wait-eta]') === null)
+    assert.match(document.querySelector('[data-row-detail]').textContent, /status unknown · last known:/)
+   }
    assert.equal(JSON.stringify(model),original)
+   // Missing-heartbeat is a distinct negative control, not the source-TTL proof.
+   now+=61
+   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   assert.equal(m.feedVouches(current),false)
+   assert.ok(document.querySelector('[data-wait-eta]') === null)
+   assert.equal(JSON.stringify(model),original)
+   await paint(null)
   }
  } finally {
   await paint(null); m.resetFeedForTests(); Date.now=originalNow
@@ -740,7 +806,11 @@ test('header counts/pips remain server values, not recomputed row totals', async
  const model = structuredClone(publicCases.all_sections.model)
  model.header.counts.running = 78; model.header.pips = [{ section: 'running', count: 91, label: 'hub value' }]
  await paint(m.renderModel(model))
- assert.equal(document.querySelector('[data-model-pip]').textContent, '91 hub value')
+ const pip = document.querySelector('[data-model-pip]')
+ // The hub count sits inside the numbered square; the section words move to the tooltip.
+ assert.equal(pip.textContent, '91')
+ assert.equal(pip.querySelector('[data-card-colour]').dataset.cardColour, 'blue')
+ assert.equal(pip.title, '91 hub value')
  assert.equal(document.querySelector('[data-model-section="running"] h3').textContent, 'In progress · 78')
 })
 test('hub renderer is unconditional, registers no settings, and switches cached scopes without raw reads', async () => {
@@ -780,8 +850,14 @@ test('Open card resolves the supplied owner target rather than the focused conne
  m.ingestBundle(current.connectionId, current.profile, { session: current.session, model })
  await paint(J.jsx(m.Panel, {}))
  const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Open original')
- assert.ok(button)
- await React.act(async () => button.click())
+ if (button) await React.act(async () => button.click())
+ else {
+  // A cold, unvouched ask is historical, not an actionable ask. Safe owner
+  // navigation remains on its line-row square (the normal non-ask control).
+  const pip = document.querySelector('[data-row-pip]')
+  assert.ok(pip)
+  await React.act(async () => pip.dispatchEvent(new dom.window.MouseEvent('dblclick', { bubbles: true })))
+ }
  assert.deepEqual(opened, [{ id: row.id, kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
  await paint(null)
 })

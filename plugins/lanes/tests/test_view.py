@@ -56,8 +56,8 @@ def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
     monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
     for expanded in (False, True):
         view = api.lane_view(6, '6h', expanded)
-        assert view['status'] == {'you': 1, 'ext': 2, 'gate': 2, 'worker': 2, 'run': 1, 'dep': 2, 'triage': 1,
-                                  'other': 1}
+        assert view['status'] == {'you': 1, 'ext': 1, 'gate': 2, 'worker': 2, 'run': 1, 'dep': 2, 'park': 1,
+                                  'triage': 1, 'other': 1}
         assert sum(view['status'].values()) == len(cards)
         strips = {n: view['lanes'][n]['strip'] for n in ('a', 'b')}
         assert sum(s['blocked'] for s in strips.values()) == view['status']['you']
@@ -214,3 +214,23 @@ def test_get_flow_returns_the_same_expanded_view(monkeypatch):
         assert first == view
         assert second.pop('stale_seconds') >= 0.
         assert second == view
+
+
+def test_scheduled_cards_count_by_what_they_wait_on(monkeypatch):
+    """Only CI/review/deploy waits are pink ``ext``; a wait on another card is ``dep``; a clock or outside event is
+    ``park``. Without the core's ``wait`` field a landing step still means CI/deploy."""
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    rows = [('ci', 'waiting'), ('review', 'waiting'), ('deploy', 'waiting'), ('card', 'waiting'), ('card', 'ci'),
+            ('clock', 'waiting'), ('external', 'waiting'), ('chat', 'waiting'), (None, 'ci'), (None, 'deploy'),
+            (None, 'waiting')]
+    cards = [dict(id=f't_{i}', lane='a', step=step, reason='gov:schedule', age_h=1, **({'wait': w} if w else {}))
+             for i, (w, step) in enumerate(rows)]
+    cards.append(dict(id='t_raw', lane='a', step='waiting', reason='time', wait='card', age_h=1))
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {'a': {'open': len(cards)}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
+    view = api.lane_view(6, '6h', False)
+    assert view['status']['ext'] == 5
+    assert view['status']['dep'] == 3
+    assert view['status']['park'] == 4
+    assert view['lanes']['a']['status'] == view['status']

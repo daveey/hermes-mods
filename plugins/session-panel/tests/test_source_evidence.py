@@ -22,6 +22,40 @@ se = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(se)
 
 
+def source_before_projection(lane, log, monkeypatch):
+    """Measure source-backed projections, not the intentionally source-less cold UI.
+
+    Keep logging before watch/capture and audit every record. A fixture-only gate
+    orders the first projection after a real accepted capture; no rows are filtered
+    and no production/auditor policy is relaxed.
+    """
+    import threading
+    acquired = threading.Event()
+    record, ready = log.record, lane._projection_ready
+    def capture_record(event, **data):
+        record(event, **data)
+        if event == 'capture_end' and data.get('disposition') == 'accepted':
+            acquired.set()
+    monkeypatch.setattr(log, 'record', capture_record)
+    monkeypatch.setattr(lane, '_projection_ready', lambda session: acquired.is_set() and ready(session))
+    return acquired
+
+
+def test_measurement_gate_requires_accepted_source_receipt(monkeypatch):
+    from types import SimpleNamespace
+    events = []
+    log = SimpleNamespace(record=lambda event, **data: events.append((event, data)))
+    lane = SimpleNamespace(_projection_ready=lambda session: session == 'S')
+    acquired = source_before_projection(lane, log, monkeypatch)
+    assert not lane._projection_ready('S')
+    log.record('capture_end', disposition='superseded')
+    assert not acquired.is_set() and not lane._projection_ready('S')
+    log.record('capture_end', disposition='accepted')
+    assert acquired.is_set() and lane._projection_ready('S')
+    assert not lane._projection_ready('other')
+    assert [data['disposition'] for _, data in events] == ['superseded', 'accepted']
+
+
 @pytest.fixture
 def measured(graph, monkeypatch, tmp_path):
     r, local, remote, ksa = graph
@@ -44,6 +78,7 @@ def measured(graph, monkeypatch, tmp_path):
     f.install_receipts(log)  # BEFORE the first watch/acquisition/admission
     f.watch(['S0', 'S1'])
     lane = f.compose_board_sources(lambda: r, gateway='local-test', profile='default')
+    source_before_projection(lane, log, monkeypatch)
     try:
         f.changes(['S0', 'S1'])
         drain(lane)

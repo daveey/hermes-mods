@@ -1,7 +1,7 @@
 """hub-status: is this host's gateway up, restarting or down, since when, and its recent history.
 
-Runs inside the always-on dashboard backend (a separate process from the gateway), so it keeps
-answering while the gateway restarts. Sources, all already written by core:
+Runs inside the always-on dashboard backend or the independent sampler service (never in the
+gateway), so it keeps observing while the gateway restarts. Sources, all already written by core:
 
 - ``$HERMES_HOME/gateway_state.json``: ``gateway_state`` (starting | running | draining | degraded |
   stopped | startup_failed), ``pid``, ``start_time`` (process start in clock ticks since boot),
@@ -344,3 +344,24 @@ class _Sampler:
 
 
 _SAMPLER = _Sampler()
+
+
+def main() -> None:
+    """Desktop-independent service: retry the same flock if a dashboard owns it.
+
+    Keep the process alive even when another backend owns the lock. On that backend's exit,
+    acquire within one sample interval; a dashboard restart needs no authenticated request.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=None)
+    args = parser.parse_args()
+    home = args.home or hermes_home()
+    while True:
+        _SAMPLER.ensure(home)
+        time.sleep(SAMPLE_S)
+
+
+if __name__ == "__main__":
+    main()

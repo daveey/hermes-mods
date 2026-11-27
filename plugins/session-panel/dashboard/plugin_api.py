@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import errno
 import functools
+import gzip
 import hashlib
 import collections
 import copy
@@ -32,7 +33,7 @@ import types
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import Response
@@ -2002,11 +2003,7 @@ class CoreReaders:
         except sqlite3.Error:
             d['ready_since'] = None
         parents = [r[0] for r in c.execute('SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id', (card_id,))]
-        link_tasks = []
-        for pid in parents:
-            p = kanban_db.get_task(c, pid)
-            if p is not None:
-                link_tasks.append({'id': p.id, 'title': p.title, 'status': p.status})
+        link_tasks = _parent_summaries(c, parents)
         events = [dataclasses.asdict(e) for e in _newest_events(c, card_id)]
         latest = kanban_db.latest_run(c, card_id)
         runs = [dataclasses.asdict(latest)] if latest is not None else []
@@ -2085,6 +2082,21 @@ class CoreReaders:
             if owned_snapshot and c.in_transaction:
                 c.rollback()
         return out
+
+
+def _parent_summaries(c, parents):
+    """Fresh display fields, not full Task hydration; retain edge order and missing parents."""
+    from hermes_cli.kanban_db import _lossy_text
+
+    rows = {}
+    # Bound SQL parameters on old SQLite too. No cache: the caller's connection and transaction own freshness.
+    for start in range(0, len(parents), 256):
+        ids = parents[start:start + 256]
+        marks = ','.join('?' for _ in ids)
+        rows.update((row['id'], row) for row in c.execute(
+            f'SELECT id, title, status FROM tasks WHERE id IN ({marks})', ids))
+    return [{key: _lossy_text(rows[pid][key]) for key in ('id', 'title', 'status')}
+            for pid in parents if pid in rows]
 
 
 def _lineage_members(pairs, ids):
@@ -2315,6 +2327,16 @@ def _explicit_readers(f):
     return readers if getattr(readers, 'home_context', None) is not None else None
 
 
+def _mkdir_live(path: Path) -> None:
+    """mkdir that never resurrects a deleted/tombstoned named profile; only a missing core falls back."""
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+    except ImportError:  # no core on the path (plugin-only test runs)
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    mkdir_under_hermes_home(path)
+
+
 def write_timing(f, path: Optional[Path] = None) -> bool:
     """Atomically write the feed's wall-clock timing (`Feed.timing`) as JSON. Best effort: never raises."""
     try:
@@ -2323,7 +2345,7 @@ def write_timing(f, path: Optional[Path] = None) -> bool:
         with f.lock:
             body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_live(path.parent)
         tmp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
         tmp.write_text(json.dumps(json_safe(body)), encoding='utf-8')
         os.replace(tmp, path)
@@ -2351,7 +2373,7 @@ def _locked(path: Path, timeout: float = 5.0):
     except ImportError:
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_live(path.parent)
     fd = os.open(path.with_name(path.name + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         deadline = time.monotonic() + timeout
@@ -3411,6 +3433,9 @@ class ChangesBody(BaseModel):
     sessions: list[str] = Field(default_factory=list, max_length=200)
     since: int = 0
     epoch: Optional[str] = None
+    # Body negotiation survives Desktop's IPC bridge, unlike renderer headers.
+    # Old clients omit it; old servers ignore it. Never alter the JSON model.
+    response_encoding: Optional[str] = Field(default=None, max_length=16)
 
 
 router = APIRouter()
@@ -3445,6 +3470,30 @@ if _serves_desktop():
     start_publication()
 
 
+def _gzip_changes(wire):
+    # Electron's existing gunzip decoder has a 16 MiB expansion limit. A POST
+    # cannot retry as identity after receipt, so fall back before compressing.
+    if not 16 * 1024 <= len(wire) <= 16 * 1024 * 1024:
+        return None
+    encoded = gzip.compress(wire, compresslevel=1, mtime=0)
+    return encoded if len(encoded) < len(wire) else None
+
+
+async def _changes_response(wire, encoding, request):
+    if encoding == 'gzip' and 16 * 1024 <= len(wire) <= 16 * 1024 * 1024:
+        try:
+            # Optional CPU work: never block the event loop or wait behind a
+            # busy feed lane. Saturation retains the existing identity answer.
+            encoded = await _on_lane('feed', _gzip_changes, wire, request=request, deadline=.05)
+        except HTTPException as error:
+            if error.status_code != 503:
+                raise
+            encoded = None
+        if encoded is not None:
+            return Response(encoded, media_type='application/json', headers={'Content-Encoding': 'gzip'})
+    return Response(wire, media_type='application/json')
+
+
 @router.post('/changes')
 async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
@@ -3453,9 +3502,12 @@ async def changes(body: ChangesBody, request: Request):
     external = _external_projection()
     if external is not None:
         from hermes_cli.serve_producer_runtime import projection_response
-        command = body.model_dump()
+        command = body.model_dump(exclude={'response_encoding'})
         command['_wire_identity'] = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE}
-        return projection_response(external, command)
+        response = projection_response(external, command)
+        if response.status_code == 200:
+            return await _changes_response(response.body, body.response_encoding, request)
+        return response
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
         # Not running in this process yet (a host process that did not start it at import): start it off this
@@ -3466,6 +3518,8 @@ async def changes(body: ChangesBody, request: Request):
                         media_type='application/json', headers={'Retry-After': '1'})
     current = f._current() if getattr(f, '_successor', None) is not None else f
     if getattr(current, 'receipt_log', None) is not None:
+        # This audit attests the exact emitted JSON bytes; keep it identity
+        # encoded until its custody format explicitly supports compression.
         # Private inclusion telemetry uses core's actual route-local admission,
         # not a client body flag/header assertion. No token/principal is logged.
         from hermes_cli.plugin_host_http_auth import admitted_for_sensitive_route
@@ -3485,7 +3539,7 @@ async def changes(body: ChangesBody, request: Request):
             on_success=lambda completed_ns: current._receipt_delivered(delivered, completed_ns))
     wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch,
                            subscriber=body.subscriber, visible_session=body.visible_session)
-    return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')
+    return await _changes_response(_WIRE_PREFIX + wire[1:], body.response_encoding, request)
 
 
 @router.get('/status')

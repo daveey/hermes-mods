@@ -88,6 +88,26 @@ def test_clock_wake_only_slightly_late_is_fine(env):
     none(env, 'BS-overdue-wake', F.overdue_clock(env.conn, env.now, late_s=600))
 
 
+@pytest.mark.parametrize('factory', [F.overdue_clock, F.overdue_probe, F.scheduled_no_wake])
+def test_reserved_final_run_is_not_an_overdue_wake(env, factory):
+    from hermes_cli import kanban_continuation as kc
+    tid = factory(env.conn, env.now)
+    park = kc.park_state(env.conn, tid)
+    F.event(env.conn, tid, 'terminal_run_reserved', {'park_event_id': park['event_id']}, at=env.now - 60)
+    assert kc._reserved_for(env.conn, tid, park), 'fixture: core preserves the exact parked final run'
+    none(env, 'BS-overdue-wake', tid)
+
+
+def test_reservation_on_older_park_does_not_hide_a_genuinely_overdue_clock(env):
+    from hermes_cli import kanban_continuation as kc
+    tid = F.overdue_clock(env.conn, env.now)
+    old = kc.park_state(env.conn, tid)
+    F.event(env.conn, tid, 'terminal_run_reserved', {'park_event_id': old['event_id']}, at=env.now - 120)
+    F.event(env.conn, tid, 'scheduled', {'wake_at': int(env.now - 3600)}, at=env.now - 90)
+    assert not kc._reserved_for(env.conn, tid, kc.park_state(env.conn, tid))
+    assert one(env, 'BS-overdue-wake', tid)['variant'] == 'clock_overdue'
+
+
 def test_scheduled_with_no_wake_published(env):
     f = one(env, 'BS-overdue-wake', F.scheduled_no_wake(env.conn, env.now))
     assert f['variant'] == 'no_wake' and f['fix']['kind'] == 'card'

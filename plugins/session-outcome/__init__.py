@@ -374,6 +374,42 @@ def person_wait_id(channel: str, contact: str, thread: str = "", request_id: str
 _PERSON_EDIT: ContextVar = ContextVar('person_edit', default=None)
 
 
+# Sessions whose person ledger this operation saved: refreshed once, after the ledger lock is released.
+_PERSON_REFRESH: ContextVar = ContextVar('person_refresh', default=None)
+
+
+def _save_people(session_id, records):
+    """Persist the person ledger and note the chat for a stored-outcome refresh: `person_provider` reads this
+    ledger for the outcome's controls, and core refreshes outcomes on no event for it. The refresh itself is
+    queued by `_queue_person_refresh` after the ledger flock is released (see `handle`)."""
+    _people().save(session_id, records)
+    pending = _PERSON_REFRESH.get()
+    if pending is not None:
+        pending.setdefault(session_id, None)
+    else:
+        _queue_person_refresh([session_id])  # no surrounding operation holds the lock
+
+
+def _queue_person_refresh(session_ids):
+    """Hand the chats to user-steps' single background controls worker: event-driven, never in the tool call, never
+    under the ledger lock, no polling. Skipped without the person provider here (a refresh would store an outcome
+    missing these waits). Trigger "notice" is user-steps' controls trigger: no special meaning in core."""
+    sids = list(dict.fromkeys(s for s in session_ids if s))
+    if not sids:
+        return
+    api = _outcome_api()
+    if api is None or 'person-dependencies' not in getattr(api, '_providers', {}):
+        return
+    try:
+        queue = getattr(_user_steps(), 'queue_controls_refresh', None)
+        if not callable(queue):
+            log.debug('session-outcome: user-steps has no controls refresh queue; person-wait refresh skipped')
+            return
+        queue(_people().home() / 'state.db', sids)
+    except Exception:
+        log.warning('session-outcome: person-wait outcome refresh not queued for %s', sids, exc_info=True)
+
+
 def _person_records(session_id):
     active = _PERSON_EDIT.get()
     return active[1] if active and active[0] == session_id else _people().read(session_id)
@@ -584,19 +620,38 @@ def _person_close_refusal(session_id: str, closes: list[dict]) -> Optional[str]:
 
 
 def handle(args: dict, session_id: str = "", tool_call_id: str = "", **kwargs: Any) -> str:
+    from contextlib import nullcontext
+    # Reject malformed declarations before loading a writer or acquiring any ledger lock.
+    try:
+        _validate(args if isinstance(args, dict) else {})
+    except ValueError as exc:
+        return _err(str(exc))
+    us = _user_steps()
+    defer = getattr(us, 'defer_controls_refresh', nullcontext)
+    with defer():
+        return _handle_with_people(args, session_id=session_id, tool_call_id=tool_call_id, **kwargs)
+
+
+def _handle_with_people(args: dict, session_id: str = "", tool_call_id: str = "", **kwargs: Any) -> str:
     if not session_id:
         return _err('no session')
     if not _interactive(session_id=session_id):
         return _err('session_outcome is only for desktop, tui, cli, gui and acp chats')
+    saved: dict = {}
+    refresh_token = _PERSON_REFRESH.set(saved)
     try:
-        with _people().edit(session_id) as records:
-            token = _PERSON_EDIT.set((session_id, records))
-            try:
-                return _handle(args, session_id=session_id, tool_call_id=tool_call_id, **kwargs)
-            finally:
-                _PERSON_EDIT.reset(token)
-    except Exception as exc:
-        return _err(f'person dependency ledger unavailable; nothing closed: {exc}')
+        try:
+            with _people().edit(session_id) as records:
+                token = _PERSON_EDIT.set((session_id, records))
+                try:
+                    return _handle(args, session_id=session_id, tool_call_id=tool_call_id, **kwargs)
+                finally:
+                    _PERSON_EDIT.reset(token)
+        except Exception as exc:
+            return _err(f'person dependency ledger unavailable; nothing closed: {exc}')
+    finally:
+        _PERSON_REFRESH.reset(refresh_token)
+        _queue_person_refresh(list(saved))  # flock released; one queued refresh however many saves
 
 
 def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
@@ -655,7 +710,7 @@ def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) 
                 records[:] = list(by_id.values())
                 # Persist BEFORE declaring: even a core rejection/crash must not lose
                 # a request already sent. No dependency is closed on failure.
-                _people().save(session_id, records)
+                _save_people(session_id, records)
                 result['person_waits'] = updates
             outcome = {"kind": "waiting", "on": [{k: v for k, v in w.items() if k != '_person'} for w in spec["on"]]}
         else:
@@ -713,7 +768,7 @@ def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) 
                     r.update(state='cancelled' if c['cancelled'] else 'closed', closed_at=time.time(),
                              closure_receipt={'ref': c['evidence'], 'verified': c['verified'],
                                               'cancelled': c['cancelled'], 'observed_at': time.time()})
-            _people().save(session_id, records)
+            _save_people(session_id, records)
         _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
         if spec["kind"] == "decide" and made_steps:

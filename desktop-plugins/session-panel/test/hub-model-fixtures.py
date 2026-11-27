@@ -126,6 +126,22 @@ cases['clock_probe'] = f.bundle(f.task(status='scheduled', hostname='long-worker
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
-print(json.dumps({**{name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
-    wire=name in ('relative_clock', 'elapsed_layout', 'aged_parked', 'clock_reason', 'clock_unreasoned') or name.startswith(('agent_held_', 'eta_'))), 'now': f.NOW} for name, b in cases.items()},
+# Timing goldens cross the real final producer boundary. A reducer-only model
+# has no source TTL and cannot prove source expiry independently of heartbeats.
+feed_path = path.parent.parent / 'dashboard' / 'feed.py'
+feed_spec = importlib.util.spec_from_file_location('_timing_fixture_feed', feed_path)
+assert feed_spec is not None and feed_spec.loader is not None
+feed_module = importlib.util.module_from_spec(feed_spec)
+sys.modules[feed_spec.name] = feed_module
+feed_spec.loader.exec_module(feed_module)
+producer = feed_module.Feed(None, emit=lambda _: None, clock=lambda: f.NOW, full_every_s=60)
+fixtures = {}
+for name, b in cases.items():
+    timing = name in ('relative_clock', 'elapsed_layout', 'aged_parked', 'clock_reason', 'clock_unreasoned') or name.startswith(('agent_held_', 'eta_'))
+    model = f.model.reduce_panel(b, now=f.NOW, projector=f.project, wire=timing)
+    if name == 'elapsed_layout' or name.startswith('eta_'):
+        model = producer._client_bundle(name, {**b, 'model': model}, True)['model']
+    fixtures[name] = {'model': model, 'now': f.NOW}
+producer.stopped.set()
+print(json.dumps({**fixtures,
     **{'header_clock_' + name: case for name, case in f.header_clock_cases().items()}}))

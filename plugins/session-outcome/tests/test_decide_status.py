@@ -30,6 +30,9 @@ def decide(real, tmp_path, monkeypatch):
     step = us.add_step('chat', 'Choose a configuration', ['One', 'Two'])
     store = us.ActionStore()
     request = store.migrate_step(owner, step)
+    # Finish setup's committed-change refresh before opening the assertion writer.
+    # Concurrent last-close/reopen can otherwise invalidate its WAL generation.
+    helpers._drain(plugin)
     db = SessionDB(db_path=tmp_path / 'state.db')
     db.append_message('chat', role='assistant', content=helpers.SUMMARY)
     plugin._llm = lambda *a: 'YES'

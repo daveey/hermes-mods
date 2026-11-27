@@ -40,6 +40,7 @@ audits, and answering one when he asked about the other is a miss even when ever
   wait). Lead the reply with the not-ready findings and the counts per gateway that reconcile with his number.
   Mention red cards in at most one line, and only when a not-ready chain is behind one. The red-card asks,
   decision forms and Done-means list below don't apply.
+- A "waiting on CI"/pink-pip count: read `references/waiting-audit.md` first.
 - Unsure which he means? Run both inventories (each is read-only and quick), and lead with the set whose count is
   closest to the number he quoted.
 

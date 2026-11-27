@@ -147,7 +147,16 @@ class ReceiptLog:
         return not self.thread.is_alive() and self.valid
 
     def _open(self, index):
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent = self.path.parent
+        fresh = not parent.exists()
+        try:
+            from hermes_constants import mkdir_under_hermes_home
+        except ImportError:  # no core on the path (plugin-only test runs)
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:  # refuses a deleted/missing named profile instead of recreating its tree
+            mkdir_under_hermes_home(parent)
+            if fresh:
+                os.chmod(parent, 0o700)
         path = self.path if index == 0 else self.path.with_name(f'{self.path.name}.{index}')
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         os.fchmod(fd, 0o600)

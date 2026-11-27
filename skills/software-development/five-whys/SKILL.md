@@ -195,8 +195,8 @@ problem gets small fixes at every level, not a rewrite. Usually:
 When designing cleanup or human-blocker fixes, read `references/cleanup-and-blocker-countermeasures.md` (authorization classification, replica ownership and lifecycle reaper verification).
 
 Each countermeasure is concrete and verifiable: a regression test that fails before and passes after, a guard you
-can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is
-too big for now, file it (card or issue with the chain) and say so in the report; don't drop it silently.
+can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If any countermeasure is
+too big for now, file its own card or issue and name its id; a comment on another card files nothing.
 
 **For this user, an authorized correction includes implementation, not just diagnosis or dispatch.** Write a bounded prevention plan, execute the in-scope mitigation, and read back the live effect before reporting progress. Keep immediate delivery recovery separate from systemic hardening: require an explicit necessity argument before making another preventive card a release prerequisite. Reuse existing owners and preserved work rather than grow a competing graph. Verify that an owner actually claimed execution and acknowledged the handoff; a ready card or posted comment is not active recovery. Ownership has a progress budget: an owner whose delivery card has not changed status in 24 h while its graph keeps spending runs is not recovering anything, so take the next step yourself instead of adding another watcher or gate (at most one watcher per graph, and it may implement and land; a new gate on a ship card needs a written reason in its body). In a live chat the budget is shorter: a second ask from the user about the same unresolved state ends it unless the owner delivered since your last reply, so take the next step yourself that turn rather than relay the owner again (coach `relay_repeat` flags it). If exact execution approval is still required, preserve that gate even when disruptive host work is broadly authorized. Takeover guidance never overrides dispatcher admission, quota pacing, or an explicit no-code-edits limit. A queue notice is not renewed execution authority: when it says not to run the work outside the dispatcher, read and record status without doing the held implementation, tests or review through chat/subagents. Preserve the existing owner and admission gates; the coach's `dispatcher_scope` exemption prevents report-only pressure on that notice. Verify this with the notice's actual saved ask and draft, not a clean queue without the prohibition.
 
@@ -255,7 +255,7 @@ Check the draft before it is posted, not after: a chain for a new card's body be
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
 - [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
-- [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link, and each live check ran at once, never as an N-hour soak?
+- [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or its own card/issue id, and each live check ran at once, never as a soak?
 - [ ] Each log-line probe (wake or live check) wakes on the precondition's own line, not only the outcomes you expect, matched a real line of its logger copied from the live log (session tag and rotated files included) and missed a line that only quotes its phrase?
 - [ ] The chain is posted where the fix lives (PR body, issue, card comment), not only in chat?
 

@@ -86,6 +86,131 @@ def test_with_done_run_stats_only_touches_done_rows():
     assert rows[0]['run_stats']['runs'] == 1 and 'run_stats' not in rows[1]
 
 
+def test_event_transport_bounds_handoffs_and_keeps_newest_receipt():
+    pytest.importorskip('hermes_state_page_pack')
+    c = board([(1, 't_a', 'done', 0, 90)],
+              [('t_a', 1, 'worker_result', {'usage': {'output_tokens': n, 'cost_usd': 0.5}})
+               for n in range(513)])
+    fetched = []
+    c.row_factory = lambda cur, row: fetched.append(len(row)) or tuple(row)
+    # Custom row factories must retain their own semantics, including callbacks.
+    want = feedmod.done_run_stats(c, ['t_a'])
+    assert len(fetched) >= 513
+    fetched.clear()
+    c.row_factory = sqlite3.Row
+    c.set_trace_callback(fetched.append)
+    got = feedmod.done_run_stats(c, ['t_a'])
+    assert got == want and got['t_a']['tokens'] == 512
+    assert any('json_group_array' in sql for sql in fetched)
+    assert any('GROUP BY _pack_ordinal / 64' in sql for sql in fetched)
+    c.close()
+
+
+def test_fresh_event_read_without_notification_and_pinned_snapshot(tmp_path):
+    pytest.importorskip('hermes_state_page_pack')
+    path = tmp_path / 'board.db'
+    c = sqlite3.connect(path)
+    source = board([(1, 't_a', 'done', 0, 90)], [])
+    source.commit()
+    source.backup(c)
+    source.close()
+    c.execute('PRAGMA journal_mode=WAL')
+    other = sqlite3.connect(path)
+    try:
+        c.execute('BEGIN')
+        before = feedmod.done_run_stats(c, ['t_a', 'missing'])
+        other.execute("INSERT INTO task_events(task_id,run_id,kind,payload) VALUES ('t_a',1,'worker_result',?)",
+                      (json.dumps({'usage': {'output_tokens': 7, 'cost_usd': 0.5}}),))
+        other.commit()
+        assert feedmod.done_run_stats(c, ['t_a', 'missing']) == before
+        c.rollback()
+        assert feedmod.done_run_stats(c, ['t_a'])['t_a']['tokens'] == 7
+    finally:
+        other.close()
+        c.close()
+
+
+def test_same_path_replacement_does_not_reuse_event_rows(tmp_path):
+    pytest.importorskip('hermes_state_page_pack')
+    path = tmp_path / 'board.db'
+    old = sqlite3.connect(path)
+    source = board([(1, 't_a', 'done', 0, 90)], [])
+    source.commit()
+    source.backup(old)
+    source.close()
+    assert feedmod.done_run_stats(old, ['t_a'])['t_a']['tokens'] == 0
+    replacement = tmp_path / 'new.db'
+    new = sqlite3.connect(replacement)
+    source = board([(1, 't_a', 'done', 0, 90)],
+                   [('t_a', 1, 'worker_result', {'usage': {'output_tokens': 9, 'cost_usd': 1}})])
+    source.commit()
+    source.backup(new)
+    source.close()
+    new.close()
+    replacement.replace(path)
+    fresh = sqlite3.connect(path)
+    try:
+        assert feedmod.done_run_stats(old, ['t_a'])['t_a']['tokens'] == 0
+        assert feedmod.done_run_stats(fresh, ['t_a'])['t_a']['tokens'] == 9
+    finally:
+        fresh.close()
+        old.close()
+
+
+def test_transport_cell_bound_and_storage_types():
+    pytest.importorskip('hermes_state_page_pack')
+    counts = []
+
+    class Cursor(sqlite3.Cursor):
+        def fetchall(self):
+            rows = super().fetchall()
+            counts.append((len(rows), len(self.description or ())))
+            return rows
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, args=()):
+            return self.cursor(Cursor).execute(sql, args)
+
+    c = sqlite3.connect(':memory:', factory=Connection)
+    try:
+        c.execute('CREATE TABLE task_events(task_id, run_id, kind, payload)')
+        values = [('t_a', n, 'worker_result', b'\x00\xff' if n % 2 else None) for n in range(513)]
+        c.executemany('INSERT INTO task_events VALUES (?,?,?,?)', values)
+        sql = 'SELECT task_id, run_id, kind, payload FROM task_events ORDER BY run_id'
+        assert list(feedmod._done_event_rows(c, sql, [])) == values
+        assert counts == [(9, 1)]  # 513 logical rows, only ceil(513/64) one-column handoffs
+    finally:
+        c.close()
+
+
+def test_transport_fallback_for_old_core_and_missing_json(monkeypatch):
+    pack = pytest.importorskip('hermes_state_page_pack')
+    c = board([(1, 't_a', 'done', 0, 90)],
+              [('t_a', 1, 'worker_result', {'usage': {'output_tokens': 7, 'cost_usd': 0.5}})])
+    try:
+        want = feedmod.done_run_stats(c, ['t_a'])
+        with monkeypatch.context() as m:
+            m.delattr(pack, 'read_chunks')
+            assert feedmod.done_run_stats(c, ['t_a']) == want
+        def missing(*args):
+            raise sqlite3.OperationalError('no such function: json_group_array')
+        monkeypatch.setattr(pack, 'read_chunks', missing)
+        assert feedmod.done_run_stats(c, ['t_a']) == want
+    finally:
+        c.close()
+
+
+def test_custom_text_factory_keeps_literal_semantics():
+    c = board([(1, 't_a', 'done', 0, 90)],
+              [('t_a', 1, 'worker_result', {'usage': {'output_tokens': 7}})])
+    try:
+        c.text_factory = bytes
+        sql = 'SELECT task_id, run_id, kind, payload FROM task_events'
+        assert list(feedmod._done_event_rows(c, sql, [])) == c.execute(sql).fetchall()
+    finally:
+        c.close()
+
+
 def done_row(tid, stats, **kw):
     return {'id': tid, 'gateway': 'hub', 'profile': 'default', 'board': 'default', 'title': 'Shipped',
             'status': 'done', 'completed_at': NOW - 60, 'run_stats': stats, **kw}

@@ -2071,6 +2071,30 @@ def _run_cost(usage: dict, route: dict) -> Optional[float]:
     return float(result.amount_usd) if result.amount_usd is not None and result.status == 'estimated' else None
 
 
+def _done_event_rows(conn, sql, ids):
+    """Transport long receipt histories in 64-row cells; never cache across reads.
+
+    The query/order and caller's snapshot stay unchanged. Older core and custom
+    SQLite factories retain the literal cursor path (including their callbacks).
+    """
+    import sqlite3
+    try:
+        from hermes_state_page_pack import read_chunks
+        from hermes_cli.kanban_db_values import _lossy_text
+    except ImportError:
+        return conn.execute(sql, ids)
+    if (getattr(conn, 'text_factory', None) not in (str, _lossy_text)
+            or getattr(conn, 'row_factory', None) not in (None, sqlite3.Row)):
+        return conn.execute(sql, ids)
+    try:
+        rows = read_chunks(conn, sql, ids)
+    except sqlite3.OperationalError:
+        # A SQLite build without the packing functions keeps the old read path;
+        # genuine query errors still propagate to done_run_stats' fail-closed path.
+        return conn.execute(sql, ids)
+    return ((r['task_id'], r['run_id'], r['kind'], r['payload']) for r in rows)
+
+
 def done_run_stats(conn, ids: Iterable[str]) -> dict[str, dict]:
     """``id -> {runs, run_seconds, cost_usd, priced_runs, usage_runs, tokens}`` for finished cards on one board connection.
 
@@ -2096,7 +2120,7 @@ def done_run_stats(conn, ids: Iterable[str]) -> dict[str, dict]:
             return out
         usage: dict[tuple, dict] = {}
         route: dict[tuple, dict] = {}
-        for tid, run_id, kind, raw in conn.execute(
+        for tid, run_id, kind, raw in _done_event_rows(conn,
                 f"SELECT task_id, run_id, kind, payload FROM task_events WHERE task_id IN ({marks}) "
                 f"AND kind IN ('worker_result', 'run_route') AND run_id IS NOT NULL ORDER BY id", ids):
             try:

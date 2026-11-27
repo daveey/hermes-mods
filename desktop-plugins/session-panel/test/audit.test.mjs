@@ -129,19 +129,20 @@ test('CI waits paint light blue; hub-deploy waits paint purple: row box, waiting
   await paint(m.renderModel(model({ waiting: [row('c', { wait_kind: 'ci', detail: 'waiting on ci' })] },
     { state: 'waiting', status: status(['linked_work_open']), wait_kind: 'ci', pips: [{ ...pips[0], wait_kind: 'ci' }] })))
   assert.match(document.querySelector('[data-row-pip]').style.border, blue)
-  assert.match(document.querySelector('[data-model-pip="waiting"] span').style.border, blue)
+  assert.equal(document.querySelector('[data-model-pip="waiting"] [data-card-colour]').dataset.cardColour, 'blue')
+  assert.match(document.querySelector('[data-model-pip="waiting"] [data-card-colour]').style.border, blue)
   assert.match(document.querySelector('[data-panel-status-stripe]').style.background, blue)
   await paint(m.renderModel(model({ waiting: [row('a', { wait_kind: 'deploy', detail: 'waiting on deploy' })] },
     { state: 'waiting', status: status(['linked_work_open']), wait_kind: 'deploy', pips: [{ ...pips[0], wait_kind: 'deploy' }] })))
   assert.match(document.querySelector('[data-row-pip]').style.border, purple)
   assert.equal(document.querySelector('[data-row-pip]').dataset.waitKind, 'deploy')
-  assert.match(document.querySelector('[data-model-pip="waiting"] span').style.border, purple)
+  assert.equal(document.querySelector('[data-model-pip="waiting"] [data-card-colour]').dataset.cardColour, 'violet')
   assert.match(document.querySelector('[data-panel-status-stripe]').style.background, purple)
   // An ordinary park keeps the amber outline and the grey header dot.
   await paint(m.renderModel(model({ waiting: [row('b', { detail: 'waiting on parent card' })] },
     { state: 'waiting', status: status(['linked_work_open']), pips })))
   assert.doesNotMatch(document.querySelector('[data-row-pip]').style.border, blue)
-  assert.doesNotMatch(document.querySelector('[data-model-pip="waiting"] span').style.border, blue)
+  assert.equal(document.querySelector('[data-model-pip="waiting"] [data-card-colour]').dataset.cardColour, 'amber')
   assert.doesNotMatch(document.querySelector('[data-panel-status-stripe]').style.background, blue)
   assert.doesNotMatch(document.querySelector('[data-row-pip]').style.border, purple)
 })
@@ -230,7 +231,10 @@ print(json.dumps(f.reduce_panel({'tasks':[card],'requests':[old,live]}, now=1795
   m.ingestBundle('conn', 'default', { session: 'chat', model: real })
   await paint(React.createElement(m.Panel))
   assert.equal(m.showsDecision('req-old'), true)
-  assert.equal(document.querySelector('[data-ask-row] [data-decision-status="req-old"]')?.textContent, real.sections.needs_you[0].decision.text)
+  // Cached task asks expire, but their independently recorded delivery receipt
+  // remains visible; companion suppression must not swallow the sole status.
+  assert.ok(document.querySelector('[data-ask-row]') === null)
+  assert.equal(document.querySelector('[data-decision-status="req-old"]')?.textContent, real.sections.needs_you[0].decision.text)
   await paint(null); m.resetFeedForTests()
 })
 

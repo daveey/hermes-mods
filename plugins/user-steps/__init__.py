@@ -182,7 +182,7 @@ def _trace(**kw: Any) -> None:
         import time
 
         p = core.home() / "cache" / "user-steps" / "trace.jsonl"
-        p.parent.mkdir(parents=True, exist_ok=True)
+        core.mkdir_live(p.parent)
         if p.exists() and p.stat().st_size > 1_000_000:
             p.write_text("\n".join(p.read_text().splitlines()[-2000:]) + "\n")
         with p.open("a") as f:
