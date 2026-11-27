@@ -1,5 +1,8 @@
 # Workflow/source compatibility
 
+After refreshing a PR with close/reopen, verify the source job's actual synthetic merge parents and executed selector regression inventory. A newly created event can still use a pre-repair synthetic merge; a post-landing event timestamp alone does not prove that the repaired base workflow executed. Read the checkout and emitted generation outputs before claiming qualification. Check every newly added required consumer too: one generation repair does not cover later qualification tooling.
+
+
 When a newer PR-event workflow invokes tooling absent from an older selected PR head, trace the source selector's immutable ancestry generation before treating downstream aggregate reds as test failures. A first-generation compatibility boundary can become stale when required tooling advances.
 
 Version each newly introduced qualification closure with its own immutable ancestry boundary and an intermediate-generation regression. When applicability differs for older exact sources, keep producer jobs unconditional and retain strict all-needs success checks; gate only the newer closure's execution/artifact steps, report older sources explicitly NOT EXECUTED/QUALIFIED, and fail reporting on missing/invalid applicability output. Keep native component inventories, checkout identities and earlier generation gates unchanged. Test an actual intermediate tree containing the earlier feature's inputs, and make shallow-history controls include a locally available boundary object so they exercise the shallow guard rather than a missing-object error. Require hosted modern execution and paired aggregation before landing; a local classifier pass is not that proof.
