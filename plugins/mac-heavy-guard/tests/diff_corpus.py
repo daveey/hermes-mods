@@ -58,6 +58,11 @@ REPROS = [
     'echo "$(echo ${x:-${y})}; pytest)"', 'echo "$(echo ${x:-\'}\')}; pytest)"',
     'echo "$(echo ${x:-\\})}; pytest)"', 'x="$(echo ${x:-${y})}; pytest)"',
     'echo $(echo ${x:-${y})}; ./build.sh)',
+    # F18 (review 6093966184): backslash-newline splitting the `$(` opener
+    'echo "$\\\n(case x in x) pytest;; esac)"', 'x="$\\\n(case x in x) pytest;; esac)"',
+    'echo "$\\\n(echo ${x:-)}; pytest)"', 'echo "$\\\n(echo ${x:-${y})}; pytest)"',
+    'echo "$\\\n(coproc a case x in x) cargo build;; esac)"', 'echo "$\\\n(pytest)"',
+    'cat <<EOF\n$\\\n(case x in x) pytest;; esac)\nEOF',
 ]
 
 # Deliberate new allows (head allows, main held). Each is a bash SYNTAX ERROR (`)` after the closed substitution),
@@ -74,6 +79,8 @@ def build():
     out = list(REPROS) + list(NEW_ALLOW_REASONS)
     for h in HEAVY:
         out += [h, 'echo $(' + h + ')', 'echo "$(' + h + ')"', 'echo `' + h + '`', 'x=$(' + h + ')',
+                'echo "$\\\n(case x in x) ' + h + ';; esac)"', 'echo "$\\\n(' + h + ')"',
+                'echo "$\\\n(echo ${x:-)}; ' + h + ')"',
                 'if true; then ' + h + '; fi', 'if false; then :; elif true; then ' + h + '; fi',
                 'while true; do ' + h + '; done', '{ ' + h + '; }', '( ' + h + ' )', 'f() { ' + h + '; }; f',
                 'function f { ' + h + '; }; f', 'time ' + h, 'time -p ' + h, 'coproc ' + h,

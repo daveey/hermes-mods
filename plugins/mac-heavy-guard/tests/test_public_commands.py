@@ -205,9 +205,18 @@ F17_CASES = [  # review 6093835158: `${...}` closer hidden by nesting, quotes or
     'x="$(echo ${x:-${y})}; pytest)"',
     'echo $(echo ${x:-${y})}; ./build.sh)',
 ]
+F18_CASES = [  # review 6093966184: backslash-newline splitting the `$(` opener inside double quotes
+    'echo "$\\\n(case x in x) pytest;; esac)"',
+    'x="$\\\n(case x in x) pytest;; esac)"',
+    'echo "$\\\n(echo ${x:-)}; pytest)"',
+    'echo "$\\\n(echo ${x:-${y})}; pytest)"',
+    'echo "$\\\n(coproc a case x in x) cargo build;; esac)"',
+    'bash -c \'echo "$\\\n(case x in x) pytest;; esac)"\'',
+    'cat <<EOF\n$\\\n(case x in x) pytest;; esac)\nEOF',
+]
 
 
-@pytest.mark.parametrize('command', F13_CASES + F14_CASES + F16_CASES + F17_CASES)
+@pytest.mark.parametrize('command', F13_CASES + F14_CASES + F16_CASES + F17_CASES + F18_CASES)
 def test_f13_f14_unconditional_hold(command, monkeypatch):
     monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
     assert guard.check_shell(command)

@@ -43,6 +43,8 @@ a substitution that contains a quote, backslash, backtick, nested `${` or an unb
 `${x:-'}'}`), and any backslash-newline continuation inside a substitution (`ca\<newline>se`). Continuations are
 now deleted like bash does (outside single quotes), so `pyt\<newline>est` is `pytest`. False refusals: any
 benign `$(... case x ...)`, e.g. `echo $(echo case x)`, and `$(echo ${x:-"a"})`; use the local exported `MAC_HEAVY_OK=1` opt-out.
+Continuations are joined before substitutions are exposed, and a `$` directly followed by backslash-newline
+(`"$\<newline>(...)"`, also in an unquoted heredoc body) is held whole; false refusal: that text as single-quoted data.
 A differential test (`tests/test_differential.py`, fixture `tests/fixtures/main_verdicts.json`, generator
 `tests/diff_corpus.py`) replays a ~5,000-command corpus (all review repros plus generated prefix/compound/wrapper
 combinations, direct, `bash -c`, `sh -c`, ssh) against origin/main's recorded verdicts: every command main holds must
