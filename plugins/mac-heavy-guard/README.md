@@ -45,10 +45,20 @@ now deleted like bash does (outside single quotes), so `pyt\<newline>est` is `py
 benign `$(... case x ...)`, e.g. `echo $(echo case x)`, and `$(echo ${x:-"a"})`; use the local exported `MAC_HEAVY_OK=1` opt-out.
 Continuations are joined before substitutions are exposed, and a `$` directly followed by backslash-newline
 (`"$\<newline>(...)"`, also in an unquoted heredoc body) is held whole; false refusal: that text as single-quoted data.
+ANSI-C command fragments (`$'pytest'`, including ASCII octal/hex/Unicode escapes)
+are decoded as quoted data before classification. Escaped apostrophes do not
+change continuation state. Non-ASCII escape results and `\\c` control escapes
+are conservatively held because their byte/locale behavior is not modeled.
+Double-quoted `$((...` is treated as arithmetic only with an adjacent closing
+`))` and arithmetic-shaped contents; bash's command-substitution fallback
+(`echo "$((pytest) )"`) is inspected as code. Benign arithmetic such as
+`echo "$((1+2))"` remains allowed.
+
 A differential test (`tests/test_differential.py`, fixture `tests/fixtures/main_verdicts.json`, generator
 `tests/diff_corpus.py`) replays a ~5,000-command corpus (all review repros plus generated prefix/compound/wrapper
 combinations, direct, `bash -c`, `sh -c`, ssh) against origin/main's recorded verdicts: every command main holds must
-also be held by the head unless listed in `NEW_ALLOWS` with a reason (currently none).
+also be held by the head unless listed in `NEW_ALLOWS` with a reason (syntax-error
+false holds and the verified benign ANSI-C continuation twin).
 The public `commands()` API still yields only simple argv lists, recursively
 flattening substitution bodies for consumers such as tailnet. Inspection holds
 raise `ValueError` there, so consumers refuse rather than treating private events
