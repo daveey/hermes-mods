@@ -124,7 +124,7 @@ Before superseding a duplicate transcript row, inspect whether its carrier alrea
 
 When a restriction or release is recognized by joining an audit event with private authority metadata, test both insertion orders and orphan halves. Fencing only metadata leaves a pre-existing orphan able to acquire authority through a later event insert; protect every authority-bearing half, while keeping ordinary audit writes allowed. Exercise SQLite REPLACE against the conflicting old primary-key identity as well as NEW task identity, since implicit deletion need not invoke ordinary DELETE triggers.
 
-For a new durable restriction, distinguish mutation fencing from maintenance eligibility. A correct write fence can still abort a whole recompute transaction or alarm when candidate selection ignores the restriction. Use marker presence (including malformed custody) to skip automatic work before effects, without treating the marker as authority or catching failures after partial writes. Prove an expiring pending-delete neighbour in both edge directions cannot stop an independent lease expiry; execute the real alarm after Durable Object eviction, and preserve target history/edges and next-alarm scheduling.
+For durable restrictions and secondary write recipients, read `references/secondary-writer-custody.md`.
 
 For bounded GC cursor/atomicity proof, read `references/gc-cursor-proof.md`.
 
