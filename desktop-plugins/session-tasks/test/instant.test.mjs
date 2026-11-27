@@ -243,6 +243,10 @@ test('a parked card shows waiting on <producer> since <time>, amber when stalled
   assert.equal(m.waitLook({ wait_state: 'waiting', wait_kind: 'deploy', waiting_on: 'hub mods-pull' }), 'deploy')
   assert.equal(m.chipColor('deploy'), '#a371f7', 'purple')
   assert.equal(m.waitLook({ wait_state: 'stalled', waiting_on: 'deploy hermes-hub' }), 'stalled', 'a stalled deploy wait stays amber')
+  // An unread watch (core external_unknown) is not a failure: the producer's colour holds; a down watch does not.
+  assert.equal(m.waitLook({ wait_state: 'external_unknown', wait_kind: 'deploy', waiting_on: 'deploy core abc → mirror' }), 'deploy')
+  assert.equal(m.waitLook({ wait_state: 'external_unknown', waiting_on: 'ci run 1' }), 'delivery')
+  assert.equal(m.waitLook({ wait_state: 'external_down', wait_kind: 'deploy', waiting_on: 'deploy core abc' }), null)
   assert.equal(m.waitLook({ wait_state: 'waiting', waiting_on: 'producer card t_abc (running)' }), 'waiting')
   assert.equal(m.waitLook({ wait_state: 'stalled', waiting_on: 'ci run 1' }), 'stalled', 'a stalled CI wait stays amber')
   const h = [waiting, human].find(c => c.id === 't_ask')
