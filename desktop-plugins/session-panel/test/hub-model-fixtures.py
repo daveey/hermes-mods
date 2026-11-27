@@ -117,6 +117,48 @@ for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service')
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
+# Composed owned-board fixture: real CoreReaders adapter, not a UI envelope.
+import os
+import tempfile
+from unittest.mock import patch
+try:
+    from hermes_cli import kanban_db, kanban_db_connect
+    import hermes_cli.kanban_triage_attention
+except ImportError:
+    pass
+else:
+    api_spec = importlib.util.spec_from_file_location('_triage_fixture_api', path.parent.parent / 'dashboard/plugin_api.py')
+    api = importlib.util.module_from_spec(api_spec)
+    sys.modules[api_spec.name] = api
+    api_spec.loader.exec_module(api)
+    with tempfile.TemporaryDirectory(prefix='triage-panel-fixture-', dir=os.environ.get('TMPDIR')) as home:
+        board_path = Path(home) / 'kanban.db'
+        # Preserve descendant fences; drop only the inherited live-board selection.
+        environment = patch.dict(os.environ, {**{k: v for k, v in os.environ.items()
+            if k not in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_HOME')},
+            'HERMES_HOME': home}, clear=True)
+        environment.start()
+        conn = kanban_db_connect.connect(board_path)
+        reader = api.CoreReaders(state_db=Path(home) / 'state.db')
+        reader.boards = lambda: [('default', board_path)]
+        try:
+            for age in (599, 600, 601, 6 * 86400):
+                tid = kanban_db.create_task(conn, title='Owned triage attention fixture', initial_status='running')
+                conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, f.NOW - age))
+                # Push the entry outside the bounded display tail.
+                for _ in range(45):
+                    conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, f.NOW - 1))
+                conn.commit()
+                record = reader.card(tid, 'default')
+                assert len(record['detail']['events']) == api.EVENTS_KEPT
+                assert record['detail']['task']['triage_entered_at'] == f.NOW - age
+                row = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
+                cases['composed_triage_' + str(age)] = f.bundle(row, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
+        finally:
+            reader.release()
+            conn.close()
+            environment.stop()
 # Timing goldens cross the real final producer boundary. A reducer-only model
 # has no source TTL and cannot prove source expiry independently of heartbeats.
 feed_path = path.parent.parent / 'dashboard' / 'feed.py'

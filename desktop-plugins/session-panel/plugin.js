@@ -474,10 +474,11 @@ export const waitColor = item => item?.wait_kind === 'agent' ? SECTION_COLOR.run
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
-  ...(section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+  ...(row?.attention === 'triage_overdue' ? { background: SECTION_COLOR.needs_you }
+    : section === 'waiting' ? { border: `1.5px solid ${waitColor(row)}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
 // Section -> shared card-square category (Desktop `CardCountSquare`), matching the row boxes' colours.
 const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
-export const pipCategory = pip => pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
+export const pipCategory = pip => pip.attention === 'triage_overdue' ? 'red' : pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
   : pip.wait_kind === 'deploy' ? 'violet' : pip.wait_kind === 'agent' || deliveryWait(pip) ? 'blue' : 'amber'
 // Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
 const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
@@ -539,7 +540,7 @@ export function clockRow(row, now = Date.now() / 1000) {
   if (row.clock_text?.details) result.details = row.clock_text.details.map(parts => formatClockText(parts, now))
   if (row.decision) result.decision = clockRow(row.decision, now)
   const reason = row.non_running_reason
-  if (reason && reason.freshness === 'current') {
+  if (reason && reason.freshness === 'current' && row.attention !== 'triage_overdue') {
     const at = reason.observed_at, until = reason.valid_until
     if (!Number.isFinite(at) || !Number.isFinite(until) || !Number.isFinite(now) || now < at || now >= Math.min(until, at + 180)) {
       result.non_running_reason = { freshness: 'unknown', disposition: 'unknown', actor: 'unknown',
@@ -560,7 +561,7 @@ function expiryPresentation(model, sections, diagnosticExpired = false) {
   const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
   const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
   const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => ({
-    section, label: model.header.pips.find(p => p.section === section)?.label || label, count: counts[section],
+    ...model.header.pips.find(p => p.section === section), section, label: model.header.pips.find(p => p.section === section)?.label || label, count: counts[section],
     ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {})
   }))
   const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
@@ -643,7 +644,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const label = freshness.stale
     ? lastSeen ? `${str(model.header.label) || model.header.state} · synced ${ageText} ago` : `status unknown (stale${ageText === null ? '' : ` · ${ageText} old`})`
     : hasHeader ? str(model.header.label) || state : 'unknown'
-  const stripe = freshness.stale ? 'none' : status?.presentation?.stripe || 'attention'
+  const stripe = freshness.stale ? 'none' : model.header.attention === 'triage_overdue' ? 'stuck' : status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
     blocked: 'var(--color-zinc-400)', waiting: hasHeader && model.header.wait_kind ? waitColor(model.header) : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
@@ -716,7 +717,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     // A finished row is already under "Done": its own `done`/`archived` label says nothing.
     const detail = section === 'done' && /^(done|archived)$/i.test(str(row.detail).trim()) ? '' : str(row.detail)
     // One line per row: title left, detail right. Only Stuck keeps its (orange) reason on a line of its own.
-    const inline = section !== 'stuck' && !!detail
+    const inline = (section !== 'stuck' || row.attention === 'triage_overdue') && !!detail
     const compact = section === 'waiting' || section === 'ready'
     const title = plain(row.title) || row.id
     const own = ownCard(row)
@@ -748,7 +749,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
             // Runtime ends in an elapsed clock. An unshrinkable metadata line
             // can extend past the clipped panel even though its DOM text exists.
             // Wrap the entire detail when necessary; never ellipsize its clock.
-            style: { ...muted, flex: '0 1 auto', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : { maxWidth: '100%', overflowWrap: 'anywhere' }), whiteSpace: compact ? 'nowrap' : 'normal', ...(section === 'waiting' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
+            style: { ...muted, flex: '0 1 auto', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : { maxWidth: '100%', overflowWrap: 'anywhere' }), whiteSpace: compact ? 'nowrap' : 'normal', ...(section === 'waiting' || row.attention === 'triage_overdue' ? { flex: '0 0 100%', maxWidth: '100%', overflow: 'visible', whiteSpace: 'normal', overflowWrap: 'anywhere' } : {}), fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
         ] }),
         !inline && detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: detail }),
         // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.

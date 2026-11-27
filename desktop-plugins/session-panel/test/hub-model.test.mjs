@@ -61,6 +61,36 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+for (const age of [599, 600, 601, 6 * 86400]) {
+ test(`real CoreReaders -> reducer -> panel/chip: triage age ${age}`, { skip: !cases[`composed_triage_${age}`] }, async () => {
+  const { model, now } = cases[`composed_triage_${age}`]
+  const red = age > 600
+  assert.equal(model.sections.needs_you.length, 0)
+  await paint(m.renderModel(model, { now }))
+  const row = model.sections[red ? 'stuck' : 'waiting'][0]
+  const pip = document.querySelector(`[data-row-pip="${red ? 'stuck' : 'waiting'}"]`)
+  assert.ok(pip)
+  if (red) {
+   assert.equal(window.getComputedStyle(pip).backgroundColor, 'rgb(248, 81, 73)')
+   assert.equal(document.querySelector('[data-session-status]').style.color, 'var(--color-red-500)')
+   assert.match(document.querySelector('[data-row-detail]').textContent, /overdue triage/)
+   assert.equal(model.header.counts.stuck, 1)
+  } else {
+   assert.notEqual(window.getComputedStyle(pip).backgroundColor, 'rgb(248, 81, 73)')
+   assert.equal(model.header.counts.stuck, 0)
+  }
+  assert.equal(model.header.status.presentation.stripe, 'waiting', 'stored canonical status remains truthful; backend attention wins')
+  assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+  const tasks = await import('../../session-tasks/plugin.js')
+  window.__sessionPanel = { clockRow: m.clockRow }
+  const [chip] = tasks.withModelDisplay([{ kind: 'kanban', id: row.id, gateway: row.gateway, profile: row.profile,
+    board: row.board, state: 'triage', observations: [], title: 'Owned triage' }], model, now)
+  assert.equal(chip.look, red ? 'triage' : 'agent-wait')
+  await paint(React.createElement(tasks.Chip, { chip, now: now * 1000 }))
+  assert.doesNotMatch(document.body.textContent, /Needs you|Needs your decision/)
+  delete window.__sessionPanel
+ })
+}
 for (const diagnostic of [false, true]) for (const collapsed of [false, true]) {
  test(`expiry withdraws header attention and wait metadata diagnostic=${diagnostic} collapsed=${collapsed}`, async () => {
   const model = structuredClone(Object.values(cases).find(c => c.model?.sections?.needs_you?.length).model)
@@ -162,7 +192,7 @@ for (const clock of [null, NaN, Infinity, '1795281000', 0]) {
  })
 }
 for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
- test(`real reducer ${name}: actor text and human-only red`, async () => {
+ test(`real reducer ${name}: overdue triage is red without inventing a human actor`, { skip: name !== 'agent_held_human' && !publicCases.composed_triage_601 }, async () => {
   const { model, now } = cases[name]
   await paint(m.renderModel(model, { now }))
   const human = name === 'agent_held_human'
@@ -171,8 +201,10 @@ for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend'
    assert.equal(model.sections.waiting.length, 0)
    assert.equal(window.getComputedStyle(document.querySelector('[data-ask-row]')).borderLeftColor, 'rgb(248, 81, 73)')
   } else {
-   const pip = document.querySelector('[data-row-pip="waiting"]')
-   assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(59, 130, 246)')
+   const pip = document.querySelector('[data-row-pip="stuck"]')
+   assert.equal(window.getComputedStyle(pip).backgroundColor, 'rgb(248, 81, 73)')
+   assert.equal(model.sections.needs_you.length, 0)
+   assert.equal(m.pipCategory(model.header.pips.find(p => p.section === 'stuck')), 'red')
    const detail = document.querySelector('[data-row-detail]')
    assert.ok(detail.textContent.includes("waiting on this chat's agent to decide: "))
    assert.ok(detail.textContent.includes('in triage · 5h 20m'))
@@ -294,7 +326,7 @@ for (const [name, { model, now, status }] of Object.entries(producerCases)) {
    assert.equal(document.querySelectorAll('[data-choice-letter]').length, 0)
    assert.ok(!document.querySelector('[data-session-status]').textContent.includes('interrupted'))
   }
-  if (active) assert.ok(document.querySelector('[data-session-status]').textContent.includes('this chat’s agent is replying'))
+  if (active) assert.ok(document.querySelector('[data-session-status]').textContent.includes('chat active · task execution shown below'))
   if (recovered || done) assert.equal(status.coverage.state, 'complete')
  })
 }

@@ -1576,7 +1576,16 @@ class Feed:
         """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
         `_due` says a pass will be due before it."""
         waits = [w for w in self._due(self.clock()) if w is not None]
+        due = self._triage_deadline(self.clock())
+        if due is not None:
+            waits.append(max(0., due - self.clock()))
         return max(MIN_IDLE_WAIT_S, min([self.heartbeat_s, *waits]))
+
+    def _triage_deadline(self, now):
+        # Detached inputs only; no task-history hydration or HTTP polling.
+        with self.lock:
+            return min((at for held in self.bundles.values()
+                        if (at := _model().triage_deadline(held['bundle'], now)) is not None), default=None)
 
     def beat(self) -> int:
         """Between data changes: registrations are renewed, expired interest dropped and a heartbeat pushed when
@@ -1584,6 +1593,7 @@ class Feed:
         state is due (`_due`) or a pending retry wakes a pass instead."""
         self._drain()
         now = self.clock()
+        triage_due = self._triage_deadline(now)
         with self.lock:
             self._expire(now)
             self._publish_wire()
@@ -1593,7 +1603,8 @@ class Feed:
         if decide is not None and decide <= 0:
             self._decision_retry_at = None  # handed to the decision lane once; its pass re-arms on failure
             self._decide.set()
-        return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
+        return len(self._publish({}, heartbeat=True, age_only=(now - self.last_emit >= self.heartbeat_s or
+                   (triage_due is not None and triage_due <= now))))
 
     def _producer_order(self, todo: list[str], wanted: set) -> list[str]:
         """Producer order under a pass budget: chats on a mounted panel, then chats with fresh source

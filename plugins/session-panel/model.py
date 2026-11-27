@@ -529,34 +529,49 @@ def _legacy_human_owned(row):
     return card_is_open_human_ask(state, row.get('block_kind'), hr)
 
 
-def triage_label(row, bundle, now, *, wire=False):
-    """Current triage entry from lifecycle events, never the card's creation clock."""
+def triage_clock(row, bundle):
+    """Use core's lifecycle policy, including detached local/replica evidence."""
     detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
-    phase, entered = None, None
-    fixed = {'spend_budget_triaged': 'triage', 'spend_budget_held': 'triage', 'decision_retained': 'triage',
-             'contained': 'triage', 'gave_up': 'triage', 'supervisor_escalated': 'triage',
-             'decision_protected_stopped': 'triage', 'block_loop_detected': 'triage', 'agent_block_escalated': 'triage',
-             'claimed': 'running', 'spawned': 'running', 'unblocked': 'ready', 'triage_swept': 'ready',
-             'scheduled': 'scheduled', 'continued': 'scheduled', 'blocked': 'blocked',
-             'completed': 'done', 'archived': 'archived', 'review_requested': 'review'}
-    for event in detail.get('events') or []:
-        if not isinstance(event, dict):
-            continue
-        kind, payload = event.get('kind'), obj(event.get('payload'))
-        if kind in ('promoted', 'promoted_manual', 'unblocked'):
-            landing = payload.get('status', 'ready')
-        else:
-            landing = payload.get('status') if kind in ('created', 'status', 'reopened', 'no_progress_escalated') else fixed.get(kind or '')
-        if landing is None:
-            continue
-        if landing == 'triage' and phase != 'triage':
-            value = event.get('created_at')
-            at = seconds(value) if type(value) in (int, float) else 0
-            entered = at if 0 < at <= now else None
-        elif landing != 'triage':
-            entered = None
-        phase = landing
-    age = (relative(entered, 'elapsed') if wire else short_dur(now - entered)) if entered else 'entry time unavailable'
+    if 'events' in detail:
+        task = obj(detail.get('task'))
+        return {**row, 'events': detail['events'],
+                **({'triage_entered_at': task['triage_entered_at']} if 'triage_entered_at' in task else {})}
+    return row
+
+
+def triage_entry(row, bundle):
+    try:
+        from hermes_cli.kanban_triage_attention import current_entry
+    except ImportError:
+        return None  # older core: explicitly unknown, never a second lifecycle policy
+    return current_entry(triage_clock(row, bundle))
+
+
+def triage_overdue(row, bundle, now):
+    try:
+        from hermes_cli.kanban_triage_attention import overdue
+    except ImportError:
+        return False
+    return overdue(triage_clock(row, bundle), now=now)
+
+
+def triage_deadline(bundle, now):
+    try:
+        from hermes_cli.kanban_triage_attention import next_transition
+    except ImportError:
+        return None
+    sections = obj(obj(bundle.get('model')).get('sections'))
+    covered = {v['key'] for name, views in sections.items() for v in views
+               if name == 'needs_you' or v.get('attention') == 'triage_overdue'}
+    clocks = [triage_clock(row, bundle) for row in bundle.get('tasks') or [] if key(row) not in covered]
+    return min((at for row in clocks if (entered := triage_entry(row, {})) is not None and entered <= now
+                if (at := next_transition(row, now=min(now, entered))) is not None), default=None)
+
+
+def triage_label(row, bundle, now, *, wire=False):
+    entered = triage_entry(row, bundle)
+    known = entered is not None and entered <= now
+    age = (relative(entered, 'elapsed') if wire else short_dur(now - entered)) if known else 'entry time unavailable'
     return 'in triage · ' + age
 
 
@@ -1191,6 +1206,18 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['details'].insert(0, f'completed {pacific(finished)}')
         sections['done'].append(v)
         diagnostic_rows[k] = row
+    aged_keys = set()
+    for section, views in sections.items():
+        if section != 'needs_you':
+            for view in views[:]:
+                source_row = rows_by_key.get(view['key'], {})
+                if triage_overdue(source_row, bundle, now):
+                    view['attention'] = 'triage_overdue'
+                    view['detail'] = 'overdue triage · ' + view.get('detail', '')
+                    aged_keys.add(view['key'])
+                    if section != 'stuck':
+                        views.remove(view)
+                        sections['stuck'].append(view)
     for views in sections.values():
         for view in views:
             source_row = rows_by_key.get(view['key'], {})
@@ -1222,6 +1249,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             group.update(section='waiting', wait_kind='agent',
                          detail=agent_hold_text(card, bundle))
         if group.get('status') == 'triage':
+            if group.get('section') != 'needs_you' and triage_overdue(card, bundle, now):
+                group.update(section='stuck', attention='triage_overdue',
+                             detail='overdue triage · ' + group.get('detail', ''))
+                aged_keys.add(group['key'])
             age = triage_label(card, bundle, now, wire=wire)
             group['detail'] += ' · ' + age
             group['details'].append(age)
@@ -1243,6 +1274,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     delivery = counts['waiting'] > 0 and all(v.get('wait_kind') for v in sections['waiting'])
     wait_kind = 'agent' if any(v.get('wait_kind') == 'agent' for v in sections['waiting']) else next((v.get('wait_kind') for v in sections['waiting']), None)
     for pip in pips:
+        if pip['section'] == 'stuck' and aged_keys:
+            pip['attention'] = 'triage_overdue'
         if pip['section'] == 'waiting' and delivery:
             pip['wait_kind'] = wait_kind
     status = published_status(outcome)
@@ -1258,6 +1291,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     label = header_label(state, status)
     source = 'canonical' if status else 'derived'
     header = {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}
+    if aged_keys:
+        header['attention'] = 'triage_overdue'
+        header['label'] = 'overdue triage · ' + label
     if delivery and state == 'waiting' and not (counts['needs_you'] or counts['stuck'] or counts['running']):
         header['wait_kind'] = wait_kind
     result = {'version': 1, 'header': header, 'sections': sections,
