@@ -92,18 +92,22 @@ try {
     assert.match(pane.container.textContent, /Partial lanes data/)
     assert.equal(pane.container.querySelector('.lanes-share-bar'), null)
     for (const row of pane.container.querySelectorAll('[data-sidebar-lane]')) {
-      assert.equal([...row.querySelector('button').querySelectorAll('span')].at(-1).textContent, '—')
+      await pane.click(row.querySelector('button'))
+      assert.match(row.querySelector('[data-lane-counts]').textContent, /— running/)
+      assert.match(row.querySelector('[data-lane-counts]').textContent, /— waiting/)
       assert.match(row.querySelector('.lanes-target-share').textContent, /—/)
       assert.equal(row.querySelector('meter'), null)
     }
   } else if (scenario === 'partial-status') {
     assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— running/)
     assert.match(pane.container.textContent, /Partial lanes data/)
-    assert.match(pane.container.textContent, /\$— today/)
-    const bad = pane.container.querySelector(`[data-sidebar-lane="${failed_lane}"] button`)
-    const good = pane.container.querySelector(`[data-sidebar-lane="${healthy_lane}"] button`)
-    assert.equal(bad.querySelectorAll('span')[1].textContent, '—')
-    assert.equal(good.querySelectorAll('span')[1].textContent, '1')
+    assert.equal(pane.container.querySelector('[data-fleet-spend]').getAttribute('aria-label'), P.spendLabel(view.spend), 'spend remains independent of flow failure')
+    const bad = pane.container.querySelector(`[data-sidebar-lane="${failed_lane}"]`)
+    const good = pane.container.querySelector(`[data-sidebar-lane="${healthy_lane}"]`)
+    await pane.click(bad.querySelector('button'))
+    assert.match(bad.querySelector('[data-lane-counts]').textContent, /— running/)
+    await pane.click(good.querySelector('button'))
+    assert.match(good.querySelector('[data-lane-counts]').textContent, /1 running/)
   } else if (scenario === 'incomplete') {
     assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /unknown/i)
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))

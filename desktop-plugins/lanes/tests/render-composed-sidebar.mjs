@@ -33,7 +33,7 @@ for (const order of ['sidebar-first', 'strip-first']) {
     for (const [label, expected] of [['max workers', '3'], ['cards / day', '7'], ['$ / day', '12.5']])
       assert.equal(sidebar.container.querySelector(`[aria-label="babybear ${label}"]`).value, expected, `${order}: ${label}`)
     assert.equal(requests.at(-1).expanded, true, 'sidebar retains expanded projection')
-    assert.equal(requests.at(-1).hours, 6, 'hidden legacy window cannot change sidebar scope')
+    assert.equal(requests.at(-1).hours, 24, 'hidden legacy window cannot change sidebar scope')
     assert.equal(registered.has('session-filter'), false, 'invisible legacy selection does not register filter')
   }
   try {

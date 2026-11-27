@@ -70,3 +70,37 @@ def test_spend_matches_real_core_usage_for_each_window(conn, configured):
         for name in pol.lanes:
             assert value[name][key] == real[name]['cost_usd']
     assert value['babybear'] == dict(hour=3.2, day=8.5, week=11.)
+
+
+def test_fleet_capacity_uses_real_core_freshness_not_last_good(monkeypatch):
+    """An outage in core retains discovery but must remove authoritative lane capacity."""
+    from types import SimpleNamespace
+    from hermes_cli import kanban_worker_node as node
+
+    clock, calls, failing = [0.], [], [False]
+    def fetch():
+        calls.append(clock[0])
+        if failing[0]:
+            raise OSError('fixture registry unavailable')
+        return {'machines': [
+            {'name': 'active', 'state': 'active', 'max_card_runs': 6},
+            {'name': 'held', 'state': 'active', 'hold': True, 'max_card_runs': 100},
+            {'name': 'retired', 'state': 'retired', 'max_card_runs': 100},
+        ]}
+    # Replace core cache bindings, not the real process cache or Board identity.
+    monkeypatch.setattr(node, '_REGISTRY', dict(at=None, value=None, retry=False, ok_at=None))
+    monkeypatch.setattr(node, '_FETCH', fetch)
+    monkeypatch.setattr(node, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    spec = importlib.util.spec_from_file_location('lane_metrics_core_registry', Path(__file__).parents[1] / 'dashboard/metrics.py')
+    metrics = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(metrics)
+    assert metrics._fetch_registry_slots() == 6
+    assert calls == [0.]
+    clock[0] = node.REGISTRY_TTL_S
+    failing[0] = True
+    assert node.registry()['machines']['active']['max_card_runs'] == 6
+    assert metrics._fetch_registry_slots() is None
+    assert calls == [0., node.REGISTRY_TTL_S]  # require_fresh obeys core outage retry TTL
+    clock[0] += node.REGISTRY_RETRY_S
+    failing[0] = False
+    assert metrics._fetch_registry_slots() == 6
