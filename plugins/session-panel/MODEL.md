@@ -80,7 +80,7 @@ A row's box and the numbered waiting square read one category: `wait_kind`, else
 goes stale or unknown (stale replica, partial owner read, aged board data, unknown
 execution evidence, or a Desktop cache that expired), the reducer and the renderer
 withdraw `wait_kind`/ETA (no live producer claim, no header dot) and keep the
-category the row last showed as `last_wait_kind`, so a known CI wait stays light
+category the non-stalled waiting row last showed as `last_wait_kind`, so a known CI wait stays light
 blue with text `status unknown · last known: waiting on CI …`. The waiting pip
 carries `wait_kind` when every waiting row is live, else `last_wait_kind` when every
 waiting row has a category; any uncategorised row keeps it amber. A row with no
@@ -197,7 +197,9 @@ Native schedule, human, startup and review lifecycles remain authoritative only
 for their source snapshot. When that snapshot expires in a cached renderer, native
 task rows become historical `status unknown · last known: …`, withdraw stuck pips,
 wake/ETA and task-decision actions (keeping the last-known wait colour category as
-`last_wait_kind` on both row and waiting pip), and retain read-only navigation.
+`last_wait_kind` on both row and waiting pip only for source waiting rows), and retain read-only navigation.
+Stuck/stalled/overdue-triage rows lose fresh attention on expiry but never inherit a blue producer category;
+their unknown historical presentation is amber, not an active wait.
 A fresh source restores the current native wait. This never clears a stored hold.
 The self-contained `test/nonrunning.test.mjs` harness runs real disposable core
 producers through the reducer and mounts the actual renderer; these tests are not
