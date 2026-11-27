@@ -305,6 +305,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
 - [ ] An optional offer is worded "Optional: I'll keep X; say if you want Y." in a plain sentence, never under a
   "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
   chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
+- [ ] No `::user-step` or `action_request` wraps a future step ("once the build is on your phone…"): its prerequisite is verifiably done now, else it's a plain sentence. Re-check every reply, not just the first: a repeated status line re-files it.
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
 - [ ] No reply restates an open ask outside the ask itself, as a bare reminder ('… still need you') or as a line in a status or batch reply's 'waiting on you' list: the open tile already shows it. ask-gate refuses such a reply and user-steps holds it once; delete the line (or re-send unchanged only if it is a different decision), and mention the ask again only with a new fact: a status change, deadline or cost.
 - [ ] Every Chrome ask came after a `browser_focus` that returned that tab shown on the user's display (else the noVNC view was opened).
