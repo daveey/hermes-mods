@@ -798,6 +798,10 @@ class _AnalysisLimit(Exception):
     pass
 
 
+class _UnsupportedSubstitution(Exception):
+    pass
+
+
 class _Substitution(list):
     """An isolated shell body, positioned in the parent command stream."""
 
@@ -859,6 +863,13 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
         out, depth = [], 0
         while i < n:
             c = text[i]
+            # Bare case-pattern `)` has no matching `(`. Do not truncate the
+            # substitution at it: this scanner deliberately holds that grammar.
+            if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
+                    i == 0 or text[i - 1] in " \t\n;&|("):
+                prefix = "".join(out)
+                if re.search(r"(?:^|[;&|({\n])\s*(?:(?:then|do|else|if|while|until|!)\s+)*$", prefix):
+                    raise _UnsupportedSubstitution
             if c == "\\":
                 out.append(text[i:i + 2])
                 i += 2
@@ -930,6 +941,10 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
         return text
     try:
         return code(0, "", 0)[0]
+    except _UnsupportedSubstitution:
+        if substitutions is not None:
+            raise
+        return text
     except (_AnalysisLimit, RecursionError):
         if substitutions is not None:
             raise _AnalysisLimit from None
@@ -1063,8 +1078,8 @@ def _command_tokens(text: str) -> list[str]:
     return _command_lex(_lexable(code, _command_lex))
 
 
-def commands(text: str, _prepared: bool = False) -> Iterator[tuple[list[str], set[str]]]:
-    """Yield (argv, env-assignment names) for each simple command, recursing into `bash -c`."""
+def _command_events(text: str, _prepared: bool = False) -> Iterator[tuple[list[str], set[str]]]:
+    """Private ordered stream: argv, isolated substitution bodies, or holds."""
     # Replace outer substitutions with collision-free tokens. Consume these at
     # their textual positions, even in suppressed headers/patterns/arrays, and
     # scan their bodies with a private cwd rather than leaking subshell `cd`.
@@ -1073,6 +1088,9 @@ def commands(text: str, _prepared: bool = False) -> Iterator[tuple[list[str], se
         code = _expose_substitutions(text if _prepared else _split_heredocs(text)[0], substitutions)
     except _AnalysisLimit:
         yield _InspectionHold(["command substitution inspection depth limit"]), set()
+        return
+    except _UnsupportedSubstitution:
+        yield _InspectionHold(["case command substitution inspection unsupported"]), set()
         return
     code = code.replace("\\\n", " ")
     toks = _command_lex(_lexable(code, _command_lex))
@@ -1123,6 +1141,28 @@ def commands(text: str, _prepared: bool = False) -> Iterator[tuple[list[str], se
             continue
         else:
             cur.append(t)
+    if case_depth:
+        yield _InspectionHold(["incomplete case command inspection"]), set()
+
+
+def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
+    """Public simple-argv stream, with no private events; holds raise ValueError.
+
+    Tailnet and other consumers must never mistake a body/limit for an argv.
+    ValueError uses their existing unclassifiable-command refusal path.
+    """
+    def flatten(body: str, prepared: bool, level: int, inherited: set[str]):
+        for argv, env in _command_events(body, prepared):
+            env = env | inherited
+            if isinstance(argv, _InspectionHold):
+                raise ValueError(argv[0])
+            if isinstance(argv, _Substitution):
+                if level >= 32:
+                    raise ValueError("command substitution inspection depth limit")
+                yield from flatten(argv[0], True, level + 1, env)
+            else:
+                yield argv, env
+    yield from flatten(text, False, 0, set())
 
 
 def _strip_prefix(argv: list[str]) -> tuple[list[str], set[str]]:
@@ -1178,14 +1218,14 @@ def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
                         pair = re.split(r"[=\s]+", value.strip(), maxsplit=1)
                         if len(pair) == 2 and pair[0].lower() in (
                                 "proxycommand", "localcommand", "knownhostscommand"):
-                            for sub, sub_env in commands(pair[1]):
+                            for sub, sub_env in _command_events(pair[1]):
                                 yield sub, sub_env | env
                     break
         return
     flag = next((k for k, a in enumerate(rest[1:], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
     if name in SHELLS and flag is not None:
         payload = rest[flag + 1] if flag + 1 < len(rest) else ""
-        for sub, sub_env in commands(payload):
+        for sub, sub_env in _command_events(payload):
             yield sub, sub_env | env
         return
     yield rest, env
@@ -1515,7 +1555,7 @@ class _ScriptLimit(Exception):
 
 def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool,
           substitution_depth: int = 0, prepared: bool = False) -> Optional[Hit]:
-    for argv, env in commands(text if prepared else _drop_ssh_heredocs(text), prepared):
+    for argv, env in _command_events(text if prepared else _drop_ssh_heredocs(text), prepared):
         if isinstance(argv, _InspectionHold):
             return f"{argv[0]}; use {OPT_OUT}=1 to opt out explicitly", None, cwd
         if isinstance(argv, _Substitution):
@@ -1651,7 +1691,7 @@ def note(text: str, cwd: Optional[str] = None, _prepared: bool = False,
     """Non-blocking note for a multi-file Python test run inside a Hermes core worktree, else None."""
     if _opted_out():
         return None
-    for argv, env in commands(text if _prepared else _drop_ssh_heredocs(text), _prepared):
+    for argv, env in _command_events(text if _prepared else _drop_ssh_heredocs(text), _prepared):
         if isinstance(argv, _InspectionHold):
             continue  # evaluate/check_shell already issue the policy hold
         if isinstance(argv, _Substitution):

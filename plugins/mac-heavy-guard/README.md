@@ -26,6 +26,16 @@ headers, using a private subshell cwd: a substitution's `cd` cannot redirect ear
 or later parent script inspection. Substitution nesting beyond 32 levels requires
 the exported opt-out rather than silently accepting uninspected code.
 
+The bounded substitution scanner conservatively holds a `case` statement inside
+a substitution (including benign case bodies): unparenthesized case-pattern `)`
+is ambiguous to its character-level delimiter matcher. Use the exported opt-out
+for that form; quoted `case` data and `echo case` remain data. This is an explicit
+inspection hold, not a claim that every case body is heavy.
+The public `commands()` API still yields only simple argv lists, recursively
+flattening substitution bodies for consumers such as tailnet. Inspection holds
+raise `ValueError` there, so consumers refuse rather than treating private events
+as executable argv. Internal cwd-sensitive scanning uses a separate event stream.
+
 Local shell scripts are inspected up to 64 KiB and two script levels. An oversized
 recognized script or an existing third-level shell script now requires an explicit
 `MAC_HEAVY_OK=1` opt-out rather than silently accepting uninspected suffixes. This
