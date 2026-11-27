@@ -52,10 +52,13 @@ ANSI-C command fragments (`$'pytest'`, including ASCII octal/hex/Unicode escapes
 are decoded as quoted data before classification. Escaped apostrophes do not
 change continuation state. Non-ASCII escape results and `\\c` control escapes
 are conservatively held because their byte/locale behavior is not modeled.
-Double-quoted `$((...` is treated as arithmetic only with an adjacent closing
-`))` and arithmetic-shaped contents; bash's command-substitution fallback
-(`echo "$((pytest) )"`) is inspected as code. Benign arithmetic such as
-`echo "$((1+2))"` remains allowed.
+Double-quoted `$((...` and expanding heredoc bodies use bash's boundary rule:
+match the pair opened by the second `(`, then require an immediately adjacent
+`)` and arithmetic-shaped contents. Otherwise the command-substitution fallback
+(`echo "$((pytest) )"`, `echo "$((pytest) | (true))"`, or their unquoted-heredoc
+twins) is inspected as code. Benign arithmetic such as `echo "$((1+2))"` and
+`echo "$(( (pytest) | (true) ))"` remains allowed (the latter reads variables,
+not commands).
 
 A differential test (`tests/test_differential.py`, fixture `tests/fixtures/main_verdicts.json`, generator
 `tests/diff_corpus.py`) replays a ~5,000-command corpus (all review repros plus generated prefix/compound/wrapper

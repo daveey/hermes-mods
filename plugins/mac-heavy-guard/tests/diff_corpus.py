@@ -16,6 +16,16 @@ HEAVY = ['pytest', 'cargo build --release', './build.sh', 'py""test', "ca''rgo b
 # 6093400492, 6093461628, 6093503973, 6093656803) plus the original C1-C4 fixtures. Repros that need real
 # script files on disk (`bash run.sh; x=$(cd proj)` family) stay in tests/test_source_review.py.
 ANSI_ARITH_PAIRS = [
+    ('echo "$((pytest) | (ls))"', 'echo "$((echo ok) | (ls))"'),
+    ('echo "$((pytest)|(true))"', 'echo "$((echo ok)|(true))"'),
+    ('echo "$((true)|(pytest))"', 'echo "$((true)|(echo ok))"'),
+    ('echo "$((pytest) && (true))"', 'echo "$((echo ok) && (true))"'),
+    ('echo "$((pytest) |& (true))"', 'echo "$((echo ok) |& (true))"'),
+    ('echo "$((pytest)>/dev/null|(true))"', 'echo "$((echo ok)>/dev/null|(true))"'),
+    ('echo "a $((pytest) && (true)) b"', 'echo "a $((echo ok) && (true)) b"'),
+    ('bash -c \'echo "$((pytest) | (true))"\'', 'bash -c \'echo "$((echo ok) | (true))"\''),
+    ('cat <<EOF\n$((pytest) )\nEOF', 'cat <<EOF\n$((echo ok) )\nEOF'),
+    ('cat <<EOF\n$((pytest) | (true))\nEOF', 'cat <<EOF\n$((echo ok) | (true))\nEOF'),
     ("$'pytest'", "$'echo' ok"),
     ("bash -c $'pytest'", "bash -c $'echo ok'"),
     ("bash -c $'py\\\ntest'", "bash -c $'ec\\\nho ok'"),
