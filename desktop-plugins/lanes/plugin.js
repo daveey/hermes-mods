@@ -993,7 +993,7 @@ export function Lanes({ ctx, totalsOnly = false }) {
     // Sidebar owns modern request parameters. A totals-only subscriber must not
     // downgrade its expanded projection, regardless of mount order/remounts.
     // If totals mounts first, start with the sidebar's same complete defaults.
-    const params = totalsOnly ? { hours: 6, window: '6h', expanded: true } :
+    const params = totalsOnly ? { hours: loadSidebarWindow(), window: flowWindow(loadSidebarWindow()), expanded: true } :
       { hours: windowHours, window: flowWindow(windowHours), expanded: open }
     subscription.current = attentionStore(ctx).connect(params,
       (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive, !totalsOnly)
@@ -1140,6 +1140,166 @@ function storedSidebarLane() { try { return localStorage.getItem(SIDEBAR_LANE_KE
 const measureText = value => value == null ? 'unknown' : typeof value === 'object'
   ? Object.entries(value).map(([key, n]) => `${key} ${measureText(n)}`).join(' · ') : String(value)
 
+// ── C Slots compact lane rows ─────────────────────────────────────────────
+// Two-line ~38px grid per lane: name (spans both lines), a reserved truncatable chip slot, the tick heat strip over
+// the slot pips/cap slider, and $/h $/d $/wk at the right. Everything drawn comes from the hub snapshot (row.ticks,
+// row.spend, snap.fleet_slots); the renderer never sums usage or counters and makes no forecast request while
+// dragging: the what-if cells and counts are the hub's precomputed `ticks.previews`.
+export const SIDEBAR_WINDOW_KEY = 'hermes-lanes-sidebar-window'
+export const SIDEBAR_WINDOWS = [[6, '6h'], [24, '24h'], [168, '7d']]
+export function loadSidebarWindow(storage = globalThis.localStorage) {
+  try {
+    const v = Number(storage?.getItem(SIDEBAR_WINDOW_KEY))
+    return SIDEBAR_WINDOWS.some(([hours]) => hours === v) ? v : 24
+  } catch { return 24 }
+}
+export function saveSidebarWindow(hours, storage = globalThis.localStorage) { try { storage?.setItem(SIDEBAR_WINDOW_KEY, String(hours)) } catch {} }
+export const TICK_COLORS = { empty: '#2f3440', partial: '#0ea5e9', full: '#38bdf8', rejecting: '#ef4444' }
+export const INFINITY_EDGE = 0.97 // the far-right 3% of the slider is the no-cap stop
+
+export const money = n => n == null || !Number.isFinite(Number(n)) ? '—' : `$${Number(n) >= 1000 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(n)) : Number(n) >= 100 ? Math.round(n) : Number(n).toFixed(2)}`
+export const spendLabel = spend => `${money(spend?.hour)}/h · ${money(spend?.day)}/d · ${money(spend?.week)}/wk`
+const capText = v => v == null ? '∞' : String(v)
+
+/** Slider stop 0..slots are caps; slots+1 is no cap. */
+export const stopValue = (stop, slots) => stop > slots ? null : stop
+export const valueStop = (value, slots) => value == null ? slots + 1 : Math.min(Math.max(0, Math.round(value)), slots)
+export function stopFromFraction(frac, slots) {
+  if (!(frac === frac)) return 0
+  if (frac >= INFINITY_EDGE) return slots + 1
+  return Math.min(slots, Math.max(0, Math.round(Math.max(0, frac) / INFINITY_EDGE * slots)))
+}
+export const previewKey = value => value == null ? 'unlimited' : String(value)
+
+const iso = ms => new Date(ms).toISOString().slice(0, 16).replace('T', ' ')
+export function tickRange(cell, bucket) {
+  const t = Number(cell?.t)
+  if (!Number.isFinite(t)) return 'time unknown'
+  const start = t < 1e11 ? t * 1000 : t, end = start + (Number(bucket) || 0) * 1000
+  const a = iso(start), b = iso(end)
+  return `${a}–${a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b} UTC`
+}
+export function tickTitle(cell, bucket) {
+  const rejected = cell?.forecast ? 'hypothetical demand, not observed rejections' : cell?.rejection_unknown || cell?.rejected == null ? 'rejections unknown' : `${cell.rejected} rejected (ready cards turned away)`
+  return `${tickRange(cell, bucket)} · running ${cell?.running ?? '—'} · cap ${capText(cell?.cap)} · ${cell?.state || 'unknown'} · ${rejected}`
+}
+
+function TickStrip({ name, cells, bucket, label }) {
+  const H = 14, n = Math.max(cells.length, 1), id = `lanes-hatch-${String(name).replace(/[^\w-]/g, '_')}`
+  return h('svg', { className: 'lanes-ticks', role: 'img', 'aria-label': `${name} ${label}`, viewBox: `0 0 ${n} ${H}`, preserveAspectRatio: 'none', width: '100%', height: H },
+    h('defs', null, h('pattern', { id, width: 0.5, height: 0.5, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' },
+      h('rect', { width: 0.5, height: 0.5, fill: '#1c1f27' }), h('rect', { width: 0.2, height: 0.5, fill: '#9aa3b2' }))),
+    cells.map((cell, i) => {
+      const x = i + 0.08, w = 0.84, state = cell?.state || 'empty'
+      const vh = Math.min(1, Math.max(0, Number(cell?.visual?.height ?? (state === 'partial' ? 0.5 : 1))))
+      const opacity = cell?.visual?.opacity ?? 1
+      const unknown = cell?.rejection_unknown === true || state === 'unknown'
+      return h('g', { key: i, 'data-tick': state, 'data-tick-unknown': unknown ? '1' : '0' },
+        h('title', null, tickTitle(cell, bucket)),
+        h('rect', { x, y: state === 'empty' ? H - 2 : 0, width: w, height: state === 'empty' ? 2 : H, fill: TICK_COLORS.empty }),
+        state === 'partial' ? h('rect', { x, y: H - vh * H, width: w, height: vh * H, fill: TICK_COLORS.partial, opacity }) : null,
+        state === 'full' ? h('rect', { x, y: 0, width: w, height: H, fill: TICK_COLORS.full, opacity }) : null,
+        state === 'rejecting' ? h(Fragment, null, h('rect', { x, y: 0, width: w, height: H, fill: TICK_COLORS.rejecting, opacity }),
+          h('path', { className: 'lanes-tick-notch', d: `M${x} 0h${w}l${-w / 2} 4z`, fill: 'var(--ui-bg-primary, #0b0d12)' })) : null,
+        unknown ? h('rect', { x, y: 0, width: w, height: H, fill: `url(#${id})`, opacity: 0.85 }) : null)
+    }))
+}
+
+function WindowToolbar({ value, onChange }) {
+  return h('div', { className: 'lanes-sb-window', role: 'group', 'aria-label': 'Lane window' },
+    SIDEBAR_WINDOWS.map(([hours, label]) => h('button', { key: hours, type: 'button', 'data-window': label,
+      'aria-pressed': hours === value, className: hours === value ? 'is-on' : '', onClick: () => onChange(hours) }, label)))
+}
+
+function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disabled, error }) {
+  const slots = Number.isInteger(snap?.fleet_slots) && snap.fleet_slots >= 0 ? snap.fleet_slots : null
+  const confirmed = row.limits?.max_workers ?? null
+  const [drag, setDrag] = useState(null) // pending stop while pointer/keyboard is active
+  const [draft, setDraft] = useState(null) // { value } saved, retained until a later hub snapshot shows it
+  const [message, setMessage] = useState('')
+  const dragRef = useRef(null), dragging = useRef(false), track = useRef(null)
+  // The PUT receipt is not confirmation: only a hub snapshot whose limits show the value releases the draft.
+  useEffect(() => { if (draft && draft.value === confirmed) setDraft(null) }, [confirmed, draft])
+  const locked = disabled || Boolean(error) || slots == null || draft != null
+  const ticks = row.ticks
+  const live = drag != null ? stopValue(drag, slots ?? 0) : draft ? draft.value : confirmed
+  const pending = drag != null || draft != null
+  const shownStop = slots == null ? 0 : drag != null ? drag : valueStop(live, slots)
+  const key = previewKey(live)
+  const preview = pending ? ticks?.previews?.[key] : null
+  const cells = preview?.cells || ticks?.cells || []
+  const set = (stop) => { dragRef.current = stop; setDrag(stop) }
+  const commit = async (stop) => {
+    dragRef.current = null; dragging.current = false; setDrag(null)
+    if (locked || stop == null) return
+    const value = stopValue(stop, slots)
+    if (draft ? value === draft.value : value === confirmed) return
+    setMessage(''); setDraft({ value })
+    try { await write(name, { max_workers: value }) } catch (err) { setDraft(null); setMessage(String(err?.message || err)) }
+  }
+  const fromPointer = e => {
+    const rect = track.current?.getBoundingClientRect?.() || { left: 0, width: 0 }
+    return stopFromFraction(rect.width ? (e.clientX - rect.left) / rect.width : 0, slots)
+  }
+  const sliderProps = {
+    ref: track, className: 'lanes-slots', role: 'slider', tabIndex: locked ? -1 : 0, 'aria-label': `${name} max workers slider`,
+    'aria-valuemin': 0, 'aria-valuemax': (slots ?? 0) + 1, 'aria-valuenow': shownStop,
+    'aria-valuetext': slots == null ? 'fleet slots unknown' : live == null ? 'no cap (∞)' : `cap ${live}`,
+    'aria-disabled': locked, 'aria-busy': draft != null, 'data-pending': pending ? '1' : '0', 'data-saving': draft ? '1' : '0',
+    title: error ? 'Lanes offline' : slots == null ? 'Fleet slots unknown' : undefined,
+    onClick: e => e.stopPropagation(),
+    onPointerDown: e => { if (locked) return; e.stopPropagation(); e.currentTarget.setPointerCapture?.(e.pointerId); dragging.current = true; setMessage(''); set(fromPointer(e)) },
+    onPointerMove: e => { if (dragging.current && !locked) set(fromPointer(e)) },
+    onPointerUp: e => { if (dragging.current) { e.currentTarget.releasePointerCapture?.(e.pointerId); void commit(fromPointer(e)) } },
+    onPointerCancel: () => { dragging.current = false; dragRef.current = null; setDrag(null) },
+    onKeyDown: e => {
+      if (locked) return
+      const at = dragRef.current ?? shownStop, max = slots + 1
+      const next = { ArrowRight: at + 1, ArrowUp: at + 1, ArrowLeft: at - 1, ArrowDown: at - 1, Home: 0, End: max }[e.key]
+      if (next == null) return
+      e.preventDefault(); e.stopPropagation(); setMessage(''); set(Math.min(max, Math.max(0, next)))
+    },
+    onKeyUp: e => { if (dragRef.current != null && ['ArrowRight', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'Home', 'End'].includes(e.key)) void commit(dragRef.current) },
+    onBlur: () => { if (dragRef.current != null && !dragging.current) void commit(dragRef.current) }
+  }
+  const run = Number(row.status?.run) || 0
+  const pct = k => `${(k / Math.max(slots || 1, 1)) * INFINITY_EDGE * 100}%`
+  const windowLabel = flowWindow(snap?.window_hours ?? 24)
+  const chip = row.paused ? 'paused' : row.top_reason || ''
+  const caption = pending && slots != null ? (preview
+    ? `cap ${capText(live)} would have turned cards away in ${preview.affected} of ${preview.total} periods (now ${preview.now}) · release to save`
+    : `cap ${capText(live)} · release to save`) : ''
+  const spend = row.spend
+  return h('div', { className: 'lanes-sb-lane', 'data-sidebar-lane': name, 'data-expanded': expanded ? '1' : '0' },
+    h('div', { className: 'lanes-row', onClick: onToggle },
+      h('button', { type: 'button', className: 'lanes-row-name', 'aria-expanded': expanded, title: `${name}${row.paused ? ' · paused' : ''}` }, name),
+      h('span', { className: 'lanes-row-chip', 'data-top-reason': name, title: chip || undefined }, chip),
+      h('div', { className: 'lanes-row-chart' },
+        ticks && cells.length ? h(TickStrip, { name, cells, bucket: ticks.bucket_s, label: `tick heat, last ${windowLabel}${preview ? ' (preview)' : ''}` })
+          : h('div', { className: 'lanes-ticks lanes-ticks-empty', 'aria-label': `${name} tick heat unavailable` }),
+        h('div', sliderProps,
+          h('div', { className: 'lanes-pips' }, slots == null ? null : Array.from({ length: slots }, (_, i) => {
+            const n = i + 1, inCap = live == null || n <= live
+            return h('i', { key: n, 'data-pip': n, 'data-run': n <= run ? '1' : '0', 'data-open': inCap ? '1' : '0' })
+          })),
+          slots == null ? null : h('span', { className: 'lanes-inf', 'data-open': live == null ? '1' : '0', 'aria-hidden': true }, '∞'),
+          slots == null ? null : h('span', { className: 'lanes-cursor', 'data-cap-cursor': capText(live), style: { left: shownStop > slots ? '98.5%' : pct(shownStop) } }),
+          pending && slots != null ? h('span', { className: 'lanes-pending' }, `cap ${capText(live)}${draft && drag == null ? ' · saving…' : ''}`) : null)),
+      h('div', { className: 'lanes-cost', role: 'group', 'data-cost': name, title: spend ? spendLabel(spend) : 'spend unknown',
+        'aria-label': spend ? spendLabel(spend) : 'spend unknown' },
+        h('span', { className: 'lanes-cost-h', 'aria-hidden': true }, money(spend?.hour)),
+        h('span', { className: 'lanes-cost-d', 'aria-hidden': true }, money(spend?.day)),
+        h('span', { className: 'lanes-cost-w', 'aria-hidden': true }, money(spend?.week)))),
+    caption ? h('div', { className: 'lanes-caption', role: 'status', 'data-caption': '1' }, caption) : null,
+    message ? h('div', { className: 'lanes-row-error', role: 'alert' }, `max workers not saved: ${message}`) : null,
+    expanded ? h('div', { className: 'lanes-target-share', title: `Actual ${row.actual == null ? 'unknown' : pct0(row.actual)} / target ${pct0(row.target)}` },
+      h('span', null, row.actual == null ? '—' : pct0(row.actual)),
+      row.actual == null ? null : h('meter', { min: 0, max: 1, value: row.actual }), h('span', null, `target ${pct0(row.target)}`),
+      h('span', { 'data-lane-counts': name }, `${summaryValue(row.status?.you)} you · ${summaryValue(row.status?.run)} running · ${summaryValue(row.governor_held)} held · ${summaryValue(row.not_ready)} waiting`)) : null,
+    detail)
+}
+const pct0 = pct
+
 export function GovernorLine({ row }) {
   const pool = row.id === 'llm_pool'
   const reading = pool && row.reading ? `${row.reading.used_pct ?? '?'}% used · ${row.reading.accounts ?? '?'} accounts` : measureText(row.reading)
@@ -1179,7 +1339,7 @@ export function LaneControls({ name, row, write, disabled }) {
     h('button', { type: 'submit', disabled }, 'Apply'), h('span', { role: 'status' }, message))
 }
 
-export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAvailable = false, disabled = false }) {
+export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAvailable = false, disabled = false, windowHours = loadSidebarWindow(), onWindow = () => {} }) {
   const [governorsOpen, updateGovernorsOpen] = useState(storedGovernorsOpen)
   const setGovernorsOpen = value => { updateGovernorsOpen(value); try { localStorage.setItem(GOVERNORS_OPEN_KEY, value ? '1' : '0') } catch {} }
   const [laneOpen, updateLaneOpen] = useState(storedSidebarLane)
@@ -1214,22 +1374,15 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
       error ? h('div', { role: 'status' }, `Lanes offline - retrying${snap ? ' · last known' : ''}`) : null,
       snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
       !snap ? h('div', null, 'Loading lanes…') : h(Fragment, null,
-      h('div', { className: 'lanes-sb-muted' }, `$${snap.sidebar?.cost_today?.toFixed(2) ?? '—'} today`),
-      snap.summary_complete === false ? h('div', { className: 'lanes-sb-muted' }, 'Worker share unknown') :
-        h('div', { className: 'lanes-share-bar', 'aria-label': 'Worker share' }, Object.entries(snap.lanes || {}).map(([name, row]) =>
-          h('span', { key: name, title: `${name} ${pct(row.actual)}`, style: { width: pct(row.actual) } }))),
-      open ? Object.entries(snap.lanes || {}).filter(([name]) => showIdle || !idle.includes(name)).map(([name, row]) =>
-        h('div', { key: name, className: 'lanes-sb-lane', 'data-sidebar-lane': name },
-          h('button', { className: 'lanes-sb-line', 'aria-expanded': laneOpen === name, onClick: () => setLaneOpen(laneOpen === name ? '' : name) },
-            h('strong', null, name), row.paused ? h('small', null, 'paused') : null,
-            h('span', { style: { color: CARD_COLORS.you } }, summaryValue(row.status?.you)),
-            h('span', { style: { color: CARD_COLORS.run } }, summaryValue(row.status?.run)),
-            h('span', { className: 'lanes-held' }, summaryValue(row.governor_held)), h('span', null, summaryValue(row.not_ready))),
-          h('div', { className: 'lanes-sb-muted', 'data-top-reason': name }, row.top_reason || 'Governor state unknown'),
-          h('div', { className: 'lanes-target-share', title: `Actual ${row.actual == null ? 'unknown' : pct(row.actual)} / target ${pct(row.target)}` },
-            h('span', null, row.actual == null ? '—' : pct(row.actual)),
-            row.actual == null ? null : h('meter', { min: 0, max: 1, value: row.actual }), h('span', null, `target ${pct(row.target)}`)),
-          laneOpen === name ? h('div', { className: 'lanes-sb-detail' },
+      h('div', { className: 'lanes-toolbar' },
+        h(WindowToolbar, { value: windowHours, onChange: onWindow }),
+        h('span', { className: 'lanes-bucket' }, windowHours === 6 ? '7.5 min ticks' : windowHours === 168 ? '3.5 h ticks' : '30 min ticks'),
+        h('div', { className: 'lanes-cost lanes-cost-labels' }, h('span', { className: 'lanes-cost-h' }, '$/h'),
+          h('span', { className: 'lanes-cost-d' }, '$/d'), h('span', { className: 'lanes-cost-w' }, '$/wk'))),
+      Object.entries(snap.lanes || {}).filter(([name]) => showIdle || !idle.includes(name)).map(([name, row]) =>
+        h(CompactLane, { key: name, name, row, snap, expanded: laneOpen === name, error,
+          onToggle: () => setLaneOpen(laneOpen === name ? '' : name),
+          detail: laneOpen === name ? h('div', { className: 'lanes-sb-detail' },
             h('h4', null, 'WHERE CARDS ARE'),
             h('div', { className: 'lanes-steps' }, (row.steps || []).map(s => h('div', { key: s.key, 'data-step': s.key,
               'data-piling': s.piling ? '1' : '0' }, s.label, h('b', null, s.count)))),
@@ -1240,7 +1393,13 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
               row.device_footnote.label, ' · ', row.device_footnote.state, ' · ', row.device_footnote.age_s == null ? 'not read' : `${Math.round(row.device_footnote.age_s)}s ago`) : null,
             h('button', { disabled: !heldAvailable || Boolean(error) || row.governor_held == null,
               title: heldAvailable ? 'Open exact held-card set on its owning gateway' : 'Held-card filtering needs a newer Desktop',
-              onClick: () => onHeld(name, row) }, `Show ${row.governor_held ?? '—'} held cards →`)) : null)) : null,
+              onClick: () => onHeld(name, row) }, `Show ${row.governor_held ?? '—'} held cards →`)) : null,
+          write, disabled })),
+      h('div', { className: 'lanes-all' }, h('span', null, 'all lanes'),
+        h('span', null, `${summaryValue(status.run)} running`),
+        h('div', { className: 'lanes-cost', 'data-fleet-spend': '1', title: spendLabel(snap.spend), 'aria-label': spendLabel(snap.spend) },
+          h('span', { className: 'lanes-cost-h' }, money(snap.spend?.hour)), h('span', { className: 'lanes-cost-d' }, money(snap.spend?.day)),
+          h('span', { className: 'lanes-cost-w' }, money(snap.spend?.week)))),
       idle.length ? h('button', { onClick: () => setShowIdle(!showIdle) }, `${idle.length} idle lanes ${showIdle ? '▾' : '▸'}`) : null)) : null),
     h('div', { 'data-sidebar-section': 'governors' },
     h('button', { className: 'lanes-sb-heading', 'aria-label': 'GOVERNORS', 'aria-description': governorSummary, 'aria-expanded': governorsOpen, onClick: () => setGovernorsOpen(!governorsOpen) },
@@ -1259,10 +1418,14 @@ export function SidebarLanes({ ctx }) {
   const [snap, setSnap] = useState()
   const [error, setError] = useState('')
   const [open, updateOpen] = useState(storedSidebarOpen)
+  const [windowHours, updateWindow] = useState(loadSidebarWindow)
   const source = sourceFor(ctx)
   const subscription = useRef()
+  const windowRef = useRef(windowHours)
   useEffect(() => {
-    subscription.current = attentionStore(ctx).connect({ hours: 6, window: '6h', expanded: true }, (view, err) => {
+    // This is the primary owner of the shared store's request parameters: connect once with the persisted window
+    // and move it with update() (never a second connection) when the toolbar changes it.
+    subscription.current = attentionStore(ctx).connect({ hours: windowRef.current, window: flowWindow(windowRef.current), expanded: true }, (view, err) => {
       if (view?.configured && !view.warming) { setSnap(view); setError('') }
       else if (err || view?.configured === false) setError(String(err?.message || view?.reason || 'Offline'))
     }, () => {}, true)
@@ -1271,8 +1434,13 @@ export function SidebarLanes({ ctx }) {
     return () => { subscription.current?.(); window.removeEventListener('hermes-show-lanes', show) }
   }, [ctx])
   const setOpen = value => { updateOpen(value); try { localStorage.setItem(SIDEBAR_OPEN_KEY, value ? '1' : '0') } catch {} }
+  const onWindow = hours => {
+    if (hours === windowRef.current) return
+    windowRef.current = hours; updateWindow(hours); saveSidebarWindow(hours)
+    subscription.current?.update({ hours, window: flowWindow(hours), expanded: true })
+  }
   const showCards = window.__hermesKanbanShowCards
-  return h(SidebarView, { snap, error, open, setOpen, heldAvailable: typeof showCards === 'function',
+  return h(SidebarView, { snap, error, open, setOpen, windowHours, onWindow, heldAvailable: typeof showCards === 'function',
     write: async (lane, body) => { await source.write(lane, body); await subscription.current?.refresh() },
     onHeld: (_name, row) => showCards?.({ cards: row.held_cards, connectionId: source.target()?.connectionId }) })
 }
@@ -1297,7 +1465,7 @@ const CSS = `
 .lanes-sb-muted{color:var(--ui-text-tertiary);font-size:10px;margin:4px 0;overflow-wrap:anywhere}
 .lanes-held{color:#bb98ff}
 .lanes-last-known{opacity:.45;filter:grayscale(1)}
-.lanes-sb-lane{padding:7px 0;border-bottom:1px solid var(--ui-stroke-secondary)}
+.lanes-sb-lane{padding:1px 0;border-bottom:1px solid var(--ui-stroke-secondary)}
 .lanes-governor{margin:6px 0}
 .lanes-gov-dot{height:6px;width:6px;flex:none;border-radius:50%;background:#52525b}
 .lanes-governor[data-state=on] .lanes-gov-dot{background:#ae87ee;box-shadow:0 0 4px #ae87ee}
@@ -1316,6 +1484,35 @@ const CSS = `
 .lanes-controls label{display:flex;justify-content:space-between;align-items:center}
 .lanes-controls input[type=number]{width:65px;background:transparent;color:inherit;border:1px solid var(--ui-stroke-secondary);border-radius:3px;font:inherit}
 .lanes-controls button{border:1px solid var(--ui-stroke-secondary);border-radius:3px;padding:3px 6px}
+
+.lanes-sidebar{container-type:inline-size;container-name:lanes-sb}
+.lanes-sb-window{display:flex;gap:2px;margin:4px 0}
+.lanes-sb-window button{border:1px solid var(--ui-stroke-secondary);border-radius:4px;padding:1px 6px;font-size:10px}
+.lanes-sb-window button.is-on{background:var(--ui-stroke-secondary);border-color:var(--ui-text-tertiary)}
+.lanes-row{display:grid;grid-template-columns:minmax(40px,76px) minmax(0,56px) minmax(70px,1fr) auto;grid-template-rows:19px 19px;column-gap:6px;align-items:center;height:38px;cursor:pointer;min-width:0}
+.lanes-row-name{grid-row:1/3;grid-column:1;align-self:center;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0}
+.lanes-row-chip{grid-row:1/3;grid-column:2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;color:var(--ui-text-tertiary)}
+.lanes-row-chart{grid-row:1/3;grid-column:3;display:grid;grid-template-rows:14px 18px;row-gap:3px;min-width:0}
+.lanes-ticks{display:block;width:100%;height:14px;border-radius:2px}
+.lanes-slots{position:relative;height:18px;display:flex;align-items:center;touch-action:none;cursor:ew-resize;outline-offset:1px}
+.lanes-slots[aria-disabled=true]{opacity:.45;cursor:default}
+.lanes-pips{display:flex;gap:1px;width:97%;height:8px}
+.lanes-pips i{flex:1 1 0;min-width:1px;border-radius:1px;background:transparent;border:1px solid #3b4252;box-sizing:border-box}
+.lanes-pips i[data-open="1"]{background:#3b4252}
+.lanes-pips i[data-run="1"]{background:#0ea5e9;border-color:#0ea5e9}
+.lanes-inf{position:absolute;right:-1px;font-size:11px;line-height:1;color:var(--ui-text-tertiary)}
+.lanes-inf[data-open="1"]{color:var(--ui-text-primary)}
+.lanes-cursor{position:absolute;top:1px;bottom:1px;width:2px;margin-left:-1px;background:var(--ui-text-primary);border-radius:1px;pointer-events:none}
+.lanes-pending{position:absolute;right:0;top:-1px;font-size:9px;background:var(--ui-bg-primary,#0b0d12);padding:0 2px;pointer-events:none}
+.lanes-cost{grid-row:1/3;grid-column:4;display:grid;grid-template-columns:44px 44px 44px;grid-template-rows:38px;column-gap:0;font-size:9px;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;align-items:center}
+.lanes-cost-h{grid-column:1;grid-row:1}.lanes-cost-d{grid-column:2;grid-row:1}.lanes-cost-w{grid-column:3;grid-row:1}
+@container lanes-sb (max-width:360px){.lanes-cost-h,.lanes-cost-w,.lanes-row-chip{display:none}.lanes-cost{grid-template-columns:auto;grid-template-rows:38px;grid-column:3}.lanes-cost-d{grid-column:1;grid-row:1}.lanes-row{grid-template-columns:minmax(40px,76px) minmax(70px,1fr) auto}.lanes-row-chart{grid-column:2}}
+.lanes-caption,.lanes-row-error{font-size:10px;margin:2px 0;color:#ef4444}
+.lanes-toolbar{display:flex;align-items:center;gap:6px;min-width:0}.lanes-toolbar .lanes-cost{margin-left:auto;height:22px;grid-template-rows:22px;color:var(--ui-text-tertiary)}
+.lanes-bucket{font-size:9px;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.lanes-all{display:flex;align-items:center;gap:8px;min-width:0;height:28px;color:var(--ui-text-tertiary)}.lanes-all .lanes-cost{margin-left:auto;grid-template-rows:28px}
+.lanes-pips i[data-open="0"]{height:2px;align-self:center;opacity:.4}.lanes-pips i[data-open="1"][data-run="0"]{background:transparent}.lanes-pips i[data-open="0"][data-run="1"]{background:#ef4444;border-color:#ef4444;opacity:1;height:8px}
+.lanes-row-error{color:#ef4444}
 
 .hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
 .hermes-lanes-mini{display:flex;align-items:flex-start;gap:4px 8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
