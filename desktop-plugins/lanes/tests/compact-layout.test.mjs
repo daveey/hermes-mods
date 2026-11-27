@@ -19,12 +19,14 @@ const T0 = Date.UTC(2026, 10, 27, 0, 0) / 1000
 const cells = Array.from({ length: 48 }, (_, i) => ({ t: T0 + i * 1800, state: i % 5 ? 'partial' : 'full', running: i % 5, cap: 4, rejected: 0,
   rejection_unknown: false, visual: { height: .5, opacity: 1 } }))
 const lane = (name, i) => ({ share: 20, actual: .2, target: .3, status: { run: 2, you: 1 }, governor_held: 0, not_ready: 3,
-  top_reason: i ? 'waiting on a long reason that must truncate' : '', limits: { max_workers: 4 }, boards: ['a'],
+  holds: i ? [{ id: 'lane_gate', name: 'Lane gate', group: 'lane_dial', count: 64, reading: 10, threshold: 50 }] : [],
+  waits: { parents: 42, scheduled: 40, deploy_ci: 20, triage: 6 }, limits: { max_workers: 4 }, boards: ['a'],
   spend: { hour: 123.45, day: 1234.5, week: 98765.43 }, ticks: { window: '24h', bucket_s: 1800, cap: 4, cells, previews: {} } })
 const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes', 'overcap']
 const snap = { configured: true, fleet_slots: 39, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
-  governors: { idle_total: 31, rows: [], counts: { on: 1, off: 8 } },
+  governors: { held_total: 65, fleet: [{ id: 'host_slots', name: 'Host slots full', group: 'fleet_dial', count: 1, reading: 7, threshold: 7 }],
+    stale_sources: [{ board: 'alpha', reason: 'stale dispatcher snapshot' }, { board: 'beta', reason: 'tick aborted at storage_admission' }], rows: [] },
   lanes: Object.fromEntries(names.map((n, i) => [n, n === 'overcap' ? { ...lane(n, 0), status: { run: 6, you: 0 }, limits: { max_workers: 2 }, ticks: { ...lane(n, 0).ticks, cap: 2 } } : lane(n, i)])) }
 
 test('compact sidebar: 38px two-line rows, no overflow/wrap, day-only at 360, toolbar+totals fit', { skip: !CHROME && !process.env.CI && 'no Chrome' }, async () => {
@@ -49,7 +51,7 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       deepOverflow: [...row.querySelectorAll('*')].filter(k => vis(k) && !inside(r(k), box)).map(k => k.className.baseVal ?? k.className),
       nameLines: Math.round(r(row.querySelector('.lanes-row-name')).height / parseFloat(getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight === 'normal' ? 15 : getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight)),
       nameWrapped: row.querySelector('.lanes-row-name').getClientRects().length > 1 || r(row.querySelector('.lanes-row-name')).height > 20,
-      chipWrapped: vis(row.querySelector('.lanes-row-chip')) && r(row.querySelector('.lanes-row-chip')).height > 20,
+      chipWrapped: vis(row.querySelector('.lanes-row-chip')) && r(row.querySelector('.lanes-row-chip')).height > 32,
       costWrapped: [...cost.children].filter(vis).filter(c => r(c).height > 19.5).map(c => c.className),
       costScrollOverflow: cost.scrollWidth > cost.clientWidth + .5,
       cost: ['h', 'd', 'w'].map(k => vis(cost.querySelector('.lanes-cost-' + k))),
@@ -73,6 +75,13 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
   const dir = mkdtempSync(join(tmpdir(), 'lanes-compact-'))
   try {
     writeFileSync(join(dir, 'compact.html'), page)
+    if (process.env.LANES_RENDER_OUTPUT) {
+      // A real renderer fixture, not a native Desktop screenshot or live-data claim.
+      const shot = page.replace('document.title = JSON.stringify(', 'const measurements = JSON.stringify(').replace('</script>', 'document.getElementById("pane").style.width = "280px";</script>')
+      writeFileSync(join(dir, 'shot.html'), shot)
+      execFileSync(CHROME, ['--headless=new', '--no-sandbox', '--disable-gpu', `--user-data-dir=${join(dir, 'shot-profile')}`,
+        '--window-size=300,600', `--screenshot=${process.env.LANES_RENDER_OUTPUT}`, 'file://' + join(dir, 'shot.html')], { timeout: 90000, stdio: 'ignore' })
+    }
     const dom = execFileSync(CHROME, ['--headless=new', '--no-sandbox', '--disable-gpu', `--user-data-dir=${join(dir, 'profile')}`,
       '--window-size=1000,900', '--dump-dom', 'file://' + join(dir, 'compact.html')], { encoding: 'utf8', timeout: 90000, stdio: ['ignore', 'pipe', 'ignore'] })
     const res = JSON.parse(dom.match(/<title>(.*?)<\/title>/s)[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'))

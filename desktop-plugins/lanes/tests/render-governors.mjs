@@ -3,60 +3,80 @@ import { readFile } from 'node:fs/promises'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
 const { view, case: scenario, failed_lane, healthy_lane } = JSON.parse(await readFile(process.argv[2], 'utf8'))
 const P = await loadPlugin({ SIDEBAR_SECTIONS_AREA: 'sidebar.sections' })
-// These views came through the real dispatcher/producer. An absent category in
-// its row histogram is zero, not missing telemetry (unknown is its own state).
-const states = ['on', 'off', 'at_cap', 'unknown']
-const counts = Object.fromEntries(states.map(state => [state, view.governors.rows.filter(row => row.state === state).length]))
-assert.deepEqual(view.governors.counts, counts, 'producer publishes a complete state histogram, including zero buckets')
-const expected = `${counts.on} on · ${counts.off} off · ${counts.at_cap} at cap · ${counts.unknown} unknown`
+// These views came through the real dispatcher/producer. Governors are folded into
+// lane rows: gov.holds (per lane), gov.fleet lines, gov.stale_sources, gov.held_total.
+const gov = view.governors
 const pane = await mount(React.createElement(P.SidebarView, {
   snap: view, open: true, setOpen() {}, write() {}, onHeld() {}
 }))
 try {
-  const heading = pane.container.querySelector('[aria-label="GOVERNORS"]')
-  const summary = heading.querySelector('.lanes-sb-summary')
-  assert.equal(summary.textContent, expected)
-  assert.equal(summary.title, expected)
-  assert.equal(heading.getAttribute('aria-description'), expected)
+  const text = el => el.textContent
+  const totals = pane.container.querySelector('[data-sidebar-totals]')
+  const heading = pane.container.querySelector('[aria-label="LANES"]')
+  // Governors are no longer a section: no heading, no per-governor rows.
+  assert.equal(pane.container.querySelector('[aria-label="GOVERNORS"]'), null)
+  assert.equal(pane.container.querySelector('[data-governor]'), null)
+  assert.equal(pane.container.querySelector('[data-sidebar-body="governors"]'), null)
   assert.ok(pane.container.querySelector('[data-slot="lanes-sidebar"]'))
-  assert.ok(pane.container.querySelector('[data-sidebar-body="governors"]') === null, 'governors start minimized')
-  await pane.click(pane.container.querySelector('[aria-label="GOVERNORS"]'))
-  const pool = pane.container.querySelector('[data-governor="llm_pool"]')
+  assert.equal(pane.container.querySelectorAll('.lanes-sb-heading').length, 1)
+  const fleetIds = [...pane.container.querySelectorAll('[data-fleet-governor]')].map(e => e.dataset.fleetGovernor)
+  const chips = lane => [...pane.container.querySelectorAll(`[data-lane-holds="${lane}"] [data-lane-hold]`)].map(e => e.dataset.laneHold)
+  const holdText = (lane, id) => text(pane.container.querySelector(`[data-lane-holds="${lane}"] [data-lane-hold="${id}"]`))
+  const allChips = () => [...pane.container.querySelectorAll('[data-lane-hold]')].map(e => e.dataset.laneHold)
+  if (gov) {
+    assert.deepEqual(fleetIds, (gov.fleet || []).map(f => f.id), 'every producer fleet line renders once, in order')
+    if (gov.held_total != null) assert.match(text(totals), new RegExp(`${gov.held_total} held`))
+    const stale = pane.container.querySelector('[data-stale-sources]')
+    if ((gov.stale_sources || []).length) {
+      assert.match(text(stale), new RegExp(`${gov.stale_sources.length} sources? stale`))
+      for (const s of gov.stale_sources) assert.ok(text(stale).includes(s.board))
+    } else assert.equal(stale, null)
+  }
+  assert.doesNotMatch(text(totals), /governor-held/)
+
   if (scenario === 'pool') {
-    assert.equal(pool.dataset.state, 'on')
-    assert.match(pool.textContent, /1 held/)
-    assert.match(pool.textContent, /% used.*accounts/)
-    assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /LLM pool/)
+    assert.deepEqual(fleetIds, ['llm_pool'])
+    assert.match(text(pane.container.querySelector('[data-fleet-governor="llm_pool"]')), /1 waiting.*% used.*accounts/)
+    assert.equal(gov.held_total, 1)
+    assert.match(text(totals), /1 held/)
   } else if (scenario === 'recovered') {
-    assert.equal(pool, null, 'pool moves into folded off list')
-    const button = [...pane.container.querySelectorAll('[data-sidebar-body="governors"] button')].find(b => b.textContent.includes(' off ·'))
-    await pane.click(button)
-    assert.equal(pane.container.querySelector('[data-governor="llm_pool"]').dataset.state, 'off')
+    assert.equal(pane.container.querySelector('[data-fleet-governor="llm_pool"]'), null, 'recovered pool leaves no fleet line')
+    assert.equal(gov.held_total, 0)
+    assert.match(text(totals), /0 held/)
   } else if (scenario === 'gate') {
-    const gate = pane.container.querySelector('[data-governor="lane_gate"]')
-    assert.equal(gate.dataset.state, 'on')
-    assert.match(gate.textContent, /1 held/)
-    assert.match(gate.textContent, /2/)
-    // Lane-gated cards are only a subset of dispatch governor charges.
-    const laneHeading = pane.container.querySelector('[aria-label="LANES"]')
-    const laneSummary = laneHeading.querySelector('.lanes-sb-summary')
-    assert.match(laneSummary.textContent, /2 governor-held/)
-    assert.equal(laneSummary.title, laneSummary.textContent)
-    assert.equal(laneHeading.getAttribute('aria-description'), laneSummary.textContent)
+    // The producer folds lane-gated cards onto the lane that owns the gate.
+    assert.ok(chips('babybear').includes('lane_gate'))
+    assert.match(holdText('babybear', 'lane_gate'), /Lane gate.* · 1/)
+    assert.equal(gov.held_total, 2)
+    assert.match(text(totals), /2 held/)
     assert.equal(view.totals.held, 1)
-    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /2 governor-held/)
+    const summary = heading.querySelector('.lanes-sb-summary')
+    assert.match(summary.textContent, /2 held/)
+    assert.equal(summary.title, summary.textContent)
+    assert.equal(heading.getAttribute('aria-description'), summary.textContent)
+    await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))
+    const holding = [...pane.container.querySelectorAll('[data-sidebar-lane="babybear"] label[data-holding="1"]')].map(l => text(l))
+    assert.ok(holding.some(t => /admit \/ day.*holding/.test(t)), 'gated admit/day field is marked holding')
+    assert.ok(pane.container.querySelector('[aria-label="babybear admit / day"]').value === '2', 'admit/day shows the configured value')
   } else if (scenario === 'host') {
-    const line = pane.container.querySelector('[data-governor="host_slots"]')
-    assert.equal(line.dataset.state, 'on')
-    assert.match(line.textContent, /1 held/)
-    assert.match(line.textContent, /default 1/)
-    assert.match(line.textContent, /beta 0/)
+    const line = pane.container.querySelector('[data-fleet-governor="host_slots"]')
+    assert.ok(line, 'host slots is a fleet line, not a lane chip')
+    assert.match(text(line), /1 waiting/)
+    assert.equal(allChips().includes('host_slots'), false)
+    assert.equal(gov.held_total, 1)
+    assert.match(text(totals), /1 held/)
   } else if (scenario === 'host-released') {
-    assert.equal(pane.container.querySelector('[data-governor="host_slots"][data-state="on"]'), null)
+    assert.equal(pane.container.querySelector('[data-fleet-governor="host_slots"]'), null)
+    assert.match(text(totals), /0 held/)
   } else if (scenario === 'overlap') {
-    assert.match(pane.container.querySelector('[data-governor="placement"]').textContent, /1 held/)
-    assert.notEqual(pool?.dataset.state, 'on', 'overlap must not be charged again')
-    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /1 governor-held/)
+    // Charged once, to placement (a fault): can't-start chip, counted for you, not held.
+    const placement = pane.container.querySelectorAll('[data-lane-hold="placement"]')
+    assert.equal(placement.length, 1)
+    assert.match(text(placement[0]), /1 can't start/)
+    assert.equal(pane.container.querySelector('[data-fleet-governor="llm_pool"]'), null, 'overlap must not be charged again')
+    assert.equal(allChips().includes('llm_pool'), false)
+    assert.equal(gov.held_total, 0)
+    assert.match(text(totals), /0 held/)
   } else if (scenario === 'partial-summary') {
     // The same real projection must stay honest in both SDK mounts.
     const old = await loadPlugin()
@@ -87,11 +107,13 @@ try {
         assert.match(pill.container.querySelector('button').getAttribute('aria-label'), /— running, — waiting/)
       } finally { await pill.close() }
     }
-    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— waiting/)
-    assert.doesNotMatch(pane.container.querySelector('[data-sidebar-totals]').textContent, /0 waiting/)
+    assert.match(text(totals), /— waiting/)
+    assert.doesNotMatch(text(totals), /0 waiting/)
     assert.match(pane.container.textContent, /Partial lanes data/)
     assert.equal(pane.container.querySelector('.lanes-share-bar'), null)
     for (const row of pane.container.querySelectorAll('[data-sidebar-lane]')) {
+      // Unknown lanes say so on the row and never invent zero holds or waits.
+      assert.match(text(row.querySelector('[data-lane-holds]')), /board reading stale|—/)
       await pane.click(row.querySelector('button'))
       assert.match(row.querySelector('[data-lane-counts]').textContent, /— running/)
       assert.match(row.querySelector('[data-lane-counts]').textContent, /— waiting/)
@@ -99,7 +121,7 @@ try {
       assert.equal(row.querySelector('meter'), null)
     }
   } else if (scenario === 'partial-status') {
-    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /— running/)
+    assert.match(text(totals), /— running/)
     assert.match(pane.container.textContent, /Partial lanes data/)
     assert.equal(pane.container.querySelector('[data-fleet-spend]').getAttribute('aria-label'), P.spendLabel(view.spend), 'spend remains independent of flow failure')
     const bad = pane.container.querySelector(`[data-sidebar-lane="${failed_lane}"]`)
@@ -109,15 +131,26 @@ try {
     await pane.click(good.querySelector('button'))
     assert.match(good.querySelector('[data-lane-counts]').textContent, /1 running/)
   } else if (scenario === 'incomplete') {
-    assert.match(pane.container.querySelector('[data-top-reason="babybear"]').textContent, /unknown/i)
+    // Incomplete lane evidence is unknown, not zero: stale marker, no holds, no waits numbers.
+    const lane = pane.container.querySelector('[data-lane-holds="babybear"]')
+    assert.match(text(lane), /board reading stale/i)
+    assert.deepEqual(chips('babybear'), [])
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))
     assert.equal(pane.container.querySelector('[data-step]'), null)
+    assert.match(text(pane.container.querySelector('[data-lane-waits="babybear"]')), /— on parents/)
     const held = [...pane.container.querySelectorAll('button')].find(b => b.textContent.startsWith('Show '))
     assert.equal(held.disabled, true)
     assert.match(held.textContent, /Show — held/)
   } else if (scenario === 'unknown' || scenario === 'adapter-stale') {
-    assert.equal(pool.dataset.state, scenario === 'unknown' ? 'unknown' : 'on')
-    if (scenario === 'unknown') assert.match(pool.textContent, /— held/)
+    if (scenario === 'unknown') {
+      // Missing or stale core telemetry: sources are named stale; no fleet line is invented.
+      assert.ok((gov?.stale_sources || []).length > 0 || !gov, 'unknown telemetry is reported as stale sources')
+      if (gov) assert.match(text(pane.container.querySelector('[data-stale-sources]')), /stale/)
+      else assert.match(pane.container.textContent, /Governor source unknown/)
+    } else {
+      assert.deepEqual(fleetIds, ['llm_pool'])
+      assert.equal(gov.stale_sources.length, 0, 'a stale device adapter is a footnote, not a stale board')
+    }
     await pane.click(pane.container.querySelector('[data-sidebar-lane="babybear"] button'))
     assert.equal(pane.container.querySelector('[data-device-footnote]').dataset.deviceFootnote, 'unknown')
   }

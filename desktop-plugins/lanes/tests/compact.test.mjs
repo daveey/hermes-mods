@@ -9,8 +9,8 @@ const cellsOf = (fn = () => ({})) => Array.from({ length: 48 }, (_, i) => cell(i
 
 const snapshot = (over = {}, rowOver = {}) => ({ configured: true, fleet_slots: 6, status: { run: 2, you: 1 }, totals: { not_ready: 3 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
-  governors: { idle_total: 0, rows: [], counts: { on: 0, off: 0 } },
-  lanes: { work: { share: 20, actual: .2, target: .3, status: { run: 2, you: 1 }, governor_held: 0, not_ready: 3, top_reason: 'waiting on a long reason that must truncate',
+  governors: { idle_total: 0, held_total: 0, fleet: [], stale_sources: [], rows: [], counts: { on: 0, off: 0 } },
+  lanes: { work: { share: 20, actual: .2, target: .3, status: { run: 2, you: 1 }, governor_held: 0, not_ready: 3, waits: { parents: 3, scheduled: 0, deploy_ci: 0, triage: 0 },
     limits: { max_workers: 4 }, boards: ['a'], spend: { hour: 0.5, day: 7, week: 49.5 },
     ticks: { window: '24h', bucket_s: 1800, cap: 4, cells: cellsOf(i => i === 1 ? { state: 'partial', running: 1, visual: { height: .4, opacity: .5 } }
       : i === 2 ? { state: 'full', running: 4, visual: { height: 1, opacity: 1 } }
@@ -44,7 +44,7 @@ test('compact row renders name, chip slot, 48 ticks, pips per fleet slot, cap cu
   try {
     const row = pane.container.querySelector('[data-sidebar-lane="work"]')
     assert.ok(row.querySelector('.lanes-row-name'))
-    assert.match(row.querySelector('.lanes-row-chip').title, /long reason/)
+    assert.match(row.querySelector('.lanes-row-chip').title, /3 on parents/)
     assert.equal(row.querySelectorAll('[data-tick]').length, 48)
     assert.equal(row.querySelectorAll('[data-pip]').length, 6)
     assert.equal(row.querySelectorAll('[data-pip][data-run="1"]').length, 2)
@@ -300,10 +300,10 @@ test('rows without server ticks or spend degrade without inventing numbers; row 
   } finally { await pane.close(); localStorage.clear() }
 })
 
-test('GOVERNORS section is unchanged and legacy strip still mounts', async () => {
+test('governors fold into LANES without a separate section', async () => {
   const t = setup(); const { pane } = await open(t)
   try {
-    assert.equal(pane.container.querySelectorAll('[data-sidebar-section]').length, 2)
-    assert.equal(pane.container.querySelector('[aria-label="GOVERNORS"]').getAttribute('aria-expanded'), 'false')
+    assert.equal(pane.container.querySelectorAll('[data-sidebar-section]').length, 1)
+    assert.ok(pane.container.querySelector('[aria-label="GOVERNORS"]') === null)
   } finally { await pane.close(); localStorage.clear() }
 })

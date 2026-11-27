@@ -49,6 +49,17 @@ def view(api):
     return api._lane_view(6, '6h', True)
 
 
+def test_admit_per_day_write_and_next_snapshot(board, api, monkeypatch):
+    monkeypatch.setattr(lanes, '_human_shell', lambda: True)
+    config(board)
+    api.change('babybear', {'admit_per_day': 17})
+    from utils import load_yaml_file_readonly
+    written = load_yaml_file_readonly(board / 'config.yaml')
+    assert written['kanban']['admission']['lanes']['babybear']['admit_per_day'] == 17
+    body = view(api)
+    assert body['lanes']['babybear']['admit_per_day'] == 17
+
+
 def test_pool_and_recovery_sidebar(board, api, monkeypatch, tmp_path):
     config(board)
     cfg = json.loads(board.joinpath('config.yaml').read_text())
@@ -318,7 +329,8 @@ def test_incomplete_lane_evidence_is_unknown(board, api, monkeypatch, tmp_path, 
         row = body['lanes']['babybear']
         assert body['governors']['known_idle_total'] == 2
         assert row['governor_held'] is None
-        assert 'unknown' in row['top_reason'].lower()
+        assert 'top_reason' not in row
+        assert row['holds'] == [] and row['waits'] == dict.fromkeys(('parents', 'scheduled', 'deploy_ci', 'triage'))
         assert not row['held_cards']
         assert not row['steps']
         render(tmp_path, body, 'incomplete')

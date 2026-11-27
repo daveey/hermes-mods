@@ -3,108 +3,169 @@ import assert from 'node:assert/strict'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
 
 const P = await loadPlugin({ SIDEBAR_SECTIONS_TOP_AREA: 'sidebar.sections.top', SIDEBAR_SECTIONS_AREA: 'sidebar.sections', SESSION_FILTER_AREA: 'sidebar.filter' })
-test('partial governors retain known charges and name board-specific missing evidence', async () => {
-  const row = { id: 'lane_gate', name: 'Lane gate', state: 'on', cards_charged: 64, partial: true,
-    reading: 10, threshold: 50, readings: [{ board: 'default', lane: 'hermes', reading: 10, threshold: 50, cards: 64 }],
-    scope: [{ gateway: 'hub', board: 'askeve', available: false, reason: 'stale dispatcher snapshot' },
-      { gateway: 'hub', board: 'default', available: true, age_s: 5, reason: 'flow unavailable: storage_admission' }] }
-  const pane = await mount(React.createElement(P.GovernorLine, { row }))
-  try {
-    assert.match(pane.container.textContent, /64 known held/)
-    assert.match(pane.container.textContent, /default \/ hermes: 10 \/ 50 · 64 held/)
-    assert.match(pane.container.textContent, /hub\/askeve: unknown · stale dispatcher snapshot/)
-    assert.match(pane.container.textContent, /hub\/default: 5s ago · flow unavailable: storage_admission/)
-    assert.equal(pane.container.querySelector('[data-governor]').getAttribute('data-state'), 'on')
-  } finally { await pane.close() }
-})
+
+// Producer schema: governors { holds: {lane: [chip]}, fleet: [line], stale_sources, held_total, fleet_stop };
+// lane { holds, waits, fleet_stop, governor_held, admit_per_day }. No GOVERNORS section exists.
+const gate = { id: 'lane_gate', name: 'Lane gate', group: 'lane_dial', count: 64, reading: 10, threshold: 50, clears: 'admit or release 64 held',
+  readings: [{ board: 'default', lane: 'hermes', reading: 10, threshold: 50, cards: 64 }] }
+const hostSlots = { id: 'host_slots', name: 'Host slots', group: 'fleet_dial', count: 1, reading: 1, threshold: 1, stop: false, clears: 'a worker finishes', readings: [] }
+const governors = (extra = {}) => ({ holds: { work: [{ ...gate, count: 31 }] }, fleet: [], stale_sources: [], held_total: 31, fleet_stop: false, ...extra })
 
 const snapshot = () => ({ configured: true, status: { run: 7, you: 3 }, totals: { not_ready: 41 },
   spend: { hour: 2.13, day: 12.34, week: 89.12 },
   sidebar: { cost_today: 12.34, idle_lanes: ['idle'] },
-  governors: { idle_total: 31, rows: [{ id: 'llm_pool', name: 'LLM pool', state: 'on', cards_charged: 31,
-    reading: { used_pct: 97, accounts: 23 }, threshold: { seven_day: 95 }, scope: [] }], counts: { on: 1, off: 8 } },
+  governors: governors(),
   lanes: { work: { share: 20, open: 90, not_ready: 41, status: { run: 7, you: 3 }, actual: .2, target: .3,
-    governor_held: 31, top_reason: '31 held · LLM pool', steps: [{ key: 'ready', count: 90, piling: true }],
+    governor_held: 31, holds: [{ ...gate, count: 31 }], waits: { parents: 10, scheduled: 5, deploy_ci: 0, triage: 0 }, fleet_stop: false,
+    admit_per_day: 50, steps: [{ key: 'ready', count: 90, piling: true }],
     limits: { max_workers: 4, cards_per_day: 20, usd_per_day: 100 }, boards: ['alpha', 'beta'],
     held_sessions: ['chat'], held_cards: ['card'] }, idle: { open: 0 } } })
 
-test('governors collapse independently and persist across remount', async () => {
-  localStorage.clear()
-  const t = setup()
-  const pane = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
+test('partial governors keep known holds and name each stale source, not a cascade', async () => {
+  const gov = governors({ holds: { hermes: [gate] }, fleet: [hostSlots], held_total: 65,
+    stale_sources: [{ board: 'askeve', reason: 'stale dispatcher snapshot' }, { board: 'aborted', reason: 'storage_admission' }] })
+  const pane = await mount(React.createElement('div', null, React.createElement(P.FleetLines, { gov }),
+    React.createElement(P.LaneHolds, { row: { governor_held: 64, holds: gov.holds.hermes } }),
+    React.createElement(P.LaneHolds, { row: { governor_held: null, holds: [] } })))
   try {
-    const governors = pane.container.querySelector('[aria-label="GOVERNORS"]')
-    assert.ok(governors, 'independent governor toggle exists')
-    assert.equal(governors.getAttribute('aria-expanded'), 'false')
-    await pane.click(governors)
-    assert.ok(pane.container.querySelector('[data-governor="llm_pool"]'))
-    assert.ok(pane.container.querySelector('.lanes-share-bar') === null)
-    await pane.click(pane.container.querySelector('[aria-label="LANES"]'))
-    await pane.click(pane.container.querySelector('[aria-label="LANES"]'))
-    assert.equal(governors.getAttribute('aria-expanded'), 'true')
+    const text = pane.container.textContent
+    assert.match(text, /2 sources stale/)
+    assert.match(text, /askeve: stale dispatcher snapshot/)
+    assert.match(text, /aborted: storage_admission/)
+    assert.equal(pane.container.querySelectorAll('[data-stale-sources]').length, 1)
+    assert.equal(pane.container.querySelectorAll('[data-fleet-governor]').length, 1)
+    assert.match(pane.container.querySelector('[data-fleet-governor="host_slots"]').textContent, /Host slots · 1 waiting/)
+    assert.match(pane.container.querySelector('[data-lane-hold="lane_gate"]').textContent, /Lane gate 10\/50 · 64/)
+    assert.match(pane.container.querySelector('[data-lane-hold="lane_gate"]').title, /default \/ hermes: 10\/50 · 64 held/)
+    assert.match(text, /board reading stale/)
   } finally { await pane.close() }
-  const remount = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
-  try {
-    assert.equal(remount.container.querySelector('[aria-label="GOVERNORS"]').getAttribute('aria-expanded'), 'true')
-    assert.equal(remount.container.querySelector('[aria-label="LANES"]').getAttribute('aria-expanded'), 'false')
-    await remount.click(remount.container.querySelector('[aria-label="GOVERNORS"]'))
-    assert.ok(remount.container.querySelector('[data-governor]') === null)
-    assert.ok(remount.container.querySelector('details') === null)
-  } finally { await remount.close(); localStorage.clear() }
 })
 
-for (const variant of ['loading', 'unknown', 'offline', 'long']) test(`collapsed sections keep ${variant} truth in their inline summaries`, async () => {
+test('unavailable governor source reads unknown, never zero held', async () => {
+  const pane = await mount(React.createElement(P.FleetLines, { gov: undefined }))
+  try { assert.match(pane.container.textContent, /Governor source unknown/) } finally { await pane.close() }
+})
+
+for (const stopped of [true, false]) test(`safety stop ${stopped ? 'shows' : 'clears'}: one red fleet line and fleet stop on every lane`, async () => {
+  const stop = { id: 'core_update_drain', name: 'Core update drain', group: 'safety', count: 0, stop: true, reading: null, threshold: null, clears: 'update finishes', readings: [] }
+  const base = snapshot()
+  const snap = { ...base, governors: governors({ holds: {}, fleet: stopped ? [stop] : [], held_total: 0, fleet_stop: stopped }),
+    lanes: { work: { ...base.lanes.work, governor_held: 0, holds: [], fleet_stop: stopped }, other: { open: 1, governor_held: 0, holds: [], fleet_stop: stopped } } }
+  const pane = await mount(React.createElement(P.SidebarView, { snap, error: '', open: true, setOpen() {} }))
+  try {
+    assert.equal(pane.container.querySelectorAll('[data-fleet-governor]').length, stopped ? 1 : 0)
+    assert.equal(pane.container.querySelectorAll('[data-fleet-stop]').length, stopped ? 2 : 0)
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /0 held/)
+    if (stopped) {
+      const line = pane.container.querySelector('[data-fleet-governor="core_update_drain"]')
+      assert.equal(line.dataset.stop, '1')
+      assert.match(line.className, /lanes-fleet-safety/)
+      assert.match(line.textContent, /stopped.*clears: update finishes/)
+      assert.match(pane.container.textContent, /fleet stop/)
+    } else assert.doesNotMatch(pane.container.textContent, /fleet stop/)
+  } finally { await pane.close() }
+})
+
+test('fault and budget chips are needs-you chips with their own wording', async () => {
+  const holds = [{ id: 'unassigned', name: 'Unassigned', group: 'fault', count: 2 }, { id: 'spend_budget', name: 'Spend budget', group: 'budget', count: 1 }]
+  const pane = await mount(React.createElement(P.LaneHolds, { row: { governor_held: 0, holds } }))
+  try {
+    const fault = pane.container.querySelector('[data-lane-hold="unassigned"]')
+    assert.match(fault.textContent, /2 can't start/)
+    assert.match(fault.className, /lanes-hold-fault/)
+    assert.match(pane.container.querySelector('[data-lane-hold="spend_budget"]').textContent, /1 needs decision/)
+  } finally { await pane.close() }
+})
+
+test('waitsText never presents schedule or parent waits as held; unknown stays unknown', () => {
+  assert.equal(P.waitsText({ parents: 2, scheduled: 100, deploy_ci: 0, triage: 1 }), '2 on parents · 100 scheduled · 1 triage')
+  assert.equal(P.waitsText({ parents: 0, scheduled: 0, deploy_ci: 0, triage: 0 }), '')
+  assert.match(P.waitsText({ parents: null, scheduled: null, deploy_ci: null, triage: null }), /— on parents · — scheduled/)
+  assert.equal(P.waitsText(undefined), '')
+})
+
+test('replay: gate 64 on hermes + host slots 1 + two stale sources folds to 65 held, one chip, one line, one stale line', async () => {
+  const base = snapshot()
+  const snap = { ...base, governors: governors({ holds: { hermes: [gate] }, fleet: [hostSlots], held_total: 65,
+    stale_sources: [{ board: 'askeve', reason: 'stale dispatcher snapshot' }, { board: 'aborted', reason: 'storage_admission' }] }),
+    lanes: { hermes: { ...base.lanes.work, governor_held: 64, holds: [gate] } } }
+  const pane = await mount(React.createElement(P.SidebarView, { snap, error: '', open: true, setOpen() {} }))
+  try {
+    assert.match(pane.container.querySelector('[data-sidebar-totals]').textContent, /65 held/)
+    assert.equal(pane.container.querySelectorAll('[data-lane-hold]').length, 1)
+    assert.equal(pane.container.querySelectorAll('[data-fleet-governor]').length, 1)
+    assert.equal(pane.container.querySelectorAll('[data-stale-sources]').length, 1)
+    assert.match(pane.container.querySelector('[data-lane-holds="hermes"]').textContent, /Lane gate 10\/50 · 64/)
+    assert.doesNotMatch(pane.container.textContent, /GOVERNORS|governor-held/)
+  } finally { await pane.close() }
+})
+
+test('there is no GOVERNORS section; fleet lines and lane chips live under LANES and fold with it', async () => {
+  localStorage.clear()
+  const snap = snapshot(); snap.governors.fleet = [hostSlots]
+  const pane = await mount(React.createElement(P.SidebarView, { snap, error: '', open: true, setOpen() {} }))
+  try {
+    assert.equal(pane.container.querySelector('[aria-label="GOVERNORS"]'), null)
+    assert.equal(pane.container.querySelectorAll('.lanes-sb-heading').length, 1)
+    assert.ok(pane.container.querySelector('[data-governor]') === null)
+    assert.doesNotMatch(pane.container.textContent, /GOVERNORS/)
+    assert.ok(pane.container.querySelector('[data-fleet-governor="host_slots"]'))
+    assert.match(pane.container.querySelector('[data-lane-holds="work"]').textContent, /Lane gate 10\/50 · 31/)
+  } finally { await pane.close() }
+  const closed = await mount(React.createElement(P.SidebarView, { snap, error: '', open: false, setOpen() {} }))
+  try { assert.ok(closed.container.querySelector('[data-fleet-governor], [data-lane-holds]') === null) } finally { await closed.close() }
+})
+
+for (const variant of ['loading', 'unknown', 'offline', 'long']) test(`collapsed section keeps ${variant} truth in its inline summary`, async () => {
   localStorage.clear()
   const snap = variant === 'loading' ? undefined : snapshot()
   if (variant === 'unknown') { snap.flow_complete = false; snap.status.run = null; snap.governors = undefined }
-  if (variant === 'long') { snap.status.run = 123456789012345; snap.governors.counts.unknown = 987654321098765 }
+  if (variant === 'long') { snap.status.run = 123456789012345; snap.governors.held_total = 987654321098765 }
   const pane = await mount(React.createElement(P.SidebarView, { snap, error: variant === 'offline' ? 'unreachable' : '', open: false, setOpen() {} }))
   try {
     const headings = [...pane.container.querySelectorAll('.lanes-sb-heading')]
-    assert.equal(headings.length, 2)
-    assert.ok(pane.container.querySelector('.lanes-share-bar, [data-governor], details, [data-sidebar-lane]') === null)
-    for (const heading of headings) {
-      assert.equal(heading.getAttribute('aria-expanded'), 'false')
-      const summary = heading.querySelector('.lanes-sb-summary')
-      assert.ok(summary, 'summary is inside heading')
-      assert.equal(summary.title, summary.textContent)
-    }
-    if (variant === 'loading') assert.match(headings[0].textContent, /Loading lanes/)
-    if (variant === 'unknown') { assert.match(headings[0].textContent, /Partial.*— running/); assert.match(headings[1].textContent, /unknown/) }
-    if (variant === 'offline') for (const heading of headings) assert.match(heading.textContent, /offline.*last known/i)
-    if (variant === 'long') { assert.match(headings[0].textContent, /123456789012345/); assert.match(headings[1].textContent, /987654321098765 unknown/) }
+    assert.equal(headings.length, 1)
+    assert.ok(pane.container.querySelector('.lanes-share-bar, [data-governor], [data-fleet-governor], details, [data-sidebar-lane]') === null)
+    const [heading] = headings
+    assert.equal(heading.getAttribute('aria-expanded'), 'false')
+    const summary = heading.querySelector('.lanes-sb-summary')
+    assert.ok(summary, 'summary is inside heading')
+    assert.equal(summary.title, summary.textContent)
+    if (variant === 'loading') assert.match(heading.textContent, /Loading lanes/)
+    if (variant === 'unknown') assert.match(heading.textContent, /Partial.*— running · — held/)
+    if (variant === 'offline') assert.match(heading.textContent, /offline.*last known/i)
+    if (variant === 'long') { assert.match(heading.textContent, /123456789012345/); assert.match(heading.textContent, /987654321098765 held/) }
   } finally { await pane.close() }
 })
 
 for (const open of [false, true]) test(`offline before any snapshot never claims last-known data (${open ? 'expanded' : 'collapsed'})`, async () => {
   localStorage.clear()
-  if (open) localStorage.setItem(P.GOVERNORS_OPEN_KEY, '1')
   const pane = await mount(React.createElement(P.SidebarView, { snap: undefined, error: 'unreachable', open, setOpen() {} }))
   try {
-    const [lanes, governors] = pane.container.querySelectorAll('.lanes-sb-heading')
+    const headings = pane.container.querySelectorAll('.lanes-sb-heading')
+    assert.equal(headings.length, 1)
+    const [lanes] = headings
     assert.equal(lanes.getAttribute('aria-expanded'), String(open))
-    assert.equal(governors.getAttribute('aria-expanded'), String(open))
     assert.match(lanes.textContent, /Lanes offline - retrying · Loading lanes…/)
-    assert.match(governors.textContent, /Governors offline · Loading governors…/)
-    for (const heading of [lanes, governors]) assert.equal(heading.getAttribute('aria-description'), heading.querySelector('.lanes-sb-summary').title)
+    assert.equal(lanes.getAttribute('aria-description'), lanes.querySelector('.lanes-sb-summary').title)
     assert.doesNotMatch(pane.container.textContent, /last known/i)
     assert.ok(pane.container.querySelector('.lanes-last-known') === null, 'nothing is styled as last-known data')
-    assert.equal(pane.container.querySelectorAll('[data-sidebar-body]').length, open ? 2 : 0)
+    assert.equal(pane.container.querySelectorAll('[data-sidebar-body]').length, open ? 1 : 0)
     if (open) {
       assert.equal(pane.container.querySelector('[data-sidebar-body="lanes"] [role=status]').textContent, 'Lanes offline - retrying')
       assert.match(pane.container.querySelector('[data-sidebar-body="lanes"]').textContent, /Loading lanes…/)
-      assert.match(pane.container.querySelector('[data-sidebar-body="governors"]').textContent, /Loading governors…/)
+      assert.ok(pane.container.querySelector('[data-sidebar-body="governors"]') === null)
     }
   } finally { await pane.close(); localStorage.clear() }
 })
 
-test('offline after a snapshot labels both expanded bodies as last known', async () => {
+test('offline after a snapshot labels the expanded body as last known and keeps folded holds', async () => {
   localStorage.clear()
-  localStorage.setItem(P.GOVERNORS_OPEN_KEY, '1')
   const pane = await mount(React.createElement(P.SidebarView, { snap: snapshot(), error: 'unreachable', open: true, setOpen() {} }))
   try {
     assert.equal(pane.container.querySelector('[data-sidebar-body="lanes"] [role=status]').textContent, 'Lanes offline - retrying · last known')
-    assert.equal(pane.container.querySelectorAll('[data-sidebar-body].lanes-last-known').length, 2)
+    assert.equal(pane.container.querySelectorAll('[data-sidebar-body].lanes-last-known').length, 1)
+    assert.ok(pane.container.querySelector('[data-lane-hold="lane_gate"]'))
   } finally { await pane.close(); localStorage.clear() }
 })
 
@@ -153,8 +214,8 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
   await P.sourceFor(t.ctx).read(6, '6h', true)
   const pane = await mount(React.createElement(P.SidebarLanes, { ctx: t.ctx }))
   try {
-    assert.match(pane.container.textContent, /7 running · 31 governor-held · 3 you · 41 waiting/)
-    assert.doesNotMatch(pane.container.textContent, /\$12.34 today/)
+    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
+    assert.doesNotMatch(pane.container.textContent, /\$12.34 today|governor-held/)
     assert.ok(pane.container.querySelector('.lanes-share-bar') === null)
     assert.ok(pane.container.querySelector('[data-governor]') === null)
     assert.ok(pane.container.querySelector('[data-sidebar-lane]') === null)
@@ -165,6 +226,11 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
     await pane.click(pane.container.querySelector('[data-sidebar-lane="work"] button'))
     assert.equal(pane.container.querySelector('[data-step="ready"]').dataset.piling, '1')
     assert.match(pane.container.textContent, /boards: alpha, beta/)
+    assert.match(pane.container.querySelector('[data-lane-waits="work"]').textContent, /10 on parents · 5 scheduled/)
+    // The lane gate holds cards: its field is marked, unrelated fields are not.
+    const holdingLabels = [...pane.container.querySelectorAll('label[data-holding="1"]')].map(l => l.textContent.trim())
+    assert.equal(holdingLabels.length, 1)
+    assert.match(holdingLabels[0], /^admit \/ day holding/)
     const setInput = async (label, value) => {
       const input = pane.container.querySelector(`[aria-label="work ${label}"]`)
       await React.act(async () => {
@@ -172,17 +238,19 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
         input.dispatchEvent(new window.Event('input', { bubbles: true }))
       })
     }
+    assert.equal(pane.container.querySelector('[aria-label="work admit / day"]').value, '50')
     await setInput('share', '30')
     await setInput('max workers', '')
+    await setInput('admit / day', '64')
     await setInput('cards / day', '24')
     await setInput('$ / day', '80.25')
     await pane.click(pane.container.querySelector('input[type=checkbox]'))
     await pane.click(pane.container.querySelector('button[type=submit]'))
     assert.deepEqual(t.writes[0], ['/v1/lanes/work', { timeoutMs: P.REQUEST_TIMEOUT_MS, method: 'PUT',
-      body: { share: 30, max_workers: null, cards_per_day: 24, usd_per_day: 80.25, paused: true } }])
+      body: { share: 30, max_workers: null, admit_per_day: 64, cards_per_day: 24, usd_per_day: 80.25, paused: true } }])
     await React.act(async () => t.push(undefined, Error('unreachable')))
     assert.match(pane.container.textContent, /Lanes offline - retrying/)
-    assert.match(pane.container.textContent, /7 running · 31 governor-held · 3 you · 41 waiting/)
+    assert.match(pane.container.textContent, /7 running · 31 held · 3 you · 41 waiting/)
     assert.ok(pane.container.querySelector('.lanes-last-known'))
     assert.ok(pane.container.querySelector('button[type=submit]').disabled)
   } finally { await pane.close() }

@@ -10,6 +10,23 @@ import time
 from pathlib import Path
 
 
+# Presentation grouping only; the dispatcher registry is unchanged (42 ids).
+_G = {
+    'wait': ('dependencies', 'schedule'),
+    'reorder': ('board_share', 'lane_share', 'ratio_routing'),
+    'lane_dial': ('lane_gate', 'lane_paused', 'lane_max_workers', 'lane_daily_limit'),
+    'fleet_dial': ('host_slots', 'max_spawn', 'profile_cap', 'llm_pool', 'admission_pool'),
+    'budget': ('spend_budget', 'no_progress', 'respawn_guard', 'spawn_failed'),
+    'safety': ('gateway_drain', 'core_update_drain', 'update_fence', 'quiet', 'memory_pressure', 'disk_floor',
+               'hub_cpu', 'worker_resources', 'storage_admission', 'provider_walls', 'class_walls',
+               'review_provider_wall', 'owner_down', 'board_lease', 'containment', 'hub_claim_screen', 'start_gate'),
+    'fault': ('unassigned', 'nonspawnable', 'model_pin', 'capsule', 'placement', 'refusal_fallback', 'unrecorded'),
+}
+GROUPS = {ident: group for group, ids in _G.items() for ident in ids}
+DIALS = ('lane_dial', 'fleet_dial')
+NEEDS_YOU = ('budget', 'fault')
+
+
 def project(snapshots, cards, registry, *, adapter=None, now=None):
     now = time.time() if now is None else now
     scope, groups = [], defaultdict(list)
@@ -123,6 +140,59 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                          since=min((r['since'] for r, _, _ in known if r.get('since')), default=None),
                          scope=row_scope, partial=bool(partial or unknown), clears=entry['threshold']))
     charged = sum(r['cards_charged'] for r in rows)
+    # Per-lane holds. A lane dial's receipt (scope = lane) is a complete counter; card charges are the
+    # only evidence for the rest and are fenced by incomplete_lanes in the view, never extended here.
+    by_id = {r['id']: r for r in rows}
+    scoped = defaultdict(list)
+    for ident, observations in groups.items():
+        if GROUPS.get(ident) != 'lane_dial':
+            continue
+        for r, source, snap in observations:
+            if source['available'] and r.get('scope') and r.get('cards') is not None and not r.get('unknown') and (
+                    r.get('cards') or r.get('reading') is not None):
+                scoped[r['scope'], ident].append((r, source))
+    lane_counts = defaultdict(dict)
+    for lane, counts in by_lane.items():
+        for ident, n in counts.items():
+            lane_counts[lane][ident] = n
+    for (lane, ident), items in scoped.items():
+        lane_counts[lane][ident] = sum(r.get('cards') or 0 for r, _ in items)
+    holds, lane_dial = {}, {}
+    for lane, counts in lane_counts.items():
+        chips = []
+        for ident, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            group, row = GROUPS.get(ident), by_id.get(ident)
+            if not n or row is None:
+                continue
+            if group in DIALS:
+                lane_dial[lane] = lane_dial.get(lane, 0) + n
+            if group not in ('lane_dial', 'budget', 'fault'):
+                continue
+            items = sorted(scoped.get((lane, ident), []),
+                           key=lambda it: (-(it[0].get('cards') or 0), it[1].get('age_s') or 0))
+            gauge = next((r for r, _ in items if r.get('reading') is not None), {})
+            chips.append(dict(id=ident, name=row['name'], count=n, reading=gauge.get('reading'),
+                              threshold=gauge.get('threshold', row['clears']), group=group, clears=row['clears'],
+                              needs_you=group in NEEDS_YOU, detail=gauge.get('detail'),
+                              readings=[dict(board=s['board'], lane=r.get('scope'), reading=r.get('reading'),
+                                             threshold=r.get('threshold'), detail=r.get('detail'),
+                                             cards=r.get('cards', 0)) for r, s in items]))
+        if chips:
+            holds[lane] = chips
+    stops = {ident for ident, observations in groups.items() for r, s, b in observations if s['available']
+             for g in b.get('globals') or [] if g.get('governor') == ident and g.get('verdict') == 'stop'}
+    fleet = []
+    for row in rows:
+        group = GROUPS.get(row['id'])
+        stop = row['id'] in stops
+        if group in ('fleet_dial', 'safety') and (row['cards_charged'] or (group == 'safety' and stop)):
+            fleet.append(dict(id=row['id'], name=row['name'], count=row['cards_charged'], reading=row['reading'],
+                              threshold=row['threshold'], group=group, clears=row['clears'], stop=stop,
+                              readings=row['readings'], detail=row['detail'], since=row['since']))
+    fleet.sort(key=lambda f: (f['group'] != 'safety', not f['stop'], -f['count'], f['id']))
+    stale_sources = [dict(board=s['board'], reason=s.get('reason') or 'stale dispatcher snapshot') for s in scope
+                     if not s['available'] or not s['accounting_available'] or not s['flow_available']]
+    held_total = sum(r['cards_charged'] for r in rows if GROUPS.get(r['id']) in DIALS)
     if charged != idle or unsupported:
         complete = lane_complete = False
         if unsupported:
@@ -144,6 +214,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                 known_idle_total=idle, charged_total=charged,
                 counts={state: sum(r['state'] == state for r in rows)
                         for state in ('on', 'off', 'at_cap', 'unknown')},
+                holds=holds, fleet=fleet, stale_sources=stale_sources, held_total=held_total,
+                fleet_stop=any(f['group'] == 'safety' and f['stop'] for f in fleet), lane_dial=lane_dial,
                 lane_reasons={lane: [dict(id=k, count=v) for k, v in counts.most_common()]
                               for lane, counts in by_lane.items()},
                 device_footnote=dict(state='known' if device_fresh else 'unknown', age_s=age,
