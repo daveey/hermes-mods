@@ -63,8 +63,8 @@ A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow
 Never signal a live Hermes gateway, its launcher/wrapper, or a Desktop serve/dashboard backend,
 including SIGUSR2, SIGQUIT, SIGABRT and SIGKILL. Only signal 0 is a safe existence probe.
 For a stack sample use `sample <pid> 5` on macOS or
-`py-spy dump --nonblocking --pid <pid>` on Linux, under `sudo -n` for a process that isn't your descendant (Yama
-ptrace_scope refuses it otherwise). Do not substitute a signal if sampling is unavailable.
+`py-spy dump --nonblocking --pid <pid>` on Linux, under `sudo -n "$(command -v py-spy)"` for a process that isn't your descendant (Yama
+ptrace_scope refuses it otherwise; sudo's PATH omits `~/.local/bin`, so a bare `sudo -n py-spy` exits 127). Redirect the dump to an absolute scratch path: a relative redirect after a persisted `cd` into the core checkout is refused. Do not substitute a signal if sampling is unavailable.
 A `py-spy dump` is one instant: enough to see what a hung process waits on, but a single dump can name a function
 that isn't the hot path. On Linux, dump headers may omit Python thread names: join each numeric TID to `/proc/<pid>/task/<tid>/comm` before filtering named threads, tolerate threads exiting during that read, and assert nonzero selected-thread coverage. Do not equate voluntary context switches with loop iterations: repeated stacks blocked on an Event, Condition or strict-reader lock require separate wake/pass evidence before a timer-loop patch. To attribute CPU to code, record instead:
 `sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
