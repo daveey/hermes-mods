@@ -33,7 +33,7 @@ def fake(remote_result=None, local_clean=True):
         remote_calls.append(owner)
         return remote_result
 
-    def local(owner, strict):
+    def local(owner, strict, *, force_full=False):
         local_calls.append((owner, strict))
         if strict and not local_clean:
             raise RuntimeError('Card reconciliation deferred')
@@ -410,7 +410,7 @@ def test_a_cold_local_pass_that_raises_still_queues_the_remote_pass():
     failing (busy board) never keeps the owner's remote asks out of the queue."""
     self, remote, local = fake()
 
-    def failing(owner, strict):
+    def failing(owner, strict, *, force_full=False):
         local.append((owner, strict))
         raise OSError('board busy')
     self._reconcile_local = failing
