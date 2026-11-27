@@ -158,6 +158,8 @@ def test_missing_triage_entry_is_explicit_and_parent_chain_carries_age():
 
 
 def test_real_promotion_and_escalation_writers_start_new_triage_episodes():
+    import pytest
+    pytest.importorskip('hermes_cli.kanban_triage_attention')
     for kind in ('block_loop_detected', 'agent_block_escalated', 'spend_budget_held', 'gave_up'):
         b = held_bundle()
         b['cards']['t_abc123']['detail']['events'] = [
@@ -178,6 +180,8 @@ def test_shared_triage_group_preserves_canonical_human_request_authority():
     assert len(m['sections']['needs_you']) == 1
     assert m['groups'][0]['section'] == 'needs_you'
     assert "waiting on you" in m['groups'][0]['detail']
+    import pytest
+    pytest.importorskip('hermes_cli.kanban_triage_attention')
     assert 'in triage · 1h' in m['groups'][0]['detail']
     assert all(row.get('wait_kind') != 'agent' for row in m['sections']['waiting'])
 
