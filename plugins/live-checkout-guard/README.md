@@ -152,11 +152,16 @@ Commits use the inherited repository author identity and include skill/session/c
 Fetched `.githooks` are **never executed**, including checkout/rebase hooks. The plugin generates a private
 hook directory whose wrappers invoke only its own `publication_validate.py`. That helper requires gitleaks
 (default rules, plugin-owned config/empty ignore file, inline allow directives ignored) and the existing private
-denylist; missing or failing checks hold publication. There is no unscanned override.
+denylist; missing or failing checks hold publication. Complete staged document blobs are scanned via stdin
+from a private empty directory, never as a fetched Git source: even a matching `.gitleaksignore` fingerprint
+committed to origin cannot suppress the scan. There is no unscanned override.
 The trusted pre-commit and pre-push validators permit only regular, non-executable Markdown skill docs.
 Non-Markdown support assets and skills containing scripts/tests are held for the normal repository suite/PR flow:
-the publisher never executes fetched tests or reduces their required coverage to obtain publication.
-This is intentionally stricter than the ordinary doc-fast-path selector. The initial file-scope check above
+the publisher never executes fetched tests. Cross-component dependent suites are not run before automatic
+doc-only pushes either (for example a plugin suite naming a skill); CI runs the ordinary full selection after
+the push. If a document requires dependent-suite validation before publication, use the reviewed PR flow,
+not this automatic documentation path. This pre-push limitation does not establish dependent-suite coverage.
+This is intentionally stricter about owning-skill tests than the ordinary doc-fast-path selector. The initial file-scope check above
 still accepts other documented asset types for safe capture, but the publication gate holds them.
 Cross-skill batches use separate commits in the same detached worktree. Privacy/scope bypass environment
 flags are stripped for commits.

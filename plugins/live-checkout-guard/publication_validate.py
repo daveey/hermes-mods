@@ -68,11 +68,19 @@ def privacy():
     deny = next((Path(p) for p in candidates if p and Path(p).is_file()), None)
     if deny is None:
         raise ValueError('privacy check(s) cannot run: denylist')
+    # Scan complete staged blobs, not a Git source: gitleaks git also loads the
+    # source repository's .gitleaksignore despite --gitleaks-ignore-path. Stdin
+    # plus a private empty cwd excludes both repository and cwd suppressions.
+    names = git('diff', '--cached', '--name-only', '-z', '--diff-filter=d',
+                '--no-renames', '--no-ext-diff', '--no-textconv').split(b'\0')
+    content = b'\n'.join(git('cat-file', 'blob', ':' + name.decode()) for name in names if name)
     try:
-        subprocess.run(['gitleaks', 'git', '--pre-commit', '--staged', '--no-banner', '--redact',
-                        '--ignore-gitleaks-allow', '--gitleaks-ignore-path', str(HERE / 'publication.gitleaksignore'),
-                        '-c', str(HERE / 'publication.gitleaks.toml')], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        with tempfile.TemporaryDirectory(prefix='publication-scan-') as scan_cwd:
+            subprocess.run(['gitleaks', 'stdin', '--no-banner', '--redact',
+                            '--ignore-gitleaks-allow', '--gitleaks-ignore-path', str(HERE / 'publication.gitleaksignore'),
+                            '-c', str(HERE / 'publication.gitleaks.toml')], check=True,
+                           input=content, cwd=scan_cwd,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     except FileNotFoundError:
         raise ValueError('privacy check(s) cannot run: gitleaks') from None
     except subprocess.CalledProcessError:
