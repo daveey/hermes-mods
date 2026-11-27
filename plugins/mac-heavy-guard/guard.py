@@ -1139,8 +1139,16 @@ def _command_events(text: str, _prepared: bool = False) -> Iterator[tuple[list[s
     # their textual positions, even in suppressed headers/patterns/arrays, and
     # scan their bodies with a private cwd rather than leaking subshell `cd`.
     substitutions: dict[str, str] = {}
+    # F18 (heredoc twin): a heredoc body's `$\<nl>(` is a substitution in bash, but the shared heredoc block reads
+    # `\<nl>` as an escape. Class closure: hold `$` immediately followed by backslash-newline. False refusal: a
+    # single-quoted `'$\<nl>'` data string.
+    if not _prepared and "$\\\n" in text:
+        yield _InspectionHold(["dollar line-continuation substitution inspection unsupported"]), set()
+        return
+    # F18: join backslash-newline BEFORE exposing substitutions: bash deletes it even inside double quotes, so
+    # `"$\<nl>(cmd)"` is a substitution that the opener scan must see.
     try:
-        code = _expose_substitutions(text if _prepared else _split_heredocs(text)[0], substitutions)
+        code = _expose_substitutions(_join_continuations(text if _prepared else _split_heredocs(text)[0]), substitutions)
     except _AnalysisLimit:
         yield _InspectionHold(["command substitution inspection depth limit"]), set()
         return
