@@ -19,7 +19,8 @@ def _git(root, *args):
 
 
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, monkeypatch):
+    monkeypatch.setattr(core.waiter, "attested_source", lambda: b"# attested fixture\n")
     root = tmp_path / "checkout"
     root.mkdir()
     _git(root, "init", "-q")
@@ -37,7 +38,9 @@ def repo(tmp_path):
 
 
 def _write(home, **state):
-    (home / "cache/core-update/state.json").write_text(json.dumps(state))
+    path = home / "cache/core-update/state.json"
+    path.write_text(json.dumps(state))
+    path.chmod(0o600)
 
 
 
@@ -146,7 +149,7 @@ def test_restart_starts_the_waiter_then_quits_desktop_detached(repo):
     spawned = []
     r = core.restart(home, checkout=root, popen=lambda cmd, **kw: spawned.append((cmd, kw)))
     assert r == {"ok": True, "sha": ahead}
-    assert spawned[0][0] == ["/usr/bin/python3", "sync", "core-waiter"]
+    assert spawned[0][0] == ["/usr/bin/python3", "-I", str(Path(core.__file__).resolve().with_name("waiter.py"))]
     assert "osascript" in spawned[1][0][-1] and core.DESKTOP_BUNDLE_ID in spawned[1][0][-1]
     assert all(kw["start_new_session"] for _cmd, kw in spawned)
 

@@ -5,10 +5,11 @@ An updater (for example a sync job that keeps a fork checkout current) writes
 
     {"status": "building" | "ready" | "failed", "sha": "<commit being packed>",
      "serves_sha": "<newer head the ready build also serves (no desktop input changed)>",
-     "app_path": "<prebuilt Hermes.app>", "built_at": "<iso>", "started_at": "<iso>",
-     "waiter_cmd": ["<argv that waits for Desktop to quit, then applies the update>"]}
+     "app_path": "<prebuilt Hermes.app>", "built_at": "<iso>", "started_at": "<iso>"}
 
 and, while it waits for Desktop to quit, ``waiter.json`` ({"pid", "state", ...}) next to it.
+The legacy ``waiter_cmd`` field is ignored. Restart uses this plugin's waiter.py,
+which accepts only a digest-pinned reference updater at its fixed installed path.
 This module only reads those files, the running checkout's HEAD and installed Desktop bundle
 stamps; ``restart`` starts the
 waiter (it is idempotent: a second waiter exits at once) and then asks Desktop to quit, so the
@@ -19,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import stat
+import importlib.util
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -46,6 +49,33 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+_waiter_spec = importlib.util.spec_from_file_location("core_update_waiter", Path(__file__).with_name("waiter.py"))
+waiter = importlib.util.module_from_spec(_waiter_spec)
+_waiter_spec.loader.exec_module(waiter)
+
+
+def _read_state(path: Path) -> Dict[str, Any]:
+    """Check the opened inode and parse it once; never stat then reopen."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "r") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                return {}
+            data = json.loads(stream.read())
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _waiter_available() -> bool:
+    try:
+        waiter.attested_source()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _git(root: Path, *args: str) -> Optional[str]:
@@ -106,9 +136,13 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
     Checkout equality is not proof of Desktop installation. A matching installed bundle
     (including identical build inputs) clears same-HEAD offers after the swap.
     """
+    return _status(_read_state(state_dir(home) / "state.json"), home, checkout, git)
+
+
+def _status(st: Dict[str, Any], home: Optional[Path], checkout: Optional[Path],
+            git: Callable[..., Optional[str]]) -> Dict[str, Any]:
     d = state_dir(home)
-    st = _read_json(d / "state.json")
-    waiter = _read_json(d / "waiter.json")
+    waiter_state = _read_json(d / "waiter.json")
     root = checkout or running_checkout()
     running = git(root, "rev-parse", "HEAD")
     sha = st.get("sha") if isinstance(st.get("sha"), str) else None
@@ -120,8 +154,8 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
     out: Dict[str, Any] = {
         "state": "idle", "sha": sha, "running": running, "built_at": st.get("built_at"),
         "started_at": st.get("started_at"), "error": st.get("error"),
-        "waiter": {"pid": waiter.get("pid"), "state": waiter.get("state"),
-                   "alive": bool(waiter.get("pid")) and _pid_alive(waiter.get("pid"))} if waiter else None,
+        "waiter": {"pid": waiter_state.get("pid"), "state": waiter_state.get("state"),
+                   "alive": bool(waiter_state.get("pid")) and _pid_alive(waiter_state.get("pid"))} if waiter_state else None,
         "can_restart": False,
         "reason": st.get("local_pack_blocked_reason"),
     }
@@ -147,7 +181,9 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
             out["state"] = "building"
     elif s == "ready" and st.get("app_path") and Path(str(st["app_path"])).is_dir():
         out["state"] = "ready"
-        out["can_restart"] = bool(st.get("waiter_cmd"))
+        out["can_restart"] = _waiter_available()
+        if not out["can_restart"]:
+            out["reason"] = "installed updater is unavailable or not attested"
     elif s == "failed":
         out["state"] = "failed"
     return out
@@ -167,10 +203,11 @@ def restart(home: Optional[Path] = None, *, popen: Callable[..., Any] = subproce
             git: Callable[..., Optional[str]] = _git) -> Dict[str, Any]:
     """Start the apply-on-quit waiter, then quit Desktop. Both detached: quitting Desktop ends
     this backend too. Refuses unless an update is ready (otherwise nothing would reopen Desktop)."""
-    s = status(home, checkout=checkout, git=git)
+    st = _read_state(state_dir(home) / "state.json")
+    s = _status(st, home, checkout, git)
     if s["state"] != "ready" or not s["can_restart"]:
         return {"ok": False, "reason": f"no update ready (state {s['state']})"}
-    cmd: List[str] = [str(c) for c in _read_json(state_dir(home) / "state.json")["waiter_cmd"]]
+    cmd = ["/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("waiter.py"))]
     detached = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True, close_fds=True)
     popen(cmd, **detached)
