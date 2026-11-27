@@ -161,8 +161,13 @@ records: dirty skill paths are rediscovered. Content fingerprints of refused/exp
 held for reviewed recovery. Discovery warnings/log lines are deduplicated per path generation
 (`.notified-*`), so unrelated tool calls do not spam unchanged refused/settled dirt. A newer edit
 is eligible again. Existing records keep their deadline. Unreadable pending entries are renamed
-`.quarantine-*` without deleting their contents; if quarantine itself fails the worker exits visibly,
-not an unbounded retry loop. The worker flock is only probed, then released before discovery,
+`.quarantine-*` without deleting their contents. If quarantine itself fails, the worker skips only
+that entry and still publishes/expires healthy siblings. A metadata-generation-bound `.blocked-*`
+marker (fallback `.queue-held-*` if its primary write fails) suppresses repeated failed-entry attempts
+and notices across workers; changing/replacing
+that entry makes it eligible again. Both queue scans exclude skipped entries, and a worker exits
+without sleeping when none are actionable. Observers do not respawn workers for nonregular or
+unchanged blocked-only queues. The worker flock is only probed, then released before discovery,
 so a defer-spawned retry worker is never excluded by that scan.
 A clean detached worktree starts at fetched origin/main and receives a
 `git apply --3way --index` patch constructed from captured bytes using a separate temporary index.

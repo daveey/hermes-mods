@@ -148,7 +148,7 @@ def test_quarantine_failure_exits_without_retry_loop(repository, monkeypatch):
     monkeypatch.setattr(Path, 'rename', rename)
     counts = pub.retry_pending(passes=3, sleep=lambda _: pytest.fail('unreadable loop'))
     assert counts['dropped'] == 1 and bad.exists()
-    assert 'quarantine failed; worker exiting' in (directory.parent.parent / 'logs/skill-publish-retry.log').read_text()
+    assert 'quarantine failed; entry held' in (directory.parent.parent / 'logs/skill-publish-retry.log').read_text()
 
 
 def test_probe_lock_is_released_before_discovery(repository):
