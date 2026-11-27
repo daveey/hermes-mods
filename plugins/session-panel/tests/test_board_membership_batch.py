@@ -101,10 +101,19 @@ def test_lineage_members_hold_for_every_chat_ordering_against_a_reversed_pass_li
     assert compared == 2 * (7 + 7 * 6 + 7 * 6 * 5)
 
 
-def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed, monkeypatch):
+@pytest.mark.parametrize('chat_count', [6, 22, 64])
+def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed, monkeypatch, chat_count):
     import hermes_cli.kanban_session_outcome_tasks as kot
     r, cards, ksa, path, c = mixed
-    chats = ['S0', 'S1', 'S2', 'S3', 'S5'] + [f'S{i}' for i in range(6, 23)]
+    extra_chats = [f'S{i}' for i in range(6, chat_count + 1)]
+    chats = ['S0', 'S1', 'S2', 'S3', 'S5'] + extra_chats
+    # Grow selected triage membership as well as the chat union: empty extra chats alone would not expose
+    # a per-card query in retained-stop hydration. Keep S5's inherited membership in every case.
+    for s in extra_chats:
+        cid = kanban_db.create_task(c, title=f'Triage for {s}', session_id=s, initial_status='running')
+        c.execute("UPDATE tasks SET status='triage' WHERE id=?", (cid,))
+    c.commit()
+    assert len(chats) == chat_count
     lineage = {s: r.lineage(s) for s in chats}
     assert lineage['S5'] == ['S5', 'S4']
     baseline = {s: (r.linked(lineage[s]), r.done(lineage[s])) for s in chats}
@@ -114,7 +123,9 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
 
     def counted(conn, ids, *a, **k):
         calls.append(list(ids))
-        conn.set_trace_callback(statements.append)
+        per_call = []
+        statements.append(per_call)
+        conn.set_trace_callback(per_call.append)
         try:
             return original(conn, ids, *a, **k)
         finally:
@@ -127,10 +138,9 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
     assert unclocked(actual) == unclocked(baseline)
     assert [t['via'] for t in actual['S0'][0]] == [t['via'] for t in baseline['S0'][0]]
     # Per status set, core's union hydration selects once and the pass's membership read selects once, both over
-    # the pass's ids: 4 calls for 22 chats, where the per-chat loop added one call per chat and status set (46).
+    # the pass's ids: four calls regardless of chat/card count (the old per-chat loop used 46 for 22 chats).
     assert calls == [union] * 4, [len(ids) for ids in calls]
-    # Bound the pass to two selector reads per status set, rather than pinning
-    # core's internal SQL count (new annotations legitimately add fixed reads).
+    # Preserve the relative oracle for duplicate selector work within the pass.
     # Use the same scope/connection shape so row-dependent enrichment is counted.
     control = []
     c.set_trace_callback(control.append)
@@ -140,4 +150,9 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
     finally:
         c.set_trace_callback(None)
     assert control
-    assert len(statements) == 2 * len(control), (len(statements), len(control))
+    counts = [len(per_call) for per_call in statements]
+    assert sum(counts) == 2 * len(control), (counts, len(control))
+    # Core's retained-stop annotation adds two set-based reads for all selected triage IDs: task claim/active-run
+    # evidence and relevant retention/invalidation events. Together with the existing triage-entry probe these
+    # need at most 14 statements per selector, not per chat or card. Older cores remain within this ceiling.
+    assert all(count <= 14 for count in counts), counts
