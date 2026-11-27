@@ -19,6 +19,12 @@ heartbeats and repeated holds do not reset the episode. Exit clears it; re-entry
 starts fresh. Missing/invalid/future/stale source time remains unknown, never a
 `created_at` estimate. Local, replica and origin-ledger paths carry this scalar.
 Older cores without the helper retain unknown age rather than a duplicate rule.
+Triage clocks, held causes and hold-event classification use owner-qualified card
+hydration, including next-threshold memo entries for listed rows and off-list
+groups. Check listed coordinates before inheriting serving display coordinates;
+omitted legacy coordinates remain compatible, but known foreign ones cannot lend
+an episode or held cause. Carry accepted history with the row so presentation
+identity defaults do not discard it in later clock reads.
 
 The feed schedules bounded next-threshold invalidation (`triage_deadlines`) for
 listed rows and shared-blocker groups, keyed by the reducer's own serving-gateway
