@@ -11,6 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+# Import before the per-test home-isolation fixture: native tool imports perform
+# one-time config bootstrap. The empty-target assertion below concerns ownership
+# reads, not that bootstrap (which otherwise runs in the first test's tmp_path).
+ProcessSession = pytest.importorskip("tools.process_registry").ProcessSession
+
 spec = importlib.util.spec_from_file_location(
     'process_goal_boundary', Path(__file__).parents[1] / 'goal_disposition.py')
 gd = importlib.util.module_from_spec(spec)
@@ -27,7 +32,6 @@ spec.loader.exec_module(gd)
      'process_id': '0123456789ab'},
 ])
 def test_native_handle_and_notify_do_not_certify_return(tmp_path, monkeypatch, ref):
-    from tools.process_registry import ProcessSession
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     # Native objects know a spawning conversation, not an authoritative goal
     # binding or successful result-consumer poll for this handle.

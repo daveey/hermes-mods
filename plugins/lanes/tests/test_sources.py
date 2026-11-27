@@ -138,6 +138,54 @@ def test_fleet_reader_gets_each_phase_budget_not_its_aged_open_deadline(board, t
     assert view['flow_complete'], view.get('flow_error')
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+def test_governed_sources_qualifies_exact_board_slugs_before_reduction(actual_board, tmp_path, monkeypatch, reverse):
+    """Exercise production qualification, not a test-side metrics.qualify call."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    from hermes_cli import kanban_governors as gov, kanban_lane_samples as samples
+    from hermes_cli.kanban_lanes_sources import read_view
+
+    api, config = actual_board
+    slugs = ['default', 'research-board', 'unserved-board']
+    metas = [dict(slug='default', db_path=config['local'])]
+    now = int(time.time())
+    # Two genuinely independent siblings: one observed, one pre-samples board.
+    for slug in slugs[1:]:
+        path = tmp_path / (slug + '.db')
+        with contextlib.closing(kbc.connect(path)) as db:
+            if slug == 'research-board':
+                db.execute(samples.SCHEMA)
+                db.execute('INSERT INTO lane_samples VALUES(?,?,?,?,?,?)',
+                           (now // 60 * 60, 'work', 2, 2, 1, 3))
+            db.commit()
+        metas.append(dict(slug=slug, db_path=str(path)))
+    monkeypatch.setattr(kb, 'list_boards', lambda **kw: list(reversed(metas)) if reverse else metas)
+    monkeypatch.setattr(gov, 'registry', lambda: {})
+    with contextlib.closing(kbc.connect(Path(config['local']))) as db:
+        db.execute(samples.SCHEMA)
+        db.execute('INSERT INTO lane_samples VALUES(?,?,?,?,?,?)',
+                   (now // 60 * 60, 'work', 1, 4, 0, 0))
+        db.commit()
+        with read_view(db) as evidence:
+            snap, raw = api._governed_sources(api.core(), db, evidence, 6., '6h')
+    assert raw['summary_complete'] and raw['flow_complete'], raw.get('partial_reason')
+    assert [source for source, _ticks in snap['lanes']['work']['_tick_sources']] == (
+        ['default', 'unserved-board', 'research-board'] if reverse else slugs)
+    rendered = api._sibling('metrics').present(snap, 8)['lanes']['work']
+    assert '_tick_sources' not in rendered
+    bucket = rendered['ticks']['cells'][-1]
+    assert bucket['running'] is None and bucket['rejected'] is None
+    assert len(bucket['components']) == 3
+    parts = {part['source']: part for part in bucket['components']}
+    assert set(parts) == set(slugs)
+    assert parts['default']['running'] == 1
+    assert parts['research-board']['running'] == 2
+    assert parts['research-board']['rejected'] == 3
+    assert parts['unserved-board']['running'] is None
+    assert parts['unserved-board']['reason'] == 'no samples'
+
+
 def test_failed_flow_keeps_fresh_strip(board, monkeypatch):
     pytest.importorskip('hermes_cli.kanban_lanes_sources')
     from hermes_cli import kanban_lanes_flow as flow

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ def config_path():
 def defaults():
     return {
         'extra_providers_dir': str(hermes_home() / 'compute-rentals' / 'providers'),
+        'extra_providers': {},  # {filename: sha256}: only these files of extra_providers_dir are executed
         'ec2': {'profiles': [os.environ.get('AWS_PROFILE') or 'default'], 'cache_seconds': 300},
         'slurm': {'hosts': [], 'user': None, 'control_host': None},
         'broker': {'command': [], 'python': None},
@@ -89,6 +91,11 @@ def _string_list(value, field):
 
 def validate(cfg):
     cfg['extra_providers_dir'] = str(Path(str(cfg['extra_providers_dir'])).expanduser())
+    pins = cfg['extra_providers']
+    if not isinstance(pins, dict) or not all(
+            isinstance(k, str) and k and isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v)
+            for k, v in pins.items()):
+        raise ValueError('extra_providers must map file names to lowercase SHA-256 digests')
     ec2 = cfg['ec2']
     ec2['profiles'] = _string_list(ec2.get('profiles'), 'ec2.profiles')
     if not isinstance(ec2.get('cache_seconds'), (int, float)) or ec2['cache_seconds'] < 0:

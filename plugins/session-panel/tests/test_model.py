@@ -716,3 +716,16 @@ def test_done_row_shows_completion_age_as_wire_clock_without_revision_churn():
     assert d['clock_text']['detail'][0] == {'timestamp': float(NOW - 3 * 3600), 'format': 'ago'}
     assert d['clock_text']['detail'][1] == ' · 57m · 1 restart · $5.21'
     assert d['detail'] == '57m · 1 restart · $5.21'  # legacy static fallback drops the age
+
+
+def test_named_dependency_uses_captured_owner_profile_not_serving_profile():
+    parent = 't_def456'
+    row = task(status='todo', wait={'waiting_on': f'card {parent}'})
+    cards = {parent: {'gateway': 'remote', 'profile': 'dependency-profile', 'board': 'default',
+                      'detail': {'owner': 'remote', 'source': 'replica',
+                                 'task': {'id': parent, 'title': 'Exact dependency', 'status': 'ready'}}}}
+    for serving in ({}, {'profile': 'serving-profile'}):
+        out = model.reduce_panel(bundle(row, cards=cards, **serving), now=NOW)
+        actions = out['sections']['waiting'][0]['actions']
+        assert [a['target'] for a in actions if a.get('role') == 'dependency'] == [
+            {'id': parent, 'gateway': 'remote', 'profile': 'dependency-profile', 'board': 'default'}]

@@ -34,6 +34,7 @@ Everything is optional. With no config file you get the defaults below. The file
 ```yaml
 # Extra providers (see below). Default: ~/.hermes/compute-rentals/providers
 extra_providers_dir: ~/.hermes/compute-rentals/providers
+extra_providers: {}          # {file.py: sha256}: only these files of that directory are executed
 
 ec2:
   profiles: [default]        # AWS CLI profiles to scan. Default: [$AWS_PROFILE or "default"]
@@ -51,13 +52,31 @@ broker:
   python: null               # interpreter for that worker (default: .extra-runtime/bin/python, else Hermes's)
 ```
 
+The worker runs as `python -I -c <bootstrap> <plugin dir> providers.<module> --worker`: isolated mode ignores
+`PYTHONPATH`/`PYTHON*`, the user site and the working directory, so only this plugin's own `providers/` package
+is imported. The directly launched pid is recorded in Hermes' spawn ledger (purpose
+`compute-rentals-worker`) and is killed and reaped on timeout. With a non-exec broker prefix,
+this pid is the wrapper: use a wrapper that execs the worker or manages its own descendants.
+The collector closes its pipes without waiting for wrapper descendants to exit.
+
 Unknown top-level keys are kept, so an extra provider can read its own section through
 `providers.config.load_config()`. An invalid file raises an error naming the bad key.
 
 ## Extra (private) providers
 
-Every `*.py` in `extra_providers_dir` is loaded as a submodule of this plugin's `providers` package.
-Files starting with `_` or `test_` are skipped. A module defines:
+Every file named in `extra_providers` (with its SHA-256) inside `extra_providers_dir` is loaded as a
+submodule of this plugin's `providers` package. **Nothing else in that directory runs**: an unpinned
+`*.py` is logged and skipped, a symlink or a file whose digest differs is refused before any of its
+code executes, and the verified bytes are the ones executed. Extra providers are code outside the
+reviewed plugin bytes: the pins in the config file are your attestation, so keep that file owner-writable only.
+Re-pin after every edit (`sha256sum my_cluster.py`). Names starting with `_` or `test_` are refused.
+
+```yaml
+extra_providers:
+  my_cluster.py: 3b1f...64 hex characters...
+```
+
+A module defines:
 
 ```python
 from .common import result          # relative imports resolve inside the plugin's providers package

@@ -98,6 +98,10 @@ The same rule for worktrees made by Claude Code or Codex sessions (and their sub
   that are clean, have no live process cwd inside, and are merged: HEAD is an ancestor of `origin/<default>` after a
   fetch, or a merged GitHub PR (`gh pr list --head <branch> --state merged`) has exactly HEAD as its head (squash
   merges, auto-deleted branches). The branch is kept. Unmerged, dirty or busy trees are left to the backstop GC.
+  Agent teardown uses the same conservative ignored-data/complex-file scan and documented disposable-cache
+  exception as card teardown: ordinary ignored notes/data and an unreadable scan preserve the tree. Before
+  considering removal, the marker path must match Git's worktree backlink and the tree's forward gitdir pointer
+  must match the marker's gitdir; missing or mismatched Git identity preserves the tree.
 
 **A tree nobody has worked in yet is not "merged".** A tree made a minute ago from `origin/main` is clean and its
 HEAD is an ancestor of the default branch, so the merge test alone passes it; on 2026-11-18 a session prepared two
@@ -143,7 +147,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 93 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 109 tests (the process-visibility test skips when cwd scans are unavailable) using disposable Git repos and boards, including agent ignored-data preservation, marker backlink/forward identity checks, a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 

@@ -473,6 +473,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
                 card['board'] = slug
             if pair[1] and pair[1].get('configured') is False:
                 pair[1]['reason'] = f"{slug}: {pair[1].get('reason', 'flow unavailable')}"
+            _sibling('metrics').qualify(pair[0].get('lanes', {}), slug)
             pairs.append(pair)
             receipt = receipt_by_board[slug]
             receipt['flow_available'] = (pair[1] or {}).get('configured') is not False

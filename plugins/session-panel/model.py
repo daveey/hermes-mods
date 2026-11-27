@@ -459,10 +459,10 @@ def wait_target(row, bundle, detail):
         cid = text(ref.get('id'))
         if not cid or cid == row.get('id'):
             continue
-        rec = obj(obj(bundle.get('cards')).get(cid))
+        linked = next((t for t in detail.get('link_tasks') or [] if isinstance(t, dict) and t.get('id') == cid), {})
+        rec = owned_card({**linked, **ref}, bundle)
         hydration = obj(rec.get('detail'))
         task = obj(hydration.get('task'))
-        linked = next((t for t in detail.get('link_tasks') or [] if isinstance(t, dict) and t.get('id') == cid), {})
         dep = {**linked, **task, **ref}
         if not dep.get('title'):
             continue
@@ -471,16 +471,19 @@ def wait_target(row, bundle, detail):
         dep['gateway'] = (dep.get('home_gateway') or dep.get('gateway') or
                           (owner if isinstance(owner, str) else None) or
                           (bundle.get('gateway') if hydration.get('source') == 'live' else None))
-        dep['profile'] = dep.get('profile') or bundle.get('profile')
+        dep['profile'] = dep.get('profile') or rec.get('profile') or row.get('profile') or bundle.get('profile')
         if dep.get('gateway') and dep.get('profile'):
             return dep
     return None
 
 
-def wait_parents(dep, bundle):
+def wait_parents(dep, bundle, *, primary=True):
     """Hydrated next hops shared by the wait label and outline; no source reads."""
-    hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
-    if text(obj(dep.get('wait')).get('waiting_on')):
+    # Reducer rows already crossed the listed-coordinate boundary. Rechecking
+    # their presentation defaults would discard accepted legacy dependencies.
+    hydration = obj(dep['_accepted_detail'] if '_accepted_detail' in dep else
+                    owned_card(dep, bundle).get('detail'))
+    if primary and text(obj(dep.get('wait')).get('waiting_on')):
         primary = wait_target(dep, bundle, hydration)
         return [primary] if primary else []
     parents = obj(hydration.get('links')).get('parents') or []
@@ -490,7 +493,7 @@ def wait_parents(dep, bundle):
     linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
     result = []
     for pid in parents:
-        rec = obj(obj(bundle.get('cards')).get(pid))
+        rec = owned_card({'id': pid, **obj(linked.get(pid))}, bundle)
         detail = obj(rec.get('detail'))
         task = {**obj(linked.get(pid)), **obj(detail.get('task'))}
         if not task.get('title') or task.get('status') in TERMINAL:
@@ -500,7 +503,7 @@ def wait_parents(dep, bundle):
                     gateway=task.get('home_gateway') or task.get('gateway') or
                     (owner if isinstance(owner, str) else None) or
                     (bundle.get('gateway') if detail.get('source') == 'live' else None),
-                    profile=task.get('profile') or dep.get('profile'))
+                    profile=task.get('profile') or rec.get('profile') or dep.get('profile'))
         if task.get('gateway') and task.get('profile'):
             result.append(task)
     return sorted(result, key=key)
@@ -548,12 +551,18 @@ def owned_card(row, bundle):
     return rec
 
 
+def card_events(row, bundle):
+    """Listed/accepted history survives presentation-only serving defaults."""
+    if 'events' in row:
+        return row['events'] or []
+    return obj(owned_card(row, bundle).get('detail')).get('events') or []
+
+
 def wait_reason(row, bundle):
     """Only the current wait's owner text, never an older ask on running work."""
     if row.get('status') not in ('scheduled', 'blocked', 'triage', 'todo'):
         return ''
-    detail = obj(owned_card(row, bundle).get('detail'))
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         kind, payload = event.get('kind'), obj(event.get('payload'))
@@ -581,10 +590,9 @@ def agent_hold(row, bundle):
     """Administrative custody, not a human ask or permission to resume execution."""
     if row.get('status') not in ('triage', 'blocked') or row.get('stale') or human_owned(row):
         return False
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
     if row.get('status') == 'triage':
         return True
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         if event.get('kind') in ('decision_retained', 'spend_budget_triaged', 'decision_requested'):
@@ -631,12 +639,10 @@ def _legacy_human_owned(row):
 
 def triage_clock(row, bundle):
     """Use core's lifecycle policy, including detached local/replica evidence."""
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
-    if 'events' in detail:
-        task = obj(detail.get('task'))
-        return {**row, 'events': detail['events'],
-                **({'triage_entered_at': task['triage_entered_at']} if 'triage_entered_at' in task else {})}
-    return row
+    detail = obj(owned_card(row, bundle).get('detail'))
+    task = obj(detail.get('task'))
+    return {**row, **({'events': detail['events']} if 'events' in detail else {}),
+            **({'triage_entered_at': task['triage_entered_at']} if 'triage_entered_at' in task else {})}
 
 
 def triage_entry(row, bundle):
@@ -687,11 +693,10 @@ def triage_clocks(bundle):
         if isinstance(raw, dict) and raw.get('id'):
             row = serving_row(raw, bundle)
             if key(row) not in needs_you and pending(shown.get(key(row))):
-                clocks.append(triage_clock(row, bundle))
+                clocks.append(serving_row(triage_clock(raw, bundle), bundle))
     for group in groups.values():
         if group.get('status') == 'triage' and pending(group):
-            clocks.append(triage_clock({**group, **obj(obj(obj(obj(bundle.get('cards')).get(group.get('id'))).get(
-                'detail')).get('task'))}, bundle))
+            clocks.append(triage_clock(group, bundle))
     return [(entered, at) for row in clocks if (entered := triage_entry(row, {})) is not None
             if (at := next_transition(row, now=entered)) is not None]
 
@@ -708,8 +713,7 @@ def triage_label(row, bundle, now, *, wire=False):
 
 
 def held_cause(row, bundle):
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         payload = obj(event.get('payload'))
@@ -738,9 +742,8 @@ def spend_review(row, bundle):
     `reviewing` while the reviewer judges the stop; `escalated` once it handed the stop to the owner. A later
     owner decision (`decision_retained`, ...) ends it. A routing notice after a queued or running review means the
     reviewer was turned off and the stop went to its usual owner: no review then."""
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
     routed = False
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         kind = event.get('kind')
@@ -786,7 +789,7 @@ def agent_hold_text(row, bundle):
         return 'waiting on ' + flat(wait['waiting_on']) + ' · next: ' + flat(wait['next_action'])
     authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
     if authority.get('id'):
-        task = obj(obj(obj(obj(bundle.get('cards')).get(authority['id'])).get('detail')).get('task'))
+        task = obj(obj(owned_card(authority, bundle).get('detail')).get('task'))
         name = clean(task.get('title')) or authority['id']
         status = task.get('status') or authority.get('status') or 'status unknown'
         return f'waiting on the release-authority agent: {name} ({status})'
@@ -996,6 +999,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     rows_by_key = {}
     diagnostic_rows = {}
     dependency_prefixes = {}
+    human_dependency_waits = {}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
     # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
@@ -1013,7 +1017,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         diagnostic_row = dict(row)
         detail = obj(rec.get('detail'))
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
-        row = {**obj(detail.get('task')), **row}
+        # Carry only the already owner-checked history. Serving defaults must not
+        # cause a second lookup to reject compatible legacy listed coordinates.
+        row = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}),
+               **row, '_accepted_detail': detail}
         if row.get('status') in ('running', 'review') and not row.get('run_model'):
             row['run_model'] = route_model(row, detail)
         k = key(row)
@@ -1042,7 +1049,27 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 dependency = leaf
         dependency_text = ''
         blocker = dependency or row
-        why = wait_reason(blocker, bundle)
+        # A parent's human ask belongs only to its own needs-you row. Its
+        # block/event reason often repeats the imperative verbatim; do not copy
+        # that into a dependent's summary, folded details or wire templates.
+        dependency_human = bool(dependency and (human_owned(blocker) or live_request(blocker)))
+        blocker_requests = [r for r in requests if dependency and
+                            any(_matches(blocker, a, same_gateway) for a in _aliases(r))]
+        dependency_check = dependency_human and (live_request(blocker) or not blocker_requests)
+        # Diagnostics describe all direct parents, not only the selected wait
+        # leaf. Keep their operational triggers while masking each human ask.
+        human_waits = []
+        for parent in wait_parents(row, bundle, primary=False):
+            if not (human_owned(parent) or live_request(parent)):
+                continue
+            matched = [r for r in requests if any(_matches(parent, a, same_gateway) for a in _aliases(r))]
+            check = live_request(parent) or not matched
+            title = clean(parent['title'])[:WAIT_MAX]
+            label = 'your check' if check else text(parent.get('status'))
+            human_waits.append((parent, f'waiting on: {title} ({label})'))
+        if human_waits:
+            human_dependency_waits[k] = human_waits
+        why = '' if dependency_human else wait_reason(blocker, bundle)
         if why:
             v['details'].append('Blocking reason: ' + why)
             why = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', why))
@@ -1067,10 +1094,15 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             # The awaited card is often not this chat's own (a worker made it), so it has no row of its
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
-            dep_label = triage_label(dependency, bundle, now, wire=wire) if dep_status == 'triage' else dep_status
+            dep_label = ('your check' if dependency_check else
+                         triage_label(dependency, bundle, now, wire=wire) if dep_status == 'triage' else dep_status)
             dep_state = f' ({dep_label})' if dep_label else ''
             dependency_prefix = f'waiting on: {title}{dep_state}{location}'
             dependency_prefixes[k] = (key(dependency), dependency_prefix)
+            if dependency_human:
+                waits = human_dependency_waits.setdefault(k, [])
+                if not any(key(parent) == key(dependency) for parent, _ in waits):
+                    waits.append((dependency, dependency_prefix))
             dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
@@ -1173,8 +1205,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             on = dependency_text + ' · ' + blocker_wait['text']
         elif dependency and dependency.get('status') in ('running', 'review') and not dependency.get('stale'):
             v['wait_kind'] = 'card'
-        elif dependency and live_request(blocker):
-            on = dependency_text + " · waiting on you to answer the parent's current request"
+        elif dependency_check:
+            on = dependency_text
         elif not v.get('wait_kind') and agent_hold(blocker, bundle):
             v['wait_kind'] = 'agent'
             actor = agent_hold_text(blocker, bundle)
@@ -1377,7 +1409,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                                 successors=lambda row: wait_parents(row, bundle),
                                 terminal=TERMINAL, prefixes=dependency_prefixes)
     for group in groups:
-        card = {**group, **obj(obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task'))}
+        detail = obj(owned_card(group, bundle).get('detail'))
+        card = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}), **group}
         matches = [r for r in requests if any(_matches(card, a, same_gateway) for a in _aliases(r))]
         # Canonical retirement outranks a preserved board human_request, just as
         # for ordinary rows. Groups must never revive dismissed attention.
@@ -1410,7 +1443,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if view.get('kind') == 'card':
             source_row = diagnostic_rows.get(view['key'], view)
             _actionability.present(view, source_row, obj(obj(bundle.get('cards')).get(view['id'])),
-                                   now=now, terminal=TERMINAL, serving=same_gateway)
+                                   now=now, terminal=TERMINAL, serving=same_gateway,
+                                   human_dependency=human_dependency_waits.get(view['key']))
     # Open session names the card's own chat; the chat this panel already shows (any compression ancestor) is not one.
     here = {str(s) for s in [bundle.get('session'), *(bundle.get('lineage') or [])] if s}
     for view in [v for values in sections.values() for v in values] + groups:

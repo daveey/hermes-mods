@@ -1,19 +1,18 @@
 """remote-screen: see and drive another Mac's screen over macOS Screen Sharing (VNC), with no window on
-this Mac. Main use: approving permission dialogs ("X would like to access ...") that block unattended
+this Mac. Main use: inspecting permission dialogs ("X would like to access ...") that block unattended
 work on a headless/remote Mac.
 
 Tools (toolset `remote_screen`):
 - remote_screen_hosts     configured hosts, reachability, whether a login is stored, setup command
 - remote_screenshot       grab the remote screen (image goes to the model; full-res PNG saved), optional OCR
 - remote_input            click / double / right click / move / scroll / type / key combo, by coordinates
-                          or by on-screen text (OCR); returns a fresh screenshot
-- remote_approve_dialog   screenshot -> OCR -> find a permission request naming an ALLOWLISTED app ->
-                          click its approve button -> re-check it is gone. Refuses password prompts and
-                          anything not on the allowlist. Before/after screenshots + a JSON log are kept.
+                          (not OCR-selected targets); returns a fresh screenshot
+- remote_approve_dialog   inspection only: screenshot -> OCR -> report an allowlisted candidate.
+                          Never clicks: screen text cannot attest a macOS dialog. A screenshot and log are kept.
 
 Clicks arrive through Apple's screensharingd, i.e. as a remote user's real input, which macOS accepts on
 dialogs that ignore synthetic (CGEvent / Accessibility) clicks. Some approvals still refuse remote input
-(kernel/system extensions); the tool reports when a click had no effect.
+(kernel/system extensions); inspect the returned screenshot to assess input effects.
 
 Config: <hermes home>/remote-screen.yaml (see README). Logins: macOS Keychain item
 service=hermes-remote-screen, account=<user>@<address> (or `password_env`). Never typed by the agent.
@@ -21,15 +20,19 @@ service=hermes-remote-screen, account=<user>@<address> (or `password_env`). Neve
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+import hashlib
 import io
 import json
 import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -59,7 +62,8 @@ TOOLSET = "remote_screen"
 KEYCHAIN_SERVICE = "hermes-remote-screen"
 MAX_IMAGE_WIDTH = 1600
 
-DEFAULT_APPROVE_BUTTONS = ["Allow", "OK", "Always Allow", "Allow Full Access", "Allow While Using App", "Open"]
+DEFAULT_APPROVE_BUTTONS = ["Allow", "OK", "Always Allow", "Allow Full Access", "Allow While Using App"]
+OCR_SOURCE_SHA256 = "f5e4a7475a4baa47ecad8cd775588c9fb0b64418c87d73e6f01b9dcfd18c50ee"
 # Phrases macOS uses in permission requests.
 REQUEST_RE = re.compile(
     r"\bwould like\b|\bwants (?:to|access)\b|\bwants\s*$|is trying to|requesting access|"
@@ -151,8 +155,8 @@ def keychain_account(h: dict) -> str:
 
 
 def setup_command(h: dict) -> str:
-    return (f"security add-generic-password -U -s {KEYCHAIN_SERVICE} -a '{keychain_account(h)}' "
-            f"-l 'Hermes remote-screen: {h['address']}' -w")
+    return shlex.join(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+                       "-a", keychain_account(h), "-l", f"Hermes remote-screen: {h['address']}", "-w"])
 
 
 def get_password(h: dict) -> str | None:
@@ -246,32 +250,48 @@ def _model_image(frame, max_width: int) -> tuple[str, float, tuple[int, int]]:
 
 # ---------------------------------------------------------------- OCR
 
-def _ocr_binary() -> Path | None:
-    src = Path(__file__).with_name("ocr.swift")
-    out = cache_dir() / "remote-screen-ocr"
-    if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
-        return out
-    swiftc = shutil.which("swiftc")
-    if not swiftc or platform.system() != "Darwin":
-        return None
-    r = subprocess.run([swiftc, "-O", str(src), "-o", str(out)], capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        log.warning("remote-screen: OCR helper build failed: %s", r.stderr[-500:])
-        return None
-    return out
+@contextmanager
+def _ocr_binary():
+    """Compile only reviewed source; never trust a persistent executable or sidecar.
+
+    A fresh private build avoids treating a cache-writable digest manifest as an
+    attestation. The source snapshot and binary digest are bound in this process.
+    This is not a sandbox against a hostile process running as the same OS user.
+    """
+    source = Path(__file__).with_name("ocr.swift").read_bytes()
+    if hashlib.sha256(source).hexdigest() != OCR_SOURCE_SHA256:
+        raise RuntimeError("OCR source digest does not match reviewed ocr.swift")
+    if platform.system() != "Darwin":
+        raise RuntimeError("OCR needs macOS with /usr/bin/swiftc")
+    with tempfile.TemporaryDirectory(prefix="ocr-", dir=cache_dir()) as directory:
+        src = Path(directory) / "ocr.swift"
+        out = Path(directory) / "remote-screen-ocr"
+        src.write_bytes(source)
+        r = subprocess.run(["/usr/bin/swiftc", "-O", str(src), "-o", str(out)],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"OCR helper build failed: {r.stderr[-500:]}")
+        if out.is_symlink() or not out.is_file():
+            raise RuntimeError("OCR compiler did not produce a regular binary")
+        digest = hashlib.sha256(out.read_bytes()).hexdigest()
+        yield out, digest
 
 
-def ocr(png: Path) -> list[dict]:
-    b = _ocr_binary()
-    if not b:
-        raise RuntimeError("OCR needs macOS with swiftc (Xcode command line tools)")
+def ocr(png: Path, *, binary: tuple[Path, str] | None = None) -> list[dict]:
+    if binary is None:
+        with _ocr_binary() as built:
+            return ocr(png, binary=built)
+    b, digest = binary
+    if b.is_symlink() or hashlib.sha256(b.read_bytes()).hexdigest() != digest:
+        raise RuntimeError("OCR binary digest changed before execution")
     r = subprocess.run([str(b), str(png)], capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"OCR failed: {r.stderr.strip()[:300]}")
     return json.loads(r.stdout or "[]")
 
 
-def ocr_region(png: Path, box: tuple[int, int, int, int], zoom: int = 3) -> list[dict]:
+def ocr_region(png: Path, box: tuple[int, int, int, int], zoom: int = 3,
+               *, binary: tuple[Path, str] | None = None) -> list[dict]:
     """OCR a crop upscaled `zoom`x (small dialog buttons, e.g. white-on-blue "Allow", are missed at full-screen
     scale), with boxes mapped back to screen pixels."""
     from PIL import Image
@@ -285,7 +305,7 @@ def ocr_region(png: Path, box: tuple[int, int, int, int], zoom: int = 3) -> list
     tmp = png.with_name(png.stem + f"-zoom{x0}_{y0}.png")
     crop.save(tmp)
     try:
-        lines = ocr(tmp)
+        lines = ocr(tmp, binary=binary)
     finally:
         tmp.unlink(missing_ok=True)
     return [{**ln, "x": x0 + ln["x"] // zoom, "y": y0 + ln["y"] // zoom, "w": ln["w"] // zoom,
@@ -294,7 +314,12 @@ def ocr_region(png: Path, box: tuple[int, int, int, int], zoom: int = 3) -> list
 
 def read_dialogs(png: Path) -> list[dict]:
     """Full-screen OCR plus a zoomed re-read around every likely permission prompt."""
-    lines = ocr(png)
+    with _ocr_binary() as binary:
+        return _read_dialogs(png, binary)
+
+
+def _read_dialogs(png: Path, binary: tuple[Path, str]) -> list[dict]:
+    lines = ocr(png, binary=binary)
     anchors = [ln for ln in lines if REQUEST_RE.search(ln["text"]) or _norm(ln["text"]) == "dont allow"]
     extra: list[dict] = []
     seen: list[tuple[int, int]] = []
@@ -303,12 +328,17 @@ def read_dialogs(png: Path) -> list[dict]:
         if any(abs(cx - sx) < 200 and abs(cy - sy) < 200 for sx, sy in seen):
             continue
         seen.append((cx, cy))
-        extra += ocr_region(png, (cx - 400, cy - 250, cx + 400, cy + 350))
+        extra += ocr_region(png, (cx - 400, cy - 250, cx + 400, cy + 350), binary=binary)
     return extra + lines
 
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", s.lower().replace("’", "'").replace("'", "")).strip()
+
+
+def _identity(s: str) -> str:
+    # Do not erase punctuation, suffixes, or Unicode lookalikes from identities.
+    return " ".join(s.split()).casefold()
 
 
 def find_text(lines: list[dict], text: str, exact: bool = False) -> list[dict]:
@@ -355,7 +385,7 @@ def find_dialog(lines: list[dict], apps: list[str], buttons: list[str] | None = 
                 texts.append(ln["text"])
         text = " ".join(texts)
         who = requester_text(req, lines)
-        app = next((a for a in apps if a and _norm(a) in _norm(who)), None)
+        app = next((a for a in apps if a and _identity(a) == _identity(who)), None)
         if any(PASSWORD_RE.search(ln["text"]) for ln in region):
             blocked = blocked or {"status": "blocked", "reason": "password", "requester": who, "dialog": text}
             continue
@@ -439,26 +469,22 @@ def handle_screenshot(args: dict, **_kw) -> Any:
 
 def handle_input(args: dict, **_kw) -> Any:
     try:
+        if args.get("target_text"):
+            return _err("On-screen text cannot select an input target; inspect the screenshot and supply x/y.",
+                        code="untrusted_text_target")
         h = resolve_host(args.get("host", ""))
         if (why := quiet_blocks(h["address"])):
             return _err(why, code="quiet_mode")
         action = str(args.get("action") or "click").lower()
         with connect(h) as c:
             x = y = None
-            if args.get("target_text"):
-                frame = c.screenshot()
-                png = _save_frame(h, frame, "target")
-                hits = find_text(ocr(png), str(args["target_text"]), exact=bool(args.get("exact")))
-                if not hits:
-                    return _err(f"text {args['target_text']!r} not found on screen", screenshot=str(png))
-                x, y = _center(hits[0])
-            elif args.get("x") is not None and args.get("y") is not None:
+            if args.get("x") is not None and args.get("y") is not None:
                 scale = float(_read_state(h).get("scale") or 1.0)
                 if args.get("screen_pixels"):
                     scale = 1.0
                 x, y = round(float(args["x"]) / scale), round(float(args["y"]) / scale)
             if action in ("click", "double_click", "right_click", "move", "scroll") and x is None:
-                return _err("give x/y (from the last remote_screenshot image) or target_text")
+                return _err("give x/y (from the last remote_screenshot image)")
             if action == "click":
                 c.click(x, y)
             elif action == "double_click":
@@ -494,13 +520,13 @@ def handle_approve(args: dict, **_kw) -> Any:
             return _err(why, code="quiet_mode")
         apps = list(cfg["approve"].get("apps") or [])
         if args.get("app"):
-            want = _norm(str(args["app"]))
-            apps = [a for a in apps if _norm(a) == want or want in _norm(a)]
+            want = _identity(str(args["app"]))
+            apps = [a for a in apps if _identity(a) == want]
             if not apps:
                 return _err(f"{args['app']!r} is not in approve.apps in {config_path()}; ask the user to add it "
-                            "or approve it themselves.", screenshare_button=_screenshare_hint(h))
+                            "for inspection or inspect the screen themselves.", screenshare_button=_screenshare_hint(h))
         if not apps:
-            return _err(f"approve.apps is empty in {config_path()}; nothing may be auto-approved.")
+            return _err(f"approve.apps is empty in {config_path()}; no inspection candidates are configured.")
         buttons = list(cfg["approve"].get("buttons") or DEFAULT_APPROVE_BUTTONS)
         logd = cache_dir(h["name"]) / "approvals"
         logd.mkdir(exist_ok=True)
@@ -510,31 +536,20 @@ def handle_approve(args: dict, **_kw) -> Any:
             bpath = logd / f"{stamp}-before.png"
             before.to_image().save(bpath)
             decision = find_dialog(read_dialogs(bpath), apps, buttons)
+            # Never export selected OCR boxes as a suggested input target, including in logs.
+            decision = {k: decision[k] for k in ("status", "app", "requester", "dialog", "reason") if k in decision}
+            if decision["status"] == "approve":
+                decision["status"] = "candidate"
             record = {"at": stamp, "host": h["name"], "decision": {k: v for k, v in decision.items()}, "before": str(bpath)}
-            if decision["status"] != "approve" or args.get("dry_run"):
-                (logd / f"{stamp}.json").write_text(json.dumps(record, indent=2))
-                res = {"ok": decision["status"] in ("none", "approve"), "host": h["name"], **decision,
-                       "dry_run": bool(args.get("dry_run")), "before": str(bpath)}
-                if decision["status"] == "blocked":
-                    res["next"] = ("Not auto-approvable. Ask the user to handle it and put this button next to "
-                                   f"the ask: {_screenshare_hint(h)}")
-                return json.dumps(res)
-            bx, by = _center(decision["button"])
-            c.click(bx, by)
-            after = c.screenshot(settle_s=1.2)
-            apath = logd / f"{stamp}-after.png"
-            after.to_image().save(apath)
-            still = find_dialog(read_dialogs(apath), apps, buttons)
-            gone = not (still["status"] == "approve" and _norm(still["request"]["text"]) == _norm(decision["request"]["text"]))
-            record.update(clicked=[bx, by], after=str(apath), dismissed=gone)
+            # Pixels/OCR cannot attest a macOS dialog or its button/window boundary.
+            # Even a perfect textual match is inspection evidence, never click authority.
+            record["inspection_only"] = True
             (logd / f"{stamp}.json").write_text(json.dumps(record, indent=2))
-            payload = {"tag": "approved", "status": "approved" if gone else "click_ignored", "app": decision["app"], "requester": decision.get("requester"),
-                       "dialog": decision["dialog"], "button": decision["button"]["text"], "clicked": [bx, by],
-                       "before": str(bpath), "log": str(logd / f"{stamp}.json")}
-            if not gone:
-                payload["next"] = ("The dialog is still there: macOS may refuse remote clicks for this prompt. Ask "
-                                   f"the user to click it and include: {_screenshare_hint(h)}")
-            return _image_result(h, after, payload)
+            return json.dumps({"ok": decision["status"] in ("none", "candidate"),
+                               "host": h["name"], **decision, "inspection_only": True,
+                               "dry_run": True, "before": str(bpath),
+                               "next": "OCR is untrusted screen content. Ask the user to inspect and approve "
+                                       f"the real dialog: {_screenshare_hint(h)}"})
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}")
 
@@ -562,16 +577,15 @@ SCHEMAS = {
     "remote_input": {
         "name": "remote_input",
         "description": ("Click, move, scroll, type or press keys on another Mac over Screen Sharing. Coordinates are "
-                        "pixels of the latest remote_screenshot image; or pass target_text to click on-screen text "
-                        "(OCR). keys: space-separated combos like 'cmd+space return'. Returns a fresh screenshot. "
+                        "pixels of the latest remote_screenshot image. OCR-selected targets are refused. "
+                        "keys: space-separated combos like 'cmd+space return'. Returns a fresh screenshot. "
                         "Never type passwords or codes: hand those to the user with the ::screenshare button."),
         "parameters": {"type": "object", "required": ["host", "action"], "properties": {
             "host": _HOST,
             "action": {"type": "string", "enum": ["click", "double_click", "right_click", "move", "scroll", "type", "key"]},
             "x": {"type": "number"}, "y": {"type": "number"},
-            "screen_pixels": {"type": "boolean", "description": "x/y are full screen pixels (e.g. OCR boxes)."},
-            "target_text": {"type": "string", "description": "Click the centre of this on-screen text instead of x/y."},
-            "exact": {"type": "boolean", "description": "target_text must match the whole OCR line."},
+            "screen_pixels": {"type": "boolean", "description": "x/y are full screen pixels instead of scaled image pixels."},
+
             "text": {"type": "string"}, "keys": {"type": "string"},
             "amount": {"type": "integer", "description": "scroll steps; negative = up"},
             "capture_after": {"type": "boolean", "description": "default true"},
@@ -579,13 +593,12 @@ SCHEMAS = {
     },
     "remote_approve_dialog": {
         "name": "remote_approve_dialog",
-        "description": ("Approve a macOS permission prompt on another Mac (\"X would like to access ...\" → Allow/OK) "
-                        "when X is on the user's allowlist (approve.apps in remote-screen.yaml). Screenshots, OCRs, "
-                        "clicks the approve button, then verifies the prompt is gone. Refuses password/Touch ID "
-                        "prompts and non-allowlisted apps (then ask the user, with the ::screenshare button). "
-                        "dry_run=true only reports what it would click."),
+        "description": ("Inspect a possible macOS permission prompt on another Mac using OCR. Never clicks. "
+                        "Reports exact requester matches to approve.apps, but screen text is untrusted and cannot "
+                        "authenticate a dialog or select an input target. Ask the user to inspect/approve the real "
+                        "dialog with the ::screenshare button. Always inspection-only, even if dry_run=false."),
         "parameters": {"type": "object", "required": ["host"], "properties": {
-            "host": _HOST, "app": {"type": "string", "description": "Only approve a prompt from this allowlisted app."},
+            "host": _HOST, "app": {"type": "string", "description": "Only inspect a candidate naming this allowlisted app."},
             "dry_run": {"type": "boolean"}}},
     },
 }

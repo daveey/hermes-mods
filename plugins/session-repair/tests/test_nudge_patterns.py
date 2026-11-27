@@ -95,6 +95,34 @@ def test_quiet_exact_target_revalidation_uses_stored_outcome(env, monkeypatch):
     assert n.fresh(env.scan_mod, f)[0] is None
 
 
+def test_desktop_stop_is_not_a_quiet_chat_to_resume(env, monkeypatch):
+    assert quiet(env, monkeypatch)
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      ('quiet', 'user', '[Turn stopped by Desktop before it finished.]', env.now - 3650))
+    env.state.commit()
+    assert env.findings(rule='BS-quiet-chat') == []
+    # A late result cannot revoke the user's stop.
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      ('quiet', 'tool', 'late receipt', env.now - 3640))
+    env.state.commit()
+    assert env.findings(rule='BS-quiet-chat') == []
+    # An explicit later user instruction can open a new unresolved episode.
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      ('quiet', 'user', 'Reconcile the prior result without retrying', env.now - 3630))
+    env.state.commit()
+    assert len(env.findings(rule='BS-quiet-chat')) == 1
+
+
+def test_inactive_or_quoted_stop_does_not_hide_unfinished_work(env, monkeypatch):
+    assert quiet(env, monkeypatch)
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp,active) VALUES (?,?,?,?,?)',
+                      ('quiet', 'user', '[Turn stopped by Desktop before it finished.]', env.now - 3650, 0))
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      ('quiet', 'assistant', '[Turn stopped by Desktop before it finished.]', env.now - 3640))
+    env.state.commit()
+    assert len(env.findings(rule='BS-quiet-chat')) == 1
+
+
 def test_quiet_repair_chat_excluded(env, monkeypatch):
     assert not quiet(env, monkeypatch, 'repair')
 

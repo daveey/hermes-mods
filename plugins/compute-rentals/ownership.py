@@ -26,6 +26,23 @@ def validate_key(key):
     return key
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3 connection whose ``with`` block also closes it.
+
+    The stock ``with conn:`` only commits or rolls back; the connection (and its
+    registry.db file descriptor) then lives until the garbage collector finds it.
+    Every caller here is poll- or request-driven, so FDs piled up between cyclic
+    GC passes. Commit/rollback semantics are unchanged: they run first, and the
+    close happens even if they raise.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 class OwnershipStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -39,7 +56,9 @@ class OwnershipStore:
                 db.execute("ALTER TABLE bindings ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
 
     def connect(self, timeout=30):
-        return sqlite3.connect(self.path, timeout=timeout)
+        # Use as `with store.connect() as db:`; leaving the block commits or
+        # rolls back and then closes the connection.
+        return sqlite3.connect(self.path, timeout=timeout, factory=_ClosingConnection)
 
     def _values(self, key, gateway_id, profile, session_id):
         return (validate_key(key), *(identity_value(v) for v in (gateway_id, profile, session_id)))

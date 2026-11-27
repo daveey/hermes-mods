@@ -9,7 +9,7 @@ B. completing its own card (``kanban_complete`` tool, or ``hermes kanban complet
    unless it names a follow-up card
    (``t_xxxxxxxx``) that exists, is open (or already done), and was created by or is linked to this card.
 D. completing its own card while the body/comments name an origin chat (``origin ... @session:X``) that is not
-   linked to the card (chat link, notify subscription, or ``follow-through: SENT`` comment), so it never hears.
+   linked to the card (chat link, notify subscription, or authenticated origin receipt), so it never hears.
 F. (any session) ``hermes kanban edit <id> --body`` that adds acceptance-waiver text or drops an acceptance sentence,
    unless the new body cites ``user message <id>`` that David typed in THIS chat (state.db, compression lineage).
    Authority quoted from another chat, a card or a notice is refused (acceptance.py; t_7e2ee45c 2026-11-10).

@@ -23,7 +23,19 @@ Due records are written by a sweep in the hooks (at most once a minute) and by `
 [--home H] [--all-profiles]`. `python3 outcomes.py rollup [--days 7]` prints the per-skill table (uses, tick-offs,
 first-pass rate, mean fix rounds, correction rate) that the hermes-coach weekly KPI post includes.
 
+## Coach source boundary
+
+Coach helpers load only from the sibling `plugins/coach` tree next to this plugin's resolved source.
+`HOME` and `HERMES_HOME` select data locations, never executable coach code. Missing or broken sibling
+modules do not trigger a search of another installation: keyword detection retains its built-in regex and
+notice detection retains its built-in filters (plus any available sibling predicates). This closes the code
+source boundary; it does not make this advisory plugin a fail-closed conversation gate.
+
 ## Tests
+
+Run `python3 scripts/test-all --no-core --exact -k plugins/skill-outcomes` from the repo root.
+`tests/test_coach_source.py` covers all three environment-root execution paths with missing/broken sibling
+modules, and positive sibling loading with category-aware and legacy notice predicates.
 
 `tests/test_skill_outcomes.py`: one test per filling path (skill capture from `skill_view`, the transform's ask,
 tick-off present / absent / no Done means section, correction by keyword, by coach log event, no next message

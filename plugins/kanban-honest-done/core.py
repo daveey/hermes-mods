@@ -574,8 +574,8 @@ def _origin_receipt_context(task_id, board, owner):
 
 def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = None) -> Optional[str]:
     """Refusal when the card body/comments name an origin chat that will not hear this completion: no unreleased
-    ``task_chat_links`` row, no ``kanban_notify_subs`` subscription, and no ``follow-through: SENT`` comment naming
-    it. Fails open (None) on any board read error."""
+    ``task_chat_links`` row, ``kanban_notify_subs`` subscription, or authenticated
+    origin obligation receipt. SENT comments never count. Fails open on board read errors."""
     try:
         conn = ro_connect(board)
     except sqlite3.Error:
@@ -588,9 +588,8 @@ def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = N
             return None
         reached = _reached_origins(conn, task_id, board)
         owner = _created_on(conn, task_id)
-        for c in comments:
-            if REPORTED_RE.search(c) and not FAILED_SEND_RE.search(c):
-                reached.update(origin_refs(c.replace("@session:", "origin @session:")))
+        # Worker comments are assertions, not delivery authority. Only scoped
+        # links/subscriptions and authenticated ledger receipts can count.
         missing = [s for s in wanted if not _matches_origin(s, reached)]
     except sqlite3.Error:
         return None
@@ -758,12 +757,9 @@ def origin_refusal(task_id: str, sessions: list[str]) -> str:
         f"[kanban-honest-done] Refused: {task_id} names origin chat @session:{s} (body/comments), but that chat is "
         "not linked to this card, so it will never see that the card finished (only the linked chats are told). "
         "Before completing:\n"
-        "1) Send that chat the result yourself: cross_session action=send, target = the @session link from the "
-        "card body, message = what finished, the proof, and anything still open.\n"
-        f"2) Record it with kanban_comment on {task_id}: \"follow-through: SENT via cross_session to @session:{s} "
-        "at <time>; delivery verified|not verified\" (verified = the send returned delivered/replied). Then complete "
-        "again. \"not verified\" means it went out with no readback; a send that returned an error does not count.\n"
-        "3) If the send fails, use kanban_supervisor_request operator action=comment on the live owning "
+        "1) Repair the exact origin link/subscription or authenticated origin obligation through its owning agent. "
+        "A cross_session send or a `follow-through: SENT` comment is not authenticated delivery evidence for this gate.\n"
+        "2) Use kanban_supervisor_request operator action=comment on the live owning "
         "gateway's card to request an origin-link repair; do not invent SENT evidence. A terminated gateway may "
         "use the independently checked origin-chat-gone audit note offered below. Missing/stale evidence is "
         "unknown: refresh the normal replicas and retry, or route a repair to the owning agent. Use kanban_block "
@@ -822,7 +818,8 @@ _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}", "$HERMES_KANBAN_WOR
 
 
 def _is_own(ref: str, own: str) -> bool:
-    return ref == own or ref.strip("\"'") in _OWN_REFS
+    # Unknown expansion could resolve to our own card. Never evaluate it.
+    return ref == own or ref.strip("\"'") in _OWN_REFS or bool(re.search(r'[$`*?{\[\\]', ref))
 
 
 @lru_cache(maxsize=1)
@@ -842,14 +839,45 @@ def _segments(command: str) -> list[list[str]]:
     return _shell_commands().segments(command)
 
 
-def _opt(tokens: list[str], *names: str) -> Optional[str]:
-    for i, t in enumerate(tokens):
-        for n in names:
-            if t == n and i + 1 < len(tokens):
-                return tokens[i + 1]
-            if t.startswith(n + "="):
-                return t[len(n) + 1:]
-    return None
+# Static to keep hook startup free of argparse/core imports. Tests compare every
+# option string and its exact arity against core's real parser.
+_CLI_VALUES = {
+    'complete': frozenset({'--result', '--summary', '--metadata'}),
+    'request-review': frozenset({'--summary', '--reviewer', '--metadata'}),
+    'edit': frozenset({'--requires', '--title', '--body', '--class', '--frees',
+                      '--priority', '--priority-bump', '--result', '--summary', '--metadata',
+                      '--max-retries', '--goal-mode', '--review-required', '--goal-max-turns',
+                      '--max-runtime-seconds', '--session-id', '--completion-contract', '--reason'}),
+}
+_CLI_FLAGS = frozenset({'--force', '--help', '-h'})
+
+
+def _option_name(token: str, verb: str) -> Optional[str]:
+    options = _CLI_VALUES.get('complete' if verb == 'done' else verb, _CLI_VALUES['edit']) | _CLI_FLAGS
+    name = token.split('=', 1)[0]
+    if name in options:
+        return name
+    matches = [n for n in options if name.startswith('--') and n.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _opt(tokens: list[str], *names: str, verb: str = 'edit') -> Optional[str]:
+    # argparse store actions are last-wins, and -- ends option interpretation.
+    result = None
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == '--':
+            break
+        name = _option_name(token, verb)
+        if name and name not in _CLI_FLAGS:
+            value = token.split('=', 1)[1] if '=' in token else (tokens[i + 1] if i + 1 < len(tokens) else None)
+            if name in names:
+                result = value
+            i += 1 if '=' in token else 2
+        else:
+            i += 1
+    return result
 
 
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
@@ -878,39 +906,73 @@ def _verb_after(seg: list[str], i: int) -> Optional[tuple[str, list[str]]]:
     return None
 
 
-def _positional(args: list[str]) -> Optional[str]:
+def _positionals(args: list[str], verb: str = 'edit') -> list[str]:
+    """All task operands, including complete's nargs='+', not just the first."""
+    out = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a.startswith("--") and "=" not in a:
+        if a == "--":
+            out.extend(args[i + 1:])
+            break
+        name = _option_name(a, verb)
+        if name and name not in _CLI_FLAGS and "=" not in a:
             i += 2
             continue
         if a.startswith("-"):
             i += 1
             continue
-        return a
-    return None
+        out.append(a)
+        i += 1
+    return out
+
+
+def _positional(args: list[str]) -> Optional[str]:
+    return next(iter(_positionals(args)), None)
+
+
+def _indirect_argv(seg: list[str]) -> bool:
+    # xargs can append ids or replace arbitrary placeholders anywhere in argv.
+    # Never infer its stdin/file contents or replacement string as literal ids.
+    return any(os.path.basename(token) in {"xargs", "parallel"} for token in seg)
 
 
 def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
     """Refusal for a worker shell command that edits its own card's title/body or completes it dishonestly."""
-    for seg in _segments(command or ""):
+    segments = _segments(command or "")
+    indirect = any(_indirect_argv(seg) for seg in segments)
+    for seg in segments:
         hit = _kanban_verb(seg)
         if not hit:
             continue
         verb, args = hit
-        target = _positional(args)
-        if not target or not _is_own(target, own):
+        targets = _positionals(args, verb)
+        if indirect and verb in {"edit", "complete", "done", "request-review"}:
+            return ("[kanban-honest-done] Refused: xargs/parallel supplies unresolved mutation operands. "
+                    "Use literal direct kanban commands so the own-card gates can check every target.")
+        own_targets = [target for target in targets if _is_own(target, own)]
+        if not own_targets:
             continue
-        if verb == "edit" and (_opt(args, "--title") is not None or _opt(args, "--body") is not None):
+        # The legacy lexer separates $(...) at '('. Its remaining segment
+        # cannot prove the mutation flags or handoff safe. Hold the operation
+        # instead of treating the missing tail as an empty, passing handoff.
+        if any(target.endswith('$') for target in own_targets) and verb in {"edit", "complete", "done", "request-review"}:
+            return ("[kanban-honest-done] Refused: unresolved substitution target. "
+                    "Use a literal card id and a complete command so the own-card gates can check it.")
+        if verb == "edit" and (_opt(args, "--title", verb=verb) is not None or _opt(args, "--body", verb=verb) is not None):
             return EDIT_REFUSAL
+        if verb in {"complete", "done", "request-review"} and any(
+                re.search(r'[$`]', _opt(args, option, verb=verb) or '')
+                for option in ("--summary", "--result", "--metadata")):
+            return ("[kanban-honest-done] Refused: unresolved handoff text. "
+                    "Use literal summary/result/metadata so completion evidence can be checked.")
         if verb in ("complete", "done"):
-            summary = _opt(args, "--summary") or _opt(args, "--result") or ""
-            why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata"))
+            summary = _opt(args, "--summary", verb=verb) or _opt(args, "--result", verb=verb) or ""
+            why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata", verb=verb))
             if why:
                 return why
         if verb == "request-review":
-            why = check_review(own, _opt(args, "--summary") or "", paths_fn(), metadata=_opt(args, "--metadata"))
+            why = check_review(own, _opt(args, "--summary", verb=verb) or "", paths_fn(), metadata=_opt(args, "--metadata", verb=verb))
             if why:
                 return why
     return None

@@ -20,6 +20,34 @@ CHATS = 64
 HOT = 8
 
 
+@pytest.mark.parametrize('state', ['pending', 'closed', 'stopped', 'unavailable'])
+def test_settle_local_between_acquisitions_classifies_deadline(monkeypatch, state):
+    """A completed capture can leave a new request owed at the 3s boundary."""
+    from types import SimpleNamespace
+    module = feedmod.Feed._source_module()
+    stamps = iter((100., 103.))
+    monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: next(stamps)))
+    stopped = threading.Event()
+    if state == 'stopped':
+        stopped.set()
+    token = object()
+    lane = SimpleNamespace(
+        step=lambda: None, service=lambda: None, lock=threading.RLock(),
+        acquiring={}, chats={'S': object()}, tokens={'S': token},
+        feed=SimpleNamespace(_watch_tokens={'S': token}, stopped=stopped),
+        _local_requested=True, closed=state == 'closed',
+        registration_attempt=SimpleNamespace(count=int(state == 'unavailable')))
+    if state == 'pending':
+        expected, message = TimeoutError, '^local source acquisition is still pending$'
+    elif state == 'unavailable':
+        expected, message = RuntimeError, '^local source registration unavailable; bounded retry is pending$'
+    else:
+        expected, message = RuntimeError, '^local source registration was cancelled or remains pending$'
+    with pytest.raises(expected, match=message):
+        module.SourceCoordinator._settle_local(lane, ['S'])
+    assert lane._local_requested, 'timeout must not consume the outstanding source request'
+
+
 def _remote(f, s, remote):
     return next(row for row in f.bundles[s]['bundle']['tasks'] if row['id'] == remote)
 

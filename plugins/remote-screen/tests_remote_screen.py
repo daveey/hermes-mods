@@ -154,14 +154,14 @@ def L(text, x, y, w=100, h=16):
     return {"text": text, "x": x, "y": y, "w": w, "h": h, "conf": 1.0}
 
 
-APPS = ["Hermes Python", "ghostty"]
+APPS = ["Hermes Python.app", "Hermes Python", "ghostty"]
 TCC = [L("“Hermes Python.app” would like to access", 600, 300, 300), L("your Photos.", 650, 320),
        L("Don't Allow", 560, 420), L("Allow", 760, 420, 60), L("Allow", 100, 900, 50)]  # far-away Allow ignored
 
 
 def test_find_dialog_approves_allowlisted():
     d = rs.find_dialog(TCC, APPS)
-    assert d["status"] == "approve" and d["app"] == "Hermes Python"
+    assert d["status"] == "approve" and d["app"] == "Hermes Python.app"
     assert (d["button"]["x"], d["button"]["y"]) == (760, 420)
 
 
@@ -230,5 +230,5 @@ def test_request_phrase_wrapped_mid_sentence():
     # Real macOS 26 Files & Folders prompt, as OCR'd: the phrase wraps after "would like".
     lines = [L("\"Hermes TCC Probe\" would like", 1610, 378, 180, 14), L("to access files in your Desktop", 1612, 396, 180, 14),
              L("folder.", 1610, 412, 40, 12), L("Don't Allow", 1626, 450, 70, 12), L("Allow", 1762, 450, 34, 12)]
-    d = rs.find_dialog(lines, ["Hermes"])
+    d = rs.find_dialog(lines, ["Hermes TCC Probe"])
     assert d["status"] == "approve" and d["requester"] == "Hermes TCC Probe" and d["button"]["x"] == 1762

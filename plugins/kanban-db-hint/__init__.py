@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,7 +25,14 @@ MARK = "kanban-db-hint:"
 # Core's KanbanDbCorruptError, and PR daveey/hermes#125's KanbanDbUnreliableViewError (two variants).
 PATTERNS = re.compile(r"Refusing to open corrupt kanban DB|attached to a deleted WAL/SHM generation"
                       r"|integrity probe disagrees with an independent process|KanbanDbUnreliableViewError")
-DB_PATH = re.compile(r"kanban DB at (/\S+?\.db)\b")
+DB_PATH = re.compile(
+    r"^(?:Error: )?(?:kanban_[A-Za-z0-9_]+: )?"
+    r"Refusing to open corrupt kanban DB at (/[-A-Za-z0-9_./]+\.db)(?=:|$)"
+)
+ERROR_START = re.compile(
+    r"^(?:Error: )?(?:kanban_[A-Za-z0-9_]+: )?"
+    r"(?:Refusing to open corrupt kanban DB|kanban DB |KanbanDbUnreliableViewError\b)"
+)
 
 
 def _hermes_home() -> Path:
@@ -41,8 +49,8 @@ def owner_cards() -> list[str]:
 
 
 def check_command(db: str) -> str:
-    """A fresh-process, read-only check. No heredoc or inline script: those wait for approval."""
-    return f"sqlite3 -readonly {db} 'pragma quick_check'"
+    """Render a single path operand, never shell syntax from an error payload."""
+    return f"sqlite3 -readonly {shlex.quote(db)} 'pragma quick_check'"
 
 
 def hint_text(message: str) -> str:
@@ -53,7 +61,7 @@ def hint_text(message: str) -> str:
     owners = (f" The stale-view fix is owned by {', '.join(cards)} (check it with `hermes kanban show {cards[0]}` "
               "in the terminal): name that card in your reply rather than opening a new one." if cards else "")
     return (f"{MARK} this may be a stale view in THIS process, not a damaged board. "
-            f"1) Check from a fresh process: `{check_command(db)}`{where}. It is read-only and needs no approval. "
+            f"1) Check from a fresh process: `{check_command(db)}`{where}. Follow the active approval policy. "
             "2) If it prints ok, the board is fine: this backend holds an out-of-date view, so every kanban_* tool "
             "in this session fails until the backend restarts, kanban_create included. Don't call it corruption. "
             "`hermes kanban show/list` in the terminal runs in a fresh process and still works." + owners +
@@ -126,18 +134,22 @@ def _missing_card(tool_name: str, args: Any, result: str) -> Optional[str]:
 def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_) -> Optional[str]:
     if not isinstance(result, str) or MARK in result:
         return None
-    if not PATTERNS.search(result):
-        return _missing_card(tool_name, args, result)
     if not _is_kanban_tool(tool_name, args):
         return None
     try:
         data = json.loads(result)
     except (ValueError, TypeError):
         data = None
+        message = result.strip()
+    else:
+        # Successful card bodies/comments are untrusted data, not diagnostic authority.
+        message = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(message, str) or not ERROR_START.match(message) or not PATTERNS.search(message):
+        return _missing_card(tool_name, args, result)
     if isinstance(data, dict):
-        data["hint"] = hint_text(result)
+        data["hint"] = hint_text(message)
         return json.dumps(data, ensure_ascii=False)
-    return result + "\n\n" + hint_text(result)
+    return result + "\n\n" + hint_text(message)
 
 
 def register(ctx) -> None:

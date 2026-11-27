@@ -1477,6 +1477,27 @@ def healthy_live_producer(card: Card, park: dict, awaited: dict, live: dict, src
             and now <= due + 900)
 
 
+def bounded_rollout_observation(card: Card, park: dict, awaited: dict, live: dict, now: float) -> bool:
+    """Honor a short, unprobed rollout checkpoint; an opaque ID has no pollable completion.
+
+    This is not a healthy-producer receipt. Only an age-only deploy observation with
+    an explicit <=2h checkpoint is covered, never a URL/probe, overdue wake or failure.
+    """
+    payload = park['payload']
+    wake = _num(payload.get('wake_at'))
+    ref = str(awaited.get('ref') or '')
+    if not (card.status == 'scheduled' and awaited.get('kind') == 'deploy'
+            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', ref)
+            and not str(payload.get('wake_check') or '').strip()
+            and live.get('state') == 'not_resolvable' and not live.get('happened')
+            and wake is not None and park['at'] <= now < wake <= park['at'] + 7200):
+        return False
+    return card.conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND id>? AND created_at>=? AND created_at<=? "
+        "AND kind IN ('wake_check_broken','wake_check_lost','wake_check_stale','condition_met') LIMIT 1",
+        (card.id, park['id'], park['at'], now)).fetchone() is None
+
+
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
         return None
@@ -1510,6 +1531,8 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         live = {'state': producer, 'last_event_at': at, 'happened': False}
     elif kind in ('ci', 'deploy', 'external'):
         live = src.producer_state(kind, ref)
+    if bounded_rollout_observation(card, park, awaited, live, src.now):
+        return None
     if healthy_widened_ci_wait(card, park, live, src.now):
         return None
     if not live.get('happened') and healthy_live_producer(card, park, awaited, live, src, src.now):
@@ -1573,6 +1596,13 @@ def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Findin
                           "AND COALESCE(end_reason,'') NOT LIKE 'moved_to_gateway:%'" + source_filter, (sid,)).fetchone()
             last = c.execute('SELECT id,timestamp FROM messages WHERE session_id=? AND active=1 ORDER BY id DESC LIMIT 1', (sid,)).fetchone()
             if not s or s[0] == REPAIR_CHAT_TITLE or not last:
+                continue
+            # A deliberate Desktop stop is not permission for autonomous continuation.
+            # Check the latest active user turn even if a late tool/assistant row followed it.
+            stopped = c.execute(
+                "SELECT content = ? FROM messages WHERE session_id=? AND active=1 AND role='user' "
+                "ORDER BY id DESC LIMIT 1", ('[Turn stopped by Desktop before it finished.]', sid)).fetchone()
+            if stopped and stopped[0]:
                 continue
             age = src.now-last[1]
             if not QUIET_CHAT_S < age <= NOTICE_LOOKBACK_S or src.chat_obligations(sid):

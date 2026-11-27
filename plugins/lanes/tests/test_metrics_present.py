@@ -88,6 +88,41 @@ def test_payload_size_at_24_slots_typical_lanes_under_200kb():
     assert size < 200_000, size
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+def test_merge_present_unaligned_buckets_remain_unknown_in_both_orders(reverse):
+    metrics = load()
+    rows = []
+    for source, start, running in [('alpha-board', 100, 1), ('beta-board', 101, 3)]:
+        cells = [dict(cell(running, state='rejecting', rejected=2), t=start + i * 450)
+                 for i in range(2)]
+        row = snapshot(cells)['lanes']
+        row['work']['spend'] = dict(hour=1., day=2., week=3.)
+        metrics.qualify(row, source)
+        rows.append(row)
+    if reverse:
+        rows.reverse()
+    before = deepcopy(rows)
+    merged = metrics.merge(*rows)
+    out = metrics.present({'lanes': merged}, 8)['lanes']['work']
+    assert '_tick_sources' not in out
+    expected_source = 'beta-board' if reverse else 'alpha-board'
+    unaligned_source = 'alpha-board' if reverse else 'beta-board'
+    for index, bucket in enumerate(out['ticks']['cells']):
+        assert bucket['t'] == (101 if reverse else 100) + index * 450
+        assert bucket['state'] == 'unknown'
+        assert bucket['running'] is None and bucket['rejected'] is None
+        assert len(bucket['components']) == 2
+        parts = {part['source']: part for part in bucket['components']}
+        known = parts[expected_source]
+        assert known['running'] == (3 if reverse else 1)
+        assert known['state'] == 'rejecting' and known['rejected'] == 2
+        unknown = parts[unaligned_source]
+        assert unknown == dict(t=bucket['t'], source=unaligned_source, state='unknown',
+                               running=None, cap=None, rejected=None, reason='unaligned samples',
+                               visual=dict(height=1, opacity=1))
+    assert rows == before
+
+
 def test_partial_visual_has_visible_floor_and_bounded_ratio():
     cells = [cell(1, cap=100), cell(200, cap=100)]
     rendered = load().present(snapshot(cells), 0)['lanes']['work']['ticks']['cells']

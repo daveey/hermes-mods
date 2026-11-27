@@ -7,10 +7,10 @@ WINDOWS = {'1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800}
 
 
 def registry_slots(registry):
-    """Sum configured active, nonheld capacity; unset/unbounded is unknown.
+    """Shared-pool schedulable slots, excluding held/retired/pinned-only hosts.
 
-    A successfully fetched empty fleet has zero slots. Never substitute the
-    local dispatcher cap, live utilization, pickup policy or machine count.
+    Missing node capacity is excluded; unavailable registry evidence is unknown.
+    Never substitute the local cap, utilization, pickup policy or machine count.
     """
     if not isinstance(registry, dict) or not isinstance(registry.get('machines'), dict):
         return None
@@ -18,7 +18,11 @@ def registry_slots(registry):
     if any(not isinstance(m, dict) for m in machines):
         return None
     entries = [m for m in machines
-               if m.get('state') in (None, 'active') and not m.get('hold')]
+               if m.get('state') in (None, 'active') and not m.get('hold')
+               and not m.get('pinned_only')]
+    # Unknown-capacity nodes are not part of the finite schedulable pool.
+    # Malformed explicit capacities still invalidate the registry evidence.
+    entries = [m for m in entries if m.get('max_card_runs') is not None]
     if any(type(m.get('max_card_runs')) is not int or m['max_card_runs'] < 0 for m in entries):
         return None
     return sum(m['max_card_runs'] for m in entries)
@@ -81,6 +85,7 @@ def present(view, slots):
     view = deepcopy(view)
     view['fleet_slots'] = slots
     for row in view.get('lanes', {}).values():
+        row.pop('_tick_sources', None)
         ticks = row.get('ticks')
         if not isinstance(ticks, dict):
             continue
@@ -89,19 +94,27 @@ def present(view, slots):
         ticks.pop('previews', None)
         cells = ticks['cells']
         peak = max((c.get('running') or 0 for c in cells), default=0) or 1
-        def visual(cell, cap):
+        def visual(cell, cap, source_peak=None):
             cell = dict(cell)
             running = cell.get('running')
             if running is None:
                 cell.update(state='unknown', visual=dict(height=1, opacity=1))
                 return cell
-            scale = cap if cap is not None and cap > 0 else peak
+            scale = cap if cap is not None and cap > 0 else source_peak or peak
             ratio = min(1, running / scale)
             cell['visual'] = dict(height=(max(.15, ratio) if cell['state'] == 'partial' else
                                           .15 if cell['state'] == 'empty' else 1),
                                   opacity=.25 + .5 * ratio if cell['state'] == 'partial' else 1)
             return cell
+        source_peaks = {}
+        for cell in cells:
+            for comp in cell.get('components', []):
+                source_peaks[comp['source']] = max(source_peaks.get(comp['source'], 1), comp.get('running') or 0)
         ticks['cells'] = [visual(c, c.get('cap')) for c in cells]
+        for cell in ticks['cells']:
+            if cell.get('components'):
+                cell['components'] = [visual(c, c.get('cap'), source_peaks[c['source']])
+                                      for c in cell['components']]
     return view
 
 
@@ -143,6 +156,42 @@ def project(sample_db, usage_db, policy, *, window='24h', now=None):
             for name in policy.lanes}
 
 
+def qualify(rows, source):
+    """Attach board provenance before any fleet reduction (also for no-table boards)."""
+    for row in rows.values():
+        row['_tick_sources'] = [(source, row.get('ticks'))]
+
+
+def _sources(row, fallback):
+    return row.get('_tick_sources', [(fallback, row.get('ticks'))])
+
+
+def _source_envelope(sources):
+    available = [(name, ticks) for name, ticks in sources if ticks is not None]
+    if not available:
+        return None
+    ref = available[0][1]
+    cells = []
+    for i, cell in enumerate(ref['cells']):
+        components = []
+        for name, ticks in sources:
+            candidate = (ticks['cells'][i] if ticks is not None and
+                         ticks['window'] == ref['window'] and i < len(ticks['cells']) else None)
+            if candidate is None or candidate['t'] != cell['t']:
+                candidate = dict(t=cell['t'], state='unknown', running=None, cap=None,
+                                 rejected=None, reason='no samples' if ticks is None else 'unaligned samples')
+            else:
+                candidate = dict(candidate)
+                if candidate.get('running') is None:
+                    candidate['reason'] = 'no samples in this period'
+            components.append(dict(candidate, source=name))
+        # Board bucket peaks are independent observations, not simultaneous
+        # fleet occupancy. Never add them or use their sum for cap forecasts.
+        cells.append(dict(t=cell['t'], state='unknown', running=None, cap=None,
+                          rejected=None, components=components))
+    return dict(window=ref['window'], bucket_s=ref['bucket_s'], cap=None, cells=cells)
+
+
 def merge(first, second):
     """Independent boards add accounting; a missing observation never becomes zero."""
     out = {}
@@ -153,29 +202,6 @@ def merge(first, second):
             continue
         spending = (None if a.get('spend') is None or b.get('spend') is None else
                     {key: round(a['spend'][key] + b['spend'][key], 2) for key in ('hour', 'day', 'week')})
-        at, bt = a.get('ticks'), b.get('ticks')
-        series = None
-        if (at is not None and bt is not None and at['window'] == bt['window'] and
-                len(at['cells']) == len(bt['cells'])):
-            series = []
-            for x, y in zip(at['cells'], bt['cells']):
-                tick = dict(x)
-                if x['t'] != y['t'] or x['running'] is None or y['running'] is None:
-                    tick.update(state='unknown', running=None, rejected=None)
-                else:
-                    tick['running'] = x['running'] + y['running']
-                    tick['rejected'] = (None if x['rejected'] is None or y['rejected'] is None else
-                                        x['rejected'] + y['rejected'])
-                    cap = x['cap'] if x['cap'] == y['cap'] else None
-                    tick['cap'] = cap
-                    tick['state'] = ('rejecting' if 'rejecting' in (x['state'], y['state']) else
-                                     'full' if cap is not None and tick['running'] >= cap and tick['running'] else
-                                     'partial' if tick['running'] else 'empty')
-                    if tick['rejected'] is None:
-                        tick['rejection_unknown'] = True
-                series.append(tick)
-        envelope = (dict(window=at['window'], bucket_s=at['bucket_s'],
-                         cap=at['cap'] if at['cap'] == bt['cap'] else None, cells=series)
-                    if series is not None else None)
-        out[name] = dict(ticks=envelope, spend=spending)
+        sources = _sources(a, 'first board') + _sources(b, 'second board')
+        out[name] = dict(ticks=_source_envelope(sources), spend=spending, _tick_sources=sources)
     return out

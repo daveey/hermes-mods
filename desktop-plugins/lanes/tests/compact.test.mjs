@@ -153,7 +153,7 @@ test('far right 3% is infinity and writes null; releasing at the current cap wri
   try {
     await pointer(pane, slider, 'pointerdown', 0.99)
     assert.equal(slider.getAttribute('aria-valuenow'), '7')
-    assert.equal(slider.getAttribute('aria-valuetext'), 'no cap (∞)')
+    assert.match(slider.getAttribute('aria-valuetext'), /^no cap \(∞\) of \d+ shared-pool slots$/)
     assert.match(pane.container.querySelector('[data-caption]').textContent, /^cap ∞ would have turned cards away in 0 of 48/)
     await pointer(pane, slider, 'pointerup', 0.99)
     assert.deepEqual(t.writes, [['/v1/lanes/work', { max_workers: null }]])

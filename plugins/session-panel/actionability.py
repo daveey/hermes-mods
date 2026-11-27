@@ -3,7 +3,7 @@ import copy
 import math
 
 
-def present(view, row, record, *, now, terminal, serving):
+def present(view, row, record, *, now, terminal, serving, human_dependency=None):
     """Only append diagnostic fields; owner-qualified row coordinates stay authoritative."""
     if row.get('status') in terminal:
         view['actionability'] = {'version': 1, 'task_id': row.get('id'), 'action': 'no_open_action',
@@ -48,6 +48,33 @@ def present(view, row, record, *, now, terminal, serving):
         view['details'].append('Actionability: unavailable — evidence unknown; owner, next action, recovery trigger and deadline unavailable')
         return
     a = copy.deepcopy(a)
+    if human_dependency and a['action'] == 'satisfy_dependency':
+        # Source diagnosis can embed the parent's imperative in all three
+        # carriers. This is display-only: retain the contract, actor, restriction
+        # and evidence fields without changing the source snapshot.
+        changed = False
+        for dependency in a.get('dependencies') or []:
+            if not isinstance(dependency, dict):
+                continue
+            for parent, summary in human_dependency:
+                if (dependency.get('task_id') == parent['id'] and
+                        all(not dependency.get(c) or dependency[c] == parent.get(c)
+                            for c in ('gateway', 'profile', 'board'))):
+                    dependency['trigger'] = summary
+                    changed = True
+                    break
+        if changed:
+            summary = '; '.join(d['trigger'] for d in a['dependencies']
+                                if isinstance(d, dict) and isinstance(d.get('trigger'), str))
+        elif not a.get('dependencies'):
+            # Older snapshots can carry only the aggregate trigger.
+            summary = '; '.join(label for _, label in human_dependency)
+        else:
+            summary = None  # Explicit foreign coordinates are not this parent.
+        if summary is not None:
+            a['instruction'] = summary
+            if a.get('blocker'):
+                a['blocker']['trigger'] = summary
     if remote or row.get('stale') or row.get('partial_source_unknown'):
         a['evidence_state'] = 'unknown'
     view['actionability'] = a

@@ -11,6 +11,12 @@ only identity/user/port/hostname options are forwarded (never payload ProxyComma
 LocalCommand, log files or port forwards). Unreadable state and failed discovery log
 and fail open; the hooks never execute the supplied signal command.
 
+Option-shaped SSH destinations (including operands after `ssh --`) are refused
+before signal discovery. The inspection boundary also rejects them without spawning
+SSH, and valid destinations follow an explicit `--` in the inspection argv.
+`tests/test_ssh_destination.py` covers ProxyCommand, log/config options and the lone
+hyphen, plus ordinary host, user@host and IPv6 controls without opening a connection.
+
 `kill` (default, numeric and named selectors), `/bin/kill`, `sudo kill`, matching
 `pkill`/`killall`, inline `python[3] -c` calls to literal `os.kill`/`os.killpg`,
 and execute_code `os.kill`/`os.killpg` are checked. Signal 0 remains allowed.

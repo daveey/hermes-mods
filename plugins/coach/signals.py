@@ -2806,6 +2806,15 @@ def ssh_argv(cfg: dict) -> List[str]:
     return argv
 
 
+# Only a destination, never ssh options, URLs or shell syntax. Validate both components
+# so even a leading dash after user@ cannot be mistaken for a host option elsewhere.
+SSH_DESTINATION_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:@[A-Za-z0-9_][A-Za-z0-9_.-]*)?")
+
+
+def valid_ssh_destination(value: str) -> bool:
+    return isinstance(value, str) and SSH_DESTINATION_RE.fullmatch(value) is not None
+
+
 def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, now: Optional[float] = None,
             cfg: Optional[dict] = None) -> dict:
     """Mac/mini: ship new raw signals to the hub. The cursor only moves when the hub accepted them. Every pass sends
@@ -2813,13 +2822,15 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     its sweep flags a host whose forwarder went silent."""
     cur = load_cursor(home)
     sigs = collect(home, cur, host, now)
+    if not valid_ssh_destination(hub):
+        return {"ok": False, "sent": 0, "pending": len(sigs), "detail": "invalid ssh destination"}
     cfg = cfg if cfg is not None else config(home)
     beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs),
             "reach": reach_target(cfg, host, home), "node": short_host()}
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
-        r = run(ssh_argv(cfg) + [hub, HUB_CMD], payload)
+        r = run(ssh_argv(cfg) + ["--", hub, HUB_CMD], payload)
         ok, detail = r.returncode == 0, (r.stdout or r.stderr or "").strip()[-200:]
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
@@ -2882,10 +2893,12 @@ SSHD_ANSWERED_RE = re.compile(r"Permission denied|Host key verification failed|R
 def probe_host(reach: str, cfg: dict, runner: Optional[Callable] = None) -> Tuple[bool, str]:
     """(awake, detail): one BatchMode ssh to `reach`. Awake = the login worked or sshd answered at all; asleep/off
     the network = connect timeout, no route, unresolvable."""
+    if not valid_ssh_destination(reach):
+        return False, "invalid ssh destination"
     run = runner or (lambda argv, stdin=None: subprocess.run(argv, input=stdin, capture_output=True, text=True,
                                                              timeout=30))
     try:
-        r = run(ssh_argv(cfg) + [reach, "true"], None)
+        r = run(ssh_argv(cfg) + ["--", reach, "true"], None)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"[:200]
     err = (r.stderr or r.stdout or "").strip()[-200:]
@@ -2894,7 +2907,8 @@ def probe_host(reach: str, cfg: dict, runner: Optional[Callable] = None) -> Tupl
 
 # The hub could not even resolve `reach`. MagicDNS keeps resolving a sleeping tailnet peer, so this means the reach
 # the forwarder sent is unusable (e.g. a gethostname fallback), not that the host is asleep.
-UNRESOLVABLE_RE = re.compile(r"Could not resolve hostname|Name or service not known|nodename nor servname", re.I)
+UNRESOLVABLE_RE = re.compile(r"Could not resolve hostname|Name or service not known|nodename nor servname|"
+                             r"invalid ssh destination", re.I)
 
 
 def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
@@ -3014,7 +3028,8 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
             if not up and UNRESOLVABLE_RE.search(detail or ""):
                 # An unusable reach can't tell asleep from dead: keep the age-only check and say why.
                 _coach_log(home, {"event": "forwarder_reach_unresolvable", **rec})
-                note = (f"; its heartbeat's reach {reach} does not resolve from the hub, so the hub cannot tell "
+                note = (f"; its heartbeat's reach {reach} does not resolve or is invalid from the hub ({detail[:160]}), "
+                        f"so the hub cannot tell "
                         f"asleep from broken (set reach_as[\"{h}\"] in selfheal-config.json)")
             elif not up:
                 _coach_log(home, {"event": "forwarder_silent_host_down", **rec})

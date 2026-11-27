@@ -74,7 +74,18 @@ FORM_ONLY_METHODS = {
 
 READ, ACT, ADMIN = "read", "act", "admin"
 
-_READ_VERBS = ("list", "info", "history", "replies", "get", "lookup", "members", "search", "test")
+# Explicit semantics: read-like names alone never authorize a future API.
+CHANNEL_READS = {"conversations.history", "conversations.replies", "conversations.info",
+                 "conversations.members", "pins.list", "bookmarks.list", "chat.getPermalink"}
+METADATA_READS = {"auth.test", "api.test", "users.info", "users.list", "users.lookupByEmail",
+                  "users.profile.get", "users.getPresence", "team.info", "team.profile.get",
+                  "emoji.list", "bots.info", "usergroups.list", "usergroups.users.list", "dnd.info"}
+# These APIs can return private content without an authoritative channel argument.
+# Keep operator access, but never treat a caller-supplied channel as their scope.
+UNSCOPED_READS = {"search.messages", "search.files", "search.all", "assistant.search.context",
+                 "files.info", "files.list", "reactions.list", "canvases.sections.lookup",
+                 "conversations.list", "users.conversations", "reminders.list"}
+_READ_METHODS = CHANNEL_READS | METADATA_READS | UNSCOPED_READS | {"reactions.get"}
 # Ordinary bot actions, auto-allowed when they target the conversation the bot is talking in.
 _ACT_METHODS = {
     "chat.postMessage", "chat.postEphemeral", "chat.update", "chat.delete", "chat.scheduleMessage",
@@ -97,16 +108,10 @@ ACT_ANYWHERE = {"conversations.open", "reminders.add", "reminders.complete", "re
 def method_tier(method: str) -> str:
     """read / act / admin. Unknown methods are admin (fail closed)."""
     m = (method or "").strip()
-    if m.startswith(("search.", "assistant.search.")) or m in ("auth.test", "api.test"):
-        return READ
-    if m.startswith("admin.") or m in ("users.profile.set", "users.setPresence", "users.deletePhoto",
-                                         "users.setPhoto"):
-        return ADMIN
-    last = m.rsplit(".", 1)[-1]
-    if any(last.startswith(v) for v in _READ_VERBS) and not last.startswith("set"):
-        return READ
     if m in _ACT_METHODS:
         return ACT
+    if m in _READ_METHODS:
+        return READ
     return ADMIN
 
 
@@ -251,9 +256,10 @@ class Store:
                     detail["name"] = event["channel"].get("name")
                 c.execute("INSERT INTO events(at,type,channel,user,detail) VALUES (?,?,?,?,?)",
                           (now, et, ch or "", user or "", json.dumps(detail)))
-                if et in ("channel_rename", "group_rename", "channel_created") and detail.get("name"):
-                    c.execute("INSERT OR REPLACE INTO names(id,name,kind,private,extra,at) VALUES (?,?,?,?,?,?)",
-                              (ch, detail["name"], "channel", 0, "{}", now))
+                if et in ("channel_rename", "group_rename", "channel_created"):
+                    # Lifecycle payloads do not attest privacy. Invalidate by stable id;
+                    # the next authorization must fetch conversations.info again.
+                    c.execute("DELETE FROM names WHERE id=?", (ch,))
 
     def prune(self) -> None:
         days = float(self.policy().get("retention_days") or 30)

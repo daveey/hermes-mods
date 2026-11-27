@@ -1175,7 +1175,7 @@ test('a real decision click emits exactly one monotonic client timing record; a 
  }
  m.resetFeedForTests()
 })
-test('recorded receipt leaves NEEDS YOU before a two-second refresh, then records visible timing', async () => {
+test('recorded receipt leaves NEEDS YOU before a two-second refresh, then records visible timing', async t => {
  m.resetFeedForTests()
  const before = structuredClone(publicCases.own_letters.model)
  const q = before.sections.needs_you[0]; q.request_revision += 301
@@ -1188,18 +1188,29 @@ test('recorded receipt leaves NEEDS YOU before a two-second refresh, then record
  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before })
  current = route
  await paint(React.createElement(m.Panel))
- const clicked = performance.now()
+ // Timer callbacks are not a lower-bound performance clock. Keep transport
+ // completion explicit and telemetry on a scoped, fractional-origin clock.
+ const realNow = performance.now.bind(performance)
+ let now = 1000.25, releaseRefresh
+ const refreshGate = new Promise(resolve => { releaseRefresh = resolve })
+ t.mock.method(performance, 'now', () => now)
+ t.after(async () => {
+   releaseRefresh()
+   await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+ })
+ const clicked = realNow()
  await m.chooseModelOption(q, q.options[0], route, { call: async (path, opts) => {
    if (path.endsWith('/decision-refresh')) {
-     await new Promise(resolve => setTimeout(resolve, 2000)); refreshed = true
+     await refreshGate; refreshed = true
      return { feed: 'f', epoch: 'e', rev: 2, bundle: { session: route.session, model: publicCases.instant_decision.model } }
    }
    if (path.endsWith('/client-timing')) { timings.push(opts.body); return {} }
    if (path.endsWith('/decisions')) return { operation: { operationId: 'provisional-op', dispatchState: 'recorded', idempotencyKey: opts.body.idempotencyKey }, request: { ...request, resolution: { operationId: 'provisional-op' } } }
    return { request }
  } })
+ now += 100
  await paint(React.createElement(m.Panel))
- assert.ok(performance.now() - clicked < 1000)
+ assert.ok(realNow() - clicked < 1000)
  assert.equal(refreshed, false)
  assert.ok(document.querySelector('[data-model-section="needs_you"]') === null, 'provisional ask departed')
  assert.equal(document.querySelector('[data-model-count="needs_you"]').textContent, '0')
@@ -1207,13 +1218,16 @@ test('recorded receipt leaves NEEDS YOU before a two-second refresh, then record
  assert.equal(m.cachedModel(route).header.counts.needs_you, 1, 'canonical cache untouched')
  assert.equal(m.decisionPresentation(before, { ...route, connectionId: 'other' }), before)
  assert.equal(timings.length, 0, 'refresh duration not yet known')
- await new Promise(resolve => setTimeout(resolve, 2050))
+ now += 1900
+ await React.act(async () => { releaseRefresh() })
  await paint(React.createElement(m.Panel))
+ assert.equal(refreshed, true)
  assert.equal(timings.length, 1)
  assert.ok(timings[0].visible_ms < 1000)
+ assert.equal(timings[0].visible_ms, 100)
  assert.equal(timings[0].painted_ms, timings[0].visible_ms)
  assert.ok(timings[0].refreshed_ms >= 2000)
- await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+ assert.equal(timings[0].refreshed_ms, 2000)
 })
 test('refresh failure restores the locked ask; failed POST operation never hides it', async () => {
  for (const [index, state] of ['recorded', 'failed', 'missing-key', 'bad-revision'].entries()) {

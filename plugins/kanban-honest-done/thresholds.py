@@ -31,6 +31,7 @@ human words authorize the change (Gate F proves only who said them), or results 
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Optional
 
@@ -248,10 +249,47 @@ def _num(v: Any) -> Optional[tuple[str, float, str]]:
     """``(comparator, value, unit)`` for a number-like value, else None."""
     if isinstance(v, bool):
         return None
-    if isinstance(v, (int, float)):
-        return "", float(v), ""
-    m = _NUM_RE.match(str(v or ""))
-    return (m.group(1) or "", float(m.group(2)), (m.group(3) or "").lower()) if m else None
+    try:
+        if isinstance(v, (int, float)):
+            result = "", float(v), ""
+        else:
+            m = _NUM_RE.match(str(v or ""))
+            result = (m.group(1) or "", float(m.group(2)), (m.group(3) or "").lower()) if m else None
+        return result if result and math.isfinite(result[1]) else None
+    except (OverflowError, ValueError):
+        return None
+
+
+_BODY_THRESHOLD = re.compile(
+    r'^\s*(?:[-*]\s*)?(?:DONE:\s*|ACCEPTANCE\s+)([^\n:]+?)\s*(?:requires\s+|:\s*)'
+    r'((?:<=|>=|==|<|>|=|≤|≥)\s*[-+]?\d+(?:\.\d+)?\s*(?:%|[A-Za-z]+)?(?:\s+[\w -]+)?)\.?\s*$',
+    re.I | re.M)
+
+
+def _bound_pass(name: str, r: dict, body: str) -> Optional[str]:
+    """Numeric passes use only explicit, unambiguous body definitions.
+
+    Do not infer authority from caller thresholds or guess a natural-language
+    inequality. Gate F protects changes to the acceptance lines in the body.
+    """
+    definitions = [_num(m[2]) for m in _BODY_THRESHOLD.finditer(body or '') if _same_check(m[1], name)]
+    observed = _num(r.get('observed'))
+    numeric_like = isinstance(r.get('observed'), (int, float)) or bool(re.match(r'^\s*[+\-<>=≤≥]*\s*\d', str(r.get('observed') or '')))
+    if not definitions and r.get('threshold') is None and observed is None and not numeric_like:
+        return None  # nonnumeric evidence, e.g. a CI run URL/status
+    if len(definitions) != 1 or definitions[0] is None:
+        return f'{name}: numeric pass needs one body-bound threshold: ACCEPTANCE {name}: >= 25% (use the actual target)'
+    t = definitions[0]
+    if observed is None:
+        return f'{name}: observed must be a finite number with the body threshold units'
+    if r.get('threshold') is not None:
+        supplied = _num(r['threshold'])
+        cmp = str(r.get('comparator') or '').strip() or (supplied[0] if supplied else '')
+        if supplied is None or supplied[1:] != t[1:] or cmp != t[0]:
+            return f'{name}: caller threshold/comparator differs from the body-bound threshold'
+    elif r.get('comparator') is not None and str(r['comparator']).strip() != t[0]:
+        return f'{name}: caller comparator differs from the body-bound threshold'
+    return _check_pass(name, dict(r, threshold=f'{t[1]}{t[2]}', comparator=t[0]))
 
 
 def _check_pass(name: str, r: dict) -> Optional[str]:
@@ -325,7 +363,7 @@ def check_thresholds(task_id: str, summary: str, metadata: Any, body: str) -> Op
             status = _norm(r.get("status"))
             status = _STATUS_ALIASES.get(status, status)
             if status == "pass":
-                why = _check_pass(name, r)
+                why = _check_pass(name, r) or _bound_pass(name, r, body)
             elif status in ("fail", "not_run"):
                 why = _check_fail(name, dict(r, status=status), branches)
             elif status == "waived":
