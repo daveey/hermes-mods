@@ -222,8 +222,7 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
     return []
 
 
-def shell_write_texts(command: str, allow_inert: bool = True) -> list[str]:
-    # Use the same executable-position classifier as comment/acceptance gates.
+def _core_module():
     try:
         from . import core
     except ImportError:
@@ -237,6 +236,12 @@ def shell_write_texts(command: str, allow_inert: bool = True) -> list[str]:
             core = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(core)
             core = sys.modules.setdefault(key, core)
+    return core
+
+
+def shell_write_texts(command: str, allow_inert: bool = True) -> list[str]:
+    # Use the same executable-position classifier as comment/acceptance gates.
+    core = _core_module()
     shell = core._shell_commands()
     semantic = [' '.join(seg) for seg in core._segments(command)
                 if not allow_inert or not shell.exempt_segment(seg)]
@@ -261,9 +266,14 @@ def _unresolved_shell_write(tool_name: str, args: Any) -> bool:
     if name == "tool_call":
         return any(_unresolved_shell_write(str(call.get("name") or ""), call.get("arguments"))
                    for call in args.get("calls") or [] if isinstance(call, dict))
-    return name in SHELL_TOOLS and any(
-        re.search(r'[$`*?{\[\\]', text) or re.search(r'(?:^|[\s/|;])xargs(?:\s|$)', text)
-        for text in write_texts(name, args))
+    if name not in SHELL_TOOLS:
+        return False
+    # Share every decoded shell view with the own-card classifier. A raw regex
+    # loses quoted command names and shell punctuation adjacent to xargs.
+    command = ' ; '.join(str(args[key]) for key in ('command', 'input', 'data') if args.get(key))
+    core = _core_module()
+    return (any(core._indirect_argv(seg) for seg in core._segments(command))
+            or any(re.search(r'[$`*?{\[\\]', text) for text in write_texts(name, args)))
 
 
 def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,

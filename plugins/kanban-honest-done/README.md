@@ -98,9 +98,18 @@ If the lexer splits an unquoted substitution target at `(`, its mutation is
 held outright: missing trailing flags or summary cannot prove a safe handoff.
 The `--` end-of-options marker is respected when locating card operands; every
 completion operand is checked, including `complete OTHER OWN` batches.
-`xargs`-driven edits, completions and review handoffs are held because targets can
-be replaced or appended from stdin/files, even without a visible placeholder.
-Consent stops likewise hold xargs-driven writes. Use direct literal commands.
+`xargs`- and GNU `parallel`-driven edits, completions and review handoffs are held
+because targets can be replaced or appended from stdin/files, even without a
+visible placeholder. Consent uses the same decoded all-view indirect classifier,
+including quoted command names, adjacent shell operators and nested scripts.
+This is deliberately whole-command conservative: an unrelated xargs/parallel
+elsewhere in the same command also holds a mutation of another card. Split it
+into direct literal calls; no per-segment provenance is asserted. Inert mentions
+that the complete grammar proves are data remain exempt.
+Option reading respects `--`, unique argparse prefixes, zero-arity `--force`
+and last-wins repeated values. Static option names/aliases and exact value arities
+are checked against the real core parser in core-backed tests; unsupported future
+arities fail that drift check rather than silently updating the contract.
 Own-card summary/result/metadata containing unresolved `$` or backticks is held
 rather than classified as literal passing evidence. Tests:
 `tests/test_review_indirect_targets.py` (multi-target completion, xargs append /

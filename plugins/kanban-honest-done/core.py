@@ -839,14 +839,45 @@ def _segments(command: str) -> list[list[str]]:
     return _shell_commands().segments(command)
 
 
-def _opt(tokens: list[str], *names: str) -> Optional[str]:
-    for i, t in enumerate(tokens):
-        for n in names:
-            if t == n and i + 1 < len(tokens):
-                return tokens[i + 1]
-            if t.startswith(n + "="):
-                return t[len(n) + 1:]
-    return None
+# Static to keep hook startup free of argparse/core imports. Tests compare every
+# option string and its exact arity against core's real parser.
+_CLI_VALUES = {
+    'complete': frozenset({'--result', '--summary', '--metadata'}),
+    'request-review': frozenset({'--summary', '--reviewer', '--metadata'}),
+    'edit': frozenset({'--requires', '--title', '--body', '--class', '--frees',
+                      '--priority', '--priority-bump', '--result', '--summary', '--metadata',
+                      '--max-retries', '--goal-mode', '--review-required', '--goal-max-turns',
+                      '--max-runtime-seconds', '--session-id', '--completion-contract', '--reason'}),
+}
+_CLI_FLAGS = frozenset({'--force', '--help', '-h'})
+
+
+def _option_name(token: str, verb: str) -> Optional[str]:
+    options = _CLI_VALUES.get('complete' if verb == 'done' else verb, _CLI_VALUES['edit']) | _CLI_FLAGS
+    name = token.split('=', 1)[0]
+    if name in options:
+        return name
+    matches = [n for n in options if name.startswith('--') and n.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _opt(tokens: list[str], *names: str, verb: str = 'edit') -> Optional[str]:
+    # argparse store actions are last-wins, and -- ends option interpretation.
+    result = None
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == '--':
+            break
+        name = _option_name(token, verb)
+        if name and name not in _CLI_FLAGS:
+            value = token.split('=', 1)[1] if '=' in token else (tokens[i + 1] if i + 1 < len(tokens) else None)
+            if name in names:
+                result = value
+            i += 1 if '=' in token else 2
+        else:
+            i += 1
+    return result
 
 
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
@@ -875,7 +906,7 @@ def _verb_after(seg: list[str], i: int) -> Optional[tuple[str, list[str]]]:
     return None
 
 
-def _positionals(args: list[str]) -> list[str]:
+def _positionals(args: list[str], verb: str = 'edit') -> list[str]:
     """All task operands, including complete's nargs='+', not just the first."""
     out = []
     i = 0
@@ -884,7 +915,8 @@ def _positionals(args: list[str]) -> list[str]:
         if a == "--":
             out.extend(args[i + 1:])
             break
-        if a.startswith("--") and "=" not in a:
+        name = _option_name(a, verb)
+        if name and name not in _CLI_FLAGS and "=" not in a:
             i += 2
             continue
         if a.startswith("-"):
@@ -902,7 +934,7 @@ def _positional(args: list[str]) -> Optional[str]:
 def _indirect_argv(seg: list[str]) -> bool:
     # xargs can append ids or replace arbitrary placeholders anywhere in argv.
     # Never infer its stdin/file contents or replacement string as literal ids.
-    return any(os.path.basename(token) == "xargs" for token in seg)
+    return any(os.path.basename(token) in {"xargs", "parallel"} for token in seg)
 
 
 def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
@@ -914,9 +946,9 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
         if not hit:
             continue
         verb, args = hit
-        targets = _positionals(args)
+        targets = _positionals(args, verb)
         if indirect and verb in {"edit", "complete", "done", "request-review"}:
-            return ("[kanban-honest-done] Refused: xargs supplies unresolved mutation operands. "
+            return ("[kanban-honest-done] Refused: xargs/parallel supplies unresolved mutation operands. "
                     "Use literal direct kanban commands so the own-card gates can check every target.")
         own_targets = [target for target in targets if _is_own(target, own)]
         if not own_targets:
@@ -927,20 +959,20 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
         if any(target.endswith('$') for target in own_targets) and verb in {"edit", "complete", "done", "request-review"}:
             return ("[kanban-honest-done] Refused: unresolved substitution target. "
                     "Use a literal card id and a complete command so the own-card gates can check it.")
-        if verb == "edit" and (_opt(args, "--title") is not None or _opt(args, "--body") is not None):
+        if verb == "edit" and (_opt(args, "--title", verb=verb) is not None or _opt(args, "--body", verb=verb) is not None):
             return EDIT_REFUSAL
         if verb in {"complete", "done", "request-review"} and any(
-                re.search(r'[$`]', _opt(args, option) or '')
+                re.search(r'[$`]', _opt(args, option, verb=verb) or '')
                 for option in ("--summary", "--result", "--metadata")):
             return ("[kanban-honest-done] Refused: unresolved handoff text. "
                     "Use literal summary/result/metadata so completion evidence can be checked.")
         if verb in ("complete", "done"):
-            summary = _opt(args, "--summary") or _opt(args, "--result") or ""
-            why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata"))
+            summary = _opt(args, "--summary", verb=verb) or _opt(args, "--result", verb=verb) or ""
+            why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata", verb=verb))
             if why:
                 return why
         if verb == "request-review":
-            why = check_review(own, _opt(args, "--summary") or "", paths_fn(), metadata=_opt(args, "--metadata"))
+            why = check_review(own, _opt(args, "--summary", verb=verb) or "", paths_fn(), metadata=_opt(args, "--metadata", verb=verb))
             if why:
                 return why
     return None
