@@ -129,5 +129,15 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
     # Per status set, core's union hydration selects once and the pass's membership read selects once, both over
     # the pass's ids: 4 calls for 22 chats, where the per-chat loop added one call per chat and status set (46).
     assert calls == [union] * 4, [len(ids) for ids in calls]
-    # ~11 statements per selector call: ~44 for the pass (the per-chat loop issued ~500).
-    assert len(statements) <= 4 * 12, len(statements)
+    # Bound the pass to two selector reads per status set, rather than pinning
+    # core's internal SQL count (new annotations legitimately add fixed reads).
+    # Use the same scope/connection shape so row-dependent enrichment is counted.
+    control = []
+    c.set_trace_callback(control.append)
+    try:
+        for statuses in _statuses(ksa):
+            original(c, union, statuses, strict=False)
+    finally:
+        c.set_trace_callback(None)
+    assert control
+    assert len(statements) == 2 * len(control), (len(statements), len(control))

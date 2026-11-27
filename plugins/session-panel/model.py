@@ -471,7 +471,7 @@ def wait_target(row, bundle, detail):
         dep['gateway'] = (dep.get('home_gateway') or dep.get('gateway') or
                           (owner if isinstance(owner, str) else None) or
                           (bundle.get('gateway') if hydration.get('source') == 'live' else None))
-        dep['profile'] = dep.get('profile') or bundle.get('profile')
+        dep['profile'] = dep.get('profile') or rec.get('profile') or bundle.get('profile')
         if dep.get('gateway') and dep.get('profile'):
             return dep
     return None
