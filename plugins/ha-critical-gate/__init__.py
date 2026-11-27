@@ -49,6 +49,8 @@ NO_GATE = ("BLOCKED, nothing was sent: {what} needs the owner's confirmation and
 
 
 def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
+    # HA normalizes entity IDs to lowercase; classification must see the same target.
+    domain, service = domain.lower(), service.lower()
     if domain in OPAQUE_ACTUATORS or service in CRITICAL_SERVICES.get(domain, ()):
         return True
     data = data if isinstance(data, dict) else {}
@@ -64,7 +66,7 @@ def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
             if not isinstance(item, str):
                 unresolved = True
                 continue
-            targets.extend(part.strip() for part in item.split(","))
+            targets.extend(part.strip().lower() for part in item.split(","))
     for target in targets:
         target_domain, dot, name = target.partition(".")
         if not dot or not name or target_domain == "group":
@@ -76,9 +78,11 @@ def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
                     "cover": {"close_cover", "stop_cover", "close_cover_tilt", "stop_cover_tilt"}}
             if service not in safe[target_domain]:
                 return True
-    # Generic HA services expand groups, areas, devices and implicit/all targets server-side.
+    # Generic HA services expand indirect/implicit targets server-side. Unknown
+    # nonempty selectors fail closed too, so a new HA selector cannot bypass us.
     return domain == "homeassistant" and (
-        unresolved or not targets or any(data.get(key) for key in ("area_id", "device_id", "label_id")))
+        unresolved or not targets or any(value for key, value in data.items()
+                                         if key not in {"entity_id", "exclude"}))
 
 
 def _homes() -> list[Path]:
@@ -168,7 +172,8 @@ def _call_of(args: Any) -> Optional[dict]:
 def ask_gate(call: dict, config: dict, run=subprocess.run) -> dict:
     """The gate's decision; raises on any failure (the caller fails closed for critical calls)."""
     done = run(config["command"], input=json.dumps(dict(call, agent=agent_name())), capture_output=True, text=True,
-               timeout=config.get("timeout") or DEFAULT_TIMEOUT, check=False)
+               timeout=config.get("timeout") or DEFAULT_TIMEOUT, check=False,
+               env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/")
     if done.returncode != 0:
         raise RuntimeError("gate exited %s" % done.returncode)
     reply = json.loads((done.stdout or "").strip().splitlines()[-1])

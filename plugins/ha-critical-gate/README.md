@@ -2,7 +2,7 @@
 
 A `pre_tool_call` guard on direct and wrapped `ha_call_service` calls. Every call is sent to a trusted confirmation gate if one is available. `hold`/`deny` blocks; `allow` permits the downstream tool to run. The plugin itself never sends HA service requests.
 
-Without a working gate, unlock/open/disarm/cover motion is blocked. Script, scene, automation, button and switch services/targets always need confirmation: their physical effects cannot be inferred from their names. Entity domains are checked in `entity_id` and `data.entity_id` (including JSON data, lists and comma-separated targets). Generic `homeassistant` calls with implicit, all, group, area, device or label targets fail closed; no network expansion is attempted. Known light/media/climate and explicit closing/locking operations retain the prior no-gate behavior. This is conservative classification, not a promise that every generic service is implemented for every HA entity domain.
+Without a working gate, unlock/open/disarm/cover motion is blocked. Script, scene, automation, button and switch services/targets always need confirmation: their physical effects cannot be inferred from their names. Entity domains are checked in `entity_id` and `data.entity_id` (including JSON data, lists and comma-separated targets). Generic `homeassistant` calls with implicit, all, group, area, device, label or floor targets fail closed; all other nonempty data keys except `entity_id` and `exclude` also fail closed to cover new indirect selectors. Domain, service and entity IDs are classified case-insensitively to match HA entity normalization; no network expansion is attempted. Known light/media/climate and explicit closing/locking operations retain the prior no-gate behavior. This is conservative classification, not a promise that every generic service is implemented for every HA entity domain.
 
 ## Trusted configuration (breaking security migration)
 
@@ -16,7 +16,7 @@ It must be a regular, root-owned file; every ancestor directory and the executab
 
 `HA_CRITICAL_GATE_COMMAND` and all home/profile `ha-critical-gate.json` files are ignored, even if chmod 0600. Owner-only files belonging to the agent are still agent-writable. Profiles share the system gate; their profile name remains in the JSON payload. No config migration, privileged install or live HA operation is performed by this plugin.
 
-The gate receives one JSON object on stdin: `domain`, `service`, `entity_id`, `data`, `agent`. It prints a final JSON line with `decision` (`allow`, `hold`, `deny`) and optional `message`. Invalid output, nonzero exit, timeout, missing or untrusted configuration fails closed for critical calls. Unexpected hook exceptions block instead of losing protection for a wrapper batch.
+The gate runs from `/` with only `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, never inheriting agent-controlled loader variables, HOME, tokens or Python module paths. It must not depend on the agent's environment. The gate receives one JSON object on stdin: `domain`, `service`, `entity_id`, `data`, `agent`. It prints a final JSON line with `decision` (`allow`, `hold`, `deny`) and optional `message`. Invalid output, nonzero exit, timeout, missing or untrusted configuration fails closed for critical calls. Unexpected hook exceptions block instead of losing protection for a wrapper batch.
 
 ## Tests
 
