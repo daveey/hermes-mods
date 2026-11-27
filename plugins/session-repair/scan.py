@@ -714,6 +714,10 @@ def rule_overdue_wake(card: Card, src: Sources) -> Optional[Finding]:
     try:
         from hermes_cli import kanban_continuation as kc
         park = kc.park_state(c, card.id)
+        # Core reserves a final authorized run for the parked condition. A
+        # generic timer/probe-age repair must not spend that run or override it.
+        if kc._reserved_for(c, card.id, park):
+            return None
     except Exception as e:  # noqa: BLE001
         src.error(f'park {card.board}/{card.id}', e)
         return None
