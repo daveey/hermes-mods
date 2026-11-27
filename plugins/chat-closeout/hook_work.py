@@ -30,9 +30,12 @@ class Lanes:
                 lane.append(job)
             else:
                 lane = deque([job])
-                self._lanes[key] = lane
+                # _run first takes our lock, so it cannot consume the lane
+                # until start succeeds and publication is complete. A failed
+                # start must leave no immortal, workerless lane across reload.
                 threading.Thread(target=self._run, args=(key, lane), daemon=True,
                                  name='closeout-hook-work').start()
+                self._lanes[key] = lane
             return future
 
     def _run(self, key, lane):
