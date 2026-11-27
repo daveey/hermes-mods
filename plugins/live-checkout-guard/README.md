@@ -125,7 +125,10 @@ not its own basename search. Failed/rolled-back batches and approval-staged resu
 authorize publication themselves. Ordinary successful tool observations also kick orphan recovery:
 dirty skill documents left by a reboot or a previously dropped record are rediscovered from Git,
 not inferred from a failed tool result. Only create/edit/patch/write_file have the direct publication
-path; independent dirty-document recovery also sees tracked deletions and untracked documents.
+path. Deletions (delete/remove_file and accidental missing files) are held visibly for reviewed
+publication, never auto-published, including when an enrolled edit is deleted before its retry.
+Recovery groups documents per skill (up to the 16-file batch limit) and uses explicit
+`session:orphan-recovery card:none` attribution: the original session cannot be inferred after reboot.
 Repeated paths in a batch are deduplicated and their final on-disk snapshot is published once.
 
 `skill_publish.py` permits `skills/.../SKILL.md` and non-executable supporting files below
@@ -155,7 +158,12 @@ a distinct disposition/reason in `$HERMES_HOME/logs/skill-publish-retry.log`.
 Later tool observations restart the worker when no worker holds its flock, even with no pending
 records: dirty skill paths are rediscovered. Content fingerprints of refused/expired bytes
 (`.settled-*`) prevent discovery from repeatedly renewing their window; those bytes stay visibly
-held for reviewed recovery. A newer edit is eligible again. Existing records keep their deadline.
+held for reviewed recovery. Discovery warnings/log lines are deduplicated per path generation
+(`.notified-*`), so unrelated tool calls do not spam unchanged refused/settled dirt. A newer edit
+is eligible again. Existing records keep their deadline. Unreadable pending entries are renamed
+`.quarantine-*` without deleting their contents; if quarantine itself fails the worker exits visibly,
+not an unbounded retry loop. The worker flock is only probed, then released before discovery,
+so a defer-spawned retry worker is never excluded by that scan.
 A clean detached worktree starts at fetched origin/main and receives a
 `git apply --3way --index` patch constructed from captured bytes using a separate temporary index.
 Commits use the inherited repository author identity and include skill/session/card in their subject.

@@ -321,6 +321,8 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             captured = {n: snapshot(p) for n, p in targets.items()}
         except ValueError as exc:
             raise Refused(str(exc)) from exc
+        if any(snap is None for snap in captured.values()):
+            raise Refused('deletion requires reviewed publication')
         run(root, 'fetch', 'origin', 'main')
         base = run(root, 'rev-parse', 'origin/main').decode().strip()
         state = ci(root, base)
@@ -613,6 +615,20 @@ def _settle(directory, root, paths, signatures):
             (directory / ('.settled-' + _record_key(root, [name]))).write_text(signatures[name])
 
 
+def _discovery_notice(directory, root, name, signature, disposition, reason):
+    """One notice per observed path generation, shared by host observers."""
+    import hashlib
+    marker = directory / ('.notified-' + _record_key(root, [name]))
+    stamp = hashlib.sha256(str(signature).encode()).hexdigest()
+    # A separate lock does not borrow execution custody from retry workers.
+    with open(directory / '.notice.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if marker.exists() and marker.read_text() == stamp:
+            return
+        marker.write_text(stamp)
+        dirt_notice([name], disposition, reason, directory)
+
+
 def kick(directory=None, *, root=None):
     """Recover orphan dirty docs as well as pending records, without duplicate workers."""
     directory = Path(directory) if directory else pending_dir()
@@ -625,38 +641,60 @@ def kick(directory=None, *, root=None):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             busy = True
-        if root is not None:
-            with operation_budget(LOCK_WAIT, time.monotonic):
-                root = str(Path(root).resolve(strict=True))
-                covered = set()
-                for path in directory.glob('*.json'):
-                    try:
-                        rec = json.loads(path.read_text())
-                        if (isinstance(rec, dict) and rec.get('root') == root
-                                and isinstance(rec.get('paths'), list)
-                                and all(isinstance(n, str) for n in rec['paths'])):
-                            covered.update(rec['paths'])
-                    except (OSError, ValueError, KeyError, TypeError):
-                        pass
-                # NUL paths, no rename ambiguity, includes deleted/untracked docs.
-                dirty = set(run(root, 'diff', *DIFF_FLAGS, '--name-only', '-z', '--no-renames', 'HEAD', '--', 'skills').decode().rstrip('\0').split('\0'))
-                dirty.update(run(root, 'ls-files', '--others', '--exclude-standard', '-z', '--', 'skills').decode().rstrip('\0').split('\0'))
-                for name in sorted(dirty - covered - {''}):
-                    try:
-                        signature = _signature(root, name)
-                    except ValueError as exc:
-                        dirt_notice([name], 'refused', str(exc), directory)
-                        continue
-                    settled = directory / ('.settled-' + _record_key(root, [name]))
-                    if settled.exists() and settled.read_text() == signature:
-                        dirt_notice([name], 'held', 'previous refusal/expiry; reviewed recovery required', directory)
-                        continue
-                    defer(root, [name], spawn=False, directory=directory)
-                    discovered = True
-                    dirt_notice([name], 'held', 'orphan edit recovered for retry', directory)
-        pending = any(directory.glob('*.json'))
     finally:
+        # Probe only: discovery must not make a defer-spawned worker exit busy.
         os.close(fd)
+    if root is not None:
+        with operation_budget(LOCK_WAIT, time.monotonic):
+            root = str(Path(root).resolve(strict=True))
+            covered = set()
+            for path in directory.glob('*.json'):
+                try:
+                    rec = json.loads(path.read_text())
+                    if (isinstance(rec, dict) and rec.get('root') == root
+                            and isinstance(rec.get('paths'), list)
+                            and all(isinstance(n, str) for n in rec['paths'])):
+                        covered.update(rec['paths'])
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+            # NUL paths, no rename ambiguity. Deletions are held, never enrolled.
+            dirty = set(run(root, 'diff', *DIFF_FLAGS, '--name-only', '-z', '--no-renames', 'HEAD', '--', 'skills').decode().rstrip('\0').split('\0'))
+            dirty.update(run(root, 'ls-files', '--others', '--exclude-standard', '-z', '--', 'skills').decode().rstrip('\0').split('\0'))
+            groups = {}
+            for name in sorted(dirty - covered - {''}):
+                try:
+                    signature = _signature(root, name)
+                except ValueError as exc:
+                    # lstat only: do not follow an out-of-scope symlink for notices.
+                    try:
+                        stamp = (Path(root) / name).lstat()
+                        signature = (stamp.st_ino, stamp.st_mode, stamp.st_size,
+                                     stamp.st_mtime_ns, stamp.st_ctime_ns)
+                    except OSError:
+                        signature = 'unreadable'
+                    _discovery_notice(directory, root, name, signature, 'refused', str(exc))
+                    continue
+                if signature == 'deleted':
+                    _discovery_notice(directory, root, name, signature, 'held',
+                                      'deletion requires reviewed publication')
+                    continue
+                settled = directory / ('.settled-' + _record_key(root, [name]))
+                if settled.exists() and settled.read_text() == signature:
+                    _discovery_notice(directory, root, name, signature, 'held',
+                                      'previous refusal/expiry; reviewed recovery required')
+                    continue
+                parts = name.split('/')
+                boundary = next((i for i, part in enumerate(parts) if part in
+                                 {'references', 'templates', 'assets'}), len(parts) - 1)
+                groups.setdefault('/'.join(parts[:boundary]), []).append(name)
+                _discovery_notice(directory, root, name, signature, 'held',
+                                  'orphan edit recovered for retry')
+            for names in groups.values():
+                for start in range(0, len(names), MAX_PATHS):
+                    defer(root, names[start:start + MAX_PATHS], session_id='orphan-recovery',
+                          spawn=False, directory=directory)
+                    discovered = True
+    pending = any(directory.glob('*.json'))
     if pending and (not busy or discovered):
         # A new enqueue needs a contender even when the incumbent appeared busy:
         # it may have crossed its final empty check during discovery. Workers
@@ -729,6 +767,18 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                                 'dropped malformed', str(exc), directory)
                     if raw is not None:
                         _drop(path, raw)
+                    else:
+                        # Preserve unreadable bytes (or directories) out of the
+                        # queue; never recurse/delete them or retry indefinitely.
+                        import uuid
+                        try:
+                            path.rename(directory / ('.quarantine-' + uuid.uuid4().hex))
+                        except FileNotFoundError:
+                            pass
+                        except OSError as quarantine_error:
+                            _retry_log(directory, 'quarantine failed; worker exiting: %s' % quarantine_error)
+                            counts['dropped'] += 1
+                            return counts
                     counts['dropped'] += 1
                     continue
                 signatures = {}
