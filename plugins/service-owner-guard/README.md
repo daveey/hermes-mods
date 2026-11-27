@@ -31,6 +31,8 @@ platform-specific killall flag. SSH lookup argv is rebuilt from a narrow allowli
 are discarded; `-4`/`-6` are retained. Destinations must be literal host/user names, not options or shell text.
 Unsupported options (including ProxyCommand, LocalCommand, KnownHostsCommand, `-F`, `-J`, `-E`, `-S`)
 and malformed values refuse the stop before SSH is invoked, even for non-persistent stops or approval tokens.
+This transport check also applies to reload-paired bootout/unload actions: the "never refused" reload
+exception above applies only to supported transports.
 Use a trusted preconfigured host alias for proxy routing; the user's existing SSH configuration is still trusted
 and may run its own configured commands. A supported lookup failure is fail-open for non-persistent stops, and is logged.
 
