@@ -159,7 +159,7 @@ F11_CASES = [
     'echo $(if :; then :; elif coproc a case x in x) pytest;; esac; then :; fi)',
     'echo $(if :; then :; elif function a$(: ")") case x in x) pytest;; esac; then :; fi)',
     'echo $(echo $(coproc a${x:-)} case x in x) pytest;; esac))',
-    # class fallback: unknown/unmodeled prefix construct + heavy token anywhere
+    # class fallback: unknown/unmodeled prefix construct
     'echo $(echo $(time -p -- coproc a${x:-)} case x in x) cargo build --release;; esac))',
     'echo $(elif case x in x) swift build;; esac)',
 ]
@@ -175,11 +175,36 @@ def test_f11_f12_class_fallback_holds(command, monkeypatch):
     assert guard.check_shell(command) is None
 
 
-@pytest.mark.parametrize('command', [
+F13_CASES = [
+    'echo $(if false; then :; elif coproc a$(: ")") case x in x) py""test;; esac; then :; fi)',
+    "echo $(if false; then :; elif coproc a$(: \")\") case x in x) ca''rgo build;; esac; then :; fi)",
+    'echo $(if false; then :; elif coproc a$(: ")") case x in x) p\\ytest;; esac; then :; fi)',
+    'echo $(if false; then :; elif coproc a$(: ")") case x in x) ./build.sh;; esac; then :; fi)',
+    'echo "$(if false; then :; elif function a case x in x) ./build.sh;; esac; then :; fi; a)"',
     'echo $(elif coproc a${x:-)} case x in x) echo hi;; esac)',
+]
+F14_CASES = [
+    'echo "$(echo ${x:-)}; pytest)"',
+    'echo "$(echo ${x:-)} ; case x in x) pytest;; esac)"',
+    'echo $(echo ${x:-)}; ./build.sh)',
     'echo $(echo ${x:-)} case)',
+]
+
+
+@pytest.mark.parametrize('command', F13_CASES + F14_CASES)
+def test_f13_f14_unconditional_hold(command, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+    monkeypatch.setenv('MAC_HEAVY_OK', '1')
+    assert guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize('command', [
+    'echo $(echo ${x:-a})', 'echo ${x:-)}', 'echo $(echo ${x:-a} case)', 'echo $(echo ${#x})',
 ])
-def test_f11_f12_fallback_needs_heavy_token(command):
+def test_f14_data_controls(command):
     assert guard.check_shell(command) is None
     assert runner.workload_reason(command) is None
 
