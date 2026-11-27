@@ -19,6 +19,7 @@ test('partial governors retain known charges and name board-specific missing evi
 })
 
 const snapshot = () => ({ configured: true, status: { run: 7, you: 3 }, totals: { not_ready: 41 },
+  spend: { hour: 2.13, day: 12.34, week: 89.12 },
   sidebar: { cost_today: 12.34, idle_lanes: ['idle'] },
   governors: { idle_total: 31, rows: [{ id: 'llm_pool', name: 'LLM pool', state: 'on', cards_charged: 31,
     reading: { used_pct: 97, accounts: 23 }, threshold: { seven_day: 95 }, scope: [] }], counts: { on: 1, off: 8 } },
@@ -158,7 +159,7 @@ test('minimized counts are hub numbers, expand and lane controls persist; offlin
     assert.ok(pane.container.querySelector('[data-governor]') === null)
     assert.ok(pane.container.querySelector('[data-sidebar-lane]') === null)
     await pane.click(pane.container.querySelector('.lanes-sb-heading'))
-    assert.match(pane.container.textContent, /\$12.34 today/)
+    assert.equal(pane.container.querySelector('[data-fleet-spend]').getAttribute('aria-label'), '$2.13/h · $12.34/d · $89.12/wk')
     assert.equal(localStorage.getItem(P.SIDEBAR_OPEN_KEY), '1')
     assert.equal(pane.container.querySelector('[data-sidebar-lane="idle"]'), null)
     await pane.click(pane.container.querySelector('[data-sidebar-lane="work"] button'))

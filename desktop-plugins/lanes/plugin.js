@@ -1158,7 +1158,8 @@ export const TICK_COLORS = { empty: '#2f3440', partial: '#0ea5e9', full: '#38bdf
 export const INFINITY_EDGE = 0.97 // the far-right 3% of the slider is the no-cap stop
 
 export const money = n => n == null || !Number.isFinite(Number(n)) ? '—' : `$${Number(n) >= 1000 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(n)) : Number(n) >= 100 ? Math.round(n) : Number(n).toFixed(2)}`
-export const spendLabel = spend => `${money(spend?.hour)}/h · ${money(spend?.day)}/d · ${money(spend?.week)}/wk`
+const exactMoney = n => n == null || !Number.isFinite(Number(n)) ? 'unknown' : `$${Number(n).toFixed(2)}`
+export const spendLabel = spend => `${exactMoney(spend?.hour)}/h · ${exactMoney(spend?.day)}/d · ${exactMoney(spend?.week)}/wk`
 const capText = v => v == null ? '∞' : String(v)
 
 /** Slider stop 0..slots are caps; slots+1 is no cap. */
@@ -1267,7 +1268,7 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   const windowLabel = flowWindow(snap?.window_hours ?? 24)
   const chip = row.paused ? 'paused' : row.top_reason || ''
   const caption = pending && slots != null ? (preview
-    ? `cap ${capText(live)} would have turned cards away in ${preview.affected} of ${preview.total} periods (now ${preview.now}) · release to save`
+    ? `cap ${capText(live)} would have turned cards away in ${preview.affected} of ${preview.total} periods${preview.unknown ? ` (${preview.unknown} unknown)` : ''} (now ${preview.now ?? 'unknown'}) · release to save`
     : `cap ${capText(live)} · release to save`) : ''
   const spend = row.spend
   return h('div', { className: 'lanes-sb-lane', 'data-sidebar-lane': name, 'data-expanded': expanded ? '1' : '0' },

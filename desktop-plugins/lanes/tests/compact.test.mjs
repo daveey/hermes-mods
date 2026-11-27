@@ -55,8 +55,9 @@ test('compact row renders name, chip slot, 48 ticks, pips per fleet slot, cap cu
     assert.equal(slider.getAttribute('aria-valuemax'), '7')
     assert.equal(slider.getAttribute('aria-valuenow'), '4')
     assert.equal(row.querySelector('.lanes-cost').getAttribute('aria-label'), '$0.50/h · $7.00/d · $49.50/wk')
-    assert.equal(row.querySelector('.lanes-cost-d').textContent, '$7.00/d')
-    assert.equal(pane.container.querySelector('[data-fleet-spend]').textContent, '$1.50/h · $20.25/d · $140/wk')
+    assert.equal(row.querySelector('.lanes-cost-d').textContent, '$7.00')
+    assert.equal(pane.container.querySelector('[data-fleet-spend]').getAttribute('aria-label'), '$1.50/h · $20.25/d · $140.00/wk')
+    assert.deepEqual([...pane.container.querySelector('[data-fleet-spend]').children].map(c => c.textContent), ['$1.50', '$20.25', '$140'])
     // state encoding and tooltips
     const ticks = [...row.querySelectorAll('[data-tick]')]
     assert.equal(ticks[0].querySelector('rect').getAttribute('fill'), '#2f3440')
@@ -67,8 +68,8 @@ test('compact row renders name, chip slot, 48 ticks, pips per fleet slot, cap cu
     assert.ok(ticks[3].querySelector('.lanes-tick-notch'))
     assert.equal(ticks[3].dataset.tickUnknown, '0')
     assert.equal(ticks[4].dataset.tickUnknown, '1')
-    assert.match(ticks[1].querySelector('title').textContent, /^2026-11-27 00:30–01:00 UTC · running 1 · cap 4 · partial · 0 rejected$/)
-    assert.match(ticks[3].querySelector('title').textContent, /rejecting · 3 rejected$/)
+    assert.equal(ticks[1].querySelector('title').textContent, '2026-11-27 00:30–01:00 UTC · running 1 · cap 4 · partial · 0 rejected (ready cards turned away)')
+    assert.match(ticks[3].querySelector('title').textContent, /rejecting · 3 rejected \(ready cards turned away\)$/)
     assert.match(ticks[4].querySelector('title').textContent, /rejecting · rejections unknown$/)
     assert.doesNotMatch(ticks[4].querySelector('title').textContent, /0 rejected/)
   } finally { await pane.close(); localStorage.clear() }
@@ -194,6 +195,9 @@ test('keyboard: arrows step, Home is 0, End is infinity, commit on key release, 
     assert.equal(t.writes.length, 0)
     await key('keyup', 'ArrowRight')
     assert.deepEqual(t.writes, [['/v1/lanes/work', { max_workers: null }]])
+    await key('keydown', 'Home')
+    assert.equal(slider.getAttribute('aria-valuenow'), '7', 'pending write locks editing until hub confirmation')
+    await React.act(async () => t.push(snapshot({}, { limits: { max_workers: null } })))
     await key('keydown', 'Home'); assert.equal(slider.getAttribute('aria-valuenow'), '0')
     await key('keydown', 'ArrowLeft'); assert.equal(slider.getAttribute('aria-valuenow'), '0')
     await key('keydown', 'End'); assert.equal(slider.getAttribute('aria-valuenow'), '7')
@@ -232,7 +236,7 @@ test('rows without server ticks or spend degrade without inventing numbers; row 
     assert.equal(row.querySelectorAll('[data-tick]').length, 0)
     assert.ok(row.querySelector('.lanes-ticks-empty'))
     assert.equal(row.querySelector('.lanes-cost').getAttribute('aria-label'), 'spend unknown')
-    assert.equal(pane.container.querySelector('[data-fleet-spend]'), null)
+    assert.match(pane.container.querySelector('[data-fleet-spend]').getAttribute('aria-label'), /unknown/)
     assert.equal(row.querySelector('button[type=submit]'), null)
     // clicking the slider never toggles the row; clicking elsewhere on the row does
     const slider = row.querySelector('[role=slider]')
