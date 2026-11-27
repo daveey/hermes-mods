@@ -178,7 +178,10 @@ def not_merged_reason(path: str, main: str) -> str | None:
         return "uncommitted/untracked changes"
     # Git's clean status (and non-force worktree remove) permits deleting ignored data.
     # Share the card teardown's conservative scan, including its disposable-cache policy.
-    complex_reason = base._complex_reason(path)
+    try:
+        complex_reason = base._complex_reason(path)
+    except OSError as exc:
+        return f"scan failed: {exc}"
     if complex_reason:
         return complex_reason
     head = base._git(path, "rev-parse", "HEAD").stdout.strip()

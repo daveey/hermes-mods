@@ -235,9 +235,47 @@ class AgentHook(unittest.TestCase):
         def fail_scan(path):
             raise OSError("fixture scan denied")
         self.b._complex_reason = fail_scan
-        self.assertEqual(self.end(), [])
+        res = self.end()
+        self.assertEqual(res[0]["action"], "kept: scan failed: fixture scan denied")
         self.assertTrue(p.exists())
         self.assertIn("fixture scan denied", self.log())
+
+    def test_scan_exception_does_not_skip_healthy_sibling(self):
+        p = self.make("proj-error-first", "berrorfirst")
+        sibling = self.make("proj-healthy-second", "bhealthysecond")
+        original = self.b._complex_reason
+        def fail_one(path):
+            if path == str(p):
+                raise PermissionError("fixture unreadable subdirectory")
+            return original(path)
+        self.b._complex_reason = fail_one
+        # Force the failing candidate first, independent of filesystem ordering.
+        from unittest import mock
+        gds = [git(tree, "rev-parse", "--absolute-git-dir").strip() for tree in (p, sibling)]
+        common = str(self.repo / ".git")
+        with mock.patch.object(self.b, "_common_dirs", return_value=[common]), \
+                mock.patch.object(self.h.glob, "glob", return_value=gds):
+            res = self.end()
+        self.assertTrue(p.exists())
+        self.assertFalse(sibling.exists(), res)
+        self.assertEqual([r["action"] for r in res],
+                         ["kept: scan failed: fixture unreadable subdirectory", "removed"])
+
+    def test_correct_marker_path_with_forged_backlink_is_kept(self):
+        p = self.make("proj-correct-marker", "bcorrectmarker")
+        other = self.make("proj-forged-backlink", "bforgedbacklink", sid="sess-2")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        self.assertEqual(self.marker(p)["path"], str(p))
+        (gd / "gitdir").write_text(str(other / ".git") + "\n")
+        # The forward pointer still matches gd: only backlink validation rejects it.
+        self.assertEqual(git(p, "rev-parse", "--absolute-git-dir").strip(), str(gd))
+        from unittest import mock
+        with mock.patch.object(self.h, "remove_if_merged") as remove:
+            self.end()
+        remove.assert_not_called()
+        self.assertTrue(p.exists())
+        self.assertTrue(other.exists())
+        self.assertIn("marker path does not match gitdir backlink", self.log())
 
     def test_missing_marker_path_uses_valid_backlink(self):
         p = self.make("proj-no-path", "bnopath")
