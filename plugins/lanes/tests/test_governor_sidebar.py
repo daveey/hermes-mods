@@ -499,6 +499,14 @@ def test_governor_receipts_survive_sibling_registry_failure(board, api, monkeypa
         with original(path, **kwargs) as db:
             yield db
     monkeypatch.setattr(merge, 'read_board', fail)
+    # Registry contention arises inside the opener, not only the flow wrapper.
+    from hermes_cli import kanban_lockguard as guard
+    original_connect = guard.connect
+    def busy_connect(path, *args, **kwargs):
+        if '/beta/' in str(path):
+            raise sqlite3.OperationalError('SQLite tracking registry is busy')
+        return original_connect(path, *args, **kwargs)
+    monkeypatch.setattr(guard, 'connect', busy_connect)
     projected = view(api)['governors']
     row = next(r for r in projected['rows'] if r['id'] == 'llm_pool')
     assert row['cards_charged'] == expected['charged_total'] == 1
@@ -506,6 +514,40 @@ def test_governor_receipts_survive_sibling_registry_failure(board, api, monkeypa
     source = next(s for s in projected['scope'] if s['board'] == 'beta')
     assert source['available'] is True and source['flow_available'] is False
     assert 'tracking registry is busy' in source['reason']
+
+
+def test_sidecar_reader_survives_real_tracking_lock(board, api, monkeypatch):
+    import threading
+    from hermes_cli import sqlite_safe_read, kanban_lockguard as guard
+    import pytest
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    kb.create_board('beta')
+    with kbc.connect(board='beta') as conn:
+        kb.create_task(conn, title='receipt survives registry contention', assignee='default', tenant='other')
+        core_fixtures._tick(conn, board='beta')
+        expected = gov.snapshot(conn)
+        path = next(r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main')
+    entered, release = threading.Event(), threading.Event()
+    def hold():
+        with sqlite_safe_read._live_lock:
+            entered.set()
+            release.wait(10)
+    thread = threading.Thread(target=hold)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        import sqlite3
+        with pytest.raises(sqlite3.OperationalError, match='tracking registry is busy'):
+            guard.connect(path, timeout=.25)
+        result = api._sibling('governors').read_snapshot(path=path, board='beta')
+        assert result['available'] is True
+        assert result['charged_total'] == expected['charged_total'] == 1
+        assert result['governors'] == expected['governors']
+    finally:
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
 
 
 def test_governor_receipts_survive_flow_failure_and_match_cli(board, api, monkeypatch, capsys):

@@ -96,7 +96,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                       isinstance(r.get('threshold'), (int, float)) and r['reading'] >= r['threshold']
                       for r, _, _ in known)
         unknown |= ident in unsupported
-        state = 'unknown' if ident in unsupported else 'on' if count else 'unknown' if unknown else 'at_cap' if at_cap else 'off'
+        # State is finalized from board-qualified scope below; a positive
+        # charge is known-on, but one board's zero cannot certify fleet-off.
         readings = [dict(board=s['board'], lane=r.get('scope'), reading=r.get('reading'),
                          threshold=r.get('threshold'), detail=r.get('detail'), cards=r.get('cards', 0))
                     for r, s, _ in known if r.get('reading') is not None or r.get('cards')]
@@ -112,6 +113,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
             if source['available'] and not row_source['available']:
                 row_source['reason'] = '; '.join(filter(None, [source.get('reason'), 'governor not observed this tick']))
             row_scope.append(row_source)
+        unknown |= any(not source['available'] for source in row_scope)
+        state = 'unknown' if ident in unsupported else 'on' if count else 'unknown' if unknown else 'at_cap' if at_cap else 'off'
         rows.append(dict(id=ident, name=entry['label'], kind=entry['kind'], state=state,
                          cards_charged=count, holding=[dict(board=s['board'], id=tid)
                          for r, s, _ in known for tid in r.get('card_ids', [])],
@@ -151,19 +154,24 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
 def read_snapshot(*, conn=None, path=None, board=None):
     """Use the CLI reader without migrations, tracking registration or a flow deadline."""
     import sqlite3
-    from hermes_cli import kanban_governors as gov, kanban_lockguard as guard
-    owned = None
+    from hermes_cli import kanban_governors as gov
     try:
         if conn is None:
-            owned = guard.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=.25)
-            owned.execute('PRAGMA query_only=ON')
-            conn = owned
+            if path is None:
+                raise RuntimeError('governor sidecar requires a database path')
+            filename = str(Path(path).resolve())
+            # snapshot only needs the database filename, not SQLite access.
+            # Even a read-only tracked open can fail on registry contention.
+            # Keep the CLI's decoding, freshness and registry normalization.
+            class SidecarPath:
+                def execute(self, query):
+                    if query != 'PRAGMA database_list':
+                        raise RuntimeError('governor sidecar reader cannot query SQLite')
+                    return [(0, 'main', filename)]
+            conn = SidecarPath()
         return gov.snapshot(conn)
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         return dict(board=board, available=False, stale=True, reason=str(exc), governors=[])
-    finally:
-        if owned is not None:
-            owned.close()
 
 
 def read_adapter(home):
