@@ -778,6 +778,51 @@ def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:
 # ---- end of the shared heredoc block ---------------------------------------------------------------------------
 
 
+def _arithmetic_data_end(text: str, i: int) -> Optional[int]:
+    """First '(' at i: bash matches the SECOND '(' before checking the adjacent ')'."""
+    depth, j = 0, i + 1
+    while j < len(text):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                body = text[i + 2:j]
+                if text[j + 1:j + 2] == ")" and re.fullmatch(r"[\w\s+*/%<>=!&|^~?:,().-]*", body):
+                    return j + 2
+                return None
+        j += 1
+    return None
+
+
+# Plugin-local specialization: preserve the shared block for the other guards,
+# but expose bash's arithmetic fallback in expanding heredoc bodies as code too.
+def _mac_hd_substitutions(body: str) -> list:
+    found, i, n = [], 0, len(body)
+    while i < n:
+        if body[i] == "\\":
+            i += 2
+        elif body.startswith("$((", i) and (end := _arithmetic_data_end(body, i + 1)) is not None:
+            i = end
+        elif body.startswith("$(", i):
+            end = _hd_subst_end(body, i + 2)
+            found.append(body[i + 2:end - 1] if body[end - 1:end] == ")" else body[i + 2:])
+            i = end
+        elif body[i] == "`":
+            end = i + 1
+            while end < n and body[end] != "`":
+                end += 2 if body[end] == "\\" else 1
+            found.append(re.sub(r"\\([\\`$])", r"\1", body[i + 1:end]))
+            i = end + 1
+        else:
+            i += 1
+    return found
+
+
+
+_hd_substitutions = _mac_hd_substitutions
+
+
 def _ansi_word(text: str, i: int) -> tuple[str, int]:
     """Decode bash's $'...' without evaluating shell code; return value and end.
 
@@ -918,22 +963,7 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
         return text[i] == "#" and (i == 0 or text[i - 1] in " \t\n;&|()")
 
     def arithmetic(i: int) -> Optional[int]:
-        # Bash tries arithmetic first, but falls back to $( (commands) ... ).
-        # Only an adjacent closing `))` with arithmetic-shaped contents is data.
-        # Everything else must go through the command-substitution scanner.
-        depth, j = 0, i
-        while j < n:
-            if text[j] == "(":
-                depth += 1
-            elif text[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    body = text[i + 2:j - 1]
-                    if text[j - 1:j + 1] == "))" and re.fullmatch(r"[\w\s+*/%<>=!&|^~?:,().-]*", body):
-                        return j + 1
-                    return None
-            j += 1
-        return None
+        return _arithmetic_data_end(text, i)
 
     def single(i: int, ansi: bool) -> int:  # quote opening at i: index just past its close
         j = i + 1
