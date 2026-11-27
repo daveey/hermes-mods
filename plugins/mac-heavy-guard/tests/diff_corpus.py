@@ -15,7 +15,24 @@ HEAVY = ['pytest', 'cargo build --release', './build.sh', 'py""test', "ca''rgo b
 # Every reviewer repro from F1-F14 (reviews 6092831609, 6092967625, 6093092970, 6093203097, 6093320272,
 # 6093400492, 6093461628, 6093503973, 6093656803) plus the original C1-C4 fixtures. Repros that need real
 # script files on disk (`bash run.sh; x=$(cd proj)` family) stay in tests/test_source_review.py.
-REPROS = [
+ANSI_ARITH_PAIRS = [
+    ("$'pytest'", "$'echo' ok"),
+    ("bash -c $'pytest'", "bash -c $'echo ok'"),
+    ("bash -c $'py\\\ntest'", "bash -c $'ec\\\nho ok'"),
+    ('echo "$((pytest) )"', 'echo "$((echo ok) )"'),
+    ('echo "$((pytest) | cat)"', 'echo "$((echo ok) | cat)"'),
+    ('x="$((pytest);(pytest))"', 'x="$((echo ok);(echo ok))"'),
+    ("echo $'\\'' ; pyt\\\nest", "echo $'\\'' ; ec\\\nho ok"),
+    (r"$'py\x74est'", r"$'ec\x68o' ok"),
+    (r"$'py\164est'", r"$'ec\150o' ok"),
+    (r"$'py\u0074est'", r"$'ec\u0068o' ok"),
+    (r"$'py\U00000074est'", r"$'ec\U00000068o' ok"),
+    ("py$'test'", "ec$'ho' ok"),
+    ("echo \"$($'pytest')\"", "echo \"$($'echo' ok)\""),
+    (r"$'pytest\0ignored'", r"$'echo\0ignored' ok"),
+]
+
+REPROS = [h for h, _ in ANSI_ARITH_PAIRS] + [
     'if true; then pytest; fi',
     'pip install -rrequirements.txt',
     'case $(pytest) in x) echo ;; esac',
@@ -65,9 +82,12 @@ REPROS = [
     'cat <<EOF\n$\\\n(case x in x) pytest;; esac)\nEOF',
 ]
 
-# Deliberate new allows (head allows, main held). Each is a bash SYNTAX ERROR (`)` after the closed substitution),
-# so nothing can run: main held it only because its scanner failed closed on the stray paren.
-NEW_ALLOW_REASONS = {'echo $(echo ${x:-}) pytest)': 'bash syntax error (unbalanced `)`); not executable'}
+# Deliberate new allows: one syntax error, and the exact benign continuation
+# twin previously held only by tailnet's ANSI-C quote/continuation confusion.
+NEW_ALLOW_REASONS = {
+    'echo $(echo ${x:-}) pytest)': 'bash syntax error (unbalanced `)`); not executable',
+    "echo $'\\'' ; ec\\\nho ok": 'bash executes only echo; ANSI-C apostrophe no longer hides continuation joining',
+}
 
 PREFIXES = ['', 'time', 'time -p', 'time --', 'time -p --', 'time !', '!', 'coproc', 'coproc w', 'coproc a-b',
             'function f', 'function a.b', 'coproc a$(:)', 'coproc a`:`', 'coproc a$(echo ")")',
@@ -76,7 +96,7 @@ PREFIXES = ['', 'time', 'time -p', 'time --', 'time -p --', 'time !', '!', 'copr
 
 
 def build():
-    out = list(REPROS) + list(NEW_ALLOW_REASONS)
+    out = list(REPROS) + [b for _, b in ANSI_ARITH_PAIRS] + ['echo "$((1+2))"'] + list(NEW_ALLOW_REASONS)
     for h in HEAVY:
         out += [h, 'echo $(' + h + ')', 'echo "$(' + h + ')"', 'echo `' + h + '`', 'x=$(' + h + ')',
                 'echo "$\\\n(case x in x) ' + h + ';; esac)"', 'echo "$\\\n(' + h + ')"',
