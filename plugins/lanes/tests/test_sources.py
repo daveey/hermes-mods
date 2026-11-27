@@ -109,6 +109,32 @@ def test_context_identity_changes_with_selected_database(board, tmp_path):
         assert first[fixtures.URL] != second[fixtures.URL]
 
 
+def test_fleet_reader_gets_each_phase_budget_not_its_aged_open_deadline(board, tmp_path):
+    """Live failure (hub :9149, 708e95bb): 'default: lanes flow is unavailable: interrupted'.
+
+    The projector child opens local and fleet under one 2 s open deadline. Each
+    phase re-armed only the local handle, so flow.snapshot, which reads the
+    fleet handle (Sources.conn), was interrupted once the whole job passed 2 s.
+    """
+    sources = pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync
+    api, connect, _calls = board
+    with connect() as local, contextlib.closing(kbc.connect(tmp_path / 'fleet.db')) as fleet:
+        for db in (local, fleet):
+            sync.apply_sync_schema_steps(db)
+        fleet.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_fleet','fixture','running',?,'work',1)",
+                      (int(time.time()) - 60,))
+        fleet.commit()
+        evidence = sources.presentation(local, fleet)  # opened inside the open deadline
+        assert evidence.conn is fleet
+        # Then the job-wide open deadline passes (job time > 2 s) while the
+        # phases run. The fleet handle is the one nobody re-armed.
+        fleet.set_progress_handler(lambda: 1, 1)
+        view = api._project_evidence(api.core(), local, evidence, 6.0, '6h', False)
+    assert 'interrupted' not in (view.get('flow_error') or ''), view.get('flow_error')
+    assert view['flow_complete'], view.get('flow_error')
+
+
 def test_failed_flow_keeps_fresh_strip(board, monkeypatch):
     pytest.importorskip('hermes_cli.kanban_lanes_sources')
     from hermes_cli import kanban_lanes_flow as flow

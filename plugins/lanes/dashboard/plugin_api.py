@@ -370,6 +370,23 @@ def _stamp_chats(db, cards):
             card['chats'] = sorted(set(linked[card['id']]))
 
 
+def _arm_source(source_conn, source, phase):
+    """Give every handle a board's phase reads its own budget, not only the board connection.
+
+    Sources/Evidence read through ``source.conn`` (the fleet replica) and
+    ``source.local``. Re-arming only ``source_conn`` left the replica on whatever
+    deadline it was opened with: in the projector child that is the job-wide 2 s
+    open deadline, so the default board's flow was interrupted once the job
+    passed 2 s ('default: lanes flow is unavailable: interrupted').
+    """
+    import sqlite3
+    seen = set()
+    for db in (source_conn, getattr(source, 'conn', None), getattr(source, 'local', None)):
+        if isinstance(db, sqlite3.Connection) and id(db) not in seen:
+            seen.add(id(db))
+            _sibling('board_merge').arm_deadline(db, phase=phase)
+
+
 def _governed_sources(mods, conn, evidence, hours, window):
     from contextlib import ExitStack
     from collections import defaultdict
@@ -406,7 +423,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
         if flow_mods is not None:
             for slug, source_conn, source in sources:
                 try:
-                    _sibling('board_merge').arm_deadline(source_conn, phase='contexts')
+                    _arm_source(source_conn, source, 'contexts')
                     for url, context in _pr_contexts(source.conn, flow_mods[1], evidence=source).items():
                         contexts[url].append(context)
                 except (OSError, RuntimeError, sqlite3.Error) as exc:
@@ -416,7 +433,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
             reader = _observations().reader(combined)
         for slug, source_conn, source in sources:
             try:
-                _sibling('board_merge').arm_deadline(source_conn, phase='projection')
+                _arm_source(source_conn, source, 'projection')
                 if slug in context_failures:
                     raise RuntimeError(context_failures[slug])
                 pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)
