@@ -5,8 +5,8 @@ environment, or an ``OWNER.md`` whose first line is ``card: t_<hex>[@host]`` in 
 script's directory (or an ancestor below $HOME). This ``pre_tool_call`` hook (plus ``claude_hook.py`` for Claude
 Code Bash) refuses ``launchctl disable|bootout|unload|remove|stop``, ``systemctl stop|disable|mask|kill`` and
 ``kill|pkill|killall`` of such a service, at top level or inside ``ssh <host> '<cmd>'`` / ``bash -c``, and from
-execute_code Python, unless the command carries ``owner-approved=<card id>``. Owner lookup reuses
-machine-investigate's collect.py (``valid_owner``, ``read_owner_md``, ``owner``); nothing here parses markers.
+execute_code Python, unless the command carries ``owner-approved=<card id>``. Owner lookup uses
+the plugin-owned owner_lib.py, vendored from machine-investigate's stdlib owner functions.
 Reloads (bootout then bootstrap of the same label) and kickstart/restart/start/enable/bootstrap are never refused.
 Shell segmenting is vendored from backend-restart-guard. ``SERVICE_OWNER_GUARD=off`` disables it.
 """
@@ -51,20 +51,12 @@ def enabled() -> bool:
     return os.environ.get("SERVICE_OWNER_GUARD", "on").lower() not in {"off", "0", "false", "no"}
 
 
-# ───────────── single-sourced owner parsing: machine-investigate/scripts/collect.py ─────────────
+# ───────────── plugin-owned owner parsing ─────────────
 def _load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
-
-def _collect_path() -> Path:
-    rel = Path("skills/devops/machine-investigate/scripts/collect.py")
-    for base in (HERE.parents[1], Path.home() / "code/hermes-mods"):
-        if (base / rel).exists():
-            return base / rel
-    raise FileNotFoundError("machine-investigate collect.py not found")
 
 
 _collect = _lib = None
@@ -73,7 +65,7 @@ _collect = _lib = None
 def libs():
     global _collect, _lib
     if _lib is None:
-        _collect = _load("sog_collect", _collect_path())
+        _collect = _load("sog_owner_lib", HERE / "owner_lib.py")
         lib = _load("sog_lookup_lib", HERE / "lookup_lib.py")
         for name in ("valid_owner", "read_owner_md", "parse_ps", "chain", "env_tags", "owner"):
             setattr(lib, name, getattr(_collect, name))
@@ -93,7 +85,7 @@ def remote_script(spec: dict) -> str:
     collect, lib = libs()
     return "\n".join([
         "from __future__ import annotations\nimport json, os, plistlib, re, subprocess, sys\nfrom pathlib import Path",
-        (HERE / "lookup_lib.py").read_text(),  # declares valid_owner = read_owner_md = None ...
+        (HERE / "lookup_lib.py").read_text(),  # owner_lib functions are appended below
         "import platform\nMAC = platform.system() == 'Darwin'",
         "TAG_KEYS = " + repr(collect.TAG_KEYS), "TASK_KEYS = " + repr(collect.TASK_KEYS),
         "TAG_RE = re.compile(" + repr(collect.TAG_RE.pattern) + ")",
@@ -1134,11 +1126,71 @@ def _ssh_parts(args: list) -> tuple:
             break
         opts.append(arg)
         i += 1
-        if len(arg) == 2 and arg[1] in takes_value and i < len(args):
-            opts.append(args[i])
-            i += 1
+        for offset, flag in enumerate(arg[1:], 2):
+            if flag in takes_value:
+                if offset == len(arg) and i < len(args):
+                    opts.append(args[i])
+                    i += 1
+                break
     dest = args[i] if i < len(args) else ""
     return opts, dest, " ".join(args[i + 1:])
+
+
+def _ssh_lookup_prefix(host: dict) -> Optional[list]:
+    """Build a lookup transport, never replay arbitrary model options.
+
+    Only target/identity selection and harmless flags are supported. Unknown
+    options (including config files, proxies, commands, logs and sockets) fail
+    closed before SSH starts. The user's pre-existing SSH config remains trusted.
+    """
+    dest = host.get("dest", "")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@%:+\[\]-]*", dest):
+        return None
+    opts, safe, i = host.get("opts", []), [], 0
+    while i < len(opts):
+        arg = opts[i]
+        i += 1
+        if not arg.startswith("-") or arg in {"-", "--"}:
+            return None
+        for offset, flag in enumerate(arg[1:], 2):
+            if flag in "46aACknqTtvXxyNf":
+                # These flags cannot execute code. TTY/stdin/session modes are
+                # not reused by the guard; only address family affects lookup.
+                if flag in "46":
+                    safe.append("-" + flag)
+                continue
+            if flag not in "ilpo":
+                return None
+            value = arg[offset:]
+            if not value:
+                if i == len(opts):
+                    return None
+                value = opts[i]
+                i += 1
+            if flag == "o":
+                pair = re.fullmatch(r"([A-Za-z]+)(?:\s*=\s*|\s+)(.+)", value)
+                if not pair:
+                    return None
+                key, value = pair[1].lower(), pair[2]
+            else:
+                key = {"i": "identityfile", "l": "user", "p": "port"}[flag]
+            if key == "port":
+                valid = bool(re.fullmatch(r"[0-9]{1,5}", value)) and 1 <= int(value) <= 65535
+            elif key == "user":
+                valid = bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value))
+            elif key == "identityfile":
+                valid = bool(value) and not value.startswith("-") and not any(c in value for c in "\r\n\0")
+            elif key in {"batchmode", "identitiesonly"}:
+                valid = value.lower() == "yes"
+            elif key == "connecttimeout":
+                valid = bool(re.fullmatch(r"[1-5]", value))
+            else:
+                return None
+            if not valid:
+                return None
+            safe.extend(["-o", key + "=" + value])
+            break
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] + safe + [dest]
 
 
 # ───────────── actions ─────────────
@@ -1383,8 +1435,9 @@ def _lookup(act: dict) -> dict:
         spec = {"kind": "systemd", "unit": act["unit"], "user": act["user"]}
     if not host:
         return local_lookup(spec)
-    opts = [o for o in host["opts"] if o not in {"-t", "-tt", "-T", "-n", "-f"}]
-    prefix = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] + opts + [host["dest"]]
+    prefix = _ssh_lookup_prefix(host)
+    if prefix is None:
+        return {"status": "failed", "error": "unsupported SSH lookup transport"}
     return remote_lookup(prefix, spec)
 
 
@@ -1533,6 +1586,10 @@ def _evaluate(text: str, actions: list) -> Optional[str]:
     if not stops:
         return None
     for act in stops:
+        if act["host"] and _ssh_lookup_prefix(act["host"]) is None:
+            return ("Refused: unsupported SSH options or destination in owner lookup. "
+                    "Use a configured host alias and only user, port or identity-file selection; "
+                    "the guard will not execute model-supplied SSH transport commands.")
         dropin, label = _pinned(act)
         if dropin:
             _log(_host_name(act["host"]), act, "pinned-owner", "refused (pinned owner)")
