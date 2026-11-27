@@ -2806,11 +2806,22 @@ def ssh_argv(cfg: dict) -> List[str]:
     return argv
 
 
+# Only a destination, never ssh options, URLs or shell syntax. Validate both components
+# so even a leading dash after user@ cannot be mistaken for a host option elsewhere.
+SSH_DESTINATION_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:@[A-Za-z0-9_][A-Za-z0-9_.-]*)?")
+
+
+def valid_ssh_destination(value: str) -> bool:
+    return isinstance(value, str) and SSH_DESTINATION_RE.fullmatch(value) is not None
+
+
 def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, now: Optional[float] = None,
             cfg: Optional[dict] = None) -> dict:
     """Mac/mini: ship new raw signals to the hub. The cursor only moves when the hub accepted them. Every pass sends
     a heartbeat line first (even with no signals), so the hub knows the forwarder is alive (signals/hosts.json) and
     its sweep flags a host whose forwarder went silent."""
+    if not valid_ssh_destination(hub):
+        return {"ok": False, "sent": 0, "pending": 0, "detail": "invalid ssh destination"}
     cur = load_cursor(home)
     sigs = collect(home, cur, host, now)
     cfg = cfg if cfg is not None else config(home)
@@ -2819,7 +2830,7 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
-        r = run(ssh_argv(cfg) + [hub, HUB_CMD], payload)
+        r = run(ssh_argv(cfg) + ["--", hub, HUB_CMD], payload)
         ok, detail = r.returncode == 0, (r.stdout or r.stderr or "").strip()[-200:]
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
@@ -2882,10 +2893,12 @@ SSHD_ANSWERED_RE = re.compile(r"Permission denied|Host key verification failed|R
 def probe_host(reach: str, cfg: dict, runner: Optional[Callable] = None) -> Tuple[bool, str]:
     """(awake, detail): one BatchMode ssh to `reach`. Awake = the login worked or sshd answered at all; asleep/off
     the network = connect timeout, no route, unresolvable."""
+    if not valid_ssh_destination(reach):
+        return False, "invalid ssh destination"
     run = runner or (lambda argv, stdin=None: subprocess.run(argv, input=stdin, capture_output=True, text=True,
                                                              timeout=30))
     try:
-        r = run(ssh_argv(cfg) + [reach, "true"], None)
+        r = run(ssh_argv(cfg) + ["--", reach, "true"], None)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"[:200]
     err = (r.stderr or r.stdout or "").strip()[-200:]
