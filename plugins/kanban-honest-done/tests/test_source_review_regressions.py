@@ -1,7 +1,9 @@
 """Behavioral regressions for independent source review B1–B5."""
 import importlib.util
 import multiprocessing
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -30,6 +32,17 @@ def test_b1_quoted_denial_records_semantic_target(tmp_path):
     env = {'HERMES_HOME': str(tmp_path)}
     consent.record('terminal', {'command': 'hermes kanban comment t_1234""5678 retry'}, DENIED, 'chat-a', env)
     assert consent.check_relay('kanban_comment', {'task_id': OWN}, ['chat-a'], env)
+
+
+@pytest.mark.parametrize('command', [
+    'hermes-hub request hub tasks default/t_1234""5678 comment retry',
+    "bash -c 'hermes kanban comment t_1234\"\"5678 retry'",
+    "bash -c 'hermes-hub request hub tasks default/t_1234\"\"5678 comment retry'",
+])
+def test_b1_nested_hub_and_shell_targets(tmp_path, command):
+    env = {'HERMES_HOME': str(tmp_path)}
+    stop(env)
+    assert consent.check_relay('terminal', {'command': command}, ['chat-a'], env)
 
 
 def test_b1_unresolved_write_cannot_skip_active_stop(tmp_path):
@@ -84,6 +97,26 @@ def test_b4_overflow_does_not_erase_prior_refusal(tmp_path):
 @pytest.mark.parametrize('flag', ['--title narrowed', "--body 'Reduced scope.'"])
 def test_b5_variable_own_target_is_not_exempt(flag):
     assert core.check_shell(f'T={OWN}; hermes kanban edit "$T" {flag}', OWN, lambda: [])
+
+
+@pytest.mark.parametrize('command,gate', [
+    ('hermes kanban comment t_1234""5678 retry', 'consent'),
+    (f'T={OWN}; hermes kanban edit "$T" --title narrowed', 'own'),
+])
+def test_b1_b5_real_shell_operand_equivalence(tmp_path, command, gate):
+    fake = tmp_path / 'hermes'
+    capture = tmp_path / 'argv'
+    fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE"\n')
+    fake.chmod(0o700)
+    subprocess.run(['/bin/sh', '-c', command], check=True,
+                   env={'PATH': str(tmp_path) + os.pathsep + '/usr/bin:/bin', 'CAPTURE': str(capture)})
+    assert capture.read_text().splitlines()[2] == OWN
+    if gate == 'consent':
+        env = {'HERMES_HOME': str(tmp_path)}
+        stop(env)
+        assert consent.check_relay('terminal', {'command': command}, ['chat-a'], env)
+    else:
+        assert core.check_shell(command, OWN, lambda: [])
 
 
 def _racing_update(home, operation, loaded, release, done):
