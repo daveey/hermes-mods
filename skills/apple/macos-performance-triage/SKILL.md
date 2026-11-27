@@ -24,7 +24,11 @@ is not measured CPU time or cores. Confirm attribution with process/thread CPU
 counters. Do not distribute an accounting residual across selected native thread
 families as if it were measured caller CPU: named threads can include already
 accounted scopes, and excluded threads can contain unaccounted work. Keep PID,
-revision and measurement window aligned. Native interpreter frames do not identify
+revision and measurement window aligned. Before interpreting a slow-pass log's item count,
+trace its argument in source: a returned delivery plan can be empty after expensive
+candidate scanning, so zero delivered/claimed chats does not prove zero candidates or
+justify skipping reconciliation. Separate accounting snapshot timestamps from live ps
+sampling boundaries; do not combine their deltas into one measured interval. Native interpreter frames do not identify
 the Python callback; a unique thread spawn proves its wrapper, not its initiating
 operation. Label any cross-window proportional allocation as a sensitivity scenario,
 not a basis for skipping real work. Do not blanket-exclude syscalls: SQLite `pread` chains identify useful
