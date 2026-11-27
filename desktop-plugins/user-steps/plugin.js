@@ -12,7 +12,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 17
+const VERSION = 18
 // The composer chrome is user-select:none app-wide; the companion queue and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -721,7 +721,27 @@ const failedText = op => sessionBusy(op)
 // withdraw and the recorded-decision status with Check status / Retry. The panel never decides without a canonical
 // request, and its decisions land here as `resolution`, so readback recovery needs no panel cooperation.
 export const panelActive = () => typeof window !== 'undefined' && !!window.__sessionPanel?.active
-export function DecisionRow({ request, route, call = api, unavailable = false }) {
+/** Whether the hosting panel drew THIS ask (exact owner/request/revision) with its options in the same render.
+ *  `coverage` comes from the mounted panel that hosts this queue; registration or a cached model alone is not
+ *  coverage. A collapsed panel counts the ask in its header instead of drawing it. */
+export function askCoverage(coverage, r) {
+  const key = requestKey(r)
+  // Mixed-version rollout: an older session panel draws the ask itself and never reports coverage. Stay silent
+  // like the queue that shipped with it, not "isn't showing this chat" beside a panel that is.
+  if (coverage?.state === 'legacy') return { covered: true, counted: false, reason: 'legacy' }
+  if (!coverage || typeof coverage !== 'object' || !key) return { covered: false, counted: false, reason: 'unmounted' }
+  if (coverage.collapsed && coverage.counted?.[key] === r.revision) return { covered: false, counted: true, reason: 'collapsed' }
+  if (coverage.state === 'presented' && coverage.drawn?.[key] === r.revision) return { covered: true, counted: false, reason: 'presented' }
+  return { covered: false, counted: false, reason: ['loading', 'unsupported', 'empty', 'presented'].includes(coverage.state) ? (coverage.state === 'presented' ? 'omitted' : coverage.state) : 'unmounted' }
+}
+export const COVERAGE_TEXT = {
+  loading: 'Loading this ask\u2019s options in session status\u2026',
+  unsupported: 'Session status isn\u2019t available for this chat, so this ask\u2019s options can\u2019t be shown. Nothing has been decided.',
+  empty: 'Session status hasn\u2019t shown this ask yet; its options appear there once it updates. Nothing has been decided.',
+  omitted: 'Session status hasn\u2019t shown this ask yet; its options appear there once it updates. Nothing has been decided.',
+  unmounted: 'Session status isn\u2019t showing this chat, so this ask\u2019s options can\u2019t be shown. Nothing has been decided.'
+}
+export function DecisionRow({ request, route, call = api, unavailable = false, coverage = null }) {
   const key = `${routeKey(route)}:${requestKey(request)}`
   const [state, setState] = useState(() => {
     const decision = recoverIntent(key, request)
@@ -947,9 +967,15 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   // Nothing for this plugin to draw under the panel: the panel already shows the ask and posts its plain options.
   if (remoteRetiring(r, state.operation)) return jsx('div', { 'data-remote-retiring': '', role: 'status', children: r.delivery?.text || 'Delivering…' })
-  if (!locked && state.phase === 'idle' && !own.length && !approvalPending && !canWithdraw && !editing && !state.error && !dismissal.note && !dismissal.error) return null
+  const cover = locked ? { covered: true } : askCoverage(coverage, r)
+  const quiet = state.phase === 'idle' && !editing && !state.error && !dismissal.note && !dismissal.error
+  // A collapsed panel still counts this ask in its header; the user minimized it, so nothing is drawn here.
+  if (!locked && quiet && cover.counted) return null
+  if (!locked && quiet && cover.covered && !own.length && !approvalPending && !canWithdraw) return null
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+    // Never an apparently actionable title-only row: say why this ask's options are not on screen.
+    !locked && !cover.covered && !cover.counted && jsx('div', { 'data-ask-coverage': cover.reason, role: 'status', style: { color: 'var(--muted-foreground)', fontSize: 12, padding: '2px 0 4px', overflowWrap: 'anywhere' }, children: COVERAGE_TEXT[cover.reason] || COVERAGE_TEXT.unmounted }),
     !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', style: delivering ? { color: 'var(--muted-foreground)' } : undefined, children: delivering ? `Delivering to chat… ${phaseText}` : phaseText }),
     state.phase === 'confirmed' && jsx('div', { 'data-owner-phase': ownerPhase(state.consumer), children: ownerPhaseText(state.consumer) }),
@@ -1040,18 +1066,50 @@ export function hasQueuePresentation() {
 export const panelWait = { ms: 10000, since: 0 }
 export const PANEL_MISSING_TEXT = 'Session panel did not load, so this chat\u2019s status and decisions can\u2019t be shown. ' +
   'Check Settings \u203a Plugins for session-panel, or desktop.log for \u201cruntime load failed (session-panel)\u201d.'
+export const PANEL_UNMOUNTED_TEXT = 'Session panel is loaded but isn\u2019t showing this chat, so its decisions can\u2019t be shown here.'
+/** The panel hosts the decision companion inside its own bounded frame. This plugin's composer contribution is only
+ *  the explicit error for a panel that never loaded (or never mounted for this chat), never a second queue. */
+const panelHostsQueue = () => panelActive() && typeof window.__sessionPanel.hostsQueue === 'function' && window.__sessionPanel.hostsQueue(decisionRoute())
+// Mixed-version rollout only: a session panel older than the hosting frame has no hostsQueue and never draws the
+// companion, so the queue keeps its own composer slot there and behaves as it did beside that panel.
+const LEGACY_COVERAGE = { state: 'legacy' }
+const legacyPanel = () => panelActive() && typeof window.__sessionPanel.hostsQueue !== 'function'
 export function PanelMissing() {
   const [, tick] = useState(0)
-  useEffect(() => { const t = setInterval(() => tick(v => v + 1), 1000); return () => clearInterval(t) }, [])
-  if (panelActive() || Date.now() - panelWait.since < panelWait.ms) return null
+  useEffect(() => {
+    const t = setInterval(() => tick(v => v + 1), 1000)
+    // React at once when a panel starts or stops hosting this chat's queue, not on the next second.
+    const fn = () => tick(v => v + 1)
+    window.addEventListener?.('hermes:session-panel-hosting', fn)
+    fn() // re-read after subscribing: a panel mounted in this same commit announced itself before we listened
+    return () => { clearInterval(t); window.removeEventListener?.('hermes:session-panel-hosting', fn) }
+  }, [])
+  if (!focusedId() || panelHostsQueue() || legacyPanel() || Date.now() - panelWait.since < panelWait.ms) return null
   const n = openAskCount()
-  return jsx('div', { role: 'alert', 'data-user-steps-panel-missing': '', style: { width: '100%', boxSizing: 'border-box', padding: 10, border: '1px solid var(--destructive, #ef4444)', borderRadius: 8, color: 'var(--foreground)', fontSize: 13 },
-    children: PANEL_MISSING_TEXT + (n ? ` ${n} decision${n === 1 ? ' is' : 's are'} waiting.` : '') })
+  return jsx('div', { role: 'alert', 'data-user-steps-panel-missing': panelActive() ? 'unmounted' : '', style: { width: '100%', boxSizing: 'border-box', padding: 10, border: '1px solid var(--destructive, #ef4444)', borderRadius: 8, color: 'var(--foreground)', fontSize: 13 },
+    children: (panelActive() ? PANEL_UNMOUNTED_TEXT : PANEL_MISSING_TEXT) + (n ? ` ${n} decision${n === 1 ? ' is' : 's are'} waiting.` : '') })
 }
 
 export const queuePoll = { ms: POLL_MS }
+/** The requests the queue draws a row for. The panel carries ordinary pending delivery; genuine failures/unknown
+ *  outcomes keep recovery here. */
+function queueRequests(snap, scope, audience = 'all') {
+  const panelCarries = r => {
+    if (!r.resolution || typeof window === 'undefined' || !window.__sessionPanel?.showsDecision?.(r.requestId)) return false
+    const op = operations.get(`${scope}:${requestKey(r)}`)
+    return !(op?.phase === 'unknown' || (op?.phase === 'failed' && !sessionBusy(op)) || op?.error && !sessionBusy(op))
+  }
+  return snap.requests.filter(r => representedInQueue(scope, r) && !panelCarries(r) && (audience === 'all' || (audience === 'agent') === agentPending(r)))
+}
+/** Whether ActionQueue currently renders anything for the focused chat (the same test it applies), so the hosting
+ *  panel paints no empty frame around a queue that draws nothing. */
+export function queueVisible() {
+  const route = decisionRoute(), scope = routeKey(route)
+  if (!route.session || canonical.scope !== scope) return false
+  return queueRequests(canonical, scope).length > 0 || !!canonical.error
+}
 // The session panel owns the frame, headings, options and minimize control.
-export function ActionQueue({ audience = 'all' } = {}) {
+export function ActionQueue({ audience = 'all', coverage = null } = {}) {
   const [snap, setSnap] = useState(canonical)
   useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
@@ -1065,18 +1123,13 @@ export function ActionQueue({ audience = 'all' } = {}) {
     return () => clearInterval(t)
   }, [])
   if (!route.session || snap.scope !== scope) return null
-  // The panel carries ordinary pending delivery; genuine failures/unknown outcomes keep recovery here.
-  const panelCarries = r => {
-    if (!r.resolution || typeof window === 'undefined' || !window.__sessionPanel?.showsDecision?.(r.requestId)) return false
-    const op = operations.get(`${scope}:${requestKey(r)}`)
-    return !(op?.phase === 'unknown' || (op?.phase === 'failed' && !sessionBusy(op)) || op?.error && !sessionBusy(op))
-  }
-  const requests = snap.requests.filter(r => representedInQueue(scope, r) && !panelCarries(r) && (audience === 'all' || (audience === 'agent') === agentPending(r)))
+  const requests = queueRequests(snap, scope, audience)
   if (!requests.length && (!snap.error || audience === 'agent')) return null
   return jsxs('section', { 'data-action-queue': '', 'data-embedded': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, color: 'var(--foreground)' }, children: [
     jsx('style', { children: '[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
     snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
-    jsx('div', { 'data-action-queue-body': '', style: { maxHeight: 'none', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: requests.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
+    // No scroll container of its own: the hosting panel body is the one bounded scroller (header stays reachable).
+    jsx('div', { 'data-action-queue-body': '', style: { minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: requests.map(r => jsx(DecisionRow, { request: r, route, coverage, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 
@@ -1159,16 +1212,17 @@ export default {
   register(ctx) {
     osApi = ctx?.os || null
     previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
-    // The session panel draws every ask (options, card tiles, Open card); this plugin keeps only the compact companion
-    // queue (free text, pending-delivery Check/Retry, plan request, withdraw). Without the panel it shows an error,
-    // never the old standalone queue + strip: a silent fallback hid a broken panel load behind an outdated view.
+    // The session panel draws every ask (options, card tiles, Open card) and hosts this plugin's compact companion
+    // queue (free text, pending-delivery Check/Retry, plan request, withdraw) inside its own bounded frame, so the
+    // composer gets one session-status block. This slot shows only the explicit error for a missing panel, never the
+    // old standalone queue + strip: a silent fallback hid a broken panel load behind an outdated view.
     panelWait.since = Date.now()
-    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => panelActive() ? jsx(ActionQueue, {}) : jsx(PanelMissing, {}) })
+    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => legacyPanel() ? jsx(ActionQueue, { coverage: LEGACY_COVERAGE }) : jsx(PanelMissing, {}) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, requestsForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestsForSource(canonical.requests, source) : [], presentationForSource, hasQueuePresentation, ActionQueue, openAskCount, openAskKeys }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, requestsForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestsForSource(canonical.requests, source) : [], presentationForSource, hasQueuePresentation, queueVisible, ActionQueue, openAskCount, openAskKeys }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

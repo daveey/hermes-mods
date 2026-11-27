@@ -324,11 +324,14 @@ export function sinceClock(sec, nowMs = Date.now()) {
 export const deliveryLook = look => look === 'delivery' || look === 'deploy'
 
 /** The card's wait look from the backend `wait` object: 'stalled' | 'delivery' | 'deploy' | 'waiting' | 'needs-you' | null.
- *  `delivery` = a non-stalled wait the backend names as CI or a deploy (`waiting_on` starts with `ci`/`deploy`). */
+ *  `delivery` = a non-stalled wait the backend names as CI or a deploy (`waiting_on` starts with `ci`/`deploy`).
+ *  `external_unknown` (core: a missed poll or an unread job, never a failure) keeps the producer's look: an unread
+ *  deploy watch is still a deploy wait, not the scheduled status colour. `external_down` keeps the status colour. */
+const PRODUCER_WAIT_STATES = new Set(['waiting', 'external_running', 'external_unknown'])
 export function waitLook(wait) {
   const state = wait && typeof wait === 'object' ? str(wait.wait_state) : ''
-  if ((state === 'waiting' || state === 'external_running') && (wait.wait_kind === 'deploy' || /^deploy\b/i.test(str(wait.waiting_on)))) return 'deploy'
-  if ((state === 'waiting' || state === 'external_running') && (/^(ci|deploy)\b/i.test(str(wait.waiting_on)) || wait.wait_kind === 'clock' || /^the clock until\b/i.test(str(wait.waiting_on)))) return 'delivery'
+  if (PRODUCER_WAIT_STATES.has(state) && (wait.wait_kind === 'deploy' || /^deploy\b/i.test(str(wait.waiting_on)))) return 'deploy'
+  if (PRODUCER_WAIT_STATES.has(state) && (/^(ci|deploy)\b/i.test(str(wait.waiting_on)) || wait.wait_kind === 'clock' || /^the clock until\b/i.test(str(wait.waiting_on)))) return 'delivery'
   return state === 'stalled' ? 'stalled' : state === 'human' ? 'needs-you' : state === 'waiting' ? 'waiting' : null
 }
 

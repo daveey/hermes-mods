@@ -38,6 +38,32 @@ const root = createRoot(document.getElementById('root'))
 const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
+for (const [name, lead] of [['clock_reason', /waiting on Event watch on service owners/], ['clock_unreasoned', /reason unavailable/]]) {
+  test(`clock wait ${name} paints the prerequisite before the timer`, async () => {
+    const { model, now } = publicCases[name]
+    await paint(m.renderModel(model, { now }))
+    const detail = document.querySelector('[data-row-detail]').textContent
+    assert.match(detail, lead)
+    assert.match(detail, /left \(until 2027-01-15 00:01 PST\)/)
+    assert.match(document.querySelector('[data-ask-title]').title, /Next actor: unknown \(the park recorded none\)/)
+    assert.doesNotMatch(document.querySelector('[data-ask-title]').title, /Next actor: the clock/, 'an older-core label names no actor')
+    assert.match(document.querySelector('[data-ask-title]').title, /Next check: the clock at 2027-01-15 00:01 PST/)
+    assert.ok(detail.search(lead) < detail.search(/left \(until/), 'prerequisite precedes the next-check time')
+  })
+}
+test('probe watch renders named actors and a complete separate backstop', async () => {
+  const { model, now } = publicCases.clock_probe
+  await paint(m.renderModel(model, { now }))
+  const detail = document.querySelector('[data-row-detail]').textContent
+  assert.match(detail, /waiting on Service rollout/)
+  assert.match(detail, /watching 2 cards/)
+  assert.match(detail, /left \(backstop 2027-01-15 00:01 PST\)/)
+  assert.match(detail, /long-worker.example.com/)
+  const hover = document.querySelector('[data-ask-title]').title
+  assert.match(hover, /Next actor: cards t_0000000000000001, t_0000000000000002 \(event watch\)/)
+  assert.match(hover, /Next check: clock backstop at 2027-01-15 00:01 PST/)
+  assert.doesNotMatch(hover, /Next actor: the clock/)
+})
 test('aged parked board data keeps its status and age in the panel and task chip', async () => {
   const { model, now } = publicCases.aged_parked
   const row = model.sections.waiting[0]
@@ -352,6 +378,13 @@ for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'ov
   assert.equal(actions[0][1].target.id, row.id)
   await paint(m.renderModel(model, { now: now + 60 }))
   if (state === 'normal') assert.equal(document.querySelector('[data-eta-left]').textContent, '12m')
+  // An unread watch (core external_unknown: missed poll, job unread) keeps the producer's colour on the chip.
+  for (const wait_state of ['external_unknown', 'external_running']) {
+   const wait = {...row.wait_eta, wait_kind:kind, wait_state, waiting_on: kind === 'clock' ? 'the clock until 2026-11-24 14:30 UTC' : `${kind} example`}
+   const [unread] = tasksEta.sessionTaskChips([{id:row.id, status:'scheduled', wait}])
+   assert.equal(unread.look, kind === 'deploy' ? 'deploy' : 'delivery', wait_state)
+   assert.equal(tasksEta.chipColor(unread.look), kind === 'deploy' ? '#a371f7' : '#38bdf8', wait_state)
+  }
   const wait = {...row.wait_eta, wait_kind:kind, wait_state:'external_running', waiting_on: kind === 'clock' ? 'the clock until 2026-11-24 14:30 UTC' : `${kind} example`}
   const [chip] = tasksEta.sessionTaskChips([{id:row.id, status:'scheduled', wait}])
   assert.equal(chip.look, kind === 'deploy' ? 'deploy' : 'delivery')
@@ -366,6 +399,32 @@ for (const kind of ['ci', 'deploy', 'clock']) for (const state of ['normal', 'ov
   assert.equal(document.querySelector('[data-eta-left]').style.color, etaColor)
  })
 }
+test('an unread hub-deploy watch (external_unknown) paints purple on the panel row, header, chip and card row', async () => {
+  const { model, now, wait } = cases.eta_deploy_unread
+  const row = model.sections.waiting[0]
+  assert.equal(row.wait_kind, 'deploy')
+  assert.equal(model.header.wait_kind, 'deploy')
+  await paint(m.renderModel(model, { now }))
+  const pip = document.querySelector('[data-row-pip="waiting"]')
+  assert.equal(pip.dataset.waitKind, 'deploy')
+  assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(163, 113, 247)')
+  assert.equal(document.querySelector('[data-model-pip="waiting"] [data-card-colour]').dataset.cardColour, 'violet')
+  assert.ok(document.querySelector('[data-line-row]').textContent.includes('waiting on hub deploy'))
+  const [chip] = tasksEta.sessionTaskChips([{ id: row.id, status: 'scheduled', board: 'default', title: 'deploy wait', wait }])
+  assert.equal(chip.look, 'deploy')
+  assert.equal(chip.waitingOn, wait.waiting_on, 'the chip keeps the named prerequisite')
+  await paint(React.createElement(tasksEta.CardRow, { chip, now: now * 1000 }))
+  const card = document.querySelector('[data-session-task="kanban-row"]')
+  assert.equal(card.dataset.waitLook, 'deploy')
+  assert.equal(card.firstChild.style.color, 'rgb(163, 113, 247)')
+  assert.ok(card.textContent.includes(wait.waiting_on))
+  // Controls: a down watch keeps the status colour; a CI park with an unread watch stays light blue.
+  const [down] = tasksEta.sessionTaskChips([{ id: 't_down', status: 'scheduled', wait: { ...wait, wait_state: 'external_down' } }])
+  assert.notEqual(down.look, 'deploy')
+  const [ci] = tasksEta.sessionTaskChips([{ id: 't_ci', status: 'scheduled', wait: { ...wait, wait_kind: 'ci', waiting_on: 'ci run 1' } }])
+  assert.equal(ci.look, 'delivery')
+  assert.equal(tasksEta.chipColor(ci.look), '#38bdf8')
+})
 test('ordinary waits and stale/blocked chip controls keep pips', async () => {
  const model = structuredClone(cases.eta_ci_normal.model)
  delete model.sections.waiting[0].wait_kind
