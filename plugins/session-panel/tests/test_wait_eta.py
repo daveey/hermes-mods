@@ -218,20 +218,50 @@ def test_ci_and_deploy_waits_keep_precedence_and_gain_the_reason(on, phrase):
     assert 'Waiting reason: exact-head checks' in painted['details'] and f'Next actor: {on}' in painted['details']
 
 
-def test_ordinary_timer_and_non_park_rows_are_untouched():
+_STUB_DIAGNOSTIC = {'actor': 'dispatcher', 'freshness': 'current', 'disposition': 'waiting',
+                    'summary': 'claimable on next dispatch', 'next_action': 'claim on next tick'}
+
+
+@pytest.fixture(params=['no-core', 'stub-core', 'real-core'])
+def diagnostic_source(request, monkeypatch):
+    """The ready-row dispatcher diagnostic in each supported environment.
+
+    no-core: an older core without kanban_nonrunning_reason (``diagnostic`` returns None); always runs.
+    stub-core: a deterministic diagnostic, so the present branch runs without core; always runs.
+    real-core: the installed core's selector; only this branch needs core.
+    """
+    if request.param == 'no-core':
+        monkeypatch.setattr(model, 'diagnostic', lambda row, now: None)
+    elif request.param == 'stub-core':
+        monkeypatch.setattr(model, 'diagnostic', lambda row, now: dict(_STUB_DIAGNOSTIC))
+    else:
+        pytest.importorskip('hermes_cli.kanban_nonrunning_reason')
+    return request.param
+
+
+def _assert_ready_diagnostic(row, source):
+    """A ready row's only "Next actor:" line is the dispatcher diagnostic's own, never a park's."""
+    actors = [d for d in row['details'] if d.startswith('Next actor:')]
+    if source == 'no-core':
+        assert 'non_running_reason' not in row and actors == []
+        return
+    why = row['non_running_reason']
+    if source == 'stub-core':
+        assert why == _STUB_DIAGNOSTIC
+    assert actors == [f'Next actor: {why.get("actor") or "unknown"}']
+
+
+def test_ordinary_timer_and_non_park_rows_are_untouched(diagnostic_source):
     for status, wait in (('todo', {}), ('ready', {}), ('running', {}),
                          ('scheduled', {'wait_state': 'waiting', 'waiting_on': 'external vendor'})):
         m = model.reduce_panel(bundle(task(status=status, wait=wait)), now=NOW)
         row = next(r for rows in m['sections'].values() for r in rows)
         assert 'wait_reason' not in row and 'wait_next_actor' not in row
         assert not any(d.startswith(('Waiting reason:', 'Next check:')) for d in row['details'])
-        # A ready row's "Next actor:" is the dispatcher diagnostic's own (independent evidence), never a park's.
-        actors = [d for d in row['details'] if d.startswith('Next actor:')]
         if status == 'ready':
-            why = row['non_running_reason']
-            assert actors == [f'Next actor: {why.get("actor") or "unknown"}']
+            _assert_ready_diagnostic(row, diagnostic_source)
         else:
-            assert actors == []
+            assert not any(d.startswith('Next actor:') for d in row['details'])
 
 
 def test_withdrawing_a_park_keeps_independent_diagnostic_lines():
@@ -243,13 +273,14 @@ def test_withdrawing_a_park_keeps_independent_diagnostic_lines():
     assert v == {'details': ['Blocking card: t_1 (running)', 'Next actor: unknown', 'Reason freshness: current']}
 
 
-def test_ready_row_diagnostic_survives_after_a_recovered_park():
+def test_ready_row_diagnostic_survives_after_a_recovered_park(diagnostic_source):
     """A card that left its park for ready carries only the dispatcher's diagnostic actor, no stale park fields."""
     row = task(status='ready', wait={'wait_state': 'waiting', 'waiting_on': CLOCK, 'waiting_since': NOW - 300,
                                      'prerequisite': WHY, 'next_actor': 'the clock (timed check)'})
     painted = next(r for rows in model.reduce_panel(bundle(row), now=NOW)['sections'].values() for r in rows)
+    # Stale park withdrawal holds in every environment, with or without core's diagnostic.
     assert 'wait_reason' not in painted and 'wait_next_actor' not in painted
     assert not any(d.startswith(('Waiting reason:', 'Next check:')) or d == 'Next actor: the clock (timed check)'
                    for d in painted['details'])
-    assert 'non_running_reason' in painted
-    assert any(d.startswith('Next actor:') for d in painted['details'])
+    assert not any(WHY in d for d in painted['details'])
+    _assert_ready_diagnostic(painted, diagnostic_source)
