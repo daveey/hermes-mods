@@ -16,6 +16,9 @@ HEAVY = ['pytest', 'cargo build --release', './build.sh', 'py""test', "ca''rgo b
 # 6093400492, 6093461628, 6093503973, 6093656803) plus the original C1-C4 fixtures. Repros that need real
 # script files on disk (`bash run.sh; x=$(cd proj)` family) stay in tests/test_source_review.py.
 ANSI_ARITH_PAIRS = [
+    ('echo "$(( $(pytest) + 1 ))"', 'echo "$(( $(echo 0) + 1 ))"'),
+    ('echo "$(( `pytest` + 1 ))"', 'echo "$(( `echo 0` + 1 ))"'),
+    ('cat <<EOF\n$(( $(pytest) + 1 ))\nEOF', 'cat <<EOF\n$(( $(echo 0) + 1 ))\nEOF'),
     ('echo "$((pytest) | (ls))"', 'echo "$((echo ok) | (ls))"'),
     ('echo "$((pytest)|(true))"', 'echo "$((echo ok)|(true))"'),
     ('echo "$((true)|(pytest))"', 'echo "$((true)|(echo ok))"'),
