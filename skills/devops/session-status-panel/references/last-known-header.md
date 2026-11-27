@@ -1,3 +1,7 @@
-# Last-known header freshness
+# Last-known header and task freshness
 
 Preserve a backend-authored last-known header label when the current bundle is unvouched as well as when its TTL expires; `vouched=false` removes current execution trust, not historical display evidence. Render `<label> · synced <age> ago` only with a positive finite nonfuture source timestamp, retaining unknown effective state and a neutral stale stripe. Missing/invalid/future clocks must not invent a zero-second sync age. Test fresh, 55-second unvouched, 30-minute, future-clock and no-state cases through the real Python reducer and mounted Desktop renderer; the header is painted by session-panel, not session-tasks.
+
+## A formerly red human task appears amber
+
+For `status unknown · last known: needs_you` under Waiting, inspect the renderer's `modelFreshness` and `expireNativeWaits` before tracing backend classification. The renderer can move an originally correct needs-you card into Waiting after source expiry or loss of trust, retain its historical detail, and remove decision controls. Its freshness TTL is capped at 60 seconds; the Waiting section supplies the amber marker. Compare the screenshot's sync age with this bound, and distinguish source computation age from transport heartbeats. This establishes the display mechanism, not why refresh failed or whether the human request remains open; those require exact-owner source/request evidence.
