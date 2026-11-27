@@ -10,6 +10,20 @@ Optional [App inventory routing and shared PAT budget](APP-INVENTORY.md) include
 runtime fields, incomplete-cache semantics, and the required ledger-safe rollback
 order. Reverting code before migrating the capped ledger is not safe.
 
+## CI panel inventory and freshness
+
+The panel discovers runners from complete GitHub scope enumerations, not host
+bindings or a runner-name allowlist. Repository-level registrations require the
+actual workload repository to be enrolled: an organization runner list does not
+include them. Two repositories with similar names can both remain valid; canonical
+rename maintenance cannot identify which one runs a workload. Verify the enrolled
+repository against its Actions runner endpoint when a new runner is missing.
+
+Fleet slot history uses each runner's `meta.provenance` observation timestamp from
+the inventory service. The CI footer distinguishes GitHub observation age from
+transport receipt age; polling or push heartbeats never renew the source age.
+Unknown source timestamps remain explicitly unknown.
+
 ## Collector and API deployment
 
 The manifest declares the collector's systemd/launchd service and

@@ -232,6 +232,22 @@ def test_ci_runners_grouped_into_machines_with_one_slot_each():
     assert {s['state'] for g in stale['machines'] for s in g['slots']} == {'unknown'}
 
 
+def test_ci_uses_real_inventory_provenance_not_snapshot_generation_time():
+    # Service.inventory emits timestamps in meta.provenance, NOT in runner rows.
+    row = dict(id='runner_one', display_name='new-mini-ci', registration='online',
+               activity='busy', freshness='fresh', labels=['self-hosted', 'macOS'])
+    observed = '2026-11-20T04:09:25Z'
+    inventory = dict(meta=dict(freshness='fresh', observed_at='2026-11-20T04:23:25Z',
+        provenance=[dict(source_id='runner_one', observed_at=observed)]), data=dict(runners=[row]))
+    out = fleet.ci_workers(inventory)
+    slot = out['machines'][0]['slots'][0]
+    assert slot['state'] == 'busy'
+    assert slot['last_observed'] == dict(state='busy', observed_at=observed)
+    # A new registration is discovered from the whole source inventory, not bindings.
+    inventory['data']['runners'].append(dict(row, id='runner_two', display_name='another-new-mini-ci'))
+    assert len(fleet.ci_workers(inventory)['machines']) == 2
+
+
 def test_ci_stale_display_history_does_not_restore_authoritative_state():
     rows = [dict(display_name=name, registration=registration, activity=activity,
                  freshness=freshness, observed_at='2026-11-20T04:09:25Z', labels=[])

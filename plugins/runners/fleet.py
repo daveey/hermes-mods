@@ -324,14 +324,14 @@ def _slot(row, fresh):
     return 'offline' if row.get('registration') == 'offline' else 'unknown'
 
 
-def _last_observed(row):
+def _last_observed(row, observed_at=None):
     """Display-only history; never a source of repair eligibility or fresh capacity."""
     if row.get('freshness') not in ('fresh', 'stale'):
         return None
     registration, activity = row.get('registration'), row.get('activity')
     state = ('offline' if registration == 'offline' else activity
              if registration == 'online' and activity in ('busy', 'idle') else None)
-    return dict(state=state, observed_at=row.get('observed_at')) if state else None
+    return dict(state=state, observed_at=observed_at or row.get('observed_at')) if state else None
 
 
 def host_load(snapshot, now_s):
@@ -393,6 +393,9 @@ def ci_workers(inventory, loads=None):
     """
     meta, data = inventory['meta'], inventory['data']
     fresh = meta.get('freshness') == 'fresh'
+    # Service.inventory keeps per-runner source times in provenance. The top-level
+    # observation time is a collector tick, not when every GitHub scope was read.
+    observations = {p['source_id']: p.get('observed_at') for p in meta.get('provenance', [])}
     groups, hidden = {}, 0
     for row in data.get('runners') or []:
         if row.get('registration') == 'missing':
@@ -404,7 +407,7 @@ def ci_workers(inventory, loads=None):
             g['load'] = loads[row['host_id']]
         g['slots'].append(dict(id=row.get('id'), runner=row.get('display_name'),
                                state=_slot(row, fresh), labels=list(row.get('labels') or []),
-                               last_observed=_last_observed(row),
+                               last_observed=_last_observed(row, observations.get(row.get('id'))),
                                warning=row.get('readiness') == 'fail' and row.get('registration') == 'online'))
         if row.get('readiness') == 'fail' and row.get('registration') == 'online':
             failed = (row.get('readiness_evidence') or {}).get('failed') or []
