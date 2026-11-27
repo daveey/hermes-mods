@@ -50,10 +50,14 @@ def test_merge_known_and_missing_board_metrics():
                                cells=[dict(t=100, running=running, cap=2, state=state, rejected=rejected)]),
                     spend=dict(hour=1., day=2., week=3.))
     merged = metrics.merge({'work': row(1)}, {'work': row(1, 'rejecting', 2)})['work']
-    assert merged['ticks']['cells'][0] == dict(t=100, running=2, cap=2, state='rejecting', rejected=2)
+    assert merged['ticks']['cells'][0]['running'] is None  # independent peaks aren't concurrent
+    parts = merged['ticks']['cells'][0]['components']
+    assert [(c['running'], c['state'], c['rejected']) for c in parts] == [(1, 'partial', 0), (1, 'rejecting', 2)]
     assert merged['spend'] == dict(hour=2., day=4., week=6.)
     unknown = metrics.merge({'work': row(1)}, {'work': dict(ticks=None, spend=None)})['work']
-    assert unknown == dict(ticks=None, spend=None)
+    assert unknown['spend'] is None
+    parts = unknown['ticks']['cells'][0]['components']
+    assert parts[0]['running'] == 1 and parts[1]['reason'] == 'no samples'
     unknown = metrics.merge({'work': row(None, 'unknown', None)}, {'work': row(1)})['work']
     assert unknown['ticks']['cells'][0]['state'] == 'unknown'
     assert unknown['ticks']['cells'][0]['running'] is None

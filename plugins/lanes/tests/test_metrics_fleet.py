@@ -22,11 +22,13 @@ def test_registry_configured_capacity_not_utilization_or_pickup_policy():
                   'metrics': {'active_card_runs': 99}, 'last_seen': 0},
         'worker': {'max_card_runs': 5, 'hold': False},
         'zero': {'state': 'active', 'max_card_runs': 0},
+        'pinned-unbounded': {'state': 'active', 'pinned_only': True, 'max_card_runs': None},
+        'unknown-capacity': {'state': 'active', 'max_card_runs': None},
         'held': {'state': 'active', 'hold': True, 'max_card_runs': None},
         'retired': {'state': 'retired', 'max_card_runs': 'invalid'},
     }}
     before = deepcopy(registry)
-    assert load().registry_slots(registry) == 8
+    assert load().registry_slots(registry) == 5  # pinned-only capacity is not shared pool
     assert registry == before
 
 
@@ -40,8 +42,8 @@ def test_registry_unavailable_malformed_and_empty_are_distinct(registry, expecte
     assert load().registry_slots(registry) == expected
 
 
-@pytest.mark.parametrize('cap', [None, True, False, -1, 1.5, '4'])
-def test_active_unknown_or_unbounded_capacity_never_becomes_partial_fleet(cap):
+@pytest.mark.parametrize('cap', [True, False, -1, 1.5, '4'])
+def test_malformed_capacity_invalidates_pool(cap):
     assert load().registry_slots({'machines': {'known': {'max_card_runs': 4},
                                                'unknown': {'max_card_runs': cap}}}) is None
 
