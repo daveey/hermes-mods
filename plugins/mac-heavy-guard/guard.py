@@ -875,8 +875,8 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
                 # Class fallback (F11/F12): an unmodeled construct before a `case` inside a substitution
                 # (coproc/function/time/elif keywords, `${...}` parameter text, any unknown prefix word list)
                 # plus a heavy-command token anywhere in the command text holds, instead of enumerating more forms.
-                if _HEAVY_TOKEN.search(text) and (
-                        re.search(r"(?:^|[\s;&|({!])(?:coproc|function|time|elif)\b", prefix) or "${" in prefix):
+                # F13: unconditional (a raw-text heavy-token test is bypassed by quote splices, escapes, scripts).
+                if re.search(r"(?:^|[\s;&|({!])(?:coproc|function|time|elif)\b", prefix) or "${" in prefix:
                     raise _UnsupportedSubstitution
                 # F10: a quoted/escaped paren inside a NAME substitution defeats the regex collapse below, so hold
                 # whenever a coproc/function keyword is followed by any substitution before this `case`.
@@ -901,6 +901,9 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
                              r"time(?:\s+-p)?(?:\s+--)?|coproc(?:\s+" + word + r")?|"
                              r"function\s+" + word + r")\s+)*$", prefix):
                     raise _UnsupportedSubstitution
+            # F14: `${x:-)}` hides a `)` this scanner would read as the end of the substitution; hold.
+            if level and text.startswith("${", i) and re.match(r"\$\{[^}]*[()]", text[i:]):
+                raise _UnsupportedSubstitution
             if c == "\\":
                 out.append(text[i:i + 2])
                 i += 2

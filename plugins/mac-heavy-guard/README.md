@@ -35,9 +35,11 @@ exported opt-out for that form (tailnet policy does not honor this opt-out);
 quoted `case` data and `echo case` remain data. This is an explicit
 inspection hold, not a claim that every case body is heavy.
 Class fallback: a `case` inside a substitution that follows an unmodeled construct (`coproc`, `function`,
-`time`, `elif`, or `${...}` text) is refused when a heavy-command token (cargo, pytest, docker, pip, make, swift,
-...) appears anywhere in the command text. False refusals: such commands that only mention a heavy word as data;
-use the local exported `MAC_HEAVY_OK=1` opt-out.
+`time`, `elif`, or `${...}` text) is refused unconditionally, with no heavy-word test (a raw-text test is
+bypassed by quote splices, escapes and scripts). A `${...}` containing a parenthesis inside any substitution
+(`$(echo ${x:-)})`) is held too, since the scanner would end the substitution at that `)`. False refusals:
+such commands that only mention a heavy word as data, or contain no heavy command at all; use the local
+exported `MAC_HEAVY_OK=1` opt-out.
 The public `commands()` API still yields only simple argv lists, recursively
 flattening substitution bodies for consumers such as tailnet. Inspection holds
 raise `ValueError` there, so consumers refuse rather than treating private events
