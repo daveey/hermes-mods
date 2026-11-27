@@ -358,7 +358,7 @@ def test_follows_scripts_two_levels_deep(tmp_path):
     _script(tmp_path, "./c.sh\n", "b.sh")
     _script(tmp_path, "./b.sh\n", "a.sh")
     assert blocked("terminal", command="./b.sh", workdir=str(tmp_path))  # b -> c: two scripts followed
-    assert not blocked("terminal", command="./a.sh", workdir=str(tmp_path))  # a -> b -> c: third not followed
+    assert blocked("terminal", command="./a.sh", workdir=str(tmp_path))  # third script needs explicit opt-out
 
 
 def test_allows_narrow_missing_optout_and_non_shell_scripts(tmp_path):
