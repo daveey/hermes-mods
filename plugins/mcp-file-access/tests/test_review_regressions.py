@@ -91,7 +91,9 @@ class ReviewTests(Base):
         result = core.rewrite_result(tool_name=tool, tool_call_id='c1',
                                      result='Saved ' + staged['requestFilePath'] + ' and ' + staged['responseFilePath'])
         self.assertNotIn('Saved ' + str(bad), result)
-        self.assertIn('not delivered', result)
+        self.assertEqual(result, 'Saved not delivered and ' + str(good))
+        self.assertTrue(bad.is_dir(), 'refused directory must survive')
+        self.assertEqual(good.read_text(), 'output')
 
     def test_transform_before_post_reports_refusal_and_delivers_sibling(self):
         tool = 'mcp__chrome_devtools__get_network_request'
@@ -107,7 +109,9 @@ class ReviewTests(Base):
         core.finish(tool_name=tool, tool_call_id='c1')
         self.assertTrue(good.exists())
         self.assertNotIn('Saved ' + str(bad), result)
-        self.assertIn('not delivered', result)
+        self.assertEqual(result, 'Saved not delivered and ' + str(good))
+        self.assertTrue(bad.is_dir(), 'refused directory must survive')
+        self.assertEqual(good.read_text(), 'output')
         self.assertEqual(core._staged, {})
 
     def test_finish_concurrent_with_prepare_and_cleanup(self):
