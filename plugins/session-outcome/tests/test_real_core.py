@@ -260,6 +260,9 @@ def test_open_step_makes_real_core_say_decision(real, monkeypatch):
     plugin._llm = lambda s, u: "NO"
     us = plugin._user_steps()
     us.add_step("chat", "Ship it now?", ["Yes", "Later"])
+    # This test checks the synchronous gate, not overlapping refresh/open lifetimes.
+    # Finish the add's real worker before derive/gate can race its last WAL close.
+    _drain(plugin)
     out = so.derive_outcome("chat", ignore_live_turn=True, pending_reply="Looking at it.")
     assert out["kind"] == "decision" and out["items"][0]["question"] == "Ship it now?"
     # The reply may resolve that step after the gate (user-steps' transform): the gate judges the reply itself.
