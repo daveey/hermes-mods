@@ -287,6 +287,44 @@ def test_cold_http_returns_ask_without_constructing_change_key(keyed, monkeypatc
         router.stop_delivery()
 
 
+@pytest.mark.parametrize('error', [sqlite3.OperationalError, OSError])
+def test_cold_http_reader_warmup_failure_still_returns_ask(keyed, monkeypatch, tmp_path, error):
+    """An optional retained reader must never gate the real first-response work."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_withdrawal import load_module, ROOT
+    k = keyed
+    scheduled, failed_opens = [], []
+    monkeypatch.setitem(k.mod, '_schedule', lambda m, o, passes: scheduled.append(set(passes)))
+    original_open = k.mod['_open_ro']
+
+    def fail_store_reader(path):
+        if str(path) == str(k.store.path):
+            failed_opens.append(str(path))
+            raise error('fixture retained-reader open failure')
+        return original_open(path)
+
+    monkeypatch.setitem(k.mod, '_open_ro', fail_store_reader)
+    api = load_module('cold_reader_failure_api', ROOT / 'dashboard/plugin_api.py')
+    api.RETRY_INTERVAL_S = 0
+    app = FastAPI()
+    router = api.create_router(ledger_dir=tmp_path / 'ledger', state_db=k.state, action_store=k.store,
+                               owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid), kanban_mirror=k.mirror)
+    app.include_router(router)
+    try:
+        with TestClient(app) as client:
+            response = client.get('/requests', params={'session': OWNER['storedSessionId']})
+        assert failed_opens, 'fault injection did not exercise retained-reader warming'
+        assert response.status_code == 200
+        assert [r['title'] for r in response.json()['requests']] == ['Choose a color']
+        assert len(k.passes) == 1
+        assert k.mod['_local_seen'](k.mod['_local_key'](k.mirror, OWNER))
+        assert k.mod['encoded'](OWNER) not in k.mod['_MEMO']
+        assert scheduled == [{'remote'}]
+    finally:
+        router.stop_delivery()
+
+
 def test_cold_full_failure_clears_stale_memo_without_warming_and_schedules_remote(keyed, monkeypatch):
     k = keyed
     settle(k)  # the memo can outlive local-seen LRU eviction

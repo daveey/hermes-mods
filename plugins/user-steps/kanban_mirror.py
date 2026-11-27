@@ -1154,8 +1154,11 @@ class Mirror:
                 # the full pass's short ActionStore reads repeatedly become the
                 # last WAL connection (schema/open/close work for every binding).
                 # Release the entry lock BEFORE reconciliation; no global pass lock.
-                with _stage('local_store_reader'), _kept(self.store.path):
-                    pass
+                try:
+                    with _stage('local_store_reader'), _kept(self.store.path):
+                        pass
+                except (sqlite3.Error, OSError):
+                    pass  # Optional warming must never skip the full reconciliation.
             now = time.monotonic()
             with _MEMO_LOCK:
                 memo = _MEMO.get(okey)
