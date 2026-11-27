@@ -80,6 +80,45 @@ def test_canonical_only_ask_is_not_repeated_as_agent_hold_reason():
     assert human()['action'] not in json.dumps(child)
 
 
+@pytest.mark.parametrize('first_human', [False, True])
+@pytest.mark.parametrize('second_state', ['open', 'dismissed'])
+def test_all_direct_parent_diagnostics_mask_human_asks(first_human, second_state):
+    b = outline_case({'t_a': ['t_b', 't_c']}, displayed=['t_a'])
+    b['gateway'] = 'remote'
+    imperative = 'Plug the hardware key into the computer and unlock it.'
+    for pid, is_human in [('t_b', first_human), ('t_c', True)]:
+        parent = b['cards'][pid]['detail']['task']
+        if is_human:
+            parent.update(status='blocked', human_request={**human(), 'action': imperative},
+                          block_kind='needs_input', block_reason=imperative)
+    r = request(second_state)
+    r['scope']['sourceRefs'][0]['id'] = 't_c'
+    b['requests'] = [r]
+    operational = 'accountable owner completes its acceptance'
+    deps = [{'task_id': pid, 'trigger': pid + ': ' +
+             (imperative if is_human else operational), 'restricted': True}
+            for pid, is_human in [('t_b', first_human), ('t_c', True)]]
+    joined = '; '.join(d['trigger'] for d in deps)
+    b['cards']['t_a']['detail'].update(source='live', task=dict(b['tasks'][0]), actionability={
+        'version': 1, 'task_id': 't_a', 'status': 'todo', 'evidence_state': 'known',
+        'owner': {'kind': 'assignee', 'refs': ['worker']},
+        'action': 'satisfy_dependency', 'instruction': joined,
+        'contract_key': 'source-contract', 'escalation': {'at': None},
+        'violations': [], 'source_refs': ['source-event'],
+        'blocker': {'prerequisite': 'Parents unfinished', 'trigger': joined},
+        'dependencies': deps})
+    original = json.dumps(b, sort_keys=True)
+    child = rows(reduce(b))['t_a']
+    assert json.dumps(b, sort_keys=True) == original
+    assert imperative not in json.dumps(child)
+    a = child['actionability']
+    assert 't_c' in a['dependencies'][1]['trigger']
+    assert ('your check' in a['dependencies'][1]['trigger']) == (second_state == 'open')
+    assert a['instruction'] == a['blocker']['trigger'] == '; '.join(d['trigger'] for d in a['dependencies'])
+    if not first_human:
+        assert a['dependencies'][0]['trigger'] == 't_b: ' + operational
+
+
 def test_nonhuman_dependency_keeps_its_operational_reason():
     b = outline_case({'t_a': ['t_b']}, displayed=['t_a'])
     b['cards']['t_b']['detail']['task'].update(status='blocked', block_reason='Cooldown window')

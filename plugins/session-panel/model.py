@@ -477,13 +477,13 @@ def wait_target(row, bundle, detail):
     return None
 
 
-def wait_parents(dep, bundle):
+def wait_parents(dep, bundle, *, primary=True):
     """Hydrated next hops shared by the wait label and outline; no source reads."""
     # Reducer rows already crossed the listed-coordinate boundary. Rechecking
     # their presentation defaults would discard accepted legacy dependencies.
     hydration = obj(dep['_accepted_detail'] if '_accepted_detail' in dep else
                     owned_card(dep, bundle).get('detail'))
-    if text(obj(dep.get('wait')).get('waiting_on')):
+    if primary and text(obj(dep.get('wait')).get('waiting_on')):
         primary = wait_target(dep, bundle, hydration)
         return [primary] if primary else []
     parents = obj(hydration.get('links')).get('parents') or []
@@ -1056,6 +1056,19 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         blocker_requests = [r for r in requests if dependency and
                             any(_matches(blocker, a, same_gateway) for a in _aliases(r))]
         dependency_check = dependency_human and (live_request(blocker) or not blocker_requests)
+        # Diagnostics describe all direct parents, not only the selected wait
+        # leaf. Keep their operational triggers while masking each human ask.
+        human_waits = []
+        for parent in wait_parents(row, bundle, primary=False):
+            if not (human_owned(parent) or live_request(parent)):
+                continue
+            matched = [r for r in requests if any(_matches(parent, a, same_gateway) for a in _aliases(r))]
+            check = live_request(parent) or not matched
+            title = clean(parent['title'])[:WAIT_MAX]
+            label = 'your check' if check else text(parent.get('status'))
+            human_waits.append((parent, f'waiting on: {title} ({label})'))
+        if human_waits:
+            human_dependency_waits[k] = human_waits
         why = '' if dependency_human else wait_reason(blocker, bundle)
         if why:
             v['details'].append('Blocking reason: ' + why)
@@ -1087,7 +1100,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             dependency_prefix = f'waiting on: {title}{dep_state}{location}'
             dependency_prefixes[k] = (key(dependency), dependency_prefix)
             if dependency_human:
-                human_dependency_waits[k] = (dependency['id'], dependency_prefix)
+                human_dependency_waits.setdefault(k, []).append((dependency, dependency_prefix))
             dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
