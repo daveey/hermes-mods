@@ -114,6 +114,20 @@ for kind, on in [('ci', 'ci example/repo'), ('deploy', 'deploy example-service')
         cases[f'eta_{kind}_{suffix}'] = f.bundle(f.task(status='scheduled', wait={
             'wait_state': 'external_running', 'waiting_on': on, 'waiting_since': f.NOW - waited,
             'waited_since': f.NOW - waited, 'expected_s': expected, 'estimate_source': 'fixture history'}))
+# The reported row: a scheduled park on a hub core deploy whose external watch is unread (core external_unknown).
+DEPLOY_UNREAD_WAIT = {'wait_state': 'external_unknown', 'wait_kind': 'deploy',
+                      'waiting_on': 'deploy core 0000000 → example/core mirror main (hub core deploy)',
+                      'waiting_since': f.NOW - 600, 'external': {'health': 'ok', 'job': 'unknown'}}
+cases['eta_deploy_unread'] = f.bundle(f.task(status='scheduled', wait=DEPLOY_UNREAD_WAIT))
+for _name, _on in (('clock_reason', 'the clock until 2027-01-15 08:01 UTC (Event watch on service owners; backstop at nightly rollout 10:30Z)'),
+                   ('clock_unreasoned', 'the clock until 2027-01-15 08:01 UTC')):
+    cases[_name] = f.bundle(f.task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': _on, 'waiting_since': f.NOW - 300}))
+cases['clock_probe'] = f.bundle(f.task(status='scheduled', hostname='long-worker.example.com', wait={
+    'wait_state': 'waiting', 'waiting_on': 'the clock until 2027-01-15 08:01 UTC',
+    'waiting_since': f.NOW - 300, 'prerequisite': 'Service rollout verification completes',
+    'watching': ['t_0000000000000001', 't_0000000000000002'],
+    'next_actor': 'cards t_0000000000000001, t_0000000000000002 (event watch)',
+    'backstop_at': f.NOW + 600}))
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
@@ -128,11 +142,12 @@ feed_spec.loader.exec_module(feed_module)
 producer = feed_module.Feed(None, emit=lambda _: None, clock=lambda: f.NOW, full_every_s=60)
 fixtures = {}
 for name, b in cases.items():
-    timing = name in ('relative_clock', 'elapsed_layout', 'aged_parked') or name.startswith(('agent_held_', 'eta_'))
+    timing = name in ('relative_clock', 'elapsed_layout', 'aged_parked', 'clock_reason', 'clock_unreasoned') or name.startswith(('agent_held_', 'eta_'))
     model = f.model.reduce_panel(b, now=f.NOW, projector=f.project, wire=timing)
     if name == 'elapsed_layout' or name.startswith('eta_'):
         model = producer._client_bundle(name, {**b, 'model': model}, True)['model']
     fixtures[name] = {'model': model, 'now': f.NOW}
+fixtures['eta_deploy_unread']['wait'] = DEPLOY_UNREAD_WAIT
 producer.stopped.set()
 print(json.dumps({**fixtures,
     **{'header_clock_' + name: case for name, case in f.header_clock_cases().items()}}))
