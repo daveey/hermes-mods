@@ -236,6 +236,14 @@ def check(text, guard, cwd="", depth=0, inherited=None, *, remote=False, in_home
         return "shell syntax exceeds the bounded live-database safety analysis; use explicit paths and swap_db.py"
 
 
+def _shallow(pipeline, blocks, braces):
+    # A compound command that is itself a pipeline element (`ls | { cd X && rm; }`,
+    # `ls | while ...`) runs inside the pipeline's subshell: its own &&/||/;
+    # must not restore the snapshot taken before it. Restore only once nesting
+    # is back at (or above) the depth where the snapshot was taken.
+    return blocks <= pipeline[7][0] and len(braces) <= pipeline[7][1]
+
+
 def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     if depth > 8:
         return "shell execution nesting exceeds the bounded live-database safety analysis"
@@ -253,8 +261,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     for index, raw in enumerate(segments):
         budget.spend(1)
         if raw in (["&&"], ["||"]):
-            if pipeline is not None and pipeline[0] == "|":
-                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline
+            if pipeline is not None and pipeline[0] == "|" and _shallow(pipeline, blocks, braces):
+                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline[:7]
                 pipeline = None
             if raw == ["&&"] and succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
@@ -273,8 +281,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
                 env, exported, readonly, in_home, blocks, failed_cd, succeeded_cd, pipeline = scopes.pop()
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
-            if raw != ["|"] and pipeline is not None:
-                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline
+            if raw != ["|"] and pipeline is not None and _shallow(pipeline, blocks, braces):
+                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline[:7]
                 pipeline = None
             if succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
@@ -288,7 +296,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
         following = segments[index + 1] if index + 1 < len(segments) else []
         if following in (["|"], ["&"]) and pipeline is None:
             pipeline = (following[0], dict(env), set(exported), set(readonly),
-                        in_home, list(failed_cd), list(succeeded_cd))
+                        in_home, list(failed_cd), list(succeeded_cd), (blocks, len(braces)))
         if raw and raw[0] == "}":
             if braces:
                 blocks = braces.pop()
