@@ -548,12 +548,18 @@ def owned_card(row, bundle):
     return rec
 
 
+def card_events(row, bundle):
+    """Listed/accepted history survives presentation-only serving defaults."""
+    if 'events' in row:
+        return row['events'] or []
+    return obj(owned_card(row, bundle).get('detail')).get('events') or []
+
+
 def wait_reason(row, bundle):
     """Only the current wait's owner text, never an older ask on running work."""
     if row.get('status') not in ('scheduled', 'blocked', 'triage', 'todo'):
         return ''
-    detail = obj(owned_card(row, bundle).get('detail'))
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         kind, payload = event.get('kind'), obj(event.get('payload'))
@@ -581,10 +587,9 @@ def agent_hold(row, bundle):
     """Administrative custody, not a human ask or permission to resume execution."""
     if row.get('status') not in ('triage', 'blocked') or row.get('stale') or human_owned(row):
         return False
-    detail = obj(owned_card(row, bundle).get('detail'))
     if row.get('status') == 'triage':
         return True
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         if event.get('kind') in ('decision_retained', 'spend_budget_triaged', 'decision_requested'):
@@ -632,11 +637,9 @@ def _legacy_human_owned(row):
 def triage_clock(row, bundle):
     """Use core's lifecycle policy, including detached local/replica evidence."""
     detail = obj(owned_card(row, bundle).get('detail'))
-    if 'events' in detail:
-        task = obj(detail.get('task'))
-        return {**row, 'events': detail['events'],
-                **({'triage_entered_at': task['triage_entered_at']} if 'triage_entered_at' in task else {})}
-    return row
+    task = obj(detail.get('task'))
+    return {**row, **({'events': detail['events']} if 'events' in detail else {}),
+            **({'triage_entered_at': task['triage_entered_at']} if 'triage_entered_at' in task else {})}
 
 
 def triage_entry(row, bundle):
@@ -690,8 +693,7 @@ def triage_clocks(bundle):
                 clocks.append(serving_row(triage_clock(raw, bundle), bundle))
     for group in groups.values():
         if group.get('status') == 'triage' and pending(group):
-            detail = obj(owned_card(group, bundle).get('detail'))
-            clocks.append(triage_clock({**obj(detail.get('task')), **group}, bundle))
+            clocks.append(triage_clock(group, bundle))
     return [(entered, at) for row in clocks if (entered := triage_entry(row, {})) is not None
             if (at := next_transition(row, now=entered)) is not None]
 
@@ -708,8 +710,7 @@ def triage_label(row, bundle, now, *, wire=False):
 
 
 def held_cause(row, bundle):
-    detail = obj(owned_card(row, bundle).get('detail'))
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         payload = obj(event.get('payload'))
@@ -1379,7 +1380,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                                 successors=lambda row: wait_parents(row, bundle),
                                 terminal=TERMINAL, prefixes=dependency_prefixes)
     for group in groups:
-        card = {**group, **obj(obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task'))}
+        detail = obj(owned_card(group, bundle).get('detail'))
+        card = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}), **group}
         matches = [r for r in requests if any(_matches(card, a, same_gateway) for a in _aliases(r))]
         # Canonical retirement outranks a preserved board human_request, just as
         # for ordinary rows. Groups must never revive dismissed attention.
