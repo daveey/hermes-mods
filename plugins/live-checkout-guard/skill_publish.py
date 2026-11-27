@@ -629,6 +629,39 @@ def _discovery_notice(directory, root, name, signature, disposition, reason):
         dirt_notice([name], disposition, reason, directory)
 
 
+def _queue_generation(path):
+    """Metadata-only identity; never open a nonregular queue entry or follow its leaf."""
+    stamp = path.lstat()
+    return ':'.join(str(n) for n in (stamp.st_dev, stamp.st_ino, stamp.st_mode,
+                                     stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns))
+
+
+def _queue_records(directory, skipped=None, *, regular_only=False):
+    import stat
+    skipped = skipped or {}
+    records = []
+    for path in sorted(directory.glob('*.json')):
+        try:
+            generation = _queue_generation(path)
+            if skipped.get(path) == generation:
+                continue
+            if regular_only and not stat.S_ISREG(path.lstat().st_mode):
+                continue
+            key = _record_key(str(directory), [path.name])
+            if any((directory / (prefix + key)).exists()
+                   and (directory / (prefix + key)).read_text() == generation
+                   for prefix in ('.blocked-', '.queue-held-')):
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Let the worker classify/quarantine unknown metadata once per run.
+            if regular_only or skipped.get(path) == 'unreadable metadata':
+                continue
+        records.append(path)
+    return records
+
+
 def kick(directory=None, *, root=None):
     """Recover orphan dirty docs as well as pending records, without duplicate workers."""
     directory = Path(directory) if directory else pending_dir()
@@ -648,7 +681,7 @@ def kick(directory=None, *, root=None):
         with operation_budget(LOCK_WAIT, time.monotonic):
             root = str(Path(root).resolve(strict=True))
             covered = set()
-            for path in directory.glob('*.json'):
+            for path in _queue_records(directory, regular_only=True):
                 try:
                     rec = json.loads(path.read_text())
                     if (isinstance(rec, dict) and rec.get('root') == root
@@ -665,7 +698,8 @@ def kick(directory=None, *, root=None):
                 try:
                     signature = _signature(root, name)
                 except ValueError as exc:
-                    # lstat only: do not follow an out-of-scope symlink for notices.
+                    # Metadata only; lstat does not follow the leaf symlink, but
+                    # intermediate components may resolve through symlinks.
                     try:
                         stamp = (Path(root) / name).lstat()
                         signature = (stamp.st_ino, stamp.st_mode, stamp.st_size,
@@ -694,7 +728,7 @@ def kick(directory=None, *, root=None):
                     defer(root, names[start:start + MAX_PATHS], session_id='orphan-recovery',
                           spawn=False, directory=directory)
                     discovered = True
-    pending = any(directory.glob('*.json'))
+    pending = bool(_queue_records(directory, regular_only=True))
     if pending and (not busy or discovered):
         # A new enqueue needs a contender even when the incumbent appeared busy:
         # it may have crossed its final empty check during discovery. Workers
@@ -731,15 +765,16 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
             counts['busy'] = 1
             return counts
         done = 0
+        skipped = {}
         while True:
-            records = sorted(directory.glob('*.json'))
+            records = _queue_records(directory, skipped)
             if not records:
                 if passes is not None:
                     return counts
                 # Release, then look again: a record written by a defer() whose own
                 # worker lost the lock race to us must still be picked up.
                 fcntl.flock(fd, fcntl.LOCK_UN)
-                if not any(directory.glob('*.json')):
+                if not _queue_records(directory, skipped):
                     return counts
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -749,6 +784,10 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
             for path in records:
                 rec = {}
                 raw = None
+                try:
+                    generation = _queue_generation(path)
+                except OSError:
+                    generation = 'unreadable metadata'
                 try:
                     raw = path.read_bytes()
                     rec = json.loads(raw)
@@ -762,9 +801,7 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError, KeyError, TypeError) as exc:
-                    _retry_log(directory, 'dropped malformed %s: %s' % (path.name, exc))
-                    dirt_notice(rec.get('paths', [path.name]) if isinstance(rec, dict) else [path.name],
-                                'dropped malformed', str(exc), directory)
+                    reason = str(exc)
                     if raw is not None:
                         _drop(path, raw)
                     else:
@@ -776,9 +813,26 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                         except FileNotFoundError:
                             pass
                         except OSError as quarantine_error:
-                            _retry_log(directory, 'quarantine failed; worker exiting: %s' % quarantine_error)
-                            counts['dropped'] += 1
-                            return counts
+                            # A broken entry must neither starve healthy siblings
+                            # nor keep the empty-after-unlock handoff spinning.
+                            skipped[path] = generation
+                            reason = 'quarantine failed; entry held: %s' % quarantine_error
+                            key = _record_key(str(directory), [path.name])
+                            for prefix in ('.blocked-', '.queue-held-'):
+                                try:
+                                    (directory / (prefix + key)).write_text(generation)
+                                    break
+                                except OSError:
+                                    pass  # In-memory skip still bounds this worker.
+                    if raw is not None:
+                        dirt_notice(rec.get('paths', [path.name]) if isinstance(rec, dict) else [path.name],
+                                    'dropped malformed', reason, directory)
+                    else:
+                        # Already under the worker flock: no discovery notice
+                        # lock or additional fallible notice storage is needed.
+                        # The generation-bound queue receipt deduplicates retries.
+                        dirt_notice([path.name], 'held malformed' if path in skipped else 'dropped malformed',
+                                    reason, directory)
                     counts['dropped'] += 1
                     continue
                 signatures = {}
@@ -818,7 +872,8 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
             done += 1
             if passes is not None and done >= passes:
                 return counts
-            sleep(interval)
+            if _queue_records(directory, skipped):
+                sleep(interval)
     finally:
         os.close(fd)
 
