@@ -94,9 +94,10 @@ def _flush_gate(session_id, timeout=_HOOK_WAIT_S):
                for probe in ("backed", "shown", "watch"))
 
 
-def _gate_probe(session_id, probe, call):
+def _gate_probe(session_id, probe, call, *, signature=()):
     # Repeated gates share an in-flight read, not another lock-waiting thread.
-    future = _gate_reads.submit((_hook_key(session_id), probe), call, reuse=True)
+    future = _gate_reads.submit((_hook_key(session_id), probe), call,
+                                reuse=True, signature=signature)
     return future.result(timeout=0.2)
 
 
@@ -1651,7 +1652,8 @@ def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optio
     try:
         shown = _gate_probe(session_id, "shown", lambda: _shown_ids(session_id))
         missing = [t for t in created if t not in shown]
-        watches = _gate_probe(session_id, "watch", lambda: _watch_parked(session_id, missing))
+        watches = _gate_probe(session_id, "watch", lambda: _watch_parked(session_id, missing),
+                              signature=tuple(sorted(missing)))
         missing = [t for t in missing if t not in watches]
         if missing:
             _visibility_sleep(VISIBILITY_RECHECK_S)

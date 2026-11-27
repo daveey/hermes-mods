@@ -18,13 +18,14 @@ class Lanes:
         self._lock = threading.Lock()
         self._lanes = {}
 
-    def submit(self, key, call, *, reuse=False):
+    def submit(self, key, call, *, reuse=False, signature=()):
         with self._lock:
             lane = self._lanes.get(key)
-            if lane is not None and reuse and not lane[-1][0].done():
+            if (lane is not None and reuse and not lane[-1][0].done()
+                    and lane[-1][3] == signature):
                 return lane[-1][0]
             future = Future()
-            job = (future, contextvars.copy_context(), call)
+            job = (future, contextvars.copy_context(), call, signature)
             if lane is not None:
                 lane.append(job)
             else:
@@ -37,7 +38,7 @@ class Lanes:
     def _run(self, key, lane):
         while True:
             with self._lock:
-                future, context, call = lane[0]
+                future, context, call, _signature = lane[0]
             try:
                 result = context.run(call)
             except BaseException as exc:
