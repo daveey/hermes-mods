@@ -286,6 +286,46 @@ test('collapsed panel keeps a queue read error visible', async () => {
   } finally { window.hermesDesktop.api = api }
 })
 
+test('collapsed panel keeps a counted ask\'s failed-withdraw error visible (not quiet, so not hidden)', async () => {
+  const r = ask()
+  backend.requests.S1 = [r]
+  const api = window.hermesDesktop.api
+  window.hermesDesktop.api = async req => { if (req.path.endsWith('/withdraw')) throw Error('503: backend down'); return api(req) }
+  try {
+    seed('S1', model({ needs_you: [askRow(r)] }))
+    await show(composerTop()); await settle()
+    await React.act(async () => { el().querySelector('[data-withdraw-request]').click(); await flush() }); await settle()
+    assert.ok(el().querySelector('[data-withdraw-error]'), 'withdraw failed while expanded')
+    await collapse(); await settle()
+    assert.ok(el().querySelector('[data-session-panel]').hasAttribute('data-collapsed'))
+    assert.equal(el().querySelectorAll('[data-panel-row]').length, 0, 'the counted ask row is gone with the canonical rows')
+    const error = el().querySelector('[data-action-request] [data-withdraw-error]')
+    assert.ok(error, 'the counted ask keeps its unresolved withdraw error while collapsed')
+    assert.equal(hiddenNode(error), false)
+  } finally { window.hermesDesktop.api = api }
+})
+
+test('idle chat with a queue read error paints a real frame with the error, not the idle frame', async () => {
+  seed('S1', model())
+  const api = window.hermesDesktop.api
+  window.hermesDesktop.api = async req => { if (req.path.includes('/requests')) throw Error('503: backend down'); return api(req) }
+  try {
+    await show(composerTop())
+    await React.act(async () => { await steps.refreshRequests().catch(() => {}) }); await settle()
+    assert.equal(el().querySelector('[data-session-panel]').getAttribute('data-panel-frame'), 'bare', 'error is visible work')
+    assert.ok(el().querySelector('[data-action-queue] [role="alert"]'), 'the error is drawn')
+  } finally { window.hermesDesktop.api = api }
+})
+
+test('idle frame is not a named landmark', async () => {
+  seed('S1', model())
+  await show(composerTop()); await settle()
+  const frame = el().querySelector('[data-panel-frame="idle"]')
+  assert.ok(frame)
+  assert.notEqual(frame.tagName, 'SECTION')
+  assert.equal(frame.hasAttribute('aria-label'), false)
+})
+
 test('idle chat: an empty model and no requests paint nothing, and a later ask still appears', async () => {
   seed('S1', model())
   await show(composerTop()); await settle()

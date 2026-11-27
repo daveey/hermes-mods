@@ -653,7 +653,8 @@ function companionFrame(companion) {
   if (!queue) return null
   const us = typeof window !== 'undefined' ? window.__userSteps : null
   if (typeof us?.queueVisible !== 'function' || us.queueVisible()) return bodyFrame(queue)
-  return jsx('section', { 'data-session-panel': '', 'data-panel-frame': 'idle', 'aria-label': 'Session status', style: { ...frameStyle, borderBottom: 0, padding: 0 },
+  // Not a landmark: an unpainted idle frame must not announce an empty "Session status" region.
+  return jsx('div', { 'data-session-panel': '', 'data-panel-frame': 'idle', style: { ...frameStyle, borderBottom: 0, padding: 0 },
     children: jsx('div', { 'data-panel-body': '', style: bodyStyle, children: queue }) })
 }
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null, companion = null } = {}) {
