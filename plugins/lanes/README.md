@@ -182,8 +182,9 @@ After authorization and parameter validation, the first stream viewer starts one
 on-demand managed-runtime child using private stdin/stdout pipes. The parent still
 owns board/config/planner/PR change detection, leading-edge scheduling, the 1 s
 burst gap and socket versions/hashes. It polls the child's lightweight observation
-cursor too; the child has no source watcher or autonomous projection loop. GET
-continues its existing in-process path.
+cursor too; the child has no source watcher or autonomous projection loop. REST
+refreshes and the default warmer submit to that same supervisor, sharing its
+single-flight jobs and revision fence instead of computing in the backend.
 
 Both paths call the same borrowed-evidence projection. Each child job freshly opens
 tracked `mode=ro` local/fleet handles, registers the existing sync mode without
@@ -195,8 +196,11 @@ is request-local. SQL has a 250 ms busy timeout and 2 s progress budget.
 RPC commands carry a fixed-size cursor digest, never PR URL lists. JSON framing,
 size limits (16 KiB commands, 8 MiB replies), session/request/revision/parameter checks,
 and captured plugin/core code hashes fence malformed or mixed-deployment replies.
-Code identity movement fails unavailable until a matching natural backend rotation;
-it never blesses new disk hashes from a stale parent. One projection runs globally,
+After code identity movement, the supervisor recaptures current disk hashes and
+retires the old child. The new child must report the parent's loaded wire protocol
+VERSION and match the captured identity, including before/after every job. A wire
+version change remains unavailable until natural backend rotation; it never falls
+back into mixed-generation parent computation. One projection runs globally,
 with at most one pending revision per hours/window pair (16 pairs) and 128 viewers.
 Collapsed and expanded viewers share that source job: the hub runs the existing pure
 presentation projection twice on its one snapshot/raw result and fans out the exact
@@ -207,9 +211,11 @@ extends the gap deadline; it is discarded on expiry or replacement, and fallback
 results are never retained. Generation AND cursor digest must match; no mutable
 SQLite evidence/history survives the job.
 
-Startup/job failure bounds are 5/10 s, not latency promises. Child failure uses a fresh,
-uncached in-process fallback, one daemon slot held through actual completion with a
-3 s delivery deadline and no executor queue. Retry backoff is 1/2/4/8/16/30 s;
+Startup/job failure bounds are 5/10 s, not latency promises. Enabled child failures
+stay unavailable (REST retains its bounded stale/warming behavior), never moving
+projection back into the backend. Only old cores without projector support use the
+bounded in-process compatibility slot, held through actual completion with no
+executor queue. Retry backoff is 1/2/4/8/16/30 s;
 backoff does not reuse stale successful frames. Socket receive/heartbeat tasks remain
 independent of compute; writes have a 3 s timeout and a latest-only pending frame.
 An idle child stops after 30 s without viewers; EOF exits even during hung work.
@@ -222,7 +228,10 @@ pending. `timing.project_start/end` come from the actual compute process. Neithe
 these diagnostics nor load/timing fields affect the view digest. The real subprocess
 fixtures test sync-primary overlay without mocking `board_mode`, byte-identical
 projection, source rebuild, identity/session fences, no-spawn auth, EOF during a
-hung projection, independent heartbeats and fresh bounded fallback. Private captured
+hung projection, independent heartbeats, live code replacement, protocol-version
+refusal and child-only REST/warming. Fixture children use the test interpreter's
+already-prepared runtime, not dependency installation in a new temporary home;
+the production managed-runtime launcher is unchanged. Private captured
 board backups are tested separately and never checked into this repository.
 
 PR network observation runs in a bounded background worker per process,

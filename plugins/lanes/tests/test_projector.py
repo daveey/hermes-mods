@@ -86,6 +86,16 @@ def test_fallback_holds_single_slot_until_actual_completion():
 @pytest.fixture
 def actual_board(tmp_path, monkeypatch):
     pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    # The test interpreter already has the runtime prepared. Keep its exact
+    # import paths while isolating all data under the fixture home; bootstrapping
+    # a fresh PM dependency generation here tests installation, not projection.
+    import sys
+    from hermes_cli import _launchers
+    paths = list(sys.path)
+    def prepared_runtime(root, args=(), *, code=None, **kwargs):
+        return [sys.executable, '-I', '-c',
+                f'import sys, runpy; sys.path[:] = {paths!r}; ' + code, *args]
+    monkeypatch.setattr(_launchers, 'runtime_command', prepared_runtime)
     from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync
     import hermes_constants
     home = tmp_path / 'home'
@@ -340,7 +350,7 @@ def test_loaded_parent_rejects_changed_plugin_and_core_identity(actual_board, tm
         start_process(api, config | {'identity': bad_core})
 
 
-def test_supervisor_backoff_fallback_is_fresh_and_coalesces(monkeypatch):
+def test_supervisor_backoff_never_computes_in_parent_and_coalesces(monkeypatch):
     from types import SimpleNamespace
     client = module('projector_client')
     state = {'value': 1}
@@ -353,20 +363,20 @@ def test_supervisor_backoff_fallback_is_fresh_and_coalesces(monkeypatch):
     monkeypatch.setattr(supervisor, '_configuration', lambda: config)
     try:
         deadline = supervisor.retry_at
-        assert supervisor.submit((6., '6h', False), 1, [1]).result(2)['view']['value'] == 1
+        with pytest.raises(client.Unavailable):
+            supervisor.submit((6., '6h', False), 1, [1]).result(2)
         state['value'] = 2
-        fresh = supervisor.submit((6., '6h', False), 2, [2]).result(2)
-        assert fresh['view']['value'] == 2
-        assert fresh['mode'] == 'fallback' and fresh['projector_pid'] is None
-        assert fresh['revision'][0] == 2
-        assert supervisor.retry_at == deadline  # fallback does not extend backoff forever
+        with pytest.raises(client.Unavailable):
+            supervisor.submit((6., '6h', False), 2, [2]).result(2)
+        assert supervisor.retry_at == deadline  # callers do not extend backoff forever
         with supervisor.cv:
             one = supervisor.submit((6., '6h', False), 3, [3])
             two = supervisor.submit((6., '6h', False), 4, [4])
             assert one is two and not one.done()
             assert len(supervisor.queue) == 1
             assert next(iter(supervisor.queue.values()))[0][0] == 4
-        assert one.result(2)['revision'][0] == 4
+        with pytest.raises(client.Unavailable):
+            one.result(2)
         for _ in range(128):
             supervisor.acquire()
         with pytest.raises(client.Unavailable):
@@ -453,6 +463,85 @@ def test_parent_cursor_keeps_planner_config_and_observation_triggers(actual_boar
     store = api._observations()
     store.reader({'https://github.com/example/repo/pull/1': ('new-evidence',)})
     assert api.change_cursor() != before
+
+
+@pytest.mark.parametrize('protocol_change', [False, True])
+def test_stream_respawns_current_code_but_refuses_new_protocol(actual_board, tmp_path, monkeypatch, protocol_change):
+    import shutil
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    _, config = actual_board
+    directory = tmp_path / 'plugins' / 'lanes' / 'dashboard'
+    shutil.copytree(DASH, directory)
+    shutil.copytree(DASH.parents[1] / 'session-panel', directory.parents[1] / 'session-panel')
+    api = module('projector_identity').load(directory / 'plugin_api.py', 'updated_api')
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    app = FastAPI()
+    app.include_router(api.router)
+    try:
+        with TestClient(app) as client:
+            with client.websocket_connect('/v1/lanes/stream?debug=true&expanded=true') as ws:
+                initial = ws.receive_json()
+                assert initial['view']['flow_complete'] is True, json.dumps(initial['view'])
+                assert initial['view']['status']
+                old = api._projector().process
+                target = directory / ('projector_protocol.py' if protocol_change else 'view.py')
+                text = target.read_text()
+                if protocol_change:
+                    text = text.replace('VERSION = 1', 'VERSION = 999')
+                    assert text != target.read_text()
+                else:
+                    text += '\n# deployed new dashboard bytes\n'
+                target.write_text(text)
+                # Parameter refresh forces demand even on an otherwise idle board.
+                ws.send_json({'expanded': False})
+                if protocol_change:
+                    with pytest.raises(WebSocketDisconnect):
+                        while True:
+                            ws.receive_json()
+                else:
+                    frame = ws.receive_json()
+                    while frame.get('type') == 'heartbeat':
+                        frame = ws.receive_json()
+                    assert frame['view']['flow_complete'] is True
+                    assert frame['view']['status']
+                    assert frame['projector']['mode'] == 'projector'
+                    assert frame['projector']['projector_pid'] != initial['projector']['projector_pid']
+                assert old.proc.poll() is not None
+    finally:
+        if api._projector_instance:
+            api._projector_instance.close()
+
+
+@pytest.mark.parametrize('warm', [False, True])
+def test_rest_and_default_warm_never_project_in_enabled_parent(actual_board, monkeypatch, warm):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    api, _ = actual_board
+    called = []
+    def forbidden(*args):
+        called.append(args)
+        raise AssertionError('parent projection is forbidden')
+    monkeypatch.setattr(api, '_lane_view', forbidden)
+    monkeypatch.setattr(api, '_lane_views', forbidden)
+    warmer = api.start_legacy() if warm else None
+    app = FastAPI()
+    app.include_router(api.router)
+    try:
+        with TestClient(app) as client:
+            deadline = time.monotonic() + 10
+            while True:
+                view = client.get('/v1/lanes').json()
+                if not view.get('warming') or called or time.monotonic() >= deadline:
+                    break
+            assert not called
+            assert view['flow_complete'] is True
+            assert view['status']
+            assert api._projector().process.proc.pid != os.getpid()
+    finally:
+        if warmer:
+            warmer.close()
 
 
 def test_child_observation_cursor_marks_parent_dirty_without_board_change(monkeypatch):

@@ -176,6 +176,7 @@ class Process:
 class Supervisor:
     def __init__(self, api, manifest):
         self.api, self.manifest = api, manifest
+
         self.cv = threading.Condition()
         self.queue = OrderedDict()
         self.active = None
@@ -188,7 +189,7 @@ class Supervisor:
         self.last_end = 0.
         self.last_start = 0.
         self.source_paths = None
-        self.fallback = Fallback()
+
         self.cursor_read = None  # (exact process, shared in-flight control future)
         self.recent = None  # one completed projection, reusable only within the gap
         threading.Thread(target=self._run, name='lanes-projector-supervisor', daemon=True).start()
@@ -283,8 +284,21 @@ class Supervisor:
         from hermes_cli import kanban_db_sync as sync, kanban_worker_node as wn
         from hermes_constants import get_default_hermes_root
         mods = self.api.core()
-        if mods is None or not identity.matches(self.manifest):
+        if mods is None:
             raise Unavailable('lanes code identity unavailable')
+        if not identity.matches(self.manifest):
+            # The child imports current disk code; its ready envelope must
+            # still speak our loaded protocol, independently of file identity.
+            manifest = identity.capture(Path(__file__).parent)
+            if not identity.matches(manifest):
+                raise Unavailable('lanes deployment in progress')
+            with self.cv:
+                old, self.process = self.process, None
+                self.manifest = manifest
+            if old:
+                old.close()
+            self.recent = None
+            self.retry_at = 0.
         with mods[0].connect_closing() as conn:
             local = sync._db_key(conn)
             mode = sync.board_mode(conn)
@@ -367,23 +381,10 @@ class Supervisor:
                 if attempted:
                     self.failures += 1
                     self.retry_at = time.monotonic() + min(30, 2 ** min(5, self.failures - 1))
-                try:
-                    if not identity.matches(self.manifest):
-                        raise Unavailable('loaded projection identity unavailable')
-                    def compute(key=key, revision=revision):
-                        started = time.time()
-                        views = self.api._lane_views(*key[:2])
-                        view = views['expanded']
-                        if not identity.matches(self.manifest):
-                            raise Unavailable('fallback identity moved')
-                        return {'view': view, 'views': views, 'projector_pid': None, 'mode': 'fallback',
-                                'revision': list(revision), 'params': list(key),
-                                'timing': {'project_start': started, 'project_end': time.time()}}
-                    job = self.fallback.submit((key, revision), compute)
-                    result = job.result(3)
-                except Exception:
-                    future.set_exception(Unavailable('lanes projection unavailable'))
-                    result = None
+                # Enabled projection must never move expensive work back into
+                # the contended backend, including startup/protocol failures.
+                future.set_exception(Unavailable('lanes projection unavailable'))
+                result = None
             with self.cv:
                 self.last_end = time.monotonic()
                 self.active = None

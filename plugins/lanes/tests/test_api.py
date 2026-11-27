@@ -70,6 +70,7 @@ def core(api, monkeypatch):
     # This fixture is a legacy core. Never import the installed core's real
     # flow on its fake connection (cold imports can exceed the REST warm budget).
     monkeypatch.setattr(api, "flow_core", lambda: None)
+    monkeypatch.setattr(api, '_projector_enabled', False)
     return fake
 
 

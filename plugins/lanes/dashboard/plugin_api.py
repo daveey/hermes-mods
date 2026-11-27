@@ -506,6 +506,31 @@ def admit(card: str, reason: str) -> Dict[str, Any]:
     return {"admitted": done}
 
 
+def _delivery_view(hours, window, expanded):
+    """All background/REST producers use the stream's bounded child owner."""
+    global _delivery_child_cursor
+    if _projector_enabled:
+        supervisor = _projector()
+        child = supervisor.cursor()
+        if child is not None:
+            _delivery_child_cursor = child
+        cursor = [change_cursor(), _delivery_child_cursor]
+        _refresh_cursor(cursor)
+        with _lock:
+            generation = _generation
+        return supervisor.submit((hours, window, expanded), generation, cursor).result(12)['view']
+    # Old-core compatibility retains one slot even if a caller times out.
+    key = (hours, window, expanded)
+    def compute():
+        if not _identity.matches(_loaded_identity):
+            raise RuntimeError('loaded projection identity unavailable')
+        view = _lane_view(*key)
+        if not _identity.matches(_loaded_identity):
+            raise RuntimeError('fallback identity moved')
+        return view
+    return _compat_fallback.submit(key, compute).result()
+
+
 def rest_view(hours, window, expanded):
     """REST delivery retains last completed exact-parameter view across revisions."""
     _validate_view(hours, window, expanded)
@@ -513,7 +538,7 @@ def rest_view(hours, window, expanded):
         generation = _generation
     return _shared_views().get_stale(
         (hours, window, expanded), (generation, _observation_cursor()),
-        lambda: _lane_view(hours, window, expanded))
+        lambda: _delivery_view(hours, window, expanded))
 
 
 REST_REFRESH_S = 60.  # default key only; completed views still expire at 120s
@@ -523,7 +548,7 @@ def start_legacy():
     """Keep the startup default fresh even without GET or stream demand."""
     warmer = _identity.load(_Path(__file__).with_name('default_warm.py'), 'lanes_default_warm')
     return warmer.DefaultWarm(_shared_views(), lambda: (_generation, _observation_cursor()),
-                              lambda: _lane_view(6., '6h', False), interval=REST_REFRESH_S)
+                              lambda: _delivery_view(6., '6h', False), interval=REST_REFRESH_S)
 
 
 @router.get("/v1/lanes")
@@ -753,9 +778,8 @@ async def stream_lanes(ws: WebSocket):
         _active_streams -= 1
 
 
-# Capture once at router load, never recalculate expected hashes at child spawn.
-# Core and common projection stay loaded; lazily file-loaded helpers are fenced
-# against these same captured bytes before child or fallback work starts.
+# Capture parent bytes once for the in-process compatibility fence. The child
+# supervisor may recapture disk bytes after sync, gated by wire VERSION.
 import importlib.util as _import_util
 from pathlib import Path as _Path
 _spec = _import_util.spec_from_file_location('lanes_rpc_identity', _Path(__file__).with_name('projector_identity.py'))
@@ -768,6 +792,7 @@ _rpc_client = _identity.load(_Path(__file__).with_name('projector_client.py'), '
 _stream_engine = _identity.load(_Path(__file__).with_name('stream_engine.py'), 'lanes_stream_engine')
 _compat_fallback = _rpc_client.Fallback()
 _projector_instance = None
+_delivery_child_cursor = None  # unavailable reads are not new observations
 _projector_init = threading.Lock()
 _projector_enabled = core() is not None
 
