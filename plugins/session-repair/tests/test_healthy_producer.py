@@ -45,10 +45,16 @@ def watched_wait(env, monkeypatch, kind='external', ref='job', park_check='pytho
 @pytest.mark.parametrize('watch', [
     {},                                                  # shell probe ok, condition not yet met
     {'state': 'external_running'},                       # probe reports the producer running
-    {'health': 'degraded', 'state': 'external_running'},  # producer alive but degraded
 ])
 def test_shell_watched_live_producer_is_not_a_stalled_park(env, monkeypatch, kind, watch):
     assert long_wait_hits(env, watched_wait(env, monkeypatch, kind=kind, **watch)) == []
+
+
+@pytest.mark.parametrize('kind', ['external', 'ci', 'deploy'])
+def test_shell_probe_reporting_degraded_does_not_hide_a_stall(env, monkeypatch, kind):
+    # nothing in core bounds a shell probe's degraded/running, so a wedged deploy must still be nudged
+    tid = watched_wait(env, monkeypatch, kind=kind, health='degraded', state='external_running')
+    assert len(long_wait_hits(env, tid)) == 1
 
 
 @pytest.mark.parametrize('ref,adapter,watch', [
