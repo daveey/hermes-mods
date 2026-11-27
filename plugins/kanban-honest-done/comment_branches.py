@@ -25,13 +25,34 @@ def _resolve(token, options):
     return (hits[0], inline) if hits else None
 
 
+# Core's top-level flags that take a value (hermes_cli/_parser.py `top_level_value_flag_sets()` plus the pre-argparse
+# `-p/--profile`). Static so hook startup imports no core; tests/test_top_level_flags.py drift-checks it against core.
+TOP_LEVEL_VALUE_FLAGS = frozenset({
+    "-p", "--profile", "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning", "-t", "--toolsets",
+    "-r", "--resume", "-s", "--skills", "--usage-file", "--in", "--cpu-profile",
+})
+TOP_LEVEL_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
+
+
+def kanban_indexes(seg):
+    """Indexes k where seg is `hermes [TOP-LEVEL FLAGS] kanban` with `kanban` at seg[k]."""
+    for h, tok in enumerate(seg):
+        real = os.path.basename(tok) in ("hermes", "hermes.exe")
+        if not (real or tok.endswith("hermes_cli.main")):
+            continue
+        j = h + 1
+        while j < len(seg) and seg[j].startswith("-") and seg[j] != "--":
+            j += 2 if "=" not in seg[j] and seg[j] in TOP_LEVEL_VALUE_FLAGS else 1
+        if j < len(seg) and (seg[j] == "kanban" or (real and os.path.basename(seg[j]) == "kanban")):
+            yield j
+
+
 def _kanban_options(seg, rest):
     """Tokens between `hermes kanban` and the verb: the kanban-level options (`--board`)."""
     end = len(seg) - len(rest) - 1
-    for i in range(1, end):
-        if os.path.basename(seg[i]) == "kanban" and (
-                os.path.basename(seg[i - 1]) in ("hermes", "hermes.exe") or seg[i - 1].endswith("hermes_cli.main")):
-            return seg[i + 1:end]
+    for k in kanban_indexes(seg):
+        if k < end:
+            return seg[k + 1:end]
     return []
 
 
