@@ -295,6 +295,20 @@ The canonical suite command is
 per-suite timeout and retain `--output-dir`/`--json` receipts. Source-reader schema
 and fail-closed cases are also covered in `tests/test_target_reader.py`.
 
+## Bounded observation and deliberate stops
+
+An age-only deploy wait with an opaque identifier, no wake probe and an unresolvable
+producer honors its explicit future checkpoint only when the whole park window is
+at most two hours. Completion or adverse watcher events override this exception;
+URL targets, probes, expired checkpoints and longer windows retain normal diagnosis.
+This prevents interrupting a short, deliberate natural-rollout observation merely
+because its opaque ID cannot be polled. It does not certify producer health.
+
+Quiet chats whose latest active user turn is the exact Desktop-stop marker are not
+resumed by this detector, even if a late tool result follows the stop. A later user
+instruction can establish a new unresolved episode. Missing delivery receipts must
+still be reconciled before any external write; interruption is not retry permission.
+
 ## Independent nudge lane
 
 `config.json` additionally accepts `nudge_mode: shadow|live` (default shadow). This does not enable the older
