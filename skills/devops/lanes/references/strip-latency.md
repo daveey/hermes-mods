@@ -39,7 +39,14 @@ summary are `desktop-plugins/lanes/plugin.js` (`StatusTotals`, `SessionsTabTotal
 list means the view's `status` is `{}` and `sessions` is empty, so every chat counts as no-cards.
 
 1. GET `/v1/lanes?hours=6&window=6h&expanded=true` on the routed backend (the 9148/9147 recipe above;
-   no token = 401). Print `flow_complete`, `summary_complete`, `status`, `len(sessions)`.
+   no token = 401). Record the exact response key list, `configured`, `warming`, `reason`,
+   `flow_complete`, `summary_complete`, `status`, and `len(sessions)` alongside HTTP status and
+   latency. Do not infer an absent warming flag from a probe that never printed it: a valid cold
+   response `{configured: true, warming: true}` also prints `None None 0` for flow/status/session
+   count. Distinguish explicit warming from an unflagged empty object before proposing a fix.
+   For cache-expiry verification, preserve timezone-aware starts and monotonic start times,
+   validate per-listener counts and spacing programmatically, and assert every zero-session
+   response has `warming is True`.
 2. Probe the stream: `websockets.connect(ws://127.0.0.1:<port>/api/plugins/lanes/v1/lanes/stream?hours=6&window=6h&expanded=true&token=<token>)`,
    send the params JSON, read three frames. A close with 1013 is why Desktop shows "not live" and
    falls back to the 60 s REST poll. With the current projector-enabled implementation, REST and
