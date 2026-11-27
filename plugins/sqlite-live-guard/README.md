@@ -175,6 +175,34 @@ late holders surviving publication, single-owner/maintenance refusal, abort/part
 cutover, and actual `hermes sessions recover` → helper installation. Core-only E2E
 skips explicitly when core is absent; that skip is not proof of integration.
 
+## Source-review hardening
+
+Local file operands are resolved (including symlinks and `..`) **before** testing
+live-file names or cache/backup exclusions. Remote operands use lexical `..`
+normalization only; remote decisions never resolve this host's symlinks. Recursive
+`rm` and source-directory `mv` also protect Hermes-home ancestors and potentially
+live subdirectories, conservatively including empty live subtrees. Cache/archive/
+backup trees retain their exclusions after normalization. For remote paths,
+database/backup-shaped operands are treated as files because local directory
+metadata cannot establish their remote type; remote directory targets should use
+explicit directory syntax. This remains defense in depth, not confinement against
+filesystem changes between classification and execution.
+
+Python AST checks resolve `from os import unlink/remove` (including `as` names)
+and `import os as ...` identities, literal and simple assigned targets, and the
+`path=` deletion argument. They do not execute submitted code or implement arbitrary
+Python dataflow, dynamic imports or rebinding.
+
+Recovery PID, receipt and pending-marker writes use adjacent unique exclusive
+0600 temporary files, write/fsync through the opened descriptor, and atomically
+replace the destination. Pre-placed predictable `.tmp` symlinks are never opened;
+failed writes/publications clean up their unique temp. The offline ownership and
+holder-scan requirements above remain unchanged.
+
+Regression coverage: `tests/test_source_review.py` (D1 path/ancestor/symlink,
+D2 import aliases and scratch controls, D3 symlink victim/mode preservation,
+unique temps and failed-publication cleanup).
+
 ## Decision-module updates in running workers
 
 Once this reload boundary has been activated, running workers pick up changes to

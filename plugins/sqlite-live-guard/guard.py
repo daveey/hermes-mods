@@ -214,13 +214,24 @@ def _under_home(path: str) -> bool:
     return False
 
 
-def is_live(path: str, in_home: bool = False) -> bool:
+def _normalized_path(path: str, in_home: bool = False, resolve_local: bool = True) -> str:
+    """Normalize before exclusions; only local paths may consult this host's symlinks."""
+    path = _expand(path)
+    if in_home and not path.startswith(("/", "~", "$")):
+        path = os.path.join(_home(), path)
+    if resolve_local and path.startswith("/"):
+        return os.path.realpath(path)
+    return os.path.normpath(path)
+
+
+def is_live(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
     """True when ``path`` names a live Hermes database file or sidecar. ``in_home``: the command's working
     directory is the Hermes home, so a relative path resolves there."""
     if not path or path.startswith("-"):
         return False
     if path.startswith("file:"):
         path = path[5:].split("?", 1)[0]
+    path = _normalized_path(path, in_home, resolve_local)
     base = path.rsplit("/", 1)[-1]
     if not _LIVE_NAME.search(base) or any(m in base for m in _NOT_LIVE_MARKERS):
         return False
@@ -237,6 +248,34 @@ def is_live(path: str, in_home: bool = False) -> bool:
     # and other non-slug folders hold archived copies or strays no Hermes process opens.
     board = _BOARDS_CHILD.search(rel)
     return not (board and not _BOARD_SLUG.match(board.group(1)))
+
+
+def protects_directory(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
+    """Protect home ancestors and potentially live subtrees without enumerating databases.
+
+    Conservative for empty live subdirectories; cache/archive/backup exclusions still apply.
+    Remote callers use lexical normalization only, never this host's filesystem.
+    """
+    if not path or path.startswith("-"):
+        return False
+    full = _normalized_path(path, in_home, resolve_local).rstrip("/") or "/"
+    home = _home().rstrip("/")
+    # A database/backup-shaped operand is a file, not a subtree. Existing local
+    # directories still count even when named like a database or backup.
+    if not path.endswith("/") and re.search(r"\.db(?:[.-]|$)", full.rsplit("/", 1)[-1]) and not (
+            resolve_local and os.path.isdir(full)):
+        return False
+    if full == home or home.startswith(full.rstrip("/") + "/"):
+        return True
+    if _under_home(full):
+        return is_live(full.rstrip("/") + "/__guard__.db", resolve_local=resolve_local)
+    return False
+
+
+def destructive_directory(word: str, args: list[str]) -> bool:
+    return word == "mv" or (word == "rm" and any(
+        a == "--recursive" or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & {"r", "R"})
+        for a in args[:args.index("--") if "--" in args else len(args)]))
 
 
 class _Unclosed(Exception):
@@ -1215,9 +1254,10 @@ def _operands(args: list[str]) -> list[str]:
     return out
 
 
-def _check_redirects(seg: list[str], in_home: bool) -> Optional[str]:
+def _check_redirects(seg: list[str], in_home: bool, resolve_local: bool = True) -> Optional[str]:
     for i, tok in enumerate(seg[:-1]):
-        if tok in (">", ">>", ">|", "&>") and not isinstance(tok, _Quoted) and is_live(seg[i + 1], in_home):
+        if tok in (">", ">>", ">|", "&>") and not isinstance(tok, _Quoted) and is_live(
+                seg[i + 1], in_home, resolve_local):
             return f"a `>` redirect would overwrite live database file {seg[i + 1]}"
     return None
 
@@ -1270,7 +1310,7 @@ def _kanban_verb(sql: str, prefix: str) -> str:
 _QUARANTINE_NAME = re.compile(r"\.db\.corrupt\.[^/]*\.bak$")
 
 
-def is_quarantine(path: str, in_home: bool = False) -> bool:
+def is_quarantine(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
     """True when ``path`` (globs included) names a live database's ``.corrupt.*.bak`` quarantine."""
     if not path or path.startswith("-"):
         return False
@@ -1278,7 +1318,7 @@ def is_quarantine(path: str, in_home: bool = False) -> bool:
     if not _QUARANTINE_NAME.search(base):
         return False
     live = path[: -len(base)] + base.split(".corrupt.", 1)[0]
-    return is_live(live, in_home)
+    return is_live(live, in_home, resolve_local)
 
 
 def _sqlite3_argv(args: list[str]) -> tuple:
@@ -1434,6 +1474,11 @@ def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
             in_home = os.path.realpath(_expand(target)) == _home()
             continue
         ops = _operands(_without_redirects(args))
+        if destructive_directory(word, args):
+            directories = ops[:-1] if word == "mv" else ops
+            hit = next((o for o in directories if protects_directory(o, in_home)), None)
+            if hit:
+                return f"`{word}` would remove a directory containing live database files: {hit}"
         if word in ("rm", "unlink", "shred", "truncate", "mv"):
             hit = next((o for o in ops if is_live(o, in_home)), None)
             if hit:
@@ -1565,19 +1610,35 @@ def _check_python_ast(code: str) -> Optional[str]:
     except (SyntaxError, ValueError):
         return None
     names = _py_assignments(tree)
+    modules, functions = {}, {}
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            for alias in node.names:
+                functions[alias.asname or alias.name] = (node.module, alias.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        mod = fn.value.id if isinstance(fn.value, ast.Name) else ""
+        if isinstance(fn, ast.Attribute):
+            mod = fn.value.id if isinstance(fn.value, ast.Name) else ""
+            identity = (modules.get(mod, mod), fn.attr)
+        elif isinstance(fn, ast.Name):
+            mod = ""
+            identity = functions.get(fn.id)
+        else:
+            continue
         target = None
-        if (mod, fn.attr) in _PY_MOVE_FUNCS and len(node.args) >= 2:
+        if identity in _PY_MOVE_FUNCS and len(node.args) >= 2:
             target = node.args[1]
-        elif (mod, fn.attr) in _PY_DELETE_FUNCS and node.args:
-            target = node.args[0]
-        elif fn.attr in ("replace", "rename") and len(node.args) == 1 and not node.keywords:
+        elif identity in _PY_DELETE_FUNCS:
+            target = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "path"), None)
+        elif isinstance(fn, ast.Attribute) and fn.attr in ("replace", "rename") and len(node.args) == 1 and not node.keywords:
             target = node.args[0]  # Path(x).replace(dst); str.replace takes two arguments
-        elif fn.attr in ("unlink", "write_bytes", "write_text", "touch") and mod not in ("os", "shutil"):
+        elif isinstance(fn, ast.Attribute) and fn.attr in ("unlink", "write_bytes", "write_text", "touch") and mod not in ("os", "shutil"):
             target = fn.value  # (home / 'kanban.db-wal').unlink()
         hit = _py_board(target, names)
         if hit:

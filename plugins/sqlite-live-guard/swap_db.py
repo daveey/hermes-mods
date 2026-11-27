@@ -250,15 +250,20 @@ def _fsync_dir(path):
 
 
 def _save(path, data):
-    tmp = path.with_name(path.name + '.tmp')
-    with open(tmp, 'w', encoding='utf-8') as out:
-        os.chmod(tmp, 0o600)
-        json.dump(data, out, indent=2)
-        out.write('\n')
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(tmp, path)
-    _fsync_dir(path.parent)
+    # mkstemp creates a new 0600 inode with O_EXCL; never follow a pre-placed
+    # predictable receipt/PID temp symlink or chmod through an attacker path.
+    fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump(data, out, indent=2)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _fingerprint(db):

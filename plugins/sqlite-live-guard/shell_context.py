@@ -349,7 +349,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
 
 
 def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote, budget):
-    why = guard._check_redirects(argv, in_home)
+    why = guard._check_redirects(argv, in_home, resolve_local=not remote)
     if why:
         return why, in_home
     argv = guard._strip_wrappers(argv)
@@ -423,19 +423,25 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
     elif remote and word == "sqlite3":
         # The remote SQLite build cannot be probed from here: assume the WAL-reset bug (fail closed).
         db = guard._sqlite3_argv(args)[0]
-        if db is not None and guard.is_live(db, in_home):
+        if db is not None and guard.is_live(db, in_home, resolve_local=False):
             return guard.remote_sqlite3_refusal(argv[0], db), in_home
     elif word == "cd":
         target = (guard._operands(args) or ["~"])[0]
         in_home = guard._HOME_PREFIX.sub("", target).rstrip("/") == "" or target.rstrip("/") == guard._home().rstrip("/")
     elif word in _FILES:
         ops = guard._operands(guard._without_redirects(args))
+        if guard.destructive_directory(word, args):
+            directories = ops[:-1] if word == "mv" else ops
+            hit = next((p for p in directories if guard.protects_directory(p, in_home, not remote)), None)
+            if hit:
+                return f"`{word}` would remove a directory containing live database files: {hit}", in_home
         if word in {"rm", "unlink", "shred", "truncate", "mv", "tee"}:
-            hit = next((p for p in ops if guard.is_live(p, in_home) or guard.is_quarantine(p, in_home)), None)
+            hit = next((p for p in ops if guard.is_live(p, in_home, not remote)
+                        or guard.is_quarantine(p, in_home, not remote)), None)
         elif word == "dd":
-            hit = next((p[3:] for p in args if p.startswith("of=") and guard.is_live(p[3:], in_home)), None)
+            hit = next((p[3:] for p in args if p.startswith("of=") and guard.is_live(p[3:], in_home, not remote)), None)
         else:
-            hit = ops[-1] if ops and guard.is_live(ops[-1], in_home) else None
+            hit = ops[-1] if ops and guard.is_live(ops[-1], in_home, not remote) else None
         # Preserve local directory policy; never stat a remote path locally.
         if not hit and word in {"mv", "cp", "install", "rsync", "ln"} and len(ops) > 1:
             dest = ops[-1]
@@ -454,7 +460,7 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
             if directory:
                 dest = dest.rstrip("/")
                 hit = next((dest + "/" + os.path.basename(src) for src in sources
-                            if guard.is_live(dest + "/" + os.path.basename(src), in_home)), None)
+                            if guard.is_live(dest + "/" + os.path.basename(src), in_home, not remote)), None)
         if hit:
             return f"`{word}` would modify live database file {hit}; use swap_db.py for a guarded replacement", in_home
     return None, in_home
