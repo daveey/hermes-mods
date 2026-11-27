@@ -287,8 +287,13 @@ memo before work and does not attach a post-pass key to older inputs. Subsequent
 background and strict passes retain their ordinary pre-pass key and full-pass
 ceiling. The cold path still establishes an idle retained ActionStore reader,
 without holding its entry lock across reconciliation, to avoid repeated last-WAL-
-connection open/close work. Namespace-wide older-owner bindings and withdrawals
-remain dependencies.
+connection open/close work. Reader warming is optional: SQLite or filesystem
+errors still fall through to the full pass. Namespace-wide older-owner bindings
+and withdrawals remain dependencies. Cold passes count as P1 `fallback` (no key),
+not keyed `change`. Because they record no memo, the first subsequent background
+local pass also runs in full to establish an ordinary pre-pass key; this moves
+work off the request thread, not necessarily out of the process. No net end-to-end
+speedup or incident recovery is established by removing the cold key alone.
 `test_kanban_mirror_keyed.py` covers first-response asks with a key trap, failure
 without warming, older-owner withdrawal, changed asks and background key recovery.
 
