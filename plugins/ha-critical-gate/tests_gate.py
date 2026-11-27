@@ -81,7 +81,8 @@ def test_hook_blocks_through_env_command(tmp_path, monkeypatch):
     script.write_text("import json,sys\ncall=json.load(sys.stdin)\n"
                       "print(json.dumps({'decision': 'hold' if call['service']=='unlock' else 'allow', 'message': 'held'}))\n")
     monkeypatch.setenv("HA_CRITICAL_GATE_COMMAND", "%s %s" % (sys.executable, script))
-    assert plugin._pre_tool_call(tool_name="ha_call_service", args=UNLOCK) == {"action": "block", "message": "held"}
+    # Legacy environment commands are not an authorization source anymore.
+    assert plugin._pre_tool_call(tool_name="ha_call_service", args=UNLOCK)["action"] == "block"
     assert plugin._pre_tool_call(tool_name="ha_call_service", args=LIGHT) is None
 
 
@@ -92,5 +93,5 @@ def test_config_file_in_root_home_covers_profiles(tmp_path, monkeypatch):
     monkeypatch.delenv("HA_CRITICAL_GATE_COMMAND", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "bb-worker"))
     monkeypatch.setattr(plugin, "_homes", lambda: [root / "profiles" / "bb-worker", root])
-    assert plugin.gate_config()["command"] == ["x"]
+    assert plugin.gate_config() is None  # profile/root-home JSON cannot select code
     assert plugin.agent_name() == "bb-worker"
