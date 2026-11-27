@@ -88,3 +88,31 @@ def test_f7_compound_prefix_case_hold(prefix, monkeypatch):
 def test_f7_prefix_words_as_data(command):
     assert guard.check_shell(command) is None
     assert runner.workload_reason(command) is None
+
+
+@pytest.mark.parametrize('prefix', [
+    'time --', 'time -p --', 'time -p -- !',
+    *[kind + ' ' + name for kind in ('function', 'coproc')
+      for name in ('a-b', 'a.b', 'a:b', 'a/b', 'a+b', '1f',
+                   "'a-b'", '"a b"', r'a\-b', "a' 'b")],
+    'time -- coproc a-b', '! time -p -- function 1f',
+])
+def test_f8_shell_word_names_and_time_terminator(prefix, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    command = 'echo $(' + prefix + ' case x in x) pytest;; esac)'
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+    monkeypatch.setenv('MAC_HEAVY_OK', '1')
+    assert guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize('command', [
+    'echo $(echo time -- case)', 'echo $(echo function a-b case)',
+    'echo $(echo coproc a.b case)', 'echo $(time -- date)',
+    'echo $(time -p -- date)', 'echo $(coproc a-b date)',
+    'echo $(function a-b { date; }; a-b)',
+])
+def test_f8_shell_word_data_controls(command):
+    assert guard.check_shell(command) is None
+    assert runner.workload_reason(command) is None

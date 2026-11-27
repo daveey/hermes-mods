@@ -868,9 +868,13 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
                 prefix = "".join(out)
+                # Bash function/coproc NAME is a shell word, not an identifier.
+                # Preserve quote provenance: only the NAME may be quoted, never
+                # the reserved prefix or case keyword. Include joined word parts.
+                word = r'''(?:[^\s;&|()<>'"\\`]|\\.|'[^']*'|"(?:\\.|[^"\\])*")+'''
                 if re.search(r"(?:^|[;&|({\n])\s*(?:(?:then|do|else|if|while|until|!|"
-                             r"time(?:\s+-p)?|coproc(?:\s+[A-Za-z_][A-Za-z0-9_]*)?|"
-                             r"function\s+[A-Za-z_][A-Za-z0-9_]*)\s+)*$", prefix):
+                             r"time(?:\s+-p)?(?:\s+--)?|coproc(?:\s+" + word + r")?|"
+                             r"function\s+" + word + r")\s+)*$", prefix):
                     raise _UnsupportedSubstitution
             if c == "\\":
                 out.append(text[i:i + 2])
