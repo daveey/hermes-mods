@@ -277,7 +277,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
         # scope. Analyze their writes, then restore custody at the list boundary.
         following = segments[index + 1] if index + 1 < len(segments) else []
         if following in (["|"], ["&"]) and pipeline is None:
-            pipeline = (dict(env), set(exported), set(readonly), in_home)
+            pipeline = (dict(env), set(exported), set(readonly),
+                        guard.merge_directory_contexts(in_home, *failed_cd))
         if raw and raw[0] == "}":
             if braces:
                 blocks = braces.pop()
