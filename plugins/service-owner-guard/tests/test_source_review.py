@@ -82,6 +82,21 @@ class SourceReview(Base):
                 self.assertEqual(calls[-1][1]["pid"], 4242)
                 self.assertIn("2222", " ".join(calls[-1][0]))
 
+    def test_clustered_port_with_separate_value_preserves_owned_target(self):
+        calls = []
+        self.g.remote_lookup = lambda p, s: calls.append((p, s)) or {"status": "found", "owner": CARD}
+        self.assertIsNotNone(self.g.check("ssh -vp 2222 box 'kill 4242'"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][-1], "box")
+        self.assertIn("port=2222", calls[0][0])
+        self.assertEqual(calls[0][1]["pid"], 4242)
+
+    def test_clustered_config_with_separate_value_never_invokes_ssh(self):
+        bindir, log = self.fake_ssh()
+        with mock.patch.dict(os.environ, {"PATH": str(bindir) + os.pathsep + os.environ["PATH"]}):
+            self.assertIsNotNone(self.g.check("ssh -vF cfg box 'systemctl stop foo'"))
+        self.assertFalse(log.exists(), "clustered config option invoked SSH")
+
     def test_malformed_or_unknown_ssh_options_fail_closed(self):
         for options in ["-Z", "-p bad", "-p 0", "-p 65536", "-o User=-oops",
                         "-o ConnectTimeout=99", "-o BatchMode=no", "-o IdentitiesOnly=no"]:
