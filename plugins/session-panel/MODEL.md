@@ -20,13 +20,18 @@ starts fresh. Missing/invalid/future/stale source time remains unknown, never a
 `created_at` estimate. Local, replica and origin-ledger paths carry this scalar.
 Older cores without the helper retain unknown age rather than a duplicate rule.
 
-The feed schedules bounded next-threshold invalidation; core detached annotation
-snapshots project distinct `kanban_triage_attention` counts and qualified refs.
+The feed schedules bounded next-threshold invalidation (`triage_deadlines`) for
+listed rows and shared-blocker groups, keyed by the reducer's own serving-gateway
+identity (`serving_row`); a crossing the feed already re-reduced never re-arms the
+wake, so after the age pass the loop returns to its normal idle cadence. Core
+detached annotation snapshots project distinct `kanban_triage_attention` counts and qualified refs.
 Canonical fanout has a separate successful-clock deadline, refreshing stored
 outcomes without task writes or reopening chat. Ordinary/Background counters
 consume the operational field; session dot/stripe consume the refreshed canonical
 red reason. Display-only elapsed ticks do not reread histories, poll HTTP or churn
-model revisions. Expired observations cannot establish current overdue attention.
+model revisions. Expired observations cannot establish current overdue attention:
+stale snapshots drop `triage_overdue` from rows, header label/attention and pips
+(the row keeps only explicit "last known:" text).
 
 Tests cover strict boundaries, six-day age, current episodes, repeated holds,
 exit/re-entry, unknown times, actual human-request controls, local/replica inputs,

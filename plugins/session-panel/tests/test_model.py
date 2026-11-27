@@ -4,6 +4,12 @@ import importlib.util
 import json
 from pathlib import Path
 
+try:  # The shared >600 s triage-age policy and lifecycle-entry derivation live in core.
+    import hermes_cli.kanban_triage_attention  # noqa: F401
+    AGED = True
+except ImportError:  # Without core the age is explicitly unknown; actor/ownership assertions still run.
+    AGED = False
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('panel_model_test', ROOT / 'model.py')
 model = importlib.util.module_from_spec(spec)
@@ -120,8 +126,6 @@ def test_triage_live_human_request_or_bound_open_request_is_red():
 
 
 def test_triage_age_uses_latest_entry_not_creation_or_repeated_hold_events():
-    import pytest
-    pytest.importorskip('hermes_cli.kanban_triage_attention')
     for remote in (False, True):
         b = held_bundle(remote=remote, kind='spend_budget_triaged', created_at=NOW - 30 * 86400)
         events = b['cards']['t_abc123']['detail']['events']
@@ -130,22 +134,24 @@ def test_triage_age_uses_latest_entry_not_creation_or_repeated_hold_events():
             {'kind': 'claimed', 'created_at': NOW - 86400, 'payload': {}},
             {'kind': 'spend_budget_triaged', 'created_at': NOW - (5 * 3600 + 20 * 60), 'payload': {'limit': 'runs', 'reason': 'Review remaining scope.'}},
             {'kind': 'decision_retained', 'created_at': NOW - 60, 'payload': {'disposition': {'reason': 'scope_stopped'}}}]
-        row = model.reduce_panel(b, now=NOW)['sections']['stuck'][0]
-        assert 'overdue triage' in row['detail']
-        assert 'in triage · 5h 20m' in row['detail']
+        m = model.reduce_panel(b, now=NOW)
+        row = m['sections']['stuck' if AGED else 'waiting'][0]
+        assert not m['sections']['needs_you']
+        assert AGED == row['detail'].startswith('overdue triage · ')
+        assert ('in triage · 5h 20m' in row['detail']) if AGED else ('entry time unavailable' in row['detail'])
         assert 'scope stopped' in row['detail']
         assert 'specified and promoted' not in row['detail']
-        assert 'in triage · 5h 20m' in row['details']
+        if AGED:
+            assert 'in triage · 5h 20m' in row['details']
         first = model.reduce_panel(b, now=NOW, wire=True)
         b['computed_at'] = NOW + 120
         later = model.reduce_panel(b, now=NOW + 120, wire=True)
         assert first['revision'] == later['revision']
-        assert {'timestamp': NOW - (5 * 3600 + 20 * 60), 'format': 'elapsed'} in first['sections']['stuck'][0]['clock_text']['detail']
+        if AGED:
+            assert {'timestamp': NOW - (5 * 3600 + 20 * 60), 'format': 'elapsed'} in first['sections']['stuck'][0]['clock_text']['detail']
 
 
 def test_missing_triage_entry_is_explicit_and_parent_chain_carries_age():
-    import pytest
-    pytest.importorskip('hermes_cli.kanban_triage_attention')
     b = held_bundle(created_at=NOW - 86400)
     row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert 'entry time unavailable' in row['detail']
@@ -153,13 +159,11 @@ def test_missing_triage_entry_is_explicit_and_parent_chain_carries_age():
     b = bundle(task(status='todo', upstream=parent), cards={parent['id']: {'detail': {'task': parent,
         'events': [{'kind': 'spend_budget_triaged', 'created_at': NOW - (3 * 3600 + 41 * 60), 'payload': {'limit': 'runs'}}]}}})
     row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-    assert 'in triage · 3h 41m' in row['detail']
+    assert ('in triage · 3h 41m' if AGED else 'entry time unavailable') in row['detail']
     assert 'run cap used up' in row['detail']
 
 
 def test_real_promotion_and_escalation_writers_start_new_triage_episodes():
-    import pytest
-    pytest.importorskip('hermes_cli.kanban_triage_attention')
     for kind in ('block_loop_detected', 'agent_block_escalated', 'spend_budget_held', 'gave_up'):
         b = held_bundle()
         b['cards']['t_abc123']['detail']['events'] = [
@@ -167,7 +171,7 @@ def test_real_promotion_and_escalation_writers_start_new_triage_episodes():
             {'kind': 'promoted_manual', 'created_at': NOW - 3600, 'payload': {'actor': 'agent', 'from_status': 'triage'}},
             {'kind': kind, 'created_at': NOW - 60, 'payload': {}}]
         row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-        assert 'in triage · 1m' in row['detail']
+        assert ('in triage · 1m' if AGED else 'entry time unavailable') in row['detail']
 
 
 def test_shared_triage_group_preserves_canonical_human_request_authority():
@@ -180,9 +184,7 @@ def test_shared_triage_group_preserves_canonical_human_request_authority():
     assert len(m['sections']['needs_you']) == 1
     assert m['groups'][0]['section'] == 'needs_you'
     assert "waiting on you" in m['groups'][0]['detail']
-    import pytest
-    pytest.importorskip('hermes_cli.kanban_triage_attention')
-    assert 'in triage · 1h' in m['groups'][0]['detail']
+    assert ('in triage · 1h' if AGED else 'entry time unavailable') in m['groups'][0]['detail']
     assert all(row.get('wait_kind') != 'agent' for row in m['sections']['waiting'])
 
 

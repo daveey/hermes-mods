@@ -226,6 +226,21 @@ def target(row):
     return {k: row.get(k) for k in ('id', 'gateway', 'profile', 'board')}
 
 
+def serving_row(raw, bundle):
+    """A copy of one listed task with the identity the reducer keys it by.
+
+    Only serving-gateway rows inherit serving coordinates. Replica/unknown
+    ownership is never repaired into local decision authority.
+    """
+    row = dict(raw)
+    if not row.get('remote') and row.get('source') != 'replica' and row.get('ownership_state') != 'unknown':
+        for field in ('gateway', 'profile'):
+            if not row.get(field) and bundle.get(field):
+                row[field] = bundle[field]
+    row.setdefault('board', 'default')
+    return row
+
+
 def session_target(row):
     """The chat that owns a card (its `session_id`), on the card's own gateway/profile; None when unknown."""
     sid = row.get('session_id')
@@ -555,17 +570,42 @@ def triage_overdue(row, bundle, now):
     return overdue(triage_clock(row, bundle), now=now)
 
 
-def triage_deadline(bundle, now):
+def triage_deadlines(bundle, now):
+    """Next overdue-triage crossings the held model has not painted yet (detached evidence only).
+
+    Keys use the reducer's own serving-gateway identity (``serving_row``), so a local row that the model has
+    already painted overdue is covered and a crossed deadline never re-arms the feed's wake. Only cards the
+    model shows (ordinary rows and dependency/shared-blocker groups) can change presentation.
+    """
     try:
         from hermes_cli.kanban_triage_attention import next_transition
     except ImportError:
-        return None
-    sections = obj(obj(bundle.get('model')).get('sections'))
-    covered = {v['key'] for name, views in sections.items() for v in views
-               if name == 'needs_you' or v.get('attention') == 'triage_overdue'}
-    clocks = [triage_clock(row, bundle) for row in bundle.get('tasks') or [] if key(row) not in covered]
-    return min((at for row in clocks if (entered := triage_entry(row, {})) is not None and entered <= now
-                if (at := next_transition(row, now=min(now, entered))) is not None), default=None)
+        return []
+    result = obj(bundle.get('model'))
+    shown = {v['key']: v for views in obj(result.get('sections')).values() for v in views or ()
+             if isinstance(v, dict) and v.get('key')}
+    groups = {g['key']: g for g in result.get('groups') or () if isinstance(g, dict) and g.get('key')}
+
+    def pending(view):
+        return (view is not None and view.get('section') != 'needs_you'
+                and view.get('attention') != 'triage_overdue')
+    needs_you = {v['key'] for v in obj(result.get('sections')).get('needs_you') or () if isinstance(v, dict)}
+    clocks = []
+    for raw in bundle.get('tasks') or ():
+        if isinstance(raw, dict) and raw.get('id'):
+            row = serving_row(raw, bundle)
+            if key(row) not in needs_you and pending(shown.get(key(row))):
+                clocks.append(triage_clock(row, bundle))
+    for group in groups.values():
+        if group.get('status') == 'triage' and pending(group):
+            clocks.append(triage_clock({**group, **obj(obj(obj(obj(bundle.get('cards')).get(group.get('id'))).get(
+                'detail')).get('task'))}, bundle))
+    return [at for row in clocks if (entered := triage_entry(row, {})) is not None and entered <= now
+            if (at := next_transition(row, now=min(now, entered))) is not None]
+
+
+def triage_deadline(bundle, now):
+    return min(triage_deadlines(bundle, now), default=None)
 
 
 def triage_label(row, bundle, now, *, wire=False):
@@ -875,15 +915,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     for raw in bundle.get('tasks') or []:
         if not isinstance(raw, dict) or not raw.get('id'):
             continue
-        row = dict(raw)
+        row = serving_row(raw, bundle)
         rec = obj(obj(bundle.get('cards')).get(str(row['id'])))
-        # Only serving-gateway rows inherit serving coordinates. Replica/unknown
-        # ownership is never repaired into local decision authority.
-        if not row.get('remote') and row.get('source') != 'replica' and row.get('ownership_state') != 'unknown':
-            for field in ('gateway', 'profile'):
-                if not row.get(field) and bundle.get(field):
-                    row[field] = bundle[field]
-        row.setdefault('board', 'default')
         diagnostic_row = dict(row)
         detail = obj(rec.get('detail'))
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
