@@ -801,6 +801,10 @@ class _AnalysisLimit(Exception):
 class _UnsupportedSubstitution(Exception):
     pass
 
+_HEAVY_TOKEN = re.compile(
+    r"(?<![\w.-])(?:cp|rsync|ditto|dd|cargo|docker|podman|nerdctl|pytest|py\.test|vitest|jest|npm|pnpm|yarn|bun|uv|"
+    r"pip3?|poetry|make|gmake|swift|swiftc|xcodebuild|run_tests(?:_parallel)?(?:\.sh|\.py)?|python3?(?:\.\d+)?)(?![\w-])")
+
 
 class _Substitution(list):
     """An isolated shell body, positioned in the parent command stream."""
@@ -868,6 +872,12 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
                 prefix = "".join(out)
+                # Class fallback (F11/F12): an unmodeled construct before a `case` inside a substitution
+                # (coproc/function/time/elif keywords, `${...}` parameter text, any unknown prefix word list)
+                # plus a heavy-command token anywhere in the command text holds, instead of enumerating more forms.
+                if _HEAVY_TOKEN.search(text) and (
+                        re.search(r"(?:^|[\s;&|({!])(?:coproc|function|time|elif)\b", prefix) or "${" in prefix):
+                    raise _UnsupportedSubstitution
                 # F10: a quoted/escaped paren inside a NAME substitution defeats the regex collapse below, so hold
                 # whenever a coproc/function keyword is followed by any substitution before this `case`.
                 if "$(" in prefix and re.search(

@@ -154,6 +154,36 @@ def test_f10_quoted_paren_in_name_substitution(prefix, monkeypatch):
     assert guard.check_shell(command) is None
 
 
+F11_CASES = [
+    'echo $(if :; then :; elif coproc a$(: ")") case x in x) pytest;; esac; then :; fi)',
+    'echo $(if :; then :; elif coproc a case x in x) pytest;; esac; then :; fi)',
+    'echo $(if :; then :; elif function a$(: ")") case x in x) pytest;; esac; then :; fi)',
+    'echo $(echo $(coproc a${x:-)} case x in x) pytest;; esac))',
+    # class fallback: unknown/unmodeled prefix construct + heavy token anywhere
+    'echo $(echo $(time -p -- coproc a${x:-)} case x in x) cargo build --release;; esac))',
+    'echo $(elif case x in x) swift build;; esac)',
+]
+
+
+@pytest.mark.parametrize('command', F11_CASES)
+def test_f11_f12_class_fallback_holds(command, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+    monkeypatch.setenv('MAC_HEAVY_OK', '1')
+    assert guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize('command', [
+    'echo $(elif coproc a${x:-)} case x in x) echo hi;; esac)',
+    'echo $(echo ${x:-)} case)',
+])
+def test_f11_f12_fallback_needs_heavy_token(command):
+    assert guard.check_shell(command) is None
+    assert runner.workload_reason(command) is None
+
+
 def test_f9_arithmetic_name_still_refused(monkeypatch):
     monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
     command = 'echo $(coproc a$((1)) case x in x) pytest;; esac)'
