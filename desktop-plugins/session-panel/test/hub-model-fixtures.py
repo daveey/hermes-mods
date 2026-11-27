@@ -155,6 +155,18 @@ else:
                 assert record['detail']['task']['triage_entered_at'] == f.NOW - age
                 row = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
                 cases['composed_triage_' + str(age)] = f.bundle(row, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
+            # Shared-blocker group: the triage parent is read through the same real
+            # adapter, but only its dependants are session rows (the group owns the red).
+            for age in (599, 601):
+                tid = kanban_db.create_task(conn, title='Owned triage shared stage', initial_status='running')
+                conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, f.NOW - age))
+                conn.commit()
+                record = reader.card(tid, 'default')
+                assert record['detail']['task']['triage_entered_at'] == f.NOW - age
+                parent = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
+                children = [f.task(cid, status='todo', gateway='fixture-gateway', upstream=parent) for cid in ('t_111111', 't_222222')]
+                cases['composed_triage_group_' + str(age)] = f.bundle(*children, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
         finally:
             reader.release()
             conn.close()

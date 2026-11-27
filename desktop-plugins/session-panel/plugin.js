@@ -555,13 +555,14 @@ export function clockRow(row, now = Date.now() / 1000) {
   return result
 }
 /** Withdraw expired row presentation, never rewrite canonical status or source clocks. */
-function expiryPresentation(model, sections, diagnosticExpired = false) {
+function expiryPresentation(model, sections, diagnosticExpired = false, groups = model.groups) {
   const counts = { ...model.header.counts }
   for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
   const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
   const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
-  // Overdue triage is fresh operational red: it survives expiry only on rows that still claim it.
-  const overdue = sections.stuck.some(row => row.attention === 'triage_overdue')
+  // Overdue triage is fresh operational red: it survives expiry only on rows or
+  // shared-blocker groups that still claim it (a group alone can own the header's red).
+  const overdue = [...sections.stuck, ...(Array.isArray(groups) ? groups : [])].some(row => row?.attention === 'triage_overdue')
   const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => {
     const { attention, ...pip } = model.header.pips.find(p => p.section === section) || {}
     return { ...pip, section, label: pip.label || label, count: counts[section],
@@ -572,7 +573,7 @@ function expiryPresentation(model, sections, diagnosticExpired = false) {
     !counts.needs_you && !counts.stuck && !counts.running
   const { attention, ...header } = model.header
   const label = !overdue && attention === 'triage_overdue' ? str(header.label).replace(/^overdue triage · /, '') : header.label
-  return { ...model, sections, header: { ...header, label, counts, pips, wait_kind: waitKind, wait_eta: null,
+  return { ...model, sections, ...(Array.isArray(groups) ? { groups } : {}), header: { ...header, label, counts, pips, wait_kind: waitKind, wait_eta: null,
     ...(overdue && attention ? { attention } : {}),
     ...(withdrawnDerived ? { state: 'unknown', label: 'execution reason unknown' } : {}) } }
 }
@@ -616,7 +617,17 @@ export function expireNativeWaits(model, now, vouched) {
       actions: row.actions.filter(a => ['open_card', 'open_session', 'open_url', 'open_process'].includes(a.kind)),
       options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null })
   }
-  return expiryPresentation(model, sections)
+  // Shared-blocker groups come from the same stale snapshot: they lose overdue red
+  // too and keep only explicitly historical text.
+  const groups = Array.isArray(model.groups) ? model.groups.map(group => {
+    if (group?.attention !== 'triage_overdue') return group
+    const { attention: _overdue, ...old } = group
+    return { ...old, section: 'waiting', reason: 'source-stale', evidence_state: 'unknown',
+      detail: `status unknown · last known: ${old.detail || 'stuck'}`,
+      details: ['Task source freshness: stale; read current authoritative task state before acting.'],
+      wait_kind: null, wait_eta: null, clock_text: null }
+  }) : model.groups
+  return expiryPresentation(model, sections, false, groups)
 }
 /** The three right-click entries for a row, in order. `action` is null when the row has nothing to open there
  *  (no owning chat, no dependency, or the owning chat is the one already in focus). */
