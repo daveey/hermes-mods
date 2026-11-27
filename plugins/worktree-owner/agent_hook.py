@@ -180,7 +180,7 @@ def not_merged_reason(path: str, main: str) -> str | None:
     # Share the card teardown's conservative scan, including its disposable-cache policy.
     try:
         complex_reason = base._complex_reason(path)
-    except OSError as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         return f"scan failed: {exc}"
     if complex_reason:
         return complex_reason

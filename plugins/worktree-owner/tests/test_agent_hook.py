@@ -261,6 +261,29 @@ class AgentHook(unittest.TestCase):
         self.assertEqual([r["action"] for r in res],
                          ["kept: scan failed: fixture unreadable subdirectory", "removed"])
 
+    def test_decode_and_timeout_scan_errors_do_not_skip_healthy_sibling(self):
+        from unittest import mock
+        for index, error in enumerate((UnicodeDecodeError("utf-8", b"\xff", 0, 1, "fixture"),
+                                       subprocess.TimeoutExpired("git ls-files", 300))):
+            with self.subTest(error=type(error).__name__):
+                sid = f"scan-error-{index}"
+                p = self.make(f"proj-error-{index}", f"berror{index}", sid=sid)
+                sibling = self.make(f"proj-sibling-{index}", f"bsibling{index}", sid=sid)
+                original = self.b._complex_reason
+                def fail_one(path):
+                    if path == str(p):
+                        raise error
+                    return original(path)
+                gds = [git(tree, "rev-parse", "--absolute-git-dir").strip() for tree in (p, sibling)]
+                with mock.patch.object(self.b, "_complex_reason", side_effect=fail_one), \
+                        mock.patch.object(self.b, "_common_dirs", return_value=[str(self.repo / ".git")]), \
+                        mock.patch.object(self.h.glob, "glob", return_value=gds):
+                    res = self.end(sid=sid)
+                self.assertTrue(p.exists())
+                self.assertFalse(sibling.exists(), res)
+                self.assertTrue(res[0]["action"].startswith("kept: scan failed:"), res)
+                self.assertEqual(res[1]["action"], "removed")
+
     def test_correct_marker_path_with_forged_backlink_is_kept(self):
         p = self.make("proj-correct-marker", "bcorrectmarker")
         other = self.make("proj-forged-backlink", "bforgedbacklink", sid="sess-2")
