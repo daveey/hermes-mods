@@ -83,7 +83,7 @@ def read_board(path, *, snapshot=True):
         db.close()
 
 
-def merge(pairs):
+def merge(pairs, *, merge_metrics=None):
     snap, raw = deepcopy(pairs[0])
     raw = raw or {}
     raw.setdefault('cards', [])
@@ -102,6 +102,9 @@ def merge(pairs):
                 snap.setdefault('lanes', {})[name] = deepcopy(row)
                 continue
             dest = snap['lanes'][name]
+            if merge_metrics is not None:
+                fields = merge_metrics({name: dest}, {name: row})[name]
+                dest.update(fields)
             for key in ('open', 'running', 'ready', 'held', 'blocked_on_you', 'done', 'run_seconds', 'runs', 'admitted_today', 'cost_usd', 'tokens', 'usage_runs'):
                 if isinstance(row.get(key), (int, float)):
                     dest[key] = dest.get(key, 0) + row[key]

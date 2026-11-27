@@ -234,7 +234,8 @@ def test_composed_sdk_mount_order_preserves_real_lane_limits(board, api, monkeyp
         collapsed = api._lane_view(6, '6h', False)
     assert expanded['lanes']['babybear']['limits'] == {
         'max_workers': 3, 'cards_per_day': 7, 'usd_per_day': 12.5}
-    assert 'limits' not in collapsed['lanes']['babybear']
+    # Compact rows need the actual ceiling even while details are collapsed.
+    assert collapsed['lanes']['babybear']['limits'] == expanded['lanes']['babybear']['limits']
     if not (NODE.parent / 'node_modules/react').exists():
         pytest.skip('install desktop-plugins/lanes/tests/package.json for jsdom acceptance')
     path = tmp_path / 'composed.json'

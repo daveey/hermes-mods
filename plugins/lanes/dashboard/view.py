@@ -184,11 +184,16 @@ def project(snap, raw, expanded):
                 row['device_footnote'] = raw['governors']['device_footnote']
         view['sidebar'] = dict(cost_today=sum((r.get('usage') or {}).get('usd_today', 0) for r in raw.get('lanes', {}).values()),
                                idle_lanes=[n for n, r in view['lanes'].items() if not r.get('open')])
+    for name, row in raw.get('lanes', {}).items():
+        if 'limits' in row:
+            view['lanes'].setdefault(name, {})['limits'] = row['limits']
     if expanded:
         for name, row in raw.get('lanes', {}).items():
             view['lanes'].setdefault(name, {}).update({k: v for k, v in row.items()
                                                      if k in ('limits', 'usage', 'run_hours', 'cost_usd', 'done')})
     for row in view['lanes'].values():
+        row.setdefault('ticks', None)
+        row.setdefault('spend', None)
         row['not_ready'] = max(0, row.get('open', 0) - row.get('running', 0) - row.get('blocked_on_you', 0))
         for key in ('running', 'blocked_on_you', 'open', 'ready', 'held', 'done'):
             row.setdefault(key, 0)
@@ -255,11 +260,15 @@ def project(snap, raw, expanded):
         view['totals'] = {key: None for key in view['totals']}
         for row in view['lanes'].values():
             for key in ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done',
-                        'actual', 'run_seconds', 'run_hours', 'runs', 'admitted_today', 'cost_usd', 'tokens', 'usage_runs'):
+                        'actual', 'run_seconds', 'run_hours', 'runs', 'admitted_today', 'cost_usd', 'tokens', 'usage_runs',
+                        'ticks', 'spend'):
                 row[key] = None
             row['drift'] = 'unknown: board source unavailable'
         if 'sidebar' in view:
             view['sidebar']['idle_lanes'] = []
+    spends = [row.get('spend') for row in view['lanes'].values()]
+    view['spend'] = ({key: round(sum(row[key] for row in spends), 2) for key in ('hour', 'day', 'week')}
+                     if spends and all(row is not None for row in spends) else None)
     if not expanded:
         return view
     cards = raw.get('cards', [])
