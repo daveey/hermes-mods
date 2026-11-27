@@ -9,7 +9,7 @@ CASES = {
     'handoff': 'hermes {f} kanban complete ' + OWN + ' --result "$(cat s)"',
 }
 FLAGS = ['', '-p default', '--profile default', '--profile=default', '-p x --model m', '--reasoning high -p x', '-c -p x', '--', '-p x --', '--model m --',
-         '--mod m', '--reas high', '--prov x', '--usage x', '--cpu x', '--tool x', '--skil x', '--res x', '--one x']
+         '--mod m', '--reas high', '--prov x', '--usage x', '--cpu x', '--tool x', '--skil x', '--res x', '--one x', '--cont x', '--con x']
 
 
 def held(cmd):
@@ -69,6 +69,15 @@ def test_static_list_matches_core():
             if prefix in options or hits == [option]:
                 for form in (prefix + ' x', prefix + '=x'):
                     assert held(f'hermes {form} kanban edit {OWN} --title new'), form
+
+
+@pytest.mark.parametrize('flags', ['--yo chat', '--wor x'])
+def test_abbreviated_switch_before_non_kanban_is_not_kanban(flags):
+    # These unique switch prefixes cannot consume chat/x as a value. A fallback
+    # that treats all prefixes as unknown would over-hold the later word kanban.
+    command = f'hermes {flags} kanban edit {OWN} --title new'
+    assert core._kanban_verb(core._segments(command)[0]) is None
+    assert held(command) is None
 
 
 @pytest.mark.parametrize('flags', ['-- --', '-- -p x', '-p x -- --', '--model m -- --', '-- chat'])
