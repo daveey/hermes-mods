@@ -44,6 +44,12 @@ Trace the actual request boundary before benchmarking: a published-wire HTTP han
 
 Freeze the complete generated input inventory, including installation identity, before fresh-process ABBA trials. Use consistent SQLite backups without copied WAL/SHM and immutable reads of the frozen seed. Preserve output identity rather than normalizing it away. Audit authoritative main files together with WALs; compare derived projection-cache logical changes separately. New rental/AWS/session stores may initialize and differ despite identical model output: retain those differences and costs, never assert all output bytes unchanged. Count instrumentation belongs in separate runs, and failed short observation windows remain excluded pilots rather than invented completeness.
 
+## Canonical writer replay boundaries
+
+Before enabling reconciliation, trace its independent board/home discovery and dynamic courier client imports; a reader's path adapter does not isolate its writer. Exercise the genuine process-home path in a disposable process rather than bypassing explicit-home write refusal. Capture each owner's deferred and unreached results: identical published models can conceal an entirely deferred writer pass. Audit consistent SQLite backups/logical dumps including WAL-resident data and newly initialized ActionStores, not only main-file hashes.
+
+Treat rental input readers as potential producers: a read can start asynchronous collector refreshes and attempt cloud subprocesses. Install trusted-code filesystem/network/subprocess guards before imports, preserve actual refused executables, and label resulting availability/fallback behavior. An audit hook is not an OS sandbox. Join the exact owned collector thread before final state capture. Empty ActionStore reconciliation proves no ask lifecycle transition; a single clean tick is not watcher/outbox/decision/retry lifecycle proof.
+
 ## Wait classification and regression tests
 
 Match exact leaf names, not caller substrings or all symbols ending in `_trap`.
