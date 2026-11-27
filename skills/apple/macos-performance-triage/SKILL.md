@@ -56,6 +56,12 @@ For canonical ask tests, read the actual ActionStore and canonical decision refr
 
 If genuine writer initialization generates UUIDs, preserve final bundle differences even in A/A. Trace event IDs/UIDs to immutable backed-up DB rows, recovery predecessors to the blocked event, source references to the transition event, and recompute dependent contract/model hashes from exact source. A value mapping can establish relational consistency but never identity/custody equality. Equal ActionStore tables do not prove equivalence of identities absent from those tables. Pending local outbox creation is not delivery; audit WAL-aware final state and join owned collector threads. Once the relational audit and producer/API proofs are complete, consolidate coverage rather than expand into unrelated watchers/outbox/retry benchmarks; controlled source proof cannot manufacture a missing live operational baseline.
 
+## Native confinement preflight
+
+Resolve the real task scratch path before generating native sandbox rules, argv and HOME/temp roots: macOS scratch aliases can point to a `.noindex` directory, and lexical subpath rules then deny even the intended positive write. Preserve that failed pilot; fix only the demonstrated path mismatch, never widen production access. Independently review the corrected preflight and test scratch write/read allowed, synthetic sibling read/write denied, and loopback connect denied before a native workload. Label default-allow profiles precisely: file/network deny proof is not hermetic process/Mach isolation or proof that Electron works under the same confinement. A Python audit hook remains best effort.
+
+For an owned renderer fixture, abort on a null render instead of acknowledging a wrongly wrapped model. Keep DOM/text serialization out of each timed acknowledgement; capture full output at final equivalence only. Denied requests and helper crashes invalidate the arm. Require canonical existing scratch, independent process-tree cleanup and a hard external controller deadline; fake-Electron/jsdom tests establish protocol logic, not native isolation, visible paint or user-window recovery.
+
 ## Wait classification and regression tests
 
 Match exact leaf names, not caller substrings or all symbols ending in `_trap`.
