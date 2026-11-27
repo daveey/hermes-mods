@@ -126,9 +126,18 @@ def test_failing_statement_inside_block_closes_and_propagates(tmp_path, opened):
 def test_close_runs_even_if_rollback_fails(tmp_path, opened):
     store = load('ownership').OwnershipStore(tmp_path / 'registry.db')
     db = store.connect()
-    db.close()  # rollback on a closed connection raises ProgrammingError
-    with pytest.raises(sqlite3.ProgrammingError):
-        db.__exit__(None, None, None)
+
+    def deny_rollback(action, arg1, *_):
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 == 'ROLLBACK':
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    db.set_authorizer(deny_rollback)
+    # A genuine rollback failure on a live, open connection.
+    with pytest.raises(sqlite3.DatabaseError):
+        with db:
+            db.execute("INSERT INTO bindings VALUES (?,?,?,?,'manual')", (KEY, 'g1', 'default', 's1'))
+            raise RuntimeError('boom')
     assert is_closed(db)
 
 
