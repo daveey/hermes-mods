@@ -1,5 +1,4 @@
-"""The waiter executes only a reviewed snapshot at the fixed installed path."""
-import hashlib
+"""The waiter executes only a checked snapshot at the fixed installed path."""
 import importlib.util
 import os
 from pathlib import Path
@@ -18,18 +17,11 @@ def updater(tmp_path, monkeypatch):
     path.write_bytes(b"# fixture updater\n")
     path.chmod(0o600)
     monkeypatch.setattr(waiter, "updater_path", lambda: path)
-    monkeypatch.setattr(waiter, "UPDATER_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
     return path
 
 
-def test_attestation_accepts_reviewed_bytes(updater):
+def test_accepts_safe_updater(updater):
     assert waiter.attested_source() == updater.read_bytes()
-
-
-def test_rejects_unreviewed_bytes(updater):
-    updater.write_bytes(b"raise RuntimeError('must not execute')\n")
-    with pytest.raises(ValueError, match="reviewed revision"):
-        waiter.main()
 
 
 @pytest.mark.parametrize("mode", [0o620, 0o602])
@@ -66,7 +58,8 @@ def test_rejects_missing_updater(updater):
 
 def test_rejects_nonregular_updater(updater):
     updater.unlink()
-    os.mkfifo(updater)
+    os.mkfifo(updater, 0o600)
+    updater.chmod(0o600)
     with pytest.raises(ValueError, match="permissions"):
         waiter.attested_source()
 

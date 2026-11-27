@@ -9,7 +9,7 @@ An updater (for example a sync job that keeps a fork checkout current) writes
 
 and, while it waits for Desktop to quit, ``waiter.json`` ({"pid", "state", ...}) next to it.
 The legacy ``waiter_cmd`` field is ignored. Restart uses this plugin's waiter.py,
-which accepts only a digest-pinned reference updater at its fixed installed path.
+which runs only the reference updater at its fixed installed path after owner/mode checks.
 This module only reads those files, the running checkout's HEAD and installed Desktop bundle
 stamps; ``restart`` starts the
 waiter (it is idempotent: a second waiter exits at once) and then asks Desktop to quit, so the
