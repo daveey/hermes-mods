@@ -4,6 +4,7 @@ from . import core
 
 
 def register(ctx):
+    core.cleanup_staging()
     # Order matters: gate records the call it asked about; prepare only stages recorded calls.
     ctx.register_hook("pre_tool_call", core.gate)
     ctx.register_hook("pre_tool_call", core.prepare)
