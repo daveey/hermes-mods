@@ -59,6 +59,10 @@ interleavings, not only subprocess mocks, and do not count parent-gated or revie
 - The producer-fix card t_01a1d342b83eb2cd lives on worker-2, and kanban_comment/cross_task refuse foreign cards from another worker. Relay evidence with `kanban_supervisor_request(ops=[{op:'operator', action:'comment', task_id, text}])`.
 - A repeating `prior_archive_evidence` task id plus `upload:recovery_intent` refusals means stale detach intents (see above). They also waste the oversize slot, so quarantine them first.
 
+## Claim-watch disk recovery verification
+
+For pinned-ready claim alerts, correlate the dispatcher's exact `worker_disk_below_floor` defer with the reclaimer's available-byte receipt and the installed admission floor before blaming gateway, slots or sync. After another session cleans generated caches, independently read statvfs and each original card's same-host Board lease/run; a provider-quota retry after a successful claim is a separate failure, not continued lease starvation. Match subsequent executor progress, not merely the watcher's generic recovery comment. Leave permanent disk-growth remediation with the existing disk incident rather than describing cache containment as a producer fix.
+
 ## Cold-volume pressure
 
 Inventory cold manifests and migration ages before recursively sizing every archive. When all entries are younger than the expiry, an empty expiry report is expected, not proof of a broken collector; compare quarantine duration with volume capacity. Size only the top-level tiers first, and keep partial `du` output on timeouts. A shorter pressure TTL must preserve the existing source/repository/evidence guards, be tested at age and free-space boundaries, and pass independent review before live expiration. Verify actual filesystem reclaim separately from reported per-file bytes (hardlinks affect accounting).
