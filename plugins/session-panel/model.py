@@ -581,7 +581,7 @@ def agent_hold(row, bundle):
     """Administrative custody, not a human ask or permission to resume execution."""
     if row.get('status') not in ('triage', 'blocked') or row.get('stale') or human_owned(row):
         return False
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    detail = obj(owned_card(row, bundle).get('detail'))
     if row.get('status') == 'triage':
         return True
     for event in reversed(detail.get('events') or []):
@@ -631,7 +631,7 @@ def _legacy_human_owned(row):
 
 def triage_clock(row, bundle):
     """Use core's lifecycle policy, including detached local/replica evidence."""
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    detail = obj(owned_card(row, bundle).get('detail'))
     if 'events' in detail:
         task = obj(detail.get('task'))
         return {**row, 'events': detail['events'],
@@ -687,11 +687,11 @@ def triage_clocks(bundle):
         if isinstance(raw, dict) and raw.get('id'):
             row = serving_row(raw, bundle)
             if key(row) not in needs_you and pending(shown.get(key(row))):
-                clocks.append(triage_clock(row, bundle))
+                clocks.append(serving_row(triage_clock(raw, bundle), bundle))
     for group in groups.values():
         if group.get('status') == 'triage' and pending(group):
-            clocks.append(triage_clock({**group, **obj(obj(obj(obj(bundle.get('cards')).get(group.get('id'))).get(
-                'detail')).get('task'))}, bundle))
+            detail = obj(owned_card(group, bundle).get('detail'))
+            clocks.append(triage_clock({**obj(detail.get('task')), **group}, bundle))
     return [(entered, at) for row in clocks if (entered := triage_entry(row, {})) is not None
             if (at := next_transition(row, now=entered)) is not None]
 
@@ -708,7 +708,7 @@ def triage_label(row, bundle, now, *, wire=False):
 
 
 def held_cause(row, bundle):
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    detail = obj(owned_card(row, bundle).get('detail'))
     for event in reversed(detail.get('events') or []):
         if not isinstance(event, dict):
             continue
@@ -1013,7 +1013,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         diagnostic_row = dict(row)
         detail = obj(rec.get('detail'))
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
-        row = {**obj(detail.get('task')), **row}
+        # Carry only the already owner-checked history. Serving defaults must not
+        # cause a second lookup to reject compatible legacy listed coordinates.
+        row = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}), **row}
         if row.get('status') in ('running', 'review') and not row.get('run_model'):
             row['run_model'] = route_model(row, detail)
         k = key(row)
