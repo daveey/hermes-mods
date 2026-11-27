@@ -57,6 +57,9 @@ def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, mon
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('unrelated','heartbeat','{}',100)")
                 stop.wait(.05)
     writer = threading.Thread(target=churn)
+    # Status delivery may wait the configured start-to-start projection floor
+    # (3s by default), plus one watch tick and transport scheduling. A strict
+    # <3s deadline contradicted that floor; match test_board_view's bound.
     with TestClient(app) as client, contextlib.ExitStack() as sockets:
         viewers = [sockets.enter_context(client.websocket_connect(f'/v1/lanes/stream?expanded={str(flag).lower()}')) for flag in variants]
         for ws, expanded in zip(viewers, variants):
@@ -69,7 +72,7 @@ def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, mon
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','scheduled','{}',100)")
             for ws, expanded in zip(viewers, variants):
                 frame = ws.receive_json()
-                assert time.monotonic() - start < 3
+                assert time.monotonic() - start < api.MIN_PROJECT_GAP_S + api.WATCH_S + 2
                 assert frame['view']['totals']['running'] == 0
                 assert frame['view']['totals']['open'] == 1
                 if expanded:
@@ -80,7 +83,7 @@ def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, mon
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','archived','{}',100)")
             for ws, expanded in zip(viewers, variants):
                 frame = ws.receive_json()
-                assert time.monotonic() - start < 3
+                assert time.monotonic() - start < api.MIN_PROJECT_GAP_S + api.WATCH_S + 2
                 assert frame['view']['totals']['open'] == 0
                 if expanded:
                     assert frame['view']['flow']['graphs']['project']['total'] == 0
