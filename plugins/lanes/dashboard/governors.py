@@ -22,9 +22,20 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                       age_s=snap.get('age_s'), available=fresh,
                       flow_available=snap.get('flow_available', True), truncated=bool(snap.get('truncated')))
         scope.append(source)
-        if snap.get('reason'):
-            source['reason'] = snap['reason']
-        complete &= fresh and snap.get('flow_available', True)
+        reasons = []
+        if not fresh:
+            reasons.append(snap.get('reason') or ('stale dispatcher snapshot' if snap.get('stale') else 'no dispatcher snapshot'))
+        if not snap.get('flow_available', True):
+            reasons.append(snap.get('flow_reason') or 'flow unavailable')
+        numeric = [r.get('cards') for r in snap.get('governors', [])]
+        accounted = all(isinstance(n, int) for n in numeric) and snap.get('idle_total') is not None
+        balanced = accounted and sum(numeric) == snap['idle_total']
+        if fresh and not balanced:
+            reasons.append('incomplete governor accounting' if not accounted else 'governor accounting mismatch')
+        if reasons:
+            source['reason'] = '; '.join(reasons)
+        source['accounting_available'] = bool(fresh and balanced)
+        complete &= fresh and balanced and snap.get('flow_available', True)
         if fresh:
             idle += snap.get('idle_total') or 0
         for row in snap.get('governors', []):
@@ -33,8 +44,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
             for tid, charge in snap.get('cards', {}).items():
                 charges[snap.get('board'), tid] = charge
     lane_complete = complete and not any(s.get('truncated') for s in snapshots)
-    incomplete_sources = [s for s in snapshots if not s.get('available') or s.get('stale') or
-                          not s.get('flow_available', True) or s.get('truncated')]
+    incomplete_sources = [snap for snap, source in zip(snapshots, scope)
+                          if not source['accounting_available'] or not source['flow_available'] or source['truncated']]
     incomplete_lanes = (None if any('open_lanes' not in s for s in incomplete_sources) else
                         sorted({name for s in incomplete_sources for name in s['open_lanes']}))
     rows = []
@@ -66,12 +77,15 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         # A receipt that did not observe this governor reports cards=None
         # (storage-admission abort): unknown, never a zero and never a crash.
         count = sum(r.get('cards') or 0 for r, _, _ in known)
-        unknown = not complete or not known
-        unknown |= any(r.get('unknown') or r.get('cards', 0) is None for r, _, _ in known)
+        observed = [(r, s, b) for r, s, b in known if r.get('cards') is not None and not r.get('unknown')]
+        unknown = not observed
+        partial = len(known) != len(observations) or len(observed) != len(known) or not complete
         # Unreached global checks must never be painted as off.
         unknown |= any(g.get('verdict') == 'unknown' for _, _, b in known
                        for g in b.get('globals') or [] if g['governor'] == ident)
-        gauges = [r for r, s, _ in sorted(known, key=lambda item: item[1].get('age_s') or 0)
+        # Prefer a charged gauge, then the freshest. An idle sibling's 0/50
+        # must not replace the 10/50 attached to the cards actually held.
+        gauges = [r for r, s, _ in sorted(known, key=lambda item: (not bool(item[0].get('cards')), item[1].get('age_s') or 0))
                   if r.get('reading') is not None]
         reading_row = gauges[0] if gauges else {}
         at_cap = any(g.get('verdict') == 'stop' for _, _, b in known
@@ -86,20 +100,31 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                          threshold=r.get('threshold'), detail=r.get('detail'), cards=r.get('cards', 0))
                     for r, s, _ in known if r.get('reading') is not None or r.get('cards')]
         lanes = [dict(lane=lane, count=counts[ident]) for lane, counts in by_lane.items() if counts[ident]]
+        row_scope = []
+        for source in scope:
+            local = [(r, b) for r, s, b in observations if s is source]
+            observed_here = source['available'] and bool(local) and all(
+                r.get('cards') is not None and not r.get('unknown') for r, _ in local)
+            reached = not any(g.get('verdict') == 'unknown' for _, b in local
+                              for g in b.get('globals') or [] if g['governor'] == ident)
+            row_source = {**source, 'available': bool(observed_here and reached)}
+            if source['available'] and not row_source['available']:
+                row_source['reason'] = '; '.join(filter(None, [source.get('reason'), 'governor not observed this tick']))
+            row_scope.append(row_source)
         rows.append(dict(id=ident, name=entry['label'], kind=entry['kind'], state=state,
                          cards_charged=count, holding=[dict(board=s['board'], id=tid)
                          for r, s, _ in known for tid in r.get('card_ids', [])],
                          reading=reading_row.get('reading'), threshold=reading_row.get('threshold', entry['threshold']),
                          readings=readings, detail=reading_row.get('detail'), lanes=lanes,
                          since=min((r['since'] for r, _, _ in known if r.get('since')), default=None),
-                         scope=scope, partial=bool(unknown), clears=entry['threshold']))
+                         scope=row_scope, partial=bool(partial or unknown), clears=entry['threshold']))
     charged = sum(r['cards_charged'] for r in rows)
     if charged != idle or unsupported:
         complete = lane_complete = False
-        incomplete_lanes = None
-        if charged != idle:
-            for row in rows:
-                row.update(state='unknown', partial=True)
+        if unsupported:
+            incomplete_lanes = None
+        # A board's incomplete census cannot invalidate another governor's
+        # positive charge. Scope diagnostics retain the accounting failure.
     device = adapter or {}
     try:
         stamp = float(device.get('read_at') or 0)
@@ -120,6 +145,24 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
                 device_footnote=dict(state='known' if device_fresh else 'unknown', age_s=age,
                                      label='Residual device-only cards on mini',
                                      status_counts=device.get('status_counts') if device_fresh else None))
+
+
+def read_snapshot(*, conn=None, path=None, board=None):
+    """Use the CLI reader without migrations, tracking registration or a flow deadline."""
+    import sqlite3
+    from hermes_cli import kanban_governors as gov, kanban_lockguard as guard
+    owned = None
+    try:
+        if conn is None:
+            owned = guard.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=.25)
+            owned.execute('PRAGMA query_only=ON')
+            conn = owned
+        return gov.snapshot(conn)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        return dict(board=board, available=False, stale=True, reason=str(exc), governors=[])
+    finally:
+        if owned is not None:
+            owned.close()
 
 
 def read_adapter(home):

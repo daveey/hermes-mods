@@ -382,12 +382,20 @@ def _governed_sources(mods, conn, evidence, hours, window):
     except ImportError:
         return _project_evidence(mods, conn, evidence, hours, window, True, sources=True)
     current = gov._board(conn)
-    pairs, snapshots = [], []
+    pairs = []
+    # Sidecar receipts do not depend on a successful SQL flow projection.
+    metas = kb.list_boards(include_archived=False)
+    receipt_by_board = {current: _sibling('governors').read_snapshot(conn=conn)}
+    for meta in metas:
+        slug = meta.get('slug') or kb.DEFAULT_BOARD
+        if slug != current:
+            receipt_by_board[slug] = _sibling('governors').read_snapshot(path=meta['db_path'], board=slug)
+    snapshots = list(receipt_by_board.values())
     source_failed = False
     source_errors = []
     with ExitStack() as stack:
         sources = [(current, conn, evidence)]
-        for meta in kb.list_boards(include_archived=False):
+        for meta in metas:
             slug = meta.get('slug') or kb.DEFAULT_BOARD
             if slug == current:
                 continue
@@ -397,7 +405,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
             except (OSError, RuntimeError, sqlite3.Error) as exc:
                 source_failed = True
                 source_errors.append(f'{slug}: {exc}')
-                snapshots.append(dict(board=slug, available=False, stale=True, reason=str(exc)))
+                receipt_by_board[slug].update(flow_available=False, flow_reason=str(exc))
         # One immutable PR observation scope for the entire projection. Alternating
         # per-board reader() calls would evict the other boards' published values.
         contexts = defaultdict(list)
@@ -423,20 +431,17 @@ def _governed_sources(mods, conn, evidence, hours, window):
             except (OSError, RuntimeError, sqlite3.Error) as exc:
                 source_failed = True
                 pairs.append(({'configured': True, 'lanes': {}}, {'configured': False, 'reason': f'{slug}: {exc}'}))
-                snapshots.append(dict(board=slug, available=False, stale=True, reason=str(exc)))
+                receipt_by_board[slug].update(flow_available=False, flow_reason=str(exc))
                 continue
             for card in (pair[1] or {}).get('cards', []):
                 card['board'] = slug
             if pair[1] and pair[1].get('configured') is False:
                 pair[1]['reason'] = f"{slug}: {pair[1].get('reason', 'flow unavailable')}"
             pairs.append(pair)
-            try:
-                receipt = gov.snapshot(source_conn)
-            except (OSError, RuntimeError, sqlite3.Error) as exc:
-                receipt = dict(board=slug, available=False, stale=True, reason=str(exc))
+            receipt = receipt_by_board[slug]
             receipt['flow_available'] = (pair[1] or {}).get('configured') is not False
+            receipt['flow_reason'] = (pair[1] or {}).get('reason')
             receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
-            snapshots.append(receipt)
         snap, raw = _sibling('board_merge').merge(pairs)
         # A flow failure still has an independent summary; an unreadable board
         # has neither. Do not certify the surviving summaries as fleet totals.

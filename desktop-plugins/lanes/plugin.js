@@ -1145,14 +1145,14 @@ export function GovernorLine({ row }) {
   const reading = pool && row.reading ? `${row.reading.used_pct ?? '?'}% used · ${row.reading.accounts ?? '?'} accounts` : measureText(row.reading)
   return h('div', { className: 'lanes-governor', 'data-governor': row.id, 'data-state': row.state },
     h('div', { className: 'lanes-sb-line' }, h('span', { className: 'lanes-gov-dot', 'aria-hidden': true }),
-      h('span', null, row.name), h('b', null, summaryValue(row.state === 'unknown' ? null : row.lane_count ?? row.cards_charged), ' held')),
+      h('span', null, row.name), h('b', null, summaryValue(row.state === 'unknown' ? null : row.lane_count ?? row.cards_charged), row.partial && row.state !== 'unknown' ? ' known held' : ' held')),
     h('div', { className: 'lanes-sb-muted' }, row.state === 'unknown' ? 'unknown · missing or stale source' : row.state,
       ' · ', reading, ' / ', measureText(row.threshold)),
     h('details', null, h('summary', null, 'Readings & release'),
       h('div', null, row.clears),
-      (row.readings || []).map((r, i) => h('div', { key: i }, `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)} / ${measureText(r.threshold)}`,
+      (row.readings || []).map((r, i) => h('div', { key: i }, `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)} / ${measureText(r.threshold)} · ${measureText(r.cards)} held`,
         r.detail ? h('div', null, measureText(r.detail)) : null)),
-      (row.scope || []).map((s, i) => h('div', { key: i }, `${s.gateway}/${s.board}: ${s.available ? `${s.age_s}s ago` : 'unknown'}`))))
+      (row.scope || []).map((s, i) => h('div', { key: i }, `${s.gateway}/${s.board}: ${s.available ? `${s.age_s}s ago` : 'unknown'}${s.reason ? ' · ' + s.reason : ''}`))))
 }
 
 export function LaneControls({ name, row, write, disabled }) {

@@ -3,6 +3,21 @@ import assert from 'node:assert/strict'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
 
 const P = await loadPlugin({ SIDEBAR_SECTIONS_TOP_AREA: 'sidebar.sections.top', SIDEBAR_SECTIONS_AREA: 'sidebar.sections', SESSION_FILTER_AREA: 'sidebar.filter' })
+test('partial governors retain known charges and name board-specific missing evidence', async () => {
+  const row = { id: 'lane_gate', name: 'Lane gate', state: 'on', cards_charged: 64, partial: true,
+    reading: 10, threshold: 50, readings: [{ board: 'default', lane: 'hermes', reading: 10, threshold: 50, cards: 64 }],
+    scope: [{ gateway: 'hub', board: 'askeve', available: false, reason: 'stale dispatcher snapshot' },
+      { gateway: 'hub', board: 'default', available: true, age_s: 5, reason: 'flow unavailable: storage_admission' }] }
+  const pane = await mount(React.createElement(P.GovernorLine, { row }))
+  try {
+    assert.match(pane.container.textContent, /64 known held/)
+    assert.match(pane.container.textContent, /default \/ hermes: 10 \/ 50 · 64 held/)
+    assert.match(pane.container.textContent, /hub\/askeve: unknown · stale dispatcher snapshot/)
+    assert.match(pane.container.textContent, /hub\/default: 5s ago · flow unavailable: storage_admission/)
+    assert.equal(pane.container.querySelector('[data-governor]').getAttribute('data-state'), 'on')
+  } finally { await pane.close() }
+})
+
 const snapshot = () => ({ configured: true, status: { run: 7, you: 3 }, totals: { not_ready: 41 },
   sidebar: { cost_today: 12.34, idle_lanes: ['idle'] },
   governors: { idle_total: 31, rows: [{ id: 'llm_pool', name: 'LLM pool', state: 'on', cards_charged: 31,
