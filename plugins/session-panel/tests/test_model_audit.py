@@ -285,6 +285,12 @@ def test_wait_chain_shows_deepest_parent_location_and_reason():
     assert 'asks origin: Choose which cutover premise to retain' in r['detail']
     assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['target']['id'] == leaf
     assert next(a for a in r['actions'] if a['label'] == 'Open dependency')['role'] == 'dependency'
+    # The hydrated leaf's profile is authoritative when its task envelope omits it.
+    b['cards'][leaf]['profile'] = 'parent-profile'
+    cross_profile = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert next(a for a in cross_profile['actions'] if a['label'] == 'Open dependency')['target'] == {
+        'id': leaf, 'gateway': 'worker-one', 'profile': 'parent-profile', 'board': 'default'}
+    del b['cards'][leaf]['profile']
     # An unrelated completed branch cannot replace the deepest unfinished parent.
     b['cards'][parent]['detail']['links']['parents'].append('t_3333333333333333')
     b['cards']['t_3333333333333333'] = {'detail': {'task': {'id': 't_3333333333333333', 'title': 'Finished', 'status': 'done'}}}
