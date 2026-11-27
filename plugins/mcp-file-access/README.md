@@ -20,5 +20,16 @@ then routes the file through the server's temp dir, so no restart or config edit
   tool_execution middleware: in the sequential executor that middleware runs before
   pre_tool_call hooks.
 
+- File-output arguments naming existing directories are refused before approval, even with
+  an ancestor grant. Delivery never removes a user directory; an output directory created
+  while the call runs also causes refusal. Regular-file delivery uses an atomic replacement
+  beside the destination (including when staging is on another filesystem).
+- Hermes collects all pre-call hooks before resolving approval, so staging cannot be deferred
+  past the verdict with this hook API. Staging directories are 0700 and read copies are 0600,
+  independent of umask/source permissions. Denial/post-call cleanup removes the stage; plugin
+  startup and subsequent staging reap orphaned UUID directories. Per-call advisory leases
+  preserve stages still used by other plugin processes. This protects against other OS users,
+  not processes running as the same user (including the MCP server).
+
 Tests: `python3 -m unittest discover -s tests`. Disable: `hermes plugins disable mcp-file-access`.
 Logs: `grep mcp-file-access ~/.hermes/logs/agent.log`.
