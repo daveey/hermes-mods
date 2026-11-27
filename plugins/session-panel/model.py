@@ -335,6 +335,23 @@ def _recorded(wait):
             'backstop': backstop if isinstance(backstop, (int, float)) and not isinstance(backstop, bool) and 0 < backstop < float('inf') else None}
 
 
+def _withdraw_wait(v):
+    """Withdraw a row's live producer authority (`wait_kind`, ETA) but keep its last-known wait category.
+
+    `last_wait_kind` is colour only: the row box and the waiting pip keep the category the row last showed
+    (a known CI wait stays blue), while the text says `status unknown · last known: …`. It never renders an
+    ETA, never sets the header dot and never vouches that the producer is still live."""
+    kind = v.pop('wait_kind', None) or v.get('last_wait_kind')
+    v.pop('wait_eta', None)
+    if kind:
+        v['last_wait_kind'] = kind
+
+
+def wait_category(v):
+    """The one colour category a waiting row or pip paints: its live wait kind, else its last-known one."""
+    return v.get('wait_kind') or v.get('last_wait_kind')
+
+
 def _drop_park(v, park_lines):
     """Withdraw a row's current park attestation: exactly the park's own Details lines, never a diagnostic's."""
     v.pop('wait_reason', None)
@@ -1153,16 +1170,13 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['queued'] = queued
             v['evidence_state'] = 'unknown'
             v['reason'] = 'source-stale'
-            v.pop('wait_kind', None)
-            v.pop('wait_eta', None)
+            _withdraw_wait(v)
             historical = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
             v['detail'] = f'status unknown · last known: {historical}'
             v['details'].append('Task source freshness: stale; read current authoritative task state before acting.')
             if age_s <= 300:
                 v['detail'] += f' · on {gw} (synced {age_s}s ago)'
             else:
-                v.pop('wait_kind', None)
-                v.pop('wait_eta', None)
                 _drop_park(v, park_lines)
                 v['detail'] += f' · as of {pacific(synced_row)}, {gw} not synced for {max(1, age_s // 60)} min'
                 v['details'].append('Historical board status: the owner has not synced recently; this does not establish current execution.')
@@ -1170,7 +1184,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v)
             continue
         if row.get('stale') or row.get('partial_source_unknown'):
-            v.pop('wait_kind', None)
+            _withdraw_wait(v)
             _drop_park(v, park_lines)  # a card that could not be re-read vouches for no current reason or actor
             v['evidence_state'] = 'unknown'
             v['detail'] = f'status unknown · last known: {state or "unknown"}; waiting for status from {row.get("gateway") or "the card’s owner"}'
@@ -1279,15 +1293,14 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             if aged_parked:
                 _drop_park(v, park_lines)
                 if now - read_at > HISTORICAL_DELIVERY_S or v.get('wait_kind') not in DELIVERY_KINDS:
-                    v.pop('wait_kind', None)
-                    v.pop('wait_eta', None)
+                    _withdraw_wait(v)
                 age = relative(read_at, 'elapsed') if wire else short_dur(now - read_at)
                 v['detail'] += f' · as of {pacific(read_at)} (panel data {age} old)'
                 v['details'].append('Historical board status: the panel data is over 60 seconds old; this does not establish current execution or producer liveness.')
             v['queued'] = queued
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
         if unknown:
-            v.pop('wait_kind', None)
+            _withdraw_wait(v)
             _drop_park(v, park_lines)
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
@@ -1455,11 +1468,18 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     # Every waiting row waits on CI or a deploy: the waiting pip and the header dot paint light blue.
     delivery = counts['waiting'] > 0 and all(v.get('wait_kind') for v in sections['waiting'])
     wait_kind = 'agent' if any(v.get('wait_kind') == 'agent' for v in sections['waiting']) else next((v.get('wait_kind') for v in sections['waiting']), None)
+    # The waiting pip paints the same category as its row boxes. When every waiting row has a category but some
+    # are only last-known (stale/unknown), it carries `last_wait_kind` instead: colour, never live authority.
+    categories = [wait_category(v) for v in sections['waiting']]
+    last_kind = (None if delivery or not categories or not all(categories) else
+                 'agent' if 'agent' in categories else categories[0])
     for pip in pips:
         if pip['section'] == 'stuck' and aged_keys:
             pip['attention'] = 'triage_overdue'
         if pip['section'] == 'waiting' and delivery:
             pip['wait_kind'] = wait_kind
+        elif pip['section'] == 'waiting' and last_kind:
+            pip['last_wait_kind'] = last_kind
     status = published_status(outcome)
     # Presentation fallback only: legacy outcome.kind is never a status envelope.
     # An unavailable outcome does not make otherwise readable panel rows unknown.

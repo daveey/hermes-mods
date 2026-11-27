@@ -131,6 +131,13 @@ cases['clock_probe'] = f.bundle(f.task(status='scheduled', hostname='long-worker
 cases['aged_parked'] = f.bundle(f.task(status='scheduled', wait={
     'wait_state': 'external_running', 'waiting_on': 'ci job 42', 'waiting_since': f.NOW - 300}),
     computed_at=f.NOW - 120)
+# One wait colour category: the reported stale CI wait (synced 58 min ago on its owner), and a mixed control.
+PALETTE_CI = {'wait_state': 'external_running', 'waiting_on': 'ci example/repo PR #751', 'waiting_since': f.NOW - 300}
+cases['palette_ci_fresh'] = f.bundle(f.task(status='scheduled', wait=dict(PALETTE_CI)))
+cases['palette_ci_stale_replica'] = f.bundle(f.task(status='scheduled', wait=dict(PALETTE_CI), remote=True,
+                                                    source='replica', stale=True, synced_at=f.NOW - 3480))
+cases['palette_mixed'] = f.bundle(f.task('t_ci', status='scheduled', wait=dict(PALETTE_CI), stale=True),
+                                  f.task('t_plain', status='blocked'))
 # Composed owned-board fixture: real CoreReaders adapter, not a UI envelope.
 import os
 import tempfile

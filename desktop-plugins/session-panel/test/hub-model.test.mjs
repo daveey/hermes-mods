@@ -438,8 +438,12 @@ test('ordinary waits and stale/blocked chip controls keep pips', async () => {
   assert.ok(document.querySelector('[data-wait-eta]') === null)
  }
  const [stale] = tasksEta.sessionTaskChips([{id:'t_stale',status:'scheduled',stale:true,wait:{wait_state:'external_running',waiting_on:'the clock until tomorrow',waited_since:1,expected_s:50}}])
- assert.equal(stale.look,null)
+ // A stale scheduled card keeps its last-known delivery colour (the panel row's `last_wait_kind`), never its ETA.
+ assert.equal(stale.look,'delivery')
  assert.equal(stale.waitEta,null)
+ assert.equal(stale.waitingOn,'')
+ const [staleBlocked] = tasksEta.sessionTaskChips([{id:'t_stale_b',status:'blocked',stale:true,wait:{wait_state:'external_running',waiting_on:'ci example',waited_since:1,expected_s:50}}])
+ assert.equal(staleBlocked.look,null, 'a blocked card keeps its own status colour')
  for (const wait_state of ['human','stalled']) assert.notEqual(tasksEta.waitLook({wait_state,wait_kind:'clock',waiting_on:'the clock until tomorrow'}),'delivery')
 })
 const producerCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./status-producer-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
@@ -948,6 +952,66 @@ test('canonical approval plan, limits, permissions, exclusions and outcomes rema
  for (const text of ['CANONICAL-PLAN distinct from the card brief', 'LIMIT-4-HOURS', 'permission: granted if you approve', 'EXCLUDED-SPEND', 'Stage A only', 'No execution', 'Only the bounded stage is authorized']) {
   assert.ok(details.textContent.includes(text), `missing consent boundary: ${text}`)
  }
+})
+// One wait colour category (user report: amber CI row beside a blue waiting square). Real reducer fixtures.
+const DELIVERY_RGB = 'rgb(56, 189, 248)', AMBER_RGB = 'rgb(210, 153, 34)'
+const waitingSquare = () => document.querySelector('[data-model-pip="waiting"] [data-card-colour]')?.dataset.cardColour
+const rowBox = id => window.getComputedStyle(document.querySelector(`[data-panel-row$="${id}"] [data-row-pip]`) ||
+  document.querySelector('[data-row-pip="waiting"]')).borderTopColor
+test('a CI wait whose cached snapshot expires keeps one category on its row box and waiting square, then recovers', async () => {
+ const { model, now } = publicCases.palette_ci_fresh
+ const before = JSON.stringify(model)
+ assert.equal(model.sections.waiting[0].wait_kind, 'ci')
+ await paint(m.renderModel(model, { now }))
+ assert.equal(rowBox(), DELIVERY_RGB)
+ assert.equal(waitingSquare(), 'blue')
+ // The source snapshot is no longer vouched for: historical text, no live producer claim, same colour category.
+ await paint(m.renderModel(model, { now, vouched: false }))
+ assert.match(document.querySelector('[data-row-detail]').textContent, /^status unknown · last known: waiting on CI/)
+ assert.equal(rowBox(), DELIVERY_RGB, 'the row box keeps the known CI category')
+ assert.equal(waitingSquare(), 'blue', 'the numbered square agrees with the row box')
+ assert.ok(document.querySelector('[data-wait-eta]') === null)
+ const effective = m.expireNativeWaits(model, now, false)
+ const [row] = effective.sections.waiting, pip = effective.header.pips.find(p => p.section === 'waiting')
+ assert.equal(row.wait_kind, null); assert.equal(row.last_wait_kind, 'ci')
+ assert.equal(pip.wait_kind, undefined, 'the stale pip carries no live wait kind'); assert.equal(pip.last_wait_kind, 'ci')
+ assert.equal(effective.header.wait_kind, null, 'the header dot never vouches for a stale producer')
+ assert.equal(m.pipCategory(pip), 'blue')
+ assert.equal(JSON.stringify(model), before)
+ // Recovery: a fresh snapshot restores the live wait.
+ await paint(m.renderModel(model, { now }))
+ assert.equal(rowBox(), DELIVERY_RGB); assert.equal(waitingSquare(), 'blue')
+})
+test('a stale replica CI wait from the reducer paints the same category on row box and waiting square', async () => {
+ const { model, now } = publicCases.palette_ci_stale_replica
+ const [row] = model.sections.waiting, pip = model.header.pips.find(p => p.section === 'waiting')
+ assert.equal(row.wait_kind, undefined); assert.equal(row.last_wait_kind, 'ci')
+ assert.equal(pip.wait_kind, undefined); assert.equal(pip.last_wait_kind, 'ci')
+ assert.equal(model.header.wait_kind, undefined)
+ for (const vouched of [null, false]) {
+  await paint(m.renderModel(model, { now, vouched }))
+  assert.match(document.querySelector('[data-row-detail]').textContent, /^status unknown · last known: waiting on CI/)
+  assert.doesNotMatch(document.querySelector('[data-row-detail]').textContent, /last known: status unknown/, 'one historical prefix')
+  assert.match(document.querySelector('[data-row-detail]').textContent, /not synced for 58 min/)
+  assert.equal(rowBox(), DELIVERY_RGB)
+  assert.equal(waitingSquare(), 'blue')
+  assert.ok(document.querySelector('[data-wait-eta]') === null)
+ }
+})
+test('mixed waits: each row box keeps its own category; the square is amber while any row has none', async () => {
+ const { model, now } = publicCases.palette_mixed
+ await paint(m.renderModel(model, { now }))
+ assert.equal(rowBox('t_ci'), DELIVERY_RGB)
+ assert.equal(rowBox('t_plain'), AMBER_RGB)
+ assert.equal(waitingSquare(), 'amber')
+ // Every expired row keeps its category: the square follows the rows, not the source snapshot's pip.
+ const fresh = structuredClone(publicCases.palette_ci_fresh.model)
+ fresh.sections.waiting.push({ ...fresh.sections.waiting[0], key: `${fresh.sections.waiting[0].key}:agent`, id: 't_agent', wait_kind: 'agent', wait_eta: null })
+ fresh.header.counts.waiting = 2; fresh.header.pips.find(p => p.section === 'waiting').count = 2
+ const effective = m.expireNativeWaits(fresh, now, false)
+ assert.deepEqual(effective.sections.waiting.map(r => [r.wait_kind, r.last_wait_kind]), [[null, 'ci'], [null, 'agent']])
+ assert.equal(effective.header.pips.find(p => p.section === 'waiting').last_wait_kind, 'agent')
+ assert.equal(m.pipCategory(effective.header.pips.find(p => p.section === 'waiting')), 'blue')
 })
 test('header counts/pips remain server values, not recomputed row totals', async () => {
  const model = structuredClone(publicCases.all_sections.model)

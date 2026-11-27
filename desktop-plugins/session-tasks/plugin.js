@@ -425,9 +425,12 @@ function taskChip(t, status) {
   const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
   const wait = t.wait && typeof t.wait === 'object' ? t.wait : null
   const rawLook = t.stale ? null : waitLook(wait)
+  // A stale scheduled card keeps its last-known delivery/deploy colour, the same category its panel row box keeps
+  // (`last_wait_kind`); it gets no ETA and no wait line, so nothing claims the producer is still live.
+  const lastLook = t.stale && status === 'scheduled' && deliveryLook(waitLook(wait)) ? waitLook(wait) : null
   // Grey 'waiting' only recolours a scheduled card: a blocked/triage card keeps its own (red/amber) status colour,
   // so a dependency block or an unvalidated ask never turns grey. The wait line still names what it waits on.
-  const look = (rawLook === 'waiting' || deliveryLook(rawLook)) && status !== 'scheduled' ? null : rawLook
+  const look = (rawLook === 'waiting' || deliveryLook(rawLook)) && status !== 'scheduled' ? null : rawLook || lastLook
   const waitingOn = rawLook ? str(wait.waiting_on) : ''
   const waitingSince = rawLook ? Number(wait.waiting_since) || 0 : 0
   const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''
@@ -441,7 +444,7 @@ function taskChip(t, status) {
     ...(wait && wait.contained ? { contained: wait.contained } : {}),
     waitingOn,
     waitingSince,
-    waitEta: deliveryLook(look) ? { waited_since: wait.waited_since, expected_s: wait.expected_s,
+    waitEta: rawLook && deliveryLook(look) ? { waited_since: wait.waited_since, expected_s: wait.expected_s,
       estimate_source: wait.estimate_source, wait_kind: wait.wait_kind || (/^the clock until\b/i.test(waitingOn) ? 'clock' : /^ci\b/i.test(waitingOn) ? 'ci' : 'deploy') } : null,
     // What the card asks the user to do, in its own words (Needs you shows this, never the card title).
     humanRequest: humanRequestOf(t.human_request),

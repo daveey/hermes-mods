@@ -467,10 +467,16 @@ export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: 
 export const DELIVERY_COLOR = '#38bdf8'
 // Purple: merged work waiting for a hub deploy (`wait_kind` deploy), so it reads apart from CI/clock/card waits.
 export const DEPLOY_COLOR = '#a371f7'
-/** Backend-selected producer wait; administrative agent decisions use ordinary blue. */
+/** Backend-selected producer wait; administrative agent decisions use ordinary blue. Live authority only (ETA). */
 export const deliveryWait = item => ['ci', 'deploy', 'clock', 'card'].includes(item?.wait_kind)
-export const waitColor = item => item?.wait_kind === 'agent' ? SECTION_COLOR.running : item?.wait_kind === 'deploy' ? DEPLOY_COLOR
-  : deliveryWait(item) ? DELIVERY_COLOR : SECTION_COLOR.waiting
+/** The one wait colour category a row box and the numbered waiting square share: the live `wait_kind`, else the
+ *  `last_wait_kind` a stale/unknown row last showed (colour only: no ETA, no header dot, no live producer claim). */
+export const waitCategory = item => item?.wait_kind || item?.last_wait_kind || null
+export const waitColor = item => {
+  const kind = waitCategory(item)
+  return kind === 'agent' ? SECTION_COLOR.running : kind === 'deploy' ? DEPLOY_COLOR
+    : ['ci', 'clock', 'card'].includes(kind) ? DELIVERY_COLOR : SECTION_COLOR.waiting
+}
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
@@ -479,7 +485,7 @@ const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing
 // Section -> shared card-square category (Desktop `CardCountSquare`), matching the row boxes' colours.
 const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
 export const pipCategory = pip => pip.attention === 'triage_overdue' ? 'red' : pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
-  : pip.wait_kind === 'deploy' ? 'violet' : pip.wait_kind === 'agent' || deliveryWait(pip) ? 'blue' : 'amber'
+  : waitCategory(pip) === 'deploy' ? 'violet' : ['agent', 'ci', 'clock', 'card'].includes(waitCategory(pip)) ? 'blue' : 'amber'
 // Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
 const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
 /** One numbered card square: the count inside an outline in the category's colour. */
@@ -560,14 +566,19 @@ function expiryPresentation(model, sections, diagnosticExpired = false, groups =
   for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
   const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
   const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
+  // The waiting square keeps its rows' shared category: last-known when some row lost live authority.
+  const lastKind = !delivery && sections.waiting.length > 0 && sections.waiting.every(waitCategory)
+    ? (sections.waiting.some(row => waitCategory(row) === 'agent') ? 'agent' : waitCategory(sections.waiting[0])) : null
   // Overdue triage is fresh operational red: it survives expiry only on rows or
   // shared-blocker groups that still claim it (a group alone can own the header's red).
   const overdue = [...sections.stuck, ...(Array.isArray(groups) ? groups : [])].some(row => row?.attention === 'triage_overdue')
   const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => {
-    const { attention, ...pip } = model.header.pips.find(p => p.section === section) || {}
+    // Recompute the wait category from the effective rows; never carry the source snapshot's pip category.
+    const { attention, wait_kind: _kind, last_wait_kind: _last, ...pip } = model.header.pips.find(p => p.section === section) || {}
     return { ...pip, section, label: pip.label || label, count: counts[section],
       ...(section === 'stuck' && overdue && attention ? { attention } : {}),
-      ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {}) }
+      ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {}),
+      ...(section === 'waiting' && lastKind ? { last_wait_kind: lastKind } : {}) }
   })
   const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
     !counts.needs_you && !counts.stuck && !counts.running
@@ -612,10 +623,12 @@ export function expireNativeWaits(model, now, vouched) {
     }
     const { attention: _overdue, ...old } = clockRow(row, now)  // stale evidence never claims fresh operational red
     sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
-      detail: `status unknown · last known: ${old.detail || key}`,
+      // A row the reducer already made historical keeps its one "status unknown · last known:" prefix.
+      detail: /^status unknown\b/.test(str(old.detail)) ? old.detail : `status unknown · last known: ${old.detail || key}`,
       details: ['Task source freshness: stale; read current authoritative task state before acting.'],
       actions: row.actions.filter(a => ['open_card', 'open_session', 'open_url', 'open_process'].includes(a.kind)),
-      options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null })
+      options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null,
+      ...(waitCategory(old) ? { last_wait_kind: waitCategory(old) } : {}) })
   }
   // Shared-blocker groups come from the same stale snapshot: they lose overdue red
   // too and keep only explicitly historical text.
@@ -795,7 +808,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
       // The state box always draws (light blue for CI/clock, purple for deploy): the ETA readout sits at the far
       // right of a wide panel, so dropping the box left a delivery wait with no colour at all.
-      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, 'data-wait-category': (section === 'waiting' && waitCategory(row)) || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0, flexWrap: 'wrap', rowGap: 1 }, children: [
