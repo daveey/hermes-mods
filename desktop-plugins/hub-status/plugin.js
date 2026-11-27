@@ -1,5 +1,5 @@
 /**
- * Hub Status — status-bar chip: is the hub up, restarting or unreachable, and for how long.
+ * Hub Status — titlebar chip (left of the settings gear): is the hub up, restarting or unreachable, and for how long.
  *
  *   ▮▮▮▮▮▮▮▮▮▮▮▮ Hub 6h 36m     up: time since the hub gateway process started
  *   ▮▮▮▮▮▮▮▮▮▮▮▮ Hub 0:42       restarting (yellow): time since the restart began
@@ -18,7 +18,7 @@
  * says "hub"). No hub connection → no chip.
  */
 
-import { atom, cn, host, Popover, PopoverContent, PopoverTrigger, STATUSBAR_AREAS, useValue } from '@hermes/plugin-sdk'
+import { atom, cn, host, Popover, PopoverContent, PopoverTrigger, useValue } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hub-status'
@@ -40,7 +40,18 @@ const WORD = { [UP]: 'up', [RESTARTING]: 'restarting', [DOWN]: 'unreachable' }
 const BAR_CLASS =
   'inline-flex h-full items-center gap-1.5 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
 
+// Titlebar placement: right of llm-split (order 50), so it sits just left of the settings gear.
+export const TITLEBAR_AREA = 'titleBar.tools.right'
+export const TITLEBAR_ORDER = 60
+export const TITLEBAR_SPAN = 6 // titlebar cells (6 x 24 px)
+// The chip lives inside the titlebar's own <button>: a mouse click reaches the Radix trigger (the span); Enter/Space
+// on the focused button arrive as a click with detail 0 and toggle the popover through onSelect instead.
+const TB_CHIP = 'hs-root hs-tb inline-flex h-full w-full items-center justify-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)'
+
 const CSS = `
+.hs-tool{width:calc(${TITLEBAR_SPAN}*var(--titlebar-control-size,24px))!important;padding:0!important}
+.hs-tool:empty{display:none!important}
+.hs-tb{user-select:none;white-space:nowrap}
 .hs-root{--hs-g:#3fb950;--hs-y:#e3b341;--hs-r:#f85149;--hs-n:color-mix(in srgb,currentColor 22%,transparent)}
 .hs-strip{display:inline-flex;gap:1px;align-items:center;height:9px}
 .hs-strip i{width:3px;height:9px;border-radius:1px;opacity:.85}
@@ -437,7 +448,7 @@ export function chipModel(poll, day, spans, now) {
   return { cur, slots, counter, label, title: `${label}\n${sub}` }
 }
 
-function Chip({ store }) {
+function Chip({ store, placement = 'titlebar' }) {
   const poll = useValue(store.$poll)
   const day = useValue(store.$day)
   const spans = useValue(store.$spans)
@@ -447,15 +458,18 @@ function Chip({ store }) {
   const m = chipModel(poll, day, spans, now)
   if (!m) return null
   const durColor = m.cur.state === UP ? undefined : COLOR[m.cur.state]
+  const inTitlebar = placement === 'titlebar'
+  // Events inside the portaled popover still bubble through React's tree to the titlebar button: stop them there.
+  const stop = e => e.stopPropagation()
   return jsxs(Popover, {
     open,
     onOpenChange: v => { setOpen(v); if (v) store.loadEvents() },
     children: [
       jsx(PopoverTrigger, {
         asChild: true,
-        children: jsxs('button', {
-          type: 'button',
-          className: cn(BAR_CLASS, 'hs-root', open && 'text-foreground'),
+        children: jsxs(inTitlebar ? 'span' : 'button', {
+          ...(inTitlebar ? {} : { type: 'button' }),
+          className: cn(inTitlebar ? TB_CHIP : cn(BAR_CLASS, 'hs-root'), open && 'text-foreground'),
           'data-slot': 'hub-status-chip',
           'data-state': m.cur.state,
           'aria-label': m.label,
@@ -468,8 +482,17 @@ function Chip({ store }) {
         })
       }),
       jsx(PopoverContent, {
-        side: 'top',
+        side: inTitlebar ? 'bottom' : 'top',
         align: 'end',
+        sideOffset: 6,
+        className: 'hs-panel',
+        ...(inTitlebar ? {
+          onClick: stop, onPointerDown: stop, onPointerMove: stop, onPointerUp: stop,
+          onFocus: stop, // portal focus must not open the outer titlebar Tooltip
+          onKeyDown: e => { if (e.key !== 'Escape') e.stopPropagation() },
+          onOpenAutoFocus: e => e.preventDefault(),
+          onFocusOutside: e => e.preventDefault()
+        } : {}),
         style: { width: 'min(400px, calc(100vw - 24px))' },
         children: open ? jsx(Popup, { store, cur: m.cur, now }) : null
       })
@@ -485,10 +508,37 @@ function useOpen() {
   return [v, x => $open.set(!!x)]
 }
 
+// The titlebar button can stop the pointer events Radix uses to detect an outside click, so close on a captured
+// click that lands outside both the chip and its panel.
+export const isOpenForTest = () => $open.get()
+
+export function closeOnOutsideClick(target) {
+  if (!$open.get() || !target?.closest) return
+  if (target.closest('[data-slot="hub-status-chip"]') || target.closest('.hs-panel')) return
+  $open.set(false)
+}
+
+export function titlebarTool(store) {
+  return {
+    id: ID,
+    label: 'Hub status',
+    title: 'Hub status: up / restarting / unreachable. Click for the timeline',
+    span: TITLEBAR_SPAN,
+    className: 'hs-tool',
+    icon: jsx(Chip, { store, placement: 'titlebar' }),
+    onSelect: event => {
+      if (!event || event.detail === 0 || (event.currentTarget && event.target === event.currentTarget)) {
+        $open.set(!$open.get())
+        if ($open.get()) store.loadEvents()
+      }
+    }
+  }
+}
+
 export default {
   id: ID,
   name: 'Hub Status',
-  description: 'Status-bar chip: hub up / restarting / unreachable with live duration and a 24 h / 7 d timeline.',
+  description: 'Titlebar chip: hub up / restarting / unreachable with live duration and a 24 h / 7 d timeline.',
   register(ctx) {
     if (typeof document !== 'undefined' && document.createElement) {
       const style = document.createElement('style')
@@ -508,7 +558,11 @@ export default {
       document.addEventListener('visibilitychange', onVis)
       ctx.onDispose?.(() => document.removeEventListener('visibilitychange', onVis))
     }
-    // Same slot the Tailscale chip used (order 130).
-    ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 130, render: () => jsx(Chip, { store }) })
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      const onClick = e => closeOnOutsideClick(e.target)
+      document.addEventListener('click', onClick, true)
+      ctx.onDispose?.(() => document.removeEventListener('click', onClick, true))
+    }
+    ctx.register({ id: 'chip', area: TITLEBAR_AREA, order: TITLEBAR_ORDER, data: titlebarTool(store) })
   }
 }

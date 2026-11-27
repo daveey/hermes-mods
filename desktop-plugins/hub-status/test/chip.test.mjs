@@ -123,15 +123,18 @@ test('register: polls the hub connection, red after two misses, green again on r
   await tick()
   assert.equal(regs.length, 1)
   assert.equal(regs[0].id, 'chip')
-  assert.equal(regs[0].area, 'statusbar.right')
-  assert.equal(regs[0].order, 130)
+  // titlebar, right of llm-split (order 50): just left of the settings gear
+  assert.equal(regs[0].area, 'titleBar.tools.right')
+  assert.equal(regs[0].order, 60)
+  assert.ok(regs[0].order > 50)
+  assert.equal(regs[0].data.span, m.TITLEBAR_SPAN)
   assert.deepEqual(calls[0], ['/status', 'hermes-hub', true])
   assert.ok(calls.some(c => c[0] === '/events?range=24h'))
   const poll = timers.find(t => t[1] === m.POLL_MS)[0]
-  const chip = () => regs[0].render().type ? regs[0].render() : null
+  const chip = () => regs[0].data.icon.type ? regs[0].data.icon : null
   assert.ok(chip())
   const el = () => {
-    const tree = regs[0].render()
+    const tree = regs[0].data.icon
     const out = tree.type({ ...tree.props })
     return out.props.children[0].props.children // trigger button
   }
@@ -203,6 +206,25 @@ test('no hub connection: no requests, no chip', async () => {
   })
   await tick()
   assert.equal(calls.length, 0)
-  const tree = regs[0].render()
+  const tree = regs[0].data.icon
   assert.equal(tree.type({ ...tree.props }), null)
+})
+
+test('titlebar: keyboard select toggles the popover, an outside click closes it, inside clicks do not', () => {
+  const loads = []
+  const tool = m.titlebarTool({ loadEvents: () => loads.push(1) })
+  const open = () => m.isOpenForTest()
+  tool.onSelect({ detail: 0 })
+  assert.equal(open(), true)
+  assert.equal(loads.length, 1)
+  const at = sel => ({ closest: s => (s === sel ? {} : null) })
+  m.closeOnOutsideClick(at('[data-slot="hub-status-chip"]'))
+  assert.equal(open(), true)
+  m.closeOnOutsideClick(at('.hs-panel'))
+  assert.equal(open(), true)
+  m.closeOnOutsideClick(at('.elsewhere'))
+  assert.equal(open(), false)
+  // a mouse click on the chip itself (detail 1, target inside) is left to the Radix trigger
+  tool.onSelect({ detail: 1, target: {}, currentTarget: {} })
+  assert.equal(open(), false)
 })
