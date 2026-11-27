@@ -778,15 +778,68 @@ def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:
 # ---- end of the shared heredoc block ---------------------------------------------------------------------------
 
 
+def _ansi_word(text: str, i: int) -> tuple[str, int]:
+    """Decode bash's $'...' without evaluating shell code; return value and end.
+
+    Byte/Unicode escapes that cannot be represented unambiguously as ASCII are
+    held, rather than guessing the shell's locale/byte decoding. Unknown escapes
+    keep their backslash (including a literal backslash-newline).
+    """
+    out = []
+    escapes = {'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f',
+               'n': '\n', 'r': '\r', 't': '\t', 'v': '\v', '\\': '\\', "'": "'", '"': '"', '?': '?'}
+    while i < len(text):
+        c = text[i]
+        if c == "'":
+            return ''.join(out).split('\0', 1)[0], i + 1
+        if c != '\\' or i + 1 == len(text):
+            out.append(c)
+            i += 1
+            continue
+        e = text[i + 1]
+        if e in escapes:
+            out.append(escapes[e])
+            i += 2
+        elif e in '01234567xuU':
+            start = i + 1 if e in '01234567' else i + 2
+            width = 3 if e in '01234567' else {'x': 2, 'u': 4, 'U': 8}[e]
+            alphabet = '01234567' if e in '01234567' else '0123456789abcdefABCDEF'
+            j = start
+            while j < min(start + width, len(text)) and text[j] in alphabet:
+                j += 1
+            if j == start:
+                out.append('\\' + e)
+                i += 2
+                continue
+            value = int(text[start:j], 8 if e in '01234567' else 16)
+            if value > 127:
+                raise _UnsupportedSubstitution
+            out.append(chr(value))
+            i = j
+        elif e == 'c':
+            # Control escapes have shell-specific edge cases (notably \\c\\).
+            raise _UnsupportedSubstitution
+        else:
+            out.append('\\' + e)
+            i += 2
+    # Keep incomplete input available to the existing partial-line lexer.
+    return ''.join(out), i
+
+
 def _join_continuations(text: str) -> str:
     """Delete backslash-newline like bash does (outside single quotes; a single-quoted body keeps it for the shell
     that later runs that body). Replacing it with a space instead split `ca\\<nl>se` and `pyt\\<nl>est` (F16)."""
-    if "\\\n" not in text:
+    if "\\\n" not in text and "$'" not in text:
         return text
     out, i, n, sq, dq = [], 0, len(text), False, False
     while i < n:
         c = text[i]
-        if sq:
+        if not sq and not dq and text.startswith("$'", i):
+            # Decode to an ordinary quoted fragment before shlex. In particular,
+            # an escaped apostrophe must not change continuation quote state.
+            value, i = _ansi_word(text, i + 2)
+            out.append("'" + value.replace("'", "'\"'\"'") + "'")
+        elif sq:
             sq = c != "'"
             out.append(c)
             i += 1
@@ -864,17 +917,23 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
     def comment_at(i: int) -> bool:
         return text[i] == "#" and (i == 0 or text[i - 1] in " \t\n;&|()")
 
-    def arithmetic(i: int) -> int:  # `$((...))` starting at i: index just past it
-        depth, j = 0, i + 1
+    def arithmetic(i: int) -> Optional[int]:
+        # Bash tries arithmetic first, but falls back to $( (commands) ... ).
+        # Only an adjacent closing `))` with arithmetic-shaped contents is data.
+        # Everything else must go through the command-substitution scanner.
+        depth, j = 0, i
         while j < n:
             if text[j] == "(":
                 depth += 1
             elif text[j] == ")":
                 depth -= 1
                 if depth == 0:
-                    return j + 1
+                    body = text[i + 2:j - 1]
+                    if text[j - 1:j + 1] == "))" and re.fullmatch(r"[\w\s+*/%<>=!&|^~?:,().-]*", body):
+                        return j + 1
+                    return None
             j += 1
-        raise _Unclosed
+        return None
 
     def single(i: int, ansi: bool) -> int:  # quote opening at i: index just past its close
         j = i + 1
@@ -942,8 +1001,7 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             elif c == '"':
                 s, i = dquote(i + 1, level)
                 out.append(s)
-            elif text.startswith("$((", i):
-                j = arithmetic(i + 1)
+            elif text.startswith("$((", i) and (j := arithmetic(i + 1)) is not None:
                 out.append(text[i:j])
                 i = j
             elif text.startswith("$(", i) or c == "`":
@@ -976,8 +1034,7 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
                 if data:
                     parts.append('"' + "".join(data) + '"')
                 return "".join(parts), i + 1
-            elif text.startswith("$((", i):
-                j = arithmetic(i + 1)
+            elif text.startswith("$((", i) and (j := arithmetic(i + 1)) is not None:
                 data.append(text[i:j])
                 i = j
             elif text.startswith("$(", i) or c == "`":
