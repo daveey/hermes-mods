@@ -341,6 +341,14 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             why, next_home = _command(argv, guard, in_home, depth, local, exported | assigned, bodies, remote, budget)
             if why:
                 return why
+            # A failed cd leaves cwd unchanged. Only && gates its continuation
+            # on success; || runs solely on failure. Keep every possibility.
+            unwrapped = guard._strip_wrappers(argv)
+            if unwrapped and os.path.basename(unwrapped[0]) == "cd":
+                if following == ["||"]:
+                    next_home = in_home
+                elif following != ["&&"]:
+                    next_home = guard.merge_directory_contexts(in_home, next_home)
             next_contexts.append(next_home)
         in_home = guard.merge_directory_contexts(*next_contexts)
         if raw[i] == "unset" and not conditional:

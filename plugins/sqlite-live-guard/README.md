@@ -16,10 +16,14 @@ unconditional assignment resets them. Subshell, pipeline and background assignme
 scopes do not replace the parent's aliases. `readonly` bindings survive failed
 reassignment/unset. Local child shells inherit the analyzed working directory; local relative paths
 resolve against the supplied cwd and literal/alias `cd` targets. Conditional `cd`
-retains both possible directories (up to 32, then refusal), including across nested
-shells. Remote initial cwd remains unknown: explicit home/absolute paths or a
-lexically known `cd` are required; local filesystem state never resolves it.
-`mv -t DIR`, `-tDIR` and `--target-directory[=]DIR` protect every source subtree.
+and a `cd` not followed by `&&` retain prior and target directories (up to 32,
+then refusal), including across nested shells; `||` retains the prior directory.
+`pushd`/`popd` and `env -C` directory changes are not tracked. Remote initial cwd
+remains unknown: although ordinary sshd starts in the user's home, forced commands,
+server wrappers and shell initialization can change it, so explicit home/absolute
+paths or a lexically known `cd` are required; local filesystem state never resolves
+it. `mv -t DIR`, `-tDIR` and `--target-directory[=]DIR` (including GNU unambiguous
+long-option prefixes such as `--t` and `--target`) protect every source subtree.
 Prefix assignments enter the child environment without changing the invoking
 shell's word expansion. Redirect operators are split before variable expansion,
 including `>path`, `1>path` and `>|path`; quoted/escaped operators remain data.
