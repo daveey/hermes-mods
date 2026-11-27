@@ -204,3 +204,12 @@ def test_shell_and_markdown_path_payload_not_recommended():
         raw = f"Refusing to open corrupt kanban DB at {path}: bad"
         out = hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw}))
         assert path not in json.loads(out)["hint"]
+
+
+def test_db_sidecar_and_backup_suffixes_do_not_guess_live_path():
+    for suffix in (".corrupt.bak", "-wal", "-shm"):
+        raw = f"Refusing to open corrupt kanban DB at /x/kanban.db{suffix}: bad"
+        data = json.loads(hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw})))
+        assert data["error"] == raw
+        assert "<board db>" in data["hint"]
+        assert "/x/kanban.db" not in data["hint"]
