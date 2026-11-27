@@ -176,6 +176,11 @@ def not_merged_reason(path: str, main: str) -> str | None:
         return "git status failed"
     if st.stdout.strip():
         return "uncommitted/untracked changes"
+    # Git's clean status (and non-force worktree remove) permits deleting ignored data.
+    # Share the card teardown's conservative scan, including its disposable-cache policy.
+    complex_reason = base._complex_reason(path)
+    if complex_reason:
+        return complex_reason
     head = base._git(path, "rev-parse", "HEAD").stdout.strip()
     ref = _default_ref(main)
     if ref and base._git(main, "merge-base", "--is-ancestor", head, ref).returncode == 0:
@@ -240,8 +245,20 @@ def _teardown(sid: str, agent: str, cwd: str = "", event: str = "Stop") -> list[
             # Worker trees must go through the board/run/result gate, never Stop.
             if rec.get('task_id'):
                 continue
-            path = rec.get("path") or base._wt_path(gd)
-            if rec.get("agent") == agent and rec.get("agent_session_id") == sid and path and os.path.isdir(path):
+            if rec.get("agent") != agent or rec.get("agent_session_id") != sid:
+                continue
+            # The marker is metadata, not authority to choose another tree. Require
+            # both Git's backlink and the candidate tree's forward gitdir pointer.
+            backlink = base._wt_path(gd)
+            path = rec.get("path") or backlink
+            if not backlink or not path or os.path.realpath(path) != os.path.realpath(backlink):
+                base._log(f"KEEP {path} (agent:{agent}): marker path does not match gitdir backlink")
+                continue
+            actual = base._git(path, "rev-parse", "--absolute-git-dir")
+            if actual.returncode != 0 or os.path.realpath(actual.stdout.strip()) != os.path.realpath(gd):
+                base._log(f"KEEP {path} (agent:{agent}): worktree gitdir does not match marker gitdir")
+                continue
+            if os.path.isdir(path):
                 out.append(remove_if_merged(path, f"made by {agent} session {sid}", event, rec, gd))
     return out
 
