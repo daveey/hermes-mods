@@ -105,6 +105,11 @@ def test_accepted_legacy_history_survives_serving_defaults(status):
     assert 'scope stopped' in row['detail']
     assert "waiting on this chat's agent" in row['detail']
     assert 'review the stopped scope' in row['detail']
+    if status == 'triage':
+        pytest.importorskip('hermes_cli.kanban_triage_attention')
+        clocks = model.triage_clocks({**b, 'model': result})
+        assert clocks and clocks[0][0] == NOW - 599
+        assert model.triage_deadline({**b, 'model': result}, NOW) is not None
 
 
 @pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
