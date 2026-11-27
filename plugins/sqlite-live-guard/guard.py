@@ -1749,6 +1749,17 @@ def _check_python_ast(code: str) -> Optional[str]:
 
 
 def check_python(code: str) -> Optional[str]:
+    # Same monotone floor as check_shell: refuse whatever origin/main's guard refuses, plus the head analysis.
+    try:
+        why = _main_floor().check_python(code)
+    except Exception:
+        return "live-database python safety floor unavailable; refusing unchecked execution"
+    if why:
+        return why
+    return _check_python_head(code)
+
+
+def _check_python_head(code: str) -> Optional[str]:
     code = code or ""
     for pat in _PY_DESTRUCTIVE:
         for m in pat.finditer(code):

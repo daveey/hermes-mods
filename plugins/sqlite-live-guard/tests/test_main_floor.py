@@ -5,6 +5,7 @@ below). guard.check_shell refuses whenever main's logic refuses OR the head anal
 """
 import hashlib
 import importlib.util
+import os
 import random
 import shlex
 import sys
@@ -140,3 +141,87 @@ def test_floor_unavailable_fails_closed(monkeypatch):
 
     monkeypatch.setattr(guard, '_main_floor', broken)
     assert 'floor unavailable' in guard.check_shell('echo hi', diff_corpus.HOME_PARENT)
+
+
+# --- execute_code (guard.check_python) is floored too -------------------------------------------------
+
+_PY_MODULES = ['os', 'posix', 'nt', 'sys', 'shutil', 'pathlib']
+_PY_CALLS = [
+    "{m}.remove(p)", "{m}.unlink(p)", "{m}.truncate(p, 0)", "{m}.rename(p, p + '.x')",
+    "open(p, 'w')", "open(p, 'wb')", "open(p, 'a')", "{m}.replace(p, '/tmp/x')",
+]
+_PY_PATHS = [
+    '{home}/.hermes/state.db', '{home}/.hermes/kanban.db', '{home}/.hermes/cache/../state.db',
+    '{home}/.hermes/', '{home}/.hermes', '{home}/.hermes/kanban/boards/b/kanban.db',
+    '{home}/.hermes/cache/state.db', '/tmp/other.db',
+]
+_PY_FORMS = [
+    "import {m} as os\np='{path}'\n{call}",
+    "import {m}\np = '{path}'\n{call}",
+    "from {m} import remove, unlink\np='{path}'\n{call}",
+    "import {m} as o2; import {m} as os\np = \"{path}\"\n{call}",
+    "p='{path}'\nimport {m}\n{call}",
+]
+
+
+def python_commands():
+    rng = random.Random(SEED)
+    out, seen = [], set()
+    for form in _PY_FORMS:
+        for path in _PY_PATHS:
+            for call in _PY_CALLS:
+                for module in _PY_MODULES:
+                    code = form.format(m=module, path=path.format(home=diff_corpus.HOME_PARENT),
+                                       call=call.format(m='os'))
+                    if code not in seen:
+                        seen.add(code)
+                        out.append(code)
+    rng.shuffle(out)
+    return out
+
+
+def test_head_python_refuses_everything_main_refuses():
+    commands = python_commands()
+    main = guard._main_floor()
+    refused = [c for c in commands if main.check_python(c)]
+    assert len(refused) > 100, 'generator must exercise main refusals'
+    assert [c for c in refused if not guard.check_python(c)] == []
+
+
+@pytest.mark.parametrize('module', ['os', 'posix', 'nt', 'sys'])
+def test_review_repro_aliased_os_module_remove_is_refused(module):
+    code = f"import {module} as os\np='{diff_corpus.HOME_PARENT}/.hermes/state.db'\nos.remove(p)"
+    assert guard.check_python(code)
+
+
+@pytest.mark.parametrize('call', ["open('{p}', 'w')", "os.remove('{p}')", "os.truncate('{p}', 0)"])
+def test_review_repro_symlinked_live_database_is_refused(monkeypatch, call):
+    # `<home>/.hermes/kanban.db` is a symlink to a database elsewhere. The scratch dir itself sits under
+    # a `/cache/` path, so simulate the link by resolving the lexical live path to an unrelated target.
+    live = f'{diff_corpus.HOME_PARENT}/.hermes/kanban.db'
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(os.path, 'realpath',
+                        lambda path, *a, **k: '/srv/elsewhere/d.db' if str(path) == live else real_realpath(path, *a, **k))
+    code = "import os\n" + call.format(p=live)
+    assert guard.check_python(code)
+
+
+def test_python_floor_deleted_mutant_and_fail_closed(monkeypatch):
+    commands = python_commands()
+    real = guard._main_floor()
+
+    class _NoFloor:
+        @staticmethod
+        def check_python(code):
+            return None
+
+    monkeypatch.setattr(guard, '_main_floor', lambda: _NoFloor)
+    leaked = [c for c in commands if real.check_python(c) and not guard.check_python(c)]
+    print(f'python floor deleted: {len(leaked)} of {len(commands)} generated snippets leak past the head alone')
+    monkeypatch.undo()
+
+    def broken():
+        raise ImportError('boom')
+
+    monkeypatch.setattr(guard, '_main_floor', broken)
+    assert 'floor unavailable' in guard.check_python('print(1)')
