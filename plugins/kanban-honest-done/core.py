@@ -907,13 +907,15 @@ def _indirect_argv(seg: list[str]) -> bool:
 
 def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
     """Refusal for a worker shell command that edits its own card's title/body or completes it dishonestly."""
-    for seg in _segments(command or ""):
+    segments = _segments(command or "")
+    indirect = any(_indirect_argv(seg) for seg in segments)
+    for seg in segments:
         hit = _kanban_verb(seg)
         if not hit:
             continue
         verb, args = hit
         targets = _positionals(args)
-        if _indirect_argv(seg) and verb in {"edit", "complete", "done", "request-review"}:
+        if indirect and verb in {"edit", "complete", "done", "request-review"}:
             return ("[kanban-honest-done] Refused: xargs supplies unresolved mutation operands. "
                     "Use literal direct kanban commands so the own-card gates can check every target.")
         own_targets = [target for target in targets if _is_own(target, own)]

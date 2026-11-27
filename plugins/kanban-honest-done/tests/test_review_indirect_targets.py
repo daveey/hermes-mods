@@ -21,7 +21,8 @@ def test_every_completion_operand(tmp_path, target, verb):
     ('request-review', "--summary 'check 4 failed; waived'"),
 ])
 @pytest.mark.parametrize('template', ['xargs -a ids -I@ hermes kanban {verb} @ {flags}',
-                                      'xargs -a ids hermes kanban {verb} {flags}'])
+                                      'xargs -a ids hermes kanban {verb} {flags}',
+                                      'xargs -a ids -I@ sh -c "hermes kanban {verb} @ {flags}"'])
 def test_xargs_unknown_own_target(tmp_path, verb, flags, template):
     db = board(tmp_path, 'DONE: check 4 requires >= 25% free disk.')
     assert core.check_shell(template.format(verb=verb, flags=flags), OWN, lambda: [db])
