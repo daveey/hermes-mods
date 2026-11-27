@@ -31,8 +31,8 @@ Every running backend imports from that tree and the core updater only fast-forw
   (outside the tree), `merge-base`.
 - File writes are refused like in hermes-mods, except gitignored runtime paths (logs, venv, build output), the
   same exemption as coach's rule; `node_modules` stays refused (it is the live dependency install).
-- One-command escape hatch for a git step the user asked for (e.g. putting a detached checkout back on main):
-  `COACH_ALLOW_LIVE=1 git -C ~/.hermes/hermes-agent checkout main`, the same hatch coach honours.
+- Agent-inline `COACH_ALLOW_LIVE=1` is not approval and never exempts a core Git write.
+  A user-approved live recovery must use an authenticated operator terminal outside the agent tool path.
 
 Why here and not only in coach: coach's `blocks_live_checkout` had this rule, but worker nodes run coach
 executor-only (not in `plugins.enabled`), while this guard is enabled on every host and profile. On 2026-11-12 a
@@ -96,18 +96,23 @@ directory was created. Existing cleanup refusals still apply to accidental live-
   URL, and the writer is told to send the note to the PR's owner instead (editing the shared copy changes the PR's
   base, forcing a reconciliation and another exact-head review). Only a confirmed overlap blocks: an unavailable or
   incomplete lookup (HTTP error, rate limit, 8 s deadline, truncated pagination) allows the edit, and the skills
-  publisher (state `hosts/hermes-hub/skills-sync/skills_sync.sh`, the same `pr_overlap.py check` CLI) holds it
-  uncommitted instead and retries. Reads are cached in `~/.hermes/cache/pr-overlap/` (PR list 120 s, files per head
+  publisher (`skill_publish.py`, independently of the state publisher's `pr_overlap.py check` CLI) holds it
+  uncommitted instead. The in-plugin publisher rechecks before commits and before **every** push attempt,
+  with a fresh PR list, through metered `gh`; overlap, unknown, exceptions and malformed verdicts all hold.
+  Non-GitHub/unrecognized publication destinations hold too. Pre-hook reads are cached in `~/.hermes/cache/pr-overlap/` (PR list 120 s, files per head
   sha; files are read from each PR's canonical base repo, so a moved repo's 301 does not double them). Transport:
   the hook reads only through the host's `gh` (`gh api --include`, one call per request, up to 4 file reads at a
   time), never with a raw token over urllib, so a metering `gh` wrapper (a GitHub quota ledger) sees every read;
   `PR_OVERLAP_GH` overrides the binary, and gh missing or refusing (e.g. a quota guard's exit 75) is unknown. The CLI
-  keeps urllib with the caller's token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`). Escape hatch for a user-approved edit:
+  keeps urllib with the caller's token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`). All transports reject
+  pagination URLs outside the configured API origin (scheme, host and port, no userinfo); urllib also rejects
+  cross-origin redirects before forwarding credentials. Escape hatch for a user-approved edit:
   `SKILL_PR_OVERLAP_GUARD=0`. Tests: `tests_pr_overlap.py`. Its successful documentation writes are
   published by the post-call observer described below; failures never turn a successful tool result into an error.
 - Claude Code: `claude_hook.py` is a PreToolUse hook for `Bash` and `Write|Edit|MultiEdit|NotebookEdit`.
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
-  `~/.claude/settings.json`). Exit 2 blocks; bad input fails open.
+  `~/.claude/settings.json`). Exit 2 blocks; bad input and classification errors fail closed.
+  Hermes classification exceptions and exhausted update-analysis depth likewise block unanalyzed calls.
 
 ## Bounded skill documentation publication
 
@@ -143,9 +148,18 @@ record (edits stay in place, as for a direct skip); a still-pending or unknown t
 the window ends. Log: `$HERMES_HOME/logs/skill-publish-retry.log`. A later `skill_manage` call
 restarts the worker if records exist but none is running. A clean detached worktree starts at fetched origin/main and receives a
 `git apply --3way --index` patch constructed from captured bytes using a separate temporary index.
-Commits use the inherited repository author identity, explicitly select `.githooks`, and include
-skill/session/card in their subject. Cross-skill batches use separate scope-checked commits in
-the same detached worktree. Privacy/scope bypass environment flags are stripped for commits.
+Commits use the inherited repository author identity and include skill/session/card in their subject.
+Fetched `.githooks` are **never executed**, including checkout/rebase hooks. The plugin generates a private
+hook directory whose wrappers invoke only its own `publication_validate.py`. That helper requires gitleaks
+(default rules, plugin-owned config/empty ignore file, inline allow directives ignored) and the existing private
+denylist; missing or failing checks hold publication. There is no unscanned override.
+The trusted pre-commit and pre-push validators permit only regular, non-executable Markdown skill docs.
+Non-Markdown support assets and skills containing scripts/tests are held for the normal repository suite/PR flow:
+the publisher never executes fetched tests or reduces their required coverage to obtain publication.
+This is intentionally stricter than the ordinary doc-fast-path selector. The initial file-scope check above
+still accepts other documented asset types for safe capture, but the publication gate holds them.
+Cross-skill batches use separate commits in the same detached worktree. Privacy/scope bypass environment
+flags are stripped for commits.
 A non-fast-forward push may fetch/rebase/retry at most **three** times (four pushes total),
 rechecking CI at every new tip. A refusal without a changed tip stops immediately. No force push.
 
@@ -169,8 +183,9 @@ Git subprocesses have 30-second limits, external CI has 20 seconds, reconciliati
 there is no observer retry loop beyond the bounded push race retries. The guard kill switch
 also disables this observer. Sync fallback is separate and not implemented here.
 
-Tests: `tests_skill_publish.py` uses real bare origins, real `.githooks`/gitleaks/fixture denylist,
-and only injects the external CI service. It covers publication/clean source/later fast-forward,
+Tests: `tests_skill_publish.py` uses real bare origins, plugin-owned hooks/gitleaks/fixture denylist,
+and injects external CI/PR services (including the disposable detached worker). Push races are injected
+immediately before the real Git push, not by executing fetched pre-push hooks. It covers publication/clean source/later fast-forward,
 inherited identity, selected multi-file and cross-skill batches, unrelated dirt, scope and alias
 rejections, red/unknown CI one-log skips, in-progress-then-green deferred publication through the
 real hook and detached worker (no second `skill_manage` call), pending-then-red drop and window
@@ -220,14 +235,13 @@ Allowed read-only flags, verified against `hermes update --help`: `-h`, `--help`
 and heredocs written as data do not trigger the update rule; heredocs/herestrings
 fed to a shell or SSH are checked as executable input.
 
-For a **user-approved update only**, prefix the specific command with
-`HERMES_UPDATE_OK=1`. It can prefix the updater, its SSH command, or its shell
-wrapper. It does not authorize subsequent commands after `;` or `&&`, does not
-read an inherited environment value, and does not bypass checkout-write checks.
+`HERMES_UPDATE_OK=1` in agent-submitted text is not authenticated approval. It cannot
+exempt an updater, SSH command, shell wrapper, heredoc or herestring. A user-approved
+manual update must use an authenticated operator terminal outside this agent tool path.
 
 Tests: `tests_update.py` exercises terminal and execute_code for blocked and
 allowed forms, including both incident SSH spellings, every read-only flag,
-text-only mentions, shell input, and override scoping. Run
+text-only mentions, shell input, and rejection of inline approval flags. Run
 `scripts/test-all -k live-checkout-guard`.
 
 ## Archive-verified stash retirement

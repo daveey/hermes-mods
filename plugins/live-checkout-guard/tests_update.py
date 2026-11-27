@@ -56,6 +56,9 @@ ALLOW = [
     "ssh host \"grep 'hermes update' log\"",
 ]
 
+BLOCK.extend(command for command in ALLOW if 'HERMES_UPDATE_OK=1' in command)
+ALLOW = [command for command in ALLOW if 'HERMES_UPDATE_OK=1' not in command]
+
 @pytest.mark.parametrize("tool", ["terminal", "execute_code"])
 @pytest.mark.parametrize("command", BLOCK)
 def test_update_refused(tool, command):

@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -66,15 +67,36 @@ def _next_link(header: str) -> Optional[str]:
     return None
 
 
+def require_api_origin(url: str):
+    """Bind credentials and all pagination/redirects to the configured API origin."""
+    try:
+        target, api = urlsplit(url), urlsplit(API)
+        origin = lambda p: (p.scheme.lower(), p.hostname, p.port if p.port is not None else (443 if p.scheme == 'https' else 80))
+        if (api.scheme not in {'https', 'http'} or not api.hostname or
+                target.username is not None or target.password is not None or target.fragment or
+                api.username is not None or api.password is not None or
+                origin(target) != origin(api)):
+            raise ValueError('foreign API origin')
+    except (TypeError, ValueError):
+        raise Unknown('refused URL outside configured API origin') from None
+
+
+class ApiRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_api_origin(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def http_fetch(url: str, token: str, timeout: float):
     """(decoded JSON, next-page URL or None). Raises Unknown on any failure."""
+    require_api_origin(url)
     req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
                                                "X-GitHub-Api-Version": "2022-11-28",
                                                "User-Agent": "hermes-pr-overlap"})
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(ApiRedirectHandler()).open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode()), _next_link(resp.headers.get("Link", ""))
     except urllib.error.HTTPError as exc:
         raise Unknown(f"GitHub HTTP {exc.code} for {url.split('?')[0]}") from None
@@ -138,6 +160,7 @@ def gh_fetch(url: str, token: str, timeout: float):
     ``token`` is ignored: gh authenticates itself (worker-gh/gh-shim vend per call and write the quota ledger row;
     a plain gh uses its own login). Raises Unknown on any failure: gh missing, timeout, non-zero exit (75 = the
     quota guard refused the call at its reserve), HTTP >= 400 or a body that is not JSON."""
+    require_api_origin(url)
     gh = shutil.which(os.environ.get("PR_OVERLAP_GH") or "gh")
     if not gh:
         raise Unknown("gh CLI not found (pr_overlap reads GitHub only through the metered gh)")
@@ -206,6 +229,7 @@ class Checker:
         return self._token
 
     def _get(self, url: str):
+        require_api_origin(url)  # validate BEFORE resolving or passing a bearer token
         with self._lock:
             if self._failed:
                 raise Unknown(self._failed)   # one failure ends the lookup: no further requests

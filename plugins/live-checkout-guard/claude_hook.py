@@ -4,7 +4,7 @@
 Install (idempotent; edits ~/.claude/settings.json, or --settings PATH):
     python3 <this file> --install [--settings PATH]
 Adds PreToolUse entries for Bash and for Write|Edit|MultiEdit|NotebookEdit. Exit 2 + stderr blocks the call.
-Protected root: $LIVE_CHECKOUT_ROOT (default ~/code/hermes-mods). Uses the payload's `cwd`. Fails open on bad input.
+Protected root: $LIVE_CHECKOUT_ROOT (default ~/code/hermes-mods). Uses the payload's `cwd`. Bad input is refused.
 """
 
 import importlib.util
@@ -51,7 +51,8 @@ def main() -> int:
         else:
             why = guard.check_file_tool(tool, {"path": ti.get("file_path") or ti.get("notebook_path")}, cwd)
     except Exception:
-        return 0
+        sys.stderr.write('[live-checkout-guard] Refused: classification failed; simplify the call and retry.\n')
+        return 2
     if why:
         sys.stderr.write(guard.message(why) + "\n")
         return 2

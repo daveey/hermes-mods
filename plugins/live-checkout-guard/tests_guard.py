@@ -392,9 +392,10 @@ def test_claude_edit_tools_blocked(env):
     assert p.returncode == 0
 
 
-def test_claude_bad_payload_fails_open(env):
+def test_claude_bad_payload_fails_closed(env):
     p = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input="not json", capture_output=True, text=True)
-    assert p.returncode == 0
+    assert p.returncode == 2
+    assert 'classification failed' in p.stderr
 
 
 def test_claude_install_idempotent(tmp_path):

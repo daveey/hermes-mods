@@ -5,11 +5,13 @@ import fcntl
 from contextlib import contextmanager
 from contextvars import ContextVar
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -123,7 +125,8 @@ def run(root, *args, data=None, env=None, index=None):
         if parsed.scheme == 'https' and parsed.hostname:
             scope = 'credential.https://' + parsed.hostname + '.helper'
             credential_args = ['-c', scope + '=', '-c', scope + '=!gh auth git-credential']
-    p = bounded(['git', '-C', str(root), *credential_args, *args], data=data, timeout=30, env=env)
+    p = bounded(['git', '-C', str(root), '-c', 'core.hooksPath=/dev/null',
+                 '-c', 'core.fsmonitor=false', *credential_args, *args], data=data, timeout=30, env=env)
     if p.returncode:
         raise ValueError(p.stderr.decode(errors='replace').strip() or 'git command failed')
     return p.stdout
@@ -214,6 +217,49 @@ def latest_main_ci(root, sha):
         return 'unknown'
 
 
+def publication_overlap(root, paths):
+    """Fresh, metered, fail-closed publication check, independent of the pre-hook."""
+    spec = importlib.util.spec_from_file_location('publication_pr_overlap',
+                                                 Path(__file__).with_name('pr_overlap.py'))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # Check both effective destinations; a local/non-GitHub origin is unknown,
+    # not a reason to publish without the PR hold.
+    for options in [(), ('--push',)]:
+        url = run(root, 'remote', 'get-url', *options, 'origin').decode().strip()
+        slug = mod.repo_slug(url)
+        if not slug:
+            return {'status': 'unknown', 'reason': 'unrecognized publication origin'}
+        result = mod.Checker(fetch=mod.gh_fetch, deadline=remaining(8), list_ttl=-1).check(slug, 'main', paths)
+        if result.get('status') != 'clear':
+            return result
+    return {'status': 'clear'}
+
+
+def require_overlap_clear(root, paths):
+    try:
+        result = publication_overlap(root, paths)
+        state = result.get('status')
+    except Exception:
+        state = 'unknown'
+    if state != 'clear':
+        return {'status': 'skipped', 'reason': 'open PR overlap ' + (state if state in {'overlap', 'unknown'} else 'unknown')}
+    return None
+
+
+def trusted_hooks(archive):
+    """Only plugin-owned code; never load .githooks or suite scripts from origin."""
+    directory = archive / 'trusted-hooks'
+    directory.mkdir(mode=0o700)
+    helper = Path(__file__).resolve().with_name('publication_validate.py')
+    for name in ('pre-commit', 'pre-push'):
+        hook = directory / name
+        hook.write_text('#!/bin/sh\nexec ' + shlex.join([sys.executable, str(helper), name]) + '\n')
+        hook.chmod(0o700)
+    return str(directory)
+
+
 def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci, clock=None):
     clock = clock or time.monotonic
     with operation_budget(WORK_BUDGET, clock):
@@ -255,6 +301,8 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         state = ci(root, base)
         if state != 'green':
             return {'status': 'skipped', 'reason': 'latest main CI ' + state}
+        if hold := require_overlap_clear(root, paths):
+            return hold
         # Durable recovery evidence is outside both deployment and worktree cleanup.
         home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
         evidence = home / 'kanban/evidence/mods-reconcile'
@@ -303,9 +351,9 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         worktree = archive / 'worktree'
         run(root, 'worktree', 'add', '--detach', str(worktree), base)
         run(worktree, 'apply', '--3way', '--index', '-', data=patch)
-        # No identity overrides, and no hook bypass even if the caller has opted out globally.
-        if not (worktree / '.githooks/pre-commit').is_file():
-            raise ValueError('required .githooks/pre-commit missing')
+        # No fetched hooks: privacy checks and the conservative doc fast path live
+        # in this plugin. A skill needing tests is held, not run from fetched code.
+        hooks = 'core.hooksPath=' + trusted_hooks(archive)
         commit_env = {k: v for k, v in clean_env().items() if k not in {
             'HERMES_MODS_ALLOW_UNSCANNED', 'HERMES_MODS_ALLOW_MULTI_MOD'}}
         # apply --3way stages the full batch. Commit one skill at a time so the real
@@ -324,10 +372,12 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
                 continue
             message = 'skills: publish %s [session:%s card:%s]' % (
                 clean(label), clean(session_id or 'unknown'), clean(task_id or 'none'))
-            run(worktree, '-c', 'core.hooksPath=.githooks', 'commit', '-m', message, env=commit_env)
+            run(worktree, '-c', hooks, 'commit', '-m', message, env=commit_env)
         for attempt in range(4):
+            if hold := require_overlap_clear(root, paths):
+                return hold
             try:
-                run(worktree, '-c', 'core.hooksPath=.githooks', 'push', 'origin', 'HEAD:main')
+                run(worktree, '-c', hooks, 'push', 'origin', 'HEAD:main')
                 break
             except ValueError:
                 if attempt == 3:
@@ -342,7 +392,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
                     raise Deferred('latest main CI pending during retry')
                 if tip_state != 'green':
                     raise ValueError('latest main CI not green during retry')
-                run(worktree, '-c', 'core.hooksPath=.githooks', 'rebase', tip)
+                run(worktree, 'rebase', tip)
                 base = tip
         published = run(worktree, 'rev-parse', 'HEAD').decode().strip()
         run(root, 'fetch', 'origin', 'main')

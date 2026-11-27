@@ -196,14 +196,14 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", **_
             overlap = _skill_overlap(tool_name, args)
         except Exception:
             logger.debug("live-checkout-guard: PR overlap check failed", exc_info=True)
-            overlap = None
+            overlap = "[live-checkout-guard] Refused: PR overlap classification failed; retry when the check is available."
         if overlap:
             logger.info("live-checkout-guard blocked %s: open-PR overlap", tool_name)
             return {"action": "block", "message": overlap}
         why = classify(tool_name, args, str(task_id or ""))
-    except Exception:  # never let this plugin break a tool call
+    except Exception:  # unanalyzed tool calls must not escape the guard
         logger.debug("live-checkout-guard classify failed", exc_info=True)
-        return None
+        return {"action": "block", "message": "[live-checkout-guard] Refused: classification failed; simplify the call and retry."}
     if not why:
         return None
     logger.info("live-checkout-guard blocked %s: %s", tool_name, why)

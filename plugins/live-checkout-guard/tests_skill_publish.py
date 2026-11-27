@@ -170,6 +170,31 @@ class ToolPathTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
+    def isolate_overlap(self, plugin):
+        original = plugin._load_sibling
+        def load(file):
+            module = original(file)
+            if file == 'skill_publish.py':
+                module.publication_overlap = lambda *_: {'status': 'clear'}
+                # Detached fixture worker gets the same fake PR service, without
+                # introducing any production environment bypass.
+                driver = self.base / 'retry_fixture.py'
+                driver.write_text("import importlib.util, sys\n"
+                    f"spec = importlib.util.spec_from_file_location('fixture_pub', {str(HERE / 'skill_publish.py')!r})\n"
+                    "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n"
+                    "mod.publication_overlap = lambda *_: {'status': 'clear'}\n"
+                    "mod.retry_pending(sys.argv[1])\n")
+                def spawn(directory):
+                    import sys
+                    import threading
+                    proc = subprocess.Popen([sys.executable, str(driver), str(directory)],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    threading.Thread(target=proc.wait, daemon=True).start()
+                module.spawn_worker = spawn
+            return module
+        plugin._load_sibling = load
+
     def setUp(self):
         if not shutil.which('gitleaks'):
             skip_or_fail_in_ci(self, 'real pre-commit tests require gitleaks',
@@ -219,6 +244,24 @@ fi
         self.head = self.git(self.root, 'rev-parse', 'HEAD')
         self.index = (self.root / '.git/index').read_bytes()
         self.target.write_text('published\n')
+        # Bare origins have no GitHub PR API. Inject only that service boundary.
+        self.overlap = patch.object(publisher, 'publication_overlap', return_value={'status': 'clear'})
+        self.overlap.start()
+        self.addCleanup(self.overlap.stop)
+        original = publisher.bounded
+        def race_before_push(command, **kwargs):
+            racer = os.environ.get('PUBLISH_RACE_REPO')
+            if racer and 'push' in command:
+                sentinel = Path(os.environ['PUBLISH_RACE_SENTINEL'])
+                count = int(sentinel.read_text()) if sentinel.exists() else 0
+                if count < int(os.environ.get('PUBLISH_RACE_REPEATS', '1')):
+                    sentinel.write_text(str(count + 1))
+                    self.git(racer, '-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-qm', 'race')
+                    self.git(racer, '-c', 'core.hooksPath=/dev/null', 'push', '-q', 'origin', 'HEAD:main')
+            return original(command, **kwargs)
+        self.race = patch.object(publisher, 'bounded', side_effect=race_before_push)
+        self.race.start()
+        self.addCleanup(self.race.stop)
 
     def git(self, root, *args):
         result = subprocess.run(['git', '-C', str(root), *args], capture_output=True,
@@ -437,6 +480,7 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
         spec = importlib.util.spec_from_file_location('live_guard_publish_test', HERE / '__init__.py')
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
+        self.isolate_overlap(plugin)
         hooks = {}
         class Context:
             def register_hook(self, name, fn):
@@ -482,6 +526,7 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
         assert spec is not None and spec.loader is not None
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
+        self.isolate_overlap(plugin)
         hooks = {}
         class Context:
             def register_hook(self, hook, fn):
