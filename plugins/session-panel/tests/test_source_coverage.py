@@ -89,25 +89,33 @@ def test_inventory_directory_entry_changes_rearm_without_content_polling(tmp_pat
     if not w.ok or w._libc is None:
         w.close()
         pytest.skip('inotify only')
+    # The autouse fixture puts HERMES_HOME below tmp_path. Core-backed suite
+    # workers may create it asynchronously; that is a real directory-entry event,
+    # not content polling. Watch only the inventory this test owns.
+    inventory = tmp_path / 'inventory'
+    inventory.mkdir()
     try:
-        w.set_paths([], directories=[tmp_path])
-        board = tmp_path / 'new-board'
+        w.set_paths([], directories=[inventory])
+        board = inventory / 'new-board'
         board.mkdir()
         assert w.wait(0.2) and w.stale
-        w.set_paths([board / 'kanban.db'], directories=[tmp_path, board])
+        w.set_paths([board / 'kanban.db'], directories=[inventory, board])
         (board / 'kanban.db').write_bytes(b'new board source')
         assert w.wait(0.2)
-        w.set_paths([board / 'kanban.db'], directories=[tmp_path, board])
+        w.set_paths([board / 'kanban.db'], directories=[inventory, board])
         # Drain creation, then prove an existing unrelated file's contents do
         # not keep either producer busy through inventory wildcard coverage.
-        log = tmp_path / 'unrelated.log'
+        log = inventory / 'unrelated.log'
         log.write_bytes(b'created')
         assert w.wait(0.2)
-        w.set_paths([board / 'kanban.db'], directories=[tmp_path, board])
+        w.set_paths([board / 'kanban.db'], directories=[inventory, board])
         while w.wait(0.01):
             pass
+        # Deterministically exercise sibling fixture activity as well as log
+        # content changes; neither belongs to this watch's source inventory.
+        (tmp_path / 'sibling-home').mkdir()
         log.write_bytes(b'changed only log contents')
-        assert not w.wait(0.05)
+        assert not w.wait(0.05), (w.changed_paths, w.source_changed, w.stale)
     finally:
         w.close()
 
