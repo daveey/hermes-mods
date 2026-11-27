@@ -1373,6 +1373,8 @@ export function waitsText(waits) {
 
 const holdText = row => row.group === 'fault' ? `${row.count} can't start` : row.group === 'budget' ? `${row.count} needs decision` :
   `${row.name}${row.reading != null ? ` ${measureText(row.reading)}/${measureText(row.threshold)}` : ''} · ${row.count}`
+const holdLabel = row => row.group === 'fault' ? `${row.count} can't start` : row.group === 'budget' ? `${row.count} needs decision` :
+  `${row.name}${row.reading != null ? ` ${measureText(row.reading)}/${measureText(row.threshold)}` : ''} · `
 const holdTitle = row => [holdText(row), row.id === 'lane_gate' ? 'admitted today' : '', measureText(row.clears),
   ...(row.readings || []).map(r => `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)}/${measureText(r.threshold)} · ${r.cards} held`)]
   .filter(Boolean).join(' · ')
@@ -1385,7 +1387,9 @@ export function LaneHolds({ row }) {
     row.governor_held === null ? h('span', { className: 'lanes-hold lanes-hold-stale' }, 'board reading stale') :
       visible.map((chip, index) => h('span', { key: chip.id, className: `lanes-hold lanes-hold-${chip.group}`,
         'data-lane-hold': chip.id, title: chips.map(holdTitle).join(' · ') },
-        holdText(chip), index === visible.length - 1 && chips.length > visible.length ? ` +${chips.length - visible.length}` : '')))
+        h('span', { className: 'lanes-hold-label' }, holdLabel(chip)),
+        chip.group === 'fault' || chip.group === 'budget' ? null : h('span', { className: 'lanes-hold-count', 'data-hold-count': chip.count }, String(chip.count)),
+        index === visible.length - 1 && chips.length > visible.length ? h('span', { className: 'lanes-hold-count' }, `+${chips.length - visible.length}`) : null)))
 }
 
 export function FleetLines({ gov }) {
@@ -1540,7 +1544,8 @@ const CSS = `
 .lanes-held{color:#bb98ff}
 .lanes-last-known{opacity:.45;filter:grayscale(1)}
 .lanes-sb-lane{padding:1px 0;border-bottom:1px solid var(--ui-stroke-secondary)}
-.lanes-hold{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;border:1px solid #a855f766;border-radius:3px;padding:0 2px;color:#bb98ff;line-height:13px}
+.lanes-hold-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:pre}.lanes-hold-count{flex:none}
+.lanes-hold{display:inline-flex;max-width:100%;min-width:0;overflow:hidden;white-space:nowrap;vertical-align:middle;border:1px solid #a855f766;border-radius:3px;padding:0 2px;color:#bb98ff;line-height:13px}
 .lanes-hold-fault,.lanes-hold-budget{color:#ef4444;border-color:#ef444477}
 .lanes-hold-stale{color:#e9ba70;border-color:#e9ba7077;border-style:dashed}
 .lanes-row-chip{display:flex;flex-direction:column;justify-content:center;gap:1px}

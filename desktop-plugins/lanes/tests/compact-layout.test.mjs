@@ -52,6 +52,8 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       nameLines: Math.round(r(row.querySelector('.lanes-row-name')).height / parseFloat(getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight === 'normal' ? 15 : getComputedStyle(row.querySelector('.lanes-row-name')).lineHeight)),
       nameWrapped: row.querySelector('.lanes-row-name').getClientRects().length > 1 || r(row.querySelector('.lanes-row-name')).height > 20,
       chipWrapped: vis(row.querySelector('.lanes-row-chip')) && r(row.querySelector('.lanes-row-chip')).height > 32,
+      countClipped: [...row.querySelectorAll('.lanes-hold-count')].filter(c => !(vis(c) && inside(r(c), r(c.closest('.lanes-row-chip'))))).map(c => c.textContent),
+      countPainted: [...row.querySelectorAll('.lanes-hold-count')].map(c => c.textContent),
       costWrapped: [...cost.children].filter(vis).filter(c => r(c).height > 19.5).map(c => c.className),
       costScrollOverflow: cost.scrollWidth > cost.clientWidth + .5,
       cost: ['h', 'd', 'w'].map(k => vis(cost.querySelector('.lanes-cost-' + k))),
@@ -100,6 +102,8 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
         assert.deepEqual(row.deepOverflow, [], 'row descendant overflows row: ' + id)
         assert.deepEqual(row.chartOverflow, [], 'chart descendant overlaps sibling column: ' + id)
         assert.ok(!row.nameWrapped && !row.chipWrapped && row.costWrapped.length === 0 && !row.costScrollOverflow, 'wrapping/overflow: ' + id)
+        assert.deepEqual(row.countClipped, [], 'hold count clipped: ' + id)
+        if (row.countPainted.length) assert.ok(row.countPainted.includes('64'), 'hold count 64 painted: ' + id)
         assert.equal(row.tickH, 14, 'chart ticks 14px: ' + id)
         assert.ok(row.tickAbovePips, 'ticks on top, pips below: ' + id)
         if (row.name === 'overcap') assert.ok(['11', '10'].every(k => row.pipStates.includes(k)), 'overcap lane shows running and over-cap pips: ' + id)
