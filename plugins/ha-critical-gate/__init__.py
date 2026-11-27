@@ -8,11 +8,14 @@ hook asks a configured gate command about every ``ha_call_service`` call (it als
 - ``hold`` / ``deny``: the call is blocked; the gate's message becomes the tool result (e.g. "waiting for a tap on
   the owner's phone; it runs by itself if approved").
 
-With no gate configured, or when the gate fails, opening-direction security calls (unlock/open a lock, disarm an
-alarm, open/toggle/move a cover) are blocked and everything else runs. Nothing is removed from the toolset.
+With no trusted gate, opening-direction security calls, opaque actuators (script, scene, automation,
+button, switch) and unresolved generic targets are blocked. Known safe light/media/climate and
+closing/locking calls remain available. Targets in entity_id and data.entity_id are checked too.
 
-Gate command: ``HA_CRITICAL_GATE_COMMAND`` (a shell-style command line) or ``<hermes home>/ha-critical-gate.json``
-``{"command": [argv...], "timeout": 25}``. It gets ``{"domain","service","entity_id","data","agent"}`` as JSON on
+Gate command comes ONLY from root-owned, non-agent-writable ``/etc/hermes/ha-critical-gate.json``:
+``{"command": ["/absolute/trusted/gate"], "timeout": 25}``. Home/profile files and
+``HA_CRITICAL_GATE_COMMAND`` are ignored. The executable and all path ancestors must also be root-owned,
+non-agent-writable and not symlinks. It gets ``{"domain","service","entity_id","data","agent"}`` on
 stdin and prints ``{"decision": "allow"|"hold"|"deny", "message": "..."}``.
 """
 
@@ -21,7 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
+import math
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -36,14 +40,45 @@ CRITICAL_SERVICES = {
     "cover": {"open_cover", "toggle", "set_cover_position", "open_cover_tilt", "set_cover_tilt_position",
               "toggle_cover_tilt"},
 }
-CONFIG_NAME = "ha-critical-gate.json"
+CONFIG_NAME = "ha-critical-gate.json"  # legacy filename; home files are never authority
+TRUSTED_CONFIG = Path("/etc/hermes/ha-critical-gate.json")
+OPAQUE_ACTUATORS = {"script", "scene", "automation", "button", "switch"}
 DEFAULT_TIMEOUT = 25
 NO_GATE = ("BLOCKED, nothing was sent: {what} needs the owner's confirmation and no confirmation gate is "
            "available right now. Do not retry it or call Home Assistant another way; tell the user.")
 
 
-def critical(domain: str, service: str) -> bool:
-    return service in CRITICAL_SERVICES.get(domain, ())
+def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
+    if domain in OPAQUE_ACTUATORS or service in CRITICAL_SERVICES.get(domain, ()):
+        return True
+    data = data if isinstance(data, dict) else {}
+    targets = []
+    unresolved = False
+    for value in (entity_id, data.get("entity_id")):
+        if value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        if not values:
+            unresolved = True
+        for item in values:
+            if not isinstance(item, str):
+                unresolved = True
+                continue
+            targets.extend(part.strip() for part in item.split(","))
+    for target in targets:
+        target_domain, dot, name = target.partition(".")
+        if not dot or not name or target_domain == "group":
+            unresolved = True
+        if target_domain in OPAQUE_ACTUATORS:
+            return True
+        if target_domain in {"lock", "alarm_control_panel", "cover"}:
+            safe = {"lock": {"lock"}, "alarm_control_panel": {"alarm_arm_home", "alarm_arm_away", "alarm_arm_night"},
+                    "cover": {"close_cover", "stop_cover", "close_cover_tilt", "stop_cover_tilt"}}
+            if service not in safe[target_domain]:
+                return True
+    # Generic HA services expand groups, areas, devices and implicit/all targets server-side.
+    return domain == "homeassistant" and (
+        unresolved or not targets or any(data.get(key) for key in ("area_id", "device_id", "label_id")))
 
 
 def _homes() -> list[Path]:
@@ -71,20 +106,48 @@ def agent_name() -> str:
     return "default"
 
 
+def _check_metadata(info, path: Path, *, directory: bool) -> None:
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if (info.st_uid != 0 or info.st_mode & 0o022 or not kind(info.st_mode)
+            or os.access(path, os.W_OK)):
+        raise ValueError("gate path must be root-owned and not agent-writable")
+
+
+def _check_trusted_path(path: Path, *, executable=False) -> None:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("gate path must be absolute")
+    # lstat rejects symlinks at every level, including a replaceable parent.
+    for parent in reversed(path.parents):
+        _check_metadata(parent.lstat(), parent, directory=True)
+    _check_metadata(path.lstat(), path, directory=False)
+    if executable and not os.access(path, os.X_OK):
+        raise ValueError("gate is not executable")
+
+
+def _read_trusted_config(path: Path) -> dict:
+    _check_trusted_path(path)
+    # Read once from a no-follow fd; verify the opened inode too. Trusted ancestry
+    # prevents replacement by the agent between validation and open/exec.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as stream:
+        _check_metadata(os.fstat(stream.fileno()), path, directory=False)
+        return json.load(stream)
+
+
 def gate_config() -> Optional[dict]:
-    command = os.environ.get("HA_CRITICAL_GATE_COMMAND", "").strip()
-    if command:
-        return {"command": shlex.split(command), "timeout": DEFAULT_TIMEOUT}
-    for home in _homes():
-        path = home / CONFIG_NAME
-        try:
-            config = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if isinstance(config, dict) and isinstance(config.get("command"), list) and config["command"]:
-            return {"command": [str(part) for part in config["command"]],
-                    "timeout": config.get("timeout") if isinstance(config.get("timeout"), (int, float)) else DEFAULT_TIMEOUT}
-    return None
+    try:
+        config = _read_trusted_config(TRUSTED_CONFIG)
+        command = config.get("command") if isinstance(config, dict) else None
+        if not isinstance(command, list) or len(command) != 1 or not all(
+                isinstance(part, str) and part and "\x00" not in part for part in command):
+            return None
+        timeout = config.get("timeout", DEFAULT_TIMEOUT)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 300:
+            return None
+        _check_trusted_path(Path(command[0]), executable=True)
+        return {"command": command, "timeout": timeout}
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _call_of(args: Any) -> Optional[dict]:
@@ -120,7 +183,7 @@ def decide(args: Any, run=subprocess.run, config=None) -> Optional[str]:
     if call is None:
         return None
     what = "%s.%s" % (call["domain"], call["service"])
-    is_critical = critical(call["domain"], call["service"])
+    is_critical = critical(**call)
     config = config if config is not None else gate_config()
     if not config:
         return NO_GATE.format(what=what) if is_critical else None
@@ -153,10 +216,8 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[
         why = classify(tool_name, args)
     except Exception:
         logger.exception("ha-critical-gate failed")
-        call = _call_of(args) if tool_name == TOOL else None
-        if call and critical(call["domain"], call["service"]):
-            return {"action": "block", "message": NO_GATE.format(what="%s.%s" % (call["domain"], call["service"]))}
-        return None
+        # An unexpected classifier/config error must not bypass a batched HA call.
+        return {"action": "block", "message": NO_GATE.format(what="Home Assistant call")}
     if not why:
         return None
     logger.info("ha-critical-gate blocked %s", tool_name)
