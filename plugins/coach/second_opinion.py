@@ -202,9 +202,10 @@ def repo_diff(root: str, files: list[str], since: Optional[float] = None, max_ch
             oldest = revs[-1]
             base = f"{oldest}^" if _git(["rev-parse", "-q", "--verify", f"{oldest}^"], root) else oldest
     parts = []
-    # Review evidence must be raw Git output, not repository-configured executables.
-    # Explicit flags override local/global diff.external, GIT_EXTERNAL_DIFF and
-    # attribute-selected textconv drivers without discarding ordinary repo config.
+    # Disable external diff and textconv specifically: these flags override
+    # local/global diff.external, GIT_EXTERNAL_DIFF and attribute-selected textconv.
+    # This is not a sandbox for all Git config: fsmonitor and clean/process filters
+    # remain outside this boundary, so the repository must still be trusted.
     stat = _git(["diff", "--no-ext-diff", "--no-textconv", "--stat", base], root) or ""
     diff = _git(["diff", "--no-ext-diff", "--no-textconv", base], root) or ""
     if stat.strip():
