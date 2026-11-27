@@ -122,10 +122,7 @@ cannot change kind or wake settings"). If David already did the step, unblock in
 When a parent and its child carry the same ask, keep it on the card that must finish first (the child cannot run
 before its parent) and clear the other one.
 
-A macOS permission ask (Screen Recording, Accessibility, "grant it at the Mac") is a premise to read, not to relay.
-Read the Mac's existing grants first (query and how to read it: `references/macos-permission-grants.md`). Often
-some client already holds the permission, so the card re-plans onto that client with no new grant. Never forward the
-ask to David before this read.
+Before a Mac permission ask, inspect existing grants (`references/macos-permission-grants.md`). Before declaring phone testing human-only, separate metadata access, developer-service reachability and actual input semantics (`references/physical-device-capability.md`); one unavailable discovery API does not rule out existing authorized routes.
 
 ## 3. Walk the self-unblock ladder
 
