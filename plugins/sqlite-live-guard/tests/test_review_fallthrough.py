@@ -138,3 +138,27 @@ def test_pipeline_cd_does_not_change_parent(lexical_home):
 
 def test_or_rhs_uses_old_context(home):
     assert guard.check_shell('cd ~ || rm -rf .hermes', cwd=str(home / 'cache')) is None
+
+
+@pytest.mark.parametrize('operator', ['&&', '||', ';'])
+@pytest.mark.parametrize('wrapper', ['', 'bash', 'sh', 'ssh'])
+@pytest.mark.parametrize('nested', [False, True])
+@pytest.mark.parametrize('form', ['alias', 'cwd'])
+def test_subshell_pipeline_does_not_leak(lexical_home, operator, wrapper, nested, form):
+    inner = '(D=/tmp; ls | head)' if form == 'alias' else '(cd /tmp && ls | head)'
+    if nested:
+        inner = '( ' + inner + ' )'
+    command = inner + ' ' + operator + ' rm -rf ' + ('"$D"' if form == 'alias' else '.hermes')
+    if form == 'alias':
+        command = 'D=~/.hermes; ' + command
+    else:
+        command = 'cd ~/.hermes; ' + command
+    if wrapper in {'bash', 'sh'}:
+        command = wrapper + " -c '" + command + "'"
+    elif wrapper == 'ssh':
+        command = "ssh example.com '" + command + "'"
+    assert guard.check_shell(command, cwd=str(lexical_home.parent))
+
+
+def test_pipeline_before_subshell_still_refused(lexical_home):
+    assert guard.check_shell('true | (cd /tmp) && rm -rf ~/.hermes', cwd=str(lexical_home.parent))

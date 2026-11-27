@@ -265,11 +265,12 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             rhs = True
             continue
         if raw == ["("]:
-            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks, list(failed_cd), list(succeeded_cd)))
+            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks, list(failed_cd), list(succeeded_cd), pipeline))
+            pipeline = None
             continue
         if raw == [")"]:
             if scopes:
-                env, exported, readonly, in_home, blocks, failed_cd, succeeded_cd = scopes.pop()
+                env, exported, readonly, in_home, blocks, failed_cd, succeeded_cd, pipeline = scopes.pop()
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
             if raw != ["|"] and pipeline is not None:
