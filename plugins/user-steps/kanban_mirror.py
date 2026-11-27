@@ -980,7 +980,10 @@ class Mirror:
         if passes:  # queued before any inline pass: a cold pass that raises must not strand the remote pass
             _schedule(self, owner, passes)
         if not warm:
-            self._reconcile_local(owner, False)  # cold owner: its first pass answers this poll
+            # No stored first result: a change key cannot justify skipping this pass.
+            # Read the full inputs once, synchronously; background/strict passes
+            # establish their ordinary PRE-pass key later.
+            self._reconcile_local(owner, False, force_full=True)
             _mark_local_seen(_local_key(self, owner))
 
     def _reconcile_remote(self, owner):
@@ -1133,13 +1136,18 @@ class Mirror:
         if strict:  # both halves clean (a strict local pass raises when it is not)
             _mark_remote_fresh(key, started)
 
-    def _reconcile_local(self, owner, strict):
+    def _reconcile_local(self, owner, strict, *, force_full=False):
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
+            okey = encoded(owner)
+            if force_full:
+                # The local-seen LRU may evict an owner whose keyed memo survives.
+                # Clear it before work, including when the cold full pass raises.
+                with _MEMO_LOCK:
+                    _MEMO.pop(okey, None)
             with _stage('local_fence'):
                 fenced = self._fenced_core()
             with _stage('local_key'):
-                key = self._key(owner, fenced)
-            okey = encoded(owner)
+                key = None if force_full else self._key(owner, fenced)
             now = time.monotonic()
             with _MEMO_LOCK:
                 memo = _MEMO.get(okey)

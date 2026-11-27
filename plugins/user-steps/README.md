@@ -295,7 +295,16 @@ terminal-history read exclusion, missing/mismatched rows, active withdrawal,
 resolution candidacy, revival/key invalidation and active-to-terminal races.
 
 The session-panel feed reconciles local card asks before reading its canonical
-requests; the compatibility `/requests` read also reconciles. The panel producer
+requests; the compatibility `/requests` read also reconciles. A cold compatibility
+poll synchronously runs the complete local pass, without first building a change
+key that cannot justify skipping its first result. It clears any surviving owner
+memo before work and does not attach a post-pass key to older inputs. Subsequent
+background and strict passes retain their ordinary pre-pass key and full-pass
+ceiling. Namespace-wide older-owner bindings and withdrawals remain dependencies.
+`test_kanban_mirror_keyed.py` covers first-response asks with a key trap, failure
+without warming, older-owner withdrawal, changed asks and background key recovery.
+
+The panel producer
 memoizes clean remote passes by canonical activity revisions plus courier, session
 and action-store file identities. An unchanged key skips remote projection for at
 most 60 seconds from the actual pass start; unknown keys never certify a skip.

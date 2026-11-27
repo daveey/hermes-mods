@@ -257,3 +257,88 @@ def test_connections_are_kept_across_passes(keyed, monkeypatch):
         k.mirror.reconcile(OWNER)
     assert sorted(set(opened)) == sorted(opened)  # one open per file
     assert set(opened) <= {str(k.path), str(k.state), str(k.store.path)}
+
+
+def test_cold_http_returns_ask_without_constructing_change_key(keyed, monkeypatch, tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_withdrawal import load_module, ROOT
+    k = keyed
+    scheduled = []
+    monkeypatch.setitem(k.mod, '_schedule', lambda m, o, passes: scheduled.append(set(passes)))
+    def key_trap(*args):
+        raise RuntimeError('cold poll constructed redundant key')
+    monkeypatch.setattr(k.mirror, '_key', key_trap)
+    api = load_module('cold_key_api', ROOT / 'dashboard/plugin_api.py')
+    api.RETRY_INTERVAL_S = 0
+    app = FastAPI()
+    router = api.create_router(ledger_dir=tmp_path / 'ledger', state_db=k.state, action_store=k.store,
+                               owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid), kanban_mirror=k.mirror)
+    app.include_router(router)
+    try:
+        with TestClient(app) as client:
+            response = client.get('/requests', params={'session': OWNER['storedSessionId']})
+        assert response.status_code == 200
+        assert [r['title'] for r in response.json()['requests']] == ['Choose a color']
+        assert len(k.passes) == 1  # actual full local resolver, not a fake local pass
+        assert k.mod['encoded'](OWNER) not in k.mod['_MEMO']
+        assert scheduled == [{'remote'}]
+    finally:
+        router.stop_delivery()
+
+
+def test_cold_full_failure_clears_stale_memo_without_warming_and_schedules_remote(keyed, monkeypatch):
+    k = keyed
+    settle(k)  # the memo can outlive local-seen LRU eviction
+    k.mod['_LOCAL_SEEN'].clear()
+    k.mod['_REMOTE_FRESH'].clear()
+    scheduled = []
+    monkeypatch.setitem(k.mod, '_schedule', lambda m, o, passes: scheduled.append(set(passes)))
+    def fail(*args):
+        raise OSError('fixture local read failure')
+    monkeypatch.setattr(k.mirror, '_reconcile', fail)
+    # Existing memo would skip the old pass. The cold full path must actually fail.
+    with pytest.raises(OSError, match='fixture local read failure'):
+        k.mirror.reconcile_poll(OWNER, 60)
+    assert not k.mod['_local_seen'](k.mod['_local_key'](k.mirror, OWNER))
+    assert k.mod['encoded'](OWNER) not in k.mod['_MEMO']
+    assert scheduled == [{'remote'}]
+
+
+def test_cold_bypass_retains_older_withdrawal_and_background_prepass_key(keyed, monkeypatch):
+    import json
+    k = keyed
+    settle(k)
+    old = k.store.requests(OWNER)[0]
+    # An unrelated cold owner still reconciles older-owner departures synchronously.
+    other = dict(OWNER, storedSessionId='session-b')
+    board(k, "UPDATE tasks SET status='ready'")
+    queued = []
+    schedule = k.mod['_schedule']
+    monkeypatch.setitem(k.mod, '_schedule', lambda m, o, passes: queued.append((o, passes)))
+    original_key = k.mirror._key
+    monkeypatch.setattr(k.mirror, '_key', lambda *args: pytest.fail('cold key'))
+    k.mirror.reconcile_poll(other, 60)
+    assert not k.store.requests(OWNER)
+    assert k.store.get(OWNER, old['requestId'])['state'] == 'withdrawn'
+    assert k.mod['encoded'](other) not in k.mod['_MEMO']
+    monkeypatch.setattr(k.mirror, '_key', original_key)
+    # Next warm poll schedules ordinary local work. Only its PRE-pass key is memoized.
+    k.mirror.reconcile_poll(other, 60)
+    assert 'local' in queued[-1][1]
+    monkeypatch.setitem(k.mod, '_schedule', schedule)
+    monkeypatch.setattr(k.mirror.remote, 'reconcile', lambda owner: None)
+    k.mirror.reconcile_poll(other, 60)
+    assert k.mod['_background_idle'](5)
+    assert k.mod['encoded'](other) in k.mod['_MEMO']
+    # A changed ask is not hidden by the bypass; a cold original owner sees it now.
+    k.mod['_LOCAL_SEEN'].clear()
+    monkeypatch.setitem(k.mod, '_schedule', lambda m, o, passes: queued.append((o, passes)))
+    with sqlite3.connect(k.path) as c:
+        c.execute("UPDATE tasks SET status='blocked',human_request=?", (json.dumps(dict(
+            action='Pick again', interaction='reply', why_human='User choice', scope='New scope',
+            evidence='fixture', choices=[dict(label='New', value='new')])),))
+        c.execute("INSERT INTO task_events(task_id,kind) VALUES ('t_test','blocked')")
+    k.mirror.reconcile_poll(OWNER, 60)
+    assert len(k.store.requests(OWNER)) == 1
+    assert k.store.requests(OWNER)[0]['requestId'] != old['requestId']
