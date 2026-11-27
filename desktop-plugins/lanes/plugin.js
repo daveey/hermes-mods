@@ -1238,7 +1238,17 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   const [message, setMessage] = useState('')
   const dragRef = useRef(null), dragging = useRef(false), track = useRef(null)
   // The PUT receipt is not confirmation: only a hub snapshot whose limits show the value releases the draft.
-  useEffect(() => { if (draft && draft.value === confirmed) setDraft(null) }, [confirmed, draft])
+  useEffect(() => { if (draft && limitsKnown && draft.value === confirmed) setDraft(null) }, [confirmed, draft, limitsKnown])
+  useEffect(() => {
+    if (!draft) return
+    // Cached pushes may still show the pre-write cap. They are not proof of a concurrent overwrite.
+    // Bound confirmation without treating PUT success or an unversioned old push as confirmation.
+    const timer = setTimeout(() => {
+      setDraft(null)
+      setMessage('hub did not confirm the requested cap; showing latest hub value, retry if needed')
+    }, 30000)
+    return () => clearTimeout(timer)
+  }, [draft])
   const locked = disabled || Boolean(error) || !limitsKnown || slots == null || draft != null
   const ticks = row.ticks
   const live = drag != null ? stopValue(drag, slots ?? 0) : draft ? draft.value : confirmed

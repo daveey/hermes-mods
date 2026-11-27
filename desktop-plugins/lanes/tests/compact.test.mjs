@@ -170,6 +170,27 @@ test('far right 3% is infinity and writes null; releasing at the current cap wri
   } finally { await pane.close(); localStorage.clear() }
 })
 
+test('a conflicting or missing hub cap cannot leave saving locked forever', async () => {
+  const original = globalThis.setTimeout
+  let expire
+  globalThis.setTimeout = (fn, ms, ...args) => ms === 30000 ? (expire = fn, { confirmation: true }) : original(fn, ms, ...args)
+  const t = setup(); let pane
+  try {
+    const opened = await open(t); pane = opened.pane; const slider = opened.slider
+    await pointer(pane, slider, 'pointerdown', 2 / 6 * .97)
+    await pointer(pane, slider, 'pointerup', 2 / 6 * .97)
+    assert.equal(slider.dataset.saving, '1')
+    await React.act(async () => t.push(snapshot({}, { limits: { max_workers: 3 } })))
+    assert.equal(slider.dataset.saving, '1', 'unversioned push may predate the write')
+    assert.equal(typeof expire, 'function')
+    await React.act(async () => expire())
+    assert.equal(slider.dataset.saving, '0')
+    assert.equal(slider.getAttribute('aria-disabled'), 'false')
+    assert.equal(slider.getAttribute('aria-valuenow'), '3')
+    assert.match(pane.container.querySelector('[role=alert]').textContent, /hub did not confirm/)
+  } finally { globalThis.setTimeout = original; await pane?.close(); localStorage.clear() }
+})
+
 test('failed write reverts the cap and shows an inline error', async () => {
   const t = setup(snapshot(), { failWrite: true }); const { pane, slider } = await open(t)
   try {
