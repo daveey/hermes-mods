@@ -87,6 +87,59 @@ def test_c2_remote_and_light_controls(cmd):
     assert guard.check_shell(cmd) is None
 
 
+@pytest.mark.parametrize("cmd", [
+    "case $(pytest) in x) echo ;; esac",
+    'case "$(cargo build --release)" in x) echo ;; esac',
+    "case `pytest` in x) echo ;; esac",
+    "case x in x) echo ;; $(pytest)) echo ;; esac",
+    "for x in $(pytest); do echo $x; done",
+    "case $(echo $(pytest)) in x) echo ;; esac",
+])
+def test_f1_header_substitutions_execute_locally(cmd):
+    assert guard.check_shell(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh host -o ProxyCommand='pytest' true",
+    "ssh host -oProxyCommand='pytest' true",
+    "ssh -P tag -o ProxyCommand='pytest' host true",
+    "ssh -Ptag -o ProxyCommand='pytest' host true",
+    "ssh -o KnownHostsCommand='pytest' host true",
+    "ssh host -o 'KnownHostsCommand pytest' true",
+    "ssh host -P tag -o LocalCommand='pytest' true",
+])
+def test_f2_ssh_option_positions_and_commands(cmd):
+    assert guard.check_shell(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh host true -o ProxyCommand=pytest",
+    "ssh -- host -o ProxyCommand=pytest true",
+    "ssh host 'echo -o KnownHostsCommand=pytest'",
+    "ssh -P tag host pytest",
+    "ssh host -o KnownHostsCommand='echo known-host' pytest",
+    "case '$(pytest)' in x) echo ;; esac",
+    "for x in '$(pytest)'; do echo $x; done",
+])
+def test_f1_f2_data_controls(cmd):
+    assert guard.check_shell(cmd) is None
+
+
+@pytest.mark.parametrize("remote", [
+    "hub 'cd ~/code/x && bash -s'",
+    "-J jump hub bash -s",
+    "hub sudo bash -s",
+    "hub 'cat > /tmp/x.sh'",
+])
+def test_f3_complex_remote_heredoc_requires_explicit_optout(remote, monkeypatch):
+    # Deliberately conservative: only the documented, auditable stdin-shell
+    # grammar is exempt. This is a load-policy hold, not a claim of local execution.
+    cmd = f"ssh {remote} <<'EOF'\npytest\nEOF"
+    assert guard.check_shell(cmd)
+    monkeypatch.setenv("MAC_HEAVY_OK", "1")
+    assert guard.check_shell(cmd) is None
+
+
 def test_c4_truncated_script(tmp_path):
     (tmp_path / "long.sh").write_text("#" * guard.SCRIPT_MAX_BYTES + "\ncargo build --release\n")
     assert guard.check_shell("bash long.sh", str(tmp_path))

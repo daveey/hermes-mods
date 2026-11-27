@@ -794,7 +794,7 @@ class _Unclosed(Exception):
     pass
 
 
-def _expose_substitutions(text: str) -> str:
+def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) -> str:
     """`text` with each command substitution moved out of its double quotes, and backticks spelled `$(...)`.
 
     Bash runs `"$(cmd)"` and "`cmd`" exactly like the unquoted forms, but shlex keeps a double-quoted string as one
@@ -858,12 +858,11 @@ def _expose_substitutions(text: str) -> str:
                 j = arithmetic(i + 1)
                 out.append(text[i:j])
                 i = j
-            elif text.startswith("$(", i):
-                s, i = code(i + 2, ")", level + 1)
+            elif text.startswith("$(", i) or c == "`":
+                s, i = code(i + 2, ")", level + 1) if c == "$" else code(i + 1, "`", level + 1)
                 out.append("$(" + s + ")")
-            elif c == "`":
-                s, i = code(i + 1, "`", level + 1)
-                out.append("$(" + s + ")")
+                if substitutions is not None and level == 0:
+                    substitutions.append(s)
             else:
                 if stop == ")" and c == "(":
                     depth += 1
@@ -900,6 +899,8 @@ def _expose_substitutions(text: str) -> str:
                     data = []
                 s, i = code(i + 2, ")", level + 1) if c == "$" else code(i + 1, "`", level + 1)
                 parts.append("$(" + s + ")")
+                if substitutions is not None and level == 0:
+                    substitutions.append(s)
             else:
                 data.append(c)
                 i += 1
@@ -1038,6 +1039,13 @@ def _command_tokens(text: str) -> list[str]:
 
 def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
     """Yield (argv, env-assignment names) for each simple command, recursing into `bash -c`."""
+    # Header/pattern words are data, but their command substitutions run first.
+    # Collect with the same quote-aware walker as the lexer (not heredoc rules,
+    # which intentionally treat apostrophes as literal characters).
+    substitutions: list[str] = []
+    _expose_substitutions(_split_heredocs(text)[0], substitutions)
+    for sub in substitutions:
+        yield from commands(sub)
     toks = _command_tokens(text)
     if toks is None:
         return
@@ -1115,22 +1123,29 @@ def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
         return
     name = os.path.basename(rest[0])
     if name == "ssh":
-        # Only pre-destination options can name local execution. Remote argv is data.
-        i = 1
-        while i < len(rest) and rest[i].startswith("-"):
+        # OpenSSH parses options before AND immediately after the destination;
+        # the first remote command operand ends option parsing.
+        i, host_seen = 1, False
+        while i < len(rest):
             opt = rest[i]
             i += 1
+            if not opt.startswith("-") or opt == "-":
+                if host_seen:
+                    break
+                host_seen = True
+                continue
             if opt == "--":
                 break
             for k, c in enumerate(opt[1:], 1):
-                if c in "BbcDEeFIiJLlmOopQRSWw":
+                if c in "BbcDEeFIiJLlmOopPQRSWw":
                     value = opt[k + 1:]
                     if not value:
                         value = rest[i] if i < len(rest) else ""
                         i += 1
                     if c == "o":
                         pair = re.split(r"[=\s]+", value.strip(), maxsplit=1)
-                        if len(pair) == 2 and pair[0].lower() in ("proxycommand", "localcommand"):
+                        if len(pair) == 2 and pair[0].lower() in (
+                                "proxycommand", "localcommand", "knownhostscommand"):
                             for sub, sub_env in commands(pair[1]):
                                 yield sub, sub_env | env
                     break
