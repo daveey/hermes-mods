@@ -457,7 +457,7 @@ def current_branch(repo: str) -> str:
 
 
 def stash_subject(repo: str, ref: str = "stash@{0}") -> Optional[str]:
-    proc = _run_git(repo, ["log", "-1", "--format=%s", ref])
+    proc = _run_git(repo, ["log", "-1", "--format=%s", "--end-of-options", ref, "--"])
     if proc is None or proc.returncode != 0 or not proc.stdout.strip():
         return None
     return proc.stdout.strip()
@@ -2975,6 +2975,10 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
         state.exported.add(_CMDS)
     try:
         analyzer.run_text(cmd or "", [state], depth)
+    except _Budget:
+        # Uninspected code may compute both git and stash without literal evidence.
+        analyzer.record(None, "stash", ["pop"], _EvidenceNote(
+            "analysis step budget exhausted; cannot inspect remaining executable code"))
     except Exception:  # budget, recursion, or an analyzer defect: never fail open
         analyzer.fail_closed(cmd or "")
     if analyzer.uncertain:  # a fragment failed: its text may not be all that went unanalyzed
@@ -2984,8 +2988,15 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
 
 def stash_op(args: list[str]) -> Optional[str]:
     """``push`` for no-arg / ``git stash -q``, the subcommand name, or None for ``--help``."""
-    if "-h" in args or "--help" in args:
-        return None
+    # Help flags count only in option positions, not message or pathspec data.
+    words = iter(args)
+    for word in words:
+        if word == "--":
+            break
+        if word == "--message" or re.fullmatch(r"-[quakpSd]*m", word):
+            next(words, None)
+        elif word in ("-h", "--help"):
+            return None
     # With no explicit subcommand Git defaults to push, including -m MESSAGE
     # and -- PATHSPEC. Option values are not subcommands.
     if not args or args[0].startswith("-"):
@@ -2994,8 +3005,15 @@ def stash_op(args: list[str]) -> Optional[str]:
 
 
 def stash_ref(args: list[str]) -> str:
-    for arg in args:
-        if arg.startswith("stash@") or arg.startswith("refs/stash"):
+    # Restore options have no values; the first operand is any Git revision,
+    # not only stash@{n}. -- ends options, and branch first takes a branch name.
+    words = iter(args[1:])
+    if args and args[0] == "branch":
+        next(words, None)
+    for arg in words:
+        if arg == "--":
+            return next(words, "stash@{0}")
+        if not arg.startswith("-"):
             return arg
     return "stash@{0}"
 
@@ -3157,7 +3175,12 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
         ref = stash_ref(args)
         subject = stash_subject(repo, ref)
         if subject is None:
-            continue  # no such stash: pop fails on its own, nothing to swap
+            # An absent entry and a transient inspection error cannot be
+            # distinguished here; neither establishes ownership of a later apply.
+            return (
+                f"STASH WORKTREE GUARD: blocked `git stash {op}` in {shown}: "
+                f"cannot read stash metadata for `{ref}`. " + _safe_recipe()
+            )
         branch = stash_branch(subject)
         here = current_branch(repo)
         if branch == here:

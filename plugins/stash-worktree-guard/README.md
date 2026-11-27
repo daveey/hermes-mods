@@ -69,6 +69,12 @@ This plugin also:
   `eval` with unknown words. An unknown command name followed by `stash` is a restore in an
   unknown repo;
 - fails closed for restoring operations when the repo cannot be resolved or read.
+  In a shared repo, missing, empty or failed stash metadata inspection also refuses:
+  absence is not proof of ownership for a later apply. Explicit apply revisions (branch
+  refs, object IDs and stash selectors) are checked as supplied, not replaced by the
+  stack's top entry. Help-looking message/pathspec data does not disable push checks.
+  Step-budget exhaustion always refuses the uninspected executable remainder, even
+  without literal Git/stash evidence (including otherwise read-looking commands).
   Unknown variables, command substitution, and unsupported expansions are not executed
   to discover the path. Read-only stash commands remain allowed; pushes are refused.
   A parse failure, the nesting limit (8 levels of `bash -c`/substitution/eval/function

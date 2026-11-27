@@ -867,10 +867,10 @@ def test_quoted_literal_variable_is_not_expanded(multi, single):
     assert block("terminal", command=cmd, workdir=str(wt.parent))
 
 
-def test_missing_stash_is_not_a_block(multi):
+def test_missing_stash_cannot_establish_ownership(multi):
     main, wt = multi
     git("stash", "clear", cwd=main)
-    assert block("terminal", command=f"git -C {wt} stash apply") is None
+    assert block("terminal", command=f"git -C {wt} stash apply")
     # An empty stack is no ownership proof: another worktree may push before the pop runs.
     assert block("terminal", command=f"git -C {wt} stash pop")
 
@@ -1772,7 +1772,9 @@ def test_step_budget_fails_closed(multi):
     same_branch = f"git -C {main} stash apply"
     assert not _blocked("true; " * 10 + same_branch, wt)
     assert _blocked("true; " * guard.MAX_STEPS + same_branch, wt)
-    assert not _blocked("true; " * guard.MAX_STEPS + f"git -C {main} stash list", wt)
+    # Exhaustion itself refuses uninspected code, even with read-looking text.
+    assert _blocked("true; " * guard.MAX_STEPS + f"git -C {main} stash list", wt)
+    assert not _blocked(f"git -C {main} stash list", wt)
 
 
 def test_unexpected_analyzer_exception_fails_closed(multi, monkeypatch):
