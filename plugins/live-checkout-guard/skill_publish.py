@@ -636,6 +636,24 @@ def _queue_generation(path):
                                      stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns))
 
 
+def _queue_receipt_matches(path, generation):
+    """Read only a bounded regular receipt, without following its leaf or waiting."""
+    import stat
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        stamp = os.fstat(fd)
+        expected = generation.encode('ascii')
+        if not stat.S_ISREG(stamp.st_mode) or stamp.st_size != len(expected):
+            return False
+        return os.read(fd, len(expected) + 1) == expected
+    except (OSError, UnicodeError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _queue_records(directory, skipped=None, *, regular_only=False):
     import stat
     skipped = skipped or {}
@@ -657,12 +675,8 @@ def _queue_records(directory, skipped=None, *, regular_only=False):
         key = _record_key(str(directory), [path.name])
         blocked = False
         for prefix in ('.blocked-', '.queue-held-'):
-            try:
-                blocked = (directory / (prefix + key)).read_text() == generation
-            except (OSError, UnicodeError):
-                # A damaged advisory skip receipt is not execution custody and
-                # must never hide a healthy record or starve its siblings.
-                continue
+            # Receipt damage is an unavailable advisory hint, not custody.
+            blocked = _queue_receipt_matches(directory / (prefix + key), generation)
             if blocked:
                 break
         if not blocked:
