@@ -59,6 +59,64 @@ def test_job_directory_and_initial_files_have_explicit_private_modes(ut, tmp_pat
     assert {p.name: stat.S_IMODE(p.stat().st_mode) for p in files} == {p.name: 0o600 for p in files}
 
 
+@pytest.mark.parametrize("key", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
+@pytest.mark.parametrize("action", ["start", "resume", "focus"])
+def test_local_card_worker_real_environment_reaches_handler(ut, monkeypatch, key, action):
+    # Exercise caller_surfaces, not a stub; mimic a dispatcher-spawned worker.
+    for name in ("HERMES_PLATFORM", "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE",
+                 "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv(key, "t_fixture")
+    monkeypatch.setattr(ut, "_session_env", lambda name: os.environ.get(name, ""))
+    monkeypatch.setattr(ut, "sweep_jobs", lambda **kw: None)
+    args = {} if action == "start" else {"action": action, "job_id": "missing"}
+    out = json.loads(ut.handle(args))
+    assert "refused" not in out.get("error", ""), out
+    assert "required" in out["error"] or "unknown job_id" in out["error"]
+
+
+@pytest.mark.parametrize("source,platform,task", [
+    ("kanban", "", ""), ("kanban", "slack", "t_fixture"),
+    ("slack", "cli", "t_fixture"), ("", "", "t_fixture"),
+    ("cron", "", "t_fixture"),
+])
+def test_local_worker_identity_never_overrides_other_or_unknown_surfaces(ut, monkeypatch, source, platform, task):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "")
+    monkeypatch.setenv("HERMES_PLATFORM", platform)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
+    monkeypatch.setattr(ut, "_session_env", lambda name: os.environ.get(name, ""))
+    assert "refused" in json.loads(ut.handle({}))["error"]
+
+
+def test_card_worker_does_not_gain_remote_mac_access(ut, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+    monkeypatch.setattr(ut, "caller_surfaces", lambda sid: ["kanban"])
+    assert "refused" in json.loads(ut.handle_remote({}))["error"]
+
+
+def test_job_modes_are_private_at_creation_and_exclusive(ut, tmp_path, monkeypatch):
+    mkdir, open_file = Path.mkdir, os.open
+    dirs, files = [], []
+    def record_mkdir(path, mode=0o777, **kw):
+        dirs.append((path, mode))
+        return mkdir(path, mode=mode, **kw)
+    def record_open(path, flags, mode=0o777, **kw):
+        files.append((Path(path), flags, mode))
+        return open_file(path, flags, mode, **kw)
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+    monkeypatch.setattr(os, "open", record_open)
+    job = ut.create_job("true", "private", str(tmp_path), confirm=True,
+                        owner={"kind": "session", "session_id": "fixture"})
+    assert (job, 0o700) in dirs
+    initial = [(p, flags, mode) for p, flags, mode in files if p.parent == job]
+    assert {p.name for p, _, _ in initial} == {p.name for p in job.iterdir()}
+    assert all(mode == 0o600 and flags & os.O_EXCL and flags & os.O_CREAT
+               for _, flags, mode in initial)
+
+
 def test_take_back_never_executes_sibling_plugin(ut, tmp_path, monkeypatch):
     plugin = tmp_path / "plugins" / "user-terminal"
     sibling = plugin.parent / "session-mentions"

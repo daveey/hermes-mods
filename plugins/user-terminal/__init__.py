@@ -2818,7 +2818,7 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
 
 def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
-        refusal = owner_refusal(session_id)
+        refusal = owner_refusal(session_id, local_card_worker=True)
         if refusal:
             return _err(refusal)
         attached: dict = {}
@@ -3192,9 +3192,15 @@ def _owner_slack_dm() -> bool:
             and _session_env("HERMES_SESSION_USER_ID") in {str(i) for i in ids})
 
 
-def owner_refusal(session_id: str | None) -> str | None:
-    """None when the caller is the owner's own session; else the refusal text. Default-deny."""
+def owner_refusal(session_id: str | None, *, local_card_worker: bool = False) -> str | None:
+    """Default-deny; local card workers retain the documented card-owned job flow."""
     surfaces = caller_surfaces(session_id)
+    # Only the local handler admits a dispatcher worker. A card identity alone
+    # never overrides messaging/unknown surfaces or grants remote Mac access.
+    if (local_card_worker and "kanban" in surfaces
+            and all(x in OWNER_SURFACES or x == "kanban" for x in surfaces)
+            and job_owner(session_id).get("kind") == "card"):
+        return None
     others = [x for x in surfaces if x not in OWNER_SURFACES]
     if surfaces and not others:
         return None

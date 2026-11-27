@@ -6,11 +6,14 @@ courier protocol and [OPENER.md](OPENER.md) for local opener responsibility.
 
 ## Authorization and local data
 
-Both local and remote tool handlers apply the same default-deny `owner_refusal`
+Both local and remote tool handlers apply the default-deny `owner_refusal`
 check before any job operation (including status, focus, Enter and withdrawal).
-Only Desktop, CLI, TUI, API and local owner surfaces are accepted; unknown or mixed
-non-owner surfaces are refused even when the tool is granted. Confirmation mode
-is unchanged and is not an authorization boundary.
+Desktop, CLI, TUI, API and local owner surfaces are accepted. The local handler
+also preserves card-owned jobs for a `kanban` surface bound to
+`HERMES_KANBAN_TASK` (or `HERMES_KANBAN_WORKER_TASK`); this exception never grants
+remote Mac access. A card identity cannot override a messaging, cron, unknown or
+mixed non-owner surface. Confirmation mode is unchanged and is not an
+authorization boundary.
 
 New job directories are created with mode 0700. Every initial job file, including
 command, metadata and runner/watchdog scripts, is created exclusively with mode
