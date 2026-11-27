@@ -199,6 +199,11 @@ refusal, staged changes, and a concurrent writer. `_skill_publish_probe.py` exer
 resolution of compact batch rows (skipped when core is absent); it does not mutate core.
 Run: `python3 -m unittest discover -s plugins/live-checkout-guard -p tests_skill_publish.py -v`.
 The real publication fixtures require gitleaks; without it they skip, never bypass privacy hooks.
+The source-review and publication-validation regressions also run in the canonical suite
+(`scripts/test-all --no-core -k live-checkout-guard`). In particular,
+`tests/test_publication_validation.py::test_gitleaks_ignores_fetched_suppressions` commits matching
+ignore fingerprints to a disposable bare origin before calling the real publisher; placing an
+uncommitted ignore in the live source tree does not exercise fetched suppression.
 
 ## Throwaway HERMES_HOME in the terminal session
 
