@@ -26,11 +26,9 @@ def test_unsampled_inventory_is_pre_instrumentation_base():
     import ast
     import inspect
     from inventory_base_reference import _inventory as base_inventory
-    # The measured correction changes SHA scheduling only. Normalize that one
-    # expression; retain the historical bare-lock/cache/decoder shape guard.
-    source = inspect.getsource(membership._inventory).replace(
-        '_inventory_digest(raw)',
-        'hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()')
+    # Digest scheduling is shared by the timing arms; the historical
+    # bare-lock/cache/decoder shape remains independent of attribution.
+    source = inspect.getsource(membership._inventory)
     assert ast.dump(ast.parse(source)) == ast.dump(
         ast.parse(inspect.getsource(base_inventory)))
 

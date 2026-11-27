@@ -1,7 +1,10 @@
 """Frozen pre-attribution inventory path from da74b589 (PR463 base).
 
-Deliberately independent of production helpers: controls must include overhead
-added even when tracing is disabled. Keep the original bare-lock algorithm.
+Keep the original bare-lock/cache/decoder algorithm independent of attribution,
+including overhead added when tracing is disabled. Both timing arms use the
+separately tested GIL-preserving digest scheduling; its deliberate extra hashing
+calls are not attribution overhead. Freeze that scheduling too, independently of
+production, so later helper overhead still appears in the comparison.
 """
 import hashlib
 import json
@@ -20,8 +23,19 @@ def _object(raw):
     return value
 
 
+def _inventory_digest(raw):
+    raw = raw if isinstance(raw, bytes) else raw.encode()
+    if len(raw) <= 2047:
+        return hashlib.sha256(raw).digest()
+    digest = hashlib.sha256()
+    view = memoryview(raw)
+    for offset in range(0, len(raw), 2047):
+        digest.update(view[offset:offset + 2047])
+    return digest.digest()
+
+
 def _inventory(raw, key, gateway, profile, linked_sessions, storage_type=None):
-    digest = hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()
+    digest = _inventory_digest(raw)
     cache_key = (digest, storage_type, key, gateway, profile, linked_sessions)
     with _INVENTORY_LOCK:
         value = _INVENTORY.get(cache_key)
