@@ -30,19 +30,19 @@ Answer the user's "why" in text as soon as step 2 is done, before any change. Th
 ## 0. Pick the card (when the user names none)
 
 Rank open cards on the fleet replica by runs, then read the top ones. Skip standing cards and shepherds: they
-are meant to recur.
+recur by design.
 
 ```sh
-sqlite3 "file:$HOME/.hermes/kanban/sync-shadow/default.db?mode=ro" "select t.id,t.status,count(r.id) runs,
+~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/kanban/sync-shadow/default.db "select t.id,t.status,count(r.id) runs,
  (select count(*) from task_comments c where c.task_id=t.id) comments,
  cast((strftime('%s','now')-t.created_at)/86400 as int) age_d, substr(t.title,1,70)
  from tasks t join task_runs r on r.task_id=t.id where t.status not in ('done','archived')
  and r.outcome not in ('released','reclaimed')
  group by t.id order by runs desc limit 15"
 ```
-Count only runs that did work: a dispatch loop can leave 200 zero-second `released` runs on a card that is
-otherwise a healthy weekly check. Also look at runs in the last 7 days and total run-hours: a card with many
-runs, many hours and steady output (one pull request per day) is a long serial pipeline, not churn. Clean its
+Count only runs that did work: a dispatch loop can leave 200 zero-second `released` runs on an
+otherwise healthy weekly check. Also look at runs in the last 7 days and total run-hours: a card with many
+runs, many hours and steady output (one PR per day) is a long serial pipeline, not churn. Clean its
 context and waits, but do not restructure it.
 The replica is for ranking and for per-run outcome counts (`task_runs.outcome`, `started_at`, `ended_at`) only.
 Everything you act on comes from the CLI on the owning gateway.
