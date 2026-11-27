@@ -22,6 +22,10 @@ _STATUS_OF = {'you': 'you', 'time': 'park', 'review': 'ext', 'gate': 'gate', 'sl
               'run': 'run', 'dep': 'dep', 'triage': 'triage'}
 _LANDING_STEPS = ('review', 'ci', 'merge', 'deploy', 'test')
 _EXTERNAL_WAITS = ('ci', 'review', 'deploy')
+WAITS = ('parents', 'scheduled', 'deploy_ci', 'triage')
+# Card-budget and fault governors need a decision: they count as ``you``, never as a held card.
+_YOU_GOVERNORS = frozenset(('spend_budget', 'no_progress', 'respawn_guard', 'spawn_failed', 'unassigned',
+                            'nonspawnable', 'model_pin', 'capsule', 'placement', 'refusal_fallback', 'unrecorded'))
 
 
 def _parked_on(card):
@@ -36,8 +40,27 @@ def _parked_on(card):
     return 'park'
 
 
+def waits_of(cards):
+    """What a lane's not-ready cards wait on; none of these is a held card."""
+    out = dict.fromkeys(WAITS, 0)
+    for card in cards:
+        reason = str(card.get('reason') or '')
+        status = status_of(reason, card)
+        if reason == 'triage':
+            out['triage'] += 1
+        elif reason in ('gov:dependencies', 'dep') or (reason in ('gov:schedule', 'time') and status == 'dep'):
+            out['parents'] += 1
+        elif reason in ('gov:schedule', 'time'):
+            out['deploy_ci' if status == 'ext' else 'scheduled'] += 1
+        elif status == 'ext':
+            out['deploy_ci'] += 1
+    return out
+
+
 def status_of(reason, card=None):
     reason = str(reason or '')
+    if reason.removeprefix('gov:') in _YOU_GOVERNORS and reason.startswith('gov:'):
+        return 'you'
     if reason == 'gov:dependencies':
         return 'dep'
     if reason in ('gov:schedule', 'time'):
@@ -166,18 +189,20 @@ def project(snap, raw, expanded):
             lane_known = raw['governors'].get('lane_accounting_available', raw['governors']['available'])
             if raw['governors'].get('incomplete_lanes') is not None:
                 lane_known = name not in raw['governors']['incomplete_lanes']
-            row['governor_held'] = sum(r['count'] for r in reasons) if lane_known else None
-            row['top_reason'] = ('Governor state unknown · incomplete lane evidence' if not lane_known else
-                                 f"{reasons[0]['count']} held · {governors[reasons[0]['id']]['name']}" if reasons else
-                                 'lane paused' if row.get('paused') else
-                                 'Governor state unknown' if not raw['governors']['available'] else
-                                 'nothing ready' if not row.get('ready') else 'starting as workers free up')
+            # Dial charges only: waits (parents, schedule) and fault/budget cards are never "held".
+            row['governor_held'] = raw['governors'].get('lane_dial', {}).get(name, 0) if lane_known else None
+            row['holds'] = list(raw['governors'].get('holds', {}).get(name, [])) if lane_known else []
+            row['fleet_stop'] = bool(raw['governors'].get('fleet_stop'))
+            row['waits'] = (waits_of(lane_cards) if lane_known else
+                            dict.fromkeys(WAITS))
             row['boards'] = sorted({c.get('board') for c in lane_cards if c.get('board')})
             row['steps'] = [dict(key=k, label=l, count=sum(c.get('step') == k for c in lane_cards),
                                  piling=sum(c.get('step') == k for c in lane_cards) >= 4) for k, l, _ in STEPS]
-            row['held_sessions'] = sorted({c['source']['id'] for c in lane_cards if c.get('governor') and
+            dial_ids = {'lane_gate', 'lane_paused', 'lane_max_workers', 'lane_daily_limit',
+                        'host_slots', 'max_spawn', 'profile_cap', 'llm_pool', 'admission_pool'}
+            row['held_sessions'] = sorted({c['source']['id'] for c in lane_cards if c.get('governor') in dial_ids and
                                           c.get('source', {}).get('kind') == 'session'})
-            row['held_cards'] = [dict(board=c['board'], id=c['id']) for c in lane_cards if c.get('governor')]
+            row['held_cards'] = [dict(board=c['board'], id=c['id']) for c in lane_cards if c.get('governor') in dial_ids]
             if not lane_known:
                 row.update(governors=[], steps=[], held_sessions=[], held_cards=[])
             if name == 'babybear':
@@ -208,7 +233,8 @@ def project(snap, raw, expanded):
         if 'attention' in raw:
             view['attention'] = raw['attention']
             if view['attention'].get('available'):
-                assert len(view['attention']['rows']) == view['status']['you']
+                # Governor-faulted cards count as ``you`` without being attention asks.
+                assert len(view['attention']['rows']) == sum(c.get('reason') == 'you' for c in raw['cards'])
         # The same card evidence owns counts and the fleet fair-share denominator.
         fleet_running = sum(c.get('reason') == 'run' for c in raw['cards'])
         idle = [name for name, row in view['lanes'].items() if not row['ready']]
@@ -253,6 +279,8 @@ def project(snap, raw, expanded):
                 row['status'] = {}
                 row['gates'] = []
                 row['usage'] = None
+                if 'waits' in row:
+                    row['waits'] = dict.fromkeys(WAITS)
     view['summary_complete'] = raw.get('summary_complete', True)
     if not view['summary_complete']:
         # Any missing board can contribute to any lane and to the share

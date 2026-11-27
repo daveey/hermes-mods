@@ -1133,8 +1133,7 @@ export function Lanes({ ctx, totalsOnly = false }) {
 
 export const SIDEBAR_OPEN_KEY = 'hermes-lanes-sidebar-open'
 function storedSidebarOpen() { try { return localStorage.getItem(SIDEBAR_OPEN_KEY) === '1' } catch { return false } }
-export const GOVERNORS_OPEN_KEY = 'hermes-lanes-sidebar-governors-open'
-function storedGovernorsOpen() { try { return localStorage.getItem(GOVERNORS_OPEN_KEY) === '1' } catch { return false } }
+
 const SIDEBAR_LANE_KEY = 'hermes-lanes-sidebar-lane'
 function storedSidebarLane() { try { return localStorage.getItem(SIDEBAR_LANE_KEY) || '' } catch { return '' } }
 const measureText = value => value == null ? 'unknown' : typeof value === 'object'
@@ -1327,7 +1326,7 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   const run = Number(row.status?.run) || 0
   const pct = k => `${(k / Math.max(slots || 1, 1)) * INFINITY_EDGE * 100}%`
   const windowLabel = flowWindow(snap?.window_hours ?? 24)
-  const chip = row.paused ? 'paused' : row.top_reason || ''
+  const chip = waitsText(row.waits)
   const caption = pending && slots != null ? (preview && preview.total > 0 && preview.unknown === preview.total
     ? `cap ${capText(live)} of ${slots} shared-pool slots: preview unknown (aggregate running unknown across sources; observed sources unchanged) · release to save`
     : preview
@@ -1337,7 +1336,7 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   return h('div', { className: 'lanes-sb-lane', 'data-sidebar-lane': name, 'data-expanded': expanded ? '1' : '0' },
     h('div', { className: 'lanes-row', onClick: onToggle },
       h('button', { type: 'button', className: 'lanes-row-name', 'aria-expanded': expanded, title: `${name}${row.paused ? ' · paused' : ''}` }, name),
-      h('span', { className: 'lanes-row-chip', 'data-top-reason': name, title: chip || undefined }, chip),
+      h('span', { className: 'lanes-row-chip', 'data-lane-holds': name, title: [chip, ...(row.holds || []).map(holdTitle)].filter(Boolean).join(' · ') || undefined }, h(LaneHolds, { row })),
       h('div', { className: 'lanes-row-chart' },
         ticks && cells.length ? h(TickStrip, { name, cells, bucket: ticks.bucket_s, label: `tick heat, last ${windowLabel}${preview ? ' (preview)' : ''}` })
           : h('div', { className: 'lanes-ticks lanes-ticks-empty', 'aria-label': `${name} tick heat unavailable` }),
@@ -1365,19 +1364,44 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
 }
 const pct0 = pct
 
-export function GovernorLine({ row }) {
-  const pool = row.id === 'llm_pool'
-  const reading = pool && row.reading ? `${row.reading.used_pct ?? '?'}% used · ${row.reading.accounts ?? '?'} accounts` : measureText(row.reading)
-  return h('div', { className: 'lanes-governor', 'data-governor': row.id, 'data-state': row.state },
-    h('div', { className: 'lanes-sb-line' }, h('span', { className: 'lanes-gov-dot', 'aria-hidden': true }),
-      h('span', null, row.name), h('b', null, summaryValue(row.state === 'unknown' ? null : row.lane_count ?? row.cards_charged), row.partial && row.state !== 'unknown' ? ' known held' : ' held')),
-    h('div', { className: 'lanes-sb-muted' }, row.state === 'unknown' ? 'unknown · missing or stale source' : row.state,
-      ' · ', reading, ' / ', measureText(row.threshold)),
-    h('details', null, h('summary', null, 'Readings & release'),
-      h('div', null, row.clears),
-      (row.readings || []).map((r, i) => h('div', { key: i }, `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)} / ${measureText(r.threshold)} · ${measureText(r.cards)} held`,
-        r.detail ? h('div', null, measureText(r.detail)) : null)),
-      (row.scope || []).map((s, i) => h('div', { key: i }, `${s.gateway}/${s.board}: ${s.available ? `${s.age_s}s ago` : 'unknown'}${s.reason ? ' · ' + s.reason : ''}`))))
+export function waitsText(waits) {
+  if (!waits) return ''
+  return [['parents', 'on parents'], ['scheduled', 'scheduled'], ['deploy_ci', 'deploy/CI'], ['triage', 'triage']]
+    .filter(([key]) => waits[key] == null || waits[key] > 0)
+    .map(([key, label]) => `${summaryValue(waits[key])} ${label}`).join(' · ')
+}
+
+const holdText = row => row.group === 'fault' ? `${row.count} can't start` : row.group === 'budget' ? `${row.count} needs decision` :
+  `${row.name}${row.reading != null ? ` ${measureText(row.reading)}/${measureText(row.threshold)}` : ''} · ${row.count}`
+const holdTitle = row => [holdText(row), row.id === 'lane_gate' ? 'admitted today' : '', measureText(row.clears),
+  ...(row.readings || []).map(r => `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)}/${measureText(r.threshold)} · ${r.cards} held`)]
+  .filter(Boolean).join(' · ')
+
+export function LaneHolds({ row }) {
+  const chips = row.holds || []
+  const visible = chips.slice(0, row.fleet_stop ? 1 : 2)
+  return h(Fragment, null,
+    row.fleet_stop ? h('span', { className: 'lanes-hold lanes-hold-fault', 'data-fleet-stop': true }, 'fleet stop') : null,
+    row.governor_held === null ? h('span', { className: 'lanes-hold lanes-hold-stale' }, 'board reading stale') :
+      visible.map((chip, index) => h('span', { key: chip.id, className: `lanes-hold lanes-hold-${chip.group}`,
+        'data-lane-hold': chip.id, title: chips.map(holdTitle).join(' · ') },
+        holdText(chip), index === visible.length - 1 && chips.length > visible.length ? ` +${chips.length - visible.length}` : '')))
+}
+
+export function FleetLines({ gov }) {
+  if (!gov) return h('div', { className: 'lanes-fleet-stale', role: 'status' }, 'Governor source unknown')
+  return h('div', { className: 'lanes-fleet-lines' },
+    (gov.fleet || []).map(row => {
+      const reading = row.id === 'llm_pool' && row.reading ? `${row.reading.used_pct ?? '?'}% used · ${row.reading.accounts ?? '?'} accounts` : measureText(row.reading)
+      return h('div', { key: row.id, className: `lanes-fleet-line lanes-fleet-${row.group}`, 'data-fleet-governor': row.id,
+        'data-stop': row.stop ? '1' : '0', title: [row.clears, ...(row.readings || []).map(r => `${r.board}: ${measureText(r.reading)}/${measureText(r.threshold)} · ${r.cards} charged`)].join(' · ') },
+        h('b', null, row.name), ` · ${row.count} ${row.group === 'safety' ? 'stopped' : 'waiting'} · ${reading}/${measureText(row.threshold)}`,
+        row.group === 'safety' ? h('span', { className: 'lanes-fleet-clears' }, ` · clears: ${measureText(row.clears)}`) : null)
+    }),
+    gov.stale_sources?.length ? h('div', { className: 'lanes-fleet-stale', 'data-stale-sources': true,
+      title: gov.stale_sources.map(s => `${s.board}: ${s.reason}`).join(' · ') },
+      h('b', null, `${gov.stale_sources.length} source${gov.stale_sources.length === 1 ? '' : 's'} stale`), ' · ',
+      gov.stale_sources.map(s => `${s.board}: ${s.reason}`).join(' · ')) : null)
 }
 
 export function LaneControls({ name, row, write, disabled }) {
@@ -1386,7 +1410,8 @@ export function LaneControls({ name, row, write, disabled }) {
   const [pending, setPending] = useState(false)
   disabled ||= pending
   const fields = [['share', 'share', row.share], ['max_workers', 'max workers', row.limits?.max_workers],
-    ['cards_per_day', 'cards / day', row.limits?.cards_per_day], ['usd_per_day', '$ / day', row.limits?.usd_per_day]]
+    ['admit_per_day', 'admit / day', row.admit_per_day], ['cards_per_day', 'cards / day', row.limits?.cards_per_day], ['usd_per_day', '$ / day', row.limits?.usd_per_day]]
+  const holding = key => (row.holds || []).some(chip => ({ lane_gate: 'admit_per_day', lane_max_workers: 'max_workers', lane_paused: 'paused' }[chip.id] === key || chip.id === 'lane_daily_limit' && ['cards_per_day', 'usd_per_day'].includes(key)))
   return h('form', { className: 'lanes-controls', onSubmit: async e => {
     e.preventDefault(); setMessage('')
     if (disabled || !Object.keys(draft).length) return
@@ -1395,31 +1420,24 @@ export function LaneControls({ name, row, write, disabled }) {
     finally { setPending(false) }
   } }, h('label', null, 'share', h('input', { type: 'range', min: 0, max: Math.max(100, row.share || 0), step: 1,
     'aria-label': `${name} share slider`, disabled, value: draft.share ?? row.share ?? 0,
-    onChange: e => setDraft(prev => ({ ...prev, share: Number(e.target.value) })) })), fields.map(([key, label, original]) => h('label', { key }, label,
+    onChange: e => setDraft(prev => ({ ...prev, share: Number(e.target.value) })) })), fields.map(([key, label, original]) => h('label', { key, 'data-holding': holding(key) ? '1' : undefined }, label, holding(key) ? h('span', { className: 'lanes-holding' }, ' holding') : null,
     h('input', { 'aria-label': `${name} ${label}`, type: 'number', min: 0, step: key === 'usd_per_day' ? '.01' : '1',
       disabled, placeholder: '∞', value: key in draft ? draft[key] ?? '' : original ?? '',
       onChange: e => setDraft(prev => ({ ...prev, [key]: e.target.value === '' ? null : Number(e.target.value) })) }))),
     h('label', null, h('input', { type: 'checkbox', disabled, checked: draft.paused ?? Boolean(row.paused),
-      onChange: e => setDraft(prev => ({ ...prev, paused: e.target.checked })) }), 'Pause lane'),
+      onChange: e => setDraft(prev => ({ ...prev, paused: e.target.checked })) }), 'Pause lane', holding('paused') ? h('span', { className: 'lanes-holding' }, ' holding') : null),
     h('button', { type: 'submit', disabled }, 'Apply'), h('span', { role: 'status' }, message))
 }
 
 export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAvailable = false, disabled = false, windowHours = loadSidebarWindow(), onWindow = () => {} }) {
-  const [governorsOpen, updateGovernorsOpen] = useState(storedGovernorsOpen)
-  const setGovernorsOpen = value => { updateGovernorsOpen(value); try { localStorage.setItem(GOVERNORS_OPEN_KEY, value ? '1' : '0') } catch {} }
   const [laneOpen, updateLaneOpen] = useState(storedSidebarLane)
   const setLaneOpen = value => { updateLaneOpen(value); try { localStorage.setItem(SIDEBAR_LANE_KEY, value) } catch {} }
   const [showIdle, setShowIdle] = useState(false)
-  const [showOff, setShowOff] = useState(false)
   const gov = snap?.governors
   const idle = snap?.sidebar?.idle_lanes || []
   const status = snap?.status || {}
   const freshness = error ? `Lanes offline - retrying · ${snap ? 'last known · ' : ''}` : ''
-  // Dispatcher charges include dependency/schedule waits, not just totals.held's lane-gated cards.
-  const totalsText = `${summaryValue(status.run)} running · ${gov?.idle_total ?? '—'} governor-held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
-  const governorsText = !snap ? 'Loading governors…' : !gov ? 'Governor state unknown' :
-    `${summaryValue(gov.counts?.on)} on · ${summaryValue(gov.counts?.off)} off · ${summaryValue(gov.counts?.at_cap)} at cap · ${summaryValue(gov.counts?.unknown)} unknown`
-  const governorSummary = `${error ? `Governors offline · ${snap ? 'last known · ' : ''}` : ''}${governorsText}`
+  const totalsText = `${summaryValue(status.run)} running · ${gov?.held_total ?? '—'} held · ${summaryValue(status.you)} you · ${summaryValue(snap?.totals?.not_ready)} waiting`
   // Chromium can keep an already-open native title at the previous generation.
   // Replace only its owning span when text changes; retain button focus/folds.
   const laneSummary = `${freshness}${snap?.flow_complete === false ? 'Partial · ' : ''}${snap ? totalsText : 'Loading lanes…'}`
@@ -1431,7 +1449,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
         'data-sidebar-totals': true }, freshness, snap?.flow_complete === false ? 'Partial · ' : '',
         !snap ? 'Loading lanes…' : h(Fragment, null,
         h('span', { style: { color: CARD_COLORS.run } }, `${summaryValue(status.run)} running`), ' · ',
-        h('span', { className: 'lanes-held' }, `${gov?.idle_total ?? '—'} governor-held`), ' · ',
+        h('span', { className: 'lanes-held' }, `${gov?.held_total ?? '—'} held`), ' · ',
         h('span', { style: { color: CARD_COLORS.you } }, `${summaryValue(status.you)} you`), ' · ',
         h('span', null, `${summaryValue(snap.totals?.not_ready)} waiting`))),
       h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, open ? '▾' : '▸')),
@@ -1439,6 +1457,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
       error ? h('div', { role: 'status' }, `Lanes offline - retrying${snap ? ' · last known' : ''}`) : null,
       snap?.flow_complete === false ? h('div', { role: 'status', className: 'lanes-unknown' }, 'Partial lanes data · unavailable counts shown as —') : null,
       !snap ? h('div', null, 'Loading lanes…') : h(Fragment, null,
+      h(FleetLines, { gov }),
       h('div', { className: 'lanes-toolbar' },
         h(WindowToolbar, { value: windowHours, onChange: onWindow }),
         h('span', { className: 'lanes-bucket' }, windowHours === 6 ? '7.5 min ticks' : windowHours === 168 ? '3.5 h ticks' : '30 min ticks'),
@@ -1451,7 +1470,8 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
             h('h4', null, 'WHERE CARDS ARE'),
             h('div', { className: 'lanes-steps' }, (row.steps || []).map(s => h('div', { key: s.key, 'data-step': s.key,
               'data-piling': s.piling ? '1' : '0' }, s.label, h('b', null, s.count)))),
-            h('h4', null, 'GOVERNORS ON THIS LANE'), (row.governors || []).map(g => h(GovernorLine, { key: g.id, row: g })),
+            h('div', { className: 'lanes-waits', 'data-lane-waits': name }, waitsText(row.waits)),
+            h('div', { className: 'lanes-hold-details' }, (row.holds || []).map(chip => h('div', { key: chip.id }, holdTitle(chip)))),
             h('h4', null, 'LANE'), h(LaneControls, { name, row, write, disabled: disabled || Boolean(error) }),
             h('div', { className: 'lanes-sb-muted' }, 'boards: ', (row.boards || []).join(', ')),
             row.device_footnote ? h('div', { 'data-device-footnote': row.device_footnote.state },
@@ -1465,18 +1485,7 @@ export function SidebarView({ snap, error, open, setOpen, write, onHeld, heldAva
         h('div', { className: 'lanes-cost', 'data-fleet-spend': '1', title: spendLabel(snap.spend), 'aria-label': spendLabel(snap.spend) },
           h('span', { className: 'lanes-cost-h' }, money(snap.spend?.hour)), h('span', { className: 'lanes-cost-d' }, money(snap.spend?.day)),
           h('span', { className: 'lanes-cost-w' }, money(snap.spend?.week)))),
-      idle.length ? h('button', { onClick: () => setShowIdle(!showIdle) }, `${idle.length} idle lanes ${showIdle ? '▾' : '▸'}`) : null)) : null),
-    h('div', { 'data-sidebar-section': 'governors' },
-    h('button', { className: 'lanes-sb-heading', 'aria-label': 'GOVERNORS', 'aria-description': governorSummary, 'aria-expanded': governorsOpen, onClick: () => setGovernorsOpen(!governorsOpen) },
-      h('span', { className: 'lanes-sb-label' }, 'GOVERNORS'),
-      h('span', { key: governorSummary, className: 'lanes-sb-summary', title: governorSummary }, governorSummary),
-      h('span', { className: 'lanes-sb-chevron', 'aria-hidden': true }, governorsOpen ? '▾' : '▸')),
-    governorsOpen ? h('div', { 'data-sidebar-body': 'governors', className: error && snap ? 'lanes-last-known' : '' },
-      gov ? gov.rows.filter(g => g.state === 'on' || g.state === 'at_cap').map(g => h(GovernorLine, { key: g.id, row: g })) : h('div', null, snap ? 'Governor state unknown' : 'Loading governors…'),
-      gov?.counts?.unknown ? h('details', { className: 'lanes-unknown' }, h('summary', null, `${gov.counts.unknown} unknown · missing or stale sources`),
-        gov.rows.filter(g => g.state === 'unknown').map(g => h(GovernorLine, { key: g.id, row: g }))) : null,
-      h('button', { onClick: () => setShowOff(!showOff) }, `${gov?.counts?.off ?? '—'} off · ${gov?.counts?.at_cap ?? '—'} at cap`),
-      showOff ? gov?.rows.filter(g => g.state === 'off').map(g => h(GovernorLine, { key: g.id, row: g })) : null) : null))
+      idle.length ? h('button', { onClick: () => setShowIdle(!showIdle) }, `${idle.length} idle lanes ${showIdle ? '▾' : '▸'}`) : null)) : null))
 }
 
 export function SidebarLanes({ ctx }) {
@@ -1523,7 +1532,7 @@ const CSS = `
 .lanes-sb-label,.lanes-sb-chevron{flex:none;font-size:10px;letter-spacing:.1em}
 .lanes-sb-summary{flex:1;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:normal;font-size:10px;font-weight:400;color:var(--ui-text-tertiary)}
 
-.lanes-sb-heading[aria-label=GOVERNORS]{color:var(--ui-text-tertiary)}
+
 .lanes-sb-line{display:flex;align-items:center;gap:7px;width:100%;font-variant-numeric:tabular-nums}
 .lanes-sb-line strong,.lanes-sb-line>span:nth-child(2){flex:1}
 .lanes-sb-line b{margin-left:auto;font-weight:500}
@@ -1531,11 +1540,16 @@ const CSS = `
 .lanes-held{color:#bb98ff}
 .lanes-last-known{opacity:.45;filter:grayscale(1)}
 .lanes-sb-lane{padding:1px 0;border-bottom:1px solid var(--ui-stroke-secondary)}
-.lanes-governor{margin:6px 0}
-.lanes-gov-dot{height:6px;width:6px;flex:none;border-radius:50%;background:#52525b}
-.lanes-governor[data-state=on] .lanes-gov-dot{background:#ae87ee;box-shadow:0 0 4px #ae87ee}
-.lanes-governor[data-state=unknown]{color:#e9ba70}
-.lanes-governor details{font-size:10px;color:var(--ui-text-tertiary)}
+.lanes-hold{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;border:1px solid #a855f766;border-radius:3px;padding:0 2px;color:#bb98ff;line-height:13px}
+.lanes-hold-fault,.lanes-hold-budget{color:#ef4444;border-color:#ef444477}
+.lanes-hold-stale{color:#e9ba70;border-color:#e9ba7077;border-style:dashed}
+.lanes-row-chip{display:flex;flex-direction:column;justify-content:center;gap:1px}
+.lanes-fleet-lines{font-size:10px;margin:4px 0}
+.lanes-fleet-line,.lanes-fleet-stale{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:18px}
+.lanes-fleet-fleet_dial{color:#bb98ff}.lanes-fleet-safety{color:#ef4444}
+.lanes-fleet-stale{color:#e9ba70}.lanes-fleet-clears{color:var(--ui-text-tertiary)}
+.lanes-holding{color:#bb98ff;font-size:9px;margin-left:auto;margin-right:6px}
+.lanes-waits,.lanes-hold-details{font-size:10px;color:var(--ui-text-tertiary);overflow-wrap:anywhere}
 .lanes-share-bar{display:flex;height:4px;background:var(--ui-stroke-secondary);margin:6px 0;overflow:hidden}
 .lanes-share-bar span{background:#7aa5ec}.lanes-share-bar span:nth-child(2n){background:#e58b91}
 .lanes-target-share{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--ui-text-tertiary)}
@@ -1571,7 +1585,7 @@ const CSS = `
 .lanes-pending{position:absolute;right:0;top:-1px;font-size:9px;background:var(--ui-bg-primary,#0b0d12);padding:0 2px;pointer-events:none}
 .lanes-cost{grid-row:1/3;grid-column:4;display:grid;grid-template-columns:44px 44px 44px;grid-template-rows:38px;column-gap:0;font-size:9px;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;align-items:center}
 .lanes-cost-h{grid-column:1;grid-row:1}.lanes-cost-d{grid-column:2;grid-row:1}.lanes-cost-w{grid-column:3;grid-row:1}
-@container lanes-sb (max-width:360px){.lanes-cost-h,.lanes-cost-w,.lanes-row-chip{display:none}.lanes-cost{grid-template-columns:auto;grid-template-rows:38px;grid-column:3}.lanes-cost-d{grid-column:1;grid-row:1}.lanes-row{grid-template-columns:minmax(40px,76px) minmax(70px,1fr) auto}.lanes-row-chart{grid-column:2}}
+@container lanes-sb (max-width:360px){.lanes-cost-h,.lanes-cost-w{display:none}.lanes-cost{grid-template-columns:auto;grid-template-rows:38px;grid-column:3}.lanes-cost-d{grid-column:1;grid-row:1}.lanes-row{grid-template-columns:minmax(40px,76px) minmax(70px,1fr) auto}.lanes-row-chart{grid-column:2}.lanes-row-name:has(+.lanes-row-chip:not(:empty)){grid-row:1;align-self:center}.lanes-row-chip{grid-column:1;grid-row:2;max-height:18px;display:flex}.lanes-hold{box-sizing:border-box}}
 .lanes-caption,.lanes-row-error{font-size:10px;margin:2px 0;color:#ef4444}
 .lanes-toolbar{display:flex;align-items:center;gap:6px;min-width:0}.lanes-toolbar .lanes-cost{margin-left:auto;height:22px;grid-template-rows:22px;color:var(--ui-text-tertiary)}
 .lanes-bucket{font-size:9px;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}

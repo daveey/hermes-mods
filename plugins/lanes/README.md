@@ -54,12 +54,22 @@ across every active board on this gateway. `scope[]` identifies source, gateway,
 board, age and availability. Exclusive dispatcher-first-stop counts conserve the
 snapshot idle total; overlaps and capped card-ID samples never inflate counts.
 `llm_pool` is one subscription-pool row, with provider breakdown only in details.
+Governors are folded into LANES, not a separate section. Presentation-only
+`GROUPS` maps lane dials to lane hold chips, fleet dials and firing safety stops
+to fleet lines, and fault/card-budget charges to red decision chips. The heading's
+`held_total` includes lane and fleet dials only, never dependency/schedule waits
+or fault/budget charges. Lane rows carry `holds`, `fleet_stop` and `waits`
+(parents, scheduled, deploy/CI, triage); waits stay in tooltips and expanded
+details so the compact row remains two lines. `stale_sources` names each source
+once and only affected lanes become unknown. Safety stops disappear when cleared.
+The expanded controls expose admit/day and mark a dial that is holding cards.
 Missing/stale core sources remain unknown. The optional
 `state/governors/mac-mini.json` adapter is a device-only lane footnote, not fleet
 accounting; it expires after three reported cadences.
 
 `GET /api/plugins/lanes/v1/governors` exposes the same governor projection.
-Independent boards use tracked read-only snapshots, without DB initialization,
+Independent governor sidecars use the CLI reader without opening SQLite;
+flow reads use read-only snapshots, without DB initialization,
 and share one PR-observation scope so one board cannot evict another's results.
 Source notifications include board metadata, DBs and governor files; clock expiry
 invalidates freshness without polling admission checks. All numbers remain
