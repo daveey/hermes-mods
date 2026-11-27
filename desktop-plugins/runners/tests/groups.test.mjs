@@ -169,6 +169,24 @@ test('fresh inventory cannot conceal old per-row observations in chip age or pan
   assert.equal(P.ciModel(ci, NOW).minutes, null)
 })
 
+test('real provenance timestamps age live slots and CI footer separately from receipt time', async () => {
+  const observed_at = '2026-11-20T04:09:25Z'
+  const ci = backendCi({
+    meta: { freshness: 'fresh', observed_at: new Date(NOW).toISOString(),
+      provenance: [{ source_id: 'new-mini', observed_at }] },
+    data: { runners: [{ id: 'new-mini', display_name: 'new-mini-ci',
+      labels: ['self-hosted', 'macOS'], registration: 'online', activity: 'busy', freshness: 'fresh' }] }
+  })
+  assert.equal(P.ciModel(ci, NOW).minutes, 14)
+  assert.equal(P.ciModel(ci, NOW).stale, true)
+  const ui = await mount(React.createElement(P.CiPanel, { view: { ci, at: NOW }, now: NOW }))
+  try {
+    assert.match(ui.container.textContent, /new-mini-ci/)
+    assert.match(ui.container.querySelector('.hermes-fleet-foot').textContent, /GitHub observations 14m ago · received 0s ago/)
+    assert.doesNotMatch(ui.container.querySelector('.hermes-fleet-foot').textContent, /Updated/)
+  } finally { await ui.close() }
+})
+
 test('stale display passes authoritative unknown state to repair preparation', async () => {
   const ci = staleBackendFixture()
   ci.route = { connectionId: 'example', targetProfile: 'example' }

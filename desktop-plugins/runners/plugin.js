@@ -806,9 +806,11 @@ export function ciModel(ci, now = Date.now()) {
   let hidden = 0, historical = false
   const historicalTimes = []
   const displaySlot = (slot) => {
+    // Source age applies to live slots too. A transport heartbeat or collector
+    // tick cannot renew the GitHub observation behind them.
+    if (slot.last_observed) historicalTimes.push(Date.parse(slot.last_observed.observed_at))
     if (slot.state !== 'unknown' || !['busy', 'idle', 'offline'].includes(slot.last_observed?.state)) return slot
     historical = true
-    historicalTimes.push(Date.parse(slot.last_observed.observed_at))
     return { ...slot, state: slot.last_observed.state, authoritativeSlot: slot }
   }
   for (const m of ci.machines || []) {
@@ -856,7 +858,7 @@ export function ciModel(ci, now = Date.now()) {
   const age = Number.isFinite(at) ? Math.max(0, now - at) : null
   const stale = historical || !['ready', 'not_configured'].includes(ci.state) || (age != null && age > CI_STALE_MS)
   const minutes = age == null ? null : Math.round(age / 60000)
-  return { sections, stale, minutes, hidden, total: sections.reduce((n, s) => n + s.busy + s.running, 0),
+  return { sections, stale, minutes, age, hidden, total: sections.reduce((n, s) => n + s.busy + s.running, 0),
     tone: sections.some((s) => s.warnings.length || s.readinessWarnings.length) ? 'bad' : stale ? 'warn' : null,
     title: sections.map((s) => s.title).join('\n') + (stale ? `\nCI data ${minutes == null ? 'age unknown' : `${minutes} min old`}` : '') }
 }
@@ -930,7 +932,7 @@ export function CiPanel({ view, now = Date.now(), repairClient }) {
       h('button', { type: 'button', onClick: () => setOpenSlot(null), 'aria-label': 'Close CI runner actions' }, 'Close actions'),
       h(SlotRepair, { key: slotKey(open), slot: open.authoritativeSlot || open, repairClient, route: view.ci.route, sourceError: view.ci.error })) : null,
     h('div', { className: 'hermes-ci-note' }, `${model.hidden} finished elastic registrations and ${view.ci.hidden_deregistered || 0} deregistered runners hidden`),
-    h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s`))
+    h('div', { className: 'hermes-fleet-foot' }, `GitHub observations ${model.age == null ? 'age unknown' : ago(model.age)} · received ${ago(now - view.at)}`))
 }
 
 function SectionNote({ section }) {
