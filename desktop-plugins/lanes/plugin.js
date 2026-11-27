@@ -1373,23 +1373,37 @@ export function waitsText(waits) {
 
 const holdText = row => row.group === 'fault' ? `${row.count} can't start` : row.group === 'budget' ? `${row.count} needs decision` :
   `${row.name}${row.reading != null ? ` ${measureText(row.reading)}/${measureText(row.threshold)}` : ''} · ${row.count}`
-const holdLabel = row => row.group === 'fault' ? `${row.count} can't start` : row.group === 'budget' ? `${row.count} needs decision` :
-  `${row.name}${row.reading != null ? ` ${measureText(row.reading)}/${measureText(row.threshold)}` : ''} · `
 const holdTitle = row => [holdText(row), row.id === 'lane_gate' ? 'admitted today' : '', measureText(row.clears),
+  ...(row.members || []).filter(() => (row.members || []).length > 1).map(m => `${m.count} ${m.name}`),
   ...(row.readings || []).map(r => `${r.board}${r.lane ? ' / ' + r.lane : ''}: ${measureText(r.reading)}/${measureText(r.threshold)} · ${r.cards} held`)]
   .filter(Boolean).join(' · ')
 
 export function LaneHolds({ row }) {
-  const chips = row.holds || []
-  const visible = chips.slice(0, row.fleet_stop ? 1 : 2)
-  return h(Fragment, null,
-    row.fleet_stop ? h('span', { className: 'lanes-hold lanes-hold-fault', 'data-fleet-stop': true }, 'fleet stop') : null,
-    row.governor_held === null ? h('span', { className: 'lanes-hold lanes-hold-stale' }, 'board reading stale') :
-      visible.map((chip, index) => h('span', { key: chip.id, className: `lanes-hold lanes-hold-${chip.group}`,
-        'data-lane-hold': chip.id, title: chips.map(holdTitle).join(' · ') },
-        h('span', { className: 'lanes-hold-label' }, holdLabel(chip)),
-        chip.group === 'fault' || chip.group === 'budget' ? null : h('span', { className: 'lanes-hold-count', 'data-hold-count': chip.count }, String(chip.count)),
-        index === visible.length - 1 && chips.length > visible.length ? h('span', { className: 'lanes-hold-count' }, `+${chips.length - visible.length}`) : null)))
+  if (row.governor_held === null) return h('span', { className: 'lanes-hold lanes-hold-stale' }, 'board reading stale')
+  // Priority, never count: red fault > fleet stop > lane dial > budget. The first chip is always painted; at
+  // narrow widths (CSS container query) the rest fold into one "+N" badge on it, so a fault can never be
+  // pushed out by a dial and a chip is never squashed below its 40px floor.
+  const rank = { fault: 0, fleet: 1, lane_dial: 2, budget: 3 }
+  const chips = [...(row.fleet_stop ? [{ id: 'fleet_stop', group: 'fleet', name: 'fleet stop', count: null }] : []), ...(row.holds || [])]
+    .map((chip, i) => [chip, i]).sort(([a, i], [b, j]) => (rank[a.group] ?? 4) - (rank[b.group] ?? 4) || i - j).map(([chip]) => chip)
+  const full = chip => chip.group === 'fleet' ? 'fleet stop: no card starts anywhere until the drain clears' : holdTitle(chip)
+  const more = (list, className) => list.length ? h('span', { className: `lanes-hold-more ${className}`, 'data-hold-more': list.length,
+    title: list.map(full).join(' · ') }, `+${list.length}`) : null
+  return chips.slice(0, 2).map((chip, index) => {
+    const text = full(chip)
+    return h('span', { key: chip.id, className: `lanes-hold lanes-hold-${chip.group === 'fleet' ? 'fault' : chip.group}`, role: 'group',
+      'data-lane-hold': chip.id, 'data-hold-rank': index, title: chips.map(full).join(' · '), 'aria-label': text },
+      chip.group === 'fault' || chip.group === 'budget' ? h(Fragment, null,
+        h('span', { className: 'lanes-hold-count', 'data-hold-count': chip.count }, String(chip.count)),
+        h('span', { className: 'lanes-hold-name' }, chip.group === 'fault' ? " can't start" : ' needs decision'))
+      : chip.group === 'fleet' ? h('span', { className: 'lanes-hold-name' }, 'fleet stop')
+      : h(Fragment, null,
+        h('span', { className: 'lanes-hold-name' }, chip.name),
+        chip.reading != null ? h('span', { className: 'lanes-hold-reading' }, ` ${measureText(chip.reading)}/${measureText(chip.threshold)}`) : null,
+        h('span', { className: 'lanes-hold-sep', 'aria-hidden': true }, ' · '),
+        h('span', { className: 'lanes-hold-count', 'data-hold-count': chip.count }, String(chip.count))),
+      index === 0 ? more(chips.slice(1), 'lanes-hold-more-narrow') : more(chips.slice(2), 'lanes-hold-more-wide'))
+  })
 }
 
 export function FleetLines({ gov }) {
@@ -1408,19 +1422,35 @@ export function FleetLines({ gov }) {
       gov.stale_sources.map(s => `${s.board}: ${s.reason}`).join(' · ')) : null)
 }
 
+const adminReflects = (row, key, want) => {
+  const have = key === 'share' ? row.share : key === 'paused' ? Boolean(row.paused) : key === 'admit_per_day' ? row.admit_per_day ?? null : row.limits?.[key] ?? null
+  return have === want || (key === 'usd_per_day' && have != null && want != null && Math.abs(have - want) < 1e-9)
+}
+
 export function LaneControls({ name, row, write, disabled }) {
   const [draft, setDraft] = useState({})
   const [message, setMessage] = useState('')
   const [pending, setPending] = useState(false)
+  const [awaiting, setAwaiting] = useState(null)
   disabled ||= pending
   const fields = [['share', 'share', row.share], ['max_workers', 'max workers', row.limits?.max_workers],
     ['admit_per_day', 'admit / day', row.admit_per_day], ['cards_per_day', 'cards / day', row.limits?.cards_per_day], ['usd_per_day', '$ / day', row.limits?.usd_per_day]]
+  // "Saved" is claimed only once a snapshot read AFTER the write shows every written value (an empty
+  // field is written as an explicit removal and read back as unset); a write the snapshot never shows is an error.
+  useEffect(() => {
+    if (!awaiting) return
+    if (Object.entries(awaiting).every(([key, want]) => adminReflects(row, key, want))) { setAwaiting(null); setDraft({}); setMessage('Saved'); return }
+    const timer = setTimeout(() => { setAwaiting(null); setMessage('Not saved: the next snapshot still shows the old value') }, 8000)
+    return () => clearTimeout(timer)
+  }, [awaiting, row])
   const holding = key => (row.holds || []).some(chip => ({ lane_gate: 'admit_per_day', lane_max_workers: 'max_workers', lane_paused: 'paused' }[chip.id] === key || chip.id === 'lane_daily_limit' && ['cards_per_day', 'usd_per_day'].includes(key)))
   return h('form', { className: 'lanes-controls', onSubmit: async e => {
     e.preventDefault(); setMessage('')
-    if (disabled || !Object.keys(draft).length) return
+    if (disabled) return
+    const changed = Object.fromEntries(Object.entries(draft).filter(([key, want]) => !adminReflects(row, key, want)))
+    if (!Object.keys(changed).length) { setDraft({}); setMessage('No change'); return }
     setPending(true)
-    try { await write(name, draft); setDraft({}); setMessage('Saved') } catch (err) { setMessage(String(err.message || err)) }
+    try { await write(name, changed); setAwaiting(changed); setMessage('Saving…') } catch (err) { setAwaiting(null); setMessage(String(err.message || err)) }
     finally { setPending(false) }
   } }, h('label', null, 'share', h('input', { type: 'range', min: 0, max: Math.max(100, row.share || 0), step: 1,
     'aria-label': `${name} share slider`, disabled, value: draft.share ?? row.share ?? 0,
@@ -1544,8 +1574,10 @@ const CSS = `
 .lanes-held{color:#bb98ff}
 .lanes-last-known{opacity:.45;filter:grayscale(1)}
 .lanes-sb-lane{padding:1px 0;border-bottom:1px solid var(--ui-stroke-secondary)}
-.lanes-hold-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:pre}.lanes-hold-count{flex:none}
-.lanes-hold{display:inline-flex;max-width:100%;min-width:0;overflow:hidden;white-space:nowrap;vertical-align:middle;border:1px solid #a855f766;border-radius:3px;padding:0 2px;color:#bb98ff;line-height:13px}
+.lanes-hold-name{flex:0 100 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:pre}.lanes-hold-reading{flex:0 1 auto;min-width:0;overflow:hidden;white-space:pre}.lanes-hold-sep,.lanes-hold-count,.lanes-hold-more{flex:none}
+.lanes-hold{display:inline-flex;align-items:center;box-sizing:border-box;max-width:100%;min-width:40px;height:16px;overflow:hidden;white-space:nowrap;vertical-align:middle;border:1px solid #a855f766;border-radius:3px;padding:0 2px;color:#bb98ff;line-height:13px}
+.lanes-hold-more{margin-left:2px;padding-left:2px;border-left:1px solid currentColor;font-size:8px}.lanes-hold-more-narrow{display:none}
+.lanes-hold-stale{display:block;text-overflow:ellipsis}
 .lanes-hold-fault,.lanes-hold-budget{color:#ef4444;border-color:#ef444477}
 .lanes-hold-stale{color:#e9ba70;border-color:#e9ba7077;border-style:dashed}
 .lanes-row-chip{display:flex;flex-direction:column;justify-content:center;gap:1px}
@@ -1573,7 +1605,7 @@ const CSS = `
 .lanes-sb-window{display:flex;gap:2px;margin:4px 0}
 .lanes-sb-window button{border:1px solid var(--ui-stroke-secondary);border-radius:4px;padding:1px 6px;font-size:10px}
 .lanes-sb-window button.is-on{background:var(--ui-stroke-secondary);border-color:var(--ui-text-tertiary)}
-.lanes-row{display:grid;grid-template-columns:minmax(40px,76px) minmax(0,56px) minmax(70px,1fr) auto;grid-template-rows:19px 19px;column-gap:6px;align-items:center;height:38px;cursor:pointer;min-width:0}
+.lanes-row{display:grid;grid-template-columns:minmax(40px,76px) fit-content(104px) minmax(70px,1fr) auto;grid-template-rows:19px 19px;column-gap:6px;align-items:center;height:38px;cursor:pointer;min-width:0}
 .lanes-row-name{grid-row:1/3;grid-column:1;align-self:center;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0}
 .lanes-row-chip{grid-row:1/3;grid-column:2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;color:var(--ui-text-tertiary)}
 .lanes-row-chart{grid-row:1/3;grid-column:3;display:grid;grid-template-rows:14px 18px;row-gap:3px;min-width:0}
@@ -1590,7 +1622,7 @@ const CSS = `
 .lanes-pending{position:absolute;right:0;top:-1px;font-size:9px;background:var(--ui-bg-primary,#0b0d12);padding:0 2px;pointer-events:none}
 .lanes-cost{grid-row:1/3;grid-column:4;display:grid;grid-template-columns:44px 44px 44px;grid-template-rows:38px;column-gap:0;font-size:9px;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;align-items:center}
 .lanes-cost-h{grid-column:1;grid-row:1}.lanes-cost-d{grid-column:2;grid-row:1}.lanes-cost-w{grid-column:3;grid-row:1}
-@container lanes-sb (max-width:360px){.lanes-cost-h,.lanes-cost-w{display:none}.lanes-cost{grid-template-columns:auto;grid-template-rows:38px;grid-column:3}.lanes-cost-d{grid-column:1;grid-row:1}.lanes-row{grid-template-columns:minmax(40px,76px) minmax(70px,1fr) auto}.lanes-row-chart{grid-column:2}.lanes-row-name:has(+.lanes-row-chip:not(:empty)){grid-row:1;align-self:center}.lanes-row-chip{grid-column:1;grid-row:2;max-height:18px;display:flex}.lanes-hold{box-sizing:border-box}}
+@container lanes-sb (max-width:360px){.lanes-cost-h,.lanes-cost-w{display:none}.lanes-cost{grid-template-columns:auto;grid-template-rows:38px;grid-column:3}.lanes-cost-d{grid-column:1;grid-row:1}.lanes-row{grid-template-columns:minmax(40px,76px) minmax(70px,1fr) auto}.lanes-row-chart{grid-column:2}.lanes-row-name:has(+.lanes-row-chip:not(:empty)){grid-row:1;align-self:center}.lanes-row-chip{grid-column:1;grid-row:2;max-height:18px;display:flex}.lanes-hold[data-hold-rank="1"]{display:none}.lanes-hold-more-narrow{display:inline}}
 .lanes-caption,.lanes-row-error{font-size:10px;margin:2px 0;color:#ef4444}
 .lanes-toolbar{display:flex;align-items:center;gap:6px;min-width:0}.lanes-toolbar .lanes-cost{margin-left:auto;height:22px;grid-template-rows:22px;color:var(--ui-text-tertiary)}
 .lanes-bucket{font-size:9px;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}

@@ -507,6 +507,35 @@ def _need_core():
     return mods
 
 
+def _unset_admit_per_day(lane: str) -> None:
+    """Remove ``admit_per_day`` from the lane so it inherits the default.
+
+    Core's ``set_lane`` treats ``None`` as "unchanged" and has no unset path for this field, so the same
+    validated config write is made here and read back; a lane that still carries a value is an error.
+    """
+    import copy
+    from pathlib import Path
+
+    from hermes_cli.config import atomic_config_replace  # deliberate deletion of one key by omission
+    from hermes_cli.config_backend import read_config_doc_readonly
+    from hermes_constants import get_default_hermes_root
+
+    _kbc, lanes, _cli = _need_core()
+    pol = lanes.policy()
+    if pol is None or lane not in pol.lanes:
+        raise ValueError(f"unknown lane: {lane}")
+    path = Path(get_default_hermes_root()) / "config.yaml"
+    doc = copy.deepcopy(read_config_doc_readonly(path))
+    spec = doc["kanban"]["admission"]["lanes"]
+    if isinstance(spec.get(lane), dict):
+        spec[lane].pop("admit_per_day", None)
+    lanes.parse(doc["kanban"]["admission"])  # refuse a mapping the policy would reject
+    atomic_config_replace(path, doc)
+    after = lanes.policy()
+    if after is None or lane not in after.lanes or after.lanes[lane].admit_per_day is not None:
+        raise HTTPException(status_code=409, detail="admit_per_day was not cleared (read-back still shows a value)")
+
+
 def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
     _kbc, _lanes, cli = _need_core()
     unknown = sorted(set(body) - {"share", "paused", "admit_per_day", *LIMIT_FIELDS})
@@ -526,8 +555,12 @@ def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
                                                 paused=body.get("paused"), **extra)
         except TypeError:
             raise HTTPException(status_code=409, detail="this Hermes core does not support the requested lane limits yet")
-    cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"),
-                 **extra)
+    unset_admit = "admit_per_day" in body and body["admit_per_day"] is None
+    if not (unset_admit and body.get("share") is None and body.get("paused") is None and not extra):
+        cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"),
+                     paused=body.get("paused"), **extra)
+    if unset_admit:
+        _unset_admit_per_day(lane)
     _written()
     return read(6.0)
 
