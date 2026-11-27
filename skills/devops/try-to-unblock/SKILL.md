@@ -114,7 +114,11 @@ If the premise is gone, remove that ask without releasing independent holds. A s
 human ask can coexist with a valid spend hold: use `action_request` withdrawal for its exact request ID, then
 `hermes kanban block <id> --metadata-only --human-request null '<reason>'` to clear the card's human-request
 metadata without authorizing execution. Read back both results. This does not change block kind or renew spend;
-report the remaining hold accurately rather than promoting merely to make the status look clear.
+report the remaining hold accurately rather than promoting merely to make the status look clear. Metadata-only can
+only clear or reword the ask: if the replacement changes its kind or wake settings, it is refused ("metadata-only
+cannot change kind or wake settings"). If David already did the step, unblock instead; otherwise re-block with the new ask.
+When a parent and its child carry the same ask, keep it on the card that must finish first (the child cannot run
+before its parent) and clear the other one.
 
 A macOS permission ask (Screen Recording, Accessibility, "grant it at the Mac") is a premise to read, not to relay.
 Read the Mac's existing grants first (query and how to read it: `references/macos-permission-grants.md`). Often
