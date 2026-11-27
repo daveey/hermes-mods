@@ -24,7 +24,15 @@ hydration, including next-threshold memo entries for listed rows and off-list
 groups. Check listed coordinates before inheriting serving display coordinates;
 omitted legacy coordinates remain compatible, but known foreign ones cannot lend
 an episode or held cause. Carry accepted history with the row so presentation
-identity defaults do not discard it in later clock reads.
+identity defaults do not discard it in later clock or dependency traversal reads.
+The reducer carries its accepted detail privately for traversal; dependencies
+reached through references still cross `owned_card` before task fields merge.
+Owner checks reject contradictory coordinates, not absent ones: core's legacy
+`upstream`/`blocked_upstream`, `authority` and `link_tasks` references can contain
+only id/status/title. Such id-only refs retain compatibility and cannot establish
+cross-owner isolation on their own; this reducer does not manufacture coordinates
+for them. Navigation preserves the accepted record's profile when slim task
+hydration omits it.
 
 The feed schedules bounded next-threshold invalidation (`triage_deadlines`) for
 listed rows and shared-blocker groups, keyed by the reducer's own serving-gateway

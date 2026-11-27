@@ -192,6 +192,64 @@ def test_explicit_triage_timestamp_without_events_is_supported():
     assert model.reduce_panel(b, now=NOW)['sections']['stuck'][0]['attention'] == 'triage_overdue'
 
 
+@pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
+def test_rejected_detail_cannot_supply_reducer_parent_links(field):
+    listed = task(status='todo')
+    parent = task('t_parent', title='Foreign-only parent')
+    b = bundle(listed, cards={listed['id']: {'detail': {
+        'task': {**listed, field: 'foreign-owner'},
+        'links': {'parents': [parent['id']]}, 'link_tasks': [parent]}}})
+    result = model.reduce_panel(b, now=NOW)
+    assert result['sections']['ready'][0]['id'] == listed['id']
+    assert not result['groups']
+    assert 'Foreign-only parent' not in str(result)
+    assert '_accepted_detail' not in str(result)
+
+
+@pytest.mark.parametrize('helper', ['wait_target', 'wait_parents'])
+def test_slim_parent_navigation_preserves_record_profile(helper):
+    parent = task('t_parent', title='Slim parent', status='blocked')
+    parent.pop('gateway')
+    parent.pop('profile')
+    child = task(status='todo', upstream={'id': parent['id'], 'status': 'blocked'})
+    detail = {'task': child, 'links': {'parents': [parent['id']]}, 'link_tasks': [parent]}
+    b = bundle(cards={parent['id']: {'profile': 'parent-profile', 'board': 'default',
+        'detail': {'task': parent, 'source': 'replica', 'owner': 'parent-owner'}},
+        child['id']: {'detail': detail}}, gateway='serving-owner', profile='default')
+    dep = model.wait_target(child, b, detail) if helper == 'wait_target' else model.wait_parents(child, b)[0]
+    assert dep['profile'] == 'parent-profile'
+    assert dep['gateway'] == 'parent-owner'
+
+
+@pytest.mark.parametrize('detail_field', ['gateway', 'home_gateway', 'profile'])
+@pytest.mark.parametrize('grouped', [False, True])
+def test_accepted_legacy_detail_keeps_unfinished_parent(detail_field, grouped):
+    parent = task('t_parent', title='Parent card', status='blocked', gateway='hub')
+    rows = [task(tid, status='todo') for tid in ('t_child1', 't_child2')[:2 if grouped else 1]]
+    cards = {parent['id']: {'detail': {'task': parent, 'events': [
+        {'kind': 'blocked', 'payload': {'reason': 'parent own reason'}}]}}}
+    for row in rows:
+        row.pop('profile' if detail_field == 'profile' else 'gateway')
+        cards[row['id']] = {'detail': {
+            'task': {**row, detail_field: 'detail-owner'},
+            'links': {'parents': [parent['id']]}, 'link_tasks': [parent]}}
+    b = bundle(*rows, gateway='serving-owner', profile='default', cards=cards)
+    before = copy.deepcopy(b)
+    result = model.reduce_panel(b, now=NOW)
+    assert not result['sections']['ready']
+    shown = result['sections']['waiting']
+    assert len(shown) == len(rows)
+    for row in shown:
+        assert 'waiting on: Parent card (blocked) on hub' in row['detail']
+        assert 'parent own reason' in row['detail']
+        assert any(a.get('target') == {'id': parent['id'], 'gateway': 'hub',
+                   'profile': 'default', 'board': 'default'} for a in row['actions'])
+    assert len(result['groups']) == int(grouped)
+    if grouped:
+        assert all(r['parent'] == result['groups'][0]['key'] for r in shown)
+    assert b == before
+
+
 def test_hydration_uses_listed_coordinates_before_serving_defaults():
     # Legacy listed rows omit gateway; the serving identity is only a display default.
     # This detail is compatible with the listed row, but not with the inherited gateway.

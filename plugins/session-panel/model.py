@@ -471,7 +471,7 @@ def wait_target(row, bundle, detail):
         dep['gateway'] = (dep.get('home_gateway') or dep.get('gateway') or
                           (owner if isinstance(owner, str) else None) or
                           (bundle.get('gateway') if hydration.get('source') == 'live' else None))
-        dep['profile'] = dep.get('profile') or rec.get('profile') or bundle.get('profile')
+        dep['profile'] = dep.get('profile') or rec.get('profile') or row.get('profile') or bundle.get('profile')
         if dep.get('gateway') and dep.get('profile'):
             return dep
     return None
@@ -479,7 +479,10 @@ def wait_target(row, bundle, detail):
 
 def wait_parents(dep, bundle):
     """Hydrated next hops shared by the wait label and outline; no source reads."""
-    hydration = obj(owned_card(dep, bundle).get('detail'))
+    # Reducer rows already crossed the listed-coordinate boundary. Rechecking
+    # their presentation defaults would discard accepted legacy dependencies.
+    hydration = obj(dep['_accepted_detail'] if '_accepted_detail' in dep else
+                    owned_card(dep, bundle).get('detail'))
     if text(obj(dep.get('wait')).get('waiting_on')):
         primary = wait_target(dep, bundle, hydration)
         return [primary] if primary else []
@@ -1015,7 +1018,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
         # Carry only the already owner-checked history. Serving defaults must not
         # cause a second lookup to reject compatible legacy listed coordinates.
-        row = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}), **row}
+        row = {**obj(detail.get('task')), **({'events': detail['events']} if 'events' in detail else {}),
+               **row, '_accepted_detail': detail}
         if row.get('status') in ('running', 'review') and not row.get('run_model'):
             row['run_model'] = route_model(row, detail)
         k = key(row)

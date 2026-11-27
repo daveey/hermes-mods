@@ -284,6 +284,7 @@ def test_real_remote_direct_and_multihop_parent_actions_keep_exact_owner(graph, 
     from hermes_cli.kanban_db_connect import connect
     r, local, remote, ksa = graph
     monkeypatch.setattr(ksa.time, 'time', lambda: 1800000000.)
+    monkeypatch.setattr(r.snapshot_modules().time, 'time_ns', lambda: 1800000000_000000000)
     with contextlib.closing(connect(r.ksc.shadow_path('default'))) as c:
         leaf = kanban_db.create_task(c, title='Remote exact leaf', session_id='elsewhere')
         c.execute("UPDATE tasks SET created_on='remote-test',status='ready' WHERE id=?", (leaf,))
@@ -293,7 +294,17 @@ def test_real_remote_direct_and_multihop_parent_actions_keep_exact_owner(graph, 
             c.execute("UPDATE tasks SET created_on='remote-test',status='todo' WHERE id=?", (parent,))
             c.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', (leaf, parent))
         c.execute("UPDATE tasks SET status='todo' WHERE id=?", (remote,))
-        c.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', (parent, remote)); c.commit()
+        c.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', (parent, remote))
+        # This composition asserts current remote navigation, not stale replica
+        # fallback. Supply the real replica read clock required by newer cores.
+        columns = {row[1] for row in c.execute('PRAGMA table_info(kanban_sync_state)')}
+        if 'pulled_at' not in columns:
+            c.execute('ALTER TABLE kanban_sync_state ADD COLUMN pulled_at REAL')
+        if not c.execute('SELECT 1 FROM kanban_sync_state').fetchone():
+            c.execute("INSERT INTO kanban_sync_state(board_id,gateway_id,hlc_last,mode,pulled_at) "
+                      "VALUES ('default','remote-test','0','replica',1800000000)")
+        c.execute('UPDATE kanban_sync_state SET pulled_at=1800000000')
+        c.commit()
     cap, m, store, chat = graph_store(graph)
     f = feedmod.Feed(r, emit=lambda _: None, clock=lambda: 1800000000.)
     f.watch(['S0'])
@@ -301,4 +312,5 @@ def test_real_remote_direct_and_multihop_parent_actions_keep_exact_owner(graph, 
     assert p.bundle['cards'][leaf]['gateway'] == 'remote-test'
     row = next(row for row in p.bundle['model']['sections']['waiting'] if row['id'] == remote)
     targets = [a['target'] for a in row['actions'] if a['kind'] == 'open_card']
+    assert not p.missing_scopes
     assert {'id': leaf, 'gateway': 'remote-test', 'profile': 'default', 'board': 'default'} in targets
