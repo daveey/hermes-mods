@@ -135,9 +135,8 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   `hermes kanban spend-budget <id> --seen <cid> --runs N --cache-read-tokens T --reason ...` in the same turn.
   Limits include recorded spend: use spent + additional allowance without resetting usage. A reviewer grant
   below usage leaves a ready card unclaimable; verify a bound executor after correction.
-  A released card that then sits `ready` with workers logging `skipped_ineligible(refusal_exhausted)` has no
-  unrefused provider left right now: on a worker, `kanban_provider_walls.active_walls()` shows which peers are
-  walled and until when. It starts by itself when the wall ends, so comment that time; don't bump, move or release it again.
+  A released card that then sits `ready` and is skipped (`refusal_exhausted`, `worker_disk_below_floor`, a dead
+  `machine:` pin) or that re-holds right after release: read `references/dispatch-skips.md`.
   `unblock` only re-triages a spend hold. Fallback without `release`: re-scope comment, `renew-scope --episode <stop
   uid> --mandate-comment <cid>`, then `promote --seen <cid>`.
   Release on a worker-homed card this chat created (run via `hub-worker-exec <w>`) is refused `not_scope_authority`
