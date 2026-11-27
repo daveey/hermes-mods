@@ -214,19 +214,20 @@ def _under_home(path: str) -> bool:
     return False
 
 
-def _normalized_path(path: str, in_home: bool = False, resolve_local: bool = True) -> str:
+def _normalized_path(path: str, in_home: bool | str | tuple = False, resolve_local: bool = True) -> str:
     """Normalize before exclusions; only local paths may consult this host's symlinks."""
     path = _expand(path)
     if in_home and not path.startswith(("/", "~", "$")):
-        path = os.path.join(_home(), path)
+        path = os.path.join(in_home if isinstance(in_home, str) else _home(), path)
     if resolve_local and path.startswith("/"):
         return os.path.realpath(path)
     return os.path.normpath(path)
 
 
-def is_live(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
-    """True when ``path`` names a live Hermes database file or sidecar. ``in_home``: the command's working
-    directory is the Hermes home, so a relative path resolves there."""
+def is_live(path: str, in_home: bool | str | tuple = False, resolve_local: bool = True) -> bool:
+    """True for live Hermes files; context is True (home), a known cwd, or False (unknown)."""
+    if isinstance(in_home, tuple):
+        return any(is_live(path, context, resolve_local) for context in in_home)
     if not path or path.startswith("-"):
         return False
     if path.startswith("file:"):
@@ -250,12 +251,14 @@ def is_live(path: str, in_home: bool = False, resolve_local: bool = True) -> boo
     return not (board and not _BOARD_SLUG.match(board.group(1)))
 
 
-def protects_directory(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
+def protects_directory(path: str, in_home: bool | str | tuple = False, resolve_local: bool = True) -> bool:
     """Protect home ancestors and potentially live subtrees without enumerating databases.
 
     Conservative for empty live subdirectories; cache/archive/backup exclusions still apply.
     Remote callers use lexical normalization only, never this host's filesystem.
     """
+    if isinstance(in_home, tuple):
+        return any(protects_directory(path, context, resolve_local) for context in in_home)
     if not path or path.startswith("-"):
         return False
     full = _normalized_path(path, in_home, resolve_local).rstrip("/") or "/"
@@ -276,6 +279,34 @@ def destructive_directory(word: str, args: list[str]) -> bool:
     return word == "mv" or (word == "rm" and any(
         a == "--recursive" or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & {"r", "R"})
         for a in args[:args.index("--") if "--" in args else len(args)]))
+
+
+def move_sources(args: list[str], ops: list[str]) -> list[str]:
+    """GNU target-directory options put every non-option operand in the source set."""
+    for i, arg in enumerate(args):
+        if arg == "--":
+            break
+        short = re.fullmatch(r"-[finuvTZb]*t(.*)", arg)
+        if (arg == "--target-directory" or (short and not short.group(1))) and i + 1 < len(args):
+            sources = list(ops)
+            if args[i + 1] in sources:
+                sources.remove(args[i + 1])
+            return sources
+        if arg.startswith("--target-directory=") or (short and short.group(1)):
+            return ops
+    return ops[:-1]
+
+
+def directory_context(target, context, resolve_local=True):
+    contexts = context if isinstance(context, tuple) else (context,)
+    return merge_directory_contexts(*(_normalized_path(target, c, resolve_local) for c in contexts))
+
+
+def merge_directory_contexts(*contexts):
+    paths = tuple(dict.fromkeys(p for c in contexts for p in (c if isinstance(c, tuple) else (c,))))
+    if len(paths) > 32:
+        raise ValueError("too many possible working directories")
+    return paths[0] if len(paths) == 1 else paths
 
 
 class _Unclosed(Exception):
@@ -1254,7 +1285,7 @@ def _operands(args: list[str]) -> list[str]:
     return out
 
 
-def _check_redirects(seg: list[str], in_home: bool, resolve_local: bool = True) -> Optional[str]:
+def _check_redirects(seg: list[str], in_home: bool | str | tuple, resolve_local: bool = True) -> Optional[str]:
     for i, tok in enumerate(seg[:-1]):
         if tok in (">", ">>", ">|", "&>") and not isinstance(tok, _Quoted) and is_live(
                 seg[i + 1], in_home, resolve_local):
@@ -1278,14 +1309,14 @@ _KANBAN_VERBS = (
 )
 
 
-def _board_of(db: str, in_home: bool) -> Optional[str]:
+def _board_of(db: str, in_home: bool | str | tuple) -> Optional[str]:
     """``hermes kanban`` prefix for the live Kanban board ``db`` names (``hermes kanban``, ``hermes kanban
     --board <slug>``, ``HERMES_HOME=<dir> hermes kanban`` for a profile's board), or None for other databases."""
     path = db[5:].split("?", 1)[0] if db.startswith("file:") else db
     if path.rsplit("/", 1)[-1] != "kanban.db":
         return None
     if in_home and not path.startswith(("/", "~", "$")):
-        path = os.path.join(_home(), path)
+        path = os.path.join(in_home if isinstance(in_home, str) else _home(), path)
     full = Path(_expand(path))
     home = Path(_home())
     if full == home / "kanban.db":
@@ -1310,8 +1341,10 @@ def _kanban_verb(sql: str, prefix: str) -> str:
 _QUARANTINE_NAME = re.compile(r"\.db\.corrupt\.[^/]*\.bak$")
 
 
-def is_quarantine(path: str, in_home: bool = False, resolve_local: bool = True) -> bool:
+def is_quarantine(path: str, in_home: bool | str | tuple = False, resolve_local: bool = True) -> bool:
     """True when ``path`` (globs included) names a live database's ``.corrupt.*.bak`` quarantine."""
+    if isinstance(in_home, tuple):
+        return any(is_quarantine(path, context, resolve_local) for context in in_home)
     if not path or path.startswith("-"):
         return False
     base = path.rsplit("/", 1)[-1]
@@ -1361,7 +1394,7 @@ def remote_sqlite3_refusal(word: str, db: str) -> str:
             f"`{MANAGED_SQLITE_CLI} {db} \"<sql>\"`")
 
 
-def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Optional[tuple] = None) -> Optional[str]:
+def _check_sqlite3(args: list[str], seg: list[str], in_home: bool | str | tuple, program: Optional[tuple] = None) -> Optional[str]:
     """``program``: (word, kind) of the binary that would open the database, for the WAL-reset check; None skips it."""
     readonly = any(a in ("-readonly", "--readonly", "-safe") for a in args)
     db, sql, fed = _sqlite3_argv(args)
@@ -1388,8 +1421,7 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Opti
         if board is not None:
             return (f"`sqlite3` would write to live Kanban board {db}; a raw write skips the board's own "
                     f"transitions, events and locks (hub incident 2026-10-28). Use {_kanban_verb(text, board)}")
-        bak = recently_quarantined(os.path.join(_home(), db) if in_home and not db.startswith(("/", "~", "$", "file:"))
-                                   else db)
+        bak = recently_quarantined(_normalized_path(db, in_home))
         if bak:
             return (f"`sqlite3` would write to live database {db}, which was quarantined as corrupt "
                     f"recently ({bak}); writes into a damaged b-tree spread the damage")
@@ -1411,7 +1443,7 @@ def _dir_like(path: str) -> bool:
         return False
 
 
-def _into_directory(args: list[str], ops: list[str], in_home: bool) -> Optional[str]:
+def _into_directory(args: list[str], ops: list[str], in_home: bool | str | tuple) -> Optional[str]:
     """``mv|cp|rsync|install SRC... DIR`` (or ``-t DIR`` / ``--target-directory=DIR``): the file lands at
     DIR/basename(SRC). Returns that live path, if any."""
     tdir = None
@@ -1460,7 +1492,7 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
 
 
 def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
-    in_home = bool(cwd) and os.path.realpath(os.path.expanduser(cwd)) == _home()
+    in_home = os.path.realpath(_expand(cwd)) if cwd else False
     for seg in _segments(_tokens(cmd or "")):
         why = _check_redirects(seg, in_home)
         if why:
@@ -1471,11 +1503,11 @@ def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
         word, args = os.path.basename(seg[0]), seg[1:]
         if word == "cd":
             target = (_operands(args) or ["~"])[0]
-            in_home = os.path.realpath(_expand(target)) == _home()
+            in_home = _normalized_path(target, in_home)
             continue
         ops = _operands(_without_redirects(args))
         if destructive_directory(word, args):
-            directories = ops[:-1] if word == "mv" else ops
+            directories = move_sources(args, ops) if word == "mv" else ops
             hit = next((o for o in directories if protects_directory(o, in_home)), None)
             if hit:
                 return f"`{word}` would remove a directory containing live database files: {hit}"
@@ -1631,8 +1663,18 @@ def _check_python_ast(code: str) -> Optional[str]:
         else:
             continue
         target = None
-        if identity in _PY_MOVE_FUNCS and len(node.args) >= 2:
-            target = node.args[1]
+        if identity in _PY_MOVE_FUNCS:
+            target = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "dst"), None)
+        elif identity == ("shutil", "rmtree"):
+            target = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "path"), None)
+            # Resolve only literals/simple assigned literals, not arbitrary Python.
+            value = target
+            if isinstance(value, ast.Name):
+                value = names.get(value.id)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str) and protects_directory(value.value):
+                return f"Python recursive removal of directory containing live database files {value.value}"
         elif identity in _PY_DELETE_FUNCS:
             target = node.args[0] if node.args else next(
                 (kw.value for kw in node.keywords if kw.arg == "path"), None)
