@@ -1,18 +1,16 @@
 """Attested reference updater entry point; state.json never selects code or argv.
 
-The pin is the hermes-sync blob from the private state repository at
-64b00305f8d2b0d2bb1c1b2a5729c5b1510e7646. Refresh it only with source review.
-Unknown installed revisions deliberately disable Restart rather than trust state.
+Only the fixed installed runner path is used, after fd checks (regular file, current uid,
+no group/other write). No content hash: the updater changes often, and the same file is already
+run unattested by the sync launchd job. The snapshot read from the opened fd is what is compiled;
+the updater may itself re-exec on interpreters lacking its dependencies.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import stat
 import sys
-
-UPDATER_SHA256 = "e352f6565b6c11eda18f0da6a776f95360b7ec25991ec30ea1a6029dd145accb"
 
 
 def updater_path() -> Path:
@@ -28,13 +26,11 @@ def attested_source() -> bytes:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError("unsafe updater ownership or permissions")
         source = stream.read()
-    if hashlib.sha256(source).hexdigest() != UPDATER_SHA256:
-        raise ValueError("installed updater is not the reviewed revision")
     return source
 
 
 def main() -> None:
-    # Execute the same immutable snapshot that was hashed, never reopen the path.
+    # Execute the snapshot read from the checked fd.
     source = attested_source()
     path = str(updater_path())
     sys.argv = [path, "core-waiter"]

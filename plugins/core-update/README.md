@@ -12,7 +12,8 @@ time Desktop quits.
 - **Update ready — restart to apply** once a prebuilt app newer than the running checkout is
   waiting. Clicking it starts the plugin-owned, attested apply-on-quit waiter and then quits
   Desktop. The waiter runs the update and reopens Desktop. Restart is disabled if the
-  installed reference updater does not match the reviewed digest.
+  installed reference updater is missing or unsafe (not a regular file of this user, or
+  group/other writable).
 - Hidden otherwise (no state file, the build is what already runs, or it failed).
 
 ## Contract
@@ -30,13 +31,15 @@ file owned by the current uid with no group/other write permission (0600 recomme
 Restart checks metadata on the opened fd and parses exactly one snapshot.
 
 `waiter.py` is launched with `/usr/bin/python3 -I`. It reads only the fixed
-`~/.hermes/sync-runner/hermes-sync`, requires the current uid, safe permissions and
-`UPDATER_SHA256`, then executes the verified byte snapshot with the fixed
-`core-waiter` argument. The pin's source revision is documented in `waiter.py`.
-A new updater revision requires a reviewed pin refresh; unknown revisions fail
-closed and do not offer Restart. This intentionally replaces the old arbitrary
-updater-argv extension point. Neither an updater path nor a digest in state can
-change the attestation. This plugin does not change the updater's drain logic.
+`~/.hermes/sync-runner/hermes-sync`, requires a regular file of the current uid without
+group/other write, and executes the bytes read from that fd with the fixed `core-waiter`
+argument. No content hash is pinned: the updater changes often, and launchd already runs the
+same file. Threat model: state.json (and anything that can only write it) cannot select code
+or argv; a same-uid writer of the installed runner is out of scope. The updater may re-exec
+itself on interpreters lacking its dependencies, which reopens the path. Restart still quits
+Desktop if the spawned waiter later fails these checks; the sync-armed waiter normally covers
+that. This replaces the old arbitrary updater-argv extension point. This plugin does not change
+the updater's drain logic.
 
 `waiter.json` next to it (`{"pid", "state"}`) is shown in `/status` when present. The plugin never
 edits the checkout. The reference updater is a sync job that keeps a fork checkout current. It
