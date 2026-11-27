@@ -1,0 +1,7 @@
+# Passive existing counters
+
+For passive-only investigations, prefer already-published loop-accounting files over adding instrumentation. Preserve duplicate publication endpoints as nonqualifying (zero elapsed), and compare a naturally advanced endpoint only with the same PID/birth and diagnostic revision. Keep their publication-clock interval separate from a live ps interval; accounting uptime can be wall-clock derived.
+
+Preserve `read_id` when compacting request stages: a request ID alone cannot distinguish shared-read followers from distinct leaders. Join existing raw records before attributing serialized work, and keep the group/profile key unknown if the producer does not record it. Report server-observed ingress separately from upstream offered traffic; retain left/right-censored requests and actual interval overlap. A larger latency cohort is still not a qualifying before-state without aligned workload and active-turn evidence. Check newer landed fixes and their existing owner before creating a competing correction; another host's causal proof never establishes the local process's cause.
+
+On macOS, verify the actual `ps -M -o` output schema: thread mode can prepend default columns, invalidating a positional sort, and repeated process TIME columns are not per-thread CPU. Reject that result rather than subtracting rows without stable thread IDs. For native-ID deltas from existing snapshots, retain new/disappeared threads and never allocate their missing CPU to selected survivors.
