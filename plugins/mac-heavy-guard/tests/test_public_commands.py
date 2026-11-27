@@ -116,3 +116,35 @@ def test_f8_shell_word_names_and_time_terminator(prefix, monkeypatch):
 def test_f8_shell_word_data_controls(command):
     assert guard.check_shell(command) is None
     assert runner.workload_reason(command) is None
+
+
+@pytest.mark.parametrize('prefix', [
+    'coproc a$(:)', 'coproc a`:`', 'coproc a"$(:)"', 'time -- coproc a$(:)', '! coproc a`:`',
+    'coproc a$(echo $(echo b))', 'function a$(:)', 'coproc a"x$(:)y"',
+])
+def test_f9_substitution_in_shell_word_name(prefix, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    command = 'echo $(' + prefix + ' case x in x) pytest;; esac)'
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+    monkeypatch.setenv('MAC_HEAVY_OK', '1')
+    assert guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize('command', [
+    'echo $(echo coproc a$(:) case)', 'echo $(coproc a$(:) date)', 'echo $(echo $(:) case)',
+])
+def test_f9_data_controls(command):
+    assert guard.check_shell(command) is None
+    assert runner.workload_reason(command) is None
+
+
+def test_f9_arithmetic_name_still_refused(monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    command = 'echo $(coproc a$((1)) case x in x) pytest;; esac)'
+    assert guard.check_shell(command)
+    try:
+        assert runner.workload_reason(command)
+    except ValueError:
+        pass
