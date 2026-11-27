@@ -67,9 +67,14 @@ list means the view's `status` is `{}` and `sessions` is empty, so every chat co
 Natural rollout can change the active port (for example 9148 to 9149) while the previous backend
 remains alive to drain existing connections. Read `desktop-ssh/always-on/active.json` and verify
 its selected PID in authenticated debug frames. Do not report the retired port as the new rollout.
-Live verification of this implementation observed a real dashboard code sync replacing the child
-while retaining the parent PID, followed by three complete refreshes with nonempty status and
-sessions; source tests and live activation are separate evidence.
+Verify the explicitly requested listener as well as the active route: natural rotation may leave
+old metadata for a retired port, so require a live listener and matching process birth identity.
+Continuous live verification on the original listener kept one authenticated socket open across
+a real dashboard-byte sync: the parent stayed unchanged, the child changed, and every frame
+remained complete with nonempty status and sessions, including at least three after replacement.
+Retain the bounded observer's raw frames and ready marker under unique filenames; preserve
+failed attempts rather than overwrite them. A standalone new connection after sync is weaker
+proof and must not be labelled uninterrupted recovery.
 
 A standalone `_lane_view` that completes proves the code, not the served view; acceptance is the
 chips on the routed backend.
