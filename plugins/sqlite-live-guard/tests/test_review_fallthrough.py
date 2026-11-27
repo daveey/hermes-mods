@@ -116,5 +116,25 @@ def test_or_exit_success_rejoins(lexical_home, prefix):
     assert guard.check_shell(command, cwd=str(home.parent))
 
 
+@pytest.mark.parametrize('operator', ['&&', '||'])
+@pytest.mark.parametrize('tail', ['', ' || exit'])
+@pytest.mark.parametrize('wrapper', ['', 'bash', 'sh', 'ssh'])
+@pytest.mark.parametrize('alias', [False, True])
+def test_cd_after_pipeline_survives(lexical_home, operator, tail, wrapper, alias):
+    target = '"$D"' if alias else '~/.hermes'
+    command = 'true | true ' + operator + ' cd ' + target + tail + '; rm -rf *'
+    if alias:
+        command = 'D=~/.hermes; ' + command
+    if wrapper in {'bash', 'sh'}:
+        command = wrapper + " -c '" + command + "'"
+    elif wrapper == 'ssh':
+        command = "ssh example.com '" + command + "'"
+    assert guard.check_shell(command, cwd=str(lexical_home.parent))
+
+
+def test_pipeline_cd_does_not_change_parent(lexical_home):
+    assert guard.check_shell('D=.hermes; true | cd "$D"; rm -rf *', cwd=str(lexical_home.parent)) is None
+
+
 def test_or_rhs_uses_old_context(home):
     assert guard.check_shell('cd ~ || rm -rf .hermes', cwd=str(home / 'cache')) is None

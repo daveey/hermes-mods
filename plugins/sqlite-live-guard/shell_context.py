@@ -253,6 +253,9 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     for index, raw in enumerate(segments):
         budget.spend(1)
         if raw in (["&&"], ["||"]):
+            if pipeline is not None and pipeline[0] == "|":
+                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline
+                pipeline = None
             if raw == ["&&"] and succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
                 succeeded_cd = []
@@ -269,22 +272,22 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
                 env, exported, readonly, in_home, blocks, failed_cd, succeeded_cd = scopes.pop()
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
+            if raw != ["|"] and pipeline is not None:
+                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline
+                pipeline = None
             if succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
                 succeeded_cd = []
             if failed_cd:
                 in_home = guard.merge_directory_contexts(in_home, *failed_cd)
                 failed_cd = []
-            if raw != ["|"] and pipeline is not None:
-                env, exported, readonly, in_home = pipeline
-                pipeline = None
             continue
         # Pipeline/background commands execute outside the parent's assignment
-        # scope. Analyze their writes, then restore custody at the list boundary.
+        # scope. A pipeline ends before &&/||; background lists end at &.
         following = segments[index + 1] if index + 1 < len(segments) else []
         if following in (["|"], ["&"]) and pipeline is None:
-            pipeline = (dict(env), set(exported), set(readonly),
-                        guard.merge_directory_contexts(in_home, *failed_cd, *succeeded_cd))
+            pipeline = (following[0], dict(env), set(exported), set(readonly),
+                        in_home, list(failed_cd), list(succeeded_cd))
         if raw and raw[0] == "}":
             if braces:
                 blocks = braces.pop()
