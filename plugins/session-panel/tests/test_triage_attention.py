@@ -31,6 +31,22 @@ def test_triage_age_changes_attention_not_actor_or_authority(age, red, remote):
     assert not any(a['kind'] == 'decide' for a in row['actions'])
 
 
+@pytest.mark.parametrize('remote', [False, True])
+@pytest.mark.parametrize('age,red', [(600, False), (601, True), (6 * 86400, True)])
+def test_a_stopped_retained_scope_ages_red_like_every_other_triage_cause(age, red, remote):
+    """The reported card was a retained scope stop, six days in triage: core's display-only
+    ``retained_stop`` receipt must not exempt it from the age rule, and age grants nothing."""
+    b = aged(age, remote=remote, retained_stop={'reason': 'scope_stopped', 'summary': 'acceptance unmet'})
+    before = copy.deepcopy(b)
+    result = model.reduce_panel(b, now=NOW, wire=True)
+    row = result['sections']['stuck' if red else 'waiting'][0]
+    assert (row.get('attention') == 'triage_overdue') is red
+    assert (result['header'].get('attention') == 'triage_overdue') is red
+    assert not result['sections']['needs_you'] and not result['sections']['running']
+    assert not any(a['kind'] == 'decide' for a in row['actions'])
+    assert b == before
+
+
 @pytest.mark.parametrize('entry', [None, 'yesterday', -1, float('nan'), float('inf'), NOW + 20])
 def test_unknown_entry_never_fabricates_age(entry):
     b = aged()

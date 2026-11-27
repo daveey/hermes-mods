@@ -6,6 +6,9 @@
 triage episode is red only after **strictly more than 600 seconds**. At 599/600
 seconds age does not escalate; at 601 seconds or six days it does. Human asks may
 already be red earlier. This explicitly supersedes red-only-for-human policy.
+Every triage cause qualifies, including an explicitly stopped retained scope
+(core's display-only `retained_stop` receipt): it stays stopped and non-executing,
+and only its age adds the red attention.
 
 Keep `needs_you` human-only and preserve actor wording and all spend, scope,
 containment and execution restrictions. Red authorizes no lifecycle changes.
