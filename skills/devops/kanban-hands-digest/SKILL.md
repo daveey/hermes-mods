@@ -97,7 +97,7 @@ Before presenting an unblock request:
 
 ## This user: clear it yourself, never hand him cards
 
-Treat a complaint about recurring stalls as recovery work, not a sequence of audit/status replies. When correction is authorized, pursue both existing-card recovery and tested prevention with the existing owners; label each separately until deployed behavior is verified.
+Treat recurring stalls or wrong chat associations as recovery plus prevention, not repeated status replies. Trace the original producer and follow-up inheritance before relinking: a valid fallback owner can conceal missing project context. Repair existing cards and the producer; report relinking, prevention tests and deployed proof separately. Relinking alone is not recurrence prevention.
 1. Sweep blocked cards and clear agent-operable causes through supported transitions (recipe: `references/clearing-blockers-yourself.md`). Keep true approvals and safety holds; verify a new claim or completed acceptance, not merely `ready`.
 Applies to every board-status reply, including "why are only N running": what waits on him is written as concrete actions grouped by where he does them (reply here / phone / Mac / when on site), each with the device and what done looks like. No card ids, no "see t_x", no table of cards for him to open.
 2. Bring genuine decisions to him INLINE as a `clarify` form. Use one question per decision in plain words, recommended option first, and batch the low-stakes defaults into one "accept all recommended" question. Never answer with card ids or links, or with "answer in a comment on t_x". Then record his answers on the cards yourself (comment the decision on the card and on every card waiting on it, then `hermes kanban complete` the decision card).
