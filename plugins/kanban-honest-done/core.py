@@ -574,8 +574,8 @@ def _origin_receipt_context(task_id, board, owner):
 
 def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = None) -> Optional[str]:
     """Refusal when the card body/comments name an origin chat that will not hear this completion: no unreleased
-    ``task_chat_links`` row, no ``kanban_notify_subs`` subscription, and no ``follow-through: SENT`` comment naming
-    it. Fails open (None) on any board read error."""
+    ``task_chat_links`` row, ``kanban_notify_subs`` subscription, or authenticated
+    origin obligation receipt. SENT comments never count. Fails open on board read errors."""
     try:
         conn = ro_connect(board)
     except sqlite3.Error:
@@ -588,9 +588,8 @@ def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = N
             return None
         reached = _reached_origins(conn, task_id, board)
         owner = _created_on(conn, task_id)
-        for c in comments:
-            if REPORTED_RE.search(c) and not FAILED_SEND_RE.search(c):
-                reached.update(origin_refs(c.replace("@session:", "origin @session:")))
+        # Worker comments are assertions, not delivery authority. Only scoped
+        # links/subscriptions and authenticated ledger receipts can count.
         missing = [s for s in wanted if not _matches_origin(s, reached)]
     except sqlite3.Error:
         return None
@@ -758,12 +757,9 @@ def origin_refusal(task_id: str, sessions: list[str]) -> str:
         f"[kanban-honest-done] Refused: {task_id} names origin chat @session:{s} (body/comments), but that chat is "
         "not linked to this card, so it will never see that the card finished (only the linked chats are told). "
         "Before completing:\n"
-        "1) Send that chat the result yourself: cross_session action=send, target = the @session link from the "
-        "card body, message = what finished, the proof, and anything still open.\n"
-        f"2) Record it with kanban_comment on {task_id}: \"follow-through: SENT via cross_session to @session:{s} "
-        "at <time>; delivery verified|not verified\" (verified = the send returned delivered/replied). Then complete "
-        "again. \"not verified\" means it went out with no readback; a send that returned an error does not count.\n"
-        "3) If the send fails, use kanban_supervisor_request operator action=comment on the live owning "
+        "1) Repair the exact origin link/subscription or authenticated origin obligation through its owning agent. "
+        "A cross_session send or a `follow-through: SENT` comment is not authenticated delivery evidence for this gate.\n"
+        "2) Use kanban_supervisor_request operator action=comment on the live owning "
         "gateway's card to request an origin-link repair; do not invent SENT evidence. A terminated gateway may "
         "use the independently checked origin-chat-gone audit note offered below. Missing/stale evidence is "
         "unknown: refresh the normal replicas and retry, or route a repair to the owning agent. Use kanban_block "
@@ -822,7 +818,8 @@ _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}", "$HERMES_KANBAN_WOR
 
 
 def _is_own(ref: str, own: str) -> bool:
-    return ref == own or ref.strip("\"'") in _OWN_REFS
+    # Unknown expansion could resolve to our own card. Never evaluate it.
+    return ref == own or ref.strip("\"'") in _OWN_REFS or bool(re.search(r'[$`*?\[\\]', ref))
 
 
 @lru_cache(maxsize=1)

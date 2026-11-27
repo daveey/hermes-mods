@@ -201,7 +201,8 @@ def test_pass_consistent_with_threshold_is_allowed(tmp_path):
         {"check": "5b", "status": "pass", "threshold": 800, "comparator": "<", "observed": 712.4},
         {"check": "build", "status": "pass", "observed": "CI run 43161163808 success"},
     ]}
-    assert complete(board_with(tmp_path, BODY_PLAIN), "All checks pass.", md) is None
+    body = BODY_PLAIN + '\nACCEPTANCE check 4: <= 80%\nACCEPTANCE 5b: < 800\n'
+    assert complete(board_with(tmp_path, body), "All checks pass.", md) is None
 
 
 def test_fail_without_preregistered_branch_is_refused(tmp_path):
@@ -297,7 +298,8 @@ def test_structured_pass_review_shapes_refused(tmp_path, entry):
     {"check": "disk", "status": "pass", "threshold": "25% free", "comparator": ">=", "observed": "31% free"},
 ])
 def test_structured_pass_review_shapes_allowed(tmp_path, entry):
-    assert complete(board_with(tmp_path, BODY_PLAIN), "Done.", {"acceptance_results": [entry]}) is None
+    body = BODY_PLAIN + '\nACCEPTANCE oracle: >= 800\nACCEPTANCE disk: >= 25% free\n'
+    assert complete(board_with(tmp_path, body), "Done.", {"acceptance_results": [entry]}) is None
 
 
 def test_prose_inside_acceptance_results_is_scanned(tmp_path):

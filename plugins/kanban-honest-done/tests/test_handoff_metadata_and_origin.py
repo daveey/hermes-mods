@@ -187,7 +187,7 @@ def test_refusal_routes_are_worker_runnable(tmp_path):
     them there: it names the cross_session send + follow-through comment, and kanban_block as the fallback."""
     why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, make_board(tmp_path))
     assert "notify-subscribe" not in why and "kanban_block" in why
-    assert f"follow-through: SENT via cross_session to @session:default@macbook/{ORIGIN}" in why
+    assert 'authenticated origin obligation' in why
 
 
 # --- E: kanban_create naming another gateway's origin chat must bind it -------------------------------------------
@@ -253,16 +253,16 @@ def test_origin_chat_released_link_refused(tmp_path):
     assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
 
 
-def test_origin_chat_reported_comment_allowed(tmp_path):
+def test_origin_chat_reported_comment_refused(tmp_path):
     note = f"follow-through: SENT via cross_session to @session:default@macbook/{ORIGIN} at 15:30Z; delivery verified"
     paths = make_board(tmp_path, comments=[note])
-    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
 
 
-def test_origin_chat_sent_without_readback_allowed(tmp_path):
+def test_origin_chat_sent_without_readback_refused(tmp_path):
     note = f"follow-through: SENT via cross_session to @session:default@macbook/{ORIGIN} at 15:30Z; delivery not verified"
     paths = make_board(tmp_path, comments=[note])
-    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
 
 
 def test_origin_chat_failed_send_comment_refused(tmp_path):

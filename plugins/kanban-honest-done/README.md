@@ -76,6 +76,48 @@ does not suppress the holder's conservative database-dependent refreshes.
 `tests/test_attention_classification_cache.py` covers repeat/changed text,
 classifier replacement, bounded/oversized retention, and mutations after warming.
 
+## Source-review hardening
+
+Shell quote removal is applied before consent target matching, including split
+quoted IDs and escaped characters. Raw text remains supplementary coverage.
+While a consent stop is active, dynamic write text containing expansion syntax
+is conservatively refused; use literal operands. This may also hold unrelated
+writes containing `$` or backticks until the user replies. Whole-input inert
+terminal data exemptions remain unchanged; process input cannot earn them.
+Consent record/clear updates lock a stable sibling `.lock` inode across the
+entire read/modify/replace transaction (Unix `flock`); readers see atomic JSON
+snapshots. Do not delete the lock file while writers run.
+
+An unresolved shell mutation target (`$T`, substitutions, globs) is treated as
+potentially the worker's own card, not silently exempted. This is bounded static
+tool-hook defense, not a universal shell evaluator or Board-writer boundary.
+Commands whose executable/verb is itself dynamically built remain outside it.
+
+SENT comments are audit prose only, even when they say `delivery verified` or
+contain pasted success JSON. Gate D requires scoped links/subscriptions or the
+existing authenticated origin-obligation receipt reader; direct-send assertions
+do not qualify. The offline historical replay still has its older SENT heuristic
+and must not be used as admission or delivery proof.
+
+Numeric structured passes must bind to exactly one explicit body definition:
+`ACCEPTANCE disk free: >= 25%` (or `DONE: check 4 requires >= 25% free disk.`).
+Keep each on its own line. The body is protected by Gate F, not completion
+metadata. Omitted caller thresholds use this definition; supplied thresholds,
+units and comparators must agree. Missing/ambiguous body definitions refuse
+numeric passes, including legacy cards with only free-form prose; record the
+canonical definition through the normal body-edit authority before completing.
+Non-numeric evidence such as a CI URL/status remains supported. This does not
+verify measurements or infer numeric thresholds from arbitrary prose.
+Overflow and non-finite numbers cannot erase another failed-check refusal.
+
+Tests: `tests/test_source_review_regressions.py` (B1 quoted target + record path,
+B2 two-process record/record and clear/record races, B3 forged SENT, B4 omitted /
+lowered / unbound threshold and overflow, B5 variable own-card edits) and
+`tests/test_source_review_controls.py` (entry paths and canonical-bound controls).
+Run the full suite: `python3 scripts/test-all --no-core --exact -k plugins/kanban-honest-done`
+from the repo root, with isolated HOME/HERMES_HOME. The supported core-backed
+mode is the same command without `--no-core`, adding `--hermes-core <checkout>`.
+
 ## What it does
 
 Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call` hook refuses (E and F: any session):
@@ -84,7 +126,7 @@ Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call`
 |---|---|---|
 | A | editing your **own** card's title/body (`--priority`, other cards, comments stay allowed) | `hermes kanban edit <own id, $HERMES_KANBAN_TASK or $HERMES_KANBAN_WORKER_TASK> --title/--body` via `terminal`, `process`, `execute_code`, `tool_call` |
 | B | completing your own card when the handoff, meaning the summary **and every text value in its `metadata`** (`not_done`, `remaining`, nested lists), admits dropped, deferred, unrun or unverified work (incl. plain "not verified / not performed / not checked / not confirmed / not tested"), unless the handoff names a follow-up card `t_xxxxxxxx` that exists (any board, or this host's Board replica `kanban/sync-shadow/*.db`: a pool worker's live board lacks cards placed on other gateways), is open or done (not archived), and was created by this card (`creator_task_id`) or is linked to it | `kanban_complete` tool (direct or via `tool_call`), `hermes kanban complete <own> --summary/--result/--metadata` via shell or `execute_code`. `execute_code` is not run: shell text is the decoded Python string value (`ast`, so a `repr`-escaped command is the command the shell would see). A command that exists only as a runtime value is not recovered |
-| D | completing your own card when its body or comments name an origin chat (`origin … @session:X`, e.g. "Origin chat: @session:default@macbook/X") that is not linked to the card: no unreleased `task_chat_links` row, no notify subscription (`tui` X, or `hub` `<gw>/<profile>/X`), and no `follow-through: SENT … X` comment. The refusal tells the worker to send the chat the result with `cross_session` and record that comment (workers are fenced from `hermes kanban notify-subscribe` on their own board), or request worker-runnable operator repair if the send fails; only an actual human step uses `kanban_block` with `human_request`. Destroyed origins have a separately verified exception below. A Board-synced card run on another machine (`runs_on machine:X`) is also checked against the Board replica (`kanban/sync-shadow/*.db`), where its owner's links live, and the adopt-task hint names the owner (`tasks.created_on`), never the executing machine. Double-quoted text is skipped | same paths as B |
+| D | completing your own card when its body or comments name an origin chat (`origin … @session:X`, e.g. "Origin chat: @session:default@macbook/X") that is not linked to the card: no unreleased `task_chat_links` row, no notify subscription (`tui` X, or `hub` `<gw>/<profile>/X`), and no authenticated origin-obligation receipt. Worker-authored `follow-through: SENT` comments are not authority. The refusal routes the worker to the owning agent for link/obligation repair (workers are fenced from `hermes kanban notify-subscribe` on their own board); only an actual human step uses `kanban_block` with `human_request`. Destroyed origins have a separately verified exception below. A Board-synced card run on another machine (`runs_on machine:X`) is also checked against the Board replica (`kanban/sync-shadow/*.db`), where its owner's links live, and the adopt-task hint names the owner (`tasks.created_on`), never the executing machine. Double-quoted text is skipped | same paths as B |
 | E | (any session, not only workers) `kanban_create` whose title/body names an origin chat on **another** gateway (`origin … @session:<profile>@<gw>/<id>`, `<gw>` a known hermes-hub gateway) without `origin_session` (or `HERMES_ORIGIN_SESSION`) binding that chat. The refusal gives the exact `origin_session='…'` to pass, which subscribes the chat so it sees the card and its completion. Fails open when this gateway has no hermes-hub name | `kanban_create` tool (direct or via `tool_call`) |
 | F | (any session) `hermes kanban edit <id> --body` that **changes acceptance**: adds waiver text (`ACCEPTANCE AMENDED`, "acceptance waived/withdrawn/…", a `WITHDRAWN:`/`WAIVED:` line, "observation/proof withdrawn") or drops a sentence of the current body that states acceptance (a `DONE` sentence, an "acceptance" sentence; removing an earlier waiver section is a restore and passes), unless the new body cites `user message <id>` (or `msg<id>`) that resolves in `state.db` to a user turn typed in **this** chat (this session or its compression ancestors; not a delegated parent, not another chat), in a local human chat only (session source `desktop`/`tui`/`cli`/`local`; `peer-mail`, kanban, subagent, cron, dispatch/review lanes and any unknown source are refused), with `messages.display_kind` empty (including legacy/UI decision rows that pass the text checks; not proof of exclusive keyboard authorship) or `steer` (a mid-turn `[OUT-OF-BAND USER MESSAGE …]` row, accepted only when it is exactly one envelope), not a runtime/Kanban notice (`[...]`, `⏸ [..]`, `⚠ subagent … was stopped by a restart`, `[Message from another Hermes session …]`, `David pressed …`; any other `display_kind`), and newer than the card's current body (its last `edited` body event, else creation). An unknown calling session fails closed for such edits only. It proves who gave the authority and when, not that the words authorize the change. `acceptance.py` | `terminal`/`process` (literal `--body`, `"$(cat FILE)"`, `$(< FILE)`, unquoted `$(cat FILE)`, variables assigned earlier in the same command), `execute_code` (decoded string literals), `tool_call`. A body built any other way at runtime is not recovered (not refused). The `kanban edit` CLI typed by a human and the dashboard are not hooked |
 | G | completing or `kanban_request_review`-ing your **own** card with a handoff that turns a **failed acceptance threshold into a waiver or a guessed pass** (see below). `thresholds.py` | `kanban_complete`, `kanban_request_review` (direct or via `tool_call`), `hermes kanban complete <own>` via shell / `execute_code` |
