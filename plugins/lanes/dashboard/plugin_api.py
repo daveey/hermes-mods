@@ -700,6 +700,24 @@ def _settled_stamp(path, now_ns=None):
         return None
     if (time.time_ns() if now_ns is None else now_ns) - newest < SIBLING_SETTLE_NS:
         return None
+    # A WAL commit becomes visible only when the writer updates the wal-index
+    # header in -shm, after the -wal fsync (synchronous=FULL) and through the
+    # mmap, so it moves no file stat. The header bytes (iChange, mxFrame, salts,
+    # checksum) do change on every commit: read them so a commit that lands
+    # after its last -wal write is never hidden behind an unchanged stamp.
+    try:
+        fd = os.open(path + '-shm', os.O_RDONLY)
+    except FileNotFoundError:
+        stamp.append(None)
+    except OSError:
+        return None
+    else:
+        try:
+            stamp.append(os.pread(fd, 48, 0))
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
     return tuple(stamp)
 
 
