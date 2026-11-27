@@ -17,13 +17,15 @@ def _quote(value: str, *, command: bool = False) -> str:
 
 
 def service_text(home: Path, python: Path, plugin: Path) -> str:
+    _quote(str(plugin))  # validate control characters; WorkingDirectory is not an argv list
+    directory = str(plugin).replace('%', '%%')
     return f'''[Unit]
 Description=Hermes hub status transition sampler (independent of Desktop and gateway)
 
 
 [Service]
 Type=simple
-WorkingDirectory={_quote(str(plugin))}
+WorkingDirectory={directory}
 ExecStart={_quote(str(python), command=True)} -m core --home {_quote(str(home), command=True)}
 Restart=always
 RestartSec=5
