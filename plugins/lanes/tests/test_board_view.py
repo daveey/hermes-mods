@@ -26,11 +26,11 @@ def test_board_deadline_identifies_expiring_handler(monkeypatch, caplog):
     with contextlib.closing(sqlite3.connect(':memory:')) as db:
         merge.arm_deadline(db)
         clock[0] += 2.5
-        cpu[0] += 2.1
+        cpu[0] += merge.BUDGET_CPU_SECONDS + .1
         with pytest.raises(sqlite3.OperationalError, match='interrupted'):
             db.execute(query).fetchone()
         assert 'lanes board_merge deadline expired' in caplog.text
-        assert 'wall=2.500s thread_cpu=2.100s' in caplog.text
+        assert f'wall=2.500s thread_cpu={merge.BUDGET_CPU_SECONDS + .1:.3f}s' in caplog.text
         caplog.clear()
         merge.arm_deadline(db)
         assert db.execute(query).fetchone()[0] == 5000050000
@@ -58,6 +58,50 @@ def test_board_deadline_does_not_charge_time_spent_waiting_for_other_threads(mon
         with pytest.raises(sqlite3.OperationalError, match='interrupted'):
             db.execute(QUERY.format(rows=100000)).fetchone()
         assert 'phase=contexts wall=3610.000s thread_cpu=0.300s' in caplog.text
+
+
+def test_board_budget_leaves_room_for_the_measured_read_in_a_busy_backend(monkeypatch, caplog):
+    """Live failure after the CPU budget landed: phase=contexts thread_cpu=2.0-2.7s expired at 2 s.
+
+    The same phase costs 1.1 s in an idle process; a contended interpreter makes
+    the identical work cost more CPU, so a budget beside the honest cost fails it.
+    """
+    import sqlite3
+    from types import SimpleNamespace
+
+    api = load()
+    merge = api._sibling('board_merge')
+    clock, cpu = [100.0], [1.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(merge, 'thread_time', lambda: cpu[0])
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db, phase='contexts')
+        clock[0] += 19.8
+        cpu[0] += 2.7     # the largest reader CPU seen at a live expiry
+        assert db.execute(QUERY.format(rows=100000)).fetchone()[0] == 5000050000
+        assert not caplog.records
+        assert merge.BUDGET_CPU_SECONDS >= 3 * 2.7, 'a budget is headroom over the honest read, not its size'
+
+
+def test_board_budget_warns_once_while_a_growing_read_still_completes(monkeypatch, caplog):
+    import sqlite3
+    from types import SimpleNamespace
+
+    api = load()
+    merge = api._sibling('board_merge')
+    clock, cpu = [100.0], [1.0]
+    monkeypatch.setattr(merge, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(merge, 'thread_time', lambda: cpu[0])
+    with contextlib.closing(sqlite3.connect(':memory:')) as db:
+        merge.arm_deadline(db, phase='projection')
+        used = merge.BUDGET_CPU_SECONDS * merge.WARN_BUDGET_SHARE + .25
+        clock[0] += 7
+        cpu[0] += used
+        for _ in range(2):
+            assert db.execute(QUERY.format(rows=400000)).fetchone()[0] == 80000200000
+        lines = [record.getMessage() for record in caplog.records]
+        assert lines == [f'lanes board_merge budget half used: phase=projection wall=7.000s '
+                         f'thread_cpu={used:.3f}s of {merge.BUDGET_CPU_SECONDS}s'], lines
 
 
 def test_board_deadline_check_does_not_queue_for_the_interpreter_lock_every_few_steps(monkeypatch):
