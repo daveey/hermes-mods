@@ -500,7 +500,7 @@ def wait_parents(dep, bundle):
                     gateway=task.get('home_gateway') or task.get('gateway') or
                     (owner if isinstance(owner, str) else None) or
                     (bundle.get('gateway') if detail.get('source') == 'live' else None),
-                    profile=task.get('profile') or dep.get('profile'))
+                    profile=task.get('profile') or rec.get('profile') or dep.get('profile'))
         if task.get('gateway') and task.get('profile'):
             result.append(task)
     return sorted(result, key=key)
