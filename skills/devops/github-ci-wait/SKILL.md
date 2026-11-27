@@ -199,6 +199,7 @@ For GraphQL exhaustion attribution and REST fallback equivalence, read `referenc
 - [ ] No filter pipe hides the wait's exit status (`| tail`/`| grep` only under `set -o pipefail`)?
 - [ ] The report cites the run URL or tag the script printed, marked "ran on a later commit" when it did?
 - [ ] On exit 1, the failing run's logs were read (`--log-failed` or the jobs API) before a cause was named?
+- [ ] For real-peer fairness flakes, did a one-time healthy IPC timeout reproduce the failure, and do bounded retries still assert healthy exit, ledger cleanup, per-call latency and blocked-peer survival?
 - [ ] For pacing freshness, does same-tick rounded/newest-wins evidence honor bounded future slack, with a deterministic clock-boundary regression and stale/far-future rejection preserved?
 
 ## Batch acceptance: several PRs, one suite
