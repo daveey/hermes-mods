@@ -31,6 +31,35 @@ each call. Wrap a single cold call in `cProfile` and sort by cumulative time.
   `_cache`/`_flow_cache` on every semantic board revision, so on a busy board nearly every GET is a
   cold recompute.
 
+## 2b. Chips missing, "Partial", "not live" (filter counts broken)
+
+The Sessions-tab filter chips (`all`, colour squares, dashed no-cards count) and the LANES/GOVERNORS
+summary are `desktop-plugins/lanes/plugin.js` (`StatusTotals`, `SessionsTabTotals`), not core
+`apps/desktop/src/app/chat/sidebar`; start there. Only `all` plus a dashed count equal to the whole
+list means the view's `status` is `{}` and `sessions` is empty, so every chat counts as no-cards.
+
+1. GET `/v1/lanes?hours=6&window=6h&expanded=true` on the routed backend (the 9148/9147 recipe above;
+   no token = 401). Print `flow_complete`, `summary_complete`, `status`, `len(sessions)`.
+2. Probe the stream: `websockets.connect(ws://127.0.0.1:<port>/api/plugins/lanes/v1/lanes/stream?hours=6&window=6h&expanded=true&token=<token>)`,
+   send the params JSON, read three frames. A close with 1013 is why Desktop shows "not live" and
+   falls back to the 60 s REST poll, which computes in the (often GIL-starved) backend process.
+3. `grep "lanes board_merge deadline expired" ~/.hermes/logs/errors.log`: `wall` far above
+   `thread_cpu` means lock starvation in the serve process, not a slow read.
+4. Compare `plugins/lanes/dashboard/*.py` mtimes (and core `hermes_cli/kanban*.py`) with the backend's
+   `ps -o lstart=`. The projector child is fenced by `projector_identity` captured at load, so a
+   plugin sync after backend start likely disables the stream until the dashboard restarts. Standalone
+   `m._projector()._spawn(m._projector()._configuration())` with current code tells a code fault from
+   that fence.
+
+A standalone `_lane_view` that completes proves the code, not the served view; acceptance is the
+chips on the routed backend.
+
+When `test_projector.py` raises `lanes projector startup failed`, see the child's stderr by making
+`projector_client.Process._drain` write to `sys.__stderr__` in a throwaway worktree (outside
+`~/.hermes/cache/scratch`). `runtime_command` with a fresh temp HERMES_HOME prints "preparing
+dependencies for this data root" and misses the 5 s ready wait: that is test setup, not the
+production failure.
+
 ## 3. Do not just raise the client timeout
 
 A longer timeout hides the latency. The fix belongs on the hub request path: serve the last view
