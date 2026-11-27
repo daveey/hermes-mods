@@ -2991,7 +2991,7 @@ def stash_op(args: list[str]) -> Optional[str]:
     # Help flags count only in option positions, not message or pathspec data.
     words = iter(args)
     for word in words:
-        if word == "--":
+        if word in ("--", "--end-of-options"):
             break
         if (word.startswith("--") and "=" not in word and len(word) > 2
                 and any(option.startswith(word) for option in
