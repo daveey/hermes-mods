@@ -871,36 +871,11 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             # substitution at it: this scanner deliberately holds that grammar.
             if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
-                prefix = "".join(out)
-                # Class fallback (F11/F12): an unmodeled construct before a `case` inside a substitution
-                # (coproc/function/time/elif keywords, `${...}` parameter text, any unknown prefix word list)
-                # plus a heavy-command token anywhere in the command text holds, instead of enumerating more forms.
-                # F13: unconditional (a raw-text heavy-token test is bypassed by quote splices, escapes, scripts).
-                if re.search(r"(?:^|[\s;&|({!])(?:coproc|function|time|elif)\b", prefix) or "${" in prefix:
-                    raise _UnsupportedSubstitution
-                # F10: a quoted/escaped paren inside a NAME substitution defeats the regex collapse below, so hold
-                # whenever a coproc/function keyword is followed by any substitution before this `case`.
-                if "$(" in prefix and re.search(
-                        r"(?:^|[;&|({\n])\s*(?:(?:then|do|else|if|while|until|!|time(?:\s+-p)?(?:\s+--)?)\s+)*"
-                        r"(?:coproc|function)\b.*\$\(", prefix):
-                    raise _UnsupportedSubstitution
-                # NAME may contain command substitutions (`coproc a$(:)`; backticks are already `$(...)`
-                # here). Collapse innermost `$(...)` spans so they read as ordinary word characters.
-                while True:
-                    collapsed = re.sub(r"\$\([^()]*\)", "X", prefix)
-                    if collapsed == prefix:
-                        break
-                    prefix = collapsed
-                if "$(" in prefix and re.search(r"(?:^|[;&|({\n\s])coproc\b", prefix):
-                    raise _UnsupportedSubstitution  # unbalanced/quoted-paren NAME: hold conservatively
-                # Bash function/coproc NAME is a shell word, not an identifier.
-                # Preserve quote provenance: only the NAME may be quoted, never
-                # the reserved prefix or case keyword. Include joined word parts.
-                word = r'''(?:[^\s;&|()<>'"\\`]|\\.|'[^']*'|"(?:\\.|[^"\\])*")+'''
-                if re.search(r"(?:^|[;&|({\n])\s*(?:(?:then|do|else|if|while|until|!|"
-                             r"time(?:\s+-p)?(?:\s+--)?|coproc(?:\s+" + word + r")?|"
-                             r"function\s+" + word + r")\s+)*$", prefix):
-                    raise _UnsupportedSubstitution
+                # Class closure (differential gate): ANY unquoted `case` keyword word inside a substitution holds.
+                # Whether it is a real case statement or an argument after an unmodeled prefix (coproc/function/
+                # time/elif/unknown word/`${...}` text) cannot be told by this character-level scanner, whose
+                # delimiter matching breaks on the bare case-pattern `)`. False refusals: `echo $(echo case x)`.
+                raise _UnsupportedSubstitution
             # F14: `${x:-)}` hides a `)` this scanner would read as the end of the substitution; hold.
             if level and text.startswith("${", i) and re.match(r"\$\{[^}]*[()]", text[i:]):
                 raise _UnsupportedSubstitution

@@ -34,12 +34,16 @@ shell-word names (punctuation, quoted or escaped name parts). For the local guar
 exported opt-out for that form (tailnet policy does not honor this opt-out);
 quoted `case` data and `echo case` remain data. This is an explicit
 inspection hold, not a claim that every case body is heavy.
-Class fallback: a `case` inside a substitution that follows an unmodeled construct (`coproc`, `function`,
-`time`, `elif`, or `${...}` text) is refused unconditionally, with no heavy-word test (a raw-text test is
-bypassed by quote splices, escapes and scripts). A `${...}` containing a parenthesis inside any substitution
-(`$(echo ${x:-)})`) is held too, since the scanner would end the substitution at that `)`. False refusals:
-such commands that only mention a heavy word as data, or contain no heavy command at all; use the local
-exported `MAC_HEAVY_OK=1` opt-out.
+Class closure: any unquoted `case` keyword word inside a command substitution is refused, whether it is a real
+case statement or an argument after an unmodeled prefix (`coproc`, `function`, `time`, `elif`, unknown words,
+`${...}` text). The scanner cannot tell them apart, and no heavy-word test is applied (a raw-text test is bypassed by
+quote splices, escapes and scripts). A `${...}` containing a parenthesis inside any substitution
+(`$(echo ${x:-)})`) is held too, since the scanner would end the substitution at that `)`. False refusals: any
+benign `$(... case x ...)`, e.g. `echo $(echo case x)`; use the local exported `MAC_HEAVY_OK=1` opt-out.
+A differential test (`tests/test_differential.py`, fixture `tests/fixtures/main_verdicts.json`, generator
+`tests/diff_corpus.py`) replays a ~5,000-command corpus (all review repros plus generated prefix/compound/wrapper
+combinations, direct, `bash -c`, `sh -c`, ssh) against origin/main's recorded verdicts: every command main holds must
+also be held by the head unless listed in `NEW_ALLOWS` with a reason (currently none).
 The public `commands()` API still yields only simple argv lists, recursively
 flattening substitution bodies for consumers such as tailnet. Inspection holds
 raise `ValueError` there, so consumers refuse rather than treating private events
