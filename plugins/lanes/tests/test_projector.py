@@ -110,11 +110,18 @@ def actual_board(tmp_path, monkeypatch):
     # import paths while isolating all data under the fixture home; bootstrapping
     # a fresh PM dependency generation here tests installation, not projection.
     import sys
-    from hermes_cli import _launchers
+    from hermes_cli import _launchers, kanban_worker_node
+    # Registry capacity refresh is intentionally asynchronous in production.
+    # A warmed parent and a fresh child may legitimately see different capacity;
+    # keep this projection-parity fixture independent of the live fleet registry.
+    monkeypatch.setattr(kanban_worker_node, 'registry', lambda **kwargs: None)
     paths = list(sys.path)
     def prepared_runtime(root, args=(), *, code=None, **kwargs):
+        assert code is not None
         return [sys.executable, '-I', '-c',
-                f'import sys, runpy; sys.path[:] = {paths!r}; ' + code, *args]
+                f'import sys, runpy; sys.path[:] = {paths!r}; '
+                'from hermes_cli import kanban_worker_node; '
+                'kanban_worker_node.registry = lambda **kwargs: None; ' + code, *args]
     monkeypatch.setattr(_launchers, 'runtime_command', prepared_runtime)
     from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync
     import hermes_constants
