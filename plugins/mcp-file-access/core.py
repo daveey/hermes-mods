@@ -23,6 +23,7 @@ import fcntl
 import logging
 import os
 import re
+import stat
 from contextlib import contextmanager
 import shutil
 import tempfile
@@ -215,7 +216,7 @@ _staged: dict[tuple, dict] = {}  # (tool_call_id, tool_name) -> {base, moves, ma
 def _stage_root(tmpdir: str):
     """Serialize creation/reaping; never follow a substituted shared-temp symlink."""
     root = Path(tmpdir) / _STAGE_DIRNAME
-    root.mkdir(mode=0o700, exist_ok=True)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
@@ -233,21 +234,40 @@ def _reap_orphans(root: Path) -> None:
         # Only plugin-created UUID directories; never delete arbitrary user paths.
         if not re.fullmatch(r"[0-9a-f]{32}", base.name) or base.is_symlink() or not base.is_dir():
             continue
-        fd = os.open(base / ".lease", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fd = os.open(base / ".lease", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except FileNotFoundError:
+            continue  # a legacy process may remove its stage without the root lock
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue  # another live process is still using this call
-            shutil.rmtree(base)
+            try:
+                shutil.rmtree(base)
+            except FileNotFoundError:
+                pass
         finally:
             os.close(fd)
 
 
 def cleanup_staging(*, _tmpdir: Optional[str] = None) -> None:
     """At plugin startup, remove abandoned (including legacy) staging only."""
-    with _stage_root(_tmpdir or _server_tmpdir(_server_config())) as root:
-        _reap_orphans(root)
+    try:
+        with _stage_root(_tmpdir or _server_tmpdir(_server_config())) as root:
+            _reap_orphans(root)
+    except OSError:
+        # Registration must still install the gate; prepare fails closed independently.
+        logger.warning("mcp-file-access: startup cleanup failed", exc_info=True)
+
+
+def _drop_stage(base, lease) -> None:
+    """Do not expose a partly removed lease to another process's orphan reaper."""
+    try:
+        with _stage_root(str(Path(base).parent.parent)):
+            shutil.rmtree(base, ignore_errors=True)
+    finally:
+        lease.close()
 
 
 def _new_stage(tmpdir: str):
@@ -271,8 +291,7 @@ def _sweep(now: float) -> None:
             _asked.pop(key, None)
     for key, entry in list(_staged.items()):
         if now - entry["ts"] > _STATE_TTL:
-            shutil.rmtree(entry["base"], ignore_errors=True)
-            entry["lease"].close()
+            _drop_stage(entry["base"], entry["lease"])
             _staged.pop(key, None)
 
 
@@ -382,8 +401,7 @@ def prepare(tool_name: str = "", args: Optional[dict] = None, tool_call_id: str 
                 values[t["index"]] = replacement
                 changes[t["key"]] = values
     except Exception:
-        shutil.rmtree(base, ignore_errors=True)
-        lease.close()
+        _drop_stage(base, lease)
         raise
     with _lock:
         _staged[(tool_call_id, tool_name)] = {"base": str(base), "moves": moves, "mapping": mapping,
@@ -399,48 +417,58 @@ def finish(tool_name: str = "", tool_call_id: str = "", **_: Any) -> None:
         if entry is None or entry.get("done"):
             return None
         entry["done"] = True
+    errors = []
     try:
         for slot, dest, mode in entry["moves"]:
             slot_path = Path(slot)
             if not slot_path.is_dir():
                 continue
-            if mode == "write":
-                for item in slot_path.iterdir():
-                    target = Path(dest) / item.name
-                    if target.is_dir():
-                        raise IsADirectoryError(f"Refusing file output to a directory: {target}")
-                    if not item.is_file() or item.is_symlink():
-                        raise ValueError(f"Expected regular file output: {item}")
-                    # Copy beside the destination for cross-filesystem outputs.
-                    fd, pending = tempfile.mkstemp(prefix=".hermes-mcp-", dir=dest)
-                    try:
-                        with os.fdopen(fd, "wb") as output, item.open("rb") as source:
-                            shutil.copyfileobj(source, output)
-                        # Atomic replace refuses directories even after the check.
-                        os.replace(pending, target)
-                    finally:
-                        if os.path.exists(pending):
-                            os.unlink(pending)
-            elif any(slot_path.iterdir()):
-                Path(dest).mkdir(parents=True, exist_ok=True)
-                shutil.copytree(slot_path, dest, dirs_exist_ok=True)
+            items = list(slot_path.iterdir()) if mode == "write" else [slot_path]
+            for item in items:
+                try:
+                    if mode == "write":
+                        target = Path(dest) / item.name
+                        if target.is_dir():
+                            raise IsADirectoryError(f"Refusing file output to a directory: {target}")
+                        if not item.is_file() or item.is_symlink():
+                            raise ValueError(f"Expected regular file output: {item}")
+                        # Copy beside the destination for cross-filesystem outputs.
+                        fd, pending = tempfile.mkstemp(prefix=".hermes-mcp-", dir=dest)
+                        try:
+                            with os.fdopen(fd, "wb") as output, item.open("rb") as source:
+                                shutil.copyfileobj(source, output)
+                                os.fchmod(output.fileno(), stat.S_IMODE(os.fstat(source.fileno()).st_mode))
+                            # Atomic replace refuses directories even after the check.
+                            os.replace(pending, target)
+                        finally:
+                            if os.path.exists(pending):
+                                os.unlink(pending)
+                    elif any(slot_path.iterdir()):
+                        Path(dest).mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(slot_path, dest, dirs_exist_ok=True)
+                except (OSError, ValueError) as exc:
+                    errors.append(exc)
+                    # Never claim a refused output was saved to the user's destination.
+                    for variant in _variants(str(item)):
+                        entry["mapping"][variant] = "[not delivered]"
+                    logger.warning("mcp-file-access: output not delivered: %s", exc)
     finally:
-        shutil.rmtree(entry["base"], ignore_errors=True)
-        entry["lease"].close()
-        with _lock:
-            if entry.get("rewritten"):
-                _staged.pop((tool_call_id, tool_name), None)
+        _drop_stage(entry["base"], entry["lease"])
+    if errors:
+        raise errors[0]  # report failure only after attempting the independent outputs
     return None
 
 
 def rewrite_result(tool_name: str = "", tool_call_id: str = "", result: Any = None, **_: Any) -> Optional[str]:
     """transform_tool_result: show the user's real paths, not the staging ones."""
+    # Some runtimes transform before post hooks. Settle output delivery first in
+    # either order so a failed publication cannot be rewritten as a successful save.
+    try:
+        finish(tool_name=tool_name, tool_call_id=tool_call_id)
+    except (OSError, ValueError):
+        pass  # finish recorded per-output refusal markers and logged the errors
     with _lock:
-        entry = _staged.get((tool_call_id, tool_name))
-        if entry is not None and entry.get("done"):
-            _staged.pop((tool_call_id, tool_name), None)
-        elif entry is not None:
-            entry["rewritten"] = True
+        entry = _staged.pop((tool_call_id, tool_name), None)
     if entry is None or not isinstance(result, str):
         return None
     out = result
