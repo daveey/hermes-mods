@@ -1223,8 +1223,13 @@ class SourceCoordinator:
                     return
                 if self.registration_attempt.count:
                     raise RuntimeError('local source registration unavailable; bounded retry is pending')
-            if time.monotonic() >= deadline or self.closed or self.feed.stopped.is_set():
+            if self.closed or self.feed.stopped.is_set():
                 raise RuntimeError('local source registration was cancelled or remains pending')
+            if time.monotonic() >= deadline:
+                # Continuous arrivals can finish one capture and request another
+                # between service() and this check. This is the same bounded
+                # acquisition timeout as an in-flight worker, not cancellation.
+                raise TimeoutError('local source acquisition is still pending')
 
     def tick(self):
         f = self.feed
