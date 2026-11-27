@@ -41,4 +41,15 @@ If step 1 shows ~1 s turn starts, the turns are fine and the Desktop's API reads
    off-CPU and a plain record omits them.
 5. Then search open cards for the endpoint and lock (step 6). An already-merged fix may simply not be loaded yet.
    Check `git merge-base --is-ancestor <sha> HEAD` in `~/.hermes/hermes-agent`. The hub batches core updates
-   (`core_update_instant_batch_s`), so tell the user when the fix will load rather than forcing a restart.
+   (`core_update_instant_batch_s`; the journal says `batching them ... next in Nm`). Give the load time and offer
+   the force. To force it: `~/.hermes/sync-runner/hermes-sync-mark-deploy <full sha> --within-seconds 60`, then
+   `systemctl --user start --no-block hermes-core-update.service`. This works where `core_expedite` is off,
+   because the expedite request is ignored there. The pass still waits for in-flight cron runs, Desktop turns
+   (your own turn included: it gets paused) and workers. It can take ~15 min. Verify with the serve PID's start
+   time and `merge-base --is-ancestor` afterwards.
+6. Push the owner cards in the same turn instead of only naming them. A stall like this sits on cards parked for
+   hours: deploy waits naming the wrong host's window, `wake_at` set to the next day, or dozens of re-park runs.
+   Read each owner card's newest park reason. Wake any whose premise already holds (fix loaded, wait moot). A
+   card homed on another gateway can't be woken from here: `kanban_unblock` returns "not blocked/... or unknown"
+   and the CLI says `unknown task id`. Run `hermes kanban unblock <id>` on its home host (`kanban show` lists it)
+   through `tailnet_exec`.
