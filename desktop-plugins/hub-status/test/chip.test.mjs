@@ -228,3 +228,13 @@ test('titlebar: keyboard select toggles the popover, an outside click closes it,
   tool.onSelect({ detail: 1, target: {}, currentTarget: {} })
   assert.equal(open(), false)
 })
+
+test('titlebar keyboard: capture runs before onSelect on the tool button, and Enter closes an open popover', () => {
+  const tool = m.titlebarTool({ loadEvents: () => {} })
+  const button = { closest: s => (s === '.hs-tool' ? button : null) }
+  const press = () => { m.closeOnOutsideClick(button); tool.onSelect({ detail: 0, target: button, currentTarget: button }) }
+  press()
+  assert.equal(m.isOpenForTest(), true)
+  press()
+  assert.equal(m.isOpenForTest(), false)
+})

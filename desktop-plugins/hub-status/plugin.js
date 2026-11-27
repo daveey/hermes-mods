@@ -515,6 +515,8 @@ export const isOpenForTest = () => $open.get()
 export function closeOnOutsideClick(target) {
   if (!$open.get() || !target?.closest) return
   if (target.closest('[data-slot="hub-status-chip"]') || target.closest('.hs-panel')) return
+  // The titlebar tool's own button (keyboard Enter/Space clicks target it) is inside too: onSelect toggles there.
+  if (target.closest('.hs-tool')) return
   $open.set(false)
 }
 
