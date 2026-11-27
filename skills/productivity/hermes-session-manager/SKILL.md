@@ -228,8 +228,11 @@ say what's running, never what needs the user.
   unsubscribe it from cards you park for days. "Your request was not processed" with no reply: grep the logs
   for `agent build failed for session <ui> (<session id>): SubscriptionQuotaUnavailable` (route out of quota,
   turn never started) before suspecting the chat. Waiting though every listed card is done: run
-  `hermes kanban chat-tasks <chat> --json` and keep non-done/archived rows, because the ask-gate list and plain
-  `kanban show` cover only the default board (`no such task` = use `--board <b> show`). A coach card filed with
+  `hermes kanban chat-tasks <chat> --json` (a bare list of rows) and keep the `unfinished: true` rows, the ones
+  holding the chat open (a watch park reads false); the ask-gate list and plain `kanban show` cover only the default
+  board (`no such task` = use `--board <b> show`). A `done_pending_release` row (`released: false`) is a finished
+  card whose `task_chat_links` row on its home board still reads `released=0`: that is link-release machinery, so
+  record it as a HERMES-NOTE on the open card for that area. A coach card filed with
   this chat as its origin (`via=created`, empty `notify-list`) can't be detached (`edit --session-id` refuses
   empty); if it is lane-gated with no runner, move the defect to a HERMES-NOTE comment and archive it with
   restore steps.
