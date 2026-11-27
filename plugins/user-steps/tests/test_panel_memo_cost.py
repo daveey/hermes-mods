@@ -59,13 +59,14 @@ def test_production_inventory_memo_cost_and_same_version_changes(replica_panel, 
     import inspect
     import statistics
     import types
-    from inventory_base_reference import _inventory as base_inventory
-    source = inspect.getsource(module._inventory).replace(
-        '_inventory_digest(raw)',
-        'hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode()).digest()')
+    from inventory_base_reference import _inventory as base_inventory, _inventory_digest as base_digest
+    # Hold digest scheduling equal: this budget measures attribution, not the
+    # deliberate sub-2048-byte SHA updates that avoid per-row GIL handoffs.
+    source = inspect.getsource(module._inventory)
     assert ast.dump(ast.parse(source)) == ast.dump(
         ast.parse(inspect.getsource(base_inventory)))
-    baseline = types.FunctionType(base_inventory.__code__, module.__dict__)
+    baseline = types.FunctionType(base_inventory.__code__,
+                                 dict(module.__dict__, _inventory_digest=base_digest))
     current = module._inventory
     base_costs, traced_costs = [], []
     for _ in range(7):
