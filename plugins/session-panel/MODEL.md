@@ -1,5 +1,15 @@
 # PanelModel v1
 
+## Human asks on dependency waits
+
+A downstream row waiting on another card's current human request names that
+card as `waiting on: <short title> (your check)` (plus owner/elapsed context).
+Do not copy the upstream block/event reason into the downstream `detail`,
+`details` or clock templates: it can repeat the human request's imperative text.
+Only the owning `needs_you` row presents the ask. Canonical request retirement
+removes the `your check` label; nonhuman operational dependency reasons remain.
+Desktop session-tasks consumes this backend-authored display text unchanged.
+
 ## Overdue triage: operational red, not a human decision
 
 `hermes_cli.kanban_triage_attention` is the authoritative backend rule: a current

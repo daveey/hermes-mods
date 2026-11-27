@@ -3,7 +3,7 @@ import copy
 import math
 
 
-def present(view, row, record, *, now, terminal, serving):
+def present(view, row, record, *, now, terminal, serving, human_dependency=None):
     """Only append diagnostic fields; owner-qualified row coordinates stay authoritative."""
     if row.get('status') in terminal:
         view['actionability'] = {'version': 1, 'task_id': row.get('id'), 'action': 'no_open_action',
@@ -48,6 +48,17 @@ def present(view, row, record, *, now, terminal, serving):
         view['details'].append('Actionability: unavailable — evidence unknown; owner, next action, recovery trigger and deadline unavailable')
         return
     a = copy.deepcopy(a)
+    if human_dependency and a['action'] == 'satisfy_dependency':
+        # Source diagnosis can embed the parent's imperative in all three
+        # carriers. This is display-only: retain the contract, actor, restriction
+        # and evidence fields without changing the source snapshot.
+        dependency_id, summary = human_dependency
+        a['instruction'] = summary
+        if a.get('blocker'):
+            a['blocker']['trigger'] = summary
+        for dependency in a.get('dependencies') or []:
+            if isinstance(dependency, dict) and dependency.get('task_id') == dependency_id:
+                dependency['trigger'] = summary
     if remote or row.get('stale') or row.get('partial_source_unknown'):
         a['evidence_state'] = 'unknown'
     view['actionability'] = a

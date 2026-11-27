@@ -999,6 +999,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     rows_by_key = {}
     diagnostic_rows = {}
     dependency_prefixes = {}
+    human_dependency_waits = {}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
     # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
@@ -1048,7 +1049,14 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 dependency = leaf
         dependency_text = ''
         blocker = dependency or row
-        why = wait_reason(blocker, bundle)
+        # A parent's human ask belongs only to its own needs-you row. Its
+        # block/event reason often repeats the imperative verbatim; do not copy
+        # that into a dependent's summary, folded details or wire templates.
+        dependency_human = bool(dependency and (human_owned(blocker) or live_request(blocker)))
+        blocker_requests = [r for r in requests if dependency and
+                            any(_matches(blocker, a, same_gateway) for a in _aliases(r))]
+        dependency_check = dependency_human and (live_request(blocker) or not blocker_requests)
+        why = '' if dependency_human else wait_reason(blocker, bundle)
         if why:
             v['details'].append('Blocking reason: ' + why)
             why = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', why))
@@ -1073,10 +1081,13 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             # The awaited card is often not this chat's own (a worker made it), so it has no row of its
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
-            dep_label = triage_label(dependency, bundle, now, wire=wire) if dep_status == 'triage' else dep_status
+            dep_label = ('your check' if dependency_check else
+                         triage_label(dependency, bundle, now, wire=wire) if dep_status == 'triage' else dep_status)
             dep_state = f' ({dep_label})' if dep_label else ''
             dependency_prefix = f'waiting on: {title}{dep_state}{location}'
             dependency_prefixes[k] = (key(dependency), dependency_prefix)
+            if dependency_human:
+                human_dependency_waits[k] = (dependency['id'], dependency_prefix)
             dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
@@ -1179,8 +1190,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             on = dependency_text + ' · ' + blocker_wait['text']
         elif dependency and dependency.get('status') in ('running', 'review') and not dependency.get('stale'):
             v['wait_kind'] = 'card'
-        elif dependency and live_request(blocker):
-            on = dependency_text + " · waiting on you to answer the parent's current request"
+        elif dependency_check:
+            on = dependency_text
         elif not v.get('wait_kind') and agent_hold(blocker, bundle):
             v['wait_kind'] = 'agent'
             actor = agent_hold_text(blocker, bundle)
@@ -1417,7 +1428,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if view.get('kind') == 'card':
             source_row = diagnostic_rows.get(view['key'], view)
             _actionability.present(view, source_row, obj(obj(bundle.get('cards')).get(view['id'])),
-                                   now=now, terminal=TERMINAL, serving=same_gateway)
+                                   now=now, terminal=TERMINAL, serving=same_gateway,
+                                   human_dependency=human_dependency_waits.get(view['key']))
     # Open session names the card's own chat; the chat this panel already shows (any compression ancestor) is not one.
     here = {str(s) for s in [bundle.get('session'), *(bundle.get('lineage') or [])] if s}
     for view in [v for values in sections.values() for v in values] + groups:
