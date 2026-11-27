@@ -1013,6 +1013,36 @@ test('mixed waits: each row box keeps its own category; the square is amber whil
  assert.equal(effective.header.pips.find(p => p.section === 'waiting').last_wait_kind, 'agent')
  assert.equal(m.pipCategory(effective.header.pips.find(p => p.section === 'waiting')), 'blue')
 })
+for (const name of ['ci', 'spend', 'triage']) test(`expired stuck ${name} never inherits a blue waiting category`, { skip: !publicCases[`palette_stuck_${name}`] }, async () => {
+ const { model, now } = publicCases[`palette_stuck_${name}`]
+ assert.equal(model.sections.stuck.length, 1)
+ const before = JSON.stringify(model)
+ await paint(m.renderModel(model, { now }))
+ assert.ok(document.querySelector('[data-row-pip="stuck"]'))
+ const effective = m.expireNativeWaits(model, now, false)
+ const [row] = effective.sections.waiting
+ assert.equal(row.last_wait_kind, undefined)
+ assert.equal(row.wait_kind, null)
+ assert.equal(row.attention, undefined)
+ await paint(m.renderModel(model, { now, vouched: false }))
+ assert.equal(rowBox(), AMBER_RGB)
+ assert.equal(waitingSquare(), 'amber')
+ assert.match(document.querySelector('[data-row-detail]').textContent, /^status unknown · last known:/)
+ assert.equal(document.querySelector('[data-wait-eta]'), null)
+ assert.equal(JSON.stringify(model), before)
+ await paint(m.renderModel(model, { now }))
+ assert.ok(document.querySelector('[data-row-pip="stuck"]'), 'fresh stuck presentation recovers')
+})
+for (const [name, kind] of [['unknown_ci', 'ci'], ['aged_agent', 'agent'], ['aged_card', 'card']]) test(`withdrawn ${name} keeps blue category without authority`, async () => {
+ const { model, now } = publicCases[`palette_${name}`]
+ const [row] = model.sections.waiting
+ assert.equal(row.wait_kind, undefined); assert.equal(row.last_wait_kind, kind)
+ assert.equal(row.evidence_state, 'unknown')
+ assert.equal(model.header.wait_kind, undefined)
+ await paint(m.renderModel(model, { now }))
+ assert.equal(rowBox(), kind === 'agent' ? 'rgb(59, 130, 246)' : DELIVERY_RGB); assert.equal(waitingSquare(), 'blue')
+ assert.equal(document.querySelector('[data-wait-eta]'), null)
+})
 test('header counts/pips remain server values, not recomputed row totals', async () => {
  const model = structuredClone(publicCases.all_sections.model)
  model.header.counts.running = 78; model.header.pips = [{ section: 'running', count: 91, label: 'hub value' }]

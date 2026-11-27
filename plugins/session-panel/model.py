@@ -335,7 +335,7 @@ def _recorded(wait):
             'backstop': backstop if isinstance(backstop, (int, float)) and not isinstance(backstop, bool) and 0 < backstop < float('inf') else None}
 
 
-def _withdraw_wait(v):
+def _withdraw_wait(v, *, preserve_category=True):
     """Withdraw a row's live producer authority (`wait_kind`, ETA) but keep its last-known wait category.
 
     `last_wait_kind` is colour only: the row box and the waiting pip keep the category the row last showed
@@ -343,8 +343,10 @@ def _withdraw_wait(v):
     ETA, never sets the header dot and never vouches that the producer is still live."""
     kind = v.pop('wait_kind', None) or v.get('last_wait_kind')
     v.pop('wait_eta', None)
-    if kind:
+    if kind and preserve_category:
         v['last_wait_kind'] = kind
+    else:
+        v.pop('last_wait_kind', None)
 
 
 def wait_category(v):
@@ -1154,6 +1156,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = f'reported {row.get("reported_status") or "done"} by {row.get("gateway") or "another gateway"} · not confirmed by its owner'
             sections['waiting'].append(v)
             continue
+        preserve_wait_category = (state in ('scheduled', 'blocked', 'triage', 'todo')
+                                  and obj(row.get('wait')).get('wait_state') != 'stalled'
+                                  and not spend_escalation_overdue(blocker, bundle, now)
+                                  and not triage_overdue(row, bundle, now))
         synced_row = row.get('synced_at')
         replica_row = bool(row.get('remote') or row.get('source') in ('replica', 'origin-obligation'))
         # Retain the owner's last parked report and sync age as historical context,
@@ -1170,7 +1176,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['queued'] = queued
             v['evidence_state'] = 'unknown'
             v['reason'] = 'source-stale'
-            _withdraw_wait(v)
+            _withdraw_wait(v, preserve_category=preserve_wait_category)
             historical = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started · execution reason unknown' if queued else _parked(row, on)
             v['detail'] = f'status unknown · last known: {historical}'
             v['details'].append('Task source freshness: stale; read current authoritative task state before acting.')
@@ -1184,7 +1190,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v)
             continue
         if row.get('stale') or row.get('partial_source_unknown'):
-            _withdraw_wait(v)
+            _withdraw_wait(v, preserve_category=preserve_wait_category)
             _drop_park(v, park_lines)  # a card that could not be re-read vouches for no current reason or actor
             v['evidence_state'] = 'unknown'
             v['detail'] = f'status unknown · last known: {state or "unknown"}; waiting for status from {row.get("gateway") or "the card’s owner"}'

@@ -138,6 +138,12 @@ cases['palette_ci_stale_replica'] = f.bundle(f.task(status='scheduled', wait=dic
                                                     source='replica', stale=True, synced_at=f.NOW - 3480))
 cases['palette_mixed'] = f.bundle(f.task('t_ci', status='scheduled', wait=dict(PALETTE_CI), stale=True),
                                   f.task('t_plain', status='blocked'))
+from test_wait_palette import stalled_cases, withdrawal_cases
+for name, b in stalled_cases():
+    if name != 'triage' or f.AGED:
+        cases['palette_stuck_' + name] = b
+for name, b, _ in withdrawal_cases():
+    cases['palette_' + name] = b
 # Composed owned-board fixture: real CoreReaders adapter, not a UI envelope.
 import os
 import tempfile

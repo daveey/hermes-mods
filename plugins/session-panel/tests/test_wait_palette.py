@@ -92,6 +92,60 @@ def test_a_wait_with_no_known_category_stays_uncategorised():
         assert 'last_wait_kind' not in waiting_pip(m) and 'wait_kind' not in waiting_pip(m)
 
 
+def stalled_cases():
+    yield 'ci', bundle(task(status='scheduled', wait={**CI, 'wait_state': 'stalled'}))
+    b = f.held_bundle(kind='spend_budget_triaged')
+    b['cards']['t_abc123']['detail']['events'] = [
+        {'kind': 'spend_budget_triaged', 'created_at': NOW - 3600, 'payload': {'limit': 'runs'}},
+        {'kind': 'spend_review_escalated', 'created_at': NOW - 1900,
+         'payload': {'episode': 'e', 'reason': 'Repeated wait.'}}]
+    yield 'spend', b
+    b = f.held_bundle()
+    b['cards']['t_abc123']['detail']['events'][0]['created_at'] = NOW - 601
+    yield 'triage', b
+
+
+def test_stale_stalled_waits_do_not_inherit_a_blue_producer_category():
+    import copy
+    for name, b in stalled_cases():
+        if name == 'triage' and not f.AGED:
+            continue
+        fresh = model.reduce_panel(b, now=NOW, projector=f.project)
+        assert fresh['sections']['stuck'], name
+        for flag in ({'stale': True}, {'partial_source_unknown': 'unavailable'},
+                     {'stale': True, 'remote': True, 'source': 'replica', 'synced_at': NOW - 120}):
+            stale = copy.deepcopy(b)
+            stale['tasks'][0].update(flag)
+            m = model.reduce_panel(stale, now=NOW, projector=f.project)
+            [row] = m['sections']['waiting']
+            assert category(row) is None, (name, flag, row)
+            assert category(waiting_pip(m)) is None
+            assert 'wait_eta' not in row and row['evidence_state'] == 'unknown'
+
+
+def withdrawal_cases():
+    # A contradictory observation is not the normal missing-run producer gap.
+    yield 'unknown_ci', bundle(f.observed(ci_row(), state='unknown'), computed_at=NOW - 120), 'ci'
+    yield 'aged_agent', {**f.held_bundle(status='blocked'), 'computed_at': NOW - 120}, 'agent'
+    parent = task('t_abcdef0123456789', status='running')
+    yield 'aged_card', bundle(task(status='scheduled', wait={'waiting_on': 'card t_abcdef0123456789'}, upstream=parent), computed_at=NOW - 400,
+                             cards={'t_abcdef0123456789': {'detail': {'task': parent}}}), 'card'
+
+
+def test_unknown_execution_and_aged_non_delivery_withdraw_live_authority_but_keep_category():
+    for name, b, kind in withdrawal_cases():
+        for wire in (False, True):
+            m = model.reduce_panel(b, now=NOW, projector=f.project, wire=wire)
+            [row] = m['sections']['waiting']
+            assert row.get('last_wait_kind') == kind, (name, row)
+            assert 'wait_kind' not in row and 'wait_eta' not in row
+            assert row['evidence_state'] == 'unknown'
+            assert waiting_pip(m).get('last_wait_kind') == kind
+            assert 'wait_kind' not in m['header']
+            if name == 'unknown_ci':
+                assert row['detail'].startswith('status unknown (unknown)')
+
+
 def test_identical_input_keeps_revision_and_category_change_moves_it():
     b = bundle(ci_row(stale=True))
     assert model.reduce_panel(b, now=NOW)['revision'] == model.reduce_panel(b, now=NOW)['revision']
