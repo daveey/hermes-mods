@@ -41,7 +41,11 @@ def kanban_indexes(seg):
         if not (real or tok.endswith("hermes_cli.main")):
             continue
         j = h + 1
-        while j < len(seg) and seg[j].startswith("-") and seg[j] != "--":
+        while j < len(seg) and seg[j].startswith("-"):
+            if seg[j] == "--":
+                # Core's command_argv consumes this marker, then dispatches the next token.
+                j += 1
+                break
             j += 2 if "=" not in seg[j] and seg[j] in TOP_LEVEL_VALUE_FLAGS else 1
         if j < len(seg) and (seg[j] == "kanban" or (real and os.path.basename(seg[j]) == "kanban")):
             yield j
