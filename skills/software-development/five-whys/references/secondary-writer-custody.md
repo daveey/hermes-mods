@@ -1,0 +1,5 @@
+# Durable restriction maintenance and secondary recipients
+
+Distinguish mutation fencing from maintenance eligibility. A correct write fence can still abort a whole recompute transaction or alarm when candidate selection ignores the restriction. Use marker presence (including malformed custody) to skip automatic work before effects, without treating the marker as authority or catching failures after partial writes. Prove an expiring pending-delete neighbour in both edge directions cannot stop an independent lease expiry; execute the real alarm after Durable Object eviction, and preserve target history/edges and next-alarm scheduling.
+
+Audit secondary write recipients: repair-card comments, creator notices and owner-backfill rows can abort healthy neighbours even when the primary candidate is unfrozen. Test frozen destinations, selection-to-writer races and exactly-once recovery after custody ends. When a stale attachment row is an ordinary successful no-op, separately re-resolve its UID's current recipient before reporting success; a rebound onto a frozen card is not the same control as an unfrozen storage echo or deletion.
