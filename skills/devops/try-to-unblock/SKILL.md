@@ -68,9 +68,11 @@ For an authorized continuation, run `hermes kanban release <id> --runs <allowanc
 from the owning chat; it records the mandate, renews applicable scope/budget and promotes. Read the stop and ledger
 first, preserve historical usage, and verify the resulting state. Do not escalate to a human terminal merely because
 a worker could not renew: the owning chat can release under its existing mandate. If this chat lacks authority,
-route to the recorded owner; use `run_in_user_terminal` only when the supported owner route cannot perform the
-user-authorized release. The explicit alternative is a fresh owner mandate comment, `renew-scope` for the exact
-episode, then `promote`; neither comments alone nor recorded UI choices substitute for that transition.
+route to the recorded owner. Before a terminal fallback, read the refusal's authentication contract: a window
+cannot turn an agent-origin request into an authenticated operator. Use the supported route in
+the `kanban-orchestrator` skill's board-write fallbacks reference, section “Identity-sensitive release”.
+A fresh authenticated owner mandate, exact-episode `renew-scope`, then `promote` is the explicit alternative;
+comments or UI choices alone do not release it.
 
 On `budget_decision_unread`, read the listed comments and retry with the exact `--seen` ID requested by the refusal.
 Do not use your newer handoff comment or the maximum comment ID: the gate acknowledges the newest qualifying
