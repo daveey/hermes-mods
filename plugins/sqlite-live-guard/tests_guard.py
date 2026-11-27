@@ -1211,6 +1211,7 @@ def test_context_heredoc_expansion_and_option_boundaries(command):
 
 @pytest.mark.parametrize("command", [
     "H=/home/u/.hermes; (H=/work); mv /work/new $H/state.db",
+    "H=/work; echo x | H=/home/u/.hermes; mv /work/new $H/state.db",  # zsh/ksh/lastpipe keep it: refused
     "H=/home/u/.hermes; false && { true; H=/work; }; mv /work/new $H/state.db",
     "H=/home/u/.hermes; echo x | H=/work; mv /work/new $H/state.db",
     "H=/home/u/.hermes; H=/work & mv /work/new $H/state.db",
@@ -1228,7 +1229,6 @@ def test_context_additional_adversarial_alias_writes(command):
     "H=/home/u/.hermes; readonly H; unset H; H=/work; mv /work/new $H/state.db",
     "H=/home/u/.hermes; (H=/work; true); H=/work; mv /work/new $H/state.db",
     "H=/work; (H=/home/u/.hermes); mv /work/new $H/state.db",
-    "H=/work; echo x | H=/home/u/.hermes; mv /work/new $H/state.db",
     "H=/work; H=/home/u/.hermes & mv /work/new $H/state.db",
     "H=/home/u/.hermes; false && { H=/work; }; H=/work; mv /work/new $H/state.db",
 ])
