@@ -2023,6 +2023,20 @@ nothing).
 
 The brief model is set with `auxiliary.coach.provider` / `.model` (default: the auto aux model).
 
+## Subprocess evidence boundaries
+
+The signal forwarder and silent-host probe accept only ASCII `host` or `user@host`
+SSH destinations (letters, digits, underscores, dots and hyphens; neither component
+may start with a hyphen). Options, URLs, whitespace and shell syntax are refused
+before launching SSH; accepted destinations follow an explicit `--`. An invalid
+forwarding destination does not advance the signal cursor. IPv6 literals and SSH
+URLs are not supported by these signal transports; use a configured SSH alias.
+
+Second-opinion diff collection passes `--no-ext-diff --no-textconv` for both its
+stat and patch reads. Repository diff drivers and `GIT_EXTERNAL_DIFF` cannot run
+while collecting review evidence. `tests/test_source_review_security.py` covers
+both boundaries, including inert real-SSH and real-Git marker fixtures.
+
 ## Tests
 
 Run the full Python suite through a current Hermes core checkout (set `CORE` and
