@@ -95,10 +95,17 @@ def test_worker_module_differs_from_provider_id_and_broker_scope(monkeypatch, tm
     import providers.runpod as shared
     from providers.lambdacloud import LambdaCollector
     calls = []
-    def run(argv, **kw):
-        calls.append((argv, kw))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({'provider': 'lambda', 'machines': [], 'status': 'ok'}))
-    monkeypatch.setattr(shared.subprocess, 'run', run)
+    class FakePopen:
+        returncode = 0
+        def __init__(self, argv, **kw):
+            calls.append((argv, kw))
+            self.pid = 0
+        def communicate(self, timeout=None):
+            calls[-1][1]['timeout'] = timeout
+            return json.dumps({'provider': 'lambda', 'machines': [], 'status': 'ok'}), ''
+        def poll(self):
+            return 0
+    monkeypatch.setattr(shared.subprocess, 'Popen', FakePopen)
     cfg = tmp_path / 'cr.json'
     cfg.write_text(json.dumps({'broker': {'command': ['token-broker', 'exec', '--scope', 'user/{provider}', '--']}}))
     monkeypatch.setenv('COMPUTE_RENTALS_CONFIG', str(cfg))
@@ -106,7 +113,7 @@ def test_worker_module_differs_from_provider_id_and_broker_scope(monkeypatch, tm
     assert collector.collect() == collector.collect() and len(calls) == 1
     argv, kw = calls[0]
     assert os.path.basename(argv[0]) == 'token-broker' and argv[1:4] == ['exec', '--scope', 'user/lambda']
-    assert argv[-3:] == ['-m', 'providers.lambdacloud', '--worker'] and kw['timeout'] == 70
+    assert argv[-2:] == ['providers.lambdacloud', '--worker'] and argv[-6:-4] == ['-I', '-c'] and kw['timeout'] == 70
 
 
 def test_worker_without_key_is_unconfigured(monkeypatch):
