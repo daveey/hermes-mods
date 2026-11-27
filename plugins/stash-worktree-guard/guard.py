@@ -2993,7 +2993,12 @@ def stash_op(args: list[str]) -> Optional[str]:
     for word in words:
         if word == "--":
             break
-        if word == "--message" or re.fullmatch(r"-[quakpSd]*m", word):
+        if (word.startswith("--") and "=" not in word and len(word) > 2
+                and any(option.startswith(word) for option in
+                        ("--message", "--pathspec-from-file"))
+                or re.fullmatch(r"-[quakpSd]*m", word)):
+            # Git parse-options accepts abbreviated long options. Their next
+            # word is data even when it looks like help (including pathspec files).
             next(words, None)
         elif word in ("-h", "--help"):
             return None
@@ -3012,9 +3017,12 @@ def stash_ref(args: list[str]) -> str:
         next(words, None)
     for arg in words:
         if arg == "--":
-            return next(words, "stash@{0}")
-        if not arg.startswith("-"):
-            return arg
+            arg = next(words, "stash@{0}")
+        elif arg.startswith("-"):
+            continue
+        # stash interprets digit-only operands as reflog indices even when a
+        # branch of that name exists; git log would resolve that branch instead.
+        return f"stash@{{{arg}}}" if re.fullmatch(r"[0-9]+", arg) else arg
     return "stash@{0}"
 
 
