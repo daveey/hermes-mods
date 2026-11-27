@@ -24,7 +24,10 @@ after 24 h. Every record / refusal / clear is a JSON line in ``$HERMES_HOME/logs
 from __future__ import annotations
 
 import json
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Native Windows: keep the plugin loadable, but no unlocked writes.
+    fcntl = None
 from contextlib import contextmanager
 import os
 import re
@@ -89,6 +92,8 @@ def _save(data: dict, env=None) -> None:
 @contextmanager
 def _transaction(env=None):
     """Lock a stable sibling inode, not the JSON inode replaced by _save."""
+    if fcntl is None:
+        raise RuntimeError("consent locking is unavailable on this platform")
     p = store_path(env).with_suffix('.lock')
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
@@ -250,19 +255,32 @@ def shell_write_texts(command: str, allow_inert: bool = True) -> list[str]:
     return []
 
 
+def _unresolved_shell_write(tool_name: str, args: Any) -> bool:
+    args = args if isinstance(args, dict) else {}
+    name = _strip(str(tool_name or ""))
+    if name == "tool_call":
+        return any(_unresolved_shell_write(str(call.get("name") or ""), call.get("arguments"))
+                   for call in args.get("calls") or [] if isinstance(call, dict))
+    return name in SHELL_TOOLS and any(re.search(r'[$`*?{\[\\]', text)
+                                           for text in write_texts(name, args))
+
+
 def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,
                 now: Optional[float] = None) -> Optional[str]:
     """Refusal for a write naming a card under an active consent stop of any of ``sessions``, or None."""
-    sessions = [s for s in dict.fromkeys(sessions) if s]
-    if not sessions:
-        return None
     texts = write_texts(tool_name, args)
     if not texts:
+        return None
+    if fcntl is None:
+        return "[kanban-honest-done] Refused: consent locking is unavailable on this platform; writes are held."
+    sessions = [s for s in dict.fromkeys(sessions) if s]
+    if not sessions:
         return None
     named = set(TASK_ID_RE.findall("\n".join(texts)))
     # An unresolved write might name the stopped card. Require literal operands
     # until consent is restored, rather than evaluate caller shell text.
-    unresolved = any(re.search(r'\$|`', text) for text in texts)
+    unresolved = (any(re.search(r'[$`]', text) for text in texts)
+                  or _unresolved_shell_write(tool_name, args))
     for sid in sessions:
         for stop in active_stops(sid, env, now):
             hit = [t for t in stop.get("targets") or [] if t in named or unresolved]

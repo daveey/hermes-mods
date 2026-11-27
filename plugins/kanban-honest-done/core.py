@@ -819,7 +819,7 @@ _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}", "$HERMES_KANBAN_WOR
 
 def _is_own(ref: str, own: str) -> bool:
     # Unknown expansion could resolve to our own card. Never evaluate it.
-    return ref == own or ref.strip("\"'") in _OWN_REFS or bool(re.search(r'[$`*?\[\\]', ref))
+    return ref == own or ref.strip("\"'") in _OWN_REFS or bool(re.search(r'[$`*?{\[\\]', ref))
 
 
 @lru_cache(maxsize=1)
@@ -879,6 +879,8 @@ def _positional(args: list[str]) -> Optional[str]:
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--":
+            return args[i + 1] if i + 1 < len(args) else None
         if a.startswith("--") and "=" not in a:
             i += 2
             continue
@@ -899,6 +901,12 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
         target = _positional(args)
         if not target or not _is_own(target, own):
             continue
+        # The legacy lexer separates $(...) at '('. Its remaining segment
+        # cannot prove the mutation flags or handoff safe. Hold the operation
+        # instead of treating the missing tail as an empty, passing handoff.
+        if target.endswith('$') and verb in {"edit", "complete", "done", "request-review"}:
+            return ("[kanban-honest-done] Refused: unresolved substitution target. "
+                    "Use a literal card id and a complete command so the own-card gates can check it.")
         if verb == "edit" and (_opt(args, "--title") is not None or _opt(args, "--body") is not None):
             return EDIT_REFUSAL
         if verb in ("complete", "done"):

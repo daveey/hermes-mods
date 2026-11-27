@@ -82,16 +82,21 @@ Shell quote removal is applied before consent target matching, including split
 quoted IDs and escaped characters. Raw text remains supplementary coverage.
 While a consent stop is active, dynamic write text containing expansion syntax
 is conservatively refused; use literal operands. This may also hold unrelated
-writes containing `$` or backticks until the user replies. Whole-input inert
+writes containing `$`, backticks, braces, globs or escapes until the user replies. Whole-input inert
 terminal data exemptions remain unchanged; process input cannot earn them.
 Consent record/clear updates lock a stable sibling `.lock` inode across the
 entire read/modify/replace transaction (Unix `flock`); readers see atomic JSON
-snapshots. Do not delete the lock file while writers run.
+snapshots. Do not delete the lock file while writers run. Without `fcntl` (native
+Windows), the plugin still imports, but consent-relevant writes are held rather
+than updating without a process lock; read-only tools remain available.
 
-An unresolved shell mutation target (`$T`, substitutions, globs) is treated as
+An unresolved shell mutation target (`$T`, substitutions, globs, brace expansion) is treated as
 potentially the worker's own card, not silently exempted. This is bounded static
 tool-hook defense, not a universal shell evaluator or Board-writer boundary.
 Commands whose executable/verb is itself dynamically built remain outside it.
+If the lexer splits an unquoted substitution target at `(`, its mutation is
+held outright: missing trailing flags or summary cannot prove a safe handoff.
+The `--` end-of-options marker is respected when locating the card operand.
 
 SENT comments are audit prose only, even when they say `delivery verified` or
 contain pasted success JSON. Gate D requires scoped links/subscriptions or the
@@ -113,7 +118,9 @@ Overflow and non-finite numbers cannot erase another failed-check refusal.
 Tests: `tests/test_source_review_regressions.py` (B1 quoted target + record path,
 B2 two-process record/record and clear/record races, B3 forged SENT, B4 omitted /
 lowered / unbound threshold and overflow, B5 variable own-card edits) and
-`tests/test_source_review_controls.py` (entry paths and canonical-bound controls).
+`tests/test_source_review_controls.py` (entry paths and canonical-bound controls),
+plus `tests/test_review_expansions.py` (real bash brace/substitution argv, split
+substitution holds, end-of-options, inert-data and missing-lock-platform controls).
 Run the full suite: `python3 scripts/test-all --no-core --exact -k plugins/kanban-honest-done`
 from the repo root, with isolated HOME/HERMES_HOME. The supported core-backed
 mode is the same command without `--no-core`, adding `--hermes-core <checkout>`.
