@@ -2031,10 +2031,16 @@ may start with a hyphen). Options, URLs, whitespace and shell syntax are refused
 before launching SSH; accepted destinations follow an explicit `--`. An invalid
 forwarding destination does not advance the signal cursor. IPv6 literals and SSH
 URLs are not supported by these signal transports; use a configured SSH alias.
+An invalid heartbeat reach is treated as unusable, not evidence that the host is
+asleep: the age-only silent-forwarder check still files a finding with a repair note.
+An invalid forwarding hub reports the collected backlog without sending it.
 
 Second-opinion diff collection passes `--no-ext-diff --no-textconv` for both its
-stat and patch reads. Repository diff drivers and `GIT_EXTERNAL_DIFF` cannot run
-while collecting review evidence. `tests/test_source_review_security.py` covers
+stat and patch reads. External diff commands, `GIT_EXTERNAL_DIFF`, and textconv
+drivers cannot run while collecting review evidence. This is not a sandbox for
+all Git configuration: `core.fsmonitor` and attribute-selected clean/process
+filters can still execute; only use this collector with trusted repositories.
+`tests/test_source_review_security.py` covers
 both boundaries, including inert real-SSH and real-Git marker fixtures.
 
 ## Tests

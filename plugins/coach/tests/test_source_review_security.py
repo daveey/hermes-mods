@@ -21,6 +21,7 @@ def load(name):
 @pytest.mark.parametrize("target", [
     "-oProxyCommand=touch marker", "-Fconfig", "user@-oProxyCommand=x", "",
     "host name", "host\nname", "ssh://host", "host;id", "user@@host", None,
+    "user@-Fx", "node\n",
 ])
 @pytest.mark.parametrize("entry", ["probe", "forward"])
 def test_ssh_rejects_invalid_destinations_without_spawning(tmp_path, monkeypatch, target, entry):
@@ -108,3 +109,27 @@ def test_both_repo_diff_invocations_disable_drivers(monkeypatch):
     diffs = [args for args in calls if args[0] == "diff"]
     assert len(diffs) == 2
     assert all("--no-ext-diff" in args and "--no-textconv" in args for args in diffs)
+
+
+@pytest.mark.parametrize("reach", ["host name", "-oProxyCommand=true", "user@-Fx", "node\n"])
+def test_silent_forwarder_invalid_reach_files_without_running_ssh(tmp_path, monkeypatch, reach):
+    sg = load("signals")
+    now = 1000000
+    sg.ingest(tmp_path, json.dumps({"kind": "heartbeat", "host": "node", "reach": reach}), now=now)
+    monkeypatch.setattr(sg, "config", lambda *a: {})
+    monkeypatch.setattr(sg.subprocess, "run", lambda *a, **kw: pytest.fail("invalid reach spawned ssh"))
+    findings = sg.silent_forwarders(tmp_path, now=now + 8 * 3600)
+    assert len(findings) == 1, "invalid reach must not suppress a silent-forwarder defect"
+    assert findings[0]["host"] == "node"
+    assert "cannot tell" in findings[0]["details"]
+    assert "set reach_as" in findings[0]["details"]
+    assert "invalid ssh destination" in (tmp_path / "coach/log.jsonl").read_text()
+
+
+def test_invalid_forward_destination_reports_backlog_without_advancing_cursor(tmp_path, monkeypatch):
+    sg = load("signals")
+    monkeypatch.setattr(sg, "collect", lambda *a: [{"kind": "collector"}, {"kind": "collector"}])
+    monkeypatch.setattr(sg, "save_cursor", lambda *a: pytest.fail("refusal advanced cursor"))
+    monkeypatch.setattr(sg.subprocess, "run", lambda *a, **kw: pytest.fail("refusal spawned ssh"))
+    result = sg.forward(tmp_path, "node", "-Fx", cfg={})
+    assert result == {"ok": False, "sent": 0, "pending": 2, "detail": "invalid ssh destination"}
