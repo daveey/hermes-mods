@@ -87,7 +87,7 @@ export function renderWaitEta(eta, now, props = {}) {
 }
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v28-timing-wrap'
+const VERSION = 'session-panel-v29-frame'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -625,11 +625,37 @@ export function rowMenuItems(row, currentSession = null) {
     ...actions.filter(a => a?.kind === 'open_process' && a.target?.id).map(action => ({key: 'process', label: 'Open process', action}))
   ]
 }
-export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null } = {}) {
-  if (!validModel(model)) return null
+/** Owner-qualified identity of a bound ask row: the same [gateway, profile, request id] key user-steps uses. */
+const boundAsk = row => {
+  if (!row?.request_id || !Number.isSafeInteger(row.request_revision)) return null
+  const a = (row.actions || []).find(x => x?.kind === 'decide' && x.request_id === row.request_id && x.revision === row.request_revision && str(x.owner?.gatewayId))
+  return a ? JSON.stringify([a.owner.gatewayId, a.owner.profile || 'default', row.request_id]) : null
+}
+/** Every bound ask the model carries: what a collapsed header still counts. */
+export const modelAsks = model => Object.fromEntries((model?.sections?.needs_you || []).filter(r => r?.kind !== 'blocker')
+  .map(r => [boundAsk(r), r.request_revision]).filter(([k]) => k))
+// One combined height budget for the session-status frame (rows + decision companion). The header never scrolls.
+export const PANEL_MAX_HEIGHT = '55vh'
+const frameStyle = { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: PANEL_MAX_HEIGHT, minHeight: 0,
+  display: 'flex', flexDirection: 'column', overflow: 'hidden', boxSizing: 'border-box',
+  borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', userSelect: 'text', WebkitUserSelect: 'text' }
+const bodyStyle = { minHeight: 0, minWidth: 0, flex: '1 1 auto', overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain' }
+/** A frame with no model header (loading, unsupported, empty model): still bounded, still scrolls inside. */
+export function bodyFrame(...children) {
+  return jsx('section', { 'data-session-panel': '', 'data-panel-frame': 'bare', 'aria-label': 'Session status', style: { ...frameStyle, padding: '6px 12px 8px' },
+    children: jsxs('div', { 'data-panel-body': '', style: bodyStyle, children }) })
+}
+const emptyCoverage = state => ({ state, collapsed: false, drawn: {}, counted: {} })
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null, companion = null } = {}) {
+  if (!validModel(model)) { const queue = companion?.(emptyCoverage('empty')); return queue ? bodyFrame(queue) : null }
   model = expireNativeWaits(expireDiagnostics(model, now), now, vouched)
   // Spec: hidden when there is neither open work nor finished history.
-  if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
+  if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) {
+    const queue = companion?.(emptyCoverage('empty'))
+    return queue ? bodyFrame(queue) : null
+  }
+  // Asks this render actually draws with their options (exact owner/request/revision), for the companion.
+  const drawn = {}
   const freshness = modelFreshness(model, { now, vouched })
   const status = freshness.stale ? null : model.header.status
   const hasHeader = status || model.header.source === 'derived'
@@ -669,11 +695,13 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         'data-row-menu-item': item.key, disabled: !item.action, onSelect: () => item.action && onAction(row, item.action), children: item.label }, item.key)) })
     ] }, row.key)
   }
-  const askRow = row => {
+  const askRow = (row, hidden = false) => {
+    const bound = boundAsk(row)
+    if (bound && !hidden) drawn[bound] = row.request_revision
     const status = decisionStatus(row)
     const enabled = option => !!onChoose && !!row.request_id && !!option.choice_id && row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision) && !status?.locked
     const decision = row.options.length > 0
-    return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source,
+    return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source, 'data-ask-binding': bound || undefined,
       style: { border: '1px solid var(--border)', borderLeft: `3px solid ${SECTION_COLOR.needs_you}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
       jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
         jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: decision ? 'Needs your decision' : 'Needs you' }),
@@ -767,20 +795,21 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const parent = entry.row.parent
     if (parent && nodes.has(parent)) children.set(parent, [...(children.get(parent) || []), entry])
   }
-  const drawTree = ({ row: raw, section }, visited = new Set()) => {
+  // Rows under the closed "done" disclosure are not visibly drawn: they never count as presented asks.
+  const drawTree = ({ row: raw, section }, visited = new Set(), hidden = section === 'done') => {
     if (visited.has(raw.key)) return null
     const row = clockRow(raw, now)
     if (raw.parent && nodes.has(raw.parent) && typeof row.nested_detail === 'string') row.detail = row.nested_detail
     const next = new Set([...visited, raw.key])
     return jsxs('div', { 'data-tree-node': row.key, 'data-tree-depth': row.depth || 0,
       'data-tree-parent': row.parent || undefined, children: [
-      section === 'needs_you' && row.kind !== 'blocker' ? askRow(row) : lineRow(row, section),
+      section === 'needs_you' && row.kind !== 'blocker' ? askRow(row, hidden) : lineRow(row, section),
       children.has(row.key) && jsx('div', { 'data-tree-guide': '', style: {
         // Desktop publishes --dt-border, not the legacy --border alias. Keep
         // geometry independent of color resolution so missing tokens cannot erase guides.
         marginLeft: 9, paddingLeft: 15, borderLeftWidth: 1, borderLeftStyle: 'solid',
         borderLeftColor: 'var(--dt-border, var(--border, #768390))', minWidth: 0
-      }, children: children.get(row.key).map(child => drawTree(child, next)) })
+      }, children: children.get(row.key).map(child => drawTree(child, next, hidden)) })
     ] }, row.key)
   }
   const roots = new Map(MODEL_SECTIONS.map(([section]) => [section, []]))
@@ -797,10 +826,11 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   }
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
     'data-collapsed': collapsed ? '' : undefined,
-    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: collapsed ? '6px 12px 4px' : '6px 12px 8px', boxSizing: 'border-box',
-      borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
+    // The frame never scrolls; only its body does, so the header (and its collapse control) stays reachable however
+    // many rows and companion decisions the body holds.
+    style: { ...frameStyle, padding: collapsed ? '6px 12px 4px' : '6px 12px 8px' }, children: [
     jsx('style', { 'data-panel-css': '', children: PANEL_CSS }),
-    jsxs('header', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, lineHeight: '18px', minWidth: 0 }, children: [
+    jsxs('header', { 'data-panel-header': '', style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, lineHeight: '18px', minWidth: 0, flexShrink: 0 }, children: [
       // The caret minimizes the panel to this header line; a new ask or stuck item reopens it.
       jsxs(onToggle ? 'button' : 'span', { ...(onToggle ? { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed,
           'aria-label': collapsed ? 'Expand session status' : 'Collapse session status',
@@ -818,6 +848,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
+    // Collapsing hides the whole body, rows and companion alike; the companion stays mounted (hidden) so its
+    // delivery recovery keeps running.
+    jsxs('div', { 'data-panel-body': '', hidden: collapsed || undefined, style: bodyStyle, children: [
     ...MODEL_SECTIONS.map(([section, label]) => {
       if (collapsed || !roots.get(section).length) return false
       const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
@@ -827,7 +860,10 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('summary', { style: { margin: '0 0 6px', listStylePosition: 'inside', color: 'var(--muted-foreground)' }, children: heading }), ...rows
       ] }, section)
       return jsxs('div', { 'data-model-section': section, children: [jsx('div', { style: { margin: '12px 0 6px' }, children: heading }), ...rows] }, section)
-    })
+    }),
+    // Evaluated after the sections above (array order), so `drawn` holds exactly the asks this render drew.
+    companion?.({ state: 'presented', collapsed: !!collapsed, drawn: collapsed ? {} : { ...drawn }, counted: modelAsks(model) }) || null
+    ] })
   ] })
 }
 
@@ -1123,6 +1159,17 @@ export function PendingModel({ waiting, onRetry }) {
   ] })
 }
 // Each mounted panel owns a short lease; sidebar registrations are not visibility.
+// Scopes whose mounted Panel hosts the user-steps decision companion in its body (user-steps reads this to decide
+// whether its "panel missing" error applies).
+const hostedScopes = new Map()
+const hostingChanged = () => { try { window.dispatchEvent?.(new window.Event('hermes:session-panel-hosting')) } catch {} }
+export function hostsQueue(route) { return !!route?.session && (hostedScopes.get(routeKey(route)) || 0) > 0 }
+/** The user-steps companion inside the panel body. Read at every render (the panel ticks each second), so a
+ *  late-registered or hot-reloaded user-steps attaches without a reload; keyed by version, so exactly one mounts. */
+export function companionFor(coverage) {
+  const us = typeof window !== 'undefined' ? window.__userSteps : null
+  return typeof us?.ActionQueue === 'function' ? jsx(us.ActionQueue, { coverage }, `user-steps:${str(us.version)}`) : null
+}
 export function watchPanel(route) {
   const subscriber = `panel-${Math.random().toString(36).slice(2)}-${Date.now()}`
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
@@ -1155,6 +1202,17 @@ export function Panel() {
   const route = panelRoute(), scope = routeKey(route)
   useEffect(() => setProcess(null), [scope])
   useEffect(() => watchPanel(route), [scope])
+  useEffect(() => {
+    if (!route.session) return
+    hostedScopes.set(scope, (hostedScopes.get(scope) || 0) + 1); hostingChanged()
+    return () => { const n = (hostedScopes.get(scope) || 1) - 1; if (n > 0) hostedScopes.set(scope, n); else hostedScopes.delete(scope); hostingChanged() }
+  }, [scope])
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const fn = () => tick(v => v + 1)
+    window.addEventListener?.('hermes:user-steps-changed', fn)
+    return () => window.removeEventListener?.('hermes:user-steps-changed', fn)
+  }, [])
   useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
   useEffect(() => {
     const timer = setInterval(() => { if (!document.hidden) tick(v => v + 1) }, 1000)
@@ -1181,11 +1239,14 @@ export function Panel() {
   const model = decisionPresentation(cachedModel(route), route)
   useEffect(() => { observeDecisionRender(route, model) })
   if (!route.session) return null
-  if (unsupportedFeed(route)) return jsx('div', { role: 'alert', 'data-session-panel-error': '',
-    children: `Session panel isn't served for profile ${route.profile || 'default'} on ${route.connectionId}: ${feeds.get(connKey(route.connectionId, route.profile)).reason}. Linked task status remains in the task strip.` })
-  if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
+  if (unsupportedFeed(route)) return bodyFrame(jsx('div', { role: 'alert', 'data-session-panel-error': '',
+    children: `Session panel isn't served for profile ${route.profile || 'default'} on ${route.connectionId}: ${feeds.get(connKey(route.connectionId, route.profile)).reason}. Linked task status remains in the task strip.` }, 'error'),
+    companionFor({ state: 'unsupported', collapsed: false, drawn: {}, counted: {} }))
+  if (!model) return bodyFrame(jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) }, 'pending'),
+    companionFor({ state: 'loading', collapsed: false, drawn: {}, counted: {} }))
   const collapsed = isCollapsed(model, readCollapsed(scope))
   const panel = renderModel(model, {
+    companion: companionFor,
     // Cold/legacy cache has no source clock: absence of a heartbeat is not a voucher.
     vouched: feedVouches(route),
     collapsed,
@@ -1222,7 +1283,7 @@ export default {
   name: 'Session Panel',
   register(ctx) {
     osApi = ctx?.os || null
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, covers, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, covers, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow, hostsQueue }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null

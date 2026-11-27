@@ -258,10 +258,15 @@ test('companion: a plain open ask with nothing only this plugin can do draws no 
  const r = question({ choices: [{ id: 'c0', label: 'Red', effect: 'answer' }, { id: 'c1', label: 'Green', effect: 'answer' }] })
  await m.refreshRequests(async () => ({ requests: [r] }))
  window.hermesDesktop = { api: async ({ path }) => path.endsWith('/ping') ? { features: [] } : { requests: [r] } }
- await show(React.createElement(m.ActionQueue, { key: 'idle' }))
+ await show(React.createElement(m.ActionQueue, { key: 'idle', coverage: { state: 'presented', collapsed: false, drawn: { [m.requestKey(r)]: r.revision }, counted: {} } }))
  await React.act(async () => { await flush(); await flush() })
  assert.ok(el().querySelector('[data-action-request]') === null)
  assert.equal(el().textContent.includes('Which color?'), false)
+ // Negative control: without that exact coverage the same ask explains itself instead of vanishing or
+ // standing as a bare title.
+ await show(React.createElement(m.ActionQueue, { key: 'uncovered' }))
+ await React.act(async () => { await flush(); await flush() })
+ assert.equal(el().querySelector('[data-ask-coverage]')?.getAttribute('data-ask-coverage'), 'unmounted')
  delete window.hermesDesktop
 })
 
@@ -291,11 +296,22 @@ test('registered strip: with the panel loaded it keeps the queue but never the l
  try {
   const strip = areas.find(a => a.id === 'strip')
   panelOn()
+  // Mixed-version rollout: a panel without the hosting frame (no hostsQueue) keeps the queue in this slot.
   const withPanel = strip.render()
-  assert.equal(withPanel.type, m.ActionQueue, 'panel loaded: only the queue, no legacy Strip')
+  assert.equal(withPanel.type, m.ActionQueue, 'older panel loaded: only the queue, no legacy Strip')
   assert.deepEqual(withPanel.props, {})
   assert.equal('Strip' in window.__userSteps, false)
- } finally { panelOff(); dispose() }
+  // A hosting panel draws the queue inside its own frame: this slot is the missing-panel error only, and quiet.
+  window.__sessionPanel = { active: true, hostsQueue: () => true }
+  const hosted = strip.render()
+  assert.equal(hosted.type, m.PanelMissing, 'no second composer queue beside the hosting panel')
+  m.panelWait.ms = 0
+  await show(hosted)
+  assert.equal(el().textContent, '', 'hosted: no error, no queue')
+  window.__sessionPanel = { active: true, hostsQueue: () => false }
+  await show(strip.render())
+  assert.equal(el().querySelector('[data-user-steps-panel-missing]')?.getAttribute('data-user-steps-panel-missing'), 'unmounted', 'loaded but not mounted for this chat is an explicit error')
+ } finally { m.panelWait.ms = 10000; panelOff(); dispose(); await show(null) }
 })
 
 test('companion queue polls requests itself (the legacy Strip that used to drive the poll is not mounted)', async () => {

@@ -329,7 +329,8 @@ test('legacy "Request complete action" placeholder never renders for any kind (D
  const legacy=[{id:'request-context',label:'Request complete action',effect:'revise'}]
  for(const kind of ['approval','external_step','choice','input']) {
   const r=freshRequest({kind,state:'needs_context',title:'Decide whether web Diplomacy gets a labeled animation',scope:{complete:false,markdown:"Should it make a clearly labeled animation rebuilt from the replay's recorded moves, or should web Diplomacy be left out of the clip set?",sourceRefs:[]},outcomes:{revise:'Request complete action; keep work blocked.'},choices:legacy})
-  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>assert.fail('no submission')}))
+  const drawn={state:'presented',collapsed:false,drawn:{[m.requestKey(r)]:r.revision},counted:{}}
+  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,coverage:drawn,call:async()=>assert.fail('no submission')}))
   assert.doesNotMatch(el().textContent,/Request complete action/,kind)
   const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
   if(kind==='approval') assert.deepEqual(labels,['Ask agent for the plan','Dismiss'])
