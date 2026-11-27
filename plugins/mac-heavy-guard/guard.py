@@ -868,6 +868,15 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
                 prefix = "".join(out)
+                # NAME may contain command substitutions (`coproc a$(:)`; backticks are already `$(...)`
+                # here). Collapse innermost `$(...)` spans so they read as ordinary word characters.
+                while True:
+                    collapsed = re.sub(r"\$\([^()]*\)", "X", prefix)
+                    if collapsed == prefix:
+                        break
+                    prefix = collapsed
+                if "$(" in prefix and re.search(r"(?:^|[;&|({\n\s])coproc\b", prefix):
+                    raise _UnsupportedSubstitution  # unbalanced/quoted-paren NAME: hold conservatively
                 # Bash function/coproc NAME is a shell word, not an identifier.
                 # Preserve quote provenance: only the NAME may be quoted, never
                 # the reserved prefix or case keyword. Include joined word parts.
