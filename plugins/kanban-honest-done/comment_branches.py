@@ -32,6 +32,13 @@ TOP_LEVEL_VALUE_FLAGS = frozenset({
     "-r", "--resume", "-s", "--skills", "--usage-file", "--in", "--cpu-profile",
 })
 TOP_LEVEL_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
+# Include switches as well: --i is ambiguous between --in and --ignore-*.
+# Core's pre-argparse profile spelling is included too, conservatively.
+TOP_LEVEL_OPTIONS = TOP_LEVEL_VALUE_FLAGS | TOP_LEVEL_OPTIONAL_VALUE_FLAGS | frozenset({
+    "-h", "--help", "--version", "-V", "--no-restore-cwd", "--worktree", "-w",
+    "--accept-hooks", "--yolo", "--pass-session-id", "--checkpoints", "--ignore-user-config",
+    "--ignore-rules", "--safe-mode", "--tui", "--native", "--tui-native", "--cli", "--dev",
+})
 
 
 def kanban_indexes(seg):
@@ -40,15 +47,30 @@ def kanban_indexes(seg):
         real = os.path.basename(tok) in ("hermes", "hermes.exe")
         if not (real or tok.endswith("hermes_cli.main")):
             continue
-        j = h + 1
-        while j < len(seg) and seg[j].startswith("-"):
-            if seg[j] == "--":
-                # Core's command_argv consumes this marker, then dispatches the next token.
+        pending, seen = [h + 1], set()
+        while pending:
+            j = pending.pop()
+            if j in seen or j >= len(seg):
+                continue
+            seen.add(j)
+            token = seg[j]
+            if token == "--":
+                # Consume exactly once; no flags may be scanned after this marker.
                 j += 1
-                break
-            j += 2 if "=" not in seg[j] and seg[j] in TOP_LEVEL_VALUE_FLAGS else 1
-        if j < len(seg) and (seg[j] == "kanban" or (real and os.path.basename(seg[j]) == "kanban")):
-            yield j
+            elif token.startswith("-"):
+                hit = _resolve(token, TOP_LEVEL_OPTIONS) if token.startswith("--") else None
+                option = hit[0] if hit else token
+                # Argparse accepts unique long prefixes. Ambiguous/unknown flags cannot run,
+                # but retaining both readings is fail-closed. Each index is visited once.
+                takes = option in TOP_LEVEL_VALUE_FLAGS
+                uncertain = option in TOP_LEVEL_OPTIONAL_VALUE_FLAGS or option == "" or option not in TOP_LEVEL_OPTIONS
+                if "=" not in token and (takes or uncertain):
+                    pending.append(j + 2)
+                if not takes or "=" in token:
+                    pending.append(j + 1)
+                continue
+            if j < len(seg) and (seg[j] == "kanban" or (real and os.path.basename(seg[j]) == "kanban")):
+                yield j
 
 
 def _kanban_options(seg, rest):

@@ -6,8 +6,10 @@ from test_honest_done import core, plugin, OWN
 CASES = {
     'waiver': 'hermes {f} kanban complete ' + OWN + ' --result "check 4 failed; waived"',
     'narrow': 'hermes {f} kanban edit ' + OWN + ' --title new',
+    'handoff': 'hermes {f} kanban complete ' + OWN + ' --result "$(cat s)"',
 }
-FLAGS = ['', '-p default', '--profile default', '--profile=default', '-p x --model m', '--reasoning high -p x', '-c -p x', '--', '-p x --', '--model m --']
+FLAGS = ['', '-p default', '--profile default', '--profile=default', '-p x --model m', '--reasoning high -p x', '-c -p x', '--', '-p x --', '--model m --',
+         '--mod m', '--reas high', '--prov x', '--usage x', '--cpu x', '--tool x', '--skil x', '--res x', '--one x']
 
 
 def held(cmd):
@@ -53,6 +55,33 @@ def test_static_list_matches_core():
     pre = {name for name, takes in PRE_ARGPARSE_INHERITED_FLAGS if takes}
     assert mine.TOP_LEVEL_VALUE_FLAGS == required | pre
     assert mine.TOP_LEVEL_OPTIONAL_VALUE_FLAGS == optional
+    from hermes_cli._parser import build_top_level_parser
+    parser, _, _ = build_top_level_parser()
+    assert mine.TOP_LEVEL_OPTIONS == {o for a in parser._actions for o in a.option_strings} | {n for n, _ in PRE_ARGPARSE_INHERITED_FLAGS}
+    # Exhaust every unique prefix of every real value flag; profile is stripped before argparse.
+    options = parser._option_string_actions
+    for option in required:
+        if not option.startswith('--'):
+            continue
+        for length in range(3, len(option) + 1):
+            prefix = option[:length]
+            hits = [o for o in options if o.startswith(prefix)]
+            if prefix in options or hits == [option]:
+                for form in (prefix + ' x', prefix + '=x'):
+                    assert held(f'hermes {form} kanban edit {OWN} --title new'), form
+
+
+@pytest.mark.parametrize('flags', ['-- --', '-- -p x', '-p x -- --', '--model m -- --', '-- chat'])
+def test_marker_negative_controls(flags):
+    command = f'hermes {flags} kanban edit {OWN} --title new'
+    assert core._kanban_verb(core._segments(command)[0]) is None
+    assert held(command) is None
+
+
+@pytest.mark.parametrize('flags', ['--i', '--c', '--i x', '--c x', '--i=x', '--c=x', '--con -p x'])
+def test_ambiguous_and_optional_value_flags_fail_closed(flags):
+    # Ambiguous options are invalid CLI, but neither arity may conceal a write.
+    assert held(f'hermes {flags} kanban edit {OWN} --title new')
 
 
 @pytest.mark.parametrize('flags', FLAGS)
