@@ -215,6 +215,71 @@ def test_ocr_execution_failure_cleans_private_build(compiler, monkeypatch):
     assert not Path(calls[-1][0]).exists()
 
 
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_inspection_payload_and_log_have_no_target_geometry(screen, monkeypatch, tmp_path, dry_run):
+    monkeypatch.setattr(rs, 'read_dialogs', lambda path: [
+        line('Web page says: “Terminal” would like to access files'), line('Allow', x=300, y=200)])
+    result = json.loads(rs.handle_approve({'host': 'example.invalid', 'dry_run': dry_run}))
+    assert result['status'] == 'candidate'
+    assert result['inspection_only'] is True
+    def no_geometry(value):
+        if isinstance(value, dict):
+            assert not ({'button', 'request', 'x', 'y', 'w', 'h'} & value.keys())
+            for item in value.values():
+                no_geometry(item)
+        elif isinstance(value, list):
+            for item in value:
+                no_geometry(item)
+    no_geometry(result)
+    logs = list(tmp_path.glob('cache/remote-screen/*/approvals/*.json'))
+    assert len(logs) == 1
+    no_geometry(json.loads(logs[0].read_text()))
+    assert screen.clicks == []
+    description = rs.SCHEMAS['remote_input']['parameters']['properties']['screen_pixels']['description']
+    assert 'OCR' not in description
+
+
+def test_dialog_inspection_compiles_once_for_all_regions(compiler, tmp_path):
+    calls, _ = compiler
+    from PIL import Image
+    png = tmp_path / 'screen.png'
+    Image.new('RGB', (1200, 1200)).save(png)
+    original = rs.subprocess.run
+    def run(argv, **kw):
+        result = original(argv, **kw)
+        if not argv[0].endswith('swiftc'):
+            result.stdout = json.dumps([line('“Terminal” would like to access files', y=100),
+                                       line('“Terminal” would like to access files', y=700)])
+        return result
+    # compiler's monkeypatch fixture owns and restores this module-global binding.
+    rs.subprocess.run = run
+    rs.read_dialogs(png)
+    assert sum(argv[0].endswith('swiftc') for argv in calls) == 1
+    assert len(calls) == 4  # one build, full-screen OCR, two zooms
+    assert len({argv[0] for argv in calls if not argv[0].endswith('swiftc')}) == 1
+    assert not Path(calls[-1][0]).exists()
+
+
+def test_shared_binary_rechecked_before_zoom(compiler, tmp_path, monkeypatch):
+    calls, _ = compiler
+    from PIL import Image
+    png = tmp_path / 'screen.png'
+    Image.new('RGB', (1200, 1200)).save(png)
+    original = rs.subprocess.run
+    def run(argv, **kw):
+        result = original(argv, **kw)
+        if not argv[0].endswith('swiftc'):
+            result.stdout = json.dumps([line('“Terminal” would like to access files')])
+            Path(argv[0]).write_bytes(b'tampered after first OCR')
+        return result
+    monkeypatch.setattr(rs.subprocess, 'run', run)
+    with pytest.raises(RuntimeError, match='binary digest'):
+        rs.read_dialogs(png)
+    assert len(calls) == 2  # no zoom execution after tampering
+    assert not Path(calls[-1][0]).exists()
+    assert list(tmp_path.glob('*-zoom*.png')) == []
+
+
 def test_no_open_default_button():
     result = rs.find_dialog([line('“Terminal” would like to access files'), line('Open', y=200)], ['Terminal'])
     assert result['reason'] == 'no_approve_button'
