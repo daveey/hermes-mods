@@ -23,6 +23,10 @@ def test_real_arithmetic_remains_allowed(command):
     assert guard.check_shell(command) is None
 
 
+def test_join_before_expose_keeps_benign_continued_substitution_allowed():
+    assert guard.check_shell('echo "$(ec\\\nho ok)"') is None
+
+
 @pytest.mark.parametrize('heavy,benign', ANSI_ARITH_PAIRS)
 def test_bash_repro_executes_only_fake_pytest(tmp_path, heavy, benign):
     shim = tmp_path / 'pytest'
