@@ -26,7 +26,6 @@ def readers(local, fleet, mode):
     from hermes_cli import kanban_lockguard as guard, kanban_db_sync as sync, kanban_db as kb
     with contextlib.ExitStack() as scope:
         handles = []
-        deadline = time.monotonic() + 2
         for path, local_source in ((local, True), (fleet, False)):
             if path is None:
                 handles.append(None)
@@ -38,7 +37,10 @@ def readers(local, fleet, mode):
             if local_source:
                 db.text_factory = kb._lossy_text
             db.execute('PRAGMA query_only=ON')
-            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            # Both local and fleet handles participate in presentation. Do not
+            # leave the replica on a separate two-second wall deadline while
+            # the local handle receives the board's CPU/starvation budget.
+            sibling('board_merge').arm_deadline(db, phase='projector-open')
             if local_source:
                 sync.register_without_install(db, sync._db_key(db))
                 if sync.board_mode(db) != mode:

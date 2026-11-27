@@ -65,6 +65,26 @@ def test_borrowed_reader_reopens_rebuilt_file_and_never_writes(tmp_path):
             pass
 
 
+def test_borrowed_fleet_reader_uses_board_budget_not_two_second_job_clock(actual_board, monkeypatch):
+    _, config = actual_board
+    worker = module('projector')
+    clock = [100.]
+    monkeypatch.setattr(worker.time, 'monotonic', lambda: clock[0])
+    query = ('WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL '
+             'SELECT x+1 FROM n WHERE x<20000) SELECT max(x) FROM n')
+    with worker.readers(config['local'], config['fleet'], 'primary') as (local, fleet):
+        # Waiting for the control thread must not expire an otherwise healthy
+        # source, including the replica used by presentation(...).conn.
+        clock[0] = 103.
+        for db in (local, fleet):
+            assert db.execute(query).fetchone()[0] == 20000
+        # Keep the bounded snapshot lifetime; this is not an unlimited reader.
+        clock[0] = 131.
+        for db in (local, fleet):
+            with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+                db.execute(query).fetchone()
+
+
 def test_fallback_holds_single_slot_until_actual_completion():
     import threading
     client = module('projector_client')
