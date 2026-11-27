@@ -30,6 +30,8 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         numeric = [r.get('cards') for r in snap.get('governors', [])]
         accounted = all(isinstance(n, int) for n in numeric) and snap.get('idle_total') is not None
         balanced = accounted and sum(numeric) == snap['idle_total']
+        if snap.get('phase') == 'preclaim_aborted':
+            reasons.append('tick aborted at ' + str(snap.get('global_stop') or 'unknown governor'))
         if fresh and not balanced:
             reasons.append('incomplete governor accounting' if not accounted else 'governor accounting mismatch')
         if reasons:
@@ -77,15 +79,14 @@ def project(snapshots, cards, registry, *, adapter=None, now=None):
         # A receipt that did not observe this governor reports cards=None
         # (storage-admission abort): unknown, never a zero and never a crash.
         count = sum(r.get('cards') or 0 for r, _, _ in known)
-        observed = [(r, s, b) for r, s, b in known if r.get('cards') is not None and not r.get('unknown')]
+        observed = [(r, s, b) for r, s, b in known
+                    if r.get('cards') is not None and not r.get('unknown') and not any(
+                        g.get('verdict') == 'unknown' for g in b.get('globals') or [] if g['governor'] == ident)]
         unknown = not observed
         partial = len(known) != len(observations) or len(observed) != len(known) or not complete
-        # Unreached global checks must never be painted as off.
-        unknown |= any(g.get('verdict') == 'unknown' for _, _, b in known
-                       for g in b.get('globals') or [] if g['governor'] == ident)
-        # Prefer a charged gauge, then the freshest. An idle sibling's 0/50
-        # must not replace the 10/50 attached to the cards actually held.
-        gauges = [r for r, s, _ in sorted(known, key=lambda item: (not bool(item[0].get('cards')), item[1].get('age_s') or 0))
+        # Prefer the largest charged gauge, then the freshest. A sibling's
+        # 0/50 must not replace the 10/50 attached to the dominant held set.
+        gauges = [r for r, s, _ in sorted(known, key=lambda item: (-(item[0].get('cards') or 0), item[1].get('age_s') or 0))
                   if r.get('reading') is not None]
         reading_row = gauges[0] if gauges else {}
         at_cap = any(g.get('verdict') == 'stop' for _, _, b in known
