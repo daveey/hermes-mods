@@ -280,6 +280,7 @@ class Feed:
         self._board_dirty = set()
         self._board_failures = set()
         self._triage_fired = frozenset()  # triage-age crossings already re-reduced (see _triage_crossed)
+        self._triage_memo = {}  # session -> (held bundle, its model, (entered, crossing) pairs); see _triage_pairs
         self._board_capture_failures = set()  # only a successful strict recapture may clear these
         self._board = threading.Event()
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
@@ -1585,19 +1586,36 @@ class Feed:
     def _triage_deadline(self, now):
         # Detached inputs only; no task-history hydration or HTTP polling. A crossing this feed already
         # re-reduced for never re-arms the wake (bounded: one age pass per crossing, then normal cadence).
-        with self.lock:
-            due = [at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)]
+        due = [at for entered, at in self._triage_pairs() if entered <= now]
         fired = self._triage_fired
         return min((at for at in due if at > now or at not in fired), default=None)
 
+    def _triage_pairs(self):
+        """Every held bundle's ``(entered, crossing)`` pairs, derived once per held bundle.
+
+        idle_wait and beat run on every loop turn: re-executing the reducer module and re-walking each bundle
+        there (under the feed lock) slowed source publishes on loaded hosts. The pairs depend on the bundle
+        alone, so a bundle the producer has not replaced reuses its pairs; only replaced bundles are derived,
+        outside the lock.
+        """
+        with self.lock:
+            held = [(session, h['bundle']) for session, h in self.bundles.items()]
+        cache, fresh, model = self._triage_memo, {}, None
+        for session, bundle in held:
+            hit = cache.get(session)
+            if hit is None or hit[0] is not bundle or hit[1] is not bundle.get('model'):
+                model = model or _model()
+                hit = (bundle, bundle.get('model'), tuple(model.triage_clocks(bundle)))
+            fresh[session] = hit
+        self._triage_memo = fresh  # held references keep identity checks sound; dropped chats are released
+        return [pair for *_, pairs in fresh.values() for pair in pairs]
+
     def _triage_crossed(self, now):
         """Record the crossings an age pass is about to repaint."""
-        with self.lock:
-            # Replaced wholesale: only deadlines that are currently past are retained, so the latch
-            # stays bounded and a later re-entry (a new, future deadline) arms normally.
-            self._triage_fired = frozenset(
-                at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)
-                if at <= now)
+        # Replaced wholesale: only deadlines that are currently past are retained, so the latch
+        # stays bounded and a later re-entry (a new, future deadline) arms normally.
+        self._triage_fired = frozenset(
+            at for entered, at in self._triage_pairs() if entered <= now and at <= now)
 
     def beat(self) -> int:
         """Between data changes: registrations are renewed, expired interest dropped and a heartbeat pushed when

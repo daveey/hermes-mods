@@ -571,11 +571,18 @@ def triage_overdue(row, bundle, now):
 
 
 def triage_deadlines(bundle, now):
-    """Next overdue-triage crossings the held model has not painted yet (detached evidence only).
+    """Next overdue-triage crossings the held model has not painted yet (detached evidence only)."""
+    return [at for entered, at in triage_clocks(bundle) if entered <= now]
+
+
+def triage_clocks(bundle):
+    """``(entered, crossing)`` for each shown card whose overdue-triage crossing is not yet painted.
 
     Keys use the reducer's own serving-gateway identity (``serving_row``), so a local row that the model has
     already painted overdue is covered and a crossed deadline never re-arms the feed's wake. Only cards the
-    model shows (ordinary rows and dependency/shared-blocker groups) can change presentation.
+    model shows (ordinary rows and dependency/shared-blocker groups) can change presentation. The result
+    depends on the bundle alone (a future entry is filtered by the caller's clock), so the feed derives it
+    once per held bundle instead of on every idle wait.
     """
     try:
         from hermes_cli.kanban_triage_attention import next_transition
@@ -600,8 +607,8 @@ def triage_deadlines(bundle, now):
         if group.get('status') == 'triage' and pending(group):
             clocks.append(triage_clock({**group, **obj(obj(obj(obj(bundle.get('cards')).get(group.get('id'))).get(
                 'detail')).get('task'))}, bundle))
-    return [at for row in clocks if (entered := triage_entry(row, {})) is not None and entered <= now
-            if (at := next_transition(row, now=min(now, entered))) is not None]
+    return [(entered, at) for row in clocks if (entered := triage_entry(row, {})) is not None
+            if (at := next_transition(row, now=entered)) is not None]
 
 
 def triage_deadline(bundle, now):
