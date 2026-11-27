@@ -14,10 +14,15 @@ def test_0720_mixed_board_receipts_preserve_known_charges():
     registry = [dict(id=k, label=k, kind='hold', threshold='limit')
                 for k in ('lane_gate', 'storage_admission', 'llm_pool')]
     rows = [dict(governor='lane_gate', scope='hermes', cards=64, reading=10, threshold=50),
-            dict(governor='storage_admission', cards=2),
-            dict(governor='llm_pool', cards=None, unknown=True)]
-    snapshots = [dict(board='default', available=True, stale=False, idle_total=None,
-                      flow_available=False, open_lanes=['hermes'], cards={}, governors=rows),
+            dict(governor='storage_admission', cards=0), dict(governor='llm_pool', cards=0)]
+    snapshots = [dict(board='hermes', available=True, stale=False, idle_total=64,
+                      open_lanes=['hermes'], cards={}, governors=rows),
+                 dict(board='default', available=True, stale=False, idle_total=None,
+                      phase='preclaim_aborted', global_stop='storage_admission',
+                      open_lanes=['other'], cards={}, governors=[
+                          dict(governor='storage_admission', cards=2),
+                          dict(governor='lane_gate', cards=None, unknown=True),
+                          dict(governor='llm_pool', cards=None, unknown=True)]),
                  dict(board='askeve', available=True, stale=True, age_s=900,
                       open_lanes=['project'], cards={}, governors=[dict(governor='llm_pool', cards=1)])]
     result = module('governors').project(snapshots, [], registry)
@@ -26,10 +31,28 @@ def test_0720_mixed_board_receipts_preserve_known_charges():
     assert (gate['state'], gate['cards_charged'], gate['reading'], gate['threshold']) == ('on', 64, 10, 50)
     assert gate['readings'][0]['cards'] == rows[0]['cards']
     assert projected['storage_admission']['state'] == 'on'
-    assert projected['llm_pool']['state'] == 'unknown'
-    assert result['counts']['unknown'] == 1
+    assert projected['llm_pool']['state'] == 'off'  # healthy board observed zero; not a fleet zero
+    assert projected['llm_pool']['partial']
+    assert result['counts']['unknown'] == 0
+    default = next(s for s in projected['llm_pool']['scope'] if s['board'] == 'default')
+    assert default['available'] is False and 'storage_admission' in default['reason']
+    assert next(s for s in gate['scope'] if s['board'] == 'hermes')['available'] is True
+    assert result['incomplete_lanes'] == ['other', 'project']
     assert any(s['board'] == 'askeve' and 'stale' in s['reason'] for s in result['scope'])
     assert result['idle_total'] is None
+
+
+def test_fresher_smaller_sibling_does_not_replace_dominant_lane_reading():
+    registry = [dict(id='lane_gate', label='Lane gate', kind='hold', threshold='budget')]
+    result = module('governors').project([
+        dict(board='default', available=True, age_s=20, idle_total=64, cards={}, governors=[
+            dict(governor='lane_gate', scope='hermes', cards=64, reading=10, threshold=50)]),
+        dict(board='sibling', available=True, age_s=1, idle_total=4, cards={}, governors=[
+            dict(governor='lane_gate', scope='hermes', cards=4, reading=0, threshold=50)])], [], registry)
+    row, = result['rows']
+    assert row['cards_charged'] == 68
+    assert row['reading'] == 10
+    assert [(r['board'], r['cards'], r['reading']) for r in row['readings']] == [('default', 64, 10), ('sibling', 4, 0)]
 
 
 def test_count_mismatch_does_not_erase_other_board_evidence():
