@@ -31,9 +31,9 @@ def test_0720_mixed_board_receipts_preserve_known_charges():
     assert (gate['state'], gate['cards_charged'], gate['reading'], gate['threshold']) == ('on', 64, 10, 50)
     assert gate['readings'][0]['cards'] == rows[0]['cards']
     assert projected['storage_admission']['state'] == 'on'
-    assert projected['llm_pool']['state'] == 'off'  # healthy board observed zero; not a fleet zero
+    assert projected['llm_pool']['state'] == 'unknown'  # healthy zero cannot certify an unreached sibling
     assert projected['llm_pool']['partial']
-    assert result['counts']['unknown'] == 0
+    assert result['counts']['unknown'] == 1
     default = next(s for s in projected['llm_pool']['scope'] if s['board'] == 'default')
     assert default['available'] is False and 'storage_admission' in default['reason']
     assert next(s for s in gate['scope'] if s['board'] == 'hermes')['available'] is True

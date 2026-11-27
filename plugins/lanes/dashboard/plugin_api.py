@@ -402,7 +402,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
     pairs = []
     # Sidecar receipts do not depend on a successful SQL flow projection.
     metas = kb.list_boards(include_archived=False)
-    receipt_by_board = {current: _sibling('governors').read_snapshot(conn=conn)}
+    receipt_by_board = {current: _sibling('governors').read_snapshot(conn=conn, board=current)}
     for meta in metas:
         slug = meta.get('slug') or kb.DEFAULT_BOARD
         if slug != current:
