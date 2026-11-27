@@ -4,6 +4,93 @@ import time
 WINDOWS = {'1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800}
 
 
+def registry_slots(registry):
+    """Active configured machines, not an invented local/fleet-size default."""
+    if not isinstance(registry, dict) or not registry.get('machines'):
+        return None
+    entries = [m for m in registry['machines'].values()
+               if m.get('state') in (None, 'active') and not m.get('hold')]
+    if any(type(m.get('max_card_runs')) is not int or m['max_card_runs'] < 0 for m in entries):
+        return None
+    return sum(m['max_card_runs'] for m in entries)
+
+
+_registry_lock = __import__('threading').Lock()
+_registry_at = 0.
+_registry_value = None
+_registry_busy = False
+
+
+def fleet_slots():
+    """Nonblocking registry refresh: never put Board HTTP on a sidebar read."""
+    global _registry_busy, _registry_at, _registry_value
+    import threading
+    with _registry_lock:
+        if not _registry_busy and time.monotonic() - _registry_at > 60:
+            _registry_busy = True
+            def refresh():
+                global _registry_busy, _registry_at, _registry_value
+                try:
+                    from hermes_cli import kanban_worker_node as node
+                    value = registry_slots(node.registry(require_fresh=True))
+                except (ImportError, OSError, RuntimeError, ValueError):
+                    value = None
+                finally:
+                    with _registry_lock:
+                        _registry_value = locals().get('value')
+                        _registry_at = time.monotonic()
+                        _registry_busy = False
+            threading.Thread(target=refresh, daemon=True, name='lane-fleet-slots').start()
+        return _registry_value
+
+
+def present(view, slots):
+    """All chart scales and hypothetical cap counts are hub-owned, after board merge.
+
+    Forecast red means observed running demand exceeds the draft cap, not a
+    historical rejection. Unknown samples stay unknown in every preview.
+    """
+    view['fleet_slots'] = slots
+    for row in view.get('lanes', {}).values():
+        ticks = row.get('ticks')
+        if not isinstance(ticks, dict):
+            continue
+        from copy import deepcopy
+        ticks = deepcopy(ticks)
+        row['ticks'] = ticks
+        cells = ticks['cells']
+        peak = max((c.get('running') or 0 for c in cells), default=0) or 1
+        def visual(cell, cap, forecast=False):
+            cell = dict(cell)
+            running = cell.get('running')
+            if running is None:
+                cell.update(state='unknown', visual=dict(height=1, opacity=1))
+                return cell
+            if forecast:
+                cell['cap'] = cap
+                cell['state'] = ('rejecting' if cap is not None and running > cap else
+                                 'full' if cap is not None and running >= cap and running else
+                                 'partial' if running else 'empty')
+                cell['forecast'] = True
+            scale = cap if cap is not None and cap > 0 else peak
+            ratio = min(1, running / scale)
+            cell['visual'] = dict(height=(max(.15, ratio) if cell['state'] == 'partial' else
+                                          .15 if cell['state'] == 'empty' else 1),
+                                  opacity=.25 + .5 * ratio if cell['state'] == 'partial' else 1)
+            return cell
+        ticks['cells'] = [visual(c, c.get('cap')) for c in cells]
+        if type(slots) is int and slots >= 0:
+            previews = {}
+            for cap in [*range(slots + 1), None]:
+                previews['unlimited' if cap is None else str(cap)] = dict(
+                    cells=[visual(c, cap, True) for c in cells], total=len(cells),
+                    affected=sum(c.get('running') is not None and cap is not None and c['running'] > cap for c in cells),
+                    unknown=sum(c.get('running') is None for c in cells),
+                    now=row.get('status', {}).get('run'))
+            ticks['previews'] = previews
+    return view
+
+
 def spend(db, policy, *, now=None):
     """Same per-task/run MAX receipts and rounding as core kanban_lanes.usage.
 

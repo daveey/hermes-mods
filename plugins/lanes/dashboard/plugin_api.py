@@ -305,10 +305,12 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
     """Same hub-computed projection for owned in-process or borrowed RPC readers."""
     if not sources:
         snap, raw = _governed_sources(mods, conn, evidence, hours, window)
+        metrics = _sibling('metrics')
+        slots = metrics.fleet_slots()
         if variants:
-            return {name: _view_module().project(snap, raw, flag)
+            return {name: metrics.present(_view_module().project(snap, raw, flag), slots)
                     for name, flag in (('collapsed', False), ('expanded', True))}
-        return _view_module().project(snap, raw, expanded)
+        return metrics.present(_view_module().project(snap, raw, expanded), slots)
     metrics_now = time.time() if metrics_now is None else metrics_now
     snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
     if snap.get('configured'):
