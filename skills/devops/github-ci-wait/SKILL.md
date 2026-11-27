@@ -168,24 +168,7 @@ Before binding GitHub run heads to native manifests, read `references/native-art
 
 ## Dependency mirror proof portability
 
-Key dependency-only bundles on their real compatibility inputs (pinned toolchains,
-lockfiles, setup logic and normalized actual Maven version), not the whole hosted
-`ImageVersion`. GitHub serves multiple Ubuntu image versions concurrently, even
-between preparation and proof jobs in the same run; whole-image keys can make
-valid independently stored bundles impossible to restore reliably. Strip ANSI
-formatting and installation paths from Maven version identity, retain actual
-version changes as misses, and test both image-rollout stability and tool-version
-invalidation. Never relabel old archives under a new input key to hide a proof
-miss: rerun reviewed preparation and validate new provenance/digests.
-
-When a mirror runbook explicitly permits input-addressed reuse after a clean base
-merge, compare the complete compatibility-input pattern set, not only root locks.
-If every input is unchanged, preserve the original archive names, manifest source
-SHA, actual preparation run/artifact IDs and digests in the new isolated candidate's
-notes; never rewrite provenance or assign different keys. Independently validate
-the source delta and run the actual denied-registry proof on the NEW exact head.
-Source-only merges need not force redundant artifact downloads/publication loops,
-but old proof success never establishes new-head acceptance.
+Before keying or reusing dependency-only mirror proof bundles, read `references/dependency-mirror-proofs.md` (compatibility-input keys, no relabelled archives, provenance-preserving reuse).
 
 ## Optional Python lanes and setup-uv cache cleanup
 
@@ -254,7 +237,7 @@ See [required-context regression and causal chain](references/required-context-c
   the approval (Hermes: `hermes-core-wt ship`'s clean rebase, range-diff all `=`; state update-branch, same
   `git patch-id --verbatim`; ship-only-guard refuses briefs demanding a review per new head). Ask the SAME
   reviewer lineage for a delta review (done card: a continuation card, same model, parent of the ship card).
-- Exact-head failure: first read main HEAD's own failing checks (`gh api repos/O/R/commits/main/check-runs`) and their test ids: the same tests red on main mean every PR inherits them (shard numbers differ per PR), so find or file the main fix. Else check main's commits since the merge-base for a fix (rebase), or re-run the failing files on a detached worktree at the merge-base. Inherited: route it to the breaking commit's owner (search cards for the test name), rebase onto the fix, re-verify range-diff, push `--force-with-lease=<ref>:<old sha>`, request the delta review. Never merge over a red aggregate.
+- Exact-head failure: first read main HEAD's own failing checks (`gh api repos/O/R/commits/main/check-runs`) and their test ids: the same tests red on main mean every PR inherits them (shard numbers differ per PR), so find or file the main fix. Else check main's commits since the merge-base for a fix, or re-run the failing files on a detached worktree at the merge-base. Inherited: route it to the breaking commit's owner (search cards for the test name). To pick up a fix on main, read the job's checkout step: a merge-ref `pull_request` job needs only a new pull_request event (close and reopen keeps an approved head; pr-blocker-check `checks_failed`); a job that tests the head itself needs a rebase onto the fix, a re-verified range-diff, a `--force-with-lease=<ref>:<old sha>` push and a delta review. Never merge over a red aggregate.
 - Hosted Actions refused for billing on a repo WITHOUT branch protection or required checks: run the workflow's
   exact commands locally at the exact head for every matrix entry (`uv run --no-project --python 3.X --with
   pytest python -m pytest ...`), run any tests a worker's mutation fence blocked as the supervisor in a clean
