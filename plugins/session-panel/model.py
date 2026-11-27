@@ -471,7 +471,9 @@ def wait_target(row, bundle, detail):
         dep['gateway'] = (dep.get('home_gateway') or dep.get('gateway') or
                           (owner if isinstance(owner, str) else None) or
                           (bundle.get('gateway') if hydration.get('source') == 'live' else None))
-        dep['profile'] = dep.get('profile') or bundle.get('profile')
+        # The hydrated card's own listed profile, then the waiting row's (as wait_parents does), before the
+        # bundle's: a named park ("card t_…") must resolve the same owner the graph walk would.
+        dep['profile'] = dep.get('profile') or rec.get('profile') or row.get('profile') or bundle.get('profile')
         if dep.get('gateway') and dep.get('profile'):
             return dep
     return None

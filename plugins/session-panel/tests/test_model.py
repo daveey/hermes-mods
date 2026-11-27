@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import pytest
 
 try:  # The shared >600 s triage-age policy and lifecycle-entry derivation live in core.
     import hermes_cli.kanban_triage_attention  # noqa: F401
@@ -716,3 +717,18 @@ def test_done_row_shows_completion_age_as_wire_clock_without_revision_churn():
     assert d['clock_text']['detail'][0] == {'timestamp': float(NOW - 3 * 3600), 'format': 'ago'}
     assert d['clock_text']['detail'][1] == ' · 57m · 1 restart · $5.21'
     assert d['detail'] == '57m · 1 restart · $5.21'  # legacy static fallback drops the age
+
+
+@pytest.mark.parametrize('listed, expected', [('work', 'work'), (None, 'default')])
+def test_named_card_wait_resolves_the_dependency_owner_without_a_bundle_profile(listed, expected):
+    # Core names a todo card's parent in its wait ("card t_…"). A replica-served bundle carries no profile of
+    # its own, so the dependency's owner comes from its listed card, else from the waiting row: the same owner
+    # the graph walk gives. Without it the row lost its Open dependency action and its live-status line.
+    dep = 't_dddddddddddddddd'
+    row = task(status='todo', wait={'waiting_on': f'card {dep}'}, upstream={'id': dep, 'status': 'ready'})
+    rec = {'board': 'default', 'gateway': 'remote', **({'profile': listed} if listed else {}),
+           'detail': {'owner': 'remote', 'source': 'replica', 'task': {'id': dep, 'title': 'Named parent', 'status': 'ready'}}}
+    result = model.reduce_panel(bundle(row, cards={dep: rec}), now=NOW)['sections']['waiting'][0]
+    action = next(a for a in result['actions'] if a.get('role') == 'dependency')
+    assert action['target'] == {'id': dep, 'gateway': 'remote', 'profile': expected, 'board': 'default'}
+    assert 'Named parent' in result['detail'] and f'Blocking card: {dep} (ready)' in result['details']
