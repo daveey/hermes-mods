@@ -131,8 +131,12 @@ window-throughput count, not an open-card layer.
 Desktop renders these numbers even when card lists disagree. It may calculate
 pixel geometry, percentages for presentation, and edit PUT payloads; it never
 recounts cards, recomputes drift/targets, groups sources, or infers dams. Target
-and drift reflect the saved policy until Apply has reached the hub; editing a
-slider does not invent a client-side forecast.
+and drift reflect the saved policy until Apply has reached the hub. During a cap
+slider drag, Desktop may recolour the hub's per-cell running peaks against the
+draft cap and count affected/unknown periods as pure presentation; it never
+invents historical rejections or live card counts. Previews are not duplicated
+per cap on the wire. Missing lane limits show an unknown, disabled slider, not
+unlimited; only an explicit `max_workers: null` means no cap.
 
 ## Push and compatibility
 
