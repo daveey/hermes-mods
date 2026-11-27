@@ -706,6 +706,30 @@ def change_cursor():
 
 
 _governor_deadlines = ()
+_sibling_cursors = {}  # board path -> (settled file stamp, cursor entry)
+# A stamp is trusted only once the board has been quiet this long, so a later
+# write always moves mtime/ctime past it even on a coarse filesystem clock.
+SIBLING_SETTLE_NS = 1_000_000_000
+
+
+def _settled_stamp(path, now_ns=None):
+    """File identity of a sibling board, or None while it may still be moving."""
+    stamp = []
+    for suffix in ('', '-wal', '-journal'):
+        try:
+            s = os.stat(path + suffix)
+        except FileNotFoundError:
+            stamp.append(None)
+            continue
+        except OSError:
+            return None
+        stamp.append((s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))
+    newest = max((max(x[3], x[4]) for x in stamp if x), default=None)
+    if newest is None:
+        return None
+    if (time.time_ns() if now_ns is None else now_ns) - newest < SIBLING_SETTLE_NS:
+        return None
+    return tuple(stamp)
 
 
 def _capture_cursor():
@@ -770,6 +794,7 @@ def _capture_cursor():
     from hermes_cli import kanban_db as kb
     import json
     deadlines = []
+    seen_siblings = {}
     paths.append(str(kb.boards_root()))
     for meta in kb.list_boards(include_archived=False):
         paths.append(str(kb.board_metadata_path(meta['slug'])))
@@ -777,18 +802,34 @@ def _capture_cursor():
         if str(board_path) not in paths:
             paths.append(str(board_path))
             import sqlite3
-            try:
-                with _sibling('board_merge').read_board(board_path, snapshot=False) as db:
-                    revision = activity.read_key(db, activity.tables_for(board_path))
-                    cursors.append((str(board_path), revision if revision is not None else tuple(
-                        db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
-            except (OSError, RuntimeError, sqlite3.Error):
-                # Preserve the failed path in native coverage, including recovery
-                # writes/replacement; an unreadable sibling cannot hide healthy
-                # board revisions or terminate the shared stream.
-                cursors.append((str(board_path), 'unavailable'))
+            # Any board write wakes this capture; a quiet sibling whose files are
+            # unchanged since a settled stamp keeps its last revision instead of
+            # another connection open + read. Stamp before reading: a write that
+            # lands during the read changes the next stamp, so it is reread.
+            stamp = _settled_stamp(str(board_path))
+            kept = _sibling_cursors.get(str(board_path))
+            if stamp is not None and kept is not None and kept[0] == stamp:
+                cursors.append(kept[1])
+                seen_siblings[str(board_path)] = kept
+            else:
+                try:
+                    with _sibling('board_merge').read_board(board_path, snapshot=False) as db:
+                        revision = activity.read_key(db, activity.tables_for(board_path))
+                        entry = (str(board_path), revision if revision is not None else tuple(
+                            db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone()))
+                    cursors.append(entry)
+                    if stamp is not None:
+                        seen_siblings[str(board_path)] = (stamp, entry)
+                except (OSError, RuntimeError, sqlite3.Error):
+                    # Preserve the failed path in native coverage, including recovery
+                    # writes/replacement; an unreadable sibling cannot hide healthy
+                    # board revisions or terminate the shared stream. A failure is
+                    # never kept: the next capture reads the board again.
+                    cursors.append((str(board_path), 'unavailable'))
         paths.append(str(board_path) + '.governors.json')
     paths.append(str(Path(get_hermes_home()) / 'state/governors/mac-mini.json'))
+    _sibling_cursors.clear()
+    _sibling_cursors.update(seen_siblings)  # only boards still listed are kept
     for name in paths:
         if not name.endswith('.json') or not (name.endswith('.governors.json') or name.endswith('/mac-mini.json')):
             continue
