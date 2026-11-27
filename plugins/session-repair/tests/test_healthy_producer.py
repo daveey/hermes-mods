@@ -143,6 +143,53 @@ def test_card_waiting_on_a_producer_that_is_not_live_is_still_nudged(env, status
     assert len(long_wait_hits(env, producer_card_wait(env, status, **kw))) == 1
 
 
+def observation_wait(env, monkeypatch, *, wake_in=3000, waited_s=3300, **changes):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state': 'not_resolvable', 'happened': False})
+    tid = F.card(env.conn, 'Observe natural bounded rollout', status='scheduled')
+    F.age_all_events(env.conn, tid, env.now - waited_s)
+    payload = {'awaiting': {'kind': 'deploy', 'ref': 'opaque-rollout'},
+               'reason': 'Observe natural rollover at the scheduled checkpoint',
+               'wake_at': env.now + wake_in}
+    payload.update(changes)
+    F.event(env.conn, tid, 'scheduled', payload, at=env.now - waited_s)
+    return tid
+
+
+def test_bounded_unprobed_observation_wait_respects_owner_checkpoint(env, monkeypatch):
+    # Natural rollout/sweep was deliberately due in 50m, not stalled after 55m.
+    assert long_wait_hits(env, observation_wait(env, monkeypatch)) == []
+
+
+@pytest.mark.parametrize('wake_in', [0, -1, 3901])
+def test_observation_boundary_or_overlong_window_keeps_nudge(env, monkeypatch, wake_in):
+    assert len(long_wait_hits(env, observation_wait(env, monkeypatch, wake_in=wake_in))) == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'wake_check': 'python3 probe.py'},
+    {'awaiting': {'kind': 'deploy', 'ref': PR}},
+    {'awaiting': {'kind': 'ci', 'ref': 'opaque-rollout'}},
+    {'awaiting': {'kind': 'deploy', 'ref': ''}},
+    {'wake_at': 'not-a-time'},
+])
+def test_observation_guard_never_masks_pollable_or_invalid_waits(env, monkeypatch, changes):
+    assert len(long_wait_hits(env, observation_wait(env, monkeypatch, **changes))) == 1
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met'])
+def test_adverse_event_overrides_observation_checkpoint(env, monkeypatch, kind):
+    tid = observation_wait(env, monkeypatch)
+    F.event(env.conn, tid, kind, {}, at=env.now - 10)
+    assert len(long_wait_hits(env, tid)) == 1
+
+
+def test_completed_producer_overrides_observation_checkpoint(env, monkeypatch):
+    tid = observation_wait(env, monkeypatch)
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state',
+                        lambda *a: {'state': 'done', 'happened': True, 'happened_at': env.now - 601})
+    assert long_wait_hits(env, tid)[0]['variant'] == 'event_happened'
+
+
 # ── clock-overdue class: a superseded park is backstopped by core, not unwoken ───────────────────────────────────
 def superseded_park(env, parked_s):
     """A spent park (a later run claimed the card) with no replacement park imported yet."""
