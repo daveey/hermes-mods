@@ -450,7 +450,7 @@ def finish(tool_name: str = "", tool_call_id: str = "", **_: Any) -> None:
                     errors.append(exc)
                     # Never claim a refused output was saved to the user's destination.
                     for variant in _variants(str(item)):
-                        entry["mapping"][variant] = "[not delivered]"
+                        entry["mapping"][variant] = "not delivered"
                     logger.warning("mcp-file-access: output not delivered: %s", exc)
     finally:
         _drop_stage(entry["base"], entry["lease"])
