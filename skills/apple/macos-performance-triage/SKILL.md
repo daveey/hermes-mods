@@ -68,6 +68,13 @@ Treat Darwin `KERN_PROCARGS2` as an ambiguous argc-plus-NUL string blob, not an 
 
 For cooperative abort channels, explicitly opt in to an inherited read-only pipe, reject O_PATH descriptors where supported, and use the platform selector rather than select's low-fd bitmap. Fail closed on listener startup/read/select exceptions and test high descriptors, EOF, idempotent stop and leaked stop-pipe cleanup. Preserve cancellation status and original exception chains when thread/audit cleanup fails. Check cancellation around final snapshot/write/emit boundaries, but disclose the last-call race: the parent must invalidate any arm it cancelled even if a result raced out. A retained result file is not success. If invalidating it fails, retain that unlink error in the cancellation chain instead of suppressing OSError.
 
+## Darwin process identity versus argv authority
+
+Keep read-only identity observations separate from launch/signal authority. On Darwin, the source-defined private-header `PROC_PIDT_BSDINFOWITHUNIQID` flavor18 combines 136-byte BSD identity with 56-byte unique-ID/version metadata; validate the exact192-byte return against pinned OS source and test actual target compatibility. Bracket an executable-path read with the full combined identity, not birth alone. Equal endpoint observations still do not prove absence of intervening exec or mutable argv. The signed32-bit identity version may be negative; do not reject it by an invented positivity rule.
+
+Do not infer exact argv boundaries from KERN_PROCARGS2 executable-path NUL padding: legal leading-empty arguments can make environment bytes look like arguments. A remembered byte-exact spawn vector is initial-launch provenance, not independently observed arbitrary current argv, and direct-child provenance says nothing about Chromium-created helper argv. Settle that contract with the creator before implementing a forced-cleanup path; never silently substitute diagnostic fields or broaden signal authority. A reviewed own-process stdin observer can validate native ABI/library/path compatibility without a workload, but cannot certify suspended spawning, exec-change rejection, helper custody or Electron confinement. Retain its exact source-closure hashes and scope, and avoid repeatedly rerunning a passed observer as performance evidence.
+
+
 ## Wait classification and regression tests
 
 Match exact leaf names, not caller substrings or all symbols ending in `_trap`.
