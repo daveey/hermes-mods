@@ -12,6 +12,15 @@ Read the session's stored `outcome_json` presentation `reason_codes` (state.db, 
   `hermes_cli/kanban_external_adapters/shell.py`, so the fix is a core card there; when the park's wait is
   valid, it can stay as it is.
 
+## "Waiting on CI" for hours: identify the actual producer
+When the panel says `status unknown` or `last known`, treat its wait label and age as historical observations, not current job state.
+
+1. Read the named prerequisite's current status, checkpoint and exact published head. Trace downstream rows to their shared prerequisite before counting them as separate stalled jobs.
+2. Query hosted checks for that exact head (`gh pr view <pr> --repo <owner/repo> --json headRefOid,statusCheckRollup`). A completed green rollup rules out a current hosted-CI wait; it does not prove the card's separate acceptance suite finished.
+3. If the checkpoint names a worker-local full gate, inspect its existing launcher, completion artifact and recent log on that worker. Report terminal exit versus active progress separately, and label partial test counts as partial. A scheduled agent can legitimately own a still-running test process; do not restart the suite, edit its immutable tree or unblock it solely because hosted CI is green.
+4. Inspect a separate triage row independently. If it has no live executor or protected decision hold, use the supported recovery path and read back an actual worker claim; do not attribute every row to the same CI problem.
+5. Report the distinction plainly: hosted CI result, local acceptance progress, shared downstream dependency and any recovered triage stall. Give the existing panel owner the conflicting source evidence without claiming a renderer root cause that has not been traced.
+
 ## Separate next-step eligibility from final acceptance
 For a scheduled CI/deployment chain, inspect each predicate separately before accepting a combined wake:
 1. Identify what the next operation actually consumes. CI using a public source mirror needs the fix published there; it need not wait for the hub to install that same revision.

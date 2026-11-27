@@ -142,15 +142,15 @@ def _keyword_fn():
     global _kw
     if _kw is None:
         _kw = lambda t: bool(_FALLBACK_CORRECTION_RE.search((t or "")[:800]))  # noqa: E731
-        for p in (HERE.parent / "coach" / "lessons.py", home_dir() / "plugins" / "coach" / "lessons.py"):
-            try:
-                spec = importlib.util.spec_from_file_location("_skill_outcomes_coach_lessons", p)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                _kw = mod.keyword_hit
-                break
-            except Exception:
-                continue
+        # Only the sibling tree belongs to the reviewed source closure. Never search HERMES_HOME.
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_skill_outcomes_coach_lessons", HERE.parent / "coach" / "lessons.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _kw = mod.keyword_hit
+        except Exception:
+            pass  # Missing/broken reviewed code: retain the built-in regex, never execute another tree.
     return _kw
 
 
@@ -166,20 +166,18 @@ def _coach_synthetic_res() -> list:
     global _coach_synth
     if _coach_synth is None:
         _coach_synth = []
-        for base in (HERE.parent / "coach", home_dir() / "plugins" / "coach"):
-            for mod_name, attr in (("self_heal", "SYNTHETIC_RE"), ("reply_check", "NOTICE_RE")):
-                try:
-                    spec = importlib.util.spec_from_file_location(f"_skill_outcomes_coach_{mod_name}",
-                                                                  base / f"{mod_name}.py")
-                    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-                    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-                    # Prefer category-aware predicates; retain old coach compatibility.
-                    predicate = "synthetic" if mod_name == "self_heal" else "notice_turn"
-                    _coach_synth.append(getattr(mod, predicate, getattr(mod, attr).search))
-                except Exception:
-                    continue
-            if _coach_synth:
-                break
+        base = HERE.parent / "coach"
+        for mod_name, attr in (("self_heal", "SYNTHETIC_RE"), ("reply_check", "NOTICE_RE")):
+            try:
+                spec = importlib.util.spec_from_file_location(f"_skill_outcomes_coach_{mod_name}",
+                                                              base / f"{mod_name}.py")
+                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                # Prefer category-aware predicates; retain old coach compatibility.
+                predicate = "synthetic" if mod_name == "self_heal" else "notice_turn"
+                _coach_synth.append(getattr(mod, predicate, getattr(mod, attr).search))
+            except Exception:
+                continue  # Fail closed to other code roots; built-in notice filters still apply.
     return _coach_synth
 
 

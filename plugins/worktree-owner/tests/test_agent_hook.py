@@ -167,6 +167,157 @@ class AgentHook(unittest.TestCase):
         self.assertTrue(other.exists()); self.assertNotIn("proj-other", acts)
         self.assertIn("bm", git(self.repo, "branch"))  # branch kept
 
+    def test_session_end_preserves_ignored_data(self):
+        p = self.make("proj-ignored", "bignored")
+        (p / ".gitignore").write_text("private/\n")
+        git(p, "add", ".gitignore"); git(p, "commit", "-qm", "ignore")
+        git(p, "push", "-q", "origin", "HEAD:bignored"); self.merge_to_main("bignored")
+        (p / "private").mkdir()
+        data = p / "private" / "notes.txt"
+        data.write_text("irreplaceable\n")
+        self.assertEqual(git(p, "status", "--porcelain"), "")
+        res = self.end()
+        self.assertTrue(p.exists(), res)
+        self.assertEqual(data.read_text(), "irreplaceable\n")
+        self.assertIn("ignored files", res[0]["action"])
+
+    def test_session_end_keeps_tree_when_ignored_listing_fails(self):
+        p = self.make("proj-scan", "bscan")
+        original = self.b._git
+        def fail_listing(path, *args, **kwargs):
+            if "--ignored" in args:
+                return subprocess.CompletedProcess(args, 1, "", "scan failed")
+            return original(path, *args, **kwargs)
+        self.b._git = fail_listing
+        self.assertIn("unreadable ignored-file listing", self.end()[0]["action"])
+        self.assertTrue(p.exists())
+
+    def test_marker_cannot_redirect_teardown_to_another_worktree(self):
+        p = self.make("proj-owner", "bowner")
+        other = self.make("proj-other-owner", "bother", sid="sess-2")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        rec = self.marker(p); rec["path"] = str(other)
+        (gd / self.b.MARKER).write_text(json.dumps(rec))
+        self.end()
+        self.assertTrue(other.exists(), "foreign worktree was removed via marker path")
+        self.assertTrue(p.exists())
+
+    def test_missing_backlink_keeps_marked_tree(self):
+        p = self.make("proj-no-backlink", "bnobacklink")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        (gd / "gitdir").unlink()
+        self.end()
+        self.assertTrue(p.exists())
+        self.assertNotIn("REMOVED", self.log())
+
+    def test_backlink_and_marker_cannot_redirect_to_foreign_gitdir(self):
+        p = self.make("proj-forged", "bforged")
+        other = self.make("proj-foreign", "bforeign", sid="sess-2")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        rec = self.marker(p); self.assertIsNotNone(rec)
+        rec["path"] = str(other)
+        (gd / self.b.MARKER).write_text(json.dumps(rec))
+        (gd / "gitdir").write_text(str(other / ".git") + "\n")
+        self.end()
+        self.assertTrue(other.exists())
+        self.assertTrue(p.exists())
+        self.assertIn("worktree gitdir does not match", self.log())
+
+    def test_unreadable_forward_gitdir_keeps_tree(self):
+        p = self.make("proj-broken-forward", "bbrokenforward")
+        (p / ".git").write_text("gitdir: /nonexistent/fixture-gitdir\n")
+        self.end()
+        self.assertTrue(p.exists())
+        self.assertIn("worktree gitdir does not match", self.log())
+
+    def test_scan_exception_preserves_tree(self):
+        p = self.make("proj-error", "berror")
+        def fail_scan(path):
+            raise OSError("fixture scan denied")
+        self.b._complex_reason = fail_scan
+        res = self.end()
+        self.assertEqual(res[0]["action"], "kept: scan failed: fixture scan denied")
+        self.assertTrue(p.exists())
+        self.assertIn("fixture scan denied", self.log())
+
+    def test_scan_exception_does_not_skip_healthy_sibling(self):
+        p = self.make("proj-error-first", "berrorfirst")
+        sibling = self.make("proj-healthy-second", "bhealthysecond")
+        original = self.b._complex_reason
+        def fail_one(path):
+            if path == str(p):
+                raise PermissionError("fixture unreadable subdirectory")
+            return original(path)
+        self.b._complex_reason = fail_one
+        # Force the failing candidate first, independent of filesystem ordering.
+        from unittest import mock
+        gds = [git(tree, "rev-parse", "--absolute-git-dir").strip() for tree in (p, sibling)]
+        common = str(self.repo / ".git")
+        with mock.patch.object(self.b, "_common_dirs", return_value=[common]), \
+                mock.patch.object(self.h.glob, "glob", return_value=gds):
+            res = self.end()
+        self.assertTrue(p.exists())
+        self.assertFalse(sibling.exists(), res)
+        self.assertEqual([r["action"] for r in res],
+                         ["kept: scan failed: fixture unreadable subdirectory", "removed"])
+
+    def test_decode_and_timeout_scan_errors_do_not_skip_healthy_sibling(self):
+        from unittest import mock
+        for index, error in enumerate((UnicodeDecodeError("utf-8", b"\xff", 0, 1, "fixture"),
+                                       subprocess.TimeoutExpired("git ls-files", 300))):
+            with self.subTest(error=type(error).__name__):
+                sid = f"scan-error-{index}"
+                p = self.make(f"proj-error-{index}", f"berror{index}", sid=sid)
+                sibling = self.make(f"proj-sibling-{index}", f"bsibling{index}", sid=sid)
+                original = self.b._complex_reason
+                def fail_one(path):
+                    if path == str(p):
+                        raise error
+                    return original(path)
+                gds = [git(tree, "rev-parse", "--absolute-git-dir").strip() for tree in (p, sibling)]
+                with mock.patch.object(self.b, "_complex_reason", side_effect=fail_one), \
+                        mock.patch.object(self.b, "_common_dirs", return_value=[str(self.repo / ".git")]), \
+                        mock.patch.object(self.h.glob, "glob", return_value=gds):
+                    res = self.end(sid=sid)
+                self.assertTrue(p.exists())
+                self.assertFalse(sibling.exists(), res)
+                self.assertTrue(res[0]["action"].startswith("kept: scan failed:"), res)
+                self.assertEqual(res[1]["action"], "removed")
+
+    def test_correct_marker_path_with_forged_backlink_is_kept(self):
+        p = self.make("proj-correct-marker", "bcorrectmarker")
+        other = self.make("proj-forged-backlink", "bforgedbacklink", sid="sess-2")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        self.assertEqual(self.marker(p)["path"], str(p))
+        (gd / "gitdir").write_text(str(other / ".git") + "\n")
+        # The forward pointer still matches gd: only backlink validation rejects it.
+        self.assertEqual(git(p, "rev-parse", "--absolute-git-dir").strip(), str(gd))
+        from unittest import mock
+        with mock.patch.object(self.h, "remove_if_merged") as remove:
+            self.end()
+        remove.assert_not_called()
+        self.assertTrue(p.exists())
+        self.assertTrue(other.exists())
+        self.assertIn("marker path does not match gitdir backlink", self.log())
+
+    def test_missing_marker_path_uses_valid_backlink(self):
+        p = self.make("proj-no-path", "bnopath")
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        rec = self.marker(p); rec.pop("path")
+        (gd / self.b.MARKER).write_text(json.dumps(rec))
+        self.assertEqual(self.end()[0]["action"], "removed")
+        self.assertFalse(p.exists())
+
+    def test_session_end_removes_disposable_ignored_cache(self):
+        p = self.make("proj-cache", "bcache")
+        (p / ".gitignore").write_text("__pycache__/\n")
+        git(p, "add", ".gitignore"); git(p, "commit", "-qm", "cache")
+        git(p, "push", "-q", "origin", "HEAD:bcache"); self.merge_to_main("bcache")
+        (p / "__pycache__").mkdir()
+        (p / "__pycache__" / "module.pyc").write_bytes(b"cache")
+        self.assertEqual(self.end()[0]["action"], "removed")
+        self.assertFalse(p.exists())
+
     def test_squash_merged_pr_whose_head_matches_is_removed_even_after_branch_delete(self):
         p = self.make("proj-sq", "bsq"); self.commit_push(p, "s.txt", "bsq")
         git(self.repo, "push", "-q", "origin", "--delete", "bsq")  # GitHub auto-delete after squash merge

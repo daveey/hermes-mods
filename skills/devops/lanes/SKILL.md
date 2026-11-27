@@ -119,6 +119,7 @@ hermes kanban lanes apply plan.json --json
 Rules `apply` enforces (a refused action comes back with its reason; do not retry it reworded):
 
 - `admit`: at most the lane's daily budget, never a title the lane lists under `never_admit`.
+- `admit_continuation`: only when installed `held --json` reports `continuation.eligible: true`. This is a separate owned-executor attestation tied to original acceptance, canonical completion/run/created identities and unchanged child scope; a done parent, title/prose similarity, age or completion receipt is not authority. Apply rechecks under the admission lock and preserves the existing budget, pause, never-admit and independent restrictions. Missing typed evidence defers to the returned next actor/reason, never a new human ask or a manual-admit fallback. Older cores without this projection leave continuations held.
 - `merge`: a held card into an open card of the same lane. The merged card stays held. Nothing is archived.
 - `reprioritize`: 0 to 1000, never a pinned card.
 - `relane`: only cards placed by inheritance or by default, never into or out of a gated lane.
@@ -128,8 +129,11 @@ How to choose:
 
 1. Label every unclassified card first (`relane`), from its title and body against the lane descriptions.
 2. For each gated lane, read the held cards. Merge duplicates into the card that already owns the problem.
-   Admit, oldest first, only cards where something is broken now or another lane's work waits on it. Leave
-   improvements held; the budget is a ceiling, not a quota to spend.
+   First propose `admit_continuation`, oldest first, for cards whose installed `continuation.eligible` is true,
+   citing their source parent/completion. This finishes explicitly attested original acceptance, not new self-work.
+   For ordinary `admit`, choose only cards where something is broken now or another lane's work waits on it. Leave
+   improvements and unauthenticated continuations held; retain their explicit next-actor/reason. Never infer missing
+   authority from prose, age, receipt or done-parent status. The budget is a ceiling, not a quota to spend.
 3. Inside each lane, raise the cards that unblock the most other cards or that the user asked about; lower
    nothing without a reason the user would accept.
 4. Write one `note` per lane that is off its target, saying why in plain words.

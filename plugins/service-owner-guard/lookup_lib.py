@@ -1,7 +1,7 @@
 """Owner lookup for one service. Stdlib only: this file's text is also sent to a remote host over ssh.
 
-``valid_owner`` and ``read_owner_md`` are NOT defined here: they are machine-investigate's collect.py
-functions (the single OWNER.md / HERMES_OWNER_CARD parser). The caller injects them (locally by setattr,
+``valid_owner`` and ``read_owner_md`` are NOT defined here: they are sibling owner_lib.py
+functions (vendored OWNER.md / HERMES_OWNER_CARD parser). The caller injects them (locally by setattr,
 remotely by appending their source to the script).
 """
 import json

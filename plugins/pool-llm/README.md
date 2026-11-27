@@ -58,6 +58,23 @@ as `text-embedding-3-large` becomes `openai/text-embedding-3-large` and the repl
 errors keep their status; the key is never logged). Each reply carries an `x-hermes-pool-route` header
 (provider, model, account). Only models the managed routing registry lists as subscription routes are accepted.
 
+### Local request boundary
+
+`serve` accepts only non-browser clients. Every request must carry exactly one `Host`
+header matching the bound loopback IP and actual port (for example `127.0.0.1:8765`),
+and must not carry an `Origin` header, even an empty value or `null`. DNS aliases
+(including `localhost` when the bound address is `127.0.0.1`), wrong/missing ports,
+missing/duplicate Host headers, and non-loopback/wildcard bindings are refused with
+HTTP 403 before reading JSON or accessing credentials/upstreams. Use the numeric
+loopback URL shown above; ordinary Anthropic/OpenAI SDKs supply Host automatically
+and do not supply Origin. `ask` and `check` use the library directly and are unchanged.
+
+This blocks browser simple-POST and DNS-rebinding use of subscription accounts and
+paid embeddings. It is not authentication against other local processes/users:
+keep this endpoint on loopback and do not publish it through a reverse proxy.
+Regression coverage: `tests/test_http_boundary.py` uses real loopback HTTP with
+fake upstreams; existing ask/check and streaming tests cover client compatibility.
+
 ### Streaming Messages
 
 `POST /v1/messages` accepts `stream: true`, including the Anthropic SDK's `messages.stream()`:

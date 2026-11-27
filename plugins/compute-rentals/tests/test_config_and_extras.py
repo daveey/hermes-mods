@@ -8,6 +8,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from providers import build_collectors, load_extra_providers  # noqa: E402
 from providers.config import ENV_PATH, load_config  # noqa: E402
 
+import hashlib
+
+
+def pinned(directory):
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(directory).glob('*.py')
+            if not p.name.startswith(('_', 'test_'))}
+
+
 BUILTINS = {'vast', 'sfcompute', 'ec2', 'runpod', 'lambda', 'modal', 'primeintellect', 'slurm'}
 
 GOOD = '''
@@ -132,7 +140,7 @@ def test_good_extra_module_loads_with_label(tmp_path):
     (tmp_path / 'extra_cloud.py').write_text(GOOD)
     (tmp_path / 'test_extra_cloud.py').write_text('raise SystemExit("tests are never loaded")')
     (tmp_path / '_helper.py').write_text('raise SystemExit("private helpers are never loaded")')
-    collectors, labels = load_extra_providers(tmp_path)
+    collectors, labels = load_extra_providers(tmp_path, pins=pinned(tmp_path))
     assert set(collectors) == {'extra_cloud'}
     assert labels == {'extra_cloud': 'Extra Cloud'}
     out = collectors['extra_cloud']()
@@ -149,7 +157,7 @@ def test_good_extra_module_loads_with_label(tmp_path):
 def test_broken_extra_module_reports_error_without_crashing(tmp_path, source, caplog):
     (tmp_path / 'broken.py').write_text(source)
     (tmp_path / 'extra_cloud.py').write_text(GOOD)
-    collectors, _ = load_extra_providers(tmp_path)
+    collectors, _ = load_extra_providers(tmp_path, pins=pinned(tmp_path))
     assert set(collectors) == {'broken', 'extra_cloud'}
     out = collectors['broken']()
     assert out['status'] == 'error'
@@ -163,6 +171,7 @@ def test_extra_module_cannot_shadow_a_builtin(tmp_path, no_user_config):
     (tmp_path / 'fake_vast.py').write_text(GOOD.replace("'extra_cloud'", "'vast'"))
     cfg = load_config()
     cfg['extra_providers_dir'] = str(tmp_path)
+    cfg['extra_providers'] = pinned(tmp_path)
     collectors = build_collectors(cfg)
     assert set(collectors) == BUILTINS | {'fake_vast'}
     assert type(collectors['vast'].__self__).__module__ == 'providers.vast'
@@ -173,4 +182,5 @@ def test_build_collectors_merges_extras(tmp_path, no_user_config):
     (tmp_path / 'extra_cloud.py').write_text(GOOD)
     cfg = load_config()
     cfg['extra_providers_dir'] = str(tmp_path)
+    cfg['extra_providers'] = pinned(tmp_path)
     assert set(build_collectors(cfg)) == BUILTINS | {'extra_cloud'}
