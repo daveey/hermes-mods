@@ -261,8 +261,9 @@ def _unresolved_shell_write(tool_name: str, args: Any) -> bool:
     if name == "tool_call":
         return any(_unresolved_shell_write(str(call.get("name") or ""), call.get("arguments"))
                    for call in args.get("calls") or [] if isinstance(call, dict))
-    return name in SHELL_TOOLS and any(re.search(r'[$`*?{\[\\]', text)
-                                           for text in write_texts(name, args))
+    return name in SHELL_TOOLS and any(
+        re.search(r'[$`*?{\[\\]', text) or re.search(r'(?:^|[\s/|;])xargs(?:\s|$)', text)
+        for text in write_texts(name, args))
 
 
 def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,
