@@ -1170,12 +1170,16 @@ export function stopFromFraction(frac, slots) {
   if (frac >= INFINITY_EDGE) return slots + 1
   return Math.min(slots, Math.max(0, Math.round(Math.max(0, frac) / INFINITY_EDGE * slots)))
 }
+export const hasComponents = c => Array.isArray(c?.components) && c.components.length > 0
 export function capPreview(ticks, cap, now) {
   if (!Array.isArray(ticks?.cells)) return null
   const peak = Math.max(1, ...ticks.cells.map(c => c.running ?? 0))
   let affected = 0, unknown = 0
   const cells = ticks.cells.map(c => {
     const running = c.running
+    // Source-qualified cells: aggregate running is unknown (a sum of per-board peaks is not a simultaneous fleet peak),
+    // so no exact aggregate recolour is possible. Keep every observed component untouched; mark the preview unknown.
+    if (running == null && hasComponents(c)) { unknown++; return { ...c, cap, forecast: true, preview_unknown: true, state: 'unknown', running: null, rejected: null } }
     if (running == null) { unknown++; return { ...c, cap, forecast: true, state: 'unknown', visual: { height: 1, opacity: 1 } } }
     const over = cap != null && running > cap
     if (over) affected++
@@ -1196,7 +1200,19 @@ export function tickRange(cell, bucket) {
   const a = iso(start), b = iso(end)
   return `${a}–${a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b} UTC`
 }
+const componentMissing = comp => comp?.state === 'unknown' || comp?.state == null
+export function componentTitle(comp) {
+  const name = comp?.source ?? 'unknown source'
+  if (componentMissing(comp)) return `${name}: unknown · ${comp?.reason || 'no samples'}`
+  const rej = comp.rejection_unknown || comp.rejected == null ? 'rejections unknown' : `${comp.rejected} rejected`
+  return `${name}: ${comp.state} · running ${comp.running ?? '—'} · cap ${capText(comp.cap)} · ${rej}`
+}
 export function tickTitle(cell, bucket) {
+  if (hasComponents(cell)) {
+    const head = cell.preview_unknown ? `${tickRange(cell, bucket)} · cap preview unknown: aggregate running unknown across sources, observed sources unchanged`
+      : `${tickRange(cell, bucket)} · aggregate running unknown (per-source peaks are not simultaneous)`
+    return [head, ...cell.components.map(componentTitle)].join('\n')
+  }
   const rejected = cell?.forecast ? 'hypothetical demand, not observed rejections' : cell?.rejection_unknown || cell?.rejected == null ? 'rejections unknown' : `${cell.rejected} rejected (ready cards turned away)`
   return `${tickRange(cell, bucket)} · running ${cell?.running ?? '—'} · cap ${capText(cell?.cap)} · ${cell?.state || 'unknown'} · ${rejected}`
 }
@@ -1208,6 +1224,24 @@ function TickStrip({ name, cells, bucket, label }) {
       h('rect', { width: 0.5, height: 0.5, fill: '#1c1f27' }), h('rect', { width: 0.2, height: 0.5, fill: '#9aa3b2' }))),
     cells.map((cell, i) => {
       const x = i + 0.08, w = 0.84, state = cell?.state || 'empty'
+      if (hasComponents(cell)) {
+        // Equal vertical share per source; only a missing source hatches its own share.
+        const k = cell.components.length, band = H / k
+        return h('g', { key: i, 'data-tick': state, 'data-tick-sources': k, 'data-tick-preview-unknown': cell.preview_unknown ? '1' : '0',
+          'data-tick-unknown': cell.components.some(componentMissing) ? '1' : '0' },
+          h('title', null, tickTitle(cell, bucket)),
+          cell.components.map((comp, j) => {
+            const y0 = j * band, cs = componentMissing(comp) ? 'unknown' : comp.state || 'empty'
+            const cvh = Math.min(1, Math.max(0, Number(comp?.visual?.height ?? (cs === 'partial' ? 0.5 : 1)))), copacity = comp?.visual?.opacity ?? 1
+            return h('g', { key: comp?.source ?? j, 'data-source': comp?.source, 'data-component': cs, 'data-component-unknown': cs === 'unknown' ? '1' : '0' },
+              h('rect', { x, y: cs === 'empty' ? y0 + band * 0.85 : y0, width: w, height: cs === 'empty' ? band * 0.15 : band, fill: TICK_COLORS.empty }),
+              cs === 'partial' ? h('rect', { x, y: y0 + band - cvh * band, width: w, height: cvh * band, fill: TICK_COLORS.partial, opacity: copacity }) : null,
+              cs === 'full' ? h('rect', { x, y: y0, width: w, height: band, fill: TICK_COLORS.full, opacity: copacity }) : null,
+              cs === 'rejecting' ? h('rect', { x, y: y0, width: w, height: band, fill: TICK_COLORS.rejecting, opacity: copacity }) : null,
+              cs === 'unknown' ? h('rect', { x, y: y0, width: w, height: band, fill: `url(#${id})`, opacity: 0.85 }) : null)
+          }),
+          cell.preview_unknown ? h('rect', { className: 'lanes-tick-preview-unknown', x, y: 0, width: w, height: H, fill: 'none', stroke: '#9aa3b2', strokeWidth: 0.08, strokeDasharray: '0.2 0.1' }) : null)
+      }
       const vh = Math.min(1, Math.max(0, Number(cell?.visual?.height ?? (state === 'partial' ? 0.5 : 1))))
       const opacity = cell?.visual?.opacity ?? 1
       const unknown = cell?.rejection_unknown === true || state === 'unknown'
@@ -1272,9 +1306,9 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   const sliderProps = {
     ref: track, className: 'lanes-slots', role: 'slider', tabIndex: locked ? -1 : 0, 'aria-label': `${name} max workers slider`,
     'aria-valuemin': 0, 'aria-valuemax': (slots ?? 0) + 1, 'aria-valuenow': limitsKnown ? shownStop : undefined,
-    'aria-valuetext': !limitsKnown ? limitsReason : slots == null ? 'fleet slots unknown' : live == null ? 'no cap (∞)' : `cap ${live}`,
+    'aria-valuetext': !limitsKnown ? limitsReason : slots == null ? 'fleet slots unknown' : live == null ? `no cap (∞) of ${slots} shared-pool slots` : `cap ${live} of ${slots} shared-pool slots`,
     'aria-disabled': locked, 'aria-busy': draft != null, 'data-pending': pending ? '1' : '0', 'data-saving': draft ? '1' : '0',
-    title: !limitsKnown ? limitsReason : error ? 'Lanes offline' : slots == null ? 'Fleet slots unknown' : undefined,
+    title: !limitsKnown ? limitsReason : error ? 'Lanes offline' : slots == null ? 'Fleet slots unknown' : live == null ? `no cap (∞) of ${slots} shared-pool slots` : `cap ${live} of ${slots} shared-pool slots`,
     onClick: e => e.stopPropagation(),
     onPointerDown: e => { if (locked) return; e.stopPropagation(); e.currentTarget.setPointerCapture?.(e.pointerId); dragging.current = true; setMessage(''); set(fromPointer(e)) },
     onPointerMove: e => { if (dragging.current && !locked) set(fromPointer(e)) },
@@ -1294,7 +1328,9 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   const pct = k => `${(k / Math.max(slots || 1, 1)) * INFINITY_EDGE * 100}%`
   const windowLabel = flowWindow(snap?.window_hours ?? 24)
   const chip = row.paused ? 'paused' : row.top_reason || ''
-  const caption = pending && slots != null ? (preview
+  const caption = pending && slots != null ? (preview && preview.total > 0 && preview.unknown === preview.total
+    ? `cap ${capText(live)} of ${slots} shared-pool slots: preview unknown (aggregate running unknown across sources; observed sources unchanged) · release to save`
+    : preview
     ? `cap ${capText(live)} would have turned cards away in ${preview.affected} of ${preview.total} periods${preview.unknown ? ` (${preview.unknown} unknown)` : ''} (now ${preview.now ?? 'unknown'}) · release to save`
     : `cap ${capText(live)} · release to save`) : ''
   const spend = row.spend

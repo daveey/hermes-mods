@@ -104,3 +104,53 @@ def test_fleet_capacity_uses_real_core_freshness_not_last_good(monkeypatch):
     clock[0] += node.REGISTRY_RETRY_S
     failing[0] = False
     assert metrics._fetch_registry_slots() == 6
+
+
+@pytest.mark.parametrize('missing_first', [False, True])
+def test_real_dispatch_with_no_table_sibling_preserves_source_bands(conn, configured, tmp_path, missing_first):
+    from contextlib import closing
+    from hermes_cli import kanban_db_connect as kbc
+    mapping = copy.deepcopy(base.LANES)
+    mapping['babybear']['max_workers'] = 1
+    configured(mapping)
+    assert kb.claim_task(conn, base._ready_in(conn, 'babybear', 'running'))
+    base._ready_in(conn, 'babybear', 'waiting')
+    dispatch_once(conn, spawn_fn=lambda *_a, **_k: pytest.fail('unexpected spawn'),
+                  max_spawn=2, max_in_progress=10, reconcile_orphans=False)
+    api = api_module()
+    metrics = api._sibling('metrics')
+    pol = lanes.policy()
+    now = __import__('time').time()
+    healthy = metrics.project(conn, conn, pol, now=now)
+    metrics.qualify(healthy, 'default')
+    with closing(kbc.connect(tmp_path / 'unserved.db')) as missing:
+        assert not missing.execute("SELECT 1 FROM sqlite_master WHERE name='lane_samples'").fetchone()
+        absent = metrics.project(missing, missing, pol, now=now)
+    metrics.qualify(absent, 'askeve')
+    a, b = (absent, healthy) if missing_first else (healthy, absent)
+    merged = metrics.merge(a, b)
+    # Repeat reduction must retain all provenance, not nest or drop a source.
+    absent2 = copy.deepcopy(absent)
+    metrics.qualify(absent2, 'unserved')
+    merged = metrics.merge(merged, absent2)
+    presented = metrics.present({'lanes': merged}, 6)
+    cell = presented['lanes']['babybear']['ticks']['cells'][-1]
+    assert cell['running'] is None and cell['rejected'] is None
+    parts = {c['source']: c for c in cell['components']}
+    assert set(parts) == {'default', 'askeve', 'unserved'}
+    assert parts['default']['state'] == 'rejecting'
+    assert parts['default']['running'] == 1 and parts['default']['rejected'] >= 1
+    assert parts['askeve']['state'] == 'unknown' and parts['askeve']['reason'] == 'no samples'
+    assert '_tick_sources' not in presented['lanes']['babybear']
+    assert metrics.merge(absent, absent2)['babybear']['ticks'] is None
+    import shutil
+    import subprocess
+    node_tests = Path(__file__).resolve().parents[3] / 'desktop-plugins/lanes/tests'
+    if not shutil.which('node') or not (node_tests / 'node_modules/jsdom').exists():
+        pytest.skip('pinned Node DOM dependencies unavailable')
+    projected = api._sibling('view').project({'configured': True, 'lanes': merged},
+                                            {'configured': True, 'cards': [], 'lanes': {}}, True)
+    presented = metrics.present(projected, 6)
+    result = subprocess.run(['node', str(node_tests / 'render-source-ticks.mjs')],
+                            input=json.dumps(presented), capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -21,7 +21,16 @@ The requested window determines 48 occupancy cells; the normal 24h view has
 30-minute cells. Each cell preserves `{t, state, running, cap, rejected}`. Core
 samples are dispatcher observations, not rerun admission checks. Historical run
 occupancy has unknown rejection (`rejected: null`, `rejection_unknown: true`);
-missing telemetry and older cores return unavailable ticks, never zero activity.
+missing telemetry never becomes zero activity. Fleet cells carry equal-height
+`components` per named board: each observed source keeps its real state and
+only missing-source bands hatch, with the reason in the tooltip. The whole
+series is unavailable only if every source lacks a series. Independent board
+bucket peaks are not simultaneous fleet occupancy, so aggregate running and
+rejected stay unknown and no exact aggregate cap forecast is made.
+The slider range is active, nonheld **shared-pool** slots from the fresh registry;
+pinned-only and unknown-capacity hosts are excluded. Unavailable registry
+capacity disables the slider.
+An existing cap above that range stays intact; the final stop still writes null.
 Caps are included in collapsed views so a compact control cannot mistake an
 omitted limit for unlimited.
 
