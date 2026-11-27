@@ -11,6 +11,12 @@ Use this procedure to verify a runner/host with the runner tools, whether you ar
 
 Two completed collections can demonstrate persistence of an evidence gap without establishing its root cause. To distinguish absent production from ingestion or mapping failures, obtain authorized evidence from those specific stages rather than inferring a cause from null timestamps alone.
 
+## GitHub inventory and display freshness
+
+- Compare the configured scope's exact repository with the workload's Actions runner endpoint. Organization-level lists omit repository-level registrations; two similarly named repositories may both remain valid, so rename maintenance cannot infer workload ownership. Preserve scope identities instead of relabeling old registrations.
+- Trace source timestamps through the real service envelope into the renderer. A fresh collector tick or transport receipt does not renew an older provider observation. Build producer-shaped regressions (including provenance metadata), not only hand-authored runner rows.
+- Compare runner IDs as well as names. Across separate GitHub and collector reads, report busy/idle transitions and ephemeral registration churn explicitly; a total-count mismatch alone does not prove missing persistent Macs. Preserve both read times and compare every requested persistent registration.
+
 ## Reconciling a dynamic worker pool
 
 - Verify instance-to-gateway identity before treating a successful instance listing as exhaustive absence evidence: an ASG can give several slot identities the same generic Name tag.
