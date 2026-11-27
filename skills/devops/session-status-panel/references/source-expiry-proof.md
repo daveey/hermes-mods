@@ -1,0 +1,5 @@
+# Independent source-expiry proof
+
+Generate mounted timing models through real `Feed._client_bundle`, not only the reducer: the final producer supplies the source freshness envelope. Do not reinterpret the cached model. Renew an actual feed heartbeat immediately after the original source TTL. Assert transport still vouches while source-derived ETA/status expires; preserve original computed_at/TTL and unchanged wire bytes through display ticks, replacement, session switch and remount. Test absent-heartbeat expiry separately. Simultaneous transport expiry can conceal a missing source-clock fence.
+
+For real capacity timestamp fixtures, assert exact producer seconds-to-persisted-milliseconds and persisted-milliseconds-to-row-seconds boundaries. Binary-float multiply/divide need not return original seconds bit-for-bit. Preserve stored bytes, stale/unknown TTL and recovery assertions; exercise exact historical failing inputs plus live capture. Do not replace application proof with arithmetic replay, tolerances, retries or longer timeouts.
