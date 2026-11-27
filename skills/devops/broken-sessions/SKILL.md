@@ -34,7 +34,7 @@ Run the scanner for a stuck chat; follow the finding's fix section. If none matc
 - **Chat still shows a blocked card/ask after it was withdrawn or answered**: `references/stale-ask-tile.md`.
 - **False "Running", over-gated wakes, or review waiting on its implementation**: `references/running-label-and-probes.md`.
 - **"Failed/crashed tasks, why not restarted?"**: `references/crashed-runs.md`.
-- **"All my sessions are stalled" / every prompt waits minutes**: backend-wide, the scanner can't see it: `references/backend-wide-stall.md`.
+- **"All my sessions are stalled" / every prompt waits minutes / Desktop timeouts, no timing indicators**: backend-wide, the scanner can't see it: `references/backend-wide-stall.md`.
 - **"My sessions disappeared" / new chats missing from the sidebar**: `references/missing-sessions.md`.
 - **"Chat isn't accepting my messages"**: this is a transport problem and the scanner can't see it. Follow `references/message-not-delivered.md`.
 
