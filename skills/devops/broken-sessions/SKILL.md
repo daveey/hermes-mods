@@ -33,6 +33,7 @@ Run the scanner for a stuck chat; follow the finding's fix section. If none matc
   fixture. Never clear `block_kind` by hand.
 - **Row says "Running" with nothing running, or a wake holds an eligible next step**: `references/running-label-and-probes.md` (executor checks and sequential dependency gates).
 - **"Failed/crashed tasks, why not restarted?"**: `references/crashed-runs.md`.
+- **"All my sessions are stalled" / every prompt waits minutes**: backend-wide, the scanner can't see it: `references/backend-wide-stall.md`.
 - **"Chat isn't accepting my messages"**: this is a transport problem and the scanner can't see it. Follow `references/message-not-delivered.md`.
 
 ```sh
