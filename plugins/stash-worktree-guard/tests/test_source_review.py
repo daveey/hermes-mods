@@ -76,12 +76,13 @@ def test_end_of_options_makes_help_a_pathspec(shared, operation):
     assert git(repo, 'rev-parse', 'refs/stash') == before
     result = subprocess.run(['git', '-C', str(repo), 'stash', *args], capture_output=True)
     version = tuple(int(n) for n in git(repo, '--version').split()[2].split('.')[:2])
-    if version >= (2, 44):
+    if operation == 'push' and version >= (2, 44):
         assert result.returncode == 0, result.stderr
         assert git(repo, 'rev-parse', 'refs/stash') != before
     else:
-        # Older Git treats --end-of-options itself as a pathspec. The refusal
-        # assertion above remains version-independent, not skipped with Git 2.43.
+        # Older Git treats --end-of-options itself as a pathspec; implicit push
+        # rejects the following --help token even on newer Git. The refusal
+        # assertion above remains version-independent and is never skipped.
         assert result.returncode != 0
         assert git(repo, 'rev-parse', 'refs/stash') == before
 
