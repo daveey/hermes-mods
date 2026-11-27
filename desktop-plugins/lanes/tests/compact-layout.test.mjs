@@ -12,7 +12,7 @@ const pw = join(homedir(), '.cache/ms-playwright')
 const playwrightChrome = existsSync(pw) ? readdirSync(pw).filter(d => d.startsWith('chromium-')).map(d => join(pw, d, 'chrome-linux64/chrome')) : []
 const CHROME = [process.env.CHROME_BIN, '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium',
   '/usr/bin/chromium-browser', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ...playwrightChrome].find(p => p && existsSync(p))
-const WIDTHS = [480, 360, 280]
+const WIDTHS = [480, 360, 280, 232, 212]
 
 const P = await loadPlugin({ SIDEBAR_SECTIONS_TOP_AREA: 'sidebar.sections.top', SIDEBAR_SECTIONS_AREA: 'sidebar.sections', SESSION_FILTER_AREA: 'sidebar.filter' })
 const T0 = Date.UTC(2026, 10, 27, 0, 0) / 1000
@@ -22,7 +22,7 @@ const lane = (name, i) => ({ share: 20, actual: .2, target: .3, status: { run: 2
   top_reason: i ? 'waiting on a long reason that must truncate' : '', limits: { max_workers: 4 }, boards: ['a'],
   spend: { hour: 123.45, day: 1234.5, week: 98765.43 }, ticks: { window: '24h', bucket_s: 1800, cap: 4, cells, previews: {} } })
 const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes']
-const snap = { configured: true, fleet_slots: 6, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
+const snap = { configured: true, fleet_slots: 39, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
   governors: { idle_total: 31, rows: [], counts: { on: 1, off: 8 } },
   lanes: Object.fromEntries(names.map((n, i) => [n, lane(n, i)])) }
@@ -54,6 +54,7 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       costScrollOverflow: cost.scrollWidth > cost.clientWidth + .5,
       cost: ['h', 'd', 'w'].map(k => vis(cost.querySelector('.lanes-cost-' + k))),
       tickH: Math.round(r(row.querySelector('.lanes-ticks')).height), slotsH: Math.round(r(row.querySelector('.lanes-slots')).height),
+      chartOverflow: [...row.querySelector('.lanes-row-chart').querySelectorAll('*')].filter(k => vis(k) && !['defs','pattern','rect','title','g'].includes(k.tagName) && !inside(r(k), r(row.querySelector('.lanes-row-chart')))).map(k => k.className.baseVal ?? k.className),
       tickAbovePips: r(row.querySelector('.lanes-ticks')).bottom <= r(row.querySelector('.lanes-slots')).top + .5,
       nameLeftOfChart: r(row.querySelector('.lanes-row-name')).right <= r(row.querySelector('.lanes-row-chart')).left + .5,
       chartLeftOfCost: r(row.querySelector('.lanes-row-chart')).right <= r(cost).left + .5 }
@@ -82,6 +83,7 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
         assert.ok(Math.abs(row.h - 38) <= 1, 'row ~38px: ' + id)
         assert.deepEqual(row.kidOverflow, [], 'row child overflows row: ' + id)
         assert.deepEqual(row.deepOverflow, [], 'row descendant overflows row: ' + id)
+        assert.deepEqual(row.chartOverflow, [], 'chart descendant overlaps sibling column: ' + id)
         assert.ok(!row.nameWrapped && !row.chipWrapped && row.costWrapped.length === 0 && !row.costScrollOverflow, 'wrapping/overflow: ' + id)
         assert.equal(row.tickH, 14, 'chart ticks 14px: ' + id)
         assert.ok(row.tickAbovePips, 'ticks on top, pips below: ' + id)
