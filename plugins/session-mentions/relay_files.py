@@ -893,7 +893,10 @@ def sweep(base: Path) -> None:
             try:
                 mtime = path.stat().st_mtime
                 if mtime < cutoff:
-                    path.unlink()
+                    if sub == "outbox" and path.suffix == ".json":
+                        take_back(path)  # Never claimed: release its reservation without racing a claim.
+                    else:
+                        path.unlink()
                 else:
                     deadline = min(deadline, mtime + STALE_SECONDS)
             except FileNotFoundError:
