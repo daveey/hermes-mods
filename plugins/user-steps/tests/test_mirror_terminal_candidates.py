@@ -50,9 +50,10 @@ def test_candidates_keep_unknown_and_active_but_skip_known_terminal(tmp_path, mo
         assert seen[0][1]['session'] == session
 
 
+@pytest.mark.parametrize('session', [OWNER['storedSessionId'], 'session-b'])
 @pytest.mark.parametrize('kind', ['missing', 'wrong-session', 'wrong-namespace'])
-def test_unmatched_terminal_row_still_defers(tmp_path, kind):
-    mirror, store, _ = seed(tmp_path)
+def test_unmatched_terminal_row_still_defers(tmp_path, kind, session):
+    mirror, store, _ = seed(tmp_path, session=session)
     with store._tx() as c:
         if kind == 'missing':
             c.execute('DELETE FROM requests')
