@@ -480,6 +480,63 @@ def test_failed_cursor_keeps_healthy_changes_and_recovery(board, api, monkeypatc
     assert api.change_cursor() != after
 
 
+def test_governor_receipts_survive_sibling_registry_failure(board, api, monkeypatch):
+    import sqlite3
+    from contextlib import contextmanager
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    kb.create_board('beta')
+    with kbc.connect(board='beta') as conn:
+        kb.create_task(conn, title='independent sidecar evidence', assignee='default', tenant='other')
+        core_fixtures._tick(conn, board='beta')
+        expected = gov.snapshot(conn)
+    merge = api._sibling('board_merge')
+    original = merge.read_board
+    @contextmanager
+    def fail(path, **kwargs):
+        if '/beta/' in str(path):
+            raise sqlite3.OperationalError('SQLite tracking registry is busy')
+        with original(path, **kwargs) as db:
+            yield db
+    monkeypatch.setattr(merge, 'read_board', fail)
+    projected = view(api)['governors']
+    row = next(r for r in projected['rows'] if r['id'] == 'llm_pool')
+    assert row['cards_charged'] == expected['charged_total'] == 1
+    assert row['state'] == 'on'
+    source = next(s for s in projected['scope'] if s['board'] == 'beta')
+    assert source['available'] is True and source['flow_available'] is False
+    assert 'tracking registry is busy' in source['reason']
+
+
+def test_governor_receipts_survive_flow_failure_and_match_cli(board, api, monkeypatch, capsys):
+    import argparse
+    from hermes_cli import kanban_governors_cli as cli
+    config(board)
+    core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 7])
+    kb.create_board('beta')
+    with kbc.connect() as a, kbc.connect(board='beta') as b:
+        kb.create_task(a, title='default known charge', assignee='default', tenant='babybear')
+        kb.create_task(b, title='beta known charge', assignee='default', tenant='other')
+        core_fixtures._tick(a)
+        core_fixtures._tick(b, board='beta')
+        cli.governors_command(argparse.Namespace(all_boards=True, json=True, board=None))
+        expected = json.loads(capsys.readouterr().out)
+        original = api.flow_core()[1].snapshot
+        def fail(conn, *args, **kwargs):
+            if gov._board(conn) == 'default':
+                raise RuntimeError('fixture flow failure after valid receipt')
+            return original(conn, *args, **kwargs)
+        monkeypatch.setattr(api.flow_core()[1], 'snapshot', fail)
+        projected = view(api)['governors']
+        pool = next(r for r in projected['rows'] if r['id'] == 'llm_pool')
+        assert pool['state'] == 'on'
+        assert pool['cards_charged'] == sum(r['cards'] for s in expected['boards'] for r in s['governors'] if r['governor'] == 'llm_pool') == 2
+        source = next(s for s in projected['scope'] if s['board'] == 'default')
+        assert source['available'] is True
+        assert source['flow_available'] is False
+        assert 'fixture flow failure' in source['reason']
+
+
 def test_overlap_exclusively_charged(pool_hub, api, monkeypatch, tmp_path):
     config(pool_hub.home, sync={'enabled': True})
     core_fixtures._usage(monkeypatch, [core_fixtures.RESERVE + 10])
