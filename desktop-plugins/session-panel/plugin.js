@@ -560,13 +560,20 @@ function expiryPresentation(model, sections, diagnosticExpired = false) {
   for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
   const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
   const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
-  const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => ({
-    ...model.header.pips.find(p => p.section === section), section, label: model.header.pips.find(p => p.section === section)?.label || label, count: counts[section],
-    ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {})
-  }))
+  // Overdue triage is fresh operational red: it survives expiry only on rows that still claim it.
+  const overdue = sections.stuck.some(row => row.attention === 'triage_overdue')
+  const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => {
+    const { attention, ...pip } = model.header.pips.find(p => p.section === section) || {}
+    return { ...pip, section, label: pip.label || label, count: counts[section],
+      ...(section === 'stuck' && overdue && attention ? { attention } : {}),
+      ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {}) }
+  })
   const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
     !counts.needs_you && !counts.stuck && !counts.running
-  return { ...model, sections, header: { ...model.header, counts, pips, wait_kind: waitKind, wait_eta: null,
+  const { attention, ...header } = model.header
+  const label = !overdue && attention === 'triage_overdue' ? str(header.label).replace(/^overdue triage · /, '') : header.label
+  return { ...model, sections, header: { ...header, label, counts, pips, wait_kind: waitKind, wait_eta: null,
+    ...(overdue && attention ? { attention } : {}),
     ...(withdrawnDerived ? { state: 'unknown', label: 'execution reason unknown' } : {}) } }
 }
 /** Expiration can withdraw diagnostic attention, never create execution or human authority. */
@@ -598,10 +605,11 @@ export function expireNativeWaits(model, now, vouched) {
   const sections = Object.fromEntries(Object.entries(model.sections).map(([key, rows]) => [key, []]))
   for (const [key, rows] of Object.entries(model.sections)) for (const row of rows) {
     if (key === 'done' || row.kind !== 'card' || row.non_running_reason) {
-      sections[key].push(row)
+      const { attention: _stale, ...kept } = row  // a stale snapshot never claims fresh operational red
+      sections[key].push(row.attention === 'triage_overdue' ? kept : row)
       continue
     }
-    const old = clockRow(row, now)
+    const { attention: _overdue, ...old } = clockRow(row, now)  // stale evidence never claims fresh operational red
     sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
       detail: `status unknown · last known: ${old.detail || key}`,
       details: ['Task source freshness: stale; read current authoritative task state before acting.'],

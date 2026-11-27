@@ -1,12 +1,27 @@
 """Spend stops under core's immediate reviewer (``kanban_spend_reviewer``): the panel says who is deciding, and an
-escalated stop nobody decided for 30 min is red, not another 'waiting on this chat's agent'."""
+escalated stop nobody decided for 30 min is red, not another 'waiting on this chat's agent'.
+
+User override (overdue triage): any triage episode older than 600 s also paints red as operational attention
+(``attention == 'triage_overdue'``) without becoming a human ask. Fixtures that enter triage an hour ago therefore
+assert ``_agent_owned`` (not ``needs_you``, not the reviewer's 30-min ``stalled``) instead of the superseded
+"not stuck / waiting" placement; ``entered=`` <= 600 keeps the original placement where it is not age-escalated.
+Ownership, reviewer and stop-cause text assertions are unchanged.
+"""
+import pytest
+
 from test_model import NOW, held_bundle, model
 
+try:
+    import hermes_cli.kanban_triage_attention  # noqa: F401  shared >600 s policy lives in core
+    AGED = True
+except ImportError:
+    AGED = False
 
-def _with(*events):
+
+def _with(*events, entered=3600):
     b = held_bundle(kind='spend_budget_triaged')
     b['cards']['t_abc123']['detail']['events'] = [
-        {'kind': 'spend_budget_triaged', 'created_at': NOW - 3600, 'payload': {'limit': 'runs'}}, *events]
+        {'kind': 'spend_budget_triaged', 'created_at': NOW - entered, 'payload': {'limit': 'runs'}}, *events]
     return b
 
 
@@ -14,20 +29,44 @@ def _row(m):
     return next(v for s in ('needs_you', 'stuck', 'waiting') for v in m['sections'][s])
 
 
+def _agent_owned(m):
+    """Not a human ask and not the reviewer's escalation; red only through overdue triage (when core ages it)."""
+    row = _row(m)
+    assert not m['sections']['needs_you'] and row.get('reason') != 'stalled'
+    if AGED:
+        assert row['attention'] == 'triage_overdue' and row in m['sections']['stuck']
+        assert row['detail'].startswith('overdue triage · ')
+    else:
+        assert row in m['sections']['waiting']
+    return row
+
+
 def test_a_stop_under_review_says_the_reviewer_is_deciding():
     for kind in ('spend_review_queued', 'spend_review_started'):
-        m = model.reduce_panel(_with({'kind': kind, 'created_at': NOW - 30, 'payload': {'episode': 'e'}}), now=NOW)
+        # Fresh triage entry (not age-escalated): original placement.
+        m = model.reduce_panel(_with({'kind': kind, 'created_at': NOW - 30, 'payload': {'episode': 'e'}},
+                                     entered=300), now=NOW)
         row = m['sections']['waiting'][0]
         assert 'the spend reviewer is deciding now' in row['detail']
         assert "this chat's agent" not in row['detail'] and not m['sections']['stuck']
+        # An hour in triage: red operational attention, same reviewer ownership.
+        row = _agent_owned(model.reduce_panel(_with({'kind': kind, 'created_at': NOW - 30, 'payload': {'episode': 'e'}}),
+                                              now=NOW))
+        assert 'the spend reviewer is deciding now' in row['detail'] and "this chat's agent" not in row['detail']
 
 
-def test_a_fresh_escalation_waits_on_the_agent_with_the_reviewers_reason():
+@pytest.mark.parametrize('entered', [600, 3600])
+def test_a_fresh_escalation_waits_on_the_agent_with_the_reviewers_reason(entered):
     m = model.reduce_panel(_with({'kind': 'spend_review_escalated', 'created_at': NOW - 600,
-                                  'payload': {'episode': 'e', 'reason': 'Runs repeat the same wait.'}}), now=NOW)
-    row = m['sections']['waiting'][0]
+                                  'payload': {'episode': 'e', 'reason': 'Runs repeat the same wait.'}},
+                                 entered=entered), now=NOW)
+    if entered <= 600:  # exactly 600 s is not age-escalated
+        row = m['sections']['waiting'][0]
+        assert not m['sections']['stuck']
+    else:
+        row = _agent_owned(m)
     assert 'reviewer escalated: Runs repeat the same wait.' in row['detail']
-    assert "waiting on this chat's agent to decide" in row['detail'] and not m['sections']['stuck']
+    assert "waiting on this chat's agent to decide" in row['detail']
 
 
 def test_an_escalation_nobody_decided_for_30_minutes_is_stuck_not_waiting():
@@ -44,7 +83,8 @@ def test_a_new_stop_after_a_grant_starts_over():
     b = _with({'kind': 'spend_review_escalated', 'created_at': NOW - 1900, 'payload': {'reason': 'old'}},
               {'kind': 'spend_budget_triaged', 'created_at': NOW - 60, 'payload': {'limit': 'runs'}})
     m = model.reduce_panel(b, now=NOW)
-    assert not m['sections']['stuck'] and 'reviewer' not in _row(m)['detail']
+    # The escalation ended; the hour-old triage episode is still overdue (a repeated hold does not reset it).
+    assert 'reviewer' not in _agent_owned(m)['detail']
 
 
 def _escalated(age, reason='Runs repeat the same wait.', **row):
@@ -54,11 +94,11 @@ def _escalated(age, reason='Runs repeat the same wait.', **row):
 
 
 def test_the_30_minute_boundary_and_millisecond_clocks():
-    assert model.reduce_panel(_escalated(1799), now=NOW)['sections']['waiting']
-    assert model.reduce_panel(_escalated(1800), now=NOW)['sections']['stuck']
+    _agent_owned(model.reduce_panel(_escalated(1799), now=NOW))
+    assert model.reduce_panel(_escalated(1800), now=NOW)['sections']['stuck'][0]['reason'] == 'stalled'
     b = _escalated(0)
     b['cards']['t_abc123']['detail']['events'][-1]['created_at'] = (NOW - 1900) * 1000
-    assert model.reduce_panel(b, now=NOW)['sections']['stuck']
+    assert model.reduce_panel(b, now=NOW)['sections']['stuck'][0]['reason'] == 'stalled'
 
 
 def test_the_reason_is_clipped_and_never_carries_a_url_or_hash():
@@ -74,8 +114,7 @@ def test_a_later_owner_decision_ends_the_escalation():
     b['cards']['t_abc123']['detail']['events'].append(
         {'kind': 'decision_retained', 'created_at': NOW - 60,
          'payload': {'disposition': {'reason': 'decision_pending', 'next_step': 'Wait for the hub deploy.'}}})
-    m = model.reduce_panel(b, now=NOW)
-    assert not m['sections']['stuck'] and 'Wait for the hub deploy.' in _row(m)['detail']
+    assert 'Wait for the hub deploy.' in _agent_owned(model.reduce_panel(b, now=NOW))['detail']
 
 
 def test_unreadable_evidence_never_turns_red():
@@ -91,8 +130,8 @@ def test_a_reviewer_turned_off_mid_review_hands_the_stop_back_to_the_agent():
 
 
 def test_an_escalation_keeps_the_stop_cause():
-    row = _row(model.reduce_panel(_escalated(600), now=NOW))
-    assert row['detail'].startswith('run cap used up · reviewer escalated')
+    row = _agent_owned(model.reduce_panel(_escalated(600), now=NOW))
+    assert row['detail'].removeprefix('overdue triage · ').startswith('run cap used up · reviewer escalated')
 
 
 def test_remote_cards_and_wire_clocks_are_stable_across_ticks():

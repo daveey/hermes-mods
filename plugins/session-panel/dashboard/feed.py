@@ -1582,10 +1582,19 @@ class Feed:
         return max(MIN_IDLE_WAIT_S, min([self.heartbeat_s, *waits]))
 
     def _triage_deadline(self, now):
-        # Detached inputs only; no task-history hydration or HTTP polling.
+        # Detached inputs only; no task-history hydration or HTTP polling. A crossing this feed already
+        # re-reduced for never re-arms the wake (bounded: one age pass per crossing, then normal cadence).
         with self.lock:
-            return min((at for held in self.bundles.values()
-                        if (at := _model().triage_deadline(held['bundle'], now)) is not None), default=None)
+            due = [at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)]
+        fired = getattr(self, '_triage_fired', frozenset())
+        return min((at for at in due if at > now or at not in fired), default=None)
+
+    def _triage_crossed(self, now):
+        """Record the crossings an age pass is about to repaint."""
+        with self.lock:
+            self._triage_fired = frozenset(
+                at for held in self.bundles.values() for at in _model().triage_deadlines(held['bundle'], now)
+                if at <= now)
 
     def beat(self) -> int:
         """Between data changes: registrations are renewed, expired interest dropped and a heartbeat pushed when
@@ -1603,8 +1612,10 @@ class Feed:
         if decide is not None and decide <= 0:
             self._decision_retry_at = None  # handed to the decision lane once; its pass re-arms on failure
             self._decide.set()
-        return len(self._publish({}, heartbeat=True, age_only=(now - self.last_emit >= self.heartbeat_s or
-                   (triage_due is not None and triage_due <= now))))
+        crossed = triage_due is not None and triage_due <= now
+        if crossed:
+            self._triage_crossed(now)
+        return len(self._publish({}, heartbeat=True, age_only=(now - self.last_emit >= self.heartbeat_s or crossed)))
 
     def _producer_order(self, todo: list[str], wanted: set) -> list[str]:
         """Producer order under a pass budget: chats on a mounted panel, then chats with fresh source

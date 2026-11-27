@@ -91,6 +91,29 @@ for (const age of [599, 600, 601, 6 * 86400]) {
   delete window.__sessionPanel
  })
 }
+for (const age of [601, 6 * 86400]) {
+ test(`stale snapshot clears overdue triage in rows, header and pips: triage age ${age}`, { skip: !cases[`composed_triage_${age}`] }, async () => {
+  const { model, now } = cases[`composed_triage_${age}`]
+  const before = JSON.stringify(model)
+  assert.equal(model.header.attention, 'triage_overdue')
+  const later = now  // the vouch is withdrawn (stale source), not merely aged
+  const effective = m.expireNativeWaits(model, later, false)
+  assert.equal(effective.header.attention, undefined)
+  assert.doesNotMatch(effective.header.label, /^overdue triage/)
+  assert.ok(effective.header.pips.every(p => p.attention === undefined && m.pipCategory(p) !== 'red'))
+  assert.ok(Object.values(effective.sections).flat().every(row => row.attention !== 'triage_overdue'))
+  await paint(m.renderModel(model, { now: later, vouched: false }))
+  for (const box of document.querySelectorAll('[data-row-pip]'))
+   assert.notEqual(window.getComputedStyle(box).backgroundColor, 'rgb(248, 81, 73)', 'stale DOM claims no fresh operational red')
+  assert.notEqual(document.querySelector('[data-session-status]').style.color, 'var(--color-red-500)')
+  // Only explicitly historical text may still mention it ("last known: overdue triage · …").
+  assert.doesNotMatch(document.body.textContent.replaceAll('last known: overdue triage · ', ''), /overdue triage/)
+  assert.equal(JSON.stringify(model), before)
+  // Recovery: a fresh snapshot paints the backend's overdue red again.
+  await paint(m.renderModel(model, { now }))
+  assert.equal(window.getComputedStyle(document.querySelector('[data-row-pip="stuck"]')).backgroundColor, 'rgb(248, 81, 73)')
+ })
+}
 for (const diagnostic of [false, true]) for (const collapsed of [false, true]) {
  test(`expiry withdraws header attention and wait metadata diagnostic=${diagnostic} collapsed=${collapsed}`, async () => {
   const model = structuredClone(Object.values(cases).find(c => c.model?.sections?.needs_you?.length).model)
@@ -192,28 +215,37 @@ for (const clock of [null, NaN, Infinity, '1795281000', 0]) {
  })
 }
 for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
- test(`real reducer ${name}: overdue triage is red without inventing a human actor`, { skip: name !== 'agent_held_human' && !publicCases.composed_triage_601 }, async () => {
+ test(`real reducer ${name}: overdue triage is red without inventing a human actor`, async () => {
   const { model, now } = cases[name]
   await paint(m.renderModel(model, { now }))
   const human = name === 'agent_held_human'
+  // The shared >600 s policy lives in core; without it the reducer cannot age, but actor wording still holds.
+  const aged = !!publicCases.composed_triage_601
   if (human) {
    assert.equal(model.sections.needs_you.length, 1)
    assert.equal(model.sections.waiting.length, 0)
    assert.equal(window.getComputedStyle(document.querySelector('[data-ask-row]')).borderLeftColor, 'rgb(248, 81, 73)')
   } else {
-   const pip = document.querySelector('[data-row-pip="stuck"]')
-   assert.equal(window.getComputedStyle(pip).backgroundColor, 'rgb(248, 81, 73)')
    assert.equal(model.sections.needs_you.length, 0)
-   assert.equal(m.pipCategory(model.header.pips.find(p => p.section === 'stuck')), 'red')
+   if (aged) {
+    const pip = document.querySelector('[data-row-pip="stuck"]')
+    assert.equal(window.getComputedStyle(pip).backgroundColor, 'rgb(248, 81, 73)')
+    assert.equal(m.pipCategory(model.header.pips.find(p => p.section === 'stuck')), 'red')
+   } else {
+    const pip = document.querySelector('[data-row-pip="waiting"]')
+    assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(59, 130, 246)')
+   }
    const detail = document.querySelector('[data-row-detail]')
    assert.ok(detail.textContent.includes("waiting on this chat's agent to decide: "))
-   assert.ok(detail.textContent.includes('in triage · 5h 20m'))
+   // Elapsed triage age needs core's lifecycle-entry derivation; without it the age is unknown, never fabricated.
+   if (aged) assert.ok(detail.textContent.includes('in triage · 5h 20m'))
+   else assert.doesNotMatch(detail.textContent, /in triage · \d/)
    assert.equal(detail.style.whiteSpace, 'normal')
    assert.equal(detail.style.overflowWrap, 'anywhere')
    assert.equal(detail.style.overflow, 'visible')
    assert.equal(detail.style.flexBasis, '100%')
    await paint(m.renderModel(model, { now: now + 120 }))
-   assert.ok(document.querySelector('[data-row-detail]').textContent.includes('in triage · 5h 22m'))
+   if (aged) assert.ok(document.querySelector('[data-row-detail]').textContent.includes('in triage · 5h 22m'))
    assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
   }
  })
