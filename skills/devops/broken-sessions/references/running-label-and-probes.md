@@ -22,6 +22,14 @@ For a scheduled CI/deployment chain, inspect each predicate separately before ac
 
 Do not require all eventual acceptance predicates before starting the next eligible operation: a correct conjunction can pass positive/negative probe tests yet unnecessarily idle CI behind a later deployment window. This procedure repairs scheduling, not product acceptance; green local tests or a running worker do not waive hosted CI or loaded proof.
 
+## Review blocked behind the implementation it must review
+When an implementation is parked and its exact-head reviewer is `todo`, inspect both cards' parents, not just the recorded park. A dependency graph can be acyclic yet deadlocked in practice: the review requires implementation completion, while completion requires that review.
+
+1. Enumerate the chat with `hermes kanban chat-tasks <chat>` and read both cards with `hermes kanban show <id> --json`. Confirm the candidate is already published and the review brief targets it; a reviewer waiting on a genuinely unfinished prerequisite is not this case.
+2. As the authorized owner, remove the erroneous implementation→review edge using `kanban_unlink(parent_id=<implementation>, child_id=<review>)`, then add review→implementation using `kanban_link(parent_id=<review>, child_id=<implementation>)`, preserving unrelated prerequisites.
+3. Record the correction. If the implementation still has an obsolete ordinary scheduled hold, use `kanban_unblock` with its newest comment id; it should remain dependency-gated until review finishes. Separate spend, safety or containment holds retain their own release requirements.
+4. Read both cards back: verify reviewer admission/running separately from implementation waiting on review. On review completion, verify the implementation resumes to consume the verdict; completion of a request-changes review is not approval.
+
 ## Test a wake probe on its executor host
 The probe runs on the `host` named in the card's newest `external_watch` event (often a pool worker), not the
 hub. Test it there: write the probe to a script and run `~/.hermes/bin/hub-worker-exec <worker> -- <script>`.

@@ -32,7 +32,7 @@ Run the scanner for a stuck chat; follow the finding's fix section. If none matc
   past blocks, not the current wait. Fix the client so it uses core's verdict, and add the card as a regression
   fixture. Never clear `block_kind` by hand.
 - **Chat still shows a blocked card/ask after it was withdrawn or answered**: `references/stale-ask-tile.md`.
-- **Row says "Running" with nothing running, or a wake holds an eligible next step**: `references/running-label-and-probes.md` (executor checks and sequential dependency gates).
+- **False "Running", over-gated wakes, or review waiting on its implementation**: `references/running-label-and-probes.md`.
 - **"Failed/crashed tasks, why not restarted?"**: `references/crashed-runs.md`.
 - **"All my sessions are stalled" / every prompt waits minutes**: backend-wide, the scanner can't see it: `references/backend-wide-stall.md`.
 - **"Chat isn't accepting my messages"**: this is a transport problem and the scanner can't see it. Follow `references/message-not-delivered.md`.
