@@ -121,8 +121,11 @@ successful `skill_manage` / `mcp__skill_manage` calls. Flat create/edit results 
 `path`, supporting writes carry a file `path`, flat patches have no path, and successful atomic
 batches return compact `results` rows (`name`, `action`, `file_path`, `success`) without paths.
 For the latter cases the helper uses core's `_find_skill` and its configured lookup precedence,
-not its own basename search. Failed/rolled-back batches and approval-staged results are ignored.
-Only create/edit/patch/write_file are eligible; delete/remove_file are deliberately not published.
+not its own basename search. Failed/rolled-back batches and approval-staged results never
+authorize publication themselves. Ordinary successful tool observations also kick orphan recovery:
+dirty skill documents left by a reboot or a previously dropped record are rediscovered from Git,
+not inferred from a failed tool result. Only create/edit/patch/write_file have the direct publication
+path; independent dirty-document recovery also sees tracked deletions and untracked documents.
 Repeated paths in a batch are deduplicated and their final on-disk snapshot is published once.
 
 `skill_publish.py` permits `skills/.../SKILL.md` and non-executable supporting files below
@@ -137,16 +140,23 @@ Private skills outside the root are ignored; unrelated live dirt is neither stag
 
 Publication fetches origin/main, then queries `gh run list` for push runs at that exact tip.
 Every latest workflow run must be completed/successful. Red, missing, malformed,
-unreadable, or truncated CI evidence skips publication with one log record; unknown fails closed.
-The observer never waits for CI. A tip whose runs are only still queued/in progress (`pending`), or a
-busy publication lock, is **deferred** instead of dropped: a record goes to
+unreadable, or truncated CI evidence holds publication; unknown fails closed.
+The observer never waits for CI. Every operational hold (including pending/red/unknown CI,
+unknown/overlapping open PRs, busy publication locks, timeouts, exhausted budgets and push races)
+is **deferred** instead of dropped: a record goes to
 `$HERMES_HOME/cache/skill-publish-pending/<key>.json` (root, paths, session/card, 30 min window) and a
 detached `skill_publish.py --retry-pending` worker (one per home, flock) retries every 20 s. Each retry
 is a full `publish()` from a fresh snapshot: the tip's CI must be green, and every scope, race,
-gitleaks and reconcile rule below applies unchanged. Red CI or any publication error drops the
-record (edits stay in place, as for a direct skip); a still-pending or unknown tip keeps it until
-the window ends. Log: `$HERMES_HOME/logs/skill-publish-retry.log`. A later `skill_manage` call
-restarts the worker if records exist but none is running. A clean detached worktree starts at fetched origin/main and receives a
+gitleaks and reconcile rule below applies unchanged. Retry attempts never renew the deadline.
+Only malformed records, selected staged changes, explicit privacy/scope refusals and expiry
+retire retry custody; edits remain in place. Other errors keep custody until the deadline.
+Each hold/refusal/expiry emits a one-line `skill publication dirt` warning naming the paths and
+a distinct disposition/reason in `$HERMES_HOME/logs/skill-publish-retry.log`.
+Later tool observations restart the worker when no worker holds its flock, even with no pending
+records: dirty skill paths are rediscovered. Content fingerprints of refused/expired bytes
+(`.settled-*`) prevent discovery from repeatedly renewing their window; those bytes stay visibly
+held for reviewed recovery. A newer edit is eligible again. Existing records keep their deadline.
+A clean detached worktree starts at fetched origin/main and receives a
 `git apply --3way --index` patch constructed from captured bytes using a separate temporary index.
 Commits use the inherited repository author identity and include skill/session/card in their subject.
 Fetched `.githooks` are **never executed**, including checkout/rebase hooks. The plugin generates a private
@@ -166,7 +176,9 @@ still accepts other documented asset types for safe capture, but the publication
 Cross-skill batches use separate commits in the same detached worktree. Privacy/scope bypass environment
 flags are stripped for commits.
 A non-fast-forward push may fetch/rebase/retry at most **three** times (four pushes total),
-rechecking CI at every new tip. A refusal without a changed tip stops immediately. No force push.
+rechecking CI at every new tip. A refusal without a changed tip ends this attempt, not retry
+custody. An ambiguous successful push already present on fetched main needs no second push;
+the normal ancestry readback and reconciliation still run. No force push.
 
 Archives persist under `$HERMES_HOME/kanban/evidence/mods-reconcile/` (default `~/.hermes`)
 as `skill-publish-*` with `manifest.json`,
@@ -192,8 +204,8 @@ Tests: `tests_skill_publish.py` uses real bare origins, plugin-owned hooks/gitle
 and injects external CI/PR services (including the disposable detached worker). Push races are injected
 immediately before the real Git push, not by executing fetched pre-push hooks. It covers publication/clean source/later fast-forward,
 inherited identity, selected multi-file and cross-skill batches, unrelated dirt, scope and alias
-rejections, red/unknown CI one-log skips, in-progress-then-green deferred publication through the
-real hook and detached worker (no second `skill_manage` call), pending-then-red drop and window
+rejections, visible red/unknown CI holds, in-progress-then-green deferred publication through the
+real hook and detached worker (no second `skill_manage` call), pending-then-red hold and window
 expiry, actual pre-push races and retry exhaustion, real hook
 refusal, staged changes, and a concurrent writer. `_skill_publish_probe.py` exercises real-core
 resolution of compact batch rows (skipped when core is absent); it does not mutate core.
@@ -201,6 +213,11 @@ Run: `python3 -m unittest discover -s plugins/live-checkout-guard -p tests_skill
 The real publication fixtures require gitleaks; without it they skip, never bypass privacy hooks.
 The source-review and publication-validation regressions also run in the canonical suite
 (`scripts/test-all --no-core -k live-checkout-guard`). In particular,
+`tests/test_retry_recovery.py` covers slow trusted transport timeout then retry/publication/
+reconciliation, budget exhaustion, four real main races, uncertain remote success, held suite-slot
+independence, visible PR/tested-skill/privacy/staged/expiry holds, empty-queue observer recovery,
+worker lock custody and refusal/expiry fingerprint renewal controls. No fetched hook is used
+to inject delays. The plugin-owned doc-only pre-push never acquires repository suite slots.
 `tests/test_publication_validation.py::test_gitleaks_ignores_fetched_suppressions` commits matching
 ignore fingerprints to a disposable bare origin before calling the real publisher; placing an
 uncommitted ignore in the live source tree does not exercise fetched suppression.

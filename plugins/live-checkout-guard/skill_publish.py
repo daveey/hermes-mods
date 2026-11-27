@@ -7,6 +7,8 @@ from contextvars import ContextVar
 import io
 import importlib.util
 import json
+import logging
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -46,7 +48,7 @@ def remaining(cap):
     deadline, clock = budget
     left = deadline - clock()
     if left <= 0:
-        raise ValueError('publication deadline exceeded')
+        raise Deferred('publication deadline exceeded')
     return min(cap, left)
 
 
@@ -128,7 +130,11 @@ def run(root, *args, data=None, env=None, index=None):
     p = bounded(['git', '-C', str(root), '-c', 'core.hooksPath=/dev/null',
                  '-c', 'core.fsmonitor=false', *credential_args, *args], data=data, timeout=30, env=env)
     if p.returncode:
-        raise ValueError(p.stderr.decode(errors='replace').strip() or 'git command failed')
+        message = p.stderr.decode(errors='replace').strip() or 'git command failed'
+        # Only the fixed plugin-owned hook emits this refusal marker. Ordinary
+        # transport/Git failures (including races) retain custody until deadline.
+        cls = Refused if 'publication held: ' in message and 'commit' in args else Deferred
+        raise cls(message)
     return p.stdout
 
 
@@ -179,9 +185,12 @@ class Deferred(ValueError):
     """Publication did not run yet for a transient reason; nothing was pushed."""
 
 
-# Deferred publication: a skip only because main CI is still running is retried
-# by one detached worker per HERMES_HOME until green (publish), anything else
-# (drop; edits stay in place for the existing dirt recovery), or the window ends.
+class Refused(ValueError):
+    """Terminal scope, content or staged-state refusal; source edits stay intact."""
+
+
+# Operational holds retry under one worker per HERMES_HOME until the fixed
+# deadline. Only explicit content/staged refusals or malformed records retire early.
 RETRY_INTERVAL = 20.0
 RETRY_WINDOW = 30 * 60.0
 
@@ -208,7 +217,7 @@ def latest_main_ci(root, sha):
             return 'red'
         if all(r['status'] == 'completed' and r['conclusion'] == 'success' for r in latest.values()):
             return 'green'
-        # Still running (and nothing else odd): the only state the publisher defers and retries.
+        # Distinguish still-running workflows from unknown CI evidence.
         if all((r['status'] == 'completed' and r['conclusion'] == 'success')
                or r['status'] in RUNNING_STATUSES for r in latest.values()):
             return 'pending'
@@ -262,18 +271,31 @@ def trusted_hooks(archive):
 
 def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci, clock=None):
     clock = clock or time.monotonic
-    with operation_budget(WORK_BUDGET, clock):
-        return _publish(root, paths, session_id=session_id, task_id=task_id, ci=ci, clock=clock)
+    try:
+        with operation_budget(WORK_BUDGET, clock):
+            outcome = _publish(root, paths, session_id=session_id, task_id=task_id, ci=ci, clock=clock)
+    except Refused as exc:
+        dirt_notice(paths, 'refused', str(exc))
+        raise
+    except Exception as exc:
+        dirt_notice(paths, 'held', str(exc))
+        raise Deferred(str(exc)) from exc
+    if outcome.get('status') == 'skipped':
+        dirt_notice(paths, 'held', outcome.get('reason', 'unknown'))
+    return outcome
 
 
 def _publish(root, paths, *, session_id, task_id, ci, clock):
     root = Path(root).expanduser().resolve(strict=True)
     if run(root, 'rev-parse', '--show-toplevel').decode().strip() != str(root):
-        raise ValueError('root must be repository top level')
+        raise Refused('root must be repository top level')
     paths = list(dict.fromkeys(paths))
     if not paths or len(paths) > MAX_PATHS:
-        raise ValueError('empty or oversized publication batch')
-    targets = {n: selected_path(root, n) for n in paths}
+        raise Refused('empty or oversized publication batch')
+    try:
+        targets = {n: selected_path(root, n) for n in paths}
+    except ValueError as exc:
+        raise Refused(str(exc)) from exc
     gitdir = Path(run(root, 'rev-parse', '--absolute-git-dir').decode().strip())
     lock = gitdir / 'skill-publish.lock'
     # flock is released by the kernel on crash, so no stale lock; the file is never
@@ -294,8 +316,11 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
     try:
         head = run(root, 'rev-parse', 'HEAD').decode().strip()
         if run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '--', *paths):
-            raise ValueError('selected paths have staged changes')
-        captured = {n: snapshot(p) for n, p in targets.items()}
+            raise Refused('selected paths have staged changes')
+        try:
+            captured = {n: snapshot(p) for n, p in targets.items()}
+        except ValueError as exc:
+            raise Refused(str(exc)) from exc
         run(root, 'fetch', 'origin', 'main')
         base = run(root, 'rev-parse', 'origin/main').decode().strip()
         state = ci(root, base)
@@ -314,7 +339,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         for name, snap in captured.items():
             entry = run(root, 'ls-tree', head, '--', name)
             if entry and not entry.startswith(b'100644 blob '):
-                raise ValueError('non-document tracked mode refused')
+                raise Refused('non-document tracked mode refused')
             if snap is None:
                 run(root, 'update-index', '--force-remove', '--', name, index=index)
             else:
@@ -376,22 +401,28 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         for attempt in range(4):
             if hold := require_overlap_clear(root, paths):
                 return hold
+            # A prior ambiguous push may already be present on fetched main.
+            # No update means no hook/push, but reconciliation is still required.
+            if run(worktree, 'rev-parse', 'HEAD').decode().strip() == base:
+                break
             try:
                 run(worktree, '-c', hooks, 'push', 'origin', 'HEAD:main')
                 break
-            except ValueError:
+            except Refused:
+                raise
+            except (Deferred, subprocess.SubprocessError):
                 if attempt == 3:
                     raise
                 run(root, 'fetch', 'origin', 'main')
                 tip = run(root, 'rev-parse', 'origin/main').decode().strip()
                 if tip == base:
-                    raise ValueError('push refused without a main race')
+                    raise Deferred('push refused without a main race')
                 tip_state = ci(root, tip)
                 if tip_state == 'pending':
                     # Nothing was pushed: a later retry from a fresh snapshot is safe.
                     raise Deferred('latest main CI pending during retry')
                 if tip_state != 'green':
-                    raise ValueError('latest main CI not green during retry')
+                    raise Deferred('latest main CI not green during retry')
                 run(worktree, 'rebase', tip)
                 base = tip
         published = run(worktree, 'rev-parse', 'HEAD').decode().strip()
@@ -404,7 +435,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             if snapshot(selected_path(root, name)) != captured[name]:
                 raise ValueError('new writer detected; publication archived')
         if run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '--', *paths):
-            raise ValueError('selected paths were staged during publication')
+            raise Refused('selected paths were staged during publication')
         cmd = [sys.executable, str(Path(__file__).with_name('reconcile.py')),
                '--root', str(root), '--archive', str(archive), '--published', published]
         for name in paths:
@@ -414,8 +445,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             raise ValueError('reconcile refused: ' + result.stderr.decode(errors='replace'))
         return {'status': 'published', 'commit': published, 'archive': str(archive)}
     except Exception as exc:
-        # Deferred stays Deferred so the observer/worker can schedule a retry.
-        cls = Deferred if isinstance(exc, Deferred) else ValueError
+        cls = Refused if isinstance(exc, Refused) else Deferred
         raise cls('%s%s' % (exc, ('; archive: ' + str(archive)) if archive else '')) from exc
     finally:
         try:
@@ -481,12 +511,9 @@ def written_paths(args, result, root):
 
 
 # --- Deferred publication -------------------------------------------------------------
-# The observer never waits for CI (45 s budget, CI takes minutes). A skip that is only
-# "main CI still running" (or a busy publication lock) is recorded under HERMES_HOME and
-# retried by one detached worker. Each retry is a full publish(): fresh snapshot, fetch,
-# CI must be green for the exact tip, the same scope/race/gitleaks rules. Red CI or any
-# publication error drops the record (edits stay in place, as for a direct skip); a tip
-# still pending or unknown is retried until the record's window ends.
+# The observer never waits for CI (45 s budget, CI takes minutes). Each retry is
+# a complete fresh publish(), retaining all CI, PR, privacy and custody gates.
+# Operational failures retain the original record/deadline, never discard edits.
 
 def pending_dir():
     home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
@@ -494,8 +521,7 @@ def pending_dir():
 
 
 def deferrable(outcome):
-    return isinstance(outcome, dict) and outcome == {
-        'status': 'skipped', 'reason': 'latest main CI pending'}
+    return isinstance(outcome, dict) and outcome.get('status') == 'skipped'
 
 
 def _record_key(root, paths):
@@ -533,6 +559,12 @@ def defer(root, paths, *, session_id='', task_id='', spawn=True, clock=None, dir
         created = now
     record = {'version': 1, 'root': root, 'paths': paths, 'session_id': str(session_id or ''),
               'task_id': str(task_id or ''), 'created': created, 'deadline': now + RETRY_WINDOW}
+    record['signatures'] = {}
+    for name in paths:
+        try:
+            record['signatures'][name] = _signature(root, name)
+        except (OSError, ValueError):
+            pass
     fd, tmp = tempfile.mkstemp(dir=directory, prefix='.record-', suffix='.tmp')
     with os.fdopen(fd, 'w') as fh:
         json.dump(record, fh)
@@ -558,10 +590,77 @@ def spawn_worker(directory=None):
     threading.Thread(target=process.wait, name='skill-publish-retry-reaper', daemon=True).start()
 
 
-def kick(directory=None):
-    """Restart the worker when records exist (e.g. after a reboot killed the last one)."""
+def dirt_notice(paths, disposition, reason, directory=None):
+    """A single visible line; never silently strand edits behind mods-pull."""
     directory = Path(directory) if directory else pending_dir()
-    if directory.is_dir() and any(directory.glob('*.json')):
+    message = 'skill publication dirt %s %s: %s' % (
+        disposition, json.dumps(paths, ensure_ascii=True), str(reason).replace('\n', ' ')[:500])
+    logging.getLogger(__name__).warning(message)
+    _retry_log(directory, message)
+
+
+def _signature(root, name):
+    import hashlib
+    snap = snapshot(selected_path(Path(root), name))
+    return hashlib.sha256(snap[0]).hexdigest() if snap else 'deleted'
+
+
+def _settle(directory, root, paths, signatures):
+    # Discovery must not renew expired/refused bytes on every unrelated tool call.
+    # Fingerprints are from BEFORE the attempt so a concurrent new edit is eligible.
+    for name in paths:
+        if name in signatures:
+            (directory / ('.settled-' + _record_key(root, [name]))).write_text(signatures[name])
+
+
+def kick(directory=None, *, root=None):
+    """Recover orphan dirty docs as well as pending records, without duplicate workers."""
+    directory = Path(directory) if directory else pending_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(directory / '.worker.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    busy = False
+    discovered = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            busy = True
+        if root is not None:
+            with operation_budget(LOCK_WAIT, time.monotonic):
+                root = str(Path(root).resolve(strict=True))
+                covered = set()
+                for path in directory.glob('*.json'):
+                    try:
+                        rec = json.loads(path.read_text())
+                        if (isinstance(rec, dict) and rec.get('root') == root
+                                and isinstance(rec.get('paths'), list)
+                                and all(isinstance(n, str) for n in rec['paths'])):
+                            covered.update(rec['paths'])
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
+                # NUL paths, no rename ambiguity, includes deleted/untracked docs.
+                dirty = set(run(root, 'diff', *DIFF_FLAGS, '--name-only', '-z', '--no-renames', 'HEAD', '--', 'skills').decode().rstrip('\0').split('\0'))
+                dirty.update(run(root, 'ls-files', '--others', '--exclude-standard', '-z', '--', 'skills').decode().rstrip('\0').split('\0'))
+                for name in sorted(dirty - covered - {''}):
+                    try:
+                        signature = _signature(root, name)
+                    except ValueError as exc:
+                        dirt_notice([name], 'refused', str(exc), directory)
+                        continue
+                    settled = directory / ('.settled-' + _record_key(root, [name]))
+                    if settled.exists() and settled.read_text() == signature:
+                        dirt_notice([name], 'held', 'previous refusal/expiry; reviewed recovery required', directory)
+                        continue
+                    defer(root, [name], spawn=False, directory=directory)
+                    discovered = True
+                    dirt_notice([name], 'held', 'orphan edit recovered for retry', directory)
+        pending = any(directory.glob('*.json'))
+    finally:
+        os.close(fd)
+    if pending and (not busy or discovered):
+        # A new enqueue needs a contender even when the incumbent appeared busy:
+        # it may have crossed its final empty check during discovery. Workers
+        # still execute only under their flock; defer() uses the same handoff.
         spawn_worker(directory)
         return True
     return False
@@ -610,39 +709,57 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                     return counts
                 continue
             for path in records:
+                rec = {}
+                raw = None
                 try:
                     raw = path.read_bytes()
                     rec = json.loads(raw)
                     root, paths = rec['root'], rec['paths']
-                    if (not isinstance(root, str) or not isinstance(paths, list)
+                    if (not isinstance(root, str) or not isinstance(paths, list) or not paths or len(paths) > MAX_PATHS
                             or not all(isinstance(p, str) for p in paths)):
                         raise ValueError('malformed record')
                     deadline = float(rec['deadline'])
+                    if not math.isfinite(deadline):
+                        raise ValueError('nonfinite deadline')
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     _retry_log(directory, 'dropped malformed %s: %s' % (path.name, exc))
-                    path.unlink(missing_ok=True)
+                    dirt_notice(rec.get('paths', [path.name]) if isinstance(rec, dict) else [path.name],
+                                'dropped malformed', str(exc), directory)
+                    if raw is not None:
+                        _drop(path, raw)
                     counts['dropped'] += 1
                     continue
-                if clock() > deadline:
+                signatures = {}
+                for name in paths:
+                    try:
+                        signatures[name] = _signature(root, name)
+                    except (ValueError, OSError):
+                        pass
+                if clock() >= deadline:
                     _retry_log(directory, 'expired; edits left in place %s' % paths)
+                    dirt_notice(paths, 'expired', 'retry deadline; reviewed recovery required', directory)
+                    enrolled = rec.get('signatures', {})
+                    _settle(directory, root, paths, enrolled if isinstance(enrolled, dict) else {})
                     _drop(path, raw)
                     counts['expired'] += 1
                     continue
                 try:
                     outcome = publish(root, paths, session_id=rec.get('session_id', ''),
                                       task_id=rec.get('task_id', ''), ci=ci)
-                except Deferred:
-                    counts['kept'] += 1
-                    continue
-                except Exception as exc:
-                    _retry_log(directory, 'preserved edits %s: %s' % (paths, exc))
+                except Refused as exc:
+                    dirt_notice(paths, 'dropped refused', str(exc), directory)
+                    _settle(directory, root, paths, signatures)
                     _drop(path, raw)
                     counts['dropped'] += 1
                     continue
-                if isinstance(outcome, dict) and outcome.get('status') == 'skipped' and \
-                        outcome.get('reason') in ('latest main CI pending', 'latest main CI unknown'):
+                except Exception as exc:
+                    dirt_notice(paths, 'held retryable', str(exc), directory)
+                    counts['kept'] += 1
+                    continue
+                if deferrable(outcome):
+                    dirt_notice(paths, 'held', outcome.get('reason', 'unknown'), directory)
                     counts['kept'] += 1
                     continue
                 _retry_log(directory, 'retry %s %s' % (paths, outcome))

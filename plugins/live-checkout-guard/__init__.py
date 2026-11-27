@@ -212,35 +212,41 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", **_
 
 def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None,
                     task_id: str = "", session_id: str = "", status: str = "", **_: Any) -> None:
-    """Observe successful skill writes only; never change the tool's result."""
-    if tool_name.removeprefix("mcp__") != "skill_manage" or status not in {"", "ok", "success"}:
+    """Observe skill writes and recover orphan docs; never change a tool result."""
+    if status not in {"", "ok", "success"}:
         return
     try:
         if not guard.enabled():
             return
         module = _load_sibling("skill_publish.py")
         root = _Path(guard.root())
+        if tool_name.removeprefix("mcp__") != "skill_manage":
+            module.kick(root=root)
+            return
         paths = module.written_paths(args if isinstance(args, dict) else {}, result, root)
         if not paths:
-            module.kick()
+            module.kick(root=root)
             return
         try:
             outcome = module.publish(root, paths, session_id=session_id, task_id=task_id)
-        except module.Deferred as exc:
+        except module.Refused:
+            # publish already emits a path-qualified dirt notice.
+            return
+        except Exception as exc:
             outcome = {'status': 'skipped', 'reason': str(exc)}
+            module.dirt_notice(paths, 'held retryable', str(exc))
             deferred = True
         else:
             deferred = module.deferrable(outcome)
         if deferred:
-            # Only a still-running main CI (or a busy lock) defers; red/unknown stay final.
+            # Every operational hold retries; privacy/scope/staged refusals do not.
             outcome = dict(outcome, deferred=module.defer(
                 root, paths, session_id=session_id, task_id=task_id)['record'])
         else:
-            module.kick()
+            module.kick(root=root)
         logger.info("live-checkout-guard: skill publication %s", outcome)
     except Exception as exc:
-        # One record per call. Red/unknown CI and errors are final here; a pending-CI
-        # skip is retried by skill_publish's detached worker, never by this observer.
+        # Recovery/snapshot errors remain visible and never affect the tool result.
         logger.warning("live-checkout-guard: skill publication preserved edits: %s", exc)
 
 

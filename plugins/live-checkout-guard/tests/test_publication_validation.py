@@ -156,6 +156,15 @@ def test_gitleaks_ignores_fetched_suppressions(repository, suppression):
                                   '-c', str(HERE / 'publication.gitleaks.toml')],
                                  input=target.read_bytes(), cwd=root, capture_output=True)
         assert control.returncode == 0, control.stderr.decode(errors='replace')
+    if suppression == 'config-and-inline':
+        # Isolate the inline vector from the root ignore-file fingerprint too.
+        private = root.parent / 'inline-positive-control'
+        private.mkdir()
+        control = subprocess.run(['gitleaks', 'stdin', '--no-banner', '--redact',
+                                  '--gitleaks-ignore-path', str(HERE / 'publication.gitleaksignore'),
+                                  '-c', str(HERE / 'publication.gitleaks.toml')],
+                                 input=target.read_bytes(), cwd=private, capture_output=True)
+        assert control.returncode == 0, control.stderr.decode(errors='replace')
     with patch.object(pub, 'publication_overlap', return_value={'status': 'clear'}):
         with pytest.raises(ValueError, match='gitleaks refused'):
             pub.publish(root, [name], ci=lambda *_: 'green')
@@ -172,6 +181,13 @@ def test_privacy_uses_plugin_config_over_inherited_allowlist(repository, monkeyp
     config.write_text(allow)
     monkeypatch.setenv(setting, str(config) if setting == 'GITLEAKS_CONFIG' else allow)
     target.write_text('token = "' + 'ghp_' + secrets.token_hex(18) + '"\n')
+    private = root.parent / 'config-positive-control'
+    private.mkdir()
+    control = subprocess.run(['gitleaks', 'stdin', '--no-banner', '--redact',
+                              '--ignore-gitleaks-allow', '--gitleaks-ignore-path',
+                              str(HERE / 'publication.gitleaksignore')],
+                             input=target.read_bytes(), cwd=private, capture_output=True)
+    assert control.returncode == 0, control.stderr.decode(errors='replace')
     git('add', name)
     validator = load('fixture_inherited_validator', 'publication_validate.py')
     monkeypatch.chdir(root)
