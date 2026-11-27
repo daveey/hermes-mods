@@ -1284,11 +1284,20 @@ class Mirror:
                         snap["task"],
                         exc,
                     )
+        # Known terminal histories have no binding work left: do not reopen their
+        # board/revision/tip on every cold poll. Match the full ActionStore owner;
+        # missing, mismatched and unknown-state requests still take the normal
+        # validation/defer path. Open resolutions must retain receipt recovery.
+        # This is candidate selection only: _reconcile_binding re-reads current
+        # authority, and _reconcile_local retains its pre-work invalidation key.
         with self.store._read() as c:
             bindings = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT * FROM kanban_projections WHERE namespace=? AND session=?",
+                    "SELECT p.* FROM kanban_projections p LEFT JOIN requests r "
+                    "ON r.namespace=p.namespace AND r.id=p.request_id AND r.session=p.session "
+                    "WHERE p.namespace=? AND p.session=? "
+                    "AND (r.state IS NULL OR r.state NOT IN ('resolved','superseded','cancelled','withdrawn'))",
                     (self.store._ns(owner), owner["storedSessionId"]),
                 )
             ]
@@ -1308,7 +1317,10 @@ class Mirror:
             older = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT * FROM kanban_projections WHERE namespace=? AND session!=?",
+                    "SELECT p.* FROM kanban_projections p LEFT JOIN requests r "
+                    "ON r.namespace=p.namespace AND r.id=p.request_id AND r.session=p.session "
+                    "WHERE p.namespace=? AND p.session!=? "
+                    "AND (r.state IS NULL OR r.state NOT IN ('resolved','superseded','cancelled','withdrawn'))",
                     (self.store._ns(owner), owner["storedSessionId"]),
                 )
             ]

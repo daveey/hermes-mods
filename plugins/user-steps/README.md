@@ -279,6 +279,21 @@ only the last kanban alias is live, earlier cards keep their decided binding.
 
 ## Blocked work-card asks
 
+Local binding reconciliation selects only potentially actionable history: a
+matching ActionStore row in `resolved`, `superseded`, `cancelled` or `withdrawn`
+state does not reopen its old board snapshot, revision body or compression tip.
+These terminal payloads are historical data, not authority for active work; a
+corrupt terminal payload alone no longer defers unrelated queue reconciliation.
+The join matches namespace, request ID **and session**. Missing/mismatched rows
+and unknown/NULL states still enter normal validation. All `open` and
+`needs_context` rows, including pending resolutions and older-chat bindings,
+retain current authoritative reads, receipt recovery and retirement fences.
+A revival invalidates the existing pre-work store key and is revisited on the
+next pass. No new cache, TTL, index or lifecycle transition is introduced.
+Tests: `tests/test_mirror_terminal_candidates.py` covers both owner cohorts,
+terminal-history read exclusion, missing/mismatched rows, active withdrawal,
+resolution candidacy, revival/key invalidation and active-to-terminal races.
+
 The session-panel feed reconciles local card asks before reading its canonical
 requests; the compatibility `/requests` read also reconciles. The panel producer
 memoizes clean remote passes by canonical activity revisions plus courier, session
