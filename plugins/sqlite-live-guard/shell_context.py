@@ -244,7 +244,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     readonly = set()
     text = text.replace("\\\n", "")
     if in_home is None:
-        in_home = bool(cwd) and guard._expand(cwd).rstrip("/") == guard._home().rstrip("/")
+        in_home = (os.path.realpath(guard._expand(cwd)) if cwd else False) if not remote else False
     text, bodies = _heredocs(text)
     blocks, rhs = 0, False
     scopes, braces, pipeline = [], [], None
@@ -340,7 +340,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             why, next_home = _command(argv, guard, in_home, depth, local, exported | assigned, bodies, remote, budget)
             if why:
                 return why
-            in_home = in_home or next_home if conditional else next_home
+            in_home = guard.merge_directory_contexts(in_home, next_home) if conditional else next_home
         if raw[i] == "unset" and not conditional:
             for name in raw[i + 1:]:
                 if name not in readonly:
@@ -427,11 +427,11 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
             return guard.remote_sqlite3_refusal(argv[0], db), in_home
     elif word == "cd":
         target = (guard._operands(args) or ["~"])[0]
-        in_home = guard._HOME_PREFIX.sub("", target).rstrip("/") == "" or target.rstrip("/") == guard._home().rstrip("/")
+        in_home = guard.directory_context(target, in_home, not remote)
     elif word in _FILES:
         ops = guard._operands(guard._without_redirects(args))
         if guard.destructive_directory(word, args):
-            directories = ops[:-1] if word == "mv" else ops
+            directories = guard.move_sources(args, ops) if word == "mv" else ops
             hit = next((p for p in directories if guard.protects_directory(p, in_home, not remote)), None)
             if hit:
                 return f"`{word}` would remove a directory containing live database files: {hit}", in_home
