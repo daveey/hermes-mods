@@ -349,31 +349,47 @@ class Supervisor:
             selected_at = time.time()
             self.last_start = time.monotonic()
             attempted = False
+            result = None
             try:
-                config = self._configuration()
-                paths = config['local'], config['fleet']
-                if self.process and paths != self.source_paths:
-                    self.process.close()
-                    self.process = None
-                if time.monotonic() >= self.retry_at:
+                # Keep the exact shared future/revision during one generation
+                # handoff. Requeueing could overwrite newer same-key demand.
+                for attempt in range(2):
+                    config = self._configuration()
+                    paths = config['local'], config['fleet']
+                    if self.process and paths != self.source_paths:
+                        self.process.close()
+                        self.process = None
+                    if time.monotonic() < self.retry_at:
+                        raise Unavailable('lanes projector retry backoff')
                     attempted = True
-                    if self.process is None or self.process.closed:
-                        self.process = self._spawn(config)
-                        self.source_paths = paths
-                    command = rpc.project_command(self.process.session, 0, key, revision[0], None, config['mode'])
-                    command['revision'] = list(revision)
-                    rpc_start = time.time()
-                    result = self.process.request(command, max(.01, 10 - (time.monotonic() - queued)))
-                    received_at = time.time()
-                    if not identity.matches(self.manifest):
-                        raise Unavailable('projection identity moved')
+                    try:
+                        if self.process is None or self.process.closed:
+                            self.process = self._spawn(config)
+                            self.source_paths = paths
+                        command = rpc.project_command(self.process.session, 0, key, revision[0], None, config['mode'])
+                        command['revision'] = list(revision)
+                        rpc_start = time.time()
+                        result = self.process.request(command, max(.01, 10 - (time.monotonic() - queued)))
+                        received_at = time.time()
+                        if not identity.matches(config['identity']):
+                            raise Unavailable('projection identity moved')
+                    except Exception:
+                        # Child per-job refusal and our post-result fence both
+                        # discard old evidence. Only disk movement permits a
+                        # retry; the new child must still pass the wire gate.
+                        if (attempt or self.stopped or time.monotonic() - queued >= 10
+                                or identity.matches(config['identity'])):
+                            raise
+                        if self.process:
+                            self.process.close()
+                            self.process = None
+                        continue
                     result['timing'] = {**result['timing'], 'selected': selected_at,
                                         'rpc_start': rpc_start, 'rpc_received': received_at,
                                         'result_ready': time.time()}
                     self.failures = 0
                     result['mode'] = 'projector'
-                else:
-                    raise Unavailable('lanes projector retry backoff')
+                    break
             except Exception:
                 if self.process:
                     self.process.close()

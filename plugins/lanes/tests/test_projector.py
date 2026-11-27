@@ -407,6 +407,41 @@ def test_supervisor_backoff_never_computes_in_parent_and_coalesces(monkeypatch):
         supervisor.close()
 
 
+@pytest.mark.parametrize('moves', [False, True])
+def test_active_generation_retry_is_bounded_and_retains_backoff(monkeypatch, moves):
+    from types import SimpleNamespace
+    client = module('projector_client')
+    supervisor = client.Supervisor(SimpleNamespace(MIN_PROJECT_GAP_S=0), {})
+    state = [0]
+    spawned = []
+    monkeypatch.setattr(client.identity, 'matches', lambda manifest: manifest == state[0])
+    monkeypatch.setattr(supervisor, '_configuration', lambda: {
+        'identity': state[0], 'local': 'fixture', 'fleet': None, 'mode': 'off'})
+    class Broken:
+        session = 'fixture'
+        closed = False
+        def request(self, command, timeout):
+            if moves:
+                state[0] += 1
+            raise client.Unavailable('injected request failure')
+        def close(self):
+            self.closed = True
+    def spawn(config):
+        child = Broken()
+        spawned.append(child)
+        return child
+    monkeypatch.setattr(supervisor, '_spawn', spawn)
+    try:
+        with pytest.raises(client.Unavailable):
+            supervisor.submit((6., '6h', True), 1, [1]).result(2)
+        assert len(spawned) == (2 if moves else 1)
+        assert all(child.closed for child in spawned)
+        assert supervisor.failures == 1
+        assert supervisor.retry_at > time.monotonic()
+    finally:
+        supervisor.close()
+
+
 def test_cursor_reads_coalesce_for_32_viewers(actual_board, monkeypatch):
     import threading
     api, config = actual_board
@@ -529,6 +564,65 @@ def test_stream_respawns_current_code_but_refuses_new_protocol(actual_board, tmp
                     assert frame['projector']['mode'] == 'projector'
                     assert frame['projector']['projector_pid'] != initial['projector']['projector_pid']
                 assert old.proc.poll() is not None
+    finally:
+        if api._projector_instance:
+            api._projector_instance.close()
+
+
+@pytest.mark.parametrize('boundary', ['before_request', 'after_result'])
+@pytest.mark.parametrize('protocol_change', [False, True])
+def test_stream_keeps_active_job_across_code_update(actual_board, tmp_path, monkeypatch, boundary, protocol_change):
+    import shutil
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    _, _config = actual_board
+    directory = tmp_path / 'plugins' / 'lanes' / 'dashboard'
+    shutil.copytree(DASH, directory)
+    shutil.copytree(DASH.parents[1] / 'session-panel', directory.parents[1] / 'session-panel')
+    api = module('projector_identity').load(directory / 'plugin_api.py', 'active_update_api')
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    app = FastAPI()
+    app.include_router(api.router)
+    try:
+        with TestClient(app) as client, client.websocket_connect('/v1/lanes/stream?debug=true&expanded=true') as ws:
+            initial = ws.receive_json()
+            assert initial['view']['flow_complete'] is True
+            old = api._projector().process
+            request = old.request
+            moved = []
+            def move():
+                if moved:
+                    return
+                moved.append(True)
+                target = directory / ('projector_protocol.py' if protocol_change else 'view.py')
+                text = target.read_text()
+                text = text.replace('VERSION = 1', 'VERSION = 999') if protocol_change else text + '\n# active deployment\n'
+                target.write_text(text)
+            def updating_request(command, timeout):
+                if command['op'] != 'project':
+                    return request(command, timeout)
+                if boundary == 'before_request':
+                    move()  # real child per-job identity refusal
+                result = request(command, timeout)
+                if boundary == 'after_result':
+                    move()  # parent post-result identity fence
+                return result
+            monkeypatch.setattr(old, 'request', updating_request)
+            ws.send_json({'expanded': False})
+            if protocol_change:
+                with pytest.raises(WebSocketDisconnect):
+                    while True:
+                        ws.receive_json()
+            else:
+                frame = ws.receive_json()
+                while frame.get('type') == 'heartbeat':
+                    frame = ws.receive_json()
+                assert frame['view']['flow_complete'] is True
+                assert frame['view']['status']
+                assert frame['projector']['projector_pid'] != initial['projector']['projector_pid']
+            assert moved == [True]
+            assert old.proc.poll() is not None
     finally:
         if api._projector_instance:
             api._projector_instance.close()

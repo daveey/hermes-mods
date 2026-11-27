@@ -74,7 +74,7 @@ def setup_supervisor(monkeypatch, gap=.12):
                     'timing': {'project_start': now, 'project_end': now}, 'projector_pid': 123}
     supervisor = client.Supervisor(SimpleNamespace(MIN_PROJECT_GAP_S=gap), {})
     child = Child()
-    monkeypatch.setattr(supervisor, '_configuration', lambda: {'local': 'fixture', 'fleet': None, 'mode': 'off'})
+    monkeypatch.setattr(supervisor, '_configuration', lambda: {'identity': supervisor.manifest, 'local': 'fixture', 'fleet': None, 'mode': 'off'})
     monkeypatch.setattr(supervisor, '_spawn', lambda _: child)
     return supervisor, calls, entered, release
 
