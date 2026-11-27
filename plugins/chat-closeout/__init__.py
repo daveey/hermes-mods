@@ -38,6 +38,7 @@ if __package__:
     from . import owner_wake
     from . import routing
     from . import waiting_inputs as wi
+    from . import hook_work
 else:  # pytest imports the hyphenated plugin dir without a parent package
     _spec = importlib.util.spec_from_file_location("chat_closeout_core", Path(__file__).with_name("core.py"))
     core = importlib.util.module_from_spec(_spec)
@@ -56,6 +57,48 @@ else:  # pytest imports the hyphenated plugin dir without a parent package
     wi = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(wi)
     wi = sys.modules.setdefault("chat_closeout_waiting_inputs", wi)
+    _spec = importlib.util.spec_from_file_location("chat_closeout_hook_work", Path(__file__).with_name("hook_work.py"))
+    hook_work = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(hook_work)
+
+# Strict work continues off the turn-end path. No stale projection can acknowledge
+# a handoff, and another turn's closeout read may not overtake its pending stamp.
+# Keep custody across plugin reload: an old daemon must finish before the new
+# module can brief the same session. Construct fully before publishing.
+from types import ModuleType
+_runtime_candidate = ModuleType('_chat_closeout_hook_runtime_v1')
+_runtime_candidate.turn_ends = hook_work.Lanes()
+_runtime_candidate.gate_reads = hook_work.Lanes()
+_runtime = sys.modules.setdefault(_runtime_candidate.__name__, _runtime_candidate)
+_turn_ends = _runtime.turn_ends
+_gate_reads = _runtime.gate_reads
+_HOOK_WAIT_S = 0.4
+
+
+def _hook_key(session_id):
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except ImportError:
+        home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    return home, os.environ.get("CHAT_CLOSEOUT_DB"), session_id
+
+
+def _flush_turn_end(session_id, timeout=_HOOK_WAIT_S):
+    return _turn_ends.flush(_hook_key(session_id), timeout)
+
+
+def _flush_gate(session_id, timeout=_HOOK_WAIT_S):
+    deadline = time.monotonic() + timeout
+    return all(_gate_reads.flush((_hook_key(session_id), probe), max(0, deadline - time.monotonic()))
+               for probe in ("backed", "shown", "watch"))
+
+
+def _gate_probe(session_id, probe, call):
+    # Repeated gates share an in-flight read, not another lock-waiting thread.
+    future = _gate_reads.submit((_hook_key(session_id), probe), call, reuse=True)
+    return future.result(timeout=0.2)
+
 
 logger = logging.getLogger("chat_closeout")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -1330,11 +1373,24 @@ def post_llm_call(session_id: str = "", platform: str = "", conversation_history
     if not _eligible(session_id, platform):
         return
     try:
-        _upgraded()
         observed = _state.setdefault("observed", {}).pop(session_id, None)
         asked = _state.setdefault("observed_ask", {}).pop(session_id, None)
+        succeeded = _turn_succeeded(conversation_history)
+        future = _turn_ends.submit(_hook_key(session_id),
+                                  lambda: _stamp_turn_end(session_id, observed, asked, succeeded))
+        try:
+            future.result(timeout=_HOOK_WAIT_S)
+        except TimeoutError:
+            logger.info("chat-closeout: deferred turn-end stamp session=%s", session_id)
+    except Exception:
+        logger.debug("chat-closeout post_llm_call failed", exc_info=True)
+
+
+def _stamp_turn_end(session_id, observed, asked, succeeded):
+    try:
+        _upgraded()
         out = core.record_turn_end(ledger(), session_id, open_card_ids(session_id), read_cards,
-                                   observed_sig=observed, succeeded=_turn_succeeded(conversation_history))
+                                   observed_sig=observed, succeeded=succeeded)
         if asked:
             row = ledger().get(session_id) or {}
             batch = set(row.get("batch") or [])
@@ -1369,6 +1425,9 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
     if not _eligible(session_id, platform):
         return None
     try:
+        if not _flush_turn_end(session_id):
+            # Do not read/brief an older generation while its stamp is in flight.
+            return None
         _state.setdefault("observed", {}).pop(session_id, None)
         _state.setdefault("observed_ask", {}).pop(session_id, None)
         _upgraded()
@@ -1590,12 +1649,13 @@ def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optio
     if not created:
         return None
     try:
-        missing = [t for t in created if t not in _shown_ids(session_id)]
-        watches = _watch_parked(session_id, missing)
+        shown = _gate_probe(session_id, "shown", lambda: _shown_ids(session_id))
+        missing = [t for t in created if t not in shown]
+        watches = _gate_probe(session_id, "watch", lambda: _watch_parked(session_id, missing))
         missing = [t for t in missing if t not in watches]
         if missing:
             _visibility_sleep(VISIBILITY_RECHECK_S)
-            shown = _shown_ids(session_id)
+            shown = _gate_probe(session_id, "shown", lambda: _shown_ids(session_id))
             missing = [t for t in missing if t not in shown]
     except Exception:
         logger.debug("chat-closeout: task-list read failed; letting the reply through", exc_info=True)
@@ -1618,7 +1678,7 @@ def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optio
 
 def _promise_gate(session_id: str, final_response: str, attempt: int) -> Optional[dict]:
     promise = core.find_promise(final_response)
-    if not promise or _backed(session_id):
+    if not promise or _gate_probe(session_id, "backed", lambda: _backed(session_id)):
         return None
     logger.info("chat-closeout: unbacked promise in %s (%r), attempt %d", session_id, promise, attempt)
     if attempt < 1:
