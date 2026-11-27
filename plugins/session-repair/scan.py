@@ -757,6 +757,12 @@ def rule_overdue_wake(card: Card, src: Sources) -> Optional[Finding]:
             missing = kc.missing_wake(c, card.id, park=park)
         except Exception as e:  # noqa: BLE001
             src.error(f'missing_wake {card.board}/{card.id}', e)
+        # A superseded park (its own newer park is still on the way) has no wake yet by design:
+        # core backstops it at parked_at + SUPERSEDED_PARK_GRACE_SECONDS. Never call the card
+        # unwoken while that backstop is pending; core's own late-wake grace applies after it.
+        implied = _num((missing or {}).get('wake_at'))
+        if park.get('superseded') and implied is not None and now - implied <= WAKE_OVERDUE_S:
+            return None
         return _finding('BS-overdue-wake', card, 'no_wake',
                         f'scheduled {_fmt_age(parked)} with no wake published (no wake_at, no probe)',
                         {'parked_s': parked, 'park_superseded': bool(park.get('superseded')),
@@ -1394,6 +1400,81 @@ def canonical_age_reassessment(card: Card, src: Sources, park: dict, awaited: di
             c.rollback()  # ends only our read transaction; never ends a borrowed caller's transaction
 
 
+def healthy_producer_card(ref: str, card: Card, live: dict, src: 'Sources', now: float) -> bool:
+    """The awaited card is actively executing, or parked by core with a future timed wake."""
+    state = live.get('state')
+    if not isinstance(state, dict):
+        return False
+    board, _ = src.find_card(ref, card.board)
+    if not board:
+        return False
+    c = src.conn(board)
+    if state.get('status') == 'running':
+        return c.execute("SELECT 1 FROM task_runs WHERE task_id=? AND status='running' AND ended_at IS NULL LIMIT 1",
+                         (ref,)).fetchone() is not None
+    if state.get('status') != 'scheduled':
+        return False
+    park = _events(c, ref, _core_wait()[0])
+    if not park:
+        return False
+    started = c.execute('SELECT MAX(started_at) FROM task_runs WHERE task_id=?', (ref,)).fetchone()
+    if started and started[0] is not None and park[0]['at'] < started[0]:
+        return False  # that park is spent; a newer one has not arrived
+    wake_at = _num(park[0]['payload'].get('wake_at'))
+    return wake_at is not None and wake_at > now
+
+
+def healthy_live_producer(card: Card, park: dict, awaited: dict, live: dict, src: 'Sources', now: float) -> bool:
+    """True when the awaited producer is demonstrably alive, so a long wait is not a stall.
+
+    card: the producer card is itself running a live run, or parked with a future timed wake
+    (ready, blocked, triage, done and archived are not live producers). ci/deploy/external:
+    core's watcher for this park observed the producer healthy (ok, or degraded while still running), with no failures, and its next poll
+    is not overdue. Any adverse watcher event since the park (broken/lost/stale probe,
+    condition_met) keeps the card eligible.
+    """
+    if awaited.get('kind') == 'card':
+        return healthy_producer_card(awaited['ref'], card, live, src, now)
+    if awaited.get('kind') not in ('ci', 'deploy', 'external'):
+        return False
+    payload = park['payload']
+    if card.status != 'scheduled' or (_num(payload.get('wake_at')) or 0) <= now:
+        return False  # only a future core backstop makes the watcher's word current
+    command = str(payload.get('wake_check') or '').strip()
+    ref = str(awaited.get('ref') or '')
+    adverse = ('wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met')
+    rows = card.conn.execute(
+        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id=? AND id>? AND created_at>=? "
+        f"AND created_at<=? AND kind IN ('external_watch', {','.join('?' for _ in adverse)}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 101",
+        (card.id, park['id'], park['at'], now, *adverse)).fetchall()
+    if not rows or len(rows) == 101:
+        return False
+    if any(r[1] in adverse for r in rows):
+        return False
+    if len(rows) > 1 and rows[0][3] == rows[1][3]:
+        return False  # equal timestamps cannot be ordered
+    data = _json(rows[0][2])
+    if not isinstance(data, dict):
+        return False
+    recorded = str(data.get('wake_check') or (data.get('_wake_episode_v1') or {}).get('cmd') or '').strip()
+    if recorded and recorded != command:
+        return False
+    if not command and not (
+            data.get('adapter') in ('github_run', 'github_pr_checks')
+            and data.get('url') == ref and re.fullmatch(r'https://github\.com/[^/]+/[^/]+/(?:actions/runs|pull)/\d+', ref)):
+        return False  # a typed GitHub watcher must name this exact run/PR
+    observed, due, every = (_num(data.get(k)) for k in ('observed_at', 'next_due_at', 'every'))
+    health, wstate = data.get('health'), data.get('state')
+    if not ((health == 'ok' and wstate in ('external_running', 'external_unknown'))
+            or (health == 'degraded' and wstate == 'external_running')):
+        return False
+    return (data.get('consecutive_failures') == 0 and not data.get('failing_since')
+            and observed is not None and every is not None and 0 < every <= 21600
+            and due is not None and observed <= now and observed <= due <= observed + every + 900
+            and now <= due + 900)
+
+
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
         return None
@@ -1429,6 +1510,8 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         live = src.producer_state(kind, ref)
     if healthy_widened_ci_wait(card, park, live, src.now):
         return None
+    if not live.get('happened') and healthy_live_producer(card, park, awaited, live, src, src.now):
+        return None  # a live, healthy producer is the explanation; age alone is not a stall
     if live.get('happened') and park['payload'].get('wake_check') and re.fullmatch(
             r'https://github\.com/[^/]+/[^/]+/pull/\d+(?:[/?#].*)?', str(ref)):
         # The explicit probe owns the condition (merge queue, installed ancestry,
