@@ -8,6 +8,8 @@ description: "Use when a Mac eats CPU. Separate stacks from CPU counters."
 Measure process CPU-time deltas over a bounded interval to establish CPU usage.
 Use native stacks to identify candidate work, not to replace that measurement.
 
+For passive-only observation, read [existing counter boundaries](references/passive-existing-counters.md).
+
 For a process you are authorized to inspect:
 
 ```sh
