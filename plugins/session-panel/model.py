@@ -1100,7 +1100,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             dependency_prefix = f'waiting on: {title}{dep_state}{location}'
             dependency_prefixes[k] = (key(dependency), dependency_prefix)
             if dependency_human:
-                human_dependency_waits.setdefault(k, []).append((dependency, dependency_prefix))
+                waits = human_dependency_waits.setdefault(k, [])
+                if not any(key(parent) == key(dependency) for parent, _ in waits):
+                    waits.append((dependency, dependency_prefix))
             dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
