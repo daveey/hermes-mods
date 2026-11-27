@@ -65,6 +65,27 @@ def test_help_is_data(shared, args):
     assert git(repo, 'rev-parse', 'refs/stash') != before
 
 
+@pytest.mark.parametrize('operation', ['push', ''])
+def test_end_of_options_makes_help_a_pathspec(shared, operation):
+    repo, _ = shared
+    (repo / '--help').write_text('changed\n')
+    git(repo, 'add', '--', '--help')
+    before = git(repo, 'rev-parse', 'refs/stash')
+    args = [*([operation] if operation else []), '--end-of-options', '--help']
+    refused('git stash ' + shlex.join(args), repo)
+    assert git(repo, 'rev-parse', 'refs/stash') == before
+    result = subprocess.run(['git', '-C', str(repo), 'stash', *args], capture_output=True)
+    version = tuple(int(n) for n in git(repo, '--version').split()[2].split('.')[:2])
+    if version >= (2, 44):
+        assert result.returncode == 0, result.stderr
+        assert git(repo, 'rev-parse', 'refs/stash') != before
+    else:
+        # Older Git treats --end-of-options itself as a pathspec. The refusal
+        # assertion above remains version-independent, not skipped with Git 2.43.
+        assert result.returncode != 0
+        assert git(repo, 'rev-parse', 'refs/stash') == before
+
+
 @pytest.mark.parametrize('ref', ['refs/heads/saved-stash', 'oid'])
 @pytest.mark.parametrize('options', ['', '--index -q ', '-- '])
 def test_apply_checks_actual_ref(shared, ref, options):
