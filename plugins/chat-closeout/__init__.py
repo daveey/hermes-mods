@@ -84,8 +84,15 @@ def _hook_key(session_id):
     return home, os.environ.get("CHAT_CLOSEOUT_DB"), session_id
 
 
+def _turn_end_key(session_id):
+    # Turns carry a profile-home scope; the host wake daemon does not. Both
+    # consume the same ledger, so stamp custody must follow that ledger, not
+    # the caller's scope. Gate reads retain their profile-qualified hook key.
+    return str(ledger().path.resolve()), session_id
+
+
 def _flush_turn_end(session_id, timeout=_HOOK_WAIT_S):
-    return _turn_ends.flush(_hook_key(session_id), timeout)
+    return _turn_ends.flush(_turn_end_key(session_id), timeout)
 
 
 def _flush_gate(session_id, timeout=_HOOK_WAIT_S):
@@ -1377,7 +1384,7 @@ def post_llm_call(session_id: str = "", platform: str = "", conversation_history
         observed = _state.setdefault("observed", {}).pop(session_id, None)
         asked = _state.setdefault("observed_ask", {}).pop(session_id, None)
         succeeded = _turn_succeeded(conversation_history)
-        future = _turn_ends.submit(_hook_key(session_id),
+        future = _turn_ends.submit(_turn_end_key(session_id),
                                   lambda: _stamp_turn_end(session_id, observed, asked, succeeded))
         try:
             future.result(timeout=_HOOK_WAIT_S)

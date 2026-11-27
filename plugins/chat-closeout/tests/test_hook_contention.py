@@ -196,6 +196,63 @@ def test_deferred_stamp_blocks_background_duplicate_wake(hooks, monkeypatch, fin
     assert led.get('chat')['done_sig']
 
 
+@pytest.mark.parametrize('scoped', [False, True])
+def test_profile_stamp_blocks_unscoped_host_wake(hooks, monkeypatch, tmp_path, scoped):
+    scope = pytest.importorskip('hermes_scope')
+    led = hooks
+    cards = {'default/t_work': {'status': 'done'}}
+    led.write('chat', batch=['default/t_work'], open=[])
+    monkeypatch.setattr(plugin, 'ensure_upgraded', lambda *a: True)
+    monkeypatch.setattr(plugin, 'read_cards', lambda ids, **k: cards)
+    monkeypatch.setattr(plugin, '_lineage', lambda sid: [sid])
+    monkeypatch.setattr(plugin, '_with_latest_comments', lambda row, c: c)
+    monkeypatch.setattr(plugin, '_named_cards', lambda *a: {})
+    profile_home = tmp_path / 'profiles' / 'work'
+    profile_home.mkdir(parents=True)
+    release = threading.Event()
+    calls = []
+    errors = []
+    token = scope.push_state(home=str(profile_home)) if scoped else None
+    try:
+        assert plugin.pre_llm_call(session_id='chat', platform='desktop').get('context')
+        monkeypatch.setattr(plugin, 'open_card_ids', lambda sid: (release.wait(10), [])[1])
+        plugin.post_llm_call(session_id='chat', platform='desktop', conversation_history=[
+            {'role': 'assistant', 'content': 'Reported.', 'finish_reason': 'stop'}])
+        assert not plugin._flush_turn_end('chat', timeout=0)
+    finally:
+        if token is not None:
+            scope.pop_state(token)
+
+    def host_pass():
+        try:
+            plugin.wake_tick(now=10_000, wake=lambda sid, *a, **k: calls.append(sid) or 'started',
+                             unseen={}, last_user=lambda _: 0, read=lambda *_a, **_k: cards)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=host_pass)
+    try:
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert not errors
+        assert calls == [], 'profile stamp must fence the unscoped host consumer'
+    finally:
+        release.set()
+        thread.join(5)
+        # Flush from the submitting scope too so RED cleanup cannot leak work.
+        token = scope.push_state(home=str(profile_home)) if scoped else None
+        try:
+            assert plugin._flush_turn_end('chat', timeout=5)
+        finally:
+            if token is not None:
+                scope.pop_state(token)
+    assert led.get('chat')['done_sig']
+    host_pass()
+    assert not errors
+    assert calls == []
+
+
 def test_failed_thread_start_does_not_poison_lane(monkeypatch):
     lane = plugin.hook_work.Lanes()
     with monkeypatch.context() as m:
@@ -288,6 +345,7 @@ def test_reload_keeps_pending_stamp_barrier(hooks, monkeypatch):
     reloaded = importlib.util.module_from_spec(spec)
     reloaded.__package__ = ''
     spec.loader.exec_module(reloaded)
+    monkeypatch.setattr(reloaded, 'ledger', lambda: hooks)
     try:
         assert reloaded._turn_ends is plugin._turn_ends
         assert not reloaded._flush_turn_end('chat', timeout=0)
