@@ -1,8 +1,8 @@
 # remote-screen
 
 See and drive another Mac's screen over macOS **Screen Sharing (VNC)**, with no window opening on the Mac
-Hermes runs on. Built for one job above all: **approving permission prompts** ("“X” would like to access …"
-→ Allow) that block work on a headless or remote Mac. Permission inspection is **read-only**: OCR is
+Hermes runs on. Built for one job above all: **inspecting permission prompts** ("“X” would like to access …")
+that block work on a headless or remote Mac. Permission inspection is **read-only**: OCR is
 untrusted screen content, not proof of a real system dialog.
 
 | Tool | What it does |
@@ -10,7 +10,7 @@ untrusted screen content, not proof of a real system dialog.
 | `remote_screen_hosts` | Configured hosts: Screen Sharing reachable?, login stored?, the one-time setup command, and a `::screenshare` button directive for the user. |
 | `remote_screenshot` | Grabs the remote screen. The image goes straight to the model; the full-res PNG is saved. `ocr: true` adds on-screen text with boxes. |
 | `remote_input` | `click` / `double_click` / `right_click` / `move` / `scroll` / `type` / `key` (`"cmd+space return"`). Target by explicit coordinates in the last screenshot's image. `target_text` is refused, even with x/y supplied. Returns a fresh screenshot. |
-| `remote_approve_dialog` | Compatibility name for **inspection only**: screenshot → OCR → report a candidate whose requester exactly matches the allowlist. Never clicks, even with `dry_run: false`. `status: approve` describes only an OCR candidate, not an approval or authenticated UI. Returns `inspection_only: true`, a screenshot and a JSON log in `<hermes home>/cache/remote-screen/<host>/approvals/`; asks the user to inspect/approve the real dialog. |
+| `remote_approve_dialog` | Compatibility name for **inspection only**: screenshot → OCR → report a candidate whose requester exactly matches the allowlist. Never clicks, even with `dry_run: false`. `status: candidate` is not an approval or authenticated UI. Candidate payloads and logs contain text only, never request/button boxes or target coordinates. Returns `inspection_only: true`, a screenshot and a JSON log in `<hermes home>/cache/remote-screen/<host>/approvals/`; asks the user to inspect/approve the real dialog. |
 
 ## Why VNC
 
@@ -55,7 +55,8 @@ OCR uses `/usr/bin/swiftc`, never PATH lookup. Each use checks `ocr.swift` again
 compiles a snapshot into a fresh private temporary directory under the cache, binds the output's SHA-256
 in process memory and rechecks it immediately before execution. Cleanup runs on success and failure.
 Persistent binaries, mtimes and writable digest sidecars are not trusted. Source edits require updating
-the reviewed digest. Per-call compilation costs latency; it avoids trusting a previous build or mutable
+the reviewed digest. One build is shared by the full-screen scan and zooms within an inspection call,
+with the binary digest rechecked before every execution. Per-call compilation costs latency; it avoids trusting a previous build or mutable
 manifest. This integrity check is not a sandbox against a malicious process with the same OS UID.
 
 ## Safety
