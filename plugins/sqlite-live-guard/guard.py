@@ -287,12 +287,14 @@ def move_sources(args: list[str], ops: list[str]) -> list[str]:
         if arg == "--":
             break
         short = re.fullmatch(r"-[finuvTZb]*t(.*)", arg)
-        if (arg == "--target-directory" or (short and not short.group(1))) and i + 1 < len(args):
+        option, equals, _ = arg.partition("=")
+        target_option = option.startswith("--t") and "--target-directory".startswith(option)
+        if ((target_option and not equals) or (short and not short.group(1))) and i + 1 < len(args):
             sources = list(ops)
             if args[i + 1] in sources:
                 sources.remove(args[i + 1])
             return sources
-        if arg.startswith("--target-directory=") or (short and short.group(1)):
+        if (target_option and equals) or (short and short.group(1)):
             return ops
     return ops[:-1]
 
@@ -1228,17 +1230,17 @@ def _tokens(cmd: str) -> list[str]:
     return _lex(_lexable(code, _lex))
 
 
-def _segments(tokens: list[str]) -> Iterable[list[str]]:
+def _segments(tokens: list[str], with_following=False) -> Iterable:
     seg: list[str] = []
     for tok in tokens:
         if tok in _SEPARATORS:
             if seg:
-                yield seg
+                yield (seg, tok) if with_following else seg
             seg = []
         else:
             seg.append(tok)
     if seg:
-        yield seg
+        yield (seg, "") if with_following else seg
 
 
 def _strip_wrappers(seg: list[str]) -> list[str]:
@@ -1493,7 +1495,7 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
 
 def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
     in_home = os.path.realpath(_expand(cwd)) if cwd else False
-    for seg in _segments(_tokens(cmd or "")):
+    for seg, following in _segments(_tokens(cmd or ""), with_following=True):
         why = _check_redirects(seg, in_home)
         if why:
             return why
@@ -1503,7 +1505,12 @@ def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
         word, args = os.path.basename(seg[0]), seg[1:]
         if word == "cd":
             target = (_operands(args) or ["~"])[0]
-            in_home = _normalized_path(target, in_home)
+            try:
+                next_home = directory_context(target, in_home)
+                if following != "||":
+                    in_home = next_home if following == "&&" else merge_directory_contexts(in_home, next_home)
+            except ValueError:
+                return "working directories exceed bounded live-database safety analysis"
             continue
         ops = _operands(_without_redirects(args))
         if destructive_directory(word, args):
