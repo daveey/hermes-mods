@@ -131,17 +131,27 @@ def test_trusted_scope_rejects_non_doc_or_unscannable_entries(repository, name, 
         validator.validate_scope('HEAD')
 
 
-def test_gitleaks_ignores_fetched_suppressions(repository):
+@pytest.mark.parametrize('suppression', ['none', 'git-fingerprint', 'stdin-fingerprint', 'config-and-inline'])
+def test_gitleaks_ignores_fetched_suppressions(repository, suppression):
     import secrets
     root, origin, name, target, marker, head, git = repository
-    (root / '.gitleaks.toml').write_text('[allowlist]\nregexes = [".*"]\n')
-    (root / '.gitleaksignore').write_text('*\n')
+    if suppression != 'none':
+        (root / '.gitleaks.toml').write_text('[allowlist]\nregexes = [".*"]\n')
+        fingerprint = (name if suppression == 'git-fingerprint' else 'stdin') + ':github-pat:1'
+        (root / '.gitleaksignore').write_text(fingerprint + '\n')
+        git('add', '.gitleaks.toml', '.gitleaksignore')
+        git('commit', '-qm', 'fetched suppression fixture')
+        git('push', '-q', 'origin', 'HEAD:main')
+        head = git('rev-parse', 'HEAD')
+        assert git('show', 'main:.gitleaksignore', cwd=origin) == fingerprint
     # Generated only inside the disposable fixture; never a real credential.
-    target.write_text('token = "' + 'ghp_' + secrets.token_hex(18) + '" # gitleaks:allow\n')
+    target.write_text('token = "' + 'ghp_' + secrets.token_hex(18) + '"' +
+                      (' # gitleaks:allow' if suppression == 'config-and-inline' else '') + '\n')
     with patch.object(pub, 'publication_overlap', return_value={'status': 'clear'}):
         with pytest.raises(ValueError, match='gitleaks refused'):
             pub.publish(root, [name], ci=lambda *_: 'green')
     assert git('rev-parse', 'main', cwd=origin) == head
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize('payload', ['', 'a b c d\ne f g h\n', 'refs/heads/x a refs/heads/other b\n', 'refs/heads/x a refs/heads/main 000000\n'])
