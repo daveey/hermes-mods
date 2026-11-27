@@ -193,17 +193,33 @@ def test_explicit_triage_timestamp_without_events_is_supported():
 
 
 @pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
-def test_rejected_detail_cannot_supply_reducer_parent_links(field):
-    listed = task(status='todo')
+@pytest.mark.parametrize('grouped', [False, True])
+def test_rejected_detail_cannot_supply_reducer_parent_links(field, grouped):
+    rows = [task(tid, status='todo') for tid in ('t_child1', 't_child2')[:2 if grouped else 1]]
     parent = task('t_parent', title='Foreign-only parent')
-    b = bundle(listed, cards={listed['id']: {'detail': {
-        'task': {**listed, field: 'foreign-owner'},
-        'links': {'parents': [parent['id']]}, 'link_tasks': [parent]}}})
+    b = bundle(*rows, cards={row['id']: {'detail': {
+        'task': {**row, field: 'foreign-owner'},
+        'links': {'parents': [parent['id']]}, 'link_tasks': [parent]}} for row in rows})
     result = model.reduce_panel(b, now=NOW)
-    assert result['sections']['ready'][0]['id'] == listed['id']
+    assert {r['id'] for r in result['sections']['ready']} == {r['id'] for r in rows}
+    assert not result['sections']['waiting']
     assert not result['groups']
     assert 'Foreign-only parent' not in str(result)
     assert '_accepted_detail' not in str(result)
+
+
+def test_slim_wait_target_prefers_child_profile_to_serving_default():
+    parent = task('t_parent', title='Slim parent', status='blocked')
+    parent.pop('gateway')
+    parent.pop('profile')
+    child = task(status='todo', profile='child-profile', upstream={'id': parent['id'], 'status': 'blocked'})
+    detail = {'task': child, 'link_tasks': [parent]}
+    b = bundle(cards={parent['id']: {'board': 'default',
+        'detail': {'task': parent, 'source': 'replica', 'owner': 'parent-owner'}}},
+        gateway='serving-owner', profile='serving-profile')
+    dep = model.wait_target(child, b, detail)
+    assert dep['profile'] == 'child-profile'
+    assert dep['gateway'] == 'parent-owner'
 
 
 @pytest.mark.parametrize('helper', ['wait_target', 'wait_parents'])
