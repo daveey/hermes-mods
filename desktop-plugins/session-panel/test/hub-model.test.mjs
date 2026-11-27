@@ -45,7 +45,8 @@ for (const [name, lead] of [['clock_reason', /waiting on Event watch on service 
     const detail = document.querySelector('[data-row-detail]').textContent
     assert.match(detail, lead)
     assert.match(detail, /left \(until 2027-01-15 00:01 PST\)/)
-    assert.match(document.querySelector('[data-ask-title]').title, /Next actor: the clock \(timed check\)/)
+    assert.match(document.querySelector('[data-ask-title]').title, /Next actor: unknown \(the park recorded none\)/)
+    assert.doesNotMatch(document.querySelector('[data-ask-title]').title, /Next actor: the clock/, 'an older-core label names no actor')
     assert.match(document.querySelector('[data-ask-title]').title, /Next check: the clock at 2027-01-15 00:01 PST/)
     assert.ok(detail.search(lead) < detail.search(/left \(until/), 'prerequisite precedes the next-check time')
   })

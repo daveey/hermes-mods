@@ -113,14 +113,38 @@ def test_legacy_label_only_reason_is_still_shown():
     assert painted['detail'].startswith('waiting on Event watch on service owners')
     assert painted['detail'].endswith(f'{TIMER} on remote')
     assert painted['wait_reason'] == WHY[:80]
-    assert 'Next actor: the clock (timed check)' in painted['details']
+    assert 'Next actor: unknown (the park recorded none)' in painted['details']
+    assert 'wait_next_actor' not in painted
+
+
+def test_legacy_event_watch_label_does_not_invent_the_clock_as_actor():
+    """An older core's clock+probe park carries only the label: its real producers are the watched cards, so the
+    panel names no actor and claims no watch, rather than defaulting to the clock."""
+    painted = _painted(_clock_row(f'{CLOCK} (Event watch on hub-hosted original owners; backstop at nightly rollout)'))
+    assert painted['detail'].startswith('waiting on Event watch on hub-hosted')
+    assert painted['detail'].endswith(f'{TIMER} on remote')  # the timer is the next check, not the actor
+    assert 'wait_next_actor' not in painted
+    assert 'watching' not in painted['detail']
+    assert not any(d.startswith('Next actor: the clock') for d in painted['details'])
+    assert 'Next actor: unknown (the park recorded none)' in painted['details']
+
+
+def test_truncated_legacy_label_is_conservatively_unavailable():
+    """An older core cut the why at 80 characters, which can leave nested parentheses unbalanced: the row then says
+    reason unavailable (documented in MODEL.md) and keeps the producer's wording in Details."""
+    on = f'{CLOCK} (watch (owner t_0000000000000001, then rollout'
+    painted = _painted(_clock_row(on))
+    assert painted['detail'] == f'waiting · reason unavailable · 5m · {TIMER} on remote'
+    assert 'wait_reason' not in painted
+    assert f'Waiting on: {on}' in painted['details']
 
 
 @pytest.mark.parametrize('bad', [7, True, [7], {'a': 1}, None])
 def test_malformed_recorded_fields_are_ignored_not_rendered(bad):
     painted = _painted(_clock_row(CLOCK, prerequisite=bad, next_actor=bad, watching=bad, backstop_at='soon'))
     assert painted['detail'] == f'waiting · reason unavailable · 5m · {TIMER} on remote'
-    assert 'Next actor: the clock (timed check)' in painted['details']
+    assert 'Next actor: unknown (the park recorded none)' in painted['details']
+    assert 'wait_next_actor' not in painted
 
 
 @pytest.mark.parametrize('backstop', [float('inf'), float('nan'), True, -1])
@@ -200,4 +224,32 @@ def test_ordinary_timer_and_non_park_rows_are_untouched():
         m = model.reduce_panel(bundle(task(status=status, wait=wait)), now=NOW)
         row = next(r for rows in m['sections'].values() for r in rows)
         assert 'wait_reason' not in row and 'wait_next_actor' not in row
-        assert not any(d.startswith(('Waiting reason:', 'Next actor:', 'Next check:')) for d in row['details'])
+        assert not any(d.startswith(('Waiting reason:', 'Next check:')) for d in row['details'])
+        # A ready row's "Next actor:" is the dispatcher diagnostic's own (independent evidence), never a park's.
+        actors = [d for d in row['details'] if d.startswith('Next actor:')]
+        if status == 'ready':
+            why = row['non_running_reason']
+            assert actors == [f'Next actor: {why.get("actor") or "unknown"}']
+        else:
+            assert actors == []
+
+
+def test_withdrawing_a_park_keeps_independent_diagnostic_lines():
+    """Stale/aged/unknown rows withdraw exactly the park's own lines; a same-prefixed diagnostic line survives."""
+    park = ['Waiting reason: soak', 'Next actor: the clock (timed check)', 'Next check: the clock at x']
+    v = {'wait_reason': 'soak', 'wait_next_actor': 'the clock (timed check)',
+         'details': ['Blocking card: t_1 (running)', *park, 'Next actor: unknown', 'Reason freshness: current']}
+    model._drop_park(v, park)
+    assert v == {'details': ['Blocking card: t_1 (running)', 'Next actor: unknown', 'Reason freshness: current']}
+
+
+def test_ready_row_diagnostic_survives_after_a_recovered_park():
+    """A card that left its park for ready carries only the dispatcher's diagnostic actor, no stale park fields."""
+    row = task(status='ready', wait={'wait_state': 'waiting', 'waiting_on': CLOCK, 'waiting_since': NOW - 300,
+                                     'prerequisite': WHY, 'next_actor': 'the clock (timed check)'})
+    painted = next(r for rows in model.reduce_panel(bundle(row), now=NOW)['sections'].values() for r in rows)
+    assert 'wait_reason' not in painted and 'wait_next_actor' not in painted
+    assert not any(d.startswith(('Waiting reason:', 'Next check:')) or d == 'Next actor: the clock (timed check)'
+                   for d in painted['details'])
+    assert 'non_running_reason' in painted
+    assert any(d.startswith('Next actor:') for d in painted['details'])

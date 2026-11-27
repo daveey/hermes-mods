@@ -37,8 +37,16 @@ Clock detail lines put a concise prerequisite before the elapsed/countdown text.
 Reason clipping never clips the timer or owner location; the row may exceed the
 ordinary phrase budget to retain them. Details retain the bounded full reason,
 next actor, and separately labelled next check. Older cores retain a label-only
-compatibility path; absent reasons explicitly say `reason unavailable`.
-Unknown/stale evidence does not attest a current reason or next actor. Recovery
+compatibility path; absent reasons explicitly say `reason unavailable`. An older
+core records no next actor, so the row omits `wait_next_actor` and Details say
+`Next actor: unknown (the park recorded none)`: its label cannot tell a plain
+timer from an event watch with a clock backstop. An older core also cut the why
+at 80 characters; when that cut leaves nested parentheses unbalanced the row
+conservatively says reason unavailable, and the producer's wording stays in the
+`Waiting on:` Details line.
+Unknown/stale evidence does not attest a current reason or next actor; it
+withdraws exactly the park's own Details lines, so an independent dispatcher
+diagnostic's `Next actor:` line on a ready row is never removed with them. Recovery
 out of the park clears these fields. Relative ticks still use wire templates,
 not semantic revisions or network reads.
 
