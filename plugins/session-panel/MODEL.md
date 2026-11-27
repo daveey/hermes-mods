@@ -73,6 +73,20 @@ header and section pip may also use these kinds: `ci`/`clock` paint light blue (
 `deploy` (merged work waiting for a hub deploy) paints purple (`#a371f7`).
 Non-delivery rows omit the fields.
 
+### One wait colour category (row box = waiting pip)
+
+A row's box and the numbered waiting square read one category: `wait_kind`, else
+`last_wait_kind` (model `wait_category`, Desktop `waitCategory`). When a row's source
+goes stale or unknown (stale replica, partial owner read, aged board data, unknown
+execution evidence, or a Desktop cache that expired), the reducer and the renderer
+withdraw `wait_kind`/ETA (no live producer claim, no header dot) and keep the
+category the row last showed as `last_wait_kind`, so a known CI wait stays light
+blue with text `status unknown · last known: waiting on CI …`. The waiting pip
+carries `wait_kind` when every waiting row is live, else `last_wait_kind` when every
+waiting row has a category; any uncategorised row keeps it amber. A row with no
+known category stays amber. Session-task chips keep the same last-known delivery/
+deploy look for a stale card, without its ETA or wait line.
+
 Desktop replaces a delivery row's pip with right-aligned `waited / expected  left`
 columns when a park timestamp is present. Its one-second display clock updates
 the readout without network reads or model revisions. Missing estimates show
@@ -182,7 +196,8 @@ independent of execution phase/identity and never renews a worker lease.
 Native schedule, human, startup and review lifecycles remain authoritative only
 for their source snapshot. When that snapshot expires in a cached renderer, native
 task rows become historical `status unknown · last known: …`, withdraw stuck pips,
-wake/ETA colouring and task-decision actions, and retain read-only navigation.
+wake/ETA and task-decision actions (keeping the last-known wait colour category as
+`last_wait_kind` on both row and waiting pip), and retain read-only navigation.
 A fresh source restores the current native wait. This never clears a stored hold.
 The self-contained `test/nonrunning.test.mjs` harness runs real disposable core
 producers through the reducer and mounts the actual renderer; these tests are not
@@ -487,7 +502,8 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
           "properties": {
             "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
             "count": {"type": "integer", "minimum": 1}, "label": {"type": "string"},
-            "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]}
+            "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]},
+            "last_wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "Waiting pip only, when every waiting row has a live or last-known category but not all are live: colour only, no live authority."}
           }
         }}
       }
@@ -515,6 +531,7 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
         "depth": {"type": "integer", "minimum": 0, "maximum": 4},
         "nested_detail": {"type": "string"},
         "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]},
+        "last_wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "The wait category a stale/unknown row last showed. Colour only: no ETA, header dot or producer liveness."},
         "status": {"type": "string"},
         "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
         "gateway": {"type": "string"}, "profile": {"type": "string"}, "board": {"type": "string"},
