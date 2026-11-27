@@ -6,6 +6,14 @@ Fail the experiment immediately if `feed.failures` is nonempty or output coverag
 
 Never count denied-write fallbacks as qualified timing; preserve canonical reads and explicitly fence only known persistence sinks. A standalone replay identifies work, not production CPU/context-switch acceptance.
 
+## Ask why chats were admitted before costing statements
+
+Read `session_panel.feed_tick` runs and wall from the loop-accounting delta first. When wall is about the whole window (7 runs, 680 s of wall in 604 s), the thread is never idle: a pass of 25 s or more earns no duty rest, so removing a statement shortens the pass without creating idle time and the switch gate barely moves. The lever is then how many chats each pass admits, not what one compute costs.
+
+Classify the cause of every `kanban_task_change` mark in a window before blaming readers: snapshot the watched tables in one read transaction per sample, diff the rows of each marked card, and join the marks to the held bundles' card ids in the published feed snapshot (`~/.hermes/session-panel/feed-serve-*-default.json`, second line). A mark whose only movement is an `external_watch` event repeating the previous (state, health), or a `task_chat_links.released` flip, changes no card state, yet it recomputes every chat that holds the card. Diff two published snapshots by JSON path to see what such a recompute changes (poll clocks, the newest-events window, `activity_at`).
+
+Read `reason_sizes` in a replay as overlapping sets: a reason that executes many statements per tick (`diagnostic_stale`) can admit zero chats.
+
 ## Context switches are GIL handoffs per fetched SQLite cell
 
 Attribute the feed thread's voluntary switches to SQLite fetches before optimizing CPU: CPython's `_sqlite` releases the GIL around every `sqlite3_column_type` (one per cell), `sqlite3_data_count` and `sqlite3_step` (one each per row), and on the many-threaded serve each release costs about two switches. Model: handoffs = cells + 2 x rows + 7 x executes. CPU-seconds per pass (loop accounting) do not show this, so a CPU win can leave the switch gate unchanged.
