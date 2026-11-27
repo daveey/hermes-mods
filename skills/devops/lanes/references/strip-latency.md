@@ -42,23 +42,37 @@ list means the view's `status` is `{}` and `sessions` is empty, so every chat co
    no token = 401). Print `flow_complete`, `summary_complete`, `status`, `len(sessions)`.
 2. Probe the stream: `websockets.connect(ws://127.0.0.1:<port>/api/plugins/lanes/v1/lanes/stream?hours=6&window=6h&expanded=true&token=<token>)`,
    send the params JSON, read three frames. A close with 1013 is why Desktop shows "not live" and
-   falls back to the 60 s REST poll, which computes in the (often GIL-starved) backend process.
+   falls back to the 60 s REST poll. With the current projector-enabled implementation, REST and
+   default warming share the same child supervisor as the stream; child failure must not trigger
+   expensive parent-process recomputation. Only an old core without projector support uses the
+   bounded in-process fallback.
 3. `grep "lanes board_merge deadline expired" ~/.hermes/logs/errors.log`: `wall` far above
    `thread_cpu` means lock starvation in the serve process, not a slow read.
-4. Compare `plugins/lanes/dashboard/*.py` mtimes (and core `hermes_cli/kanban*.py`) with the backend's
-   `ps -o lstart=`. The projector child is fenced by `projector_identity` captured at load, so a
-   plugin sync after backend start likely disables the stream until the dashboard restarts. Standalone
-   `m._projector()._spawn(m._projector()._configuration())` with current code tells a code fault from
-   that fence.
+4. Compare dashboard/core identity bytes and parent/child boot identities across a real sync.
+   The supervisor now recaptures disk identity and replaces its child on compatible updates, without
+   restarting the parent. Wire protocol VERSION mismatch still refuses, and the child checks its
+   identity for every job. A pure mtime touch does not change the content-hash identity. On older
+   code the captured router-load manifest permanently disabled streaming after an update.
+5. If the child serves partial flow with `interrupted`, inspect every borrowed reader, including the
+   fleet replica: resetting a local connection's phase budget does not reset the replica's handler.
+   Projector readers now use the shared board CPU budget and bounded snapshot lifetime on both
+   connections, not a leftover two-second whole-job wall deadline. Verify real local/fleet reads
+   after a simulated three-second wait and refusal beyond the snapshot wall backstop.
+
+Natural rollout can change the active port (for example 9148 to 9149) while the previous backend
+remains alive to drain existing connections. Read `desktop-ssh/always-on/active.json` and verify
+its selected PID in authenticated debug frames. Do not report the retired port as the new rollout.
+Live verification of this implementation observed a real dashboard code sync replacing the child
+while retaining the parent PID, followed by three complete refreshes with nonempty status and
+sessions; source tests and live activation are separate evidence.
 
 A standalone `_lane_view` that completes proves the code, not the served view; acceptance is the
 chips on the routed backend.
 
-When `test_projector.py` raises `lanes projector startup failed`, see the child's stderr by making
-`projector_client.Process._drain` write to `sys.__stderr__` in a throwaway worktree (outside
-`~/.hermes/cache/scratch`). `runtime_command` with a fresh temp HERMES_HOME prints "preparing
-dependencies for this data root" and misses the 5 s ready wait: that is test setup, not the
-production failure.
+Projector fixtures must use the already-prepared test interpreter and import paths while preserving
+an isolated HERMES_HOME. Bootstrapping production `runtime_command` against a fresh temp home can
+print "preparing dependencies" and miss the five-second ready bound; fix fixture setup, never skip
+the tests or raise that timeout. The production runtime launcher remains unchanged.
 
 ## 3. Do not just raise the client timeout
 
