@@ -1,5 +1,39 @@
 # PanelModel v1
 
+## Overdue triage: operational red, not a human decision
+
+`hermes_cli.kanban_triage_attention` is the authoritative backend rule: a current
+triage episode is red only after **strictly more than 600 seconds**. At 599/600
+seconds age does not escalate; at 601 seconds or six days it does. Human asks may
+already be red earlier. This explicitly supersedes red-only-for-human policy.
+
+Keep `needs_you` human-only and preserve actor wording and all spend, scope,
+containment and execution restrictions. Red authorizes no lifecycle changes.
+Overdue rows/groups use `attention: "triage_overdue"` in `stuck`; their box, pip,
+header attention overlay and session-tasks chip are red. Canonical status remains
+intact and its actor/reason remains in the header label alongside overdue triage.
+
+Adapters detach `triage_entered_at` from full relevant lifecycle events **before**
+clipping the display tail. Creation counts only if it entered triage; comments,
+heartbeats and repeated holds do not reset the episode. Exit clears it; re-entry
+starts fresh. Missing/invalid/future/stale source time remains unknown, never a
+`created_at` estimate. Local, replica and origin-ledger paths carry this scalar.
+Older cores without the helper retain unknown age rather than a duplicate rule.
+
+The feed schedules bounded next-threshold invalidation; core detached annotation
+snapshots project distinct `kanban_triage_attention` counts and qualified refs.
+Canonical fanout has a separate successful-clock deadline, refreshing stored
+outcomes without task writes or reopening chat. Ordinary/Background counters
+consume the operational field; session dot/stripe consume the refreshed canonical
+red reason. Display-only elapsed ticks do not reread histories, poll HTTP or churn
+model revisions. Expired observations cannot establish current overdue attention.
+
+Tests cover strict boundaries, six-day age, current episodes, repeated holds,
+exit/re-entry, unknown times, actual human-request controls, local/replica inputs,
+fake-clock unchanged-board canonical crossing/recovery, real CoreReaders → reducer
+→ mounted panel/chip with clipped event history, and actual ordinary/Background
+sidebar dot/stripe/counters. Native pixels remain a separate passive observation.
+
 ## Delivery wait ETA
 
 Rows may carry `wait_kind: "ci" | "deploy" | "clock"` and
@@ -511,8 +545,11 @@ Order matters, matching Desktop `classify`:
    requests. Retired/resolved requests do not re-open decisions; a still-blocked
    owner remains discoverable as status. **Never infer a human wait from preserved
    `block_kind` alone**. Scheduled external watches without requests stay Waiting.
-4. Nonhuman triage/administratively held blocked cards -> Waiting, blue (`wait_kind=agent`),
-   naming the chat agent and its current decision reason. Retained next steps, spend holds and
+4. Nonhuman triage -> red Stuck once the current episode exceeds 600 seconds,
+   with `attention=triage_overdue`, never Needs you. Before that threshold (or
+   with unknown time), nonhuman triage/administratively held blocked cards -> Waiting,
+   blue (`wait_kind=agent`), naming the chat agent and its current decision reason.
+   Retained next steps, spend holds and
    creator decisions are presentation evidence, never permission to resume. Canonical nonhuman
    wait ownership suppresses preserved old human fields; a currently open owner-bound request
    remains an ask. Named CI/deploy/clock and running-card producers take precedence and paint

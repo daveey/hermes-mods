@@ -120,6 +120,8 @@ def test_triage_live_human_request_or_bound_open_request_is_red():
 
 
 def test_triage_age_uses_latest_entry_not_creation_or_repeated_hold_events():
+    import pytest
+    pytest.importorskip('hermes_cli.kanban_triage_attention')
     for remote in (False, True):
         b = held_bundle(remote=remote, kind='spend_budget_triaged', created_at=NOW - 30 * 86400)
         events = b['cards']['t_abc123']['detail']['events']
@@ -128,7 +130,8 @@ def test_triage_age_uses_latest_entry_not_creation_or_repeated_hold_events():
             {'kind': 'claimed', 'created_at': NOW - 86400, 'payload': {}},
             {'kind': 'spend_budget_triaged', 'created_at': NOW - (5 * 3600 + 20 * 60), 'payload': {'limit': 'runs', 'reason': 'Review remaining scope.'}},
             {'kind': 'decision_retained', 'created_at': NOW - 60, 'payload': {'disposition': {'reason': 'scope_stopped'}}}]
-        row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+        row = model.reduce_panel(b, now=NOW)['sections']['stuck'][0]
+        assert 'overdue triage' in row['detail']
         assert 'in triage · 5h 20m' in row['detail']
         assert 'scope stopped' in row['detail']
         assert 'specified and promoted' not in row['detail']
@@ -137,10 +140,12 @@ def test_triage_age_uses_latest_entry_not_creation_or_repeated_hold_events():
         b['computed_at'] = NOW + 120
         later = model.reduce_panel(b, now=NOW + 120, wire=True)
         assert first['revision'] == later['revision']
-        assert {'timestamp': NOW - (5 * 3600 + 20 * 60), 'format': 'elapsed'} in first['sections']['waiting'][0]['clock_text']['detail']
+        assert {'timestamp': NOW - (5 * 3600 + 20 * 60), 'format': 'elapsed'} in first['sections']['stuck'][0]['clock_text']['detail']
 
 
 def test_missing_triage_entry_is_explicit_and_parent_chain_carries_age():
+    import pytest
+    pytest.importorskip('hermes_cli.kanban_triage_attention')
     b = held_bundle(created_at=NOW - 86400)
     row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert 'entry time unavailable' in row['detail']

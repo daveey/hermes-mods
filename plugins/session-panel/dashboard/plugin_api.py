@@ -1978,6 +1978,12 @@ class CoreReaders:
         if task is None:
             return None
         d = dataclasses.asdict(task)
+        try:
+            from hermes_cli.kanban_triage_attention import annotate
+        except ImportError:
+            pass  # mixed-version core: age remains explicitly unknown
+        else:
+            annotate(c, [d])  # before the bounded display event tail is clipped
         explicit = self._explicit_home() is not None
         if explicit and parent_connection is ...:
             parent_connection = None  # never discover a process-home replica for contained parents

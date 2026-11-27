@@ -92,6 +92,7 @@ const STATE_COLOR = {
   blocked: '#f85149',
   review: '#db61a2',
   triage: '#f85149', // unfinished agent triage, not an implied human ask
+  'agent-wait': '#38bdf8', // backend says triage is not yet overdue
   // [daveey] Wait looks (backend `wait.wait_state`), which override the status colour of a parked card:
   waiting: '#8b949e', // parked on a named producer, or not yet stalled: grey
   delivery: '#38bdf8', // parked on CI or a timer: light blue (something is producing it, nothing is wrong)
@@ -408,7 +409,9 @@ export function withModelDisplay(chips, model, now = Date.now() / 1000) {
   return chips.map(c => {
     const row = modelRowFor(model, c)
     const painted = row && typeof window !== 'undefined' && window.__sessionPanel?.clockRow ? window.__sessionPanel.clockRow(row, now) : row
-    return painted ? { ...c, display: { title: str(painted.title), detail: str(painted.detail) } } : c
+    return painted ? { ...c,
+      ...(c.state === 'triage' && !model.sections.needs_you.some(v => v.key === painted.key) ? { look: painted.attention === 'triage_overdue' ? 'triage' : 'agent-wait' } : {}),
+      display: { title: str(painted.title), detail: str(painted.detail) } } : c
   })
 }
 
