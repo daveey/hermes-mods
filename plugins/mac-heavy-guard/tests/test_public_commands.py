@@ -140,6 +140,20 @@ def test_f9_data_controls(command):
     assert runner.workload_reason(command) is None
 
 
+@pytest.mark.parametrize('prefix', [
+    'coproc a$(echo ")"|tr -d ")")', 'coproc a$(echo \')\'>/dev/null)', 'coproc a$(: \\))',
+    'time -- coproc a$(: ")")', '! coproc a`: \\)`', 'function a$(echo ")")',
+])
+def test_f10_quoted_paren_in_name_substitution(prefix, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    command = 'echo $(' + prefix + ' case x in x) pytest;; esac)'
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+    monkeypatch.setenv('MAC_HEAVY_OK', '1')
+    assert guard.check_shell(command) is None
+
+
 def test_f9_arithmetic_name_still_refused(monkeypatch):
     monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
     command = 'echo $(coproc a$((1)) case x in x) pytest;; esac)'

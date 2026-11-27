@@ -868,6 +868,12 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
                 prefix = "".join(out)
+                # F10: a quoted/escaped paren inside a NAME substitution defeats the regex collapse below, so hold
+                # whenever a coproc/function keyword is followed by any substitution before this `case`.
+                if "$(" in prefix and re.search(
+                        r"(?:^|[;&|({\n])\s*(?:(?:then|do|else|if|while|until|!|time(?:\s+-p)?(?:\s+--)?)\s+)*"
+                        r"(?:coproc|function)\b.*\$\(", prefix):
+                    raise _UnsupportedSubstitution
                 # NAME may contain command substitutions (`coproc a$(:)`; backticks are already `$(...)`
                 # here). Collapse innermost `$(...)` spans so they read as ordinary word characters.
                 while True:
