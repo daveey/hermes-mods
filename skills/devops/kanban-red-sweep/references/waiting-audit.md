@@ -15,6 +15,15 @@ or asks whether parked cards' waits are legitimate.
    read that card's status; for a `deploy` ref, check whether the PR merged and its rollout window. A park whose
    ref has already finished sleeps until its backstop: comment the outcome on it, then `kanban_unblock` it. The
    unblock can be refused because the card woke itself meanwhile, so read the status back.
+   For a dependency-gated `todo` card, compare the latest `dependency_wait.reason` and checkpoint with the
+   actual parent edge. A parent can have delivered the specific prerequisite while continuing unrelated
+   acceptance work; its open status alone does not prove the child still needs to wait. Independently verify
+   the named artifact (for a PR, `gh pr view <n> --repo <repo> --json state,mergedAt,mergeCommit`), check for newer
+   restrictions, and record why it satisfies the child's exact prerequisite. Then use
+   `kanban_unlink(parent_id=<parent>, child_id=<child>)` only for that satisfied edge; leave the parent's own
+   acceptance and the child's remaining gates intact. Read back the child's status and actual claim/process
+   binding before saying execution resumed. If the prerequisite requires the whole parent's acceptance, keep
+   the edge. This prevents an artifact-level wait from silently becoming a wait for an expanding task.
 5. **Wrong-kind parks.** Look for `kind=clock` parks whose `why` names a reviewer card, a PR or a run. They don't
    wake when that event happens. The legitimate kind there was `card`/`ci`. Count them as a root cause, separate
    from the miscount.
