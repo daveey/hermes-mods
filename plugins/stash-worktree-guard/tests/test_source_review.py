@@ -45,11 +45,18 @@ def shared(tmp_path):
 
 
 @pytest.mark.parametrize('args', ["push -m '--help'", "push -m '-h'", "push -- --help",
-                                  "-m '--help'", "push --message=--help", "push -qm '--help'"])
+                                  "-m '--help'", "push --message=--help", "push -qm '--help'",
+                                  "push --mess --help", "push --me --help", "--mess --help",
+                                  "push --m --help", "push --pathspec-from-file --help",
+                                  "push --pathspec-from-f --help"])
 def test_help_is_data(shared, args):
     repo, _ = shared
-    (repo / '--help').write_text('changed\n')
-    git(repo, 'add', '--', '--help')
+    if '--pathspec' in args:
+        (repo / '--help').write_text('file\n')
+        (repo / 'file').write_text('changed\n')
+    else:
+        (repo / '--help').write_text('changed\n')
+        git(repo, 'add', '--', '--help')
     before = git(repo, 'rev-parse', 'refs/stash')
     refused(f'git stash {args}', repo)
     assert git(repo, 'rev-parse', 'refs/stash') == before
@@ -67,6 +74,26 @@ def test_apply_checks_actual_ref(shared, ref, options):
     # Git really applies the foreign stash, not the safe top-of-stack entry.
     git(repo, 'stash', 'apply', ref)
     assert (repo / 'file').read_text() == 'foreign\n'
+
+
+@pytest.mark.parametrize('options', ['', '--index -q ', '-- '])
+def test_numeric_ref_uses_stash_reflog(shared, options):
+    repo, _ = shared
+    # A real branch named 1 must not shadow Git stash's numeric shorthand.
+    git(repo, 'update-ref', 'refs/heads/1', git(repo, 'rev-parse', 'refs/stash'))
+    refused(f'git stash apply {options}1', repo)
+    git(repo, 'stash', 'apply', *shlex.split(options), '1')
+    assert (repo / 'file').read_text() == 'foreign\n'
+
+
+@pytest.mark.parametrize('ref', ['0', '00'])
+def test_numeric_same_branch_control(shared, ref):
+    repo, _ = shared
+    command = f'git stash apply {ref}'
+    assert guard.refuse_reason(command, str(repo)) is None
+    assert plugin._pre_tool_call('terminal', {'command': command, 'workdir': str(repo)}) is None
+    git(repo, 'stash', 'apply', ref)
+    assert (repo / 'file').read_text() == 'local\n'
 
 
 @pytest.mark.parametrize('failure', ['timeout', 'error', 'empty'])
