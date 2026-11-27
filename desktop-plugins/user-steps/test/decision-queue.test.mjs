@@ -803,7 +803,7 @@ test('with the session panel loaded, the strip keeps only the compact companion 
   window.__sessionPanel = { active: true }
   const drawn = strip.render()
   assert.equal(drawn.type, m.ActionQueue, 'the companion queue stays: free text, Retry, plan request, withdraw')
-  assert.deepEqual(drawn.props, {})
+  assert.deepEqual(drawn.props, { coverage: { state: 'legacy' } })
   assert.equal(window.__userSteps.ActionQueue, m.ActionQueue)
   assert.equal('Strip' in window.__userSteps, false)
   assert.equal('Strip' in m, false)

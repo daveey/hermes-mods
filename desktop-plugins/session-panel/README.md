@@ -73,8 +73,11 @@ model's rows **and** user-steps' companion queue (`window.__userSteps.ActionQueu
 read every render so a late or hot-reloaded user-steps attaches exactly once). The
 user-steps composer slot shows only the explicit missing-panel error (panel never
 loaded, or loaded but not mounted for this chat via `__sessionPanel.hostsQueue`).
-Collapsing hides the whole body; the companion stays mounted (hidden) so delivery
-recovery keeps running, and new attention still reopens it.
+Collapsing removes the rows and every ask the header still counts. The body stays
+visible for what the header does not count: delivery Check status / Retry, an ask
+the model omits and a queue error stay on screen, still inside the bounded body.
+A chat with no rows and nothing in the queue paints nothing (`data-panel-frame="idle"`,
+no padding or border) while the companion stays mounted and polling.
 
 The panel passes the companion a per-render `coverage`: the exact
 `[gateway, profile, request id] → revision` asks it drew with options, plus what a

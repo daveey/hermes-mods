@@ -646,14 +646,21 @@ export function bodyFrame(...children) {
     children: jsxs('div', { 'data-panel-body': '', style: bodyStyle, children }) })
 }
 const emptyCoverage = state => ({ state, collapsed: false, drawn: {}, counted: {} })
+/** No rows to show: the companion stays mounted (it keeps polling for a new ask) inside a frame that paints nothing
+ *  (no padding, no border) until the companion has something to draw. */
+function companionFrame(companion) {
+  const queue = companion?.(emptyCoverage('empty'))
+  if (!queue) return null
+  const us = typeof window !== 'undefined' ? window.__userSteps : null
+  if (typeof us?.queueVisible !== 'function' || us.queueVisible()) return bodyFrame(queue)
+  return jsx('section', { 'data-session-panel': '', 'data-panel-frame': 'idle', 'aria-label': 'Session status', style: { ...frameStyle, borderBottom: 0, padding: 0 },
+    children: jsx('div', { 'data-panel-body': '', style: bodyStyle, children: queue }) })
+}
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null, currentSession = null, companion = null } = {}) {
-  if (!validModel(model)) { const queue = companion?.(emptyCoverage('empty')); return queue ? bodyFrame(queue) : null }
+  if (!validModel(model)) return companionFrame(companion)
   model = expireNativeWaits(expireDiagnostics(model, now), now, vouched)
   // Spec: hidden when there is neither open work nor finished history.
-  if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) {
-    const queue = companion?.(emptyCoverage('empty'))
-    return queue ? bodyFrame(queue) : null
-  }
+  if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return companionFrame(companion)
   // Asks this render actually draws with their options (exact owner/request/revision), for the companion.
   const drawn = {}
   const freshness = modelFreshness(model, { now, vouched })
@@ -848,9 +855,10 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
-    // Collapsing hides the whole body, rows and companion alike; the companion stays mounted (hidden) so its
-    // delivery recovery keeps running.
-    jsxs('div', { 'data-panel-body': '', hidden: collapsed || undefined, style: bodyStyle, children: [
+    // Collapsing removes the rows and every ask the header still counts. The body itself stays visible: what the
+    // header does not count (delivery Check status / Retry, an ask the model omits, a queue error) is drawn by the
+    // companion and must not disappear behind a quiet header.
+    jsxs('div', { 'data-panel-body': '', 'data-body-collapsed': collapsed ? '' : undefined, style: bodyStyle, children: [
     ...MODEL_SECTIONS.map(([section, label]) => {
       if (collapsed || !roots.get(section).length) return false
       const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
@@ -1163,7 +1171,13 @@ export function PendingModel({ waiting, onRetry }) {
 // whether its "panel missing" error applies).
 const hostedScopes = new Map()
 const hostingChanged = () => { try { window.dispatchEvent?.(new window.Event('hermes:session-panel-hosting')) } catch {} }
-export function hostsQueue(route) { return !!route?.session && (hostedScopes.get(routeKey(route)) || 0) > 0 }
+/** Whether a mounted Panel hosts the companion for the focused chat. The connection comes from this plugin's own
+ *  route (one source), so a caller that resolves the active connection differently cannot disagree with a working
+ *  panel; the caller's session and profile must still be the focused ones. */
+export function hostsQueue(route) {
+  const own = panelRoute()
+  return !!route?.session && route.session === own.session && (route.profile || 'default') === own.profile && (hostedScopes.get(routeKey(own)) || 0) > 0
+}
 /** The user-steps companion inside the panel body. Read at every render (the panel ticks each second), so a
  *  late-registered or hot-reloaded user-steps attaches without a reload; keyed by version, so exactly one mounts. */
 export function companionFor(coverage) {

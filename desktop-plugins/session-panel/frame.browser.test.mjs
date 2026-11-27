@@ -38,7 +38,7 @@ const model = { version: 1, revision: 'r1', header: { state: 'needs_you', label:
 window.hermesDesktop = { api: async ({ path, body }) => {
   if (path.startsWith('/api/plugins/session-panel/')) return { feed: 'hub:1', profile: 'default', epoch: 'E1', rev: 1, bundles: (body?.sessions || []).includes('S1') ? { S1: { session: 'S1', model } } : {} }
   if (path.endsWith('/ping')) return { features: ['withdraw'] }
-  if (path.includes('/requests')) return { requests: [...asks, ...extra] }
+  if (path.includes('/requests')) return { requests: window.__extras === false ? asks : [...asks, ...extra] }
   return {}
 } }
 const contributions = [], ctx = { register: a => contributions.push(a), onEvent: () => () => {} }
@@ -63,7 +63,7 @@ const measure = () => {
   const frame = q('[data-session-panel]'), body = q('[data-panel-body]'), toggle = q('[data-panel-toggle]'), composer = q('#composer')
   const t = box(toggle), hit = t && document.elementFromPoint(t.x + t.width / 2, t.y + t.height / 2)
   return { vh: innerHeight, vw: innerWidth, frame: box(frame), body: box(body), toggle: t, composer: box(composer),
-    toggleHit: !!hit && (hit === toggle || toggle.contains(hit)), bodyHidden: body?.hidden, bodyScroll: body && { top: body.scrollTop, h: body.scrollHeight, ch: body.clientHeight, sw: body.scrollWidth, cw: body.clientWidth },
+    toggleHit: !!hit && (hit === toggle || toggle.contains(hit)), bodyScroll: body && { top: body.scrollTop, h: body.scrollHeight, ch: body.clientHeight, sw: body.scrollWidth, cw: body.clientWidth },
     frameSW: frame?.scrollWidth, frameCW: frame?.clientWidth, docScroll: document.scrollingElement.scrollTop, docSW: document.scrollingElement.scrollWidth,
     asks: document.querySelectorAll('[data-ask-row]').length, companion: document.querySelectorAll('[data-action-request]').length,
     queues: document.querySelectorAll('[data-action-queue]').length, queueInBody: !!q('[data-action-queue]')?.closest('[data-panel-body]') }
@@ -112,14 +112,25 @@ test('session-status frame: bounded, header reachable, body scrolls rows + compa
       // Collapse with a real pointer click on the header control.
       await page.mouse.click(m.toggle.x + m.toggle.width / 2, m.toggle.y + m.toggle.height / 2)
       const collapsed = await page.evaluate(measure)
-      assert.equal(collapsed.bodyHidden, true, `${name}: body hidden`)
-      assert.equal(collapsed.asks + (await page.evaluate(() => [...document.querySelectorAll('[data-action-request]')].filter(e => e.offsetParent).length)), 0, `${name}: rows and companion both hidden`)
-      assert.ok(collapsed.frame.height < 60, `${name}: frame shrinks to the header (${collapsed.frame.height})`)
+      // Rows and the 6 asks the header counts go. The 8 asks it does not count stay visible, inside the same
+      // bounded body, with the header and the composer still reachable.
+      assert.equal(collapsed.asks, 0, `${name}: canonical rows removed`)
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('[data-action-request]')].filter(e => e.offsetParent).length), 8, `${name}: uncounted asks stay visible`)
+      assert.ok(collapsed.frame.height <= collapsed.vh * 0.55 + 1, `${name}: collapsed frame still bounded`)
       assert.ok(collapsed.toggleHit, `${name}: expand reachable`)
+      assert.ok(collapsed.composer.y >= 0 && collapsed.composer.y + collapsed.composer.height <= collapsed.vh + 1, `${name}: composer on screen while collapsed`)
       assert.equal(await page.evaluate(() => document.activeElement?.hasAttribute('data-panel-toggle')), true, `${name}: focus not stranded`)
+      // With nothing uncounted left, the collapsed frame is just the header.
+      await page.evaluate(async () => { window.__extras = false; await window.__userSteps.refreshRequests() })
+      await page.waitForFunction(() => document.querySelectorAll('[data-action-request]').length === 0, null, { timeout: 15000 })
+      const header = await page.evaluate(measure)
+      assert.ok(header.frame.height < 60, `${name}: frame shrinks to the header (${header.frame.height})`)
+      assert.ok(header.toggleHit, `${name}: expand reachable from the header-only frame`)
+      await page.evaluate(async () => { window.__extras = true; await window.__userSteps.refreshRequests() })
+      await page.waitForFunction(() => document.querySelectorAll('[data-action-request]').length === 8, null, { timeout: 15000 })
       await page.mouse.click(collapsed.toggle.x + collapsed.toggle.width / 2, collapsed.toggle.y + collapsed.toggle.height / 2)
       const expanded = await page.evaluate(measure)
-      assert.equal(expanded.bodyHidden, false, `${name}: expanded again`)
+      assert.equal(await page.evaluate(() => document.querySelector('[data-panel-body]').hasAttribute('data-body-collapsed')), false, `${name}: expanded again`)
       assert.equal(expanded.asks, 6, `${name}: rows restored`)
       assert.ok(expanded.frame.height <= expanded.vh * 0.55 + 1, `${name}: still bounded`)
       await page.close()

@@ -299,7 +299,7 @@ test('registered strip: with the panel loaded it keeps the queue but never the l
   // Mixed-version rollout: a panel without the hosting frame (no hostsQueue) keeps the queue in this slot.
   const withPanel = strip.render()
   assert.equal(withPanel.type, m.ActionQueue, 'older panel loaded: only the queue, no legacy Strip')
-  assert.deepEqual(withPanel.props, {})
+  assert.deepEqual(withPanel.props, { coverage: { state: 'legacy' } }, 'behaves as it did beside that older panel')
   assert.equal('Strip' in window.__userSteps, false)
   // A hosting panel draws the queue inside its own frame: this slot is the missing-panel error only, and quiet.
   window.__sessionPanel = { active: true, hostsQueue: () => true }

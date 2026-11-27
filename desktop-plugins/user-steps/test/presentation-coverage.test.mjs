@@ -212,24 +212,115 @@ test('newer revision: an older drawn revision is not coverage until the model ca
   assert.deepEqual(coverageOf(), [])
 })
 
-test('collapse hides rows and companion together; the header toggle stays; expanding restores both', async () => {
+const hiddenNode = n => !!n?.closest('[hidden]')
+const collapse = async () => { await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() }); await settle() }
+
+test('collapse removes rows and counted asks; the header toggle stays; expanding restores both', async () => {
   const r = ask(), stray = ask()
   backend.requests.S1 = [r, stray]
   seed('S1', model({ needs_you: [askRow(r), askRow(stray)] }))
   await show(composerTop()); await settle()
   assert.equal(el().querySelectorAll('[data-action-request]').length, 2, 'withdraw rows while expanded')
-  await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
-  await settle()
+  await collapse()
   const body = el().querySelector('[data-panel-body]')
-  assert.equal(body.hidden, true, 'whole body hidden')
+  assert.ok(body.hasAttribute('data-body-collapsed'))
+  assert.equal(el().querySelectorAll('[data-panel-row]').length, 0, 'no canonical rows while collapsed')
   assert.ok(el().querySelector('[data-panel-toggle]'), 'toggle reachable')
   assert.ok(el().querySelector('[data-panel-toggle]').closest('[data-panel-body]') === null, 'toggle is outside the scrolling body')
   assert.equal(el().querySelectorAll('[data-action-request]').length, 0, 'counted asks draw nothing under a collapsed panel')
-  assert.equal(el().querySelectorAll('[data-action-queue]').length, 1, 'companion stays mounted (hidden) for recovery')
-  await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
-  await settle()
-  assert.equal(el().querySelector('[data-panel-body]').hidden, false)
+  assert.equal(el().querySelectorAll('[data-action-queue]').length, 1, 'companion stays mounted for recovery')
+  await collapse()
+  assert.equal(el().querySelector('[data-panel-body]').hasAttribute('data-body-collapsed'), false)
   assert.equal(el().querySelectorAll('[data-action-request]').length, 2)
+  assert.equal(el().querySelectorAll('[data-panel-row]').length, 2)
+})
+
+// What the header does not count must never vanish behind a collapsed panel.
+test('collapsed panel keeps recorded-delivery Check status / Retry visible', async () => {
+  const r = ask({ resolution: { operationId: 'op-collapsed', choiceId: 'c0', revision: 1 } })
+  backend.requests.S1 = [r]
+  const api = window.hermesDesktop.api
+  window.hermesDesktop.api = async req => req.path.includes('/operations/') ? { operation: { operationId: 'op-collapsed', dispatchState: 'pending' }, request: r } : api(req)
+  try {
+    seed('S1', model({ running: [lineRow('t1')] }))
+    await show(composerTop()); await settle()
+    await collapse(); await settle()
+    assert.ok(el().querySelector('[data-session-panel]').hasAttribute('data-collapsed'))
+    assert.equal(el().querySelectorAll('[data-panel-row]').length, 0, 'rows are gone')
+    const buttons = [...el().querySelectorAll('[data-action-request] button')]
+    const labels = buttons.map(b => b.textContent)
+    assert.ok(labels.includes('Check status') && labels.includes('Retry'), `recovery controls kept: ${labels}`)
+    assert.deepEqual(buttons.map(hiddenNode), buttons.map(() => false), 'none under a hidden ancestor')
+    assert.ok(buttons[0].closest('[data-panel-body]'), 'still inside the one bounded body')
+  } finally { window.hermesDesktop.api = api }
+})
+
+test('collapsed panel keeps an open ask the model omits visible, with its explanation', async () => {
+  const counted = ask()
+  backend.requests.S1 = [counted]
+  seed('S1', model({ needs_you: [askRow(counted)], running: [lineRow('t1')] }))
+  await show(composerTop()); await settle()
+  await collapse()
+  assert.equal(el().querySelectorAll('[data-action-request]').length, 0)
+  const omitted = ask(); backend.requests.S1 = [counted, omitted]
+  await React.act(async () => { await steps.refreshRequests() }); await settle()
+  const rows = [...el().querySelectorAll('[data-action-request]')]
+  assert.equal(rows.length, 1, 'only the uncounted ask is drawn')
+  assert.ok(rows[0].textContent.includes(omitted.title))
+  assert.equal(hiddenNode(rows[0]), false)
+  assert.deepEqual(coverageOf(), ['omitted'])
+  assert.ok(el().querySelector('[data-session-panel]').hasAttribute('data-collapsed'), 'the panel stays collapsed')
+})
+
+test('collapsed panel keeps a queue read error visible', async () => {
+  seed('S1', model({ running: [lineRow('t1')] }))
+  await show(composerTop()); await settle()
+  await collapse()
+  const api = window.hermesDesktop.api
+  window.hermesDesktop.api = async req => { if (req.path.includes('/requests')) throw Error('503: backend down'); return api(req) }
+  try {
+    await React.act(async () => { await steps.refreshRequests().catch(() => {}) }); await settle()
+    const alert = el().querySelector('[data-action-queue] [role="alert"]')
+    assert.ok(alert, 'the error is drawn')
+    assert.equal(hiddenNode(alert), false)
+  } finally { window.hermesDesktop.api = api }
+})
+
+test('idle chat: an empty model and no requests paint nothing, and a later ask still appears', async () => {
+  seed('S1', model())
+  await show(composerTop()); await settle()
+  const frame = el().querySelector('[data-session-panel]')
+  assert.equal(frame.getAttribute('data-panel-frame'), 'idle')
+  assert.equal(frame.textContent, '', 'no content')
+  assert.equal(frame.style.padding, '0px')
+  assert.ok(!/1px/.test(frame.style.borderBottom), `no border: ${frame.style.borderBottom}`)
+  assert.equal(frame.querySelectorAll('[data-action-queue]').length, 0)
+  // The companion is still mounted (polling): a new ask shows up in a real frame.
+  const r = ask(); backend.requests.S1 = [r]
+  await React.act(async () => { await steps.refreshRequests() }); await settle()
+  assert.equal(el().querySelector('[data-session-panel]').getAttribute('data-panel-frame'), 'bare')
+  assert.deepEqual(coverageOf(), ['empty'])
+})
+
+test('mixed-version: an older panel without hostsQueue keeps its quiet queue, no false "not showing" line', async () => {
+  const r = ask(); backend.requests.S1 = [r]; backend.features = []
+  const real = window.__sessionPanel
+  window.__sessionPanel = { active: true, version: 'old', covers: () => true, showsDecision: () => false }
+  try {
+    await steps.refreshRequests()
+    await show(contributions.find(a => a.id === 'strip').render()); await settle()
+    assert.deepEqual(coverageOf(), [])
+    assert.equal(el().querySelectorAll('[data-action-request]').length, 0, 'the old panel draws the ask; nothing duplicated here')
+    assert.ok(el().querySelector('[data-user-steps-panel-missing]') === null)
+  } finally { window.__sessionPanel = real }
+})
+
+test('hostsQueue follows the panel\'s own connection, so a differing active-connection source cannot disagree', async () => {
+  seed('S1', model({ running: [lineRow('t1')] }))
+  await show(composerTop()); await settle()
+  assert.equal(panel.hostsQueue({ connectionId: 'OTHER', profile: 'default', session: 'S1' }), true)
+  assert.equal(panel.hostsQueue({ connectionId: 'C1', profile: 'default', session: 'S2' }), false)
+  assert.equal(panel.hostsQueue({ connectionId: 'C1', profile: 'work', session: 'S1' }), false)
 })
 
 test('recorded-delivery recovery keeps Check status / Retry in the hosted companion', async () => {
