@@ -794,7 +794,19 @@ class _Unclosed(Exception):
     pass
 
 
-def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) -> str:
+class _AnalysisLimit(Exception):
+    pass
+
+
+class _Substitution(list):
+    """An isolated shell body, positioned in the parent command stream."""
+
+
+class _InspectionHold(list):
+    """An analysis limit, never an ordinary executable argv."""
+
+
+def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = None) -> str:
     """`text` with each command substitution moved out of its double quotes, and backticks spelled `$(...)`.
 
     Bash runs `"$(cmd)"` and "`cmd`" exactly like the unquoted forms, but shlex keeps a double-quoted string as one
@@ -804,6 +816,16 @@ def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) 
     Single quotes, `$'...'`, escaped `\\$(`/`` \\` ``, `$((...))` arithmetic and `#` comments are copied unchanged.
     Text whose quotes or substitutions do not close comes back unchanged."""
     n = len(text)
+    marker = "__MAC_SUBSTITUTION_"
+    while marker in text:
+        marker += "_"
+
+    def substitution(body: str, level: int) -> str:
+        if substitutions is None or level != 0:
+            return "$(" + body + ")"
+        key = marker + str(len(substitutions))
+        substitutions[key] = body
+        return " " + key + " "
 
     def comment_at(i: int) -> bool:
         return text[i] == "#" and (i == 0 or text[i - 1] in " \t\n;&|()")
@@ -833,7 +855,7 @@ def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) 
 
     def code(i: int, stop: str, level: int) -> tuple:
         if level > 32:
-            raise _Unclosed
+            raise _AnalysisLimit
         out, depth = [], 0
         while i < n:
             c = text[i]
@@ -859,10 +881,9 @@ def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) 
                 out.append(text[i:j])
                 i = j
             elif text.startswith("$(", i) or c == "`":
+                start = i + (2 if c == "$" else 1)
                 s, i = code(i + 2, ")", level + 1) if c == "$" else code(i + 1, "`", level + 1)
-                out.append("$(" + s + ")")
-                if substitutions is not None and level == 0:
-                    substitutions.append(s)
+                out.append(substitution(text[start:i - 1] if c == "$" and substitutions is not None else s, level))
             else:
                 if stop == ")" and c == "(":
                     depth += 1
@@ -897,10 +918,9 @@ def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) 
                 if data:
                     parts.append('"' + "".join(data) + '"')
                     data = []
+                start = i + (2 if c == "$" else 1)
                 s, i = code(i + 2, ")", level + 1) if c == "$" else code(i + 1, "`", level + 1)
-                parts.append("$(" + s + ")")
-                if substitutions is not None and level == 0:
-                    substitutions.append(s)
+                parts.append(substitution(text[start:i - 1] if c == "$" and substitutions is not None else s, level))
             else:
                 data.append(c)
                 i += 1
@@ -910,7 +930,13 @@ def _expose_substitutions(text: str, substitutions: Optional[list[str]] = None) 
         return text
     try:
         return code(0, "", 0)[0]
-    except (_Unclosed, RecursionError):
+    except (_AnalysisLimit, RecursionError):
+        if substitutions is not None:
+            raise _AnalysisLimit from None
+        return text
+    except _Unclosed:
+        if substitutions is not None:
+            substitutions.clear()
         return text
 
 
@@ -1037,16 +1063,19 @@ def _command_tokens(text: str) -> list[str]:
     return _command_lex(_lexable(code, _command_lex))
 
 
-def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
+def commands(text: str, _prepared: bool = False) -> Iterator[tuple[list[str], set[str]]]:
     """Yield (argv, env-assignment names) for each simple command, recursing into `bash -c`."""
-    # Header/pattern words are data, but their command substitutions run first.
-    # Collect with the same quote-aware walker as the lexer (not heredoc rules,
-    # which intentionally treat apostrophes as literal characters).
-    substitutions: list[str] = []
-    _expose_substitutions(_split_heredocs(text)[0], substitutions)
-    for sub in substitutions:
-        yield from commands(sub)
-    toks = _command_tokens(text)
+    # Replace outer substitutions with collision-free tokens. Consume these at
+    # their textual positions, even in suppressed headers/patterns/arrays, and
+    # scan their bodies with a private cwd rather than leaking subshell `cd`.
+    substitutions: dict[str, str] = {}
+    try:
+        code = _expose_substitutions(text if _prepared else _split_heredocs(text)[0], substitutions)
+    except _AnalysisLimit:
+        yield _InspectionHold(["command substitution inspection depth limit"]), set()
+        return
+    code = code.replace("\\\n", " ")
+    toks = _command_lex(_lexable(code, _command_lex))
     if toks is None:
         return
     cur: list[str] = []
@@ -1055,6 +1084,9 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
     case_depth = 0
     case_pattern = False
     for t in toks + [";"]:
+        if t in substitutions:
+            yield _Substitution([substitutions[t]]), set()
+            continue
         # `name=(a b c)` / `local name=(...)` is a bash array literal: its words are data, not a command
         # (hermes-core-wt's `here=(./scripts/run_tests.sh)` read as a whole-suite run and blocked the tool
         # this guard itself recommends).
@@ -1481,8 +1513,18 @@ class _ScriptLimit(Exception):
     """A recognized shell script was not completely inspected."""
 
 
-def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[Hit]:
-    for argv, env in commands(_drop_ssh_heredocs(text)):
+def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool,
+          substitution_depth: int = 0, prepared: bool = False) -> Optional[Hit]:
+    for argv, env in commands(text if prepared else _drop_ssh_heredocs(text), prepared):
+        if isinstance(argv, _InspectionHold):
+            return f"{argv[0]}; use {OPT_OUT}=1 to opt out explicitly", None, cwd
+        if isinstance(argv, _Substitution):
+            if substitution_depth >= 32:
+                return f"command substitution inspection depth limit; use {OPT_OUT}=1", None, cwd
+            inner = _scan(argv[0], cwd, depth, in_script, substitution_depth + 1, True)
+            if inner:
+                return inner
+            continue
         if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
             cwd = _cd(cwd, argv[1])
             continue
@@ -1508,7 +1550,7 @@ def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optiona
             if body is not None and depth >= SCRIPT_MAX_DEPTH:
                 return f"{ref}: script inspection depth limit; use {OPT_OUT}=1 to opt out explicitly", None, cwd
             if body:
-                inner = _scan(body, cwd, depth + 1, True)
+                inner = _scan(body, cwd, depth + 1, True, substitution_depth)
                 if inner:
                     return f"{ref} \u2192 {inner[0]}", None, cwd
     return None
@@ -1604,11 +1646,19 @@ def core_test_command(args: list[str]) -> str:
     return "hermes-core-wt test" + (" " + shlex.join(args) if args else "")
 
 
-def note(text: str, cwd: Optional[str] = None) -> Optional[str]:
+def note(text: str, cwd: Optional[str] = None, _prepared: bool = False,
+         _level: int = 0) -> Optional[str]:
     """Non-blocking note for a multi-file Python test run inside a Hermes core worktree, else None."""
     if _opted_out():
         return None
-    for argv, env in commands(_drop_ssh_heredocs(text)):
+    for argv, env in commands(text if _prepared else _drop_ssh_heredocs(text), _prepared):
+        if isinstance(argv, _InspectionHold):
+            continue  # evaluate/check_shell already issue the policy hold
+        if isinstance(argv, _Substitution):
+            inner = note(argv[0], cwd, True, _level + 1) if _level < 32 else None
+            if inner:
+                return inner
+            continue
         if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
             cwd = _cd(cwd, argv[1])
             continue

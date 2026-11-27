@@ -140,6 +140,61 @@ def test_f3_complex_remote_heredoc_requires_explicit_optout(remote, monkeypatch)
     assert guard.check_shell(cmd) is None
 
 
+@pytest.mark.parametrize("cmd", [
+    "bash run.sh; x=$(cd proj && pwd)",
+    "./run.sh; echo $(cd proj)",
+    "bash run.sh; case $(cd proj && pwd) in *) ;; esac",
+    "cd proj && case $(bash heavy.sh) in *) ;; esac",
+    "x=$(cd proj); bash run.sh",
+    "echo `cd proj`; bash run.sh",
+    "case $(cd proj) in *) ;; esac; bash run.sh",
+    "cd proj; for x in $(bash heavy.sh); do echo $x; done",
+    "cd proj; case x in $(bash heavy.sh)) echo ;; esac",
+    "cd proj; echo $(cd ..; bash run.sh)",
+])
+def test_f4_substitution_cwd_order_and_isolation(cmd, tmp_path):
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "run.sh").write_text("cargo build --release\n")
+    (tmp_path / "run.sh").chmod(0o700)
+    (tmp_path / "proj" / "heavy.sh").write_text("cargo build --release\n")
+    assert guard.check_shell(cmd, str(tmp_path))
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo $(cd proj); bash light.sh",
+    "cd proj; case $(bash light.sh) in *) ;; esac",
+    "echo '$(cd proj)'; bash light.sh",
+])
+def test_f4_cwd_light_controls(cmd, tmp_path):
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "light.sh").write_text("echo ok\n")
+    (tmp_path / "proj" / "light.sh").write_text("echo ok\n")
+    assert guard.check_shell(cmd, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("levels", [32, 33, 40])
+def test_f4_substitution_limit_does_not_fail_open(levels):
+    inner = "pytest"
+    for _ in range(levels):
+        inner = f"echo $({inner})"
+    assert guard.check_shell(f"case $({inner}) in *) ;; esac")
+
+
+def test_f3_body_command_optout():
+    assert guard.check_shell("ssh hub sudo bash -s <<'EOF'\nMAC_HEAVY_OK=1 pytest\nEOF") is None
+
+
+def test_f4_substitution_note_keeps_private_cwd(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard, "core_worktree", lambda cwd: str(tmp_path) if cwd == str(tmp_path) else None)
+    cmd = "echo $(cd proj); echo $(pytest tests/test_a.py tests/test_b.py)"
+    assert guard.note(cmd, str(tmp_path))
+
+
+def test_f4_limit_exported_optout(monkeypatch):
+    monkeypatch.setenv("MAC_HEAVY_OK", "1")
+    assert guard.check_shell("case " + "$(echo " * 40 + "pytest" + ")" * 40 + " in *) ;; esac") is None
+
+
 def test_c4_truncated_script(tmp_path):
     (tmp_path / "long.sh").write_text("#" * guard.SCRIPT_MAX_BYTES + "\ncargo build --release\n")
     assert guard.check_shell("bash long.sh", str(tmp_path))

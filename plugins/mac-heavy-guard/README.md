@@ -16,9 +16,15 @@ even when they would never execute locally. Keeping the narrow, auditable gramma
 avoids widening local-pipeline/remapping exemptions; this is a conservative load-policy
 hold, not evidence that the body runs locally. For those forms, set `MAC_HEAVY_OK=1`
 in the invoking guard process's environment (the exported opt-out); an inline
-assignment on SSH alone does not exempt a separately scanned heredoc body.
+assignment on SSH alone does not exempt a separately scanned heredoc body. For a
+per-command exception, prefix the held body line itself: `MAC_HEAVY_OK=1 pytest`.
 This is a static load-policy aid, not a shell sandbox: implicit SSH config, arbitrary
 variable evaluation and read/execute races are not contained.
+
+Command substitutions are inspected at their textual position, including case/loop
+headers, using a private subshell cwd: a substitution's `cd` cannot redirect earlier
+or later parent script inspection. Substitution nesting beyond 32 levels requires
+the exported opt-out rather than silently accepting uninspected code.
 
 Local shell scripts are inspected up to 64 KiB and two script levels. An oversized
 recognized script or an existing third-level shell script now requires an explicit
