@@ -189,6 +189,57 @@ def test_idle_waits_derive_triage_clocks_once_per_held_bundle(monkeypatch):
     assert f._triage_memo == {}  # a dropped chat releases its held bundle
 
 
+def test_a_replaced_model_on_the_same_held_bundle_is_derived_again(monkeypatch):
+    """Defence in depth: the memo is keyed on the bundle AND its model, so a model swapped in place re-derives."""
+    from test_feed import make, feedmod
+    f, _, _, clock = make()
+    f.changes(['S1'])
+    import types
+    real = feedmod._model()
+    calls = []
+    stub = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith('__')})
+    stub.triage_clocks = lambda bundle: calls.append(bundle) or [(400.0, 1000.5 + len(calls))]
+    monkeypatch.setattr(feedmod, '_model', lambda: stub)
+    assert f.idle_wait() == pytest.approx(1.5)
+    assert f.idle_wait() == pytest.approx(1.5) and len(calls) == 1
+    with f.lock:
+        held = f.bundles['S1']['bundle']
+        held['model'] = {**(held.get('model') or {})}  # same bundle object, new model
+    assert f.idle_wait() == pytest.approx(2.5)
+    assert len(calls) == 2 and calls[0] is calls[1]
+
+
+def test_a_later_card_still_crosses_after_an_earlier_crossing_latched():
+    """The latch keeps only crossings that are already past: a card whose deadline is still ahead when an
+    earlier card crosses gets its own age pass at its own crossing, without waiting for the heartbeat."""
+    from test_feed import make, detail
+    f, readers, _, clock = make()
+    rows = [{'id': cid, 'status': 'triage', 'board': 'default', 'session_id': 'S1', 'block_kind': 'decision_pending'}
+            for cid in ('t_aaaaaa1', 't_ffffff6')]
+    readers.links['S1'] = rows
+    for row, entered in zip(rows, (401, 405.5)):
+        readers.cards[row['id']] = detail(row['id'], 'triage',
+                                          events=[{'kind': 'decision_retained', 'created_at': entered}])
+    f.changes(['S1'])
+
+    def overdue():
+        stuck = f.bundles['S1']['bundle']['model']['sections']['stuck']
+        return sorted(v['key'].rsplit(':', 1)[-1] for v in stuck if v.get('attention') == 'triage_overdue')
+    clock['now'] = 1002
+    f.beat()
+    assert overdue() == ['t_aaaaaa1']
+    assert f.idle_wait() == pytest.approx(3.5, abs=0.01)  # the later card's own crossing stays armed
+    clock['now'] = 1005
+    revision = f.rev
+    f.beat()
+    assert f.rev == revision and overdue() == ['t_aaaaaa1']
+    clock['now'] = 1006
+    assert clock['now'] - f.last_emit < f.heartbeat_s  # no heartbeat is due: only the crossing can repaint
+    f.beat()
+    assert f.rev > revision and overdue() == ['t_aaaaaa1', 't_ffffff6']
+    assert f.idle_wait() == f.heartbeat_s
+
+
 @pytest.mark.parametrize('age', [599, 601])
 def test_an_off_list_shared_blocker_group_schedules_its_own_crossing(age):
     """Shared-blocker parents are not in bundle['tasks']; their group still arms the bounded next-threshold wake."""
