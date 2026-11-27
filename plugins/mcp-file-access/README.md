@@ -23,7 +23,9 @@ then routes the file through the server's temp dir, so no restart or config edit
 - File-output arguments naming existing directories are refused before approval, even with
   an ancestor grant. Delivery never removes a user directory; an output directory created
   while the call runs also causes refusal. Regular-file delivery uses an atomic replacement
-  beside the destination (including when staging is on another filesystem).
+  beside the destination (including when staging is on another filesystem), retaining the
+  staged output's mode. Refusal is per output: other outputs are still delivered and refused
+  paths are reported as `[not delivered]` in transformed results, in either hook order.
 - Hermes collects all pre-call hooks before resolving approval, so staging cannot be deferred
   past the verdict with this hook API. Staging directories are 0700 and read copies are 0600,
   independent of umask/source permissions. Denial/post-call cleanup removes the stage; plugin
