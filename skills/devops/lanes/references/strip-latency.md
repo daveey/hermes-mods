@@ -51,7 +51,12 @@ list means the view's `status` is `{}` and `sessions` is empty, so every chat co
 4. Compare dashboard/core identity bytes and parent/child boot identities across a real sync.
    The supervisor now recaptures disk identity and replaces its child on compatible updates, without
    restarting the parent. Wire protocol VERSION mismatch still refuses, and the child checks its
-   identity for every job. A pure mtime touch does not change the content-hash identity. On older
+   identity for every job. Cover deployment DURING an active request too: changing bytes before
+   opening a stream misses both the child's per-job refusal and the parent's post-result fence.
+   Keep the same future/revision and bounded newer-demand queue while retrying one changed
+   generation; reject protocol mismatch and repeated movement rather than dropping either fence.
+   Prove uninterrupted service on one socket across a byte-changing sync, not merely three complete
+   frames from a new socket afterward. A pure mtime touch does not change the content-hash identity. On older
    code the captured router-load manifest permanently disabled streaming after an update.
 5. If the child serves partial flow with `interrupted`, inspect every borrowed reader, including the
    fleet replica: resetting a local connection's phase budget does not reset the replica's handler.
