@@ -1521,12 +1521,12 @@ def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
             target = (_operands(args) or ["~"])[0]
             try:
                 next_home = directory_context(target, in_home)
-                if following == "||":
-                    succeeded_cd = [merge_directory_contexts(*succeeded_cd, next_home)]
-                else:
-                    if following == "&&":
-                        failed_cd = [merge_directory_contexts(*failed_cd, in_home)]
-                    in_home = next_home if following == "&&" else merge_directory_contexts(in_home, next_home)
+                # A `||` RHS gets every possible cwd, like a plain cd: `! cd X || rm`,
+                # a shadowing `cd()` function, aliases and eval can all run it after a
+                # cd that took effect.
+                if following == "&&":
+                    failed_cd = [merge_directory_contexts(*failed_cd, in_home)]
+                in_home = next_home if following == "&&" else merge_directory_contexts(in_home, next_home)
             except ValueError:
                 return "working directories exceed bounded live-database safety analysis"
             continue

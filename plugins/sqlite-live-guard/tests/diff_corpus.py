@@ -47,6 +47,27 @@ REVIEW_REPROS = [
     "ssh example.com \"bash -c 'shopt -s lastpipe; ls | cd ~/.hermes && rm -rf state.db'\"",
     "ssh example.com 'ls | cd ~/.hermes; rm -rf state.db'",
     "zsh -c 'ls | cd ~/.hermes; rm -rf state.db'",
+    # Round 8: negated cd and a shadowing cd() function still run a `||` RHS after a cd that took effect.
+    "! cd ~/.hermes || rm -rf state.db",
+    "! command cd ~/.hermes || rm -rf state.db",
+    "time ! cd ~/.hermes || rm -rf state.db",
+    "! time cd ~/.hermes || rm -rf state.db",
+    "bash -c '! cd ~/.hermes || rm -rf state.db'",
+    "sh -c '! cd ~/.hermes || rm -rf state.db'",
+    "zsh -c '! cd ~/.hermes || rm -rf state.db'",
+    "ssh example.com '! cd ~/.hermes || rm -rf state.db'",
+    "zsh -c '! ls | cd ~/.hermes || rm -rf state.db'",
+    "cd() { builtin cd \"$@\"; false; }; cd ~/.hermes || rm -rf state.db",
+    "function cd { builtin cd \"$@\"; return 1; }; cd ~/.hermes || rm -rf state.db",
+    "cd() { command cd \"$@\"; return 1; }; cd ~/.hermes || rm -rf state.db",
+    "bash -c 'cd() { builtin cd \"$@\"; false; }; cd ~/.hermes || rm -rf state.db'",
+    "ssh example.com 'cd() { builtin cd \"$@\"; false; }; cd ~/.hermes || rm -rf state.db'",
+    "! cd /nonexistent && rm -rf .hermes",
+    # The plain `||` forms follow from the same rule (no cwd is assumed for a `||` RHS).
+    "cd ~/.hermes || rm -rf state.db",
+    "bash -c 'cd ~/.hermes || rm -rf state.db'",
+    "sh -c 'cd ~/.hermes || rm -rf state.db'",
+    "ssh example.com 'cd ~/.hermes || rm -rf state.db'",
 ]
 
 # Setup (S), neutral (N) and kill (R) fragments. S establishes a dangerous

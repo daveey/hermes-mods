@@ -334,7 +334,9 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
         conditional, rhs = bool(blocks) or rhs, False
         if not raw:
             continue
+        negated = False
         while raw and raw[0] in {"{", "!", "time"}:
+            negated = negated or raw[0] == "!"
             raw = raw[1:]
         if not raw:
             continue
@@ -390,11 +392,10 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             # on success; || runs solely on failure. Keep every possibility.
             unwrapped = guard._strip_wrappers(argv)
             if unwrapped and os.path.basename(unwrapped[0]) == "cd":
-                if following == ["||"]:
-                    # Success skips this RHS, but rejoins at && or list end.
-                    succeeded_cd = [guard.merge_directory_contexts(*succeeded_cd, next_home)]
-                    next_home = in_home
-                elif following != ["&&"]:
+                # A `||` RHS gets every possible cwd, like a plain cd: `! cd X || rm`,
+                # a shadowing `cd()` function, aliases and eval can all run it after a
+                # cd that took effect.
+                if following != ["&&"] or negated:
                     next_home = guard.merge_directory_contexts(in_home, next_home)
                 else:
                     # Success gates this RHS only; failure rejoins at the next

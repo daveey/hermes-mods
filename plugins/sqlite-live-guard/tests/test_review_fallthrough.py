@@ -140,7 +140,9 @@ def test_pipeline_cd_does_not_change_parent(lexical_home):
 
 
 def test_or_rhs_uses_old_context(home):
-    assert guard.check_shell('cd ~ || rm -rf .hermes', cwd=str(home / 'cache')) is None
+    # No cwd is assumed for a `||` RHS (`! cd X || rm`, a shadowing cd(), aliases,
+    # eval all run it after a cd that took effect), so this stays refused.
+    assert guard.check_shell('cd ~ || rm -rf .hermes', cwd=str(home / 'cache'))
 
 
 @pytest.mark.parametrize('operator', ['&&', '||', ';'])

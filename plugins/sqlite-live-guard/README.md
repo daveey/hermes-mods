@@ -12,13 +12,15 @@ arguments to commands such as `echo` are not interpreted as scripts.
 
 The pass checks file operations and redirects against the existing live-file and
 quarantine predicates. Conditional assignments retain possible values; an
-unconditional assignment resets them. Subshell, pipeline and background assignment
-scopes do not replace the parent's aliases. `readonly` bindings survive failed
+unconditional assignment resets them. Background-job assignment scopes and `( )`
+subshells do not replace the parent's aliases; after a `|` pipeline both the
+pre-pipeline and the last-element state are kept (zsh, ksh, bash lastpipe and ssh
+login shells keep the last element's `cd`/assignments). `readonly` bindings survive failed
 reassignment/unset. Local child shells inherit the analyzed working directory; local relative paths
 resolve against the supplied cwd and literal/alias `cd` targets. Conditional `cd`
-and a `cd` not followed by `&&` retain prior and target directories (up to 32,
-then refusal), including across nested shells; the immediate `||` RHS retains the
-prior directory. Deferred successful `cd` contexts rejoin at a following `&&` or
+and a `cd` not followed by `&&` (including the left side of `||`, a negated `! cd` and a
+shadowed `cd`) retain prior and target directories (up to 32,
+then refusal), including across nested shells. Deferred successful `cd` contexts rejoin at a following `&&` or
 list boundary, while failed contexts rejoin after success-gated `&&` chains end.
 `pushd`/`popd` and `env -C` directory changes are not tracked. Remote initial cwd
 remains unknown: although ordinary sshd starts in the user's home, forced commands,
