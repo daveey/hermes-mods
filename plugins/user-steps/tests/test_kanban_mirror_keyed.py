@@ -342,3 +342,20 @@ def test_cold_bypass_retains_older_withdrawal_and_background_prepass_key(keyed, 
     k.mirror.reconcile_poll(OWNER, 60)
     assert len(k.store.requests(OWNER)) == 1
     assert k.store.requests(OWNER)[0]['requestId'] != old['requestId']
+
+
+def test_cold_full_keeps_store_reader_without_holding_its_lock(keyed, monkeypatch):
+    k = keyed
+    monkeypatch.setitem(k.mod, '_schedule', lambda *args: None)
+    full = k.mirror._reconcile
+    checked = []
+    def check(owner, fenced):
+        entry = k.mod['_POOL'].get(str(k.store.path))
+        assert entry is not None and entry.conn is not None, 'cold pass lost retained store reader'
+        assert entry.owner is None, 'must not hold a shared reader lock across the full pass'
+        checked.append(True)
+        return full(owner, fenced)
+    monkeypatch.setattr(k.mirror, '_reconcile', check)
+    k.mirror.reconcile_poll(OWNER, 60)
+    assert checked == [True]
+    assert len(k.store.requests(OWNER)) == 1

@@ -285,7 +285,10 @@ poll synchronously runs the complete local pass, without first building a change
 key that cannot justify skipping its first result. It clears any surviving owner
 memo before work and does not attach a post-pass key to older inputs. Subsequent
 background and strict passes retain their ordinary pre-pass key and full-pass
-ceiling. Namespace-wide older-owner bindings and withdrawals remain dependencies.
+ceiling. The cold path still establishes an idle retained ActionStore reader,
+without holding its entry lock across reconciliation, to avoid repeated last-WAL-
+connection open/close work. Namespace-wide older-owner bindings and withdrawals
+remain dependencies.
 `test_kanban_mirror_keyed.py` covers first-response asks with a key trap, failure
 without warming, older-owner withdrawal, changed asks and background key recovery.
 

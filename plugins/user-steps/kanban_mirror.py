@@ -1148,6 +1148,14 @@ class Mirror:
                 fenced = self._fenced_core()
             with _stage('local_key'):
                 key = None if force_full else self._key(owner, fenced)
+            if force_full:
+                # _key also established this idle retained reader. Keep that
+                # lifetime benefit without its namespace-wide digest: otherwise
+                # the full pass's short ActionStore reads repeatedly become the
+                # last WAL connection (schema/open/close work for every binding).
+                # Release the entry lock BEFORE reconciliation; no global pass lock.
+                with _stage('local_store_reader'), _kept(self.store.path):
+                    pass
             now = time.monotonic()
             with _MEMO_LOCK:
                 memo = _MEMO.get(okey)
