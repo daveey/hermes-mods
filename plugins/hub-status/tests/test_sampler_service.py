@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -132,3 +133,17 @@ def test_unit_path_escaping():
     assert installer._quote('/a%/$b', command=True) == '"/a%%/$$b"'
     with pytest.raises(ValueError):
         installer._quote("bad\npath")
+
+
+@pytest.mark.skipif(sys.platform != "linux" or not shutil.which("systemd-analyze"),
+                    reason="requires systemd unit parser")
+@pytest.mark.parametrize("plugin_name", ["plugin", 'plugin space$percent%quote"'])
+def test_generated_service_is_accepted_by_real_systemd_parser(tmp_path, plugin_name):
+    unit = tmp_path / "hub-status-sampler.service"
+    # WorkingDirectory is a path directive, not an ExecStart-style quoted argument.
+    plugin = tmp_path / plugin_name
+    plugin.mkdir()
+    unit.write_text(installer.service_text(tmp_path / "profile home", Path(sys.executable), plugin))
+    result = subprocess.run(["systemd-analyze", "verify", str(unit)], capture_output=True, text=True,
+                            timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
