@@ -1143,8 +1143,8 @@ const measureText = value => value == null ? 'unknown' : typeof value === 'objec
 // ── C Slots compact lane rows ─────────────────────────────────────────────
 // Two-line ~38px grid per lane: name (spans both lines), a reserved truncatable chip slot, the tick heat strip over
 // the slot pips/cap slider, and $/h $/d $/wk at the right. Everything drawn comes from the hub snapshot (row.ticks,
-// row.spend, snap.fleet_slots); the renderer never sums usage or counters and makes no forecast request while
-// dragging: the what-if cells and counts are the hub's precomputed `ticks.previews`.
+// row.spend, snap.fleet_slots); usage and live counters remain hub-owned. Draft-cap recolouring is pure
+// presentation of the supplied per-cell running peaks, without an extra request or per-cap wire copies.
 export const SIDEBAR_WINDOW_KEY = 'hermes-lanes-sidebar-window'
 export const SIDEBAR_WINDOWS = [[6, '6h'], [24, '24h'], [168, '7d']]
 export function loadSidebarWindow(storage = globalThis.localStorage) {
@@ -1170,7 +1170,23 @@ export function stopFromFraction(frac, slots) {
   if (frac >= INFINITY_EDGE) return slots + 1
   return Math.min(slots, Math.max(0, Math.round(Math.max(0, frac) / INFINITY_EDGE * slots)))
 }
-export const previewKey = value => value == null ? 'unlimited' : String(value)
+export function capPreview(ticks, cap, now) {
+  if (!Array.isArray(ticks?.cells)) return null
+  const peak = Math.max(1, ...ticks.cells.map(c => c.running ?? 0))
+  let affected = 0, unknown = 0
+  const cells = ticks.cells.map(c => {
+    const running = c.running
+    if (running == null) { unknown++; return { ...c, cap, forecast: true, state: 'unknown', visual: { height: 1, opacity: 1 } } }
+    const over = cap != null && running > cap
+    if (over) affected++
+    const state = over ? 'rejecting' : cap != null && running >= cap && running > 0 ? 'full' : running > 0 ? 'partial' : 'empty'
+    const ratio = Math.min(1, running / (cap != null && cap > 0 ? cap : peak))
+    return { ...c, cap, forecast: true, state, visual: {
+      height: state === 'partial' ? Math.max(.15, ratio) : state === 'empty' ? .15 : 1,
+      opacity: state === 'partial' ? .25 + .5 * ratio : 1 } }
+  })
+  return { cells, affected, unknown, total: cells.length, now }
+}
 
 const iso = ms => new Date(ms).toISOString().slice(0, 16).replace('T', ' ')
 export function tickRange(cell, bucket) {
@@ -1214,20 +1230,21 @@ function WindowToolbar({ value, onChange }) {
 
 function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disabled, error }) {
   const slots = Number.isInteger(snap?.fleet_slots) && snap.fleet_slots >= 0 ? snap.fleet_slots : null
-  const confirmed = row.limits?.max_workers ?? null
+  const limitsKnown = row.limits != null && Object.hasOwn(row.limits, 'max_workers')
+  const confirmed = limitsKnown ? row.limits.max_workers : undefined
+  const limitsReason = `Cap unknown · ${snap.flow_error || snap.reason || 'lane limits source unavailable'}`
   const [drag, setDrag] = useState(null) // pending stop while pointer/keyboard is active
   const [draft, setDraft] = useState(null) // { value } saved, retained until a later hub snapshot shows it
   const [message, setMessage] = useState('')
   const dragRef = useRef(null), dragging = useRef(false), track = useRef(null)
   // The PUT receipt is not confirmation: only a hub snapshot whose limits show the value releases the draft.
   useEffect(() => { if (draft && draft.value === confirmed) setDraft(null) }, [confirmed, draft])
-  const locked = disabled || Boolean(error) || slots == null || draft != null
+  const locked = disabled || Boolean(error) || !limitsKnown || slots == null || draft != null
   const ticks = row.ticks
   const live = drag != null ? stopValue(drag, slots ?? 0) : draft ? draft.value : confirmed
   const pending = drag != null || draft != null
-  const shownStop = slots == null ? 0 : drag != null ? drag : valueStop(live, slots)
-  const key = previewKey(live)
-  const preview = pending ? ticks?.previews?.[key] : null
+  const shownStop = slots == null || !limitsKnown ? 0 : drag != null ? drag : valueStop(live, slots)
+  const preview = pending && limitsKnown ? capPreview(ticks, live, row.status?.run) : null
   const cells = preview?.cells || ticks?.cells || []
   const set = (stop) => { dragRef.current = stop; setDrag(stop) }
   const commit = async (stop) => {
@@ -1244,10 +1261,10 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
   }
   const sliderProps = {
     ref: track, className: 'lanes-slots', role: 'slider', tabIndex: locked ? -1 : 0, 'aria-label': `${name} max workers slider`,
-    'aria-valuemin': 0, 'aria-valuemax': (slots ?? 0) + 1, 'aria-valuenow': shownStop,
-    'aria-valuetext': slots == null ? 'fleet slots unknown' : live == null ? 'no cap (∞)' : `cap ${live}`,
+    'aria-valuemin': 0, 'aria-valuemax': (slots ?? 0) + 1, 'aria-valuenow': limitsKnown ? shownStop : undefined,
+    'aria-valuetext': !limitsKnown ? limitsReason : slots == null ? 'fleet slots unknown' : live == null ? 'no cap (∞)' : `cap ${live}`,
     'aria-disabled': locked, 'aria-busy': draft != null, 'data-pending': pending ? '1' : '0', 'data-saving': draft ? '1' : '0',
-    title: error ? 'Lanes offline' : slots == null ? 'Fleet slots unknown' : undefined,
+    title: !limitsKnown ? limitsReason : error ? 'Lanes offline' : slots == null ? 'Fleet slots unknown' : undefined,
     onClick: e => e.stopPropagation(),
     onPointerDown: e => { if (locked) return; e.stopPropagation(); e.currentTarget.setPointerCapture?.(e.pointerId); dragging.current = true; setMessage(''); set(fromPointer(e)) },
     onPointerMove: e => { if (dragging.current && !locked) set(fromPointer(e)) },
@@ -1279,12 +1296,13 @@ function CompactLane({ name, row, snap, expanded, onToggle, detail, write, disab
         ticks && cells.length ? h(TickStrip, { name, cells, bucket: ticks.bucket_s, label: `tick heat, last ${windowLabel}${preview ? ' (preview)' : ''}` })
           : h('div', { className: 'lanes-ticks lanes-ticks-empty', 'aria-label': `${name} tick heat unavailable` }),
         h('div', sliderProps,
-          h('div', { className: 'lanes-pips' }, slots == null ? null : Array.from({ length: slots }, (_, i) => {
+          h('div', { className: 'lanes-pips' }, slots == null || !limitsKnown ? null : Array.from({ length: slots }, (_, i) => {
             const n = i + 1, inCap = live == null || n <= live
             return h('i', { key: n, 'data-pip': n, 'data-run': n <= run ? '1' : '0', 'data-open': inCap ? '1' : '0' })
           })),
-          slots == null ? null : h('span', { className: 'lanes-inf', 'data-open': live == null ? '1' : '0', 'aria-hidden': true }, '∞'),
-          slots == null ? null : h('span', { className: 'lanes-cursor', 'data-cap-cursor': capText(live), style: { left: shownStop > slots ? '98.5%' : pct(shownStop) } }),
+          !limitsKnown ? h('span', { className: 'lanes-cap-unknown' }, '—') : null,
+          slots == null || !limitsKnown ? null : h('span', { className: 'lanes-inf', 'data-open': live == null ? '1' : '0', 'aria-hidden': true }, '∞'),
+          slots == null || !limitsKnown ? null : h('span', { className: 'lanes-cursor', 'data-cap-cursor': capText(live), style: { left: shownStop > slots ? '98.5%' : pct(shownStop) } }),
           pending && slots != null ? h('span', { className: 'lanes-pending' }, `cap ${capText(live)}${draft && drag == null ? ' · saving…' : ''}`) : null)),
       h('div', { className: 'lanes-cost', role: 'group', 'data-cost': name, title: spend ? spendLabel(spend) : 'spend unknown',
         'aria-label': spend ? spendLabel(spend) : 'spend unknown' },
