@@ -244,6 +244,23 @@ def _shallow(pipeline, blocks, braces):
     return blocks <= pipeline[7][0] and len(braces) <= pipeline[7][1]
 
 
+def _rejoin(guard, pipeline, env, exported, readonly, in_home, failed_cd, succeeded_cd):
+    # Whether the last pipeline element's cd/assignments survive depends on the
+    # shell (bash/dash: subshell; zsh, ksh, bash lastpipe, remote login shells:
+    # parent). The shell is not knowable here, so keep BOTH possibilities: the
+    # pre-pipeline state and the state after the last element.
+    _, s_env, s_exported, s_readonly, s_home, s_failed, s_succeeded = pipeline[:7]
+    if pipeline[0] == "&":  # a background job never changes the parent shell
+        return s_env, s_exported, s_readonly, s_home, s_failed, s_succeeded
+    merged = {}
+    for name in set(s_env) | set(env):
+        merged[name] = s_env.get(name, frozenset({"$" + name})) | env.get(name, frozenset({"$" + name}))
+    return (merged, set(s_exported) | set(exported), set(s_readonly) | set(readonly),
+            guard.merge_directory_contexts(s_home, in_home),
+            list(dict.fromkeys(list(s_failed) + list(failed_cd))),
+            list(dict.fromkeys(list(s_succeeded) + list(succeeded_cd))))
+
+
 def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     if depth > 8:
         return "shell execution nesting exceeds the bounded live-database safety analysis"
@@ -262,7 +279,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
         budget.spend(1)
         if raw in (["&&"], ["||"]):
             if pipeline is not None and pipeline[0] == "|" and _shallow(pipeline, blocks, braces):
-                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline[:7]
+                env, exported, readonly, in_home, failed_cd, succeeded_cd = _rejoin(
+                    guard, pipeline, env, exported, readonly, in_home, failed_cd, succeeded_cd)
                 pipeline = None
             if raw == ["&&"] and succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
@@ -282,7 +300,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
             if raw != ["|"] and pipeline is not None and _shallow(pipeline, blocks, braces):
-                _, env, exported, readonly, in_home, failed_cd, succeeded_cd = pipeline[:7]
+                env, exported, readonly, in_home, failed_cd, succeeded_cd = _rejoin(
+                    guard, pipeline, env, exported, readonly, in_home, failed_cd, succeeded_cd)
                 pipeline = None
             if succeeded_cd:
                 in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)

@@ -37,6 +37,16 @@ REVIEW_REPROS = [
     "ls | until cd ~/.hermes && rm -rf state.db; do break; done",
     "ls | if cd ~/.hermes && rm -rf state.db; then :; fi",
     "python3 -c 'from os import unlink; unlink(\"~/.hermes/state.db\")'",
+    # Round 7: the last pipeline element's cd survives under zsh, ksh and bash lastpipe.
+    "zsh -c 'ls | cd ~/.hermes && rm -rf state.db'",
+    "bash -c 'shopt -s lastpipe; ls | cd ~/.hermes && rm -rf state.db'",
+    "bash -O lastpipe -c 'ls | cd ~/.hermes && rm -rf state.db'",
+    "ssh example.com zsh -c \"'ls | cd ~/.hermes && rm -rf state.db'\"",
+    "ssh example.com \"zsh -c 'ls | cd ~/.hermes && rm -rf state.db'\"",
+    "ssh example.com 'shopt -s lastpipe; ls | cd ~/.hermes && rm -rf state.db'",
+    "ssh example.com \"bash -c 'shopt -s lastpipe; ls | cd ~/.hermes && rm -rf state.db'\"",
+    "ssh example.com 'ls | cd ~/.hermes; rm -rf state.db'",
+    "zsh -c 'ls | cd ~/.hermes; rm -rf state.db'",
 ]
 
 # Setup (S), neutral (N) and kill (R) fragments. S establishes a dangerous

@@ -133,7 +133,10 @@ def test_cd_after_pipeline_survives(lexical_home, operator, tail, wrapper, alias
 
 
 def test_pipeline_cd_does_not_change_parent(lexical_home):
-    assert guard.check_shell('D=.hermes; true | cd "$D"; rm -rf *', cwd=str(lexical_home.parent)) is None
+    # Plain bash/dash run the last element in a subshell, but zsh, ksh and bash
+    # lastpipe keep its cd, and the shell (local -c, ssh login shell) is not
+    # knowable: both possibilities are kept, so this is refused (conservative).
+    assert guard.check_shell('D=.hermes; true | cd "$D"; rm -rf *', cwd=str(lexical_home.parent))
 
 
 def test_or_rhs_uses_old_context(home):
