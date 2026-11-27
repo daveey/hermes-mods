@@ -22,7 +22,12 @@ def sibling(name):
 
 @contextlib.contextmanager
 def readers(local, fleet, mode):
-    """C1: open through generation recovery EVERY job; never retain dead files."""
+    """Reopen generation-aware, read-only snapshots for every job.
+
+    Local and replica handles have independent CPU budgets and bounded snapshot
+    lifetimes. Presentation may read either, so neither may retain a separate
+    whole-job wall timer. Handles are released before the result is published.
+    """
     from hermes_cli import kanban_lockguard as guard, kanban_db_sync as sync, kanban_db as kb
     with contextlib.ExitStack() as scope:
         handles = []
