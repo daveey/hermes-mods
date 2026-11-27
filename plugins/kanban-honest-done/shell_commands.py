@@ -229,7 +229,7 @@ def segments(command):
             if words not in out:
                 out.append(words)
             for value in words:
-                if ('kanban' in value and ('hermes' in value)) and value != text:
+                if ('hermes-hub' in value or 'kanban' in value and 'hermes' in value) and value != text:
                     pending.append(value)
         # Continuations join before shell lexing. Backticks delimit nested scripts;
         # read a second conservative view, but do not truncate already recovered
