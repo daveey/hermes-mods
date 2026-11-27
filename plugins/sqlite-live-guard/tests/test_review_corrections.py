@@ -60,6 +60,19 @@ def test_conditional_cwd_bound(home):
     assert 'bounded' in guard.check_shell(command, cwd=str(home))
 
 
+def test_cd_alias_variants_union(home, monkeypatch):
+    guard.check_shell('echo ready')
+    context = guard._SHELL_CONTEXT
+    values = context._values
+    # Make the harmless alternative last: no hash-order-dependent safety.
+    class OrderedValues(frozenset):
+        def __iter__(self):
+            return iter(sorted(super().__iter__(), key=lambda p: p == '/unrelated'))
+    monkeypatch.setattr(context, '_values', lambda *a: OrderedValues(values(*a)))
+    command = 'if test -d ~; then D=~; else D=/unrelated; fi; cd "$D"; rm -rf .hermes'
+    assert guard.check_shell(command, cwd=str(home / 'cache'))
+
+
 @pytest.mark.parametrize('code', [
     'from os import rename; rename(src="copy", dst={db!r})',
     'import os as x; x.replace("copy", dst={db!r})',

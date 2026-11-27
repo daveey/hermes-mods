@@ -333,6 +333,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             count *= len(choice)
         if count > 256:
             raise ValueError("too many command variants")
+        next_contexts = [in_home] if conditional else []
         for variant in itertools.product(*choices):
             budget.spend(32)
             argv = [guard._Quoted(value) if token[:1] in {"'", '"', "\\"} or token != value else value
@@ -340,7 +341,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             why, next_home = _command(argv, guard, in_home, depth, local, exported | assigned, bodies, remote, budget)
             if why:
                 return why
-            in_home = guard.merge_directory_contexts(in_home, next_home) if conditional else next_home
+            next_contexts.append(next_home)
+        in_home = guard.merge_directory_contexts(*next_contexts)
         if raw[i] == "unset" and not conditional:
             for name in raw[i + 1:]:
                 if name not in readonly:
