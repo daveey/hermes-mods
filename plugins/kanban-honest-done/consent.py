@@ -24,6 +24,8 @@ after 24 h. Every record / refusal / clear is a JSON line in ``$HERMES_HOME/logs
 from __future__ import annotations
 
 import json
+import fcntl
+from contextlib import contextmanager
 import os
 import re
 import tempfile
@@ -84,6 +86,20 @@ def _save(data: dict, env=None) -> None:
     os.replace(tmp, p)
 
 
+@contextmanager
+def _transaction(env=None):
+    """Lock a stable sibling inode, not the JSON inode replaced by _save."""
+    p = store_path(env).with_suffix('.lock')
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _live(stops: Iterable[dict], now: float) -> list[dict]:
     return [s for s in stops if isinstance(s, dict) and now - float(s.get("at") or 0) < TTL_S]
 
@@ -138,29 +154,31 @@ def record(tool_name: str, args: Any, result: Any, session_id: str, env=None,
     if not msg or not session_id:
         return None
     own = env.get("HERMES_KANBAN_TASK") or env.get("HERMES_KANBAN_WORKER_TASK") or ""
-    targets = _targets(args, exclude=[own] if own else [])
+    targets = _targets([args, write_texts(tool_name, args)], exclude=[own] if own else [])
     if not targets:  # nothing card-scoped to carry: the stop text in the result already governs this chat
         return None
     now = time.time() if now is None else now
     stop = {"targets": targets, "tool": str(tool_name or ""), "at": now,
             "outcome": "timeout" if re.search(r"timed out|Silence", msg, re.I) else "denied"}
-    data = _load(env)
-    data[session_id] = (_live(data.get(session_id) or [], now) + [stop])[-MAX_PER_SESSION:]
-    for sid in list(data):  # prune expired sessions
-        if not _live(data[sid] or [], now):
-            data.pop(sid, None)
-    _save(data, env)
+    with _transaction(env):
+        data = _load(env)
+        data[session_id] = (_live(data.get(session_id) or [], now) + [stop])[-MAX_PER_SESSION:]
+        for sid in list(data):
+            if not _live(data[sid] or [], now):
+                data.pop(sid, None)
+        _save(data, env)
     telemetry("consent_stop_recorded", env, session=session_id, targets=targets, tool=stop["tool"],
               outcome=stop["outcome"])
     return stop
 
 
 def clear(session_id: str, env=None) -> bool:
-    data = _load(env)
-    if session_id and data.pop(session_id, None):
-        _save(data, env)
-        telemetry("consent_stop_cleared", env, session=session_id, why="user_reply")
-        return True
+    with _transaction(env):
+        data = _load(env)
+        if session_id and data.pop(session_id, None):
+            _save(data, env)
+            telemetry("consent_stop_cleared", env, session=session_id, why="user_reply")
+            return True
     return False
 
 
@@ -192,14 +210,14 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
         # a fresh shell. Only a terminal's command-only field can prove inertness.
         if name in {'terminal', 'run_in_user_terminal'} and not any(args.get(k) for k in ('input', 'data')):
             return shell_write_texts(command)
-        return [command] if _SHELL_WRITE_RE.search(command) else []
+        return shell_write_texts(command, allow_inert=False)
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
     return []
 
 
-def shell_write_texts(command: str) -> list[str]:
+def shell_write_texts(command: str, allow_inert: bool = True) -> list[str]:
     # Use the same executable-position classifier as comment/acceptance gates.
     try:
         from . import core
@@ -215,15 +233,20 @@ def shell_write_texts(command: str) -> list[str]:
             spec.loader.exec_module(core)
             core = sys.modules.setdefault(key, core)
     shell = core._shell_commands()
-    if not shell.within_inert_grammar(command):
+    semantic = [' '.join(seg) for seg in core._segments(command)
+                if not allow_inert or not shell.exempt_segment(seg)]
+    decoded = '\n'.join(semantic)
+    new_targets = set(TASK_ID_RE.findall(decoded)) - set(TASK_ID_RE.findall(command))
+    combined = '\n'.join([command, decoded]) if new_targets or not _SHELL_WRITE_RE.search(command) else command
+    if not allow_inert or not shell.within_inert_grammar(command):
         # Consent's main detector is a raw regex, not the core argv detector.
         # Preserve its entire text (including all targets), even when one parsed
         # segment already exposes another write. Only whole-input G may exempt.
-        return [command] if _SHELL_WRITE_RE.search(command) else []
+        return [combined] if _SHELL_WRITE_RE.search(combined) else []
     # A literal hermes command is executable, including chat prompts and stdin.
     # Preserve main's raw match and all targets rather than narrowing to a verb.
     if any(seg and seg[0] == 'hermes' for seg in core._segments(command)):
-        return [command] if _SHELL_WRITE_RE.search(command) else []
+        return [combined] if _SHELL_WRITE_RE.search(combined) else []
     return []
 
 
@@ -237,11 +260,12 @@ def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,
     if not texts:
         return None
     named = set(TASK_ID_RE.findall("\n".join(texts)))
-    if not named:
-        return None
+    # An unresolved write might name the stopped card. Require literal operands
+    # until consent is restored, rather than evaluate caller shell text.
+    unresolved = any(re.search(r'\$|`', text) for text in texts)
     for sid in sessions:
         for stop in active_stops(sid, env, now):
-            hit = [t for t in stop.get("targets") or [] if t in named]
+            hit = [t for t in stop.get("targets") or [] if t in named or unresolved]
             if hit:
                 telemetry("consent_relay_refused", env, session=sid, targets=hit, tool=_strip(str(tool_name)))
                 return relay_refusal(sid, hit, stop)
