@@ -227,7 +227,7 @@ def core_message(why: str) -> str:
             "Allowed on the core checkout: reads (log/show/diff/status/grep), git fetch, git worktree add, and "
             "writes to gitignored runtime paths (logs, venv, build output; not node_modules). Updates go through "
             "the fenced core updater. Only for a git step the user explicitly asked for in the live tree (e.g. "
-            "putting a detached checkout back on main): prefix that git command with COACH_ALLOW_LIVE=1.")
+            "putting a detached checkout back on main): use an authenticated operator terminal, not an agent-inline approval flag.")
 
 
 def message(why: str) -> str:
@@ -241,7 +241,7 @@ def message(why: str) -> str:
                 "batched) and hermes-sync's drain windows on the Macs. To wait for a commit, schedule "
                 "the card with a wake check like `ssh <hub> 'git -C ~/.hermes/hermes-agent "
                 "merge-base --is-ancestor <sha> HEAD'`. Read-only update flags are allowed. "
-                "Escape hatch: prefix the command with HERMES_UPDATE_OK=1 for a user-approved update only.")
+                "An agent-inline HERMES_UPDATE_OK=1 is not user approval; use an authenticated operator terminal for a user-approved update only.")
     r = root_label()
     return (f"[live-checkout-guard] Refused: {why}.\n"
             f"{r} is the live checkout that the sync job and other agents load from; edit it in place and "
@@ -1293,8 +1293,6 @@ def _check_git(args: list[str], cwd: str, git_env: Optional[dict] = None) -> Opt
     elif git_dir or work_tree or not (base := root_of(d)):
         return None  # an explicit git dir / work tree elsewhere wins over the cwd
     if base != root():
-        if git_env.get("COACH_ALLOW_LIVE") == "1":
-            return None  # coach's escape hatch, scoped to this one command (a user-asked core recovery)
         return _check_core_git(sub, rest, _where(base) + via)
     clean_dir = d if in_root(d) else root()
     if sub == "update-ref":
@@ -1571,8 +1569,7 @@ def _update_source(source: str) -> str:
         lines.append(line)
         toks = _update_tokens(line)
         words, _, assignments = _strip_wrappers(toks[:], os.getcwd())
-        execute = bool(words and os.path.basename(words[0]) in SHELLS | {"ssh"}
-                       and assignments.get("HERMES_UPDATE_OK") != "1")
+        execute = bool(words and os.path.basename(words[0]) in SHELLS | {"ssh"})
         for i, token in enumerate(toks[:-1]):
             if token == "<<" and "$((" not in line:
                 delimiter = toks[i + 1]
@@ -1609,7 +1606,7 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0)
     """Inspect command positions, not arbitrary strings mentioning an update.
     Explicit approval is scoped to one command and its nested shell/SSH payload."""
     if depth > 20:
-        return None
+        return "update inspection exceeds safe analysis depth"
     for seg in _segments(_update_tokens(_update_source(source))):
         words, _ = _redirect_targets(seg)
         while words and words[0] in {"{", "!", "then", "do", "else", "elif", "if", "while", "until"}:
@@ -1617,7 +1614,7 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0)
         words, _, assignments = _strip_wrappers(words, cwd)
         if not words:
             continue
-        allowed = assignments.get("HERMES_UPDATE_OK", "1" if approved else "0") == "1"
+        allowed = False  # agent-inline strings are not authenticated user approval
         cmd, args = os.path.basename(words[0]), words[1:]
         if cmd == "hermes":
             cli = args

@@ -196,7 +196,7 @@ def test_claude_hook_refuses_core_head_move(env):
 
 
 def test_core_escape_hatch_is_per_command_and_core_only(env):
-    assert not term("COACH_ALLOW_LIVE=1 git -C ~/.hermes/hermes-agent checkout main", cwd=env.other)
+    assert blocked(term("COACH_ALLOW_LIVE=1 git -C ~/.hermes/hermes-agent checkout main", cwd=env.other))
     # scoped to that one command: the next segment is still checked
     assert blocked(term("COACH_ALLOW_LIVE=1 git -C ~/.hermes/hermes-agent status; "
                         "git -C ~/.hermes/hermes-agent checkout --detach", cwd=env.other))
