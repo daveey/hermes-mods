@@ -2603,6 +2603,16 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
     pending = led.pending() if rows is None else rows
     for row in pending:
         sid = row["session_id"]
+        # A returned post hook may still own the strict stamp. Neither a
+        # closeout nor an ask-relay claim may overtake it. This is unjudged:
+        # do not cache a quiet/idle verdict, and retry on the next tick.
+        if not _flush_turn_end(sid, timeout=0):
+            continue
+        # pending/rows may have been captured while the stamp was running.
+        # If it finished just before the barrier, judge the committed row.
+        row = led.get(sid)
+        if row is None:
+            continue
         cards = core.canonical_view(read(row["batch"]))
         hkey = _host_row_key(row, cards, lineages, now, unseen)
         hit = quiet_rows.get(sid, hkey) if pre_keys is None else None

@@ -154,6 +154,60 @@ def test_real_links_lock_held_sixty_seconds(hooks, monkeypatch):
         plugin._flush_gate('chat', timeout=5)
 
 
+@pytest.mark.parametrize('finish_at_snapshot', [False, True])
+def test_deferred_stamp_blocks_background_duplicate_wake(hooks, monkeypatch, finish_at_snapshot):
+    led = hooks
+    cards = {'default/t_work': {'status': 'done'}}
+    led.write('chat', batch=['default/t_work'], open=[])
+    monkeypatch.setattr(plugin, 'ensure_upgraded', lambda *a: True)
+    monkeypatch.setattr(plugin, 'read_cards', lambda ids, **k: cards)
+    monkeypatch.setattr(plugin, '_lineage', lambda sid: [sid])
+    monkeypatch.setattr(plugin, '_with_latest_comments', lambda row, c: c)
+    monkeypatch.setattr(plugin, '_named_cards', lambda *a: {})
+    assert plugin.pre_llm_call(session_id='chat', platform='desktop').get('context')
+    assert led.get('chat')['closing'] is not None
+    release = threading.Event()
+    monkeypatch.setattr(plugin, 'open_card_ids', lambda sid: (release.wait(5), [])[1])
+    calls = []
+    def wake(sid, *a, **k):
+        calls.append(sid)
+        return 'started'
+    try:
+        plugin.post_llm_call(session_id='chat', platform='desktop', conversation_history=[
+            {'role': 'assistant', 'content': 'Reported.', 'finish_reason': 'stop'}])
+        assert not plugin._flush_turn_end('chat', timeout=0)
+        if finish_at_snapshot:
+            original_pending = led.pending
+            def pending():
+                rows = original_pending()
+                release.set()
+                assert plugin._flush_turn_end('chat', timeout=5)
+                return rows
+            monkeypatch.setattr(led, 'pending', pending)
+        plugin.wake_tick(now=10_000, wake=wake, unseen={}, last_user=lambda _: 0,
+                         read=lambda *_a, **_k: cards)
+        assert calls == []
+    finally:
+        release.set()
+        assert plugin._flush_turn_end('chat', timeout=5)
+    plugin.wake_tick(now=10_030, wake=wake, unseen={}, last_user=lambda _: 0,
+                     read=lambda *_a, **_k: cards)
+    assert calls == []
+    assert led.get('chat')['done_sig']
+
+
+def test_failed_thread_start_does_not_poison_lane(monkeypatch):
+    lane = plugin.hook_work.Lanes()
+    with monkeypatch.context() as m:
+        def fail(thread):
+            raise RuntimeError('cannot start fixture thread')
+        m.setattr(threading.Thread, 'start', fail)
+        with pytest.raises(RuntimeError, match='cannot start fixture thread'):
+            lane.submit('s', lambda: 'lost')
+    assert lane.flush('s', timeout=0)
+    assert lane.submit('s', lambda: 'recovered').result(timeout=2) == 'recovered'
+
+
 def test_lane_fifo_and_submission_context():
     import contextvars
     lane = plugin.hook_work.Lanes()
