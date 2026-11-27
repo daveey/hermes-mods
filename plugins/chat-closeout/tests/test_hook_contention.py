@@ -192,6 +192,41 @@ def test_completed_probe_is_not_reused():
     assert new.result(timeout=3) == 'new'
 
 
+def test_watch_probe_does_not_reuse_different_missing_ids(hooks, monkeypatch):
+    release = threading.Event()
+    calls = []
+    monkeypatch.setattr(plugin, '_shown_ids', lambda sid: set())
+    monkeypatch.setattr(plugin, '_visibility_sleep', lambda seconds: None)
+
+    def watches(sid, missing):
+        calls.append(tuple(missing))
+        if missing == ['t_old']:
+            assert release.wait(5)
+            return {}
+        return {'t_new': 12345}
+
+    monkeypatch.setattr(plugin, '_watch_parked', watches)
+    def gate(tid):
+        turn = [{'role': 'tool', 'name': 'kanban_create',
+                 'content': '{"ok": true, "task_id": "' + tid + '"}'}]
+        return plugin.pre_final_gate(session_id='chat', platform='desktop',
+                                     final_response='Created.', turn_messages=turn)
+
+    timer = None
+    try:
+        assert gate('t_old') is None
+        assert calls == [('t_old',)]
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        assert gate('t_new') is None
+        assert calls == [('t_old',), ('t_new',)]
+    finally:
+        release.set()
+        if timer:
+            timer.join(2)
+        plugin._flush_gate('chat', timeout=5)
+
+
 def test_reload_keeps_pending_stamp_barrier(hooks, monkeypatch):
     release = threading.Event()
     monkeypatch.setattr(plugin, 'open_card_ids', lambda sid: (release.wait(5), ['default/t_work'])[1])
