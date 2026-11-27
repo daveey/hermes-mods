@@ -16,6 +16,12 @@ Do not pack every read on the feed thread: a generic packed cursor kept exact ro
 
 Reject a replay tick in which the origin-ledger refresh came due: `kanban_origin_ledger._db` issues `CREATE TABLE IF NOT EXISTS`, which a read-only authorizer denies, so that tick ran a different path. A `time.sleep(0)` contender thread does not reproduce GIL handoffs; do not read switch counts from such a harness.
 
+## Qualify natural-deployment accounting
+
+Preserve interrupted census cohorts as NO_PROOF, even when their shortened adjacent rate is below target. A route metadata change can precede a real natural backend rollover; retain the exact interruption record and independently resolve successor PID/birth/loaded code before replacing the incomplete acceptance window. Do not weaken the original collector's identity predicate to manufacture completion.
+
+Check thread-family membership at every census sample and accounting boundaries before subtracting family totals. `loop_accounting._residual` sums live threads only and folds departed work into the separate `exited` aggregate, so family CPU/accounted totals can decrease during plugin-reload churn despite an unchanged process birth. Reject regressions and mismatched/short accounting windows; never clamp them or sum nested loop scopes to repair attribution. A stable successor window can qualify later acceptance, not retroactively repair the interrupted cohort.
+
 ## Controlled transport comparisons
 
 Measure the calling thread's CPU and `/proc/thread-self/status` voluntary switches. For a controlled GIL competitor, use a pure-Python loop with a bounded lifetime and explicit switch interval, not `time.sleep(0)`: the latter releases the GIL immediately and does not reproduce a waiter convoy. Restore the switch interval and join competitors in reusable tests. Controlled contention is mechanism evidence, not the production acceptance census.
