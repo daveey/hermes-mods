@@ -6,16 +6,25 @@ plain commands; quoted keywords and loop/case data are not executable positions.
 Pip's attached `-rFILE` and Cargo's `--profile release` are equivalent to their separated
 and `--profile=release` forms.
 
-SSH remote commands stay remote. Explicit `ProxyCommand`/`LocalCommand` options and
-unquoted-heredoc command substitutions run locally and are inspected. Heredoc bodies
-are exempt only for the strict remote-stdin shell form with data-only downstream
-readers and no detected SSH remapping. This is a static load-policy aid, not a shell
-sandbox: implicit SSH config, arbitrary variable evaluation and read/execute races
-are not contained.
+SSH remote commands stay remote. Explicit `ProxyCommand`/`LocalCommand`/`KnownHostsCommand`
+options (before or immediately after the host) and unquoted-heredoc command
+substitutions run locally and are inspected. Heredoc bodies are exempt only for the
+strict remote-stdin shell form with data-only downstream readers and no detected
+SSH remapping. This intentionally holds complex remote heredocs too: remote `cd &&
+bash -s`, `sudo bash -s`, `cat > file`, and `-J` are outside the exemption grammar,
+even when they would never execute locally. Keeping the narrow, auditable grammar
+avoids widening local-pipeline/remapping exemptions; this is a conservative load-policy
+hold, not evidence that the body runs locally. For those forms, set `MAC_HEAVY_OK=1`
+in the invoking guard process's environment (the exported opt-out); an inline
+assignment on SSH alone does not exempt a separately scanned heredoc body.
+This is a static load-policy aid, not a shell sandbox: implicit SSH config, arbitrary
+variable evaluation and read/execute races are not contained.
 
 Local shell scripts are inspected up to 64 KiB and two script levels. An oversized
 recognized script or an existing third-level shell script now requires an explicit
-`MAC_HEAVY_OK=1` opt-out rather than silently accepting uninspected suffixes. Explicit
+`MAC_HEAVY_OK=1` opt-out rather than silently accepting uninspected suffixes. This
+also holds benign oversized helpers such as a sourced `nvm.sh` or `./configure`.
+Explicit
 `bash`/`source` execution does not trust a different interpreter in the file's shebang.
 Missing files and directly executed non-shell files retain their existing behavior.
 
