@@ -248,24 +248,30 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     text, bodies = _heredocs(text)
     blocks, rhs = 0, False
     scopes, braces, pipeline = [], [], None
-    failed_cd = []
+    failed_cd, succeeded_cd = [], []
     segments = list(_raw_segments(text))
     for index, raw in enumerate(segments):
         budget.spend(1)
         if raw in (["&&"], ["||"]):
+            if raw == ["&&"] and succeeded_cd:
+                in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
+                succeeded_cd = []
             if raw == ["||"] and failed_cd:
                 in_home = guard.merge_directory_contexts(in_home, *failed_cd)
                 failed_cd = []
             rhs = True
             continue
         if raw == ["("]:
-            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks, list(failed_cd)))
+            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks, list(failed_cd), list(succeeded_cd)))
             continue
         if raw == [")"]:
             if scopes:
-                env, exported, readonly, in_home, blocks, failed_cd = scopes.pop()
+                env, exported, readonly, in_home, blocks, failed_cd, succeeded_cd = scopes.pop()
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
+            if succeeded_cd:
+                in_home = guard.merge_directory_contexts(in_home, *succeeded_cd)
+                succeeded_cd = []
             if failed_cd:
                 in_home = guard.merge_directory_contexts(in_home, *failed_cd)
                 failed_cd = []
@@ -278,7 +284,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
         following = segments[index + 1] if index + 1 < len(segments) else []
         if following in (["|"], ["&"]) and pipeline is None:
             pipeline = (dict(env), set(exported), set(readonly),
-                        guard.merge_directory_contexts(in_home, *failed_cd))
+                        guard.merge_directory_contexts(in_home, *failed_cd, *succeeded_cd))
         if raw and raw[0] == "}":
             if braces:
                 blocks = braces.pop()
@@ -354,6 +360,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             unwrapped = guard._strip_wrappers(argv)
             if unwrapped and os.path.basename(unwrapped[0]) == "cd":
                 if following == ["||"]:
+                    # Success skips this RHS, but rejoins at && or list end.
+                    succeeded_cd = [guard.merge_directory_contexts(*succeeded_cd, next_home)]
                     next_home = in_home
                 elif following != ["&&"]:
                     next_home = guard.merge_directory_contexts(in_home, next_home)

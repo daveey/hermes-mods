@@ -64,5 +64,57 @@ def test_success_chain_failure_rejoins(home, boundary, alias, wrapper):
     assert guard.check_shell(command, cwd=str(home.parent))
 
 
+@pytest.fixture
+def lexical_home(monkeypatch):
+    # No writes at these synthetic paths. A physical fixture below the worker's
+    # real ~/.hermes makes even its parent look live and masks cwd regressions.
+    home = Path('/home/sqlite-guard-fixture/.hermes')
+    monkeypatch.setenv('HOME', str(home.parent))
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    return home
+
+
+@pytest.mark.parametrize('boundary', [';', '\n', '&&', '&'])
+@pytest.mark.parametrize('alias', [False, True])
+@pytest.mark.parametrize('wrapper', ['', 'command ', 'bash', 'sh', 'ssh'])
+@pytest.mark.parametrize('operand', ['kanban.db', '*'])
+def test_or_success_rejoins(lexical_home, boundary, alias, wrapper, operand):
+    home = lexical_home
+    target = '"$D"' if alias else '~/.hermes'
+    command = 'cd ' + target + ' || true ' + boundary + ' rm -rf ' + operand
+    if wrapper == 'command ':
+        command = wrapper + command
+    if alias:
+        command = 'D=~/.hermes; ' + command
+    if wrapper in {'bash', 'sh'}:
+        command = wrapper + " -c '" + command + "'"
+    elif wrapper == 'ssh':
+        command = "ssh example.com '" + command + "'"
+    assert guard.check_shell(command, cwd=str(home.parent))
+
+
+@pytest.mark.parametrize('boundary', [';', '\n', '&&', '&'])
+@pytest.mark.parametrize('operand', ['kanban.db', '*'])
+@pytest.mark.parametrize('analyzer', ['base', 'context'])
+def test_or_relative_success_each_analyzer(lexical_home, boundary, operand, analyzer):
+    home = lexical_home
+    command = 'cd .hermes || true ' + boundary + ' rm -rf ' + operand
+    if analyzer == 'base':
+        result = guard._check_shell_base(command, cwd=str(home.parent))
+    else:
+        from types import SimpleNamespace
+        guard.check_shell('true')
+        result = guard._SHELL_CONTEXT.check(command, SimpleNamespace(**vars(guard)), str(home.parent))
+    assert result
+
+
+@pytest.mark.parametrize('prefix', ['', 'command ', 'bash -c '])
+def test_or_exit_success_rejoins(lexical_home, prefix):
+    home = lexical_home
+    command = 'cd .hermes || exit; true; rm -f kanban.db'
+    command = prefix + ("'" + command + "'" if prefix == 'bash -c ' else command)
+    assert guard.check_shell(command, cwd=str(home.parent))
+
+
 def test_or_rhs_uses_old_context(home):
     assert guard.check_shell('cd ~ || rm -rf .hermes', cwd=str(home / 'cache')) is None
