@@ -25,6 +25,12 @@ not an execution permission or a second persisted reason store. Core derives the
 annotation from existing `awaiting` and wake-check evidence. A probe watch's
 `watching` list names recorded card IDs; it does not invent titles, owner coordinates,
 or navigation actions for those IDs. The existing hierarchy/actions remain authoritative.
+Supplementary id-keyed card hydration and event reasons are rejected when their
+known gateway, board or profile conflicts with the row. Serving gateway aliases
+remain equivalent; omitted legacy coordinates do not manufacture a new owner.
+Legacy clock reasons are read only from a balanced parenthesized suffix; extra
+trailing text remains in Details. Invalid clock dates render reason unavailable,
+and non-finite backstop values do not assert an event watch.
 
 Clock detail lines put a concise prerequisite before the elapsed/countdown text.
 `backstop_at` distinguishes a timed fallback from the actual watched producer.

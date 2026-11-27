@@ -317,7 +317,7 @@ def _recorded(wait):
     backstop = wait.get('backstop_at')
     return {'reason': words('prerequisite'), 'actor': words('next_actor'),
             'watching': [w for w in watching if isinstance(w, str)] if isinstance(watching, list) else [],
-            'backstop': backstop if isinstance(backstop, (int, float)) and not isinstance(backstop, bool) and backstop > 0 else None}
+            'backstop': backstop if isinstance(backstop, (int, float)) and not isinstance(backstop, bool) and 0 < backstop < float('inf') else None}
 
 
 def clock_line(clock, location=''):
@@ -357,11 +357,19 @@ def wait_info(row, now, *, wire=False):
     match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b', on)
     recorded = _recorded(wait)
     if match:
-        due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
+        try:
+            due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
+        except (ValueError, OverflowError, OSError):
+            return {'text': 'waiting · reason unavailable (invalid clock)', 'raw': on, 'urls': []}
         # The prerequisite is the producer's own `awaiting.why`; the clock is only when it is next checked.
-        # Cores before `park_semantics` carry it only inside the label, after the time (cut at 80 characters).
+        # Cores before `park_semantics` carry it inside balanced parentheses.
         rest = on[match.end():].strip()
-        legacy = flat(rest[1:-1] if rest.startswith('(') and rest.endswith(')') else rest)
+        legacy, depth = '', 0
+        for i, char in enumerate(rest if rest.startswith('(') else ''):
+            depth += (char == '(') - (char == ')')
+            if depth == 0:
+                legacy = flat(rest[1:i])[:REASON_FULL]
+                break
         reason = recorded['reason'] or legacy
         actor = recorded['actor'] or 'the clock (timed check)'
         backstop = bool(recorded['backstop'])
@@ -491,11 +499,36 @@ def wait_leaf(dependency, bundle):
     return best
 
 
+def owned_card(row, bundle):
+    """Reject contradictory owner coordinates before using id-keyed hydration.
+
+    Older snapshots omit coordinates; keep that compatibility, but never let a
+    known foreign gateway/board/profile lend its wait or event history to a row.
+    """
+    rec = obj(obj(bundle.get('cards')).get(str(row.get('id'))))
+    detail = obj(rec.get('detail'))
+    task = obj(detail.get('task'))
+    owner = detail.get('owner')
+    gateway = (task.get('home_gateway') or task.get('gateway') or
+               (owner if isinstance(owner, str) else None) or
+               (bundle.get('gateway') if detail.get('source') == 'live' else None))
+    aliases = {bundle.get('gateway'), *(bundle.get('gateway_aliases') or [])} - {None, ''}
+    coordinates = {'gateway': gateway, 'board': task.get('board') or rec.get('board'),
+                   'profile': task.get('profile') or rec.get('profile') or bundle.get('profile')}
+    for field, value in coordinates.items():
+        actual = row.get(field)
+        if actual and value and actual != value:
+            if field == 'gateway' and actual in aliases and value in aliases:
+                continue
+            return {}
+    return rec
+
+
 def wait_reason(row, bundle):
     """Only the current wait's owner text, never an older ask on running work."""
     if row.get('status') not in ('scheduled', 'blocked', 'triage', 'todo'):
         return ''
-    detail = obj(obj(obj(bundle.get('cards')).get(row['id'])).get('detail'))
+    detail = obj(owned_card(row, bundle).get('detail'))
     for event in reversed(detail.get('events') or []):
         if not isinstance(event, dict):
             continue
@@ -889,7 +922,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if not isinstance(raw, dict) or not raw.get('id'):
             continue
         row = dict(raw)
-        rec = obj(obj(bundle.get('cards')).get(str(row['id'])))
+        rec = owned_card(row, bundle)
         # Only serving-gateway rows inherit serving coordinates. Replica/unknown
         # ownership is never repaired into local decision authority.
         if not row.get('remote') and row.get('source') != 'replica' and row.get('ownership_state') != 'unknown':

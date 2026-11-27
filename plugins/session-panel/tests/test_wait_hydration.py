@@ -161,3 +161,60 @@ def test_same_card_id_on_two_owners_keeps_each_owners_reason(api, board, monkeyp
     assert 'wait_reason' not in rows['mini'] and 'reason unavailable' in rows['mini']['detail']
     assert 'Waiting reason: unavailable (the park recorded none)' in rows['mini']['details']
     assert 'Waiting reason: hub reason' not in rows['mini']['details']
+
+
+@pytest.mark.parametrize('field,value', [('gateway', 'another-owner'), ('board', 'another-board'), ('profile', 'another-profile')])
+def test_hydrated_wait_rejects_conflicting_owner(api, board, monkeypatch, field, value):
+    path, conn = board
+    monkeypatch.setattr('time.time', lambda: NOW - 300)
+    tid = kanban_db.create_task(conn, title='Owner-qualified', initial_status='running')
+    assert kanban_db.schedule_task(conn, tid, reason=f'{UNTIL} private prerequisite', clock_only=True,
+                                   awaiting={'kind': 'clock', 'why': 'private prerequisite'})
+    monkeypatch.setattr('time.time', lambda: NOW)
+    detail, b = _hydrated_row(api, board, monkeypatch, tid, True)
+    # A second owner's list row does not publish a wait. The id-keyed hydration
+    # belongs to the first owner, not to this row.
+    b['tasks'][0].pop('wait', None)
+    b['tasks'][0][field] = value
+    row = _only_row(b)
+    assert 'private prerequisite' not in str(row)
+    assert 'wait_reason' not in row
+
+
+def test_hydrated_wait_accepts_serving_gateway_alias(api, board, monkeypatch):
+    path, conn = board
+    monkeypatch.setattr('time.time', lambda: NOW - 300)
+    tid = kanban_db.create_task(conn, title='Alias-qualified', initial_status='running')
+    assert kanban_db.schedule_task(conn, tid, reason=f'{UNTIL} shared prerequisite', clock_only=True,
+                                   awaiting={'kind': 'clock', 'why': 'shared prerequisite'})
+    monkeypatch.setattr('time.time', lambda: NOW)
+    detail, b = _hydrated_row(api, board, monkeypatch, tid, False)
+    b['gateway_aliases'] = ['install:example']
+    b['tasks'][0].pop('wait', None)
+    b['tasks'][0]['gateway'] = 'install:example'
+    assert _only_row(b)['wait_reason'] == 'shared prerequisite'
+
+
+@pytest.mark.parametrize('replica', [False, True])
+def test_real_retained_agent_transition_names_decision_owner(api, board, monkeypatch, replica):
+    from hermes_cli import kanban_retain
+    from gateway.session_context import scoped_current_session_id
+    support = pytest.importorskip('tests.hermes_cli.test_kanban_containment_actor')
+    path, conn = board
+    monkeypatch.setattr('time.time', lambda: NOW - 300)
+    tid, _, session = support.bind(conn, monkeypatch)
+    with scoped_current_session_id(session):
+        result = kanban_retain.retain(conn, board='default', reason='scope_stopped',
+                                     summary='Owner instructed a bounded scope stop',
+                                     next_step='Owning chat checks the remaining scope',
+                                     release_condition='Owning chat records its decision',
+                                     evidence=['disposable fixture owner instruction'])
+    assert result['terminal_for_run'] and not result['dependency_satisfied']
+    monkeypatch.setattr('time.time', lambda: NOW)
+    detail, b = _hydrated_row(api, board, monkeypatch, tid, replica)
+    assert detail['task']['status'] == 'triage'
+    panel = model.reduce_panel(b, now=NOW)
+    assert not panel['sections']['needs_you']
+    row = _only_row(b)
+    assert 'decide' in row['detail'] or 'decision' in row['detail']
+    assert 'Owning chat checks the remaining scope' in str(row['details'])

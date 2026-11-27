@@ -123,6 +123,24 @@ def test_malformed_recorded_fields_are_ignored_not_rendered(bad):
     assert 'Next actor: the clock (timed check)' in painted['details']
 
 
+@pytest.mark.parametrize('backstop', [float('inf'), float('nan'), True, -1])
+def test_invalid_backstop_does_not_claim_an_event_watch(backstop):
+    painted = _painted(_clock_row(CLOCK, backstop_at=backstop))
+    assert 'backstop' not in painted['detail'] and 'watching' not in painted['detail']
+
+
+def test_legacy_clock_tail_preserves_reason_without_parenthesis_noise():
+    painted = _painted(_clock_row(f'{CLOCK} (soak) extra tail'))
+    assert painted['wait_reason'] == 'soak'
+    assert f'{CLOCK} (soak) extra tail' in str(painted['details'])
+
+
+def test_malformed_legacy_clock_does_not_crash_the_panel():
+    painted = _painted(_clock_row('the clock until 2026-99-24 14:30 UTC (soak)'))
+    assert 'reason unavailable' in painted['detail']
+    assert 'wait_reason' not in painted
+
+
 def test_stale_row_vouches_for_no_reason_or_actor():
     painted = _painted(_clock_row(CLOCK, prerequisite=WHY, next_actor='the clock (timed check)', stale=True))
     assert 'wait_reason' not in painted and 'wait_next_actor' not in painted
