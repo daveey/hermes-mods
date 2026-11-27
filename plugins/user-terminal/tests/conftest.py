@@ -14,6 +14,13 @@ import pytest
 CORE_MODULE = "hermes_cli"
 
 
+@pytest.fixture(autouse=True)
+def owner_cli_surface(monkeypatch):
+    # Existing local-handler fixtures model an owner CLI, not an unidentified caller.
+    # Authorization tests supply their own complete surfaces explicitly.
+    monkeypatch.setenv("HERMES_PLATFORM", "cli")
+
+
 def core_importable() -> bool:
     try:
         return importlib.util.find_spec(CORE_MODULE) is not None
