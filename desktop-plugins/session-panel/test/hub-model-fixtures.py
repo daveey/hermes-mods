@@ -194,6 +194,23 @@ else:
                 parent = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
                 children = [f.task(cid, status='todo', gateway='fixture-gateway', upstream=parent) for cid in ('t_111111', 't_222222')]
                 cases['composed_triage_group_' + str(age)] = f.bundle(*children, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
+            # An explicitly stopped, retained scope (core annotates ``retained_stop`` from the same board
+            # snapshot) ages like every other triage cause; the stop itself stays a non-executing hold.
+            for age in (600, 601, 6 * 86400):
+                tid = kanban_db.create_task(conn, title='Owned stopped retained fixture', initial_status='running')
+                conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,?)",
+                             (tid, f.NOW - age, json.dumps({'disposition': {'reason': 'scope_stopped', 'summary': 'acceptance unmet'}})))
+                conn.commit()
+                record = reader.card(tid, 'default')
+                stop = record['detail']['task'].get('retained_stop')
+                if stop is None:
+                    break  # a core without the retained-stop receipt cannot compose this case: skipped, not faked
+                assert stop['reason'] == 'scope_stopped'
+                assert record['detail']['task']['triage_entered_at'] == f.NOW - age
+                assert not record['detail']['task'].get('human_request')
+                row = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
+                cases['composed_triage_retained_' + str(age)] = f.bundle(row, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
         finally:
             reader.release()
             conn.close()

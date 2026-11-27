@@ -117,6 +117,25 @@ for (const age of [599, 600, 601, 6 * 86400]) {
   delete window.__sessionPanel
  })
 }
+for (const age of [600, 601, 6 * 86400]) {
+ test(`real CoreReaders -> reducer -> panel: stopped retained scope triage age ${age}`, { skip: !cases[`composed_triage_retained_${age}`] }, async () => {
+  const { model, now } = cases[`composed_triage_retained_${age}`]
+  const red = age > 600
+  assert.equal(model.sections.needs_you.length, 0, 'age never invents a human ask')
+  assert.equal(model.sections.running.length, 0, 'a stopped scope is never shown executing')
+  await paint(m.renderModel(model, { now }))
+  const row = model.sections[red ? 'stuck' : 'waiting'][0]
+  assert.equal(row.attention === 'triage_overdue', red)
+  assert.equal(model.header.attention === 'triage_overdue', red)
+  assert.equal(model.header.counts.stuck, red ? 1 : 0)
+  const pip = document.querySelector(`[data-row-pip="${red ? 'stuck' : 'waiting'}"]`)
+  assert.equal(window.getComputedStyle(pip).backgroundColor === 'rgb(248, 81, 73)', red)
+  assert.equal(document.querySelector('[data-session-status]').style.color === 'var(--color-red-500)', red)
+  if (red) assert.match(document.querySelector('[data-row-detail]').textContent, /overdue triage/)
+  assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+  assert.ok(row.actions.every(a => a.kind !== 'decide'))
+ })
+}
 for (const age of [601, 6 * 86400]) {
  test(`stale snapshot clears overdue triage in rows, header and pips: triage age ${age}`, { skip: !cases[`composed_triage_${age}`] }, async () => {
   const { model, now } = cases[`composed_triage_${age}`]
