@@ -65,7 +65,9 @@ SCHEMA = {
         "With `wait_for_reply` (seconds; the whole call, reaching the chat included, is held to 400 s, so "
         "the wait is at most 390 and shorter after a busy-chat retry: the result then says so in "
         "`reply_wait_note`) it waits for that session's next reply "
-        "and returns it; otherwise it returns once delivered.\n"
+        "and returns it; otherwise it returns once delivered. For relaying a Kanban comment or decision, "
+        "set dedupe_key=\"kanban:<task_id>:<comment_id>\". A duplicate returns the first delivery receipt, "
+        "not a new turn (duplicate_pending while in flight). Without a key, sends are unchanged.\n"
         "While another Hermes window holds the target's turn the send is retried for up to 5 minutes; "
         "`status: refused` with `retry_safe: true` after that means nothing was delivered.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
@@ -79,6 +81,7 @@ SCHEMA = {
             "gateway": {"type": "string", "description": "list: only this gateway (name or id)."},
             "message": {"type": "string", "description": "send: the text to deliver. Relaying a standing instruction of the user (e.g. \"don't wait\")? Put it on its own line as `standing: <exact words>`; quoted user directives get one automatically."},
             "limit": {"type": "integer", "description": "list: max rows (default 20); read: max messages (default 40)."},
+            "dedupe_key": {"type": "string", "maxLength": 200, "description": "send: gateway-wide idempotency key; use kanban:<task_id>:<comment_id> for relayed decisions (7-day retention)."},
             "wait_for_reply": {"type": "integer", "description": "send: seconds to wait for the target's reply (0 = don't wait)."},
         },
         "required": ["action"],
@@ -180,6 +183,10 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
     if action == "send" and not str(args.get("message") or "").strip():
         return _err("message is required for send — pass the text as `message`")
 
+    if action == "send" and "dedupe_key" in args:
+        key = args["dedupe_key"]
+        if not isinstance(key, str) or not key or len(key) > 200:
+            return _err("dedupe_key must be a nonempty string of at most 200 characters")
     if action == "send":
         refusal = rf.worker_send_refusal(args.get("target"))
         if refusal:
@@ -511,7 +518,12 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
     }
     if action == "send":  # opt in: other writers of send requests (Slack follower, close-out) want the first refusal
         req.update(retry_busy=True, retry_busy_seconds=SEND_BUSY_RETRY, total_wait_seconds=SEND_TOTAL_WAIT_MAX)
-    rf.atomic_write(base / "outbox" / f"{rid}.json", req)
+    if action == "send" and args.get("dedupe_key"):
+        duplicate = rf.queue_send(base, req, args["dedupe_key"])
+        if duplicate:
+            return json.dumps(duplicate)
+    else:
+        rf.atomic_write(base / "outbox" / f"{rid}.json", req)
     if hasattr(rf, "notify_outbox"):
         rf.notify_outbox(base)  # wake the Desktop courier now (no-op outside `hermes serve`)
 

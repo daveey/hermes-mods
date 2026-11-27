@@ -28,6 +28,8 @@ name>`` and ``reach=<every gateway name it can resolve>``, and is registered und
 """
 from __future__ import annotations
 
+import fcntl
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -147,6 +149,72 @@ def atomic_write(path: Path, payload: Any) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload))
     os.replace(tmp, path)
+
+
+SEND_DEDUPE_SECONDS = 7 * 86400
+
+
+@contextmanager
+def _send_ledger(base: Path):
+    """One gateway-wide OS lock: includes publication, never the courier/network wait.
+
+    A corrupt ledger fails closed rather than silently delivering a decision twice.
+    The lock inode is permanent; only the JSON data is atomically replaced.
+    """
+    with (base / "send-dedupe.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = base / "send-dedupe.json"
+        ledger = json.loads(path.read_text()) if path.exists() else {}
+        now = time.time()
+        ledger = {k: v for k, v in ledger.items() if now - v["created_at"] < SEND_DEDUPE_SECONDS}
+        try:
+            yield ledger
+        finally:
+            atomic_write(path, ledger)
+
+
+def _send_target(target: Any) -> str:
+    text = str(target or "").strip().strip("`\"'")
+    while text.startswith("@session:"):
+        text = text[len("@session:"):].strip("`\"'")
+    profile = text.split("/", 1)[0].split("@", 1)[0] if "/" in text else "default"
+    return json.dumps([route_of_target(target), profile or "default", session_id_of(target)])
+
+
+def queue_send(base: Path, req: dict, key: str) -> dict | None:
+    """Atomically find/reserve an identity and publish exactly one outbox request."""
+    identity = json.dumps([_send_target(req["args"].get("target")), key])
+    with _send_ledger(base) as ledger:
+        original = ledger.get(identity)
+        if original:
+            return {"ok": True, "status": "duplicate_pending" if original["state"] == "pending" else "duplicate",
+                    "delivered": False, "original": {"request_id": original["request_id"],
+                    "sender": original["sender"], "sent_at": original["created_at"], "state": original["state"]}}
+        ledger[identity] = {"request_id": req["id"], "sender": req["sender"],
+                            "created_at": req["created_at"], "state": "pending"}
+        # Persist reservation first: after a crash, uncertainty must not permit a second send.
+        atomic_write(base / "send-dedupe.json", ledger)
+        try:
+            atomic_write(base / "outbox" / f"{req['id']}.json", req)
+        except BaseException:
+            ledger.pop(identity, None)
+            raise
+    return None
+
+
+def finish_send(base: Path, rid: str, result: dict | None = None) -> None:
+    """A definite no-delivery releases the key; uncertain/in-flight sends remain pending."""
+    if not (base / "send-dedupe.json").exists():
+        return
+    with _send_ledger(base) as ledger:
+        for identity, entry in list(ledger.items()):
+            if entry["request_id"] != rid:
+                continue
+            if result is None or (result.get("ok") is False and
+                                  (result.get("delivered") is False or result.get("retry_safe") is True)):
+                del ledger[identity]
+            elif result.get("delivered") is True or (result.get("ok") is True and result.get("status") in ("queued", "delivered", "completed")):
+                entry["state"] = result.get("status") or "delivered"
 
 
 def device_info() -> dict:
@@ -411,6 +479,7 @@ def write_result(req_id: Any, result: dict, base: Path | None = None) -> bool:
         # Suppress execution replay BEFORE publishing a consumable result. If this write fails,
         # fail the POST so the courier retries; never expose a failure and then re-arm its start.
         atomic_write(claimed, {**req, "result_recorded": True})
+    finish_send(base, rid, result)
     atomic_write(base / "results" / f"{rid}.json", result)
     return True
 
@@ -783,6 +852,7 @@ def take_back(path: Path) -> bool:
         os.replace(path, taken)
     except FileNotFoundError:
         return False
+    finish_send(path.parent.parent, path.stem)
     taken.unlink(missing_ok=True)
     return True
 
