@@ -7,7 +7,7 @@ CASES = {
     'waiver': 'hermes {f} kanban complete ' + OWN + ' --result "check 4 failed; waived"',
     'narrow': 'hermes {f} kanban edit ' + OWN + ' --title new',
 }
-FLAGS = ['', '-p default', '--profile default', '--profile=default', '-p x --model m', '--reasoning high -p x', '-c -p x']
+FLAGS = ['', '-p default', '--profile default', '--profile=default', '-p x --model m', '--reasoning high -p x', '-c -p x', '--', '-p x --', '--model m --']
 
 
 def held(cmd):
@@ -36,8 +36,9 @@ def test_flag_before_non_kanban_is_not_kanban():
     assert core._kanban_verb(['python', '-m', 'hermes_cli.main', '--profile=x', 'kanban', 'edit', OWN])[0] == 'edit'
 
 
-def test_comment_branches_and_consent_cover_profile_flag():
-    command = f'hermes -p x kanban --board b comment {OWN} "IF FAIL x: y"'
+@pytest.mark.parametrize('flags', FLAGS)
+def test_comment_branches_and_consent_cover_profile_flag(flags):
+    command = f'hermes {flags} kanban --board b comment {OWN} "IF FAIL x: y"'
     assert core._kanban_verb(core._segments(command)[0]) == ('comment', [OWN, 'IF FAIL x: y'])
     writes = list(plugin.comment_branches.writes('terminal', {'command': command}, core))
     assert writes == [(OWN, 'IF FAIL x: y', 'b', False)]
