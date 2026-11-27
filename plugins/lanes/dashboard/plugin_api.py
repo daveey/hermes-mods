@@ -300,7 +300,8 @@ def token_series(db, policy, *, now=None):
     return out
 
 
-def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False, sources=False, reader=None):
+def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False, sources=False, reader=None,
+                      metrics_now=None):
     """Same hub-computed projection for owned in-process or borrowed RPC readers."""
     if not sources:
         snap, raw = _governed_sources(mods, conn, evidence, hours, window)
@@ -308,7 +309,21 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             return {name: _view_module().project(snap, raw, flag)
                     for name, flag in (('collapsed', False), ('expanded', True))}
         return _view_module().project(snap, raw, expanded)
+    metrics_now = time.time() if metrics_now is None else metrics_now
     snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
+    if snap.get('configured'):
+        import sqlite3
+        policy = mods[1].policy()
+        if policy is not None:
+            try:
+                metrics = _sibling('metrics').project(conn, evidence.conn, policy, window=window,
+                                                      now=metrics_now)
+            except (sqlite3.Error, OSError, RuntimeError):
+                import logging
+                logging.getLogger(__name__).exception('lane metrics unavailable')
+                metrics = {}
+            for name, row in snap.get('lanes', {}).items():
+                row.update(metrics.get(name, dict(ticks=None, spend=None)))
     raw = None
     if snap.get('configured'):
         try:
@@ -320,7 +335,7 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
                 contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
                 with _observer_init_lock:
                     reader = _observations().reader(contexts)
-            raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
+            raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence, now=metrics_now)
             raw['configured'] = bool(raw.get('lanes'))
             for card in raw.get('cards', []):
                 source_row = evidence.row(card['id'])
@@ -399,6 +414,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
     except ImportError:
         return _project_evidence(mods, conn, evidence, hours, window, True, sources=True)
     current = gov._board(conn)
+    metrics_now = time.time()
     pairs = []
     # Sidecar receipts do not depend on a successful SQL flow projection.
     metas = kb.list_boards(include_archived=False)
@@ -444,7 +460,8 @@ def _governed_sources(mods, conn, evidence, hours, window):
                 _arm_source(source_conn, source, 'projection')
                 if slug in context_failures:
                     raise RuntimeError(context_failures[slug])
-                pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader)
+                pair = _project_evidence(mods, source_conn, source, hours, window, True, sources=True, reader=reader,
+                                         metrics_now=metrics_now)
             except (OSError, RuntimeError, sqlite3.Error) as exc:
                 source_failed = True
                 pairs.append(({'configured': True, 'lanes': {}}, {'configured': False, 'reason': f'{slug}: {exc}'}))
@@ -459,7 +476,7 @@ def _governed_sources(mods, conn, evidence, hours, window):
             receipt['flow_available'] = (pair[1] or {}).get('configured') is not False
             receipt['flow_reason'] = (pair[1] or {}).get('reason')
             receipt['open_lanes'] = [name for name, row in pair[0].get('lanes', {}).items() if row.get('open')]
-        snap, raw = _sibling('board_merge').merge(pairs)
+        snap, raw = _sibling('board_merge').merge(pairs, merge_metrics=_sibling('metrics').merge)
         # A flow failure still has an independent summary; an unreadable board
         # has neither. Do not certify the surviving summaries as fleet totals.
         raw['summary_complete'] = not source_failed

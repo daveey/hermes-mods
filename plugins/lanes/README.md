@@ -13,6 +13,31 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
+## Occupancy and spend projection
+
+Every lane row now carries `ticks: {window, bucket_s, cap, cells}` and
+`spend: {hour, day, week}` in both REST and stream views, collapsed or expanded.
+The requested window determines 48 occupancy cells; the normal 24h view has
+30-minute cells. Each cell preserves `{t, state, running, cap, rejected}`. Core
+samples are dispatcher observations, not rerun admission checks. Historical run
+occupancy has unknown rejection (`rejected: null`, `rejection_unknown: true`);
+missing telemetry and older cores return unavailable ticks, never zero activity.
+Caps are included in collapsed views so a compact control cannot mistake an
+omitted limit for unlimited.
+
+Spend uses exactly the same worker-result receipt source and per-task/run MAX
+aggregation as core `kanban_lanes.usage` / `lanes flow`, separately applying the
+60-minute, 24-hour and 7-day cutoffs before deduplication. The top-level `spend`
+is the all-lanes total. Independent boards add accounting; an unavailable board
+invalidates totals instead of displaying a partial number as the whole fleet.
+A flow-only failure may retain independently acquired summary metrics. These
+values are reported usage estimates, not billing invoices.
+
+Tests: `test_metrics.py` covers receipt cutoffs, repeats, unknown multi-board
+observations and both presentation variants. `test_metrics_core.py` runs real
+`dispatch_once` fixtures for empty/partial/full/rejecting through the production
+hub view and compares all three spend windows to real core `usage()`.
+
 ## Governor/sidebar projection
 
 The view adds `governors` from persisted `kanban_governors.snapshot` receipts
