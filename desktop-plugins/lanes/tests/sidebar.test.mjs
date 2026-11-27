@@ -287,6 +287,11 @@ test('a fault chip keeps its place ahead of a bigger lane dial, with full text i
 })
 
 const controlRow = { share: 20, admit_per_day: 17, holds: [], limits: {} }
+
+test('lane dials outrank budgets regardless of producer order', async () => {
+  const view = await mount(React.createElement(P.LaneHolds, { row: { holds: [budget, gate] } }))
+  try { assert.deepEqual(chipIds(view), ['lane_gate', 'spend_budget']) } finally { await view.close() }
+})
 const typeInto = async (view, label, value) => {
   const input = view.container.querySelector(`[aria-label="${label}"]`)
   await React.act(async () => {
@@ -313,6 +318,47 @@ test('clearing admit/day writes an explicit null, and Saved shows only after the
     assert.match(view.container.textContent, /Saved/)
     assert.equal(view.container.querySelector('[aria-label="work admit / day"]').value, '')
   } finally { await view.close() }
+})
+
+test('multi-field saving requires every field, excludes unchanged fields, and bounds push-stream waiting', async () => {
+  const writes = [], timers = new Map()
+  const originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout
+  globalThis.setTimeout = (fn, ms, ...args) => {
+    if (ms !== 8000) return originalSet(fn, ms, ...args)
+    const id = {}; timers.set(id, fn); return id
+  }
+  globalThis.clearTimeout = id => { if (!timers.delete(id)) originalClear(id) }
+  let setRow
+  const Harness = () => { const [row, set] = React.useState(controlRow); setRow = set
+    return React.createElement(P.LaneControls, { name: 'work', row, write: async (_lane, body) => writes.push(body) }) }
+  const view = await mount(React.createElement(Harness))
+  try {
+    await typeInto(view, 'work share', '21'); await typeInto(view, 'work share', '20')
+    await typeInto(view, 'work admit / day', '18')
+    await typeInto(view, 'work max workers', '3')
+    await submit(view)
+    assert.deepEqual(writes, [{ admit_per_day: 18, max_workers: 3 }])
+    assert.equal(timers.size, 1, 'one bounded write deadline')
+    const [deadline] = timers.keys()
+    for (let i = 0; i < 4; i++) {
+      await React.act(async () => setRow({ ...controlRow, admit_per_day: 18 }))
+      await view.flush()
+      assert.match(view.container.textContent, /Saving…/, 'one reflected field is not Saved')
+      assert.ok(timers.has(deadline), 'new snapshots cannot renew the write deadline')
+    }
+    await React.act(async () => timers.get(deadline)())
+    await view.flush()
+    assert.match(view.container.textContent, /Not saved/)
+    assert.doesNotMatch(view.container.textContent, /Saved/)
+    await submit(view)
+    assert.deepEqual(writes[1], { max_workers: 3 }, 'retry only writes the outstanding field')
+    await React.act(async () => setRow({ ...controlRow, admit_per_day: 18, limits: { max_workers: 3 } }))
+    await view.flush()
+    assert.match(view.container.textContent, /Saved/)
+    assert.equal(timers.size, 0, 'success cancels the deadline')
+  } finally {
+    await view.close(); globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear
+  }
 })
 
 test('an unchanged form or a rejected write never shows Saved', async () => {

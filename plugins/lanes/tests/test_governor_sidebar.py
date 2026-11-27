@@ -97,6 +97,19 @@ def test_clear_admit_per_day_preserves_concurrent_setting(board, api, monkeypatc
     assert view(api)['lanes']['babybear']['admit_per_day'] is None
 
 
+def test_clear_admit_per_day_refuses_unconfirmed_write(board, api, monkeypatch):
+    from hermes_cli import config_backend
+    from fastapi import HTTPException
+    monkeypatch.setattr(lanes, '_human_shell', lambda: True)
+    config(board)
+    api.change('babybear', {'admit_per_day': 17})
+    monkeypatch.setattr(config_backend, 'write_config_key', lambda *a, **k: None)
+    with pytest.raises(HTTPException) as error:
+        api._unset_admit_per_day('babybear')
+    assert error.value.status_code == 409
+    assert lanes.policy().lanes['babybear'].admit_per_day == 17
+
+
 def test_pool_and_recovery_sidebar(board, api, monkeypatch, tmp_path):
     config(board)
     cfg = json.loads(board.joinpath('config.yaml').read_text())
