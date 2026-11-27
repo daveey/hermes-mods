@@ -64,7 +64,7 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
   `test_claimed_then_mac_offline_withdraw_is_queued_and_applied_on_reconnect`,
   `test_withdraw_claimed_running_job_through_a_live_courier`, `test_withdraw_through_an_old_mac_says_nothing_was_withdrawn`,
   `../session-mentions/tests/user-terminal.test.mjs` ("withdraw: ..."):
-  - Still in the gateway's outbox (unclaimed): the gateway takes it back with `os.replace` (session-mentions `relay_files.take_back`; an `unlink` racing the claim can also succeed on APFS). A start call still waiting on that request answers `status: withdrawn` (`test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_the_withdrawal`). The courier's claim is `os.replace` of that
+  - Still in the gateway's outbox (unclaimed): the gateway takes it back with `os.replace` (the plugin's self-contained `_take_back` rename-and-unlink protocol; an `unlink` racing the claim can also succeed on APFS). A start call still waiting on that request answers `status: withdrawn` (`test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_the_withdrawal`). The courier's claim is `os.replace` of that
     same file, so exactly one wins; a Mac that reconnects never sees it. Ledger `withdrawn`, result `ok`,
     `status: withdrawn`; a later poll by that id reads `withdrawn` without a courier.
   - Already claimed: the withdrawal goes to the Mac as a `user_terminal` request with `args.withdraw_request`;
