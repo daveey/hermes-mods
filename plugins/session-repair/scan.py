@@ -1429,7 +1429,7 @@ def healthy_live_producer(card: Card, park: dict, awaited: dict, live: dict, src
 
     card: the producer card is itself running a live run, or parked with a future timed wake
     (ready, blocked, triage, done and archived are not live producers). ci/deploy/external:
-    core's watcher for this park observed the producer healthy (ok, or degraded while still running), with no failures, and its next poll
+    core's watcher for this park observed the producer healthy (ok, or a GitHub run degraded while still running), with no failures, and its next poll
     is not overdue. Any adverse watcher event since the park (broken/lost/stale probe,
     condition_met) keeps the card eligible.
     """
@@ -1467,7 +1467,9 @@ def healthy_live_producer(card: Card, park: dict, awaited: dict, live: dict, src
     observed, due, every = (_num(data.get(k)) for k in ('observed_at', 'next_due_at', 'every'))
     health, wstate = data.get('health'), data.get('state')
     if not ((health == 'ok' and wstate in ('external_running', 'external_unknown'))
-            or (health == 'degraded' and wstate == 'external_running')):
+            or (health == 'degraded' and wstate == 'external_running' and data.get('adapter') == 'github_run')):
+        # degraded is bounded only for a GitHub run (core wakes the card once it stops queueing);
+        # a shell probe may report degraded/running indefinitely for a wedged deploy
         return False
     return (data.get('consecutive_failures') == 0 and not data.get('failing_since')
             and observed is not None and every is not None and 0 < every <= 21600
