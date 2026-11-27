@@ -75,7 +75,9 @@ async def test_gateway_exact_scope_and_final_read(owned, monkeypatch, tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatch, tmp_path):
+@pytest.mark.parametrize("contended_settlement", [False, True])
+async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatch, tmp_path,
+                                                              contended_settlement):
     """No forged completion/acceptance: real child exit -> watcher -> native queue -> guard."""
     import shlex
     import sys
@@ -92,19 +94,55 @@ async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatc
         bootstrap = registry.spawn_local(f"{shlex.quote(sys.executable)} -c 'print(123456)'",
                                          session_key=entry.session_key)
         bootstrap.notify_on_complete = True
+    import asyncio
+    import threading
+    from tools import process_registry_obligations as obligations
+    loop = asyncio.get_running_loop()
+    settling = asyncio.Event()
+    watcher_done = loop.create_future()
+    watcher_registered = False
+    release_settlement = threading.Event()
+    run_watcher = runner._run_process_watcher
+    settle = obligations.settle_quietly
+
+    async def joined_watcher(watcher):
+        if watcher["session_id"] != bootstrap.id:
+            return await run_watcher(watcher)
+        try:
+            await run_watcher(watcher)
+        except BaseException as exc:
+            watcher_done.set_exception(exc)
+        else:
+            watcher_done.set_result(None)
+
+    def held_settlement(process_id, how):
+        if process_id == bootstrap.id and contended_settlement:
+            # Called under the real registry lock: model slow receipt I/O without sleeps.
+            loop.call_soon_threadsafe(settling.set)
+            assert release_settlement.wait(15), "fixture settlement was not released"
+        return settle(process_id, how)
+
+    monkeypatch.setattr(runner, "_run_process_watcher", joined_watcher)
+    monkeypatch.setattr(obligations, "settle_quietly", held_settlement)
     try:
         # The unchanged native watcher builds the completion from the real Popen,
         # coalesces it, proves the route, and obtains the real base-adapter admission.
         import weakref
         from tools.terminal_tool_background import _register_completion_watcher
         from gateway.process_consumer_health import receipt_version
-        from tests.waiting import async_wait_until
         monkeypatch.setattr("gateway.run._gateway_runner_ref", weakref.ref(runner))
         bootstrap.watcher_platform = "telegram"
         bootstrap.watcher_chat_id = "process-proof"
         _register_completion_watcher(registry, bootstrap, entry.session_key)
-        await async_wait_until(lambda: receipt_version(registry.ownership_snapshot(running.id)) is not None,
-                               timeout=15)
+        watcher_registered = True
+        if contended_settlement:
+            await asyncio.wait_for(settling.wait(), timeout=15)
+            assert registry.ownership_snapshot(running.id) is None
+        release_settlement.set()
+        # Admission precedes the watcher's threaded, registry-locked receipt settlement.
+        # Join that work before the public gate's intentionally bounded ownership reads.
+        await asyncio.wait_for(asyncio.shield(watcher_done), timeout=15)
+        assert receipt_version(registry.ownership_snapshot(running.id)) is not None
         assert bootstrap.exited and bootstrap.exit_code == 0
         queued = adapter.get_pending_message(entry.session_key)
         assert queued is not None and queued.internal and "123456" in queued.text
@@ -112,7 +150,12 @@ async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatc
         v, evidence, sid = args(owned)
         assert gd.validate_disposition(v, evidence, session_id=sid)["disposition"] == "owned_continuing"
     finally:
-        if bootstrap.process.returncode is None:
-            bootstrap.process.kill()
-        bootstrap.process.wait(timeout=5)
-        bootstrap._completion_event.wait(5)
+        release_settlement.set()
+        try:
+            if watcher_registered:
+                await asyncio.wait_for(asyncio.shield(watcher_done), timeout=15)
+        finally:
+            if bootstrap.process.returncode is None:
+                bootstrap.process.kill()
+            bootstrap.process.wait(timeout=5)
+            bootstrap._completion_event.wait(5)
