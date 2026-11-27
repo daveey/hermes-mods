@@ -1,4 +1,8 @@
-"""Projection-only worker. Parent owns detection, authorization and scheduling."""
+"""Projection-only worker. Parent owns detection, authorization and scheduling.
+
+Each job checks its captured source generation; compatible generation handoff is
+retried by the supervisor, not computed in the serving parent's request thread.
+"""
 from __future__ import annotations
 
 import contextlib
