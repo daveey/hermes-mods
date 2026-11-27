@@ -38,8 +38,11 @@ Class closure: any unquoted `case` keyword word inside a command substitution is
 case statement or an argument after an unmodeled prefix (`coproc`, `function`, `time`, `elif`, unknown words,
 `${...}` text). The scanner cannot tell them apart, and no heavy-word test is applied (a raw-text test is bypassed by
 quote splices, escapes and scripts). A `${...}` containing a parenthesis inside any substitution
-(`$(echo ${x:-)})`) is held too, since the scanner would end the substitution at that `)`. False refusals: any
-benign `$(... case x ...)`, e.g. `echo $(echo case x)`; use the local exported `MAC_HEAVY_OK=1` opt-out.
+(`$(echo ${x:-)})`) is held too, since the scanner would end the substitution at that `)`; so is any `${...}` inside
+a substitution that contains a quote, backslash, backtick, nested `${` or an unbalanced brace (`${x:-${y})}`,
+`${x:-'}'}`), and any backslash-newline continuation inside a substitution (`ca\<newline>se`). Continuations are
+now deleted like bash does (outside single quotes), so `pyt\<newline>est` is `pytest`. False refusals: any
+benign `$(... case x ...)`, e.g. `echo $(echo case x)`, and `$(echo ${x:-"a"})`; use the local exported `MAC_HEAVY_OK=1` opt-out.
 A differential test (`tests/test_differential.py`, fixture `tests/fixtures/main_verdicts.json`, generator
 `tests/diff_corpus.py`) replays a ~5,000-command corpus (all review repros plus generated prefix/compound/wrapper
 combinations, direct, `bash -c`, `sh -c`, ssh) against origin/main's recorded verdicts: every command main holds must

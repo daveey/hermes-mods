@@ -2,6 +2,7 @@
 repro must be held, and any deliberate new allow must be listed with a reason. Strings only; nothing runs."""
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -15,6 +16,10 @@ FIXTURE = json.loads((Path(__file__).parent / 'fixtures' / 'main_verdicts.json')
 
 # Deliberate new allows: command -> reason (head allows what main held). Keep empty unless justified.
 NEW_ALLOWS: dict = {}
+for _c, _r in diff_corpus.NEW_ALLOW_REASONS.items():
+    for _w in (_c, 'bash -c ' + shlex.quote(_c), 'sh -c ' + shlex.quote(_c),
+               'ssh -o BatchMode=yes host ' + shlex.quote(_c)):
+        NEW_ALLOWS[_w] = _r
 
 
 @pytest.fixture(scope='module')
@@ -52,4 +57,4 @@ def test_corpus_counts(head, capsys):
     head_held = sum(1 for v in head.values() if v[0] or v[1])
     new_allowed = sum(1 for c, v in FIXTURE.items() if (v[0] and not head[c][0]) or (v[1] and not head[c][1]))
     print(f'CORPUS total={total} main_held={main_held} head_held={head_held} new_allowed={new_allowed}')
-    assert new_allowed == len(NEW_ALLOWS)
+    assert {c for c, v in FIXTURE.items() if (v[0] and not head[c][0]) or (v[1] and not head[c][1])} <= set(NEW_ALLOWS)

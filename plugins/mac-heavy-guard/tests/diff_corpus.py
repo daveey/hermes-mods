@@ -51,7 +51,18 @@ REPROS = [
     'echo "$(echo ${x:-)} ; case x in x) pytest;; esac)"',
     'echo $(echo ${x:-)}; ./build.sh)',
     'ssh hub bash -s <<\'EOF\'\npytest\nEOF',
+    # F16/F17 (review 6093835158)
+    'echo $(ca\\\nse x in x) pytest;; esac)', 'echo $(ca\\\nse x in x) cargo build;; esac)',
+    'echo $(c\\\na\\\nse x in x) pytest;; esac)', 'echo $(nosuchkw ca\\\nse x in x) pytest;; esac)',
+    'echo $(if :; then ca\\\nse x in x) pytest;; esac; fi)', 'echo $(nosuchkw case; x in x) pytest;; esac)',
+    'echo "$(echo ${x:-${y})}; pytest)"', 'echo "$(echo ${x:-\'}\')}; pytest)"',
+    'echo "$(echo ${x:-\\})}; pytest)"', 'x="$(echo ${x:-${y})}; pytest)"',
+    'echo $(echo ${x:-${y})}; ./build.sh)',
 ]
+
+# Deliberate new allows (head allows, main held). Each is a bash SYNTAX ERROR (`)` after the closed substitution),
+# so nothing can run: main held it only because its scanner failed closed on the stray paren.
+NEW_ALLOW_REASONS = {'echo $(echo ${x:-}) pytest)': 'bash syntax error (unbalanced `)`); not executable'}
 
 PREFIXES = ['', 'time', 'time -p', 'time --', 'time -p --', 'time !', '!', 'coproc', 'coproc w', 'coproc a-b',
             'function f', 'function a.b', 'coproc a$(:)', 'coproc a`:`', 'coproc a$(echo ")")',
@@ -60,14 +71,16 @@ PREFIXES = ['', 'time', 'time -p', 'time --', 'time -p --', 'time !', '!', 'copr
 
 
 def build():
-    out = list(REPROS)
+    out = list(REPROS) + list(NEW_ALLOW_REASONS)
     for h in HEAVY:
         out += [h, 'echo $(' + h + ')', 'echo "$(' + h + ')"', 'echo `' + h + '`', 'x=$(' + h + ')',
                 'if true; then ' + h + '; fi', 'if false; then :; elif true; then ' + h + '; fi',
                 'while true; do ' + h + '; done', '{ ' + h + '; }', '( ' + h + ' )', 'f() { ' + h + '; }; f',
                 'function f { ' + h + '; }; f', 'time ' + h, 'time -p ' + h, 'coproc ' + h,
                 'case x in x) ' + h + ';; esac', 'for i in 1; do ' + h + '; done', 'echo ${x:-)}; ' + h,
-                'echo $(echo ${x:-)}; ' + h + ')', 'echo "$(echo ${x:-)}; ' + h + ')"']
+                'echo $(echo ${x:-)}; ' + h + ')', 'echo "$(echo ${x:-)}; ' + h + ')"',
+                'echo $(ca\\\nse x in x) ' + h + ';; esac)', 'echo "$(echo ${x:-${y})}; ' + h + ')"',
+                'echo "$(echo ${x:-\'}\')}; ' + h + ')"', 'echo $(echo ${x:-\\})}; ' + h + ')']
         for p in PREFIXES:
             sp = (p + ' ') if p else ''
             out += ['echo $(' + sp + 'case x in x) ' + h + ';; esac)',

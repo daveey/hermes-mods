@@ -189,9 +189,25 @@ F14_CASES = [
     'echo $(echo ${x:-)}; ./build.sh)',
     'echo $(echo ${x:-)} case)',
 ]
+F16_CASES = [  # review 6093835158: line continuation inside a substitution (bash deletes backslash-newline)
+    'echo $(ca\\\nse x in x) pytest;; esac)',
+    'echo $(ca\\\nse x in x) cargo build;; esac)',
+    'echo $(c\\\na\\\nse x in x) pytest;; esac)',
+    'echo $(nosuchkw ca\\\nse x in x) pytest;; esac)',
+    'echo $(if :; then ca\\\nse x in x) pytest;; esac; fi)',
+    'bash -c \'echo $(ca\\\nse x in x) pytest;; esac)\'',
+    'echo $(nosuchkw case; x in x) pytest;; esac)',
+]
+F17_CASES = [  # review 6093835158: `${...}` closer hidden by nesting, quotes or an escape
+    'echo "$(echo ${x:-${y})}; pytest)"',
+    'echo "$(echo ${x:-\'}\')}; pytest)"',
+    'echo "$(echo ${x:-\\})}; pytest)"',
+    'x="$(echo ${x:-${y})}; pytest)"',
+    'echo $(echo ${x:-${y})}; ./build.sh)',
+]
 
 
-@pytest.mark.parametrize('command', F13_CASES + F14_CASES)
+@pytest.mark.parametrize('command', F13_CASES + F14_CASES + F16_CASES + F17_CASES)
 def test_f13_f14_unconditional_hold(command, monkeypatch):
     monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
     assert guard.check_shell(command)
