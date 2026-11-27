@@ -47,12 +47,20 @@ def test_cd_cache_control(home, separator):
 def test_success_gated_cd_exact(home):
     assert guard.check_shell('cd /unrelated && rm -rf .hermes', cwd=str(home.parent)) is None
 
-@pytest.mark.parametrize('boundary', [';', '\n', '||'])
+@pytest.mark.parametrize('boundary', [';', '\n', '||', '&'])
 @pytest.mark.parametrize('alias', [False, True])
-def test_success_chain_failure_rejoins(home, boundary, alias):
+@pytest.mark.parametrize('wrapper', ['', 'command ', 'bash', 'sh', 'ssh'])
+def test_success_chain_failure_rejoins(home, boundary, alias, wrapper):
     command = 'cd /nonexistent && echo done ' + boundary + ' rm -rf ' + ('"$D"' if alias else '.hermes')
+    if wrapper == 'command ':
+        command = wrapper + command
     if alias:
         command = 'D=.hermes; ' + command
+    if wrapper in {'bash', 'sh'}:
+        command = wrapper + " -c '" + command + "'"
+    elif wrapper == 'ssh':
+        command = "ssh example.com 'cd ~ && " + command + "'"
+
     assert guard.check_shell(command, cwd=str(home.parent))
 
 
