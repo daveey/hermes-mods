@@ -149,12 +149,44 @@ def test_feed_never_rearms_a_crossed_deadline_it_already_repainted(monkeypatch):
     import types
     real = feedmod._model()
     stub = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith('__')})
-    stub.triage_deadlines = lambda bundle, now: [1000.5]
+    stub.triage_clocks = lambda bundle: [(400.0, 1000.5)]
     monkeypatch.setattr(feedmod, '_model', lambda: stub)
     assert f.idle_wait() == pytest.approx(0.5)
     clock['now'] = 1001
     f.beat()
     assert [f.idle_wait() for _ in range(3)] == [f.heartbeat_s] * 3
+
+
+def test_idle_waits_derive_triage_clocks_once_per_held_bundle(monkeypatch):
+    """The loop's idle_wait/beat never re-execute the reducer for a bundle the producer has not replaced.
+
+    Re-deriving on every loop turn (under the feed lock) slowed source publishes on loaded CI hosts
+    (test_selective_producer's <1 s publish bound); a replaced bundle is still derived, so a new triage
+    entry arms its wake.
+    """
+    from test_feed import make, feedmod
+    f, _, _, clock = make()
+    f.changes(['S1'])
+    import types
+    real = feedmod._model()
+    calls = []
+    stub = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith('__')})
+    stub.triage_clocks = lambda bundle: calls.append(bundle) or [(400.0, 1000.5)]
+    loads = []
+    monkeypatch.setattr(feedmod, '_model', lambda: loads.append(1) or stub)
+    for _ in range(5):
+        assert f.idle_wait() == pytest.approx(0.5)
+    f.beat()
+    assert len(calls) == 1 and len(loads) == 1
+    with f.lock:
+        held = f.bundles['S1']
+        held['bundle'] = {**held['bundle']}  # the producer replaces a bundle, never mutates it
+    assert f.idle_wait() == pytest.approx(0.5)
+    assert len(calls) == 2
+    with f.lock:
+        f.bundles.pop('S1')
+    f.idle_wait()
+    assert f._triage_memo == {}  # a dropped chat releases its held bundle
 
 
 @pytest.mark.parametrize('age', [599, 601])
