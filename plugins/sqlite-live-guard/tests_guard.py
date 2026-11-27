@@ -37,6 +37,10 @@ def _home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_SQLITE_GUARD_LOG", str(tmp_path / "guard.log"))  # never the real log
     # The host's own sqlite3/python3 builds must not decide these tests (macOS /usr/bin/sqlite3 is 3.51.0, affected).
     monkeypatch.setattr(plugin.guard, "program_sqlite_version", lambda word, kind: None)
+    # The main floor is a separate copy of main's guard: it must see the same stubbed builds
+    # (tests re-stub plugin.guard.program_sqlite_version later, so delegate at call time).
+    monkeypatch.setattr(plugin.guard._main_floor(), "program_sqlite_version",
+                        lambda word, kind: plugin.guard.program_sqlite_version(word, kind))
 
 
 def blocked(tool, **args):

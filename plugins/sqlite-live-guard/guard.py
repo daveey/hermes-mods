@@ -1470,9 +1470,44 @@ def _into_directory(args: list[str], ops: list[str], in_home: bool | str | tuple
 
 
 _SHELL_CONTEXT = None
+_MAIN_FLOOR = None
+
+
+def _main_floor():
+    """Byte-identical copy of origin/main's guard (see tests/test_main_floor.py) under a private name."""
+    global _MAIN_FLOOR
+    if _MAIN_FLOOR is None:
+        import importlib.util
+        import sys
+        name = "_sqlite_live_guard_main_floor"
+        path = Path(__file__).with_name("main_floor") / "guard.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError("missing main floor loader")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _MAIN_FLOOR = module
+    return _MAIN_FLOOR
 
 
 def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
+    # Monotone floor: refuse whenever main's decision logic refuses OR the analysis below refuses,
+    # so this module can only add refusals relative to main. Fail closed if the floor cannot load.
+    try:
+        why = _main_floor().check_shell(cmd, cwd)
+    except Exception:
+        return "live-database shell safety floor unavailable; refusing unchecked execution"
+    if why:
+        return why
+    return _check_shell_head(cmd, cwd)
+
+
+def _check_shell_head(cmd: str, cwd: str = "") -> Optional[str]:
     # Preserve the existing policy and refusal text, then analyze execution scopes.
     why = _check_shell_base(cmd, cwd)
     if why:
