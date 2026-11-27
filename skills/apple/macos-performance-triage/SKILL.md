@@ -95,6 +95,8 @@ For read-only dependency-tree commitments, make directory-walk errors fail close
 
 Before Darwin image/cache acquisition or import-custody claims, read [loader metadata boundaries](references/loader-metadata-boundaries.md): installed dyld_info, archive/slice counting, complete transport and cached-module provenance.
 
+Before adopting a returned native-proof slice or classifying a cold FD delta, read [native-proof adoption](references/native-proof-adoption.md). Actual disk protocol/pins, truthful test doubles and runtime-owned capabilities remain separate from native admission.
+
 ## Descriptor-headroom warnings
 
 For a backend FD alert, read its own public `/api/status` → `components.dashboard.fd_headroom`; `/api/health` alone does not expose the guard sample. Match the incident's loaded-core fingerprint with health and checkout separately. Count only numeric `lsof -F ftn` descriptor records, excluding cwd/text mappings, and compare same-birth process snapshots over a bounded interval. Group SQLite main/WAL/SHM separately from sockets and pipes. An empty census below the detector's classification threshold makes an `(other)` title uninformative; a low-utilization warning can be a slope-based exhaustion projection rather than immediate pressure. Verify the actual source thresholds and report spontaneous `state:ok` separately from long-duration leak clearance. Do not restart services or alter limits to investigate an alert that excludes those actions.
