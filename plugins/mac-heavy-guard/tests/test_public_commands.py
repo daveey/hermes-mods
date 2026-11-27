@@ -67,3 +67,24 @@ def test_f6_case_substitution_conservative_hold(command, monkeypatch):
 ])
 def test_f6_quoted_case_data_allowed(command):
     assert guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize('prefix', [
+    'time', 'time -p', 'time !', 'time -p !', 'coproc', 'coproc worker',
+    'function f', 'time coproc worker',
+])
+def test_f7_compound_prefix_case_hold(prefix, monkeypatch):
+    monkeypatch.delenv('MAC_HEAVY_OK', raising=False)
+    command = 'echo $(' + prefix + ' case x in x) pytest;; esac)'
+    assert guard.check_shell(command)
+    with pytest.raises(ValueError, match='inspection'):
+        runner.workload_reason(command)
+
+
+@pytest.mark.parametrize('command', [
+    'echo $(echo time case)', 'echo $(echo coproc worker case)',
+    'echo $(echo function f case)',
+])
+def test_f7_prefix_words_as_data(command):
+    assert guard.check_shell(command) is None
+    assert runner.workload_reason(command) is None

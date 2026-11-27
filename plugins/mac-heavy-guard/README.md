@@ -28,8 +28,10 @@ the exported opt-out rather than silently accepting uninspected code.
 
 The bounded substitution scanner conservatively holds a `case` statement inside
 a substitution (including benign case bodies): unparenthesized case-pattern `)`
-is ambiguous to its character-level delimiter matcher. Use the exported opt-out
-for that form; quoted `case` data and `echo case` remain data. This is an explicit
+is ambiguous to its character-level delimiter matcher. This includes `time`,
+`coproc` and `function NAME` compound prefixes. For the local guard, use the
+exported opt-out for that form (tailnet policy does not honor this opt-out);
+quoted `case` data and `echo case` remain data. This is an explicit
 inspection hold, not a claim that every case body is heavy.
 The public `commands()` API still yields only simple argv lists, recursively
 flattening substitution bodies for consumers such as tailnet. Inspection holds
