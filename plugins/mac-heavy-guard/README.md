@@ -44,7 +44,10 @@ a substitution that contains a quote, backslash, backtick, nested `${` or an unb
 now deleted like bash does (outside single quotes), so `pyt\<newline>est` is `pytest`. False refusals: any
 benign `$(... case x ...)`, e.g. `echo $(echo case x)`, and `$(echo ${x:-"a"})`; use the local exported `MAC_HEAVY_OK=1` opt-out.
 Continuations are joined before substitutions are exposed, and a `$` directly followed by backslash-newline
-(`"$\<newline>(...)"`, also in an unquoted heredoc body) is held whole; false refusal: that text as single-quoted data.
+(`"$\<newline>(...)"`, also in an unquoted heredoc body) is held whole; false refusals:
+that text as single-quoted data, and even a quoted heredoc such as
+`cat <<'EOF'` whose body contains `$\<newline>(...` (the quoted body is data,
+but the conservative whole-input hold runs before heredoc removal).
 ANSI-C command fragments (`$'pytest'`, including ASCII octal/hex/Unicode escapes)
 are decoded as quoted data before classification. Escaped apostrophes do not
 change continuation state. Non-ASCII escape results and `\\c` control escapes
