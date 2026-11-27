@@ -5,8 +5,8 @@ Shared by the Hermes pre_tool_call hook (__init__.py) and the Claude Code PreToo
 (`docker build`), whole test suites (`pytest` with no test path or with `-n`, bare `npm test`,
 `vitest run` with no filter, `make test`, Hermes `scripts/run_tests.sh` with no test path) and whole-repo dependency installs (`npm install`,
 `pnpm install`, `uv sync`, `pip install -r`). Targeted work stays allowed (`pytest tests/test_x.py`,
-`cargo build`, `npm install left-pad`), as does anything sent over `ssh`, including the body of a
-heredoc fed to it (`ssh hub bash -s <<'EOF'`).
+`cargo build`, `npm install left-pad`), as does remote work sent over `ssh`. Local SSH
+ProxyCommand/LocalCommand options and unquoted-heredoc substitutions are still inspected.
 
 Hermes core worktrees: a multi-file Python test run there (pytest or scripts/run_tests.sh with 2+ test paths
 or a directory) is allowed but gets a note pointing at `hermes-core-wt test <same args>`, which runs it on
@@ -955,7 +955,7 @@ _QUOTE_UNMASK = str.maketrans({v: k for k, v in _QUOTE_MASK.items()})
 
 
 class _Quoted(str):
-    """A word whose `<`/`>` were quoted or escaped (`'>>'`, `"2>x"`, `\\>`): an argument, never a redirect."""
+    """A quoted/escaped word: neither a reserved shell keyword nor a redirect operator."""
 
 
 def _mask_quoted_redirects(text: str) -> str:
@@ -975,12 +975,13 @@ def _mask_quoted_redirects(text: str) -> str:
             else:
                 out.append(_QUOTE_MASK.get(c, c))
         elif c == "\\" and i + 1 < n:
-            out.append(_QUOTE_MASK.get(text[i + 1]) or text[i:i + 2])
+            out.append("\ue002" + (_QUOTE_MASK.get(text[i + 1]) or text[i:i + 2]))
             i += 2
             continue
         else:
             if c in "'\"":
                 quote = c
+                out.append("\ue002")  # preserve quoted reserved words as data
             out.append(c)
         i += 1
     return text if quote else "".join(out)
@@ -988,7 +989,8 @@ def _mask_quoted_redirects(text: str) -> str:
 
 def _unmask_quoted(tokens: list) -> list:
     """Tokens lexed from `_mask_quoted_redirects` text, each word that held a quoted `<`/`>` as `_Quoted`."""
-    return [_Quoted(t.translate(_QUOTE_UNMASK)) if any(m in t for m in _QUOTE_MASK.values()) else t for t in tokens]
+    return [_Quoted(t.translate(_QUOTE_UNMASK).replace("\ue002", ""))
+            if "\ue002" in t or any(m in t for m in _QUOTE_MASK.values()) else t for t in tokens]
 
 
 def _drop_redirects(tokens: list[str]) -> list[str]:
@@ -1041,6 +1043,9 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
         return
     cur: list[str] = []
     in_array = False
+    header = False
+    case_depth = 0
+    case_pattern = False
     for t in toks + [";"]:
         # `name=(a b c)` / `local name=(...)` is a bash array literal: its words are data, not a command
         # (hermes-core-wt's `here=(./scripts/run_tests.sh)` read as a whole-suite run and blocked the tool
@@ -1052,10 +1057,30 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
         if t == "(" and cur and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=", cur[-1]):
             in_array = True
             continue
-        if t in SEPARATORS or (t and set(t) <= set(";&|()\n")):
+        syntax = not isinstance(t, _Quoted)
+        if syntax and (t in SEPARATORS or (t and set(t) <= set(";&|()\n"))):
             if cur:
                 yield from _unwrap(cur)
             cur = []
+            header = False
+            if case_pattern and ")" in t:
+                case_pattern = False
+            if case_depth and t in (";;", ";&", ";;&"):
+                case_pattern = True
+        elif syntax and not cur and t == "esac":
+            case_depth = max(0, case_depth - 1)
+            case_pattern = False
+            header = False
+        elif syntax and not cur and t == "case":
+            case_depth += 1
+            case_pattern = True
+        elif header or case_pattern:
+            continue
+        elif syntax and not cur and t in ("for", "select"):
+            header = True
+        elif syntax and not cur and t in ("if", "then", "elif", "else", "while", "until",
+                                          "do", "done", "fi", "{", "}", "!"):
+            continue
         else:
             cur.append(t)
 
@@ -1089,7 +1114,26 @@ def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
     if not rest:
         return
     name = os.path.basename(rest[0])
-    if name == "ssh":  # runs elsewhere
+    if name == "ssh":
+        # Only pre-destination options can name local execution. Remote argv is data.
+        i = 1
+        while i < len(rest) and rest[i].startswith("-"):
+            opt = rest[i]
+            i += 1
+            if opt == "--":
+                break
+            for k, c in enumerate(opt[1:], 1):
+                if c in "BbcDEeFIiJLlmOopQRSWw":
+                    value = opt[k + 1:]
+                    if not value:
+                        value = rest[i] if i < len(rest) else ""
+                        i += 1
+                    if c == "o":
+                        pair = re.split(r"[=\s]+", value.strip(), maxsplit=1)
+                        if len(pair) == 2 and pair[0].lower() in ("proxycommand", "localcommand"):
+                            for sub, sub_env in commands(pair[1]):
+                                yield sub, sub_env | env
+                    break
         return
     flag = next((k for k, a in enumerate(rest[1:], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
     if name in SHELLS and flag is not None:
@@ -1124,7 +1168,7 @@ def _owner(before: str) -> Optional[str]:
 
 
 def _drop_ssh_heredocs(text: str) -> str:
-    """Drop the body and delimiter lines of every heredoc fed to `ssh`: that text runs on the remote host.
+    """Drop remote stdin bodies only after strict SSH/pipeline checks, keeping local expansions.
     Every other heredoc body stays in the text; `_command_tokens` then keeps a body a local shell reads
     (`bash -s`) as commands and reads any other body (`python3 -`, `cat > f`) as data (`_split_heredocs`)."""
     if "<<" not in text:
@@ -1150,9 +1194,14 @@ def _drop_ssh_heredocs(text: str) -> str:
                 word = shlex.split(m.group(2))[0]
             except (ValueError, IndexError):
                 continue
-            bodies.append((owner == "ssh", m.group(1) == "-", word))
+            prefix = logical[:m.start()].replace("\\\n", " ")
+            remote = owner == "ssh" and _hd_remote_shell(shell + prefix, len(shell), logical[m.start():])
+            quoted = any(c in m.group(2) for c in "'\"\\")
+            bodies.append((remote, m.group(1) == "-", word, quoted))
         shell += logical
-        for remote, strip_tabs, word in bodies:  # several on one line: their bodies follow in order
+        local_expansions = []
+        for remote, strip_tabs, word, quoted in bodies:
+            body = []
             while i < len(lines):  # no delimiter line: the body runs to the end of the text
                 line = lines[i]
                 i += 1
@@ -1161,6 +1210,10 @@ def _drop_ssh_heredocs(text: str) -> str:
                 bare = line.rstrip("\r\n")
                 if (bare.lstrip("\t") if strip_tabs else bare) == word:
                     break
+                body.append(line)
+            if remote and not quoted:
+                local_expansions.extend(_hd_substitutions("".join(body)))
+        out.extend("\n" + code + "\n" for code in local_expansions)
     return "".join(out)
 
 
@@ -1315,7 +1368,8 @@ def check_argv(argv: list[str], cwd: Optional[str] = None) -> Optional[str]:
         return _large_copy(name, args, cwd)
     if name == "cargo":
         if sub in ("build", "b", "test", "t", "bench", "run", "r", "install", "clippy") and (
-                "--release" in args or "-r" in args[1:] or "--profile=release" in args):
+                "--release" in args or "-r" in args[1:] or "--profile=release" in args
+                or any(args[k:k + 2] == ["--profile", "release"] for k in range(len(args)))):
             return f"cargo {sub} --release"
         if sub == "bench":
             return "cargo bench"
@@ -1348,7 +1402,7 @@ def check_argv(argv: list[str], cwd: Optional[str] = None) -> Optional[str]:
         return "uv sync (whole-repo install)"
     if name in ("pip", "pip3") or (PY.match(name) and args[:2] == ["-m", "pip"]):
         pargs = args[2:] if PY.match(name) else args
-        if pargs[:1] == ["install"] and ("-r" in pargs or any(a.startswith("--requirement") for a in pargs)
+        if pargs[:1] == ["install"] and (any(a.startswith("-r") for a in pargs) or any(a.startswith("--requirement") for a in pargs)
                                           or "-e" in pargs and "." in pargs):
             return "pip install of a whole requirements set"
         return None
@@ -1376,7 +1430,7 @@ def _script_arg(argv: list[str]) -> Optional[str]:
     return argv[0] if "/" in argv[0] else None
 
 
-def _read_script(path: str, cwd: Optional[str]) -> Optional[str]:
+def _read_script(path: str, cwd: Optional[str], explicit_shell: bool = False) -> Optional[str]:
     """Text of a local shell script (<= 64 KB), or None when missing, binary or not a shell script."""
     try:
         full = os.path.expanduser(path)
@@ -1385,23 +1439,31 @@ def _read_script(path: str, cwd: Optional[str]) -> Optional[str]:
         if not os.path.isfile(full):
             return None
         with open(full, "rb") as fh:
-            raw = fh.read(SCRIPT_MAX_BYTES)
+            raw = fh.read(SCRIPT_MAX_BYTES + 1)
     except OSError:
         return None
+    if explicit_shell and len(raw) > SCRIPT_MAX_BYTES:
+        raise _ScriptLimit("script exceeds the 64 KiB inspection limit")
     if b"\0" in raw:
         return None
     text = raw.decode("utf-8", errors="replace")
-    if text.startswith("#!"):
+    if text.startswith("#!") and not explicit_shell:
         words = text.split("\n", 1)[0][2:].split()
         interp = [os.path.basename(w) for w in words if not w.startswith("-")]
         if interp and interp[0] == "env":
             interp = interp[1:]
         if not interp or interp[0] not in SHELLS | {"ksh", "ash"}:
             return None
+    if len(raw) > SCRIPT_MAX_BYTES:
+        raise _ScriptLimit("script exceeds the 64 KiB inspection limit")
     return text
 
 
 Hit = tuple[str, Optional[list[str]], Optional[str]]  # (why, Python-test args if a direct pytest/run_tests run, cwd)
+
+
+class _ScriptLimit(Exception):
+    """A recognized shell script was not completely inspected."""
 
 
 def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[Hit]:
@@ -1418,13 +1480,18 @@ def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optiona
             test = None if in_script else _py_test(argv)
             return why, (test[1] if test else None), cwd
         ref = _script_arg(argv)
-        if ref and depth < SCRIPT_MAX_DEPTH:
+        if ref:
             if os.path.basename(argv[0]) not in SHELLS | {"source", "."}:
                 # Direct execution requires an executable file; quoted data paths do not.
                 full = _cd(cwd, ref)
                 if not os.path.isfile(full) or not os.access(full, os.X_OK):
                     continue
-            body = _read_script(ref, cwd)
+            try:
+                body = _read_script(ref, cwd, os.path.basename(argv[0]) in SHELLS | {"source", "."})
+            except _ScriptLimit as exc:
+                return f"{ref}: {exc}; use {OPT_OUT}=1 to opt out explicitly", None, cwd
+            if body is not None and depth >= SCRIPT_MAX_DEPTH:
+                return f"{ref}: script inspection depth limit; use {OPT_OUT}=1 to opt out explicitly", None, cwd
             if body:
                 inner = _scan(body, cwd, depth + 1, True)
                 if inner:
