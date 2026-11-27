@@ -778,8 +778,34 @@ def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:
 # ---- end of the shared heredoc block ---------------------------------------------------------------------------
 
 
+def _join_continuations(text: str) -> str:
+    """Delete backslash-newline like bash does (outside single quotes; a single-quoted body keeps it for the shell
+    that later runs that body). Replacing it with a space instead split `ca\\<nl>se` and `pyt\\<nl>est` (F16)."""
+    if "\\\n" not in text:
+        return text
+    out, i, n, sq, dq = [], 0, len(text), False, False
+    while i < n:
+        c = text[i]
+        if sq:
+            sq = c != "'"
+            out.append(c)
+            i += 1
+        elif c == "\\":
+            if text[i + 1:i + 2] != "\n":
+                out.append(text[i:i + 2])
+            i += 2
+        else:
+            if c == "'" and not dq:
+                sq = True
+            elif c == '"':
+                dq = not dq
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _tokens(text: str) -> Optional[list[str]]:
-    lex = shlex.shlex(_expose_substitutions(_strip_comments(text.replace("\\\n", " "))), posix=True,
+    lex = shlex.shlex(_expose_substitutions(_strip_comments(_join_continuations(text))), posix=True,
                       punctuation_chars=";&|()\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
@@ -869,7 +895,7 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
             c = text[i]
             # Bare case-pattern `)` has no matching `(`. Do not truncate the
             # substitution at it: this scanner deliberately holds that grammar.
-            if level and text.startswith("case", i) and text[i + 4:i + 5].isspace() and (
+            if level and text.startswith("case", i) and re.match(r"[\s;&|<>(]", text[i + 4:i + 5]) and (
                     i == 0 or text[i - 1] in " \t\n;&|("):
                 # Class closure (differential gate): ANY unquoted `case` keyword word inside a substitution holds.
                 # Whether it is a real case statement or an argument after an unmodeled prefix (coproc/function/
@@ -877,7 +903,27 @@ def _expose_substitutions(text: str, substitutions: Optional[dict[str, str]] = N
                 # delimiter matching breaks on the bare case-pattern `)`. False refusals: `echo $(echo case x)`.
                 raise _UnsupportedSubstitution
             # F14: `${x:-)}` hides a `)` this scanner would read as the end of the substitution; hold.
-            if level and text.startswith("${", i) and re.match(r"\$\{[^}]*[()]", text[i:]):
+            # F17: the same, with nested `${y})}`, quoted `'}'` or escaped `\}` closers. Class closure: inside a
+            # substitution hold any `${...}` whose naive brace-balanced span (or, if unbalanced, the rest of the
+            # text) holds a paren, quote, backslash, backtick or nested `${`. False refusal: `$(echo ${x:-"a"})`.
+            if level and text.startswith("${", i):
+                depth_b, j = 0, i
+                while j < n:
+                    if text.startswith("${", j):
+                        depth_b += 1
+                        j += 2
+                        continue
+                    if text[j] == "}":
+                        depth_b -= 1
+                        if depth_b == 0:
+                            break
+                    j += 1
+                span = text[i + 2:j]
+                if depth_b != 0 or re.search(r"[()'\"\\`]|\$\{", span):
+                    raise _UnsupportedSubstitution
+            # F16: bash deletes backslash-newline, so `ca\<nl>se` is the `case` keyword; this scanner cannot
+            # see through it. Hold a line continuation anywhere inside a substitution (outside single quotes).
+            if level and text.startswith("\\\n", i):
                 raise _UnsupportedSubstitution
             if c == "\\":
                 out.append(text[i:i + 2])
@@ -1083,7 +1129,7 @@ def _command_tokens(text: str) -> list[str]:
     `pytest` with a test path `2>` or `2>/dev/null` (that hid whole-suite runs). Comments and heredoc bodies are
     split off first (`_split_heredocs`: an apostrophe in them no longer hides the commands after them, and an
     unquoted body's `$(...)` is a command); a line whose quotes never close is dropped, never the whole text."""
-    code = _split_heredocs(text)[0].replace("\\\n", " ")
+    code = _join_continuations(_split_heredocs(text)[0])
     return _command_lex(_lexable(code, _command_lex))
 
 
@@ -1101,7 +1147,7 @@ def _command_events(text: str, _prepared: bool = False) -> Iterator[tuple[list[s
     except _UnsupportedSubstitution:
         yield _InspectionHold(["case command substitution inspection unsupported"]), set()
         return
-    code = code.replace("\\\n", " ")
+    code = _join_continuations(code)
     toks = _command_lex(_lexable(code, _command_lex))
     if toks is None:
         return
