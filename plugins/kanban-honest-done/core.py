@@ -875,20 +875,34 @@ def _verb_after(seg: list[str], i: int) -> Optional[tuple[str, list[str]]]:
     return None
 
 
-def _positional(args: list[str]) -> Optional[str]:
+def _positionals(args: list[str]) -> list[str]:
+    """All task operands, including complete's nargs='+', not just the first."""
+    out = []
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--":
-            return args[i + 1] if i + 1 < len(args) else None
+            out.extend(args[i + 1:])
+            break
         if a.startswith("--") and "=" not in a:
             i += 2
             continue
         if a.startswith("-"):
             i += 1
             continue
-        return a
-    return None
+        out.append(a)
+        i += 1
+    return out
+
+
+def _positional(args: list[str]) -> Optional[str]:
+    return next(iter(_positionals(args)), None)
+
+
+def _indirect_argv(seg: list[str]) -> bool:
+    # xargs can append ids or replace arbitrary placeholders anywhere in argv.
+    # Never infer its stdin/file contents or replacement string as literal ids.
+    return any(os.path.basename(token) == "xargs" for token in seg)
 
 
 def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
@@ -898,17 +912,26 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
         if not hit:
             continue
         verb, args = hit
-        target = _positional(args)
-        if not target or not _is_own(target, own):
+        targets = _positionals(args)
+        if _indirect_argv(seg) and verb in {"edit", "complete", "done", "request-review"}:
+            return ("[kanban-honest-done] Refused: xargs supplies unresolved mutation operands. "
+                    "Use literal direct kanban commands so the own-card gates can check every target.")
+        own_targets = [target for target in targets if _is_own(target, own)]
+        if not own_targets:
             continue
         # The legacy lexer separates $(...) at '('. Its remaining segment
         # cannot prove the mutation flags or handoff safe. Hold the operation
         # instead of treating the missing tail as an empty, passing handoff.
-        if target.endswith('$') and verb in {"edit", "complete", "done", "request-review"}:
+        if any(target.endswith('$') for target in own_targets) and verb in {"edit", "complete", "done", "request-review"}:
             return ("[kanban-honest-done] Refused: unresolved substitution target. "
                     "Use a literal card id and a complete command so the own-card gates can check it.")
         if verb == "edit" and (_opt(args, "--title") is not None or _opt(args, "--body") is not None):
             return EDIT_REFUSAL
+        if verb in {"complete", "done", "request-review"} and any(
+                re.search(r'[$`]', _opt(args, option) or '')
+                for option in ("--summary", "--result", "--metadata")):
+            return ("[kanban-honest-done] Refused: unresolved handoff text. "
+                    "Use literal summary/result/metadata so completion evidence can be checked.")
         if verb in ("complete", "done"):
             summary = _opt(args, "--summary") or _opt(args, "--result") or ""
             why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata"))

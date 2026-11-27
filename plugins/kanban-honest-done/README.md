@@ -96,7 +96,17 @@ tool-hook defense, not a universal shell evaluator or Board-writer boundary.
 Commands whose executable/verb is itself dynamically built remain outside it.
 If the lexer splits an unquoted substitution target at `(`, its mutation is
 held outright: missing trailing flags or summary cannot prove a safe handoff.
-The `--` end-of-options marker is respected when locating the card operand.
+The `--` end-of-options marker is respected when locating card operands; every
+completion operand is checked, including `complete OTHER OWN` batches.
+`xargs`-driven edits, completions and review handoffs are held because targets can
+be replaced or appended from stdin/files, even without a visible placeholder.
+Consent stops likewise hold xargs-driven writes. Use direct literal commands.
+Own-card summary/result/metadata containing unresolved `$` or backticks is held
+rather than classified as literal passing evidence. Tests:
+`tests/test_review_indirect_targets.py` (multi-target completion, xargs append /
+replacement and nested consent tools, real bash argv, dynamic handoffs and inert controls).
+Run tests with the documented runner below: raw pytest inheriting worker identity
+variables is not an isolated test environment.
 
 SENT comments are audit prose only, even when they say `delivery verified` or
 contain pasted success JSON. Gate D requires scoped links/subscriptions or the
