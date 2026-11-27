@@ -148,7 +148,10 @@ def test_real_reducer_offlist_blocker_defeats_absence(graph, board, monkeypatch,
     feed.install_receipts(log)
     feed.watch(['S0', 'S1'])
     lane = feed.compose_board_sources(lambda: r, gateway='local-test', profile='default')
-    source_before_projection(lane, log, monkeypatch)
+    if not cold_before_acquisition:
+        # The cold case deliberately projects before acquisition. Installing
+        # the opposite accepted-source gate here deadlocks both fixture barriers.
+        source_before_projection(lane, log, monkeypatch)
     try:
         parent = kanban_db.create_task(conn, title='Off-list blocker', session_id='other', initial_status='running')
         for title in ('First child', 'Second child'):

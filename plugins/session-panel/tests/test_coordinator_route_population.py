@@ -32,12 +32,25 @@ def test_real_64_chat_routes_share_40_shared_and_distinct_details_without_projec
     with r.batch(sessions):
         for s in sessions:
             assert {t['id'] for t in r.linked([s])} == expected[s]
-    counts = collections.Counter()
-    original_detail = r._detail
+    counts = collections.Counter()  # all attempted detail calls, including aborted SQL snapshots
+    materialized = collections.Counter()
+    attempt = threading.local()
+    original_detail, original_capture = r._detail, r.capture_local
     def detail(*args, **kwargs):
-        counts[(args[1], bool(args[3]))] += 1
+        key = (args[1], bool(args[3]))
+        counts[key] += 1
+        attempt.counts[key] += 1
         return original_detail(*args, **kwargs)
+    def capture(*args, **kwargs):
+        attempt.counts = collections.Counter()
+        part = original_capture(*args, **kwargs)
+        # Only a completed snapshot materializes reusable details. The real
+        # two-second SQL deadline can abort earlier attempts; they still count
+        # in `counts`, so route dispatch below cannot hide ANY extra work.
+        materialized.update(attempt.counts)
+        return part
     monkeypatch.setattr(r, '_detail', detail)
+    monkeypatch.setattr(r, 'capture_local', capture)
     f = feedmod.Feed(r, emit=lambda _: None)
     f.watch(sessions)
     lane = compose(f, r)
@@ -68,7 +81,8 @@ def test_real_64_chat_routes_share_40_shared_and_distinct_details_without_projec
         drain(lane)
         f.changes(sessions)
         drain(lane)
-        assert len(counts) == 104 and set(counts.values()) == {1}
+        assert len(materialized) == 104 and set(materialized.values()) == {1}
+        assert set(counts) == set(materialized)
         before = dict(counts)
         def forbidden(*args, **kwargs):
             raise AssertionError('legacy per-chat board reader invoked')

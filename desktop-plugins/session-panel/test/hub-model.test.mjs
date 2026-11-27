@@ -453,11 +453,24 @@ test('mounted feed timing survives local ticks, replacement, session switch and 
    assert.equal(read(),after)
    // Local repaint cannot keep an ETA alive after the independent source TTL.
    now+=1
-   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   await React.act(async () => {
+    // Renew transport independently. Expired source evidence must stay expired
+    // even while the owning Feed continues delivering live heartbeats.
+    m.onFeedEvent({payload:{feed:'timing',profile:'default',epoch:'timing',rev:1,heartbeat:true,fresh:[current.session]}})
+    for(const t of ticks.values()) if(t.ms===1000)t.fn()
+   })
+   assert.ok(m.feedVouches(current), `${name}: transport is still fresh at source expiry`)
+   assert.deepEqual(model.freshness, {trusted:true,computed_at:cases[name].now,ttl_s:60})
    if (name !== 'elapsed_layout') {
     assert.ok(document.querySelector('[data-wait-eta]') === null)
     assert.match(document.querySelector('[data-row-detail]').textContent, /status unknown · last known:/)
    }
+   assert.equal(JSON.stringify(model),original)
+   // Missing-heartbeat is a distinct negative control, not the source-TTL proof.
+   now+=61
+   await React.act(async () => { for(const t of ticks.values()) if(t.ms===1000)t.fn() })
+   assert.equal(m.feedVouches(current),false)
+   assert.ok(document.querySelector('[data-wait-eta]') === null)
    assert.equal(JSON.stringify(model),original)
    await paint(null)
   }
