@@ -103,12 +103,15 @@ def stalled_cases():
     b = f.held_bundle()
     b['cards']['t_abc123']['detail']['events'][0]['created_at'] = NOW - 601
     yield 'triage', b
+    # Aged producer evidence withdraws the agent wait before the overdue post-pass
+    # moves it to stuck. Expiry must strip this carried last_wait_kind as well.
+    yield 'aged_triage', {**b, 'computed_at': NOW - 120}
 
 
 def test_stale_stalled_waits_do_not_inherit_a_blue_producer_category():
     import copy
     for name, b in stalled_cases():
-        if name == 'triage' and not f.AGED:
+        if name.endswith('triage') and not f.AGED:
             continue
         fresh = model.reduce_panel(b, now=NOW, projector=f.project)
         assert fresh['sections']['stuck'], name
