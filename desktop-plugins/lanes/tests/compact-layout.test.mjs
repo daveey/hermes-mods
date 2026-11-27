@@ -56,6 +56,7 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       nameWrapped: row.querySelector('.lanes-row-name').getClientRects().length > 1 || r(row.querySelector('.lanes-row-name')).height > 20,
       chipWrapped: vis(row.querySelector('.lanes-row-chip')) && r(row.querySelector('.lanes-row-chip')).height > 32,
       countClipped: [...row.querySelectorAll('.lanes-hold-count')].filter(c => vis(c.closest('.lanes-hold'))).filter(c => !(vis(c) && inside(r(c), r(c.closest('.lanes-row-chip'))))).map(c => c.textContent),
+      readingClipped: [...row.querySelectorAll('.lanes-hold-reading')].filter(c => vis(c.closest('.lanes-hold'))).filter(c => !(vis(c) && c.scrollWidth <= c.clientWidth + .5 && inside(r(c), r(c.closest('.lanes-hold'))) && inside(r(c), r(c.closest('.lanes-row-chip'))))).map(c => c.textContent),
       countPainted: [...row.querySelectorAll('.lanes-hold-count')].filter(vis).map(c => c.textContent),
       chips: [...row.querySelectorAll('.lanes-hold')].filter(vis).map(c => ({ id: c.dataset.laneHold, w: r(c).width, h: r(c).height,
         label: c.getAttribute('aria-label'), clip: c.scrollWidth > c.clientWidth + .5 && !c.querySelector('.lanes-hold-name') })),
@@ -109,6 +110,7 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
         assert.deepEqual(row.chartOverflow, [], 'chart descendant overlaps sibling column: ' + id)
         assert.ok(!row.nameWrapped && !row.chipWrapped && row.costWrapped.length === 0 && !row.costScrollOverflow, 'wrapping/overflow: ' + id)
         assert.deepEqual(row.countClipped, [], 'hold count clipped: ' + id)
+        assert.deepEqual(row.readingClipped, [], 'hold reading clipped: ' + id)
         if (row.name === 'faulty') {
           // Priority fault > fleet stop > dial > budget: the fault chip is first at every width, never pushed out
           // by the bigger dial; at <=360 exactly one chip plus a "+3" badge, above that two chips plus "+2".

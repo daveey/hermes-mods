@@ -1440,9 +1440,13 @@ export function LaneControls({ name, row, write, disabled }) {
   useEffect(() => {
     if (!awaiting) return
     if (Object.entries(awaiting).every(([key, want]) => adminReflects(row, key, want))) { setAwaiting(null); setDraft({}); setMessage('Saved'); return }
+  }, [awaiting, row])
+  // The write owns its deadline; incoming snapshots must not extend it indefinitely.
+  useEffect(() => {
+    if (!awaiting) return
     const timer = setTimeout(() => { setAwaiting(null); setMessage('Not saved: the next snapshot still shows the old value') }, 8000)
     return () => clearTimeout(timer)
-  }, [awaiting, row])
+  }, [awaiting])
   const holding = key => (row.holds || []).some(chip => ({ lane_gate: 'admit_per_day', lane_max_workers: 'max_workers', lane_paused: 'paused' }[chip.id] === key || chip.id === 'lane_daily_limit' && ['cards_per_day', 'usd_per_day'].includes(key)))
   return h('form', { className: 'lanes-controls', onSubmit: async e => {
     e.preventDefault(); setMessage('')
