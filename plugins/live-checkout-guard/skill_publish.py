@@ -647,18 +647,26 @@ def _queue_records(directory, skipped=None, *, regular_only=False):
                 continue
             if regular_only and not stat.S_ISREG(path.lstat().st_mode):
                 continue
-            key = _record_key(str(directory), [path.name])
-            if any((directory / (prefix + key)).exists()
-                   and (directory / (prefix + key)).read_text() == generation
-                   for prefix in ('.blocked-', '.queue-held-')):
-                continue
         except FileNotFoundError:
             continue
         except OSError:
             # Let the worker classify/quarantine unknown metadata once per run.
-            if regular_only or skipped.get(path) == 'unreadable metadata':
+            if not regular_only and skipped.get(path) != 'unreadable metadata':
+                records.append(path)
+            continue
+        key = _record_key(str(directory), [path.name])
+        blocked = False
+        for prefix in ('.blocked-', '.queue-held-'):
+            try:
+                blocked = (directory / (prefix + key)).read_text() == generation
+            except (OSError, UnicodeError):
+                # A damaged advisory skip receipt is not execution custody and
+                # must never hide a healthy record or starve its siblings.
                 continue
-        records.append(path)
+            if blocked:
+                break
+        if not blocked:
+            records.append(path)
     return records
 
 
