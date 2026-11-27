@@ -2003,11 +2003,7 @@ class CoreReaders:
         except sqlite3.Error:
             d['ready_since'] = None
         parents = [r[0] for r in c.execute('SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id', (card_id,))]
-        link_tasks = []
-        for pid in parents:
-            p = kanban_db.get_task(c, pid)
-            if p is not None:
-                link_tasks.append({'id': p.id, 'title': p.title, 'status': p.status})
+        link_tasks = _parent_summaries(c, parents)
         events = [dataclasses.asdict(e) for e in _newest_events(c, card_id)]
         latest = kanban_db.latest_run(c, card_id)
         runs = [dataclasses.asdict(latest)] if latest is not None else []
@@ -2086,6 +2082,21 @@ class CoreReaders:
             if owned_snapshot and c.in_transaction:
                 c.rollback()
         return out
+
+
+def _parent_summaries(c, parents):
+    """Fresh display fields, not full Task hydration; retain edge order and missing parents."""
+    from hermes_cli.kanban_db import _lossy_text
+
+    rows = {}
+    # Bound SQL parameters on old SQLite too. No cache: the caller's connection and transaction own freshness.
+    for start in range(0, len(parents), 256):
+        ids = parents[start:start + 256]
+        marks = ','.join('?' for _ in ids)
+        rows.update((row['id'], row) for row in c.execute(
+            f'SELECT id, title, status FROM tasks WHERE id IN ({marks})', ids))
+    return [{key: _lossy_text(rows[pid][key]) for key in ('id', 'title', 'status')}
+            for pid in parents if pid in rows]
 
 
 def _lineage_members(pairs, ids):
