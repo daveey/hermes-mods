@@ -54,7 +54,10 @@ broker:
 
 The worker runs as `python -I -c <bootstrap> <plugin dir> providers.<module> --worker`: isolated mode ignores
 `PYTHONPATH`/`PYTHON*`, the user site and the working directory, so only this plugin's own `providers/` package
-is imported. Its pid is recorded in Hermes' spawn ledger (purpose `compute-rentals-worker`) and it is killed on timeout.
+is imported. The directly launched pid is recorded in Hermes' spawn ledger (purpose
+`compute-rentals-worker`) and is killed and reaped on timeout. With a non-exec broker prefix,
+this pid is the wrapper: use a wrapper that execs the worker or manages its own descendants.
+The collector closes its pipes without waiting for wrapper descendants to exit.
 
 Unknown top-level keys are kept, so an extra provider can read its own section through
 `providers.config.load_config()`. An invalid file raises an error naming the bad key.

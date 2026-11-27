@@ -153,6 +153,8 @@ def test_factories_are_lazy_and_broker_cache_is_process_only(monkeypatch):
         def __init__(self, argv, **kw):
             calls.append((argv, kw))
             self.pid = 0
+            import io
+            self.stdout, self.stderr = io.StringIO(), io.StringIO()
         def communicate(self, timeout=None):
             calls[-1][1]['timeout'] = timeout
             return json.dumps({'provider': 'runpod', 'machines': [], 'status': 'ok'}), ''

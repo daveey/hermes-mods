@@ -53,7 +53,8 @@ MAX_EXTRA_BYTES = 1 << 20
 
 def _read_pinned(path, digest):
     """Return the bytes of one regular, non-symlink file whose SHA-256 is ``digest``."""
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    flags = (os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+             | getattr(os, 'O_NONBLOCK', 0))
     fd = os.open(path, flags)  # a symlink raises here, so a pin cannot be redirected
     with os.fdopen(fd, 'rb') as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -130,7 +131,7 @@ def load_extra_providers(directory, reserved=(), pins=None):
             label = getattr(module, 'LABEL', None)
             if isinstance(label, str) and label:
                 labels[provider] = label
-        except Exception:
+        except (Exception, SystemExit):
             log.exception('compute-rentals: extra provider %s failed to load', path)
             usable = isinstance(provider, str) and _PROVIDER_ID.fullmatch(provider) and provider not in reserved
             name = provider if usable else Path(filename).stem

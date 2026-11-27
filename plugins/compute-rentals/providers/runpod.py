@@ -79,7 +79,7 @@ class ReadHTTP:
 class BrokerCollector:
     """Credentials live only in a worker subprocess; bounded run and 60-second cache.
 
-    The worker is `<python> -m providers.<module or provider> --worker` (cwd = plugin dir),
+    The worker uses isolated Python with WORKER_BOOTSTRAP and this plugin's directory,
     optionally wrapped by `broker.command` from compute-rentals.yaml, an argv
     prefix such as a secrets manager's `exec ... --` that injects the provider
     API key into the worker's environment ('{provider}' is substituted). With no
@@ -124,7 +124,12 @@ class BrokerCollector:
         finally:
             if proc is not None and proc.poll() is None:
                 proc.kill()
-                proc.communicate()
+                # A non-exec broker wrapper may leave a child holding both pipes.
+                # Reap only our child; draining those pipes has no bounded EOF.
+                proc.wait()
+            if proc is not None:
+                proc.stdout.close()
+                proc.stderr.close()
         self._cached, self._at = out, time.monotonic()
         return copy.deepcopy(out)
 
