@@ -481,23 +481,32 @@ def test_slow_pure_projection_does_not_block_new_peer(api, board, monkeypatch, d
     f.watch(['A', 'B'])
     lane = compose(f, r)
     f.changes(['A', 'B']); drain(lane)
-    entered, release = threading.Event(), threading.Event()
-    project = f.project_board
+    entered, release, acquired = threading.Event(), threading.Event(), threading.Event()
+    project, accept = f.project_board, lane.store.accept_local
+    def accepted(part, prior):
+        result = accept(part, prior)
+        if any(row.get('title') == 'B changed' for row in part.rows.values()):
+            acquired.set()
+        return result
+    monkeypatch.setattr(lane.store, 'accept_local', accepted)
     def slow(store, chat, **kwargs):
         if chat.session_id == 'A':
             entered.set()
-            assert release.wait(5)
+            assert release.wait(15)
         return project(store, chat, **kwargs)
     monkeypatch.setattr(f, 'project_board', slow)
     lane.start_service()
     try:
         conn.execute('UPDATE tasks SET title=? WHERE id=?', ('A changed', a)); conn.commit()
         lane.step()
-        assert entered.wait(2)
+        assert entered.wait(5)
         writer = second if second is not None else conn
         writer.execute('UPDATE tasks SET title=? WHERE id=?', ('B changed', b)); writer.commit()
         lane.step()
-        assert emitted.wait(2), 'slow A projection withheld new B'
+        # Async capture (including two independent boards) precedes projection.
+        # Bound each stage separately, and keep A held throughout both stages.
+        assert acquired.wait(5), 'B source was not acquired while A projected'
+        assert emitted.wait(5), 'slow A projection withheld accepted new B'
         assert not release.is_set()
         assert len(lane.active) <= 2 and set(lane.acquiring) <= {'local', 'external'}
     finally:
