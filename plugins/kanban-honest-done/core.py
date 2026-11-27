@@ -884,12 +884,11 @@ def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
     """Any-position matching unless the WHOLE input proves a data exemption in G."""
     if _shell_commands().exempt_segment(seg):
         return None
-    for k in range(1, len(seg)):
-        if (os.path.basename(seg[k]) == "kanban" and os.path.basename(seg[k - 1]) in ("hermes", "hermes.exe")
-                or seg[k] == "kanban" and seg[k - 1].endswith("hermes_cli.main")):
-            hit = _verb_after(seg, k)
-            if hit:
-                return hit
+    # `hermes [-p X | --profile X | --profile=X | other top-level flags] kanban`: core strips those before dispatch.
+    for k in _load_sibling("comment_branches").kanban_indexes(seg):
+        hit = _verb_after(seg, k)
+        if hit:
+            return hit
     return None
 
 
