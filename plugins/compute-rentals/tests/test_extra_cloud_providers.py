@@ -148,10 +148,17 @@ def test_factories_are_lazy_and_broker_cache_is_process_only(monkeypatch):
     import providers.runpod as shared
     from types import SimpleNamespace
     calls = []
-    def run(argv, **kw):
-        calls.append((argv,kw))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({'provider':'runpod','machines':[], 'status':'ok'}))
-    monkeypatch.setattr(shared.subprocess, 'run', run)
+    class FakePopen:
+        returncode = 0
+        def __init__(self, argv, **kw):
+            calls.append((argv, kw))
+            self.pid = 0
+        def communicate(self, timeout=None):
+            calls[-1][1]['timeout'] = timeout
+            return json.dumps({'provider': 'runpod', 'machines': [], 'status': 'ok'}), ''
+        def poll(self):
+            return 0
+    monkeypatch.setattr(shared.subprocess, 'Popen', FakePopen)
     import tempfile, pathlib
     cfg = pathlib.Path(tempfile.mkdtemp()) / 'cr.json'
     cfg.write_text(json.dumps({'broker': {'command': ['token-broker', 'exec', '--scope', 'user/{provider}', '--']}}))

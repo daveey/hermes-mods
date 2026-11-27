@@ -9,6 +9,21 @@ import time
 from datetime import datetime, timezone
 from .common import machine, money, result, spawn_argv
 
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+# argv: <plugin dir> <module> --worker. Runs under `python -I`, so sys.path gets the plugin dir and nothing inherited.
+WORKER_BOOTSTRAP = ('import runpy, sys; d, m = sys.argv[1:3]; sys.argv = [m] + sys.argv[3:]; '
+                    'sys.path.insert(0, d); runpy.run_module(m, run_name="__main__", alter_sys=True)')
+WORKER_PURPOSE = 'compute-rentals-worker'
+
+
+def register_worker(pid):
+    """Record the credentialed worker in core's spawn ledger (best effort; absent outside a Hermes runtime)."""
+    try:
+        import importlib
+        return bool(importlib.import_module('hermes_cli.process_identity').register_child(pid, WORKER_PURPOSE))
+    except Exception:
+        return False
+
 
 
 def iso(value):
@@ -82,24 +97,34 @@ class BrokerCollector:
         from .config import load_config, worker_python
         cfg = self.config if self.config is not None else load_config()
         prefix = [part.replace('{provider}', self.provider) for part in (cfg.get('broker') or {}).get('command') or []]
-        return prefix + [worker_python(cfg), '-m', 'providers.' + (self.module or self.provider), '--worker']
+        # `-I` ignores PYTHON* variables, the user site and the working directory, so only this plugin's own
+        # providers/ package (put first on sys.path by the bootstrap) is imported by the worker.
+        return prefix + [worker_python(cfg), '-I', '-c', WORKER_BOOTSTRAP, str(PLUGIN_DIR),
+                         'providers.' + (self.module or self.provider), '--worker']
 
     def broker_collect(self):
         if self._cached is not None and time.monotonic() - self._at < 60:
             return copy.deepcopy(self._cached)
+        proc = None
         try:
-            # PYTHONPATH, not cwd=, finds providers/: a cwd forces fork() (see spawn_argv).
-            plugin_dir = str(Path(__file__).resolve().parents[1])
-            pythonpath = os.pathsep.join(p for p in (plugin_dir, os.environ.get('PYTHONPATH')) if p)
-            proc = subprocess.run(spawn_argv(self.worker_argv()), env={**os.environ, 'PYTHONPATH': pythonpath},
-                capture_output=True, text=True, timeout=70, check=False, close_fds=False)
-            if proc.returncode or len(proc.stdout) > 8_000_000:
+            # PYTHONPATH, not cwd=, finds providers/ for a custom worker: a cwd forces fork() (see spawn_argv).
+            # The caller's own PYTHONPATH is never inherited by the credentialed worker.
+            env = {**os.environ, 'PYTHONPATH': str(PLUGIN_DIR)}
+            proc = subprocess.Popen(spawn_argv(self.worker_argv()), env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, close_fds=False)
+            register_worker(proc.pid)
+            stdout, _ = proc.communicate(timeout=70)
+            if proc.returncode or len(stdout) > 8_000_000:
                 raise ValueError()
-            out = json.loads(proc.stdout)
+            out = json.loads(stdout)
             if out.get('provider') != self.provider or not isinstance(out.get('machines'), list):
                 raise ValueError()
         except Exception:
             out = result(self.provider, [], self.scope, ['Credential/runtime inventory read unavailable'])
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
         self._cached, self._at = out, time.monotonic()
         return copy.deepcopy(out)
 
