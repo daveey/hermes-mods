@@ -48,12 +48,12 @@ Read the card's newest comments and runs, the linked PR/CI, and the actual state
 alive? file present? token valid? PR merged?). Many asks are already answered, already done, or about a process
 that no longer exists.
 
-A `⏸ … blocked` notice can be stale on arrival. It quotes its own event's reason and actor (an agent's CLI block
-can read `actor: user`) and can land after a later clear, including your own metadata-only clear, which sends you
-nothing. Compare the notice's reason with the card's newest `blocked` event and `human_request`. If a later event
-superseded it, reuse the existing disposition: return its comment ID to the notifying observer, without another
-waking card comment. For a repeated-park alert, compare the actual questions, intervening decisions and evidence;
-a reused chat fingerprint does not establish an unchanged premise.
+Match a delayed notice to its exact run or stop before acting. Compare failed-run timestamps with the current
+run and newer disposition: a launch failure delivered after a successful replacement is not a new failure.
+For a blocked notice, compare the newest block and human_request; an agent CLI block may say `actor: user`.
+If superseded, return the existing disposition or replacement-run evidence without another waking comment,
+renewal or restart. Successful retry proves resumed execution, not permanent repair. For repeated-park alerts,
+compare the actual questions and intervening decisions; a reused fingerprint does not prove an unchanged premise.
 
 Before writing an ask, look for one that already exists. A decision card the owner filed (named in the newest
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
@@ -99,10 +99,12 @@ Its detector also counts the I/O word ("nonblocking open", O_NONBLOCK), so appro
 code trip it: check each counted point against the head and quote the per-point answers verbatim in the mandate.
 Measure a dollar cap from the comment that set it: sum `usage.cost_usd` over the card's `worker_result` events
 created after that comment. The spend-budget window and older totals start earlier, so they overstate it.
-After promote, confirm a `claimed` event. A card with a PR link in a comment from the last 24 h that stays ready
-after `respawn_guarded` `active_pr` is held by the duplicate-PR guard, because `promoted_manual` is not a handoff.
-Run `hermes kanban resume <id> --reason <why this owner continues THAT PR>`. It records one continuation, and the
-next tick claims the card.
+After a budget grant, inspect actual claim diagnostics: a fresh-window grant can promote while cumulative
+claim accounting still says `spend_budget_exhausted`. Have the recorded owner reconcile the supported budget
+limit against already-counted usage plus the authorized increment; preserve history, then verify worker binding
+and fresh heartbeat, not `ready` or a leftover current_run_id. If `release` says `not_held`, inspect the ledger
+rather than repeat promotion. For `respawn_guarded active_pr`, use `hermes kanban resume <id> --reason <why this
+owner continues THAT PR>` only after observing that exact guard; a PR link alone does not establish it.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
 Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
