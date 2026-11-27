@@ -459,10 +459,10 @@ def wait_target(row, bundle, detail):
         cid = text(ref.get('id'))
         if not cid or cid == row.get('id'):
             continue
-        rec = obj(obj(bundle.get('cards')).get(cid))
+        linked = next((t for t in detail.get('link_tasks') or [] if isinstance(t, dict) and t.get('id') == cid), {})
+        rec = owned_card({**linked, **ref}, bundle)
         hydration = obj(rec.get('detail'))
         task = obj(hydration.get('task'))
-        linked = next((t for t in detail.get('link_tasks') or [] if isinstance(t, dict) and t.get('id') == cid), {})
         dep = {**linked, **task, **ref}
         if not dep.get('title'):
             continue
@@ -479,7 +479,7 @@ def wait_target(row, bundle, detail):
 
 def wait_parents(dep, bundle):
     """Hydrated next hops shared by the wait label and outline; no source reads."""
-    hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
+    hydration = obj(owned_card(dep, bundle).get('detail'))
     if text(obj(dep.get('wait')).get('waiting_on')):
         primary = wait_target(dep, bundle, hydration)
         return [primary] if primary else []
@@ -490,7 +490,7 @@ def wait_parents(dep, bundle):
     linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
     result = []
     for pid in parents:
-        rec = obj(obj(bundle.get('cards')).get(pid))
+        rec = owned_card({'id': pid, **obj(linked.get(pid))}, bundle)
         detail = obj(rec.get('detail'))
         task = {**obj(linked.get(pid)), **obj(detail.get('task'))}
         if not task.get('title') or task.get('status') in TERMINAL:
@@ -739,9 +739,8 @@ def spend_review(row, bundle):
     `reviewing` while the reviewer judges the stop; `escalated` once it handed the stop to the owner. A later
     owner decision (`decision_retained`, ...) ends it. A routing notice after a queued or running review means the
     reviewer was turned off and the stop went to its usual owner: no review then."""
-    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
     routed = False
-    for event in reversed(detail.get('events') or []):
+    for event in reversed(card_events(row, bundle)):
         if not isinstance(event, dict):
             continue
         kind = event.get('kind')
@@ -787,7 +786,7 @@ def agent_hold_text(row, bundle):
         return 'waiting on ' + flat(wait['waiting_on']) + ' · next: ' + flat(wait['next_action'])
     authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
     if authority.get('id'):
-        task = obj(obj(obj(obj(bundle.get('cards')).get(authority['id'])).get('detail')).get('task'))
+        task = obj(obj(owned_card(authority, bundle).get('detail')).get('task'))
         name = clean(task.get('title')) or authority['id']
         status = task.get('status') or authority.get('status') or 'status unknown'
         return f'waiting on the release-authority agent: {name} ({status})'

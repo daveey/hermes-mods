@@ -107,6 +107,91 @@ def test_accepted_legacy_history_survives_serving_defaults(status):
     assert 'review the stopped scope' in row['detail']
 
 
+@pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
+@pytest.mark.parametrize('helper', ['triage_clock', 'agent_hold', 'held_cause', 'wait_reason',
+                                    'spend_review', 'wait_target', 'wait_parents', 'wait_parents_next', 'agent_hold_text'])
+def test_every_history_reader_rejects_foreign_same_id(field, helper):
+    parent = task('t_parent', status='blocked')
+    events = [
+        {'kind': 'decision_retained', 'created_at': NOW - 601,
+         'payload': {'disposition': {'reason': 'scope_stopped', 'summary': 'owner-only reason'}}},
+        {'kind': 'spend_review_escalated', 'created_at': NOW - 1801,
+         'payload': {'reason': 'owner-only review'}},
+    ]
+    detail = {'task': {**parent, field: 'foreign-owner', 'title': 'owner-only title',
+                       'triage_entered_at': NOW - 601}, 'events': events,
+              'links': {'parents': ['t_ancestor']},
+              'link_tasks': [task('t_ancestor', title='owner-only ancestor')]}
+    b = bundle(cards={parent['id']: {'detail': detail}})
+    child = task(status='todo', upstream=parent)
+    hold = task(status='triage', wait={'contained': {'authority': parent}})
+    def read():
+        if helper == 'wait_target':
+            return model.wait_target(child, b, {})
+        if helper == 'wait_parents':
+            return model.wait_parents(parent, b)
+        if helper == 'wait_parents_next':
+            b['cards'][child['id']] = {'detail': {'task': child, 'links': {'parents': [parent['id']]},
+                                                 'link_tasks': [parent]}}
+            return model.wait_parents(child, b)
+        if helper == 'agent_hold_text':
+            return model.agent_hold_text(hold, b)
+        return getattr(model, helper)(parent, b)
+    foreign = read()
+    if helper == 'triage_clock':
+        assert not foreign.get('events')
+    elif helper == 'wait_target':
+        assert foreign == parent  # listed ref survives; foreign supplementary episode does not
+    elif helper == 'wait_parents_next':
+        assert foreign == [parent]
+    elif helper == 'agent_hold_text':
+        assert 'owner-only' not in foreign
+    else:
+        assert not foreign
+    detail['task'][field] = parent[field]
+    owned = read()
+    assert owned
+    if helper == 'wait_target':
+        assert owned['triage_entered_at'] == NOW - 601
+    if helper == 'wait_parents_next':
+        assert owned[0]['triage_entered_at'] == NOW - 601
+    if helper == 'agent_hold_text':
+        assert 'owner-only title' in owned
+
+
+@pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
+@pytest.mark.parametrize('grouped', [False, True])
+def test_foreign_spend_review_cannot_escalate_rows_or_groups(field, grouped):
+    parent = task('t_parent', status='triage')
+    rows = [task(tid, status='todo', upstream=parent) for tid in ('t_child1', 't_child2')] if grouped else [parent]
+    detail = {'task': {**parent, field: 'foreign-owner'}, 'events': [
+        {'kind': 'spend_review_escalated', 'created_at': NOW - 1801,
+         'payload': {'reason': 'owner-only review'}}]}
+    b = bundle(*rows, cards={parent['id']: {'detail': detail}})
+    foreign = model.reduce_panel(b, now=NOW)
+    assert not foreign['sections']['stuck']
+    assert 'owner-only review' not in str(foreign)
+    detail['task'][field] = parent[field]
+    owned = model.reduce_panel(b, now=NOW)
+    assert 'owner-only review' in str(owned)
+    assert owned['groups'][0]['section'] == 'stuck' if grouped else owned['sections']['stuck']
+
+
+def test_group_listed_status_wins_over_hydrated_status():
+    parent = task('t_parent', status='triage')
+    children = [task(tid, status='todo', upstream=parent) for tid in ('t_child1', 't_child2')]
+    b = bundle(*children, cards={parent['id']: {'detail': {'task': {**parent, 'status': 'running'}}}})
+    assert model.reduce_panel(b, now=NOW)['groups'][0]['status'] == 'triage'
+
+
+def test_explicit_triage_timestamp_without_events_is_supported():
+    pytest.importorskip('hermes_cli.kanban_triage_attention')
+    parent = task(status='triage')
+    b = bundle(parent, cards={parent['id']: {'detail': {
+        'task': {**parent, 'triage_entered_at': NOW - 601}}}})
+    assert model.reduce_panel(b, now=NOW)['sections']['stuck'][0]['attention'] == 'triage_overdue'
+
+
 def test_hydration_uses_listed_coordinates_before_serving_defaults():
     # Legacy listed rows omit gateway; the serving identity is only a display default.
     # This detail is compatible with the listed row, but not with the inherited gateway.
