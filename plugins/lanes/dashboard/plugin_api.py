@@ -513,11 +513,9 @@ def _unset_admit_per_day(lane: str) -> None:
     Core's ``set_lane`` treats ``None`` as "unchanged" and has no unset path for this field, so the same
     validated config write is made here and read back; a lane that still carries a value is an error.
     """
-    import copy
     from pathlib import Path
 
-    from hermes_cli.config import atomic_config_replace  # deliberate deletion of one key by omission
-    from hermes_cli.config_backend import read_config_doc_readonly
+    from hermes_cli.config_backend import write_config_key
     from hermes_constants import get_default_hermes_root
 
     _kbc, lanes, _cli = _need_core()
@@ -525,12 +523,10 @@ def _unset_admit_per_day(lane: str) -> None:
     if pol is None or lane not in pol.lanes:
         raise ValueError(f"unknown lane: {lane}")
     path = Path(get_default_hermes_root()) / "config.yaml"
-    doc = copy.deepcopy(read_config_doc_readonly(path))
-    spec = doc["kanban"]["admission"]["lanes"]
-    if isinstance(spec.get(lane), dict):
-        spec[lane].pop("admit_per_day", None)
-    lanes.parse(doc["kanban"]["admission"])  # refuse a mapping the policy would reject
-    atomic_config_replace(path, doc)
+    # A key-scoped mutation preserves settings written after the policy read.
+    # Escape literal lane-name dots rather than interpreting them as nested keys.
+    key = lane.replace("\\", "\\\\").replace(".", "\\.")
+    write_config_key(path, f"kanban.admission.lanes.{key}.admit_per_day", None)
     after = lanes.policy()
     if after is None or lane not in after.lanes or after.lanes[lane].admit_per_day is not None:
         raise HTTPException(status_code=409, detail="admit_per_day was not cleared (read-back still shows a value)")

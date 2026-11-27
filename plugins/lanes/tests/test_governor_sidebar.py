@@ -60,6 +60,43 @@ def test_admit_per_day_write_and_next_snapshot(board, api, monkeypatch):
     assert body['lanes']['babybear']['admit_per_day'] == 17
 
 
+def test_clear_admit_per_day_preserves_concurrent_setting(board, api, monkeypatch):
+    from hermes_cli import config_backend
+    from utils import load_yaml_file_readonly
+    monkeypatch.setattr(lanes, '_human_shell', lambda: True)
+    config(board)
+    api.change('babybear', {'admit_per_day': 17})
+    path = board / 'config.yaml'
+    original_write = config_backend.write_config_key
+    original_replace = config_backend.write_config_document
+    injected = []
+
+    def concurrent_setting():
+        if not injected:
+            injected.append(True)
+            original_write(path, 'display.concurrent_setting', 'keep me')
+
+    # Inject immediately before either writer's commit boundary: the old whole-document
+    # replacement drops this key; a key-scoped unset never carries a stale document.
+    def write_key(*args, **kwargs):
+        concurrent_setting()
+        return original_write(*args, **kwargs)
+
+    def write_document(*args, **kwargs):
+        concurrent_setting()
+        return original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(config_backend, 'write_config_key', write_key)
+    import hermes_cli.config as core_config
+    monkeypatch.setattr(core_config, 'write_config_document', write_document)
+    api._unset_admit_per_day('babybear')
+    written = load_yaml_file_readonly(path)
+    assert injected
+    assert written['display']['concurrent_setting'] == 'keep me'
+    assert 'admit_per_day' not in written['kanban']['admission']['lanes']['babybear']
+    assert view(api)['lanes']['babybear']['admit_per_day'] is None
+
+
 def test_pool_and_recovery_sidebar(board, api, monkeypatch, tmp_path):
     config(board)
     cfg = json.loads(board.joinpath('config.yaml').read_text())

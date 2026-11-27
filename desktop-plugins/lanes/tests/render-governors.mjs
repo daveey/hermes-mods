@@ -70,7 +70,7 @@ try {
     assert.match(text(totals), /0 held/)
   } else if (scenario === 'overlap') {
     // Charged once, to placement (a fault): can't-start chip, counted for you, not held.
-    const placement = pane.container.querySelectorAll('[data-lane-hold="placement"]')
+    const placement = pane.container.querySelectorAll('[data-lane-hold="fault"]')
     assert.equal(placement.length, 1)
     assert.match(text(placement[0]), /1 can't start/)
     assert.equal(pane.container.querySelector('[data-fleet-governor="llm_pool"]'), null, 'overlap must not be charged again')

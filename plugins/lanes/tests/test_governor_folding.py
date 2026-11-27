@@ -198,3 +198,30 @@ def test_fleet_stop_needs_a_stopped_safety_governor_not_a_capped_fleet_dial():
     capped = gov.project([snap('main', [row('host_slots', 3, reading=1, threshold=1)], 3)],
                          [], REGISTRY)
     assert capped['fleet_stop'] is False and capped['fleet'][0]['id'] == 'host_slots'
+
+
+def test_exact_held_navigation_contains_only_dials_with_source_board_and_session():
+    ids = ['lane_gate', 'host_slots', 'schedule', 'dependencies', 'unassigned', 'spend_budget', 'core_update_drain']
+    charges = {f't{i}': dict(governor=ident) for i, ident in enumerate(ids)}
+    cards = [dict(id=f't{i}', board='main', lane='alpha', step='ready', reason='slot',
+                  source=dict(kind='session', id=f'chat{i}')) for i in range(len(ids))]
+    result = gov.project([snap('main', [row(ident, 1, **({'scope': 'alpha'} if ident == 'lane_gate' else {}))
+                                      for ident in ids], len(ids), cards=charges)], cards, REGISTRY)
+    lane = project_view(result, cards)['lanes']['alpha']
+    assert lane['governor_held'] == 2
+    assert lane['held_cards'] == [dict(board='main', id='t0'), dict(board='main', id='t1')]
+    assert lane['held_sessions'] == ['chat0', 'chat1']
+
+
+def test_flow_failure_nulls_waits_only_for_affected_lane_and_recovers():
+    cards = [dict(id='t1', board='main', lane='alpha', step='waiting', reason='dep'),
+             dict(id='t2', board='main', lane='beta', step='waiting', reason='time')]
+    result = gov.project([snap('main', [], 0, lanes=['alpha', 'beta'])], cards, REGISTRY)
+    raw = raw_for(result, cards)
+    raw.update(flow_complete=False, incomplete_status_lanes=['alpha'])
+    partial = view.project(dict(lanes={'alpha': dict(open=1), 'beta': dict(open=1)}), raw, False)
+    assert partial['lanes']['alpha']['waits'] == dict.fromkeys(view.WAITS)
+    assert partial['lanes']['beta']['waits'] == dict(parents=0, scheduled=1, deploy_ci=0, triage=0)
+    raw.update(flow_complete=True, incomplete_status_lanes=[])
+    recovered = view.project(dict(lanes={'alpha': dict(open=1), 'beta': dict(open=1)}), raw, False)
+    assert recovered['lanes']['alpha']['waits'] == dict(parents=1, scheduled=0, deploy_ci=0, triage=0)
