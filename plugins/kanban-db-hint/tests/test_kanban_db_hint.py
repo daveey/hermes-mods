@@ -1,6 +1,8 @@
 """kanban-db-hint: a Kanban tool result that refuses a "corrupt" or unreliable board gets one actionable hint."""
 import importlib.util
 import json
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -146,3 +148,76 @@ def test_missing_card_idempotent():
     once = hint.transform_tool_result(tool_name="kanban_show", args={}, result=REAL_MISSING)
     assert hint.transform_tool_result(tool_name="kanban_show", args={}, result=once) is None
     assert once.count(hint.MARK) == 1
+
+
+def test_corruption_quotes_are_not_diagnostics():
+    for data in (
+        {"task": {"body": json.loads(REAL_CORRUPT)["error"]}},
+        {"comments": [json.loads(REAL_CORRUPT)["error"]]},
+        {"error": "read failed", "body": json.loads(REAL_CORRUPT)["error"]},
+        [json.loads(REAL_CORRUPT)["error"]],
+    ):
+        assert hint.transform_tool_result("kanban_show", {}, json.dumps(data)) is None
+
+
+def test_corruption_error_does_not_take_path_from_neighbor_field():
+    data = {"error": "KanbanDbUnreliableViewError: read failed",
+            "body": "kanban DB at /x/owned.db"}
+    out = json.loads(hint.transform_tool_result("kanban_show", {}, json.dumps(data)))
+    assert "/x/owned.db" not in out["hint"]
+    assert out["error"] == data["error"]
+
+
+def test_shell_path_remains_one_argument():
+    for path in ("/x/a;touch${IFS}marker.db", "/x/a$(id).db", "/x/a'b.db", "/x/a b.db"):
+        assert shlex.split(hint.check_command(path)) == ["sqlite3", "-readonly", path, "pragma quick_check"]
+
+
+def test_check_command_in_real_shell_uses_inert_recorder(tmp_path, monkeypatch):
+    # No database engine or SQL is executed: this replacement only prints argv.
+    recorder = tmp_path / "sqlite3"
+    recorder.write_text(f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+    recorder.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    marker = tmp_path / "unexpected.db"
+    paths = (f"/x/a; /usr/bin/touch {marker}",
+             f"/x/$(/usr/bin/touch {marker}).db", "/x/a'b.db", "/x/a b.db")
+    for path in paths:
+        result = subprocess.run(["/bin/sh", "-c", hint.check_command(path)],
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == ["-readonly", path, "pragma quick_check"]
+        assert not marker.exists()
+
+
+def test_hint_does_not_claim_approval_authority():
+    assert "needs no approval" not in hint.hint_text(json.loads(REAL_CORRUPT)["error"])
+
+
+def test_plain_text_quoted_corruption_is_not_diagnostic():
+    raw = "A comment quoted: " + json.loads(REAL_CORRUPT)["error"]
+    assert hint.transform_tool_result("kanban_show", {}, raw) is None
+
+
+def test_shell_and_markdown_path_payload_not_recommended():
+    for path in ("/x/a;touch${IFS}marker.db", "/x/`id`.db", "/x/$(id).db"):
+        raw = f"Refusing to open corrupt kanban DB at {path}: bad"
+        out = hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw}))
+        assert path not in json.loads(out)["hint"]
+
+
+def test_db_path_at_end_of_diagnostic_is_preserved():
+    raw = "Refusing to open corrupt kanban DB at /x/kanban.db"
+    data = json.loads(hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw})))
+    assert data["error"] == raw
+    assert "sqlite3 -readonly /x/kanban.db 'pragma quick_check'" in data["hint"]
+    assert "<board db>" not in data["hint"]
+
+
+def test_db_sidecar_and_backup_suffixes_do_not_guess_live_path():
+    for suffix in (".corrupt.bak", "-wal", "-shm"):
+        raw = f"Refusing to open corrupt kanban DB at /x/kanban.db{suffix}: bad"
+        data = json.loads(hint.transform_tool_result("kanban_show", {}, json.dumps({"error": raw})))
+        assert data["error"] == raw
+        assert "<board db>" in data["hint"]
+        assert "/x/kanban.db" not in data["hint"]

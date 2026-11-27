@@ -522,6 +522,7 @@ def embeddings(body: dict, *, get_key: Optional[Callable[[], str]] = None, post:
 
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import ipaddress
     pools: dict = {}
     lock = threading.Lock()
 
@@ -532,6 +533,23 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
             return pools[p]
 
     class H(BaseHTTPRequestHandler):
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            # No browser callers: Origin includes "null" and empty values. Host
+            # must name the actual bound loopback socket, never a DNS alias or a
+            # client/forwarded header. Check before reading a body or loading pools.
+            address, bound_port = self.server.server_address[:2]
+            authority = f"[{address}]:{bound_port}" if ":" in address else f"{address}:{bound_port}"
+            if (not ipaddress.ip_address(address).is_loopback
+                    or self.headers.get_all("Host", []) != [authority]
+                    or self.headers.get_all("Origin") is not None):
+                self.close_connection = True
+                self._send(403, {"error": {"type": "permission_error",
+                                          "message": "local non-browser requests only"}})
+                return False
+            return True
+
         def log_message(self, fmt, *args):
             sys.stderr.write("pool-llm: " + (fmt % args) + "\n")
 

@@ -12,7 +12,7 @@ const pw = join(homedir(), '.cache/ms-playwright')
 const playwrightChrome = existsSync(pw) ? readdirSync(pw).filter(d => d.startsWith('chromium-')).map(d => join(pw, d, 'chrome-linux64/chrome')) : []
 const CHROME = [process.env.CHROME_BIN, '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium',
   '/usr/bin/chromium-browser', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ...playwrightChrome].find(p => p && existsSync(p))
-const WIDTHS = [480, 360, 280]
+const WIDTHS = [480, 360, 280, 232, 212]
 
 const P = await loadPlugin({ SIDEBAR_SECTIONS_TOP_AREA: 'sidebar.sections.top', SIDEBAR_SECTIONS_AREA: 'sidebar.sections', SESSION_FILTER_AREA: 'sidebar.filter' })
 const T0 = Date.UTC(2026, 10, 27, 0, 0) / 1000
@@ -21,11 +21,11 @@ const cells = Array.from({ length: 48 }, (_, i) => ({ t: T0 + i * 1800, state: i
 const lane = (name, i) => ({ share: 20, actual: .2, target: .3, status: { run: 2, you: 1 }, governor_held: 0, not_ready: 3,
   top_reason: i ? 'waiting on a long reason that must truncate' : '', limits: { max_workers: 4 }, boards: ['a'],
   spend: { hour: 123.45, day: 1234.5, week: 98765.43 }, ticks: { window: '24h', bucket_s: 1800, cap: 4, cells, previews: {} } })
-const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes']
-const snap = { configured: true, fleet_slots: 6, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
+const names = ['babybear-long-lane-name', 'games', 'askeve', 'hermes', 'overcap']
+const snap = { configured: true, fleet_slots: 39, status: { run: 12345, you: 678 }, totals: { not_ready: 9999 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
   governors: { idle_total: 31, rows: [], counts: { on: 1, off: 8 } },
-  lanes: Object.fromEntries(names.map((n, i) => [n, lane(n, i)])) }
+  lanes: Object.fromEntries(names.map((n, i) => [n, n === 'overcap' ? { ...lane(n, 0), status: { run: 6, you: 0 }, limits: { max_workers: 2 }, ticks: { ...lane(n, 0).ticks, cap: 2 } } : lane(n, i)])) }
 
 test('compact sidebar: 38px two-line rows, no overflow/wrap, day-only at 360, toolbar+totals fit', { skip: !CHROME && !process.env.CI && 'no Chrome' }, async () => {
   assert.ok(CHROME, 'CI must provide Chrome for the compact layout test')
@@ -54,6 +54,13 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
       costScrollOverflow: cost.scrollWidth > cost.clientWidth + .5,
       cost: ['h', 'd', 'w'].map(k => vis(cost.querySelector('.lanes-cost-' + k))),
       tickH: Math.round(r(row.querySelector('.lanes-ticks')).height), slotsH: Math.round(r(row.querySelector('.lanes-slots')).height),
+      chartOverflow: [...row.querySelector('.lanes-row-chart').querySelectorAll('*')].filter(k => vis(k) && !['defs','pattern','rect','title','g'].includes(k.tagName) && !inside(r(k), r(row.querySelector('.lanes-row-chart')))).map(k => k.className.baseVal ?? k.className),
+      pipPaint: [...row.querySelectorAll('.lanes-pips i')].map(p => { const c = getComputedStyle(p), run = p.dataset.run === '1', open = p.dataset.open === '1'
+        const want = run ? (open ? 'rgb(14, 165, 233)' : 'rgb(239, 68, 68)') : null
+        return { state: run ? (open ? 'running' : 'overcap') : (open ? 'idle' : 'closed'), bg: c.backgroundColor, sh: c.boxShadow, want } })
+        .filter(p => p.want ? !(p.bg === p.want && p.sh.startsWith(p.want)) : (p.state === 'idle' && (p.bg !== 'rgba(0, 0, 0, 0)' || !p.sh.startsWith('rgb(59, 66, 82)')))),
+      pipStates: [...new Set([...row.querySelectorAll('.lanes-pips i')].map(p => p.dataset.run + p.dataset.open))],
+      pipRunCount: row.querySelectorAll('.lanes-pips i[data-run="1"]').length,
       tickAbovePips: r(row.querySelector('.lanes-ticks')).bottom <= r(row.querySelector('.lanes-slots')).top + .5,
       nameLeftOfChart: r(row.querySelector('.lanes-row-name')).right <= r(row.querySelector('.lanes-row-chart')).left + .5,
       chartLeftOfCost: r(row.querySelector('.lanes-row-chart')).right <= r(cost).left + .5 }
@@ -82,9 +89,14 @@ document.title = JSON.stringify(${JSON.stringify(WIDTHS)}.map(w => {
         assert.ok(Math.abs(row.h - 38) <= 1, 'row ~38px: ' + id)
         assert.deepEqual(row.kidOverflow, [], 'row child overflows row: ' + id)
         assert.deepEqual(row.deepOverflow, [], 'row descendant overflows row: ' + id)
+        assert.deepEqual(row.chartOverflow, [], 'chart descendant overlaps sibling column: ' + id)
         assert.ok(!row.nameWrapped && !row.chipWrapped && row.costWrapped.length === 0 && !row.costScrollOverflow, 'wrapping/overflow: ' + id)
         assert.equal(row.tickH, 14, 'chart ticks 14px: ' + id)
         assert.ok(row.tickAbovePips, 'ticks on top, pips below: ' + id)
+        if (row.name === 'overcap') assert.ok(['11', '10'].every(k => row.pipStates.includes(k)), 'overcap lane shows running and over-cap pips: ' + id)
+        else assert.ok(['11', '01'].every(k => row.pipStates.includes(k)), 'lane shows running and idle pips: ' + id)
+        assert.ok(row.pipRunCount > 0, 'fixture has running pips: ' + id)
+        assert.deepEqual(row.pipPaint, [], 'running/over-cap pip outline must match its fill, not grey over it: ' + id)
         assert.ok(row.nameLeftOfChart && row.chartLeftOfCost, 'columns ordered name | chart | cost: ' + id)
         if (r.w <= 360) assert.deepEqual(row.cost, [false, true, false], 'only day visible at <=360: ' + id)
         else assert.deepEqual(row.cost, [true, true, true], 'hour/day/week visible above 360: ' + id)

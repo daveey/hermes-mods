@@ -34,6 +34,8 @@ class Base(unittest.TestCase):
         self.grants = set()
 
     def tearDown(self):
+        for call_id, tool in list(core._staged):
+            core.finish(tool_name=tool, tool_call_id=call_id)
         self._td.cleanup()
 
     def approved(self, session, key):

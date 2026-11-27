@@ -205,8 +205,8 @@ class State:
         if not cid or who["trusted"] or cid == who["channel"]:
             return True, ""
         info = self.channel_info(cid)
-        if info.get("private"):
-            return False, ("that is a private conversation; its content can only be read from inside it "
+        if info.get("private") or info.get("unknown"):
+            return False, ("that is a private or unverified conversation; its content can only be read from inside it "
                            "or by an admin")
         return True, ""
 
@@ -700,6 +700,8 @@ def tool_api(state: State, args: dict, **_) -> str:
             params = json.loads(params)
         except ValueError:
             return _out({"error": "params must be a JSON object"})
+    if not isinstance(params, dict):
+        return _out({"error": "params must be a JSON object"})
     if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.]+", method):
         return _out({"error": "method must look like conversations.history"})
     if method == "conversations.join":
@@ -708,6 +710,22 @@ def tool_api(state: State, args: dict, **_) -> str:
     ch = core.target_channel(params)
     pol = state.store.policy()
     if tier == core.READ:
+        if not who["trusted"]:
+            scoped = method in core.CHANNEL_READS
+            if method == "reactions.get":
+                # Slack selects the file variant when file/file_comment is supplied.
+                scoped = bool(params.get("timestamp")) and not any(
+                    params.get(key) for key in ("file", "file_comment"))
+            if method not in core.METADATA_READS:
+                if not scoped:
+                    return _out({"error": "this API cannot constrain private content to a conversation; "
+                                          "use a channel-scoped read or ask an admin"})
+                canonical = "channel_id" if method == "bookmarks.list" else "channel"
+                if (not re.fullmatch(r"[CGD][A-Z0-9]+", ch)
+                        or params.get(canonical) != ch
+                        or any(params.get(key) not in (None, "", ch)
+                               for key in ("channel", "channel_id", "channels"))):
+                    return _out({"error": "a channel-scoped read requires one channel id"})
         ok, why = state.can_read(ch, who)
         if not ok:
             return _out({"error": why})
@@ -764,10 +782,12 @@ SCHEMAS = {
                      "description": "names or ids; [\"*\"] = every public channel not joined yet"},
         "reason": {"type": "string", "description": "why — shown to the admins"}}, ["channels"]),
     "slack_api": ("Call any Slack Web API method with the bot token (e.g. conversations.history, "
-                  "conversations.replies, users.info, search.messages, assistant.search.context, "
-                  "reactions.add, pins.add, bookmarks.add, canvases.create, conversations.setTopic). Reads "
-                  "are free except other private conversations; posting/reacting is free in the current "
-                  "conversation; anything else or admin-type methods (topic/rename/archive/invite/kick/"
+                  "conversations.replies, users.info, reactions.add, pins.add, bookmarks.add, "
+                  "canvases.create, conversations.setTopic). Metadata and channel-scoped reads are "
+                  "allowed except other private conversations. Search, files and unscoped content "
+                  "reads require a trusted operator; adding a channel does not authorize them. "
+                  "Posting/reacting is free in the current conversation; anything else or admin-type "
+                  "methods (topic/rename/archive/invite/kick/"
                   "usergroups/profile) needs an admin's approval, requested automatically.", {
         "method": {"type": "string"},
         "params": {"type": "object", "description": "method arguments as JSON"},
