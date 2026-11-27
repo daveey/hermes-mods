@@ -64,6 +64,29 @@ models. Choices requiring free text, withdrawal and delivery Check status/Retry
 remain available in user-steps' compact companion queue without duplicate tiles.
 Open card uses the existing owner-qualified session-tasks connection mapping.
 
+## One session-status frame
+
+The panel owns one bounded frame (`PANEL_MAX_HEIGHT`, 55vh) in the composer-top
+area: a non-scrolling header (status dot, label, pips and the collapse caret) and
+one internally scrolling body (`overscroll-behavior: contain`). The body holds the
+model's rows **and** user-steps' companion queue (`window.__userSteps.ActionQueue`,
+read every render so a late or hot-reloaded user-steps attaches exactly once). The
+user-steps composer slot shows only the explicit missing-panel error (panel never
+loaded, or loaded but not mounted for this chat via `__sessionPanel.hostsQueue`).
+Collapsing removes the rows and every ask the header still counts. The body stays
+visible for what the header does not count: delivery Check status / Retry, an ask
+the model omits and a queue error stay on screen, still inside the bounded body.
+A chat with no rows and nothing in the queue paints nothing (`data-panel-frame="idle"`,
+no padding or border) while the companion stays mounted and polling.
+
+The panel passes the companion a per-render `coverage`: the exact
+`[gateway, profile, request id] → revision` asks it drew with options, plus what a
+collapsed header still counts. The companion omits an ask's options only for that
+exact coverage; otherwise the row says why (`data-ask-coverage`: loading,
+unsupported, empty, omitted, unmounted) instead of standing as a bare title.
+Registration, `covers()` or a cached model alone is never coverage.
+`frame.browser.test.mjs` checks the real layout in owned headless Chromium.
+
 ## Feed transport
 
 Desktop registers the focused chat, recent chats and active sidebar chats with

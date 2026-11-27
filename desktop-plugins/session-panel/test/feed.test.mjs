@@ -93,14 +93,17 @@ for (const why of ['404', 'profile_unsupported']) test(`unsupported feed renders
  reply = () => { if (why === '404') throw Error('404: Not Found'); return { profile_unsupported: true } }
  await m.feedCatchUp(target())
  const panel = m.Panel()
- assert.equal(panel.props.role, 'alert')
- assert.match(panel.props.children, /isn't served for profile default on C1/)
+ // The alert sits in the panel's bounded frame body, beside the (here absent) decision companion.
+ assert.equal(panel.props['data-panel-frame'], 'bare')
+ const alert = panel.props.children.props.children[0]
+ assert.equal(alert.props.role, 'alert')
+ assert.match(alert.props.children, /isn't served for profile default on C1/)
  assert.ok(!JSON.stringify(panel).includes('taking longer'))
  assert.equal(m.covers(route()), false)
  assert.equal(m.covers(route('S1', 'C2')), false, 'no model on another gateway')
  m.ingestBundle('C1', 'default', bundle())
  assert.equal(m.covers(route()), false, 'unsupported feed overrides old cached data')
- assert.equal(m.Panel().props.role, 'alert')
+ assert.equal(m.Panel().props.children.props.children[0].props.role, 'alert')
  m.ingestBundle('C2', 'work', bundle())
  assert.equal(m.covers(route('S1', 'C2', 'work')), true, 'coverage is route-qualified')
  await m.feedCatchUp(target(), { nowMs: Date.now() + 11 * 60_000 })

@@ -56,6 +56,39 @@ the readout without network reads or model revisions. Missing estimates show
 producer's estimate source. Older payloads lacking a park timestamp retain pips.
 Double-clicking the readout retains the owner-qualified Open card action.
 
+## Recorded waiting prerequisite
+
+Scheduled/blocked rows may expose `wait_reason` and `wait_next_actor` strings.
+They project the owner's canonical wait annotation (`prerequisite`, `next_actor`),
+not an execution permission or a second persisted reason store. Core derives the
+annotation from existing `awaiting` and wake-check evidence. A probe watch's
+`watching` list names recorded card IDs; it does not invent titles, owner coordinates,
+or navigation actions for those IDs. The existing hierarchy/actions remain authoritative.
+Supplementary id-keyed card hydration and event reasons are rejected when their
+known gateway, board or profile conflicts with the row. Serving gateway aliases
+remain equivalent; omitted legacy coordinates do not manufacture a new owner.
+Legacy clock reasons are read only from a balanced parenthesized suffix; extra
+trailing text remains in Details. Invalid clock dates render reason unavailable,
+and non-finite backstop values do not assert an event watch.
+
+Clock detail lines put a concise prerequisite before the elapsed/countdown text.
+`backstop_at` distinguishes a timed fallback from the actual watched producer.
+Reason clipping never clips the timer or owner location; the row may exceed the
+ordinary phrase budget to retain them. Details retain the bounded full reason,
+next actor, and separately labelled next check. Older cores retain a label-only
+compatibility path; absent reasons explicitly say `reason unavailable`. An older
+core records no next actor, so the row omits `wait_next_actor` and Details say
+`Next actor: unknown (the park recorded none)`: its label cannot tell a plain
+timer from an event watch with a clock backstop. An older core also cut the why
+at 80 characters; when that cut leaves nested parentheses unbalanced the row
+conservatively says reason unavailable, and the producer's wording stays in the
+`Waiting on:` Details line.
+Unknown/stale evidence does not attest a current reason or next actor; it
+withdraws exactly the park's own Details lines, so an independent dispatcher
+diagnostic's `Next actor:` line on a ready row is never removed with them. Recovery
+out of the park clears these fields. Relative ticks still use wire templates,
+not semantic revisions or network reads.
+
 ## Relative display text
 
 The feed calls `reduce_panel(..., wire=True)`. A row (or its `decision`)
