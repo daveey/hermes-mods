@@ -18,6 +18,7 @@ reassignment/unset. Local child shells inherit the analyzed working directory; l
 resolve against the supplied cwd and literal/alias `cd` targets. Conditional `cd`
 and a `cd` not followed by `&&` retain prior and target directories (up to 32,
 then refusal), including across nested shells; `||` retains the prior directory.
+Failed `cd` contexts also rejoin after a success-gated `&&` chain ends.
 `pushd`/`popd` and `env -C` directory changes are not tracked. Remote initial cwd
 remains unknown: although ordinary sshd starts in the user's home, forced commands,
 server wrappers and shell initialization can change it, so explicit home/absolute

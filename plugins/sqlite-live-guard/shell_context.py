@@ -248,20 +248,27 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     text, bodies = _heredocs(text)
     blocks, rhs = 0, False
     scopes, braces, pipeline = [], [], None
+    failed_cd = []
     segments = list(_raw_segments(text))
     for index, raw in enumerate(segments):
         budget.spend(1)
         if raw in (["&&"], ["||"]):
+            if raw == ["||"] and failed_cd:
+                in_home = guard.merge_directory_contexts(in_home, *failed_cd)
+                failed_cd = []
             rhs = True
             continue
         if raw == ["("]:
-            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks))
+            scopes.append((dict(env), set(exported), set(readonly), in_home, blocks, list(failed_cd)))
             continue
         if raw == [")"]:
             if scopes:
-                env, exported, readonly, in_home, blocks = scopes.pop()
+                env, exported, readonly, in_home, blocks, failed_cd = scopes.pop()
             continue
         if raw in ([";"], ["\n"], ["&"], ["|"]):
+            if failed_cd:
+                in_home = guard.merge_directory_contexts(in_home, *failed_cd)
+                failed_cd = []
             if raw != ["|"] and pipeline is not None:
                 env, exported, readonly, in_home = pipeline
                 pipeline = None
@@ -349,6 +356,10 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
                     next_home = in_home
                 elif following != ["&&"]:
                     next_home = guard.merge_directory_contexts(in_home, next_home)
+                else:
+                    # Success gates this RHS only; failure rejoins at the next
+                    # list/OR boundary, even after other commands in the chain.
+                    failed_cd = [guard.merge_directory_contexts(*failed_cd, in_home)]
             next_contexts.append(next_home)
         in_home = guard.merge_directory_contexts(*next_contexts)
         if raw[i] == "unset" and not conditional:
