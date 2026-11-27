@@ -206,15 +206,19 @@ def finish_send(base: Path, rid: str, result: dict | None = None) -> None:
     """A definite no-delivery releases the key; uncertain/in-flight sends remain pending."""
     if not (base / "send-dedupe.json").exists():
         return
-    with _send_ledger(base) as ledger:
-        for identity, entry in list(ledger.items()):
-            if entry["request_id"] != rid:
-                continue
-            if result is None or (result.get("ok") is False and
-                                  (result.get("delivered") is False or result.get("retry_safe") is True)):
-                del ledger[identity]
-            elif result.get("delivered") is True or (result.get("ok") is True and result.get("status") in ("queued", "delivered", "completed")):
-                entry["state"] = result.get("status") or "delivered"
+    try:
+        with _send_ledger(base) as ledger:
+            for identity, entry in list(ledger.items()):
+                if entry["request_id"] != rid:
+                    continue
+                if result is None or (result.get("ok") is False and result.get("retry_safe") is True):
+                    del ledger[identity]
+                elif result.get("delivered") is True or (result.get("ok") is True and result.get("status") in ("queued", "delivered", "completed")):
+                    entry["state"] = result.get("status") or "delivered"
+    except Exception:
+        # Settlement is shared by unkeyed sends, reads and terminal requests too.
+        # Keep the old pending reservation on failure; queue_send still fails closed.
+        log.warning("session-mentions: dedupe settlement failed for %s; retaining uncertainty", rid, exc_info=True)
 
 
 def device_info() -> dict:
@@ -404,7 +408,8 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         except Exception:
             continue
         if now - float(req.get("created_at") or now) > float(req.get("ttl") or 600):
-            write_result(req.get("id"), {"ok": False, "error": "request expired before the Desktop picked it up"}, base)
+            write_result(req.get("id"), {"ok": False, "delivered": False, "retry_safe": True,
+                                       "error": "request expired before the Desktop picked it up"}, base)
             continue
         if device:
             # Which Desktop took it, running which plugin.js: the trail for "who answered that?".
