@@ -482,6 +482,14 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
         spec.loader.exec_module(plugin)
         self.isolate_overlap(plugin)
         hooks = {}
+        # CI advances synchronously here; detached retries have separate tests.
+        loader = plugin._load_sibling
+        def synchronous_loader(file):
+            module = loader(file)
+            if file == 'skill_publish.py':
+                module.spawn_worker = lambda *_: None
+            return module
+        plugin._load_sibling = synchronous_loader
         class Context:
             def register_hook(self, name, fn):
                 hooks[name] = fn
@@ -493,8 +501,8 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
                     with self.assertLogs(plugin.logger, level='INFO') as skipped:
                         hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file'},
                             result={'success': True, 'path': str(self.target)}, status='ok')
-                self.assertEqual(len(skipped.output), 1)
-                self.assertIn('latest main CI ' + expected, skipped.output[0])
+                self.assertIn('latest main CI ' + expected, '\n'.join(skipped.output))
+                self.assertIn('skill publication dirt', '\n'.join(skipped.output))
                 self.assertEqual(self.target.read_text(), 'published\n')
                 self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
             with self.assertLogs(plugin.logger, level='INFO') as logs:
@@ -502,8 +510,7 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
                     'name': 'sample', 'file_path': 'SKILL.md'},
                     result=json.dumps({'success': True, 'path': str(self.target)}),
                     task_id='card-example', session_id='session-example', status='ok')
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("'status': 'published'", logs.output[0])
+        self.assertIn("'status': 'published'", '\n'.join(logs.output))
         self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
         self.assert_no_worktrees()
 
@@ -556,7 +563,7 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
                 hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file'},
                     result={'success': True, 'path': str(self.target)},
                     task_id='card-example', session_id='session-desktop', status='ok')
-            self.assertIn("'status': 'skipped'", logs.output[0])
+            self.assertIn("'status': 'skipped'", '\n'.join(logs.output))
             # Still running: nothing is published while the tip's CI is in progress.
             self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
             self.assertEqual(self.target.read_text(), 'published\n')
@@ -592,7 +599,7 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
         clock = [1000.0]
         with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
                                     'PUBLISH_CI_STATE': str(state)}):
-            # In progress, then red: the record is dropped and nothing is published.
+            # In progress, then red: held until deadline; nothing is published.
             state.write_text('in_progress null\n')
             publisher.defer(self.root, [self.path], session_id='s', task_id='c', spawn=False,
                             clock=lambda: clock[0])
@@ -601,8 +608,8 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
                                                      passes=1)['kept'], 1)
             state.write_text('completed failure\n')
             done = publisher.retry_pending(pending, interval=0, clock=lambda: clock[0], passes=1)
-            self.assertEqual(done['dropped'], 1)
-            self.assertEqual(list(pending.glob('*.json')), [])
+            self.assertEqual(done['kept'], 1)
+            self.assertEqual(len(list(pending.glob('*.json'))), 1)
             self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
             # Still in progress past the window: expired, never published.
             state.write_text('in_progress null\n')
@@ -632,7 +639,7 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
                 hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file'},
                     result={'success': True, 'path': str(self.target)}, status='ok')
             self.assertIn('lock busy', logs.output[0])
-            self.assertIn("'deferred'", logs.output[0])
+            self.assertIn("'deferred'", '\n'.join(logs.output))
             self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
             fcntl.flock(holder, fcntl.LOCK_UN)
             self.assertTrue(self.wait_for(
