@@ -57,6 +57,24 @@ def test_board_and_owner_identity_survive_attention_projection(api):
     assert all(link['chat_session'] == 'kanban_owner_terminal' for link in row['links'])
 
 
+def test_created_and_shepherd_links_to_one_chat_render_once(api):
+    hr = {'action': 'Choose', 'why_human': 'Only you', 'interaction': 'reply',
+          'scope': 'This card', 'evidence': 'Choice needed'}
+    with closing(sqlite3.connect(':memory:')) as db:
+        db.row_factory = sqlite3.Row
+        db.execute('CREATE TABLE task_chat_links(task_id,chat_gateway,chat_profile,chat_session,kind,released)')
+        db.executemany('INSERT INTO task_chat_links VALUES (?,?,?,?,?,?)',
+                       [('ask', 'edge', 'default', 'chat', 'created', 0),
+                        ('ask', 'edge', 'default', 'chat', 'shepherd', 0),
+                        ('ask', 'edge', 'default', 'other', 'shepherd', 0)])
+        result = api._attention_module().project(
+            [{'id': 'ask', 'reason': 'you', 'attention': {
+                'id': 'ask', 'status': 'blocked', 'human_request': hr}, 'lane': 'work'}],
+            SimpleNamespace(connection=lambda _: db))
+    row, = result['rows']
+    assert [link['chat_session'] for link in row['links']] == ['chat', 'other']
+
+
 def test_missing_membership_never_invents_unlinked_rows(api):
     with closing(sqlite3.connect(':memory:')) as db:
         row = {'id': 'ask', 'status': 'blocked', 'human_request': {

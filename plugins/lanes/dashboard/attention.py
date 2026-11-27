@@ -35,10 +35,12 @@ def project(cards, evidence, *, board=None):
         db = evidence.connection(card['id'])
         # Membership is not a creator session_id: automation and worker sessions
         # can have those without a user-facing chat. Ignore released subscriptions.
+        # One chat holds a created and a shepherd row per card: list each chat once.
         try:
             links = [dict(r) for r in db.execute(
                 'SELECT chat_gateway,chat_profile,chat_session FROM task_chat_links '
-                'WHERE task_id=? AND released=0', (card['id'],))]
+                'WHERE task_id=? AND released=0 GROUP BY chat_gateway,chat_profile,chat_session '
+                'ORDER BY MIN(rowid)', (card['id'],))]
         except sqlite3.Error:
             return {'available': False, 'rows': [], 'reason': 'Chat membership is unavailable'}
         view = model.ask(raw)
