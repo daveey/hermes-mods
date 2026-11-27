@@ -5,6 +5,31 @@ shepherd`, and because a shepherded card keeps a chat "waiting", one look at a c
 that card ended (2,300 such links, 131 chats on a single incident). A chat that really owns the work takes it with
 `hermes-hub adopt-task`.
 
+## Idempotent decision relays
+
+For `cross_session(action="send", ...)`, set `dedupe_key="kanban:<task_id>:<comment_id>"`
+when relaying a Kanban comment or decision. The optional nonempty string is limited to 200
+characters. Omit it for ordinary repeated messages; unkeyed sends are unchanged.
+
+Every sender session/profile on one gateway shares `session_mentions/send-dedupe.json`
+under `relay_files.root()`. A permanent OS file lock serializes lookup, reservation and outbox
+publication; JSON replacement is atomic. Entries expire after seven days on ledger access.
+Targets normalize gateway spelling and equivalent session-link/shorthand syntax, retaining
+profile and case-sensitive session IDs. Different gateway aliases are not resolved remotely.
+
+A repeated target/key writes no outbox request. It returns `ok: true`, `delivered: false`,
+`status: duplicate` and `original: {request_id, sender, sent_at, state}`. An in-flight or
+uncertain first delivery returns `duplicate_pending`. The receipt is the original delivery,
+not a new turn. A definite no-delivery refusal or successful unclaimed take-back releases the
+key. Late courier results update the ledger even after the sender yields. An uncertain
+acknowledgement retains the key: inspect the target before resending under another key.
+Corrupt/unwritable ledger data fails closed. This is sender-gateway deduplication, not a
+cross-gateway or receiver-side exactly-once guarantee.
+
+Tests: `tests/test_send_dedupe.py` exercises independent senders, distinct keys/targets,
+refusal/take-back/interruption retry, pending and late results, unknown acknowledgements,
+unkeyed compatibility, retention, normalization, validation and concurrent processes.
+
 ## Headless Board readers
 
 A managed headless host can opt into `hermes config set session_mentions.task_transport board_replica`.
