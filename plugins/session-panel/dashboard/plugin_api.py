@@ -2170,9 +2170,20 @@ def _newest_events(c: sqlite3.Connection, card_id: str) -> list:
     the hub backend ~75 thread-seconds a minute (2026-11-22): cards carry up to 9,302 events, most of them
     heartbeats, and each row paid a GIL round trip in a ~190-thread process."""
     from hermes_cli import kanban_db
-    rows = c.execute(
-        "SELECT * FROM task_events WHERE task_id = ? AND kind != 'heartbeat' "
-        "ORDER BY created_at DESC, id DESC LIMIT ?", (card_id, EVENTS_KEPT)).fetchall()
+    sql = ("SELECT * FROM task_events WHERE task_id = ? AND kind != 'heartbeat' "
+           "ORDER BY created_at DESC, id DESC LIMIT ?")
+    params = (card_id, EVENTS_KEPT)
+    try:
+        from hermes_state_page_pack import read_page
+    except ImportError:  # older cores retain their original bounded reader
+        rows = c.execute(sql, params).fetchall()
+    else:
+        try:
+            rows = read_page(c, sql, params)
+        except sqlite3.DataError as exc:
+            if getattr(exc, 'sqlite_errorcode', None) != sqlite3.SQLITE_TOOBIG:
+                raise
+            rows = c.execute(sql, params).fetchall()  # row cap is not a byte cap
     return [kanban_db.Event.from_row(r) for r in reversed(rows)]
 
 

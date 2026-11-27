@@ -70,6 +70,18 @@ Bundles are computed outside any lock, on per-thread read-only connections (reop
 
 Changes with no `task_events` row (a chat link adopted or released, a wake probe's next run, another card's queue move, origin receipt history) show at the next full refresh: within 60 s for a chat with open cards, 5 min for one with none.
 
+### Bounded card-event transport
+
+The newest-40 non-heartbeat event query retains its exact filter, tie order and
+canonical `Event` conversion. With a core providing `hermes_state_page_pack`, its
+bounded result crosses SQLite/Python as one typed transport cell instead of up to
+40 row handoffs. This reduces GIL convoy waits under concurrent Python work;
+it is not a result cache or a change to event history. Older cores retain the
+original reader. Aggregate `SQLITE_TOOBIG` falls back to individual rows, since
+40 individually valid events need not fit in one SQLite string; other helper
+failures propagate. Uncontended transport can cost more CPU, so a component
+benchmark is not a claim of whole-backend CPU acceptance.
+
 ## Urgent board-read mitigation
 
 `HERMES_PANEL_EXTERNAL_VISIBLE_ONLY` defaults on. Board capture defers global
